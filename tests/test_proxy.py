@@ -345,3 +345,47 @@ class TestEnsureProxy:
             def resolve_account(self, identifier):
                 raise AccountNotFoundError(identifier)
         assert pin_proxy.ensure_proxy(Sw(tmp_path)) is None
+
+
+class TestSessionWiring:
+    """Every launch path funnels through SessionManager._exec — the pin hook
+    lives there so run/fast-path/exec_default all get proxy wiring."""
+
+    def _manager(self, tmp_path):
+        import logging
+        from claude_swap.session import SessionManager
+
+        class Sw:
+            backup_dir = tmp_path
+            _logger = logging.getLogger("test")
+
+        return SessionManager(Sw())
+
+    def test_exec_wires_pin_proxy_env(self, tmp_path, monkeypatch):
+        from claude_swap import pin_proxy, session
+        ca = tmp_path / "pin-proxy" / "ca.pem"
+        ca.parent.mkdir()
+        ca.write_text("CA\n")
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, ca))
+        captured = {}
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+            raise SystemExit(0)
+        monkeypatch.setattr(session.os, "execvpe", fake_execvpe)
+        with __import__("pytest").raises(SystemExit):
+            self._manager(tmp_path)._exec("/bin/claude", [], env={"A": "1"})
+        assert captured["env"]["HTTPS_PROXY"] == "http://127.0.0.1:9955"
+        assert captured["env"]["NODE_EXTRA_CA_CERTS"] == str(ca)
+        assert captured["env"]["A"] == "1"
+
+    def test_exec_untouched_without_pin(self, tmp_path, monkeypatch):
+        from claude_swap import pin_proxy, session
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: None)
+        captured = {}
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+            raise SystemExit(0)
+        monkeypatch.setattr(session.os, "execvpe", fake_execvpe)
+        with __import__("pytest").raises(SystemExit):
+            self._manager(tmp_path)._exec("/bin/claude", [], env={"A": "1"})
+        assert captured["env"] == {"A": "1"}

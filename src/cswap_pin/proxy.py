@@ -577,9 +577,7 @@ class PinProxy:
             if not sent_host:
                 out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
             out.append(b"Connection: close")
-            up.sendall(b"\r\n".join(out) + b"\r\n\r\n")
-            if body:
-                up.sendall(body)
+            up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
             resp = _read_all(up)
         finally:
             up.close()

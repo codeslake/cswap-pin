@@ -59,7 +59,17 @@ class _FakeUpstream:
                     if not chunk:
                         break
                     data += chunk
-                head = data.split(b"\r\n\r\n", 1)[0].decode("latin1")
+                head, _, rest = data.partition(b"\r\n\r\n")
+                head = head.decode("latin1")
+                # Read the full body before replying — closing early races the
+                # proxy's body send into an RST (a real server reads it all).
+                m = [l for l in head.lower().split("\r\n") if l.startswith("content-length:")]
+                want = int(m[0].split(":")[1]) if m else 0
+                while len(rest) < want:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    rest += chunk
                 lines = head.split("\r\n")
                 self.seen_path = lines[0].split(" ")[1]
                 for line in lines[1:]:
