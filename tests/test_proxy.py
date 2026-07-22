@@ -267,3 +267,30 @@ class TestPinStore:
         assert load_pin(tmp_path) == ("pin@example.com", "org-1")
         save_settings(tmp_path, AutoSwitchSettings(threshold=88.0))
         assert load_pin(tmp_path) == ("pin@example.com", "org-1")
+
+
+class TestWireEnv:
+    """wire_env points the child session at the pin proxy: HTTPS_PROXY set,
+    our CA merged into NODE_EXTRA_CA_CERTS (never replacing an existing one,
+    e.g. a CCF or corp CA)."""
+
+    def test_sets_proxy_and_ca(self, tmp_path):
+        from claude_swap.pin_proxy import wire_env
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        env = wire_env({}, 9955, ca, tmp_path)
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:9955"
+        assert env["https_proxy"] == "http://127.0.0.1:9955"
+        assert env["NODE_EXTRA_CA_CERTS"] == str(ca)
+
+    def test_merges_existing_node_extra_ca(self, tmp_path):
+        from claude_swap.pin_proxy import wire_env
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        other = tmp_path / "ccf-ca.pem"
+        other.write_text("CCF-CA\n")
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(other)}, 9955, ca, tmp_path)
+        bundle = env["NODE_EXTRA_CA_CERTS"]
+        assert bundle not in (str(ca), str(other))  # a merged file
+        text = (tmp_path / "ca-bundle.pem").read_text()
+        assert "PIN-CA" in text and "CCF-CA" in text

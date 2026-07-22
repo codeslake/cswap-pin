@@ -295,6 +295,35 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     return provider
 
 
+def wire_env(
+    env: dict[str, str], port: int, ca_path: Path, certdir: Path
+) -> dict[str, str]:
+    """Return a copy of ``env`` routed through the pin proxy.
+
+    Sets ``HTTPS_PROXY``/``https_proxy`` to the proxy and makes Node trust our
+    MITM CA. Node's ``NODE_EXTRA_CA_CERTS`` takes exactly one file, so when the
+    session already trusts another CA (CCF, corp) the two PEMs are merged into
+    ``certdir/ca-bundle.pem`` — never replaced.
+    """
+    out = dict(env)
+    proxy = f"http://127.0.0.1:{port}"
+    out["HTTPS_PROXY"] = proxy
+    out["https_proxy"] = proxy
+    existing = env.get("NODE_EXTRA_CA_CERTS")
+    if existing and Path(existing) != ca_path:
+        bundle = Path(certdir) / "ca-bundle.pem"
+        try:
+            bundle.write_bytes(
+                Path(ca_path).read_bytes() + Path(existing).read_bytes()
+            )
+            out["NODE_EXTRA_CA_CERTS"] = str(bundle)
+        except OSError:
+            out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
+    else:
+        out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
+    return out
+
+
 UPSTREAM_HOST = "api.anthropic.com"
 UPSTREAM_PORT = 443
 
