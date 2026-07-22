@@ -295,6 +295,93 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     return provider
 
 
+def ensure_proxy(switcher) -> tuple[int, Path] | None:
+    """Make sure a pin proxy is serving for the pinned account.
+
+    Returns ``(port, ca_path)`` to wire into the child env, or ``None`` when
+    no pin is set (or the pinned account no longer exists — a dangling pin
+    must never block a launch). Reuses a live daemon recorded in
+    ``<backup>/pin-proxy/proxy.port`` (one proxy shared across sessions);
+    otherwise spawns one.
+    """
+    from claude_swap.exceptions import AccountNotFoundError, ConfigError
+
+    pin = load_pin(switcher.backup_dir)
+    if not pin:
+        return None
+    email, _org = pin
+    try:
+        account_num, email, _ = switcher.resolve_account(email)
+    except (AccountNotFoundError, ConfigError):
+        return None
+    certdir = switcher.backup_dir / "pin-proxy"
+    certdir.mkdir(parents=True, exist_ok=True)
+    port = _read_alive_port(certdir)
+    if port is None:
+        port = _spawn_daemon(account_num, email, certdir)
+        if port is None:
+            return None
+    return port, certdir / "ca.pem"
+
+
+def _read_alive_port(certdir: Path) -> int | None:
+    """Port of a live recorded daemon, else None. File format: ``port pid``."""
+    try:
+        port_s, pid_s = (certdir / "proxy.port").read_text().split()
+        port, pid = int(port_s), int(pid_s)
+        os.kill(pid, 0)  # raises if the pid is gone
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return port
+    except (OSError, ValueError):
+        return None
+
+
+def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
+    """Start the proxy daemon detached; wait for its port file. None on failure."""
+    import subprocess
+    import sys
+    import time
+
+    port_file = certdir / "proxy.port"
+    try:
+        port_file.unlink()
+    except FileNotFoundError:
+        pass
+    subprocess.Popen(
+        [sys.executable, "-m", "claude_swap.pin_proxy", account_num, email, str(certdir)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    for _ in range(100):  # up to ~10s (first run generates RSA keys)
+        port = _read_alive_port(certdir)
+        if port is not None:
+            return port
+        time.sleep(0.1)
+    return None
+
+
+def daemon_main(account_num: str, email: str, certdir: Path) -> None:
+    """Entry point for the detached proxy process (``-m claude_swap.pin_proxy``).
+
+    Chains to whatever HTTPS_PROXY was in cswap's environment (CCF, corp, or
+    none) and serves until killed. Writes ``proxy.port`` once listening.
+    """
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    proxy = PinProxy(
+        certdir=certdir,
+        pin_token_provider=make_pin_token_provider(switcher, account_num, email),
+        chain_proxy=parse_upstream_proxy(
+            os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        ),
+    )
+    proxy.start()
+    (certdir / "proxy.port").write_text(f"{proxy.port} {os.getpid()}")
+    threading.Event().wait()  # serve forever; lifecycle is kill-based
+
+
 def wire_env(
     env: dict[str, str], port: int, ca_path: Path, certdir: Path
 ) -> dict[str, str]:
@@ -642,3 +729,8 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
                 s.close()
             except OSError:
                 pass
+
+if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
+    import sys as _sys
+
+    daemon_main(_sys.argv[1], _sys.argv[2], Path(_sys.argv[3]))

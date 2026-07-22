@@ -294,3 +294,54 @@ class TestWireEnv:
         assert bundle not in (str(ca), str(other))  # a merged file
         text = (tmp_path / "ca-bundle.pem").read_text()
         assert "PIN-CA" in text and "CCF-CA" in text
+
+
+class TestEnsureProxy:
+    """ensure_proxy: no pin → None; live daemon → reuse; else spawn."""
+
+    class _Sw:
+        def __init__(self, backup_dir):
+            self.backup_dir = backup_dir
+        def resolve_account(self, identifier):
+            return ("2", "pin@example.com", "org-1")
+
+    def test_none_when_no_pin(self, tmp_path):
+        from claude_swap.pin_proxy import ensure_proxy
+        assert ensure_proxy(self._Sw(tmp_path)) is None
+
+    def test_spawns_when_no_daemon(self, tmp_path, monkeypatch):
+        from claude_swap import pin_proxy
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        spawned = []
+        def fake_spawn(account_num, email, certdir):
+            spawned.append((account_num, email))
+            return 9955
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", fake_spawn)
+        port, ca = pin_proxy.ensure_proxy(self._Sw(tmp_path))
+        assert port == 9955
+        assert spawned == [("2", "pin@example.com")]
+        assert ca == tmp_path / "pin-proxy" / "ca.pem"
+
+    def test_reuses_live_daemon(self, tmp_path, monkeypatch):
+        import os, socket
+        from claude_swap import pin_proxy
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        # A live listener + our own (alive) pid recorded in the port file.
+        srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        port = srv.getsockname()[1]
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        (certdir / "proxy.port").write_text(f"{port} {os.getpid()}")
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("no spawn")))
+        got_port, _ = pin_proxy.ensure_proxy(self._Sw(tmp_path))
+        srv.close()
+        assert got_port == port
+
+    def test_none_when_pin_account_gone(self, tmp_path):
+        from claude_swap import pin_proxy
+        from claude_swap.exceptions import AccountNotFoundError
+        pin_proxy.save_pin(tmp_path, "gone@example.com", "org-x")
+        class Sw(self._Sw):
+            def resolve_account(self, identifier):
+                raise AccountNotFoundError(identifier)
+        assert pin_proxy.ensure_proxy(Sw(tmp_path)) is None
