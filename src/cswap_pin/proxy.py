@@ -554,7 +554,11 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
 
 
 def wire_env(
-    env: dict[str, str], port: int, ca_path: Path, certdir: Path
+    env: dict[str, str],
+    port: int,
+    ca_path: Path,
+    certdir: Path,
+    open_refcount: bool = True,
 ) -> dict[str, str]:
     """Return a copy of ``env`` routed through the pin proxy.
 
@@ -562,6 +566,13 @@ def wire_env(
     MITM CA. Node's ``NODE_EXTRA_CA_CERTS`` takes exactly one file, so when the
     session already trusts another CA (CCF, corp) the two PEMs are merged into
     ``certdir/ca-bundle.pem`` — never replaced.
+
+    ``open_refcount`` controls the refcount holder. In-process callers
+    (session.py, which execs claude and hands off its own fds) pass True: we
+    open an inheritable write fd on the FIFO here so the exec'd claude keeps it.
+    The shell path (pin-env) passes False — the SHELL must open the fd (this
+    process exits immediately, so a fd we opened would close and tear the daemon
+    down at once); pin-env emits the `exec {fd}<>fifo` for the shell instead.
     """
     out = dict(env)
     proxy = f"http://127.0.0.1:{port}"
@@ -585,12 +596,12 @@ def wire_env(
     # The daemon's reader sees EOF only when every such fd closes → idle
     # teardown. O_RDWR so the open never blocks even if the daemon died.
     fifo = refcount_fifo_path(certdir)
-    if fifo.exists():
+    out["CSWAP_PIN_FIFO"] = str(fifo)
+    if open_refcount and fifo.exists():
         try:
             fd = os.open(str(fifo), os.O_RDWR)
             os.set_inheritable(fd, True)
             out["CSWAP_PIN_REFCOUNT_FD"] = str(fd)
-            out["CSWAP_PIN_FIFO"] = str(fifo)
         except OSError:
             pass
     return out

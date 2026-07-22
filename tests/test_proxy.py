@@ -676,3 +676,37 @@ class TestRefcount:
         assert not fired.is_set()  # holder still open → daemon stays up
         os.close(holder)            # last holder gone
         assert fired.wait(timeout=3)  # → teardown callback fires
+
+
+class TestPinEnvRefcount:
+    """pin-env (shell path) must emit a shell `exec {fd}<>fifo` so the SHELL
+    opens the refcount holder — not the transient cswap process (whose fd would
+    close the instant cswap exits, tearing the daemon down immediately)."""
+
+    def _seed(self, temp_home):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories(); sw._init_sequence_file()
+        data = sw._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "pin@co.com", "uuid": "u1", "organizationUuid": "org-1",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        sw._write_json(sw.sequence_file, data)
+        return sw
+
+    def test_pin_env_emits_shell_fifo_hold(self, temp_home, capsys, monkeypatch):
+        import os
+        from claude_swap import cli, pin_proxy
+        sw = self._seed(temp_home)
+        certdir = sw.backup_dir / "pin-proxy"; certdir.mkdir(parents=True)
+        (certdir / "ca.pem").write_text("CA\n")
+        os.mkfifo(str(pin_proxy.refcount_fifo_path(certdir)))
+        monkeypatch.setattr(pin_proxy, "ensure_proxy",
+                            lambda s: (9955, certdir / "ca.pem"))
+        cli._pin_env_command([])
+        out = capsys.readouterr().out
+        # a shell exec that opens the FIFO on an inherited fd (CCF pattern)
+        assert "<>" in out and "refcount.fifo" in out
+        assert "exec" in out
