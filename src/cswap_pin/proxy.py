@@ -532,23 +532,7 @@ class PinProxy:
 
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket):
         raw = self._connect_upstream()
-        # One context, three trust sources: system roots (real upstream), our
-        # own CA (test fakes), and NODE_EXTRA_CA_CERTS (a chained MITM proxy
-        # like CCF presents ITS cert for api.anthropic.com, not the real one).
-        ctx = ssl.create_default_context()
-        # Python 3.13+ turns on VERIFY_X509_STRICT, which rejects a leaf with
-        # no Authority Key Identifier — CCF's MITM cert is exactly that, and
-        # Node (the actual client this proxy fronts) doesn't enforce it.
-        # Chain-of-trust verification itself stays on.
-        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
-        ctx.load_verify_locations(cafile=str(self._bundle.ca_path))
-        extra = os.environ.get("NODE_EXTRA_CA_CERTS")
-        if extra:
-            try:
-                ctx.load_verify_locations(cafile=extra)
-            except (OSError, ssl.SSLError):
-                pass
-        up = ctx.wrap_socket(raw, server_hostname=UPSTREAM_HOST)
+        up = self._upstream_ctx().wrap_socket(raw, server_hostname=UPSTREAM_HOST)
         try:
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
@@ -567,6 +551,36 @@ class PinProxy:
             _relay_response(up, client)
         finally:
             up.close()
+
+    def _upstream_ctx(self) -> ssl.SSLContext:
+        """TLS context for the hop to the real api.anthropic.com.
+
+        When we chain through a LOOPBACK proxy (CCF, or any local MITM), that
+        hop re-signs api.anthropic.com with its own CA whose path we can't know
+        portably — and it terminates on localhost, having itself verified the
+        real upstream. So we skip cert verification for a loopback chain,
+        exactly as the real client (Node) does by trusting the CCF CA blindly.
+        For a direct dial or a remote proxy, full verification stays on:
+        system roots (real cert) + our own CA (test fakes) + any corp CA on
+        NODE_EXTRA_CA_CERTS.
+        """
+        if self._chain and self._chain[0] in ("127.0.0.1", "::1", "localhost"):
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+        ctx = ssl.create_default_context()
+        # Python 3.13+ VERIFY_X509_STRICT rejects a leaf with no Authority Key
+        # Identifier; a corp MITM leaf may lack one. Chain-of-trust stays on.
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        ctx.load_verify_locations(cafile=str(self._bundle.ca_path))
+        extra = os.environ.get("NODE_EXTRA_CA_CERTS")
+        if extra:
+            try:
+                ctx.load_verify_locations(cafile=extra)
+            except (OSError, ssl.SSLError):
+                pass
+        return ctx
 
     def _connect_upstream(self) -> socket.socket:
         chain = self._chain

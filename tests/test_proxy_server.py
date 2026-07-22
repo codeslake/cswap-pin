@@ -285,3 +285,72 @@ class TestStreamingRelay:
         finally:
             proxy.stop()
             upstream.stop()
+
+
+class _LoopbackConnectProxy:
+    """A localhost CONNECT proxy (stands in for CCF) that forwards to a fake
+    upstream signed by a CA the pin proxy does NOT trust. Proves the pin proxy
+    relays through a loopback MITM without being able to verify its cert."""
+
+    def __init__(self, target: tuple[str, int]):
+        self._target = target
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        try:
+            conn, _ = self._srv.accept()
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += conn.recv(1)
+            up = socket.create_connection(self._target, timeout=10)
+            conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            # blind-pipe both directions
+            import select
+            while True:
+                r, _, _ = select.select([conn, up], [], [], 10)
+                if not r:
+                    break
+                for s in r:
+                    d = s.recv(65536)
+                    if not d:
+                        return
+                    (up if s is conn else conn).sendall(d)
+        except Exception:
+            pass
+
+    def stop(self):
+        self._srv.close()
+
+
+class TestLoopbackChainTrust:
+    def test_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
+        from claude_swap.pin_proxy import PinProxy
+
+        # Fake upstream signed by a FOREIGN CA the pin proxy has no way to trust.
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        ensure_ca(foreign, "api.anthropic.com")
+        upstream = _FakeUpstream(foreign)
+        chain = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+
+        proxy = PinProxy(
+            certdir=certdir,  # pin proxy's own CA != foreign CA
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+            chain_proxy=("127.0.0.1", chain.port),
+        )
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert status == 200  # verification was skipped for the loopback hop
+        finally:
+            proxy.stop()
+            chain.stop()
+            upstream.stop()
