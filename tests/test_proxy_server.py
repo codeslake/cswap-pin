@@ -193,3 +193,95 @@ class TestPinProxyServer:
         finally:
             proxy.stop()
             upstream.stop()
+
+
+class _StreamingUpstream:
+    """A TLS server that sends response headers + a first SSE event, then
+    BLOCKS on ``release`` before sending the second event. Lets a test prove
+    the proxy relays the first event before the response finishes — i.e. it
+    streams instead of buffering to EOF."""
+
+    def __init__(self, certdir: Path):
+        self.release = threading.Event()
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        try:
+            conn, _ = self._srv.accept()
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            tls.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+                b"8\r\nevent: a\r\n"
+            )
+            self.release.wait(timeout=10)
+            tls.sendall(b"8\r\nevent: b\r\n0\r\n\r\n")
+            tls.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        self._srv.close()
+
+
+class TestStreamingRelay:
+    def test_first_event_arrives_before_upstream_finishes(self, certdir):
+        from claude_swap.pin_proxy import PinProxy
+
+        upstream = _StreamingUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            # Raw client through the proxy so we can read incrementally.
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(
+                b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                b"Host: api.anthropic.com:443\r\n\r\n"
+            )
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += raw.recv(1)
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            tls.sendall(
+                b"GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                b"Authorization: Bearer t\r\n\r\n"
+            )
+            # Read until the first event lands. If the proxy buffered to EOF,
+            # nothing arrives (upstream is blocked on release) → recv times out.
+            tls.settimeout(5)
+            got = b""
+            while b"event: a" not in got:
+                chunk = tls.recv(4096)
+                assert chunk, "connection closed before first event"
+                got += chunk
+            # First event relayed while upstream still holds the second one.
+            assert not upstream.release.is_set()
+            upstream.release.set()
+            while b"event: b" not in got:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                got += chunk
+            assert b"event: b" in got
+            tls.close()
+        finally:
+            proxy.stop()
+            upstream.stop()

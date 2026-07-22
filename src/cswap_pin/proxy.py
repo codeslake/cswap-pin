@@ -526,17 +526,11 @@ class PinProxy:
                     for k, v in headers
                 ]
 
-        status_line, resp_headers, resp_body = self._forward(method, path, headers, body)
-        tls.sendall(status_line + b"\r\n")
-        for k, v in resp_headers:
-            tls.sendall(f"{k}: {v}\r\n".encode("latin1"))
-        tls.sendall(b"\r\n")
-        if resp_body:
-            tls.sendall(resp_body)
+        self._forward(method, path, headers, body, tls)
         # Simplify: one request per MITM connection (Connection: close).
         return False
 
-    def _forward(self, method, path, headers, body):
+    def _forward(self, method, path, headers, body, client: ssl.SSLSocket):
         raw = self._connect_upstream()
         # One context, three trust sources: system roots (real upstream), our
         # own CA (test fakes), and NODE_EXTRA_CA_CERTS (a chained MITM proxy
@@ -570,10 +564,9 @@ class PinProxy:
                 out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
             out.append(b"Connection: close")
             up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
-            resp = _read_all(up)
+            _relay_response(up, client)
         finally:
             up.close()
-        return _parse_response(resp)
 
     def _connect_upstream(self) -> socket.socket:
         chain = self._chain
@@ -665,35 +658,42 @@ def _read_body(sock, headers) -> bytes:
     return bytes(body)
 
 
-def _read_all(sock) -> bytes:
-    data = bytearray()
+def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> None:
+    """Stream the upstream response to the client as bytes arrive.
+
+    Reads only up to the header terminator, forwards the status line + headers
+    (minus hop-by-hop), then pipes the remaining body verbatim without waiting
+    for EOF — so an SSE stream reaches the client event-by-event instead of
+    being buffered whole. A ``Content-Length``-then-close peer can surface as
+    a reset rather than a clean EOF; that's treated as the end of the body.
+    """
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        try:
+            chunk = up.recv(65536)
+        except (ConnectionResetError, ssl.SSLError, OSError):
+            chunk = b""
+        if not chunk:
+            break
+        buf += chunk
+    head, sep, rest = bytes(buf).partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status_line = lines[0] if lines and lines[0] else b"HTTP/1.1 502 Bad Gateway"
+    out = [status_line]
+    for line in lines[1:]:
+        if b":" in line and line.split(b":", 1)[0].strip().lower() in _HOP_BY_HOP:
+            continue
+        out.append(line)
+    client.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (rest if sep else b""))
+
     while True:
         try:
-            chunk = sock.recv(65536)
+            chunk = up.recv(65536)
         except (ConnectionResetError, ssl.SSLError, OSError):
-            # A peer that sends Content-Length then closes can surface as an
-            # abrupt reset rather than a clean EOF; treat what we have as the
-            # full response.
             break
         if not chunk:
             break
-        data += chunk
-    return bytes(data)
-
-
-def _parse_response(raw: bytes):
-    head, _, body = raw.partition(b"\r\n\r\n")
-    lines = head.split(b"\r\n")
-    status_line = lines[0] if lines else b"HTTP/1.1 502 Bad Gateway"
-    headers = []
-    for line in lines[1:]:
-        if b":" in line:
-            k, v = line.split(b":", 1)
-            kl = k.strip().lower()
-            if kl in _HOP_BY_HOP:
-                continue
-            headers.append((k.strip().decode("latin1"), v.strip().decode("latin1")))
-    return status_line, headers, body
+        client.sendall(chunk)
 
 
 def _pump(a: socket.socket, b: socket.socket) -> None:
