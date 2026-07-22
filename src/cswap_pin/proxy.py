@@ -358,17 +358,84 @@ def _spawn_lock(certdir: Path):
 
 
 def _kill_daemon(pid: int) -> None:
-    """TERM a daemon and give it a moment to release its port."""
+    """TERM a daemon, then escalate to KILL if it does not exit — so a daemon
+    that ignores TERM (or hangs mid-teardown) never lingers as an orphan
+    holding a port. Mirrors CCF's recycle_supervisor bounded-wait-then-force."""
     import time
 
     try:
-        os.kill(pid, 15)
+        os.kill(pid, 15)  # SIGTERM
     except OSError:
         return
-    for _ in range(20):  # up to ~2s for the port to free
+    for _ in range(20):  # up to ~2s for a clean exit
         if not _pid_alive(pid):
             return
         time.sleep(0.1)
+    try:
+        os.kill(pid, 9)  # SIGKILL escalation
+    except OSError:
+        return
+    for _ in range(10):  # up to ~1s for the port to actually free
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+
+
+def _pin_daemon_pids(certdir: Path) -> list[int]:
+    """Pids of every running pin_proxy daemon serving THIS certdir. Matched on
+    the daemon's argv (``-m claude_swap.pin_proxy ... <certdir>``) via ps, so a
+    daemon for another backup dir is never touched."""
+    import subprocess
+
+    target = str(Path(certdir).resolve())
+    pids: list[int] = []
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return pids
+    for line in out.splitlines():
+        line = line.strip()
+        if "claude_swap.pin_proxy" not in line:
+            continue
+        if target not in line:
+            continue
+        head = line.split(None, 1)[0]
+        try:
+            pids.append(int(head))
+        except ValueError:
+            continue
+    return pids
+
+
+def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
+    """Kill every pin_proxy daemon for ``certdir`` except ``keep_pid`` — orphans
+    that fell out of proxy.json (a redeploy/recycle replaced them but they
+    didn't die) hold ports and never idle-teardown. Best-effort; never raises."""
+    for pid in _pin_daemon_pids(certdir):
+        if pid != keep_pid and pid != os.getpid():
+            _kill_daemon(pid)
+
+
+def _install_signal_teardown(cleanup) -> None:
+    """Register SIGTERM/SIGINT so a recycle/cc-update TERM runs ``cleanup``
+    (stop the server, remove the state file) instead of a bare default kill —
+    the daemon leaves no stale state or bound port behind."""
+    import signal
+
+    def _handler(signum, frame):
+        try:
+            cleanup()
+        finally:
+            os._exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass  # not on the main thread (tests) — best effort
 
 
 _STATE_FILE = "proxy.json"
@@ -499,6 +566,12 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
     for _ in range(100):  # up to ~10s (first run generates RSA keys)
         port = _read_alive_port(certdir)
         if port is not None:
+            # New daemon is serving and recorded in proxy.json — sweep any
+            # orphan pin daemons for this certdir that aren't the keeper, so a
+            # recycle that left the old one alive never accumulates.
+            st = read_daemon_state(certdir)
+            keep = int(st["pid"]) if st else -1
+            _sweep_orphan_daemons(certdir, keep_pid=keep)
             return port
         time.sleep(0.1)
     return None
@@ -538,14 +611,17 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     done = threading.Event()
 
     def _teardown():
-        # Last session closed its holder — stop serving and clean up.
+        # Last session closed its holder (or a signal arrived) — stop serving
+        # and clean up our state so a launcher never reuses a dead record.
         proxy.stop()
-        for f in (certdir / _STATE_FILE,):
-            try:
-                f.unlink()
-            except OSError:
-                pass
+        try:
+            (certdir / _STATE_FILE).unlink()
+        except OSError:
+            pass
         done.set()
+
+    # A recycle/cc-update TERM runs the same cleanup as an idle teardown.
+    _install_signal_teardown(_teardown)
 
     threading.Thread(
         target=watch_refcount, args=(fifo, _teardown), daemon=True

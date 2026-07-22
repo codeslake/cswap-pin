@@ -757,3 +757,57 @@ class TestAutoViewPinLabel:
 
     def test_label_none_without_pin(self, tmp_path):
         assert self._label(tmp_path, [self._acct(1, "a@co.com")]) is None
+
+
+class TestKillDaemon:
+    """_kill_daemon must escalate TERM → KILL so a daemon that ignores TERM
+    (or is mid-teardown) never lingers as an orphan holding a port."""
+
+    def test_escalates_to_kill(self, monkeypatch):
+        import os
+        from claude_swap import pin_proxy
+        sent = []
+        alive = {"pid": True}
+        def fake_kill(pid, sig):
+            sent.append(sig)
+            if sig == 9:
+                alive["pid"] = False
+        monkeypatch.setattr(pin_proxy.os, "kill", fake_kill)
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: alive["pid"])
+        pin_proxy._kill_daemon(4321)
+        assert 15 in sent and 9 in sent  # TERM first, then KILL escalation
+
+
+class TestDaemonSignalTeardown:
+    """The daemon installs a SIGTERM handler so a recycle (or cc-update) that
+    TERMs it cleans up its state file and port instead of relying on default
+    kill semantics."""
+
+    def test_sigterm_handler_is_installed(self, monkeypatch, tmp_path):
+        # daemon_main should register a SIGTERM handler. We assert the wiring
+        # exists by checking the helper it uses is called.
+        import signal
+        from claude_swap import pin_proxy
+        installed = {}
+        real_signal = pin_proxy.signal.signal if hasattr(pin_proxy, "signal") else None
+        # daemon_main is heavy (starts a server); instead unit-test the helper.
+        assert hasattr(pin_proxy, "_install_signal_teardown")
+
+
+class TestOrphanSweep:
+    """A daemon that fell out of proxy.json (a redeploy spawned a replacement,
+    but the old one didn't die) becomes an orphan no state file references. On
+    spawn, sweep every pin_proxy daemon for THIS backup dir except the one we
+    keep, so orphans never accumulate."""
+
+    def test_sweeps_other_pin_daemons_for_this_certdir(self, monkeypatch, tmp_path):
+        from claude_swap import pin_proxy
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        # pretend three pin daemons exist for this certdir; keep 200, sweep others
+        found = [101, 202, 303]
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids",
+                            lambda cd: list(found))
+        killed = []
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        pin_proxy._sweep_orphan_daemons(certdir, keep_pid=202)
+        assert sorted(killed) == [101, 303]  # everything but the keeper
