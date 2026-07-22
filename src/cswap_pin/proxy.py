@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import selectors
+import socket
+import ssl
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -226,3 +230,323 @@ def swap_authorization(headers: dict[str, str], pin_token: str) -> dict[str, str
         if name.lower() == "authorization":
             out[name] = f"Bearer {pin_token}"
     return out
+
+
+UPSTREAM_HOST = "api.anthropic.com"
+UPSTREAM_PORT = 443
+
+
+class PinProxy:
+    """A CONNECT forward proxy that MITMs api.anthropic.com and swaps the
+    Authorization bearer to a pinned token on the RC/Artifact routes.
+
+    Non-anthropic CONNECTs are blind-tunnelled (optionally through the upstream
+    proxy that was on HTTPS_PROXY before us). The anthropic connection is
+    terminated with our leaf cert, the decrypted request is inspected, and —
+    on a pinned route — its Authorization is replaced before being re-issued
+    to the real upstream over TLS.
+    """
+
+    def __init__(
+        self,
+        certdir: Path,
+        pin_token_provider: "Callable[[], str | None]",
+        upstream: tuple[str, int] | None = None,
+        chain_proxy: tuple[str, int] | None = None,
+        host: str = "127.0.0.1",
+    ):
+        self._certdir = Path(certdir)
+        self._pin_token_provider = pin_token_provider
+        # Where the MITM'd anthropic request is really sent. Defaults to the
+        # real upstream; tests point it at a fake server.
+        self._upstream = upstream or (UPSTREAM_HOST, UPSTREAM_PORT)
+        # A proxy to CONNECT through for egress (CCF 9901, corp proxy).
+        self._chain = chain_proxy
+        self._host = host
+        self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
+        self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._server_ctx.load_cert_chain(
+            str(self._bundle.leaf_path), str(self._bundle.leaf_key_path)
+        )
+        self._srv: socket.socket | None = None
+        self._stop = False
+        self.port = 0
+
+    def start(self) -> None:
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind((self._host, 0))
+        self._srv.listen(64)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._srv:
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+
+    # -- internals ----------------------------------------------------------
+
+    def _accept_loop(self) -> None:
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            threading.Thread(
+                target=self._handle_client, args=(conn,), daemon=True
+            ).start()
+
+    def _handle_client(self, conn: socket.socket) -> None:
+        try:
+            line = _read_line(conn)
+            if not line:
+                conn.close()
+                return
+            parts = line.split(" ")
+            if parts[0] != "CONNECT":
+                conn.close()
+                return
+            target = parts[1]  # host:port
+            # Drain the rest of the CONNECT headers.
+            while True:
+                h = _read_line(conn)
+                if h in ("", None):
+                    break
+            host = target.rsplit(":", 1)[0]
+            if host != UPSTREAM_HOST:
+                self._blind_tunnel(target, conn)
+                return
+            self._mitm(conn)
+        except Exception:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _mitm(self, conn: socket.socket) -> None:
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        tls = self._server_ctx.wrap_socket(conn, server_side=True)
+        try:
+            while True:
+                if not self._handle_one_request(tls):
+                    break
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    def _handle_one_request(self, tls: ssl.SSLSocket) -> bool:
+        request_line = _read_line(tls)
+        if not request_line:
+            return False
+        method, path, _ = _split_request_line(request_line)
+        headers: list[tuple[str, str]] = []
+        while True:
+            h = _read_line(tls)
+            if h in ("", None):
+                break
+            if ":" in h:
+                k, v = h.split(":", 1)
+                headers.append((k.strip(), v.strip()))
+        body = _read_body(tls, headers)
+
+        if is_pinned_route(path):
+            token = self._pin_token_provider()
+            if token:
+                headers = [
+                    (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
+                    for k, v in headers
+                ]
+
+        status_line, resp_headers, resp_body = self._forward(method, path, headers, body)
+        tls.sendall(status_line + b"\r\n")
+        for k, v in resp_headers:
+            tls.sendall(f"{k}: {v}\r\n".encode("latin1"))
+        tls.sendall(b"\r\n")
+        if resp_body:
+            tls.sendall(resp_body)
+        # Simplify: one request per MITM connection (Connection: close).
+        return False
+
+    def _forward(self, method, path, headers, body):
+        raw = self._connect_upstream()
+        ctx = ssl.create_default_context(cafile=str(self._bundle.ca_path))
+        # The fake upstream (and the real one) present a cert for
+        # api.anthropic.com; validate against our CA (which signed the fake's
+        # leaf) — for the real upstream this is the system trust path instead.
+        try:
+            up = ctx.wrap_socket(raw, server_hostname=UPSTREAM_HOST)
+        except ssl.SSLError:
+            ctx2 = ssl.create_default_context()
+            up = ctx2.wrap_socket(raw, server_hostname=UPSTREAM_HOST)
+        try:
+            out = [f"{method} {path} HTTP/1.1".encode("latin1")]
+            sent_host = False
+            for k, v in headers:
+                kl = k.lower()
+                if kl in _HOP_BY_HOP or kl.startswith("proxy-"):
+                    continue
+                if kl == "host":
+                    v = UPSTREAM_HOST
+                    sent_host = True
+                out.append(f"{k}: {v}".encode("latin1"))
+            if not sent_host:
+                out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
+            out.append(b"Connection: close")
+            up.sendall(b"\r\n".join(out) + b"\r\n\r\n")
+            if body:
+                up.sendall(body)
+            resp = _read_all(up)
+        finally:
+            up.close()
+        return _parse_response(resp)
+
+    def _connect_upstream(self) -> socket.socket:
+        chain = self._chain
+        if chain:
+            raw = socket.create_connection(chain, timeout=15)
+            raw.sendall(
+                f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
+                f"Host: {self._upstream[0]}:{self._upstream[1]}\r\n\r\n".encode("latin1")
+            )
+            status = _read_line(raw)
+            while True:
+                h = _read_line(raw)
+                if h in ("", None):
+                    break
+            if not status or " 200" not in status:
+                raw.close()
+                raise OSError(f"upstream CONNECT failed: {status}")
+            return raw
+        return socket.create_connection(self._upstream, timeout=15)
+
+    def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
+        host, _, port_s = target.rpartition(":")
+        port = int(port_s) if port_s else 443
+        try:
+            if self._chain:
+                up = socket.create_connection(self._chain, timeout=15)
+                up.sendall(
+                    f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("latin1")
+                )
+                status = _read_line(up)
+                while True:
+                    h = _read_line(up)
+                    if h in ("", None):
+                        break
+                if not status or " 200" not in status:
+                    up.close()
+                    conn.close()
+                    return
+            else:
+                up = socket.create_connection((host, port), timeout=15)
+        except OSError:
+            conn.close()
+            return
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        _pump(conn, up)
+
+
+_HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "upgrade",
+}
+
+
+def _read_line(sock) -> str | None:
+    buf = bytearray()
+    while True:
+        b = sock.recv(1)
+        if not b:
+            return None if not buf else buf.decode("latin1")
+        if b == b"\n":
+            if buf.endswith(b"\r"):
+                buf.pop()
+            return buf.decode("latin1")
+        buf += b
+
+
+def _split_request_line(line: str) -> tuple[str, str, str]:
+    parts = line.split(" ")
+    if len(parts) < 3:
+        return parts[0], parts[1] if len(parts) > 1 else "/", "HTTP/1.1"
+    return parts[0], parts[1], parts[2]
+
+
+def _read_body(sock, headers) -> bytes:
+    length = 0
+    for k, v in headers:
+        if k.lower() == "content-length":
+            try:
+                length = int(v)
+            except ValueError:
+                length = 0
+    body = bytearray()
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return bytes(body)
+
+
+def _read_all(sock) -> bytes:
+    data = bytearray()
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except (ConnectionResetError, ssl.SSLError, OSError):
+            # A peer that sends Content-Length then closes can surface as an
+            # abrupt reset rather than a clean EOF; treat what we have as the
+            # full response.
+            break
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+
+def _parse_response(raw: bytes):
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status_line = lines[0] if lines else b"HTTP/1.1 502 Bad Gateway"
+    headers = []
+    for line in lines[1:]:
+        if b":" in line:
+            k, v = line.split(b":", 1)
+            kl = k.strip().lower()
+            if kl in _HOP_BY_HOP:
+                continue
+            headers.append((k.strip().decode("latin1"), v.strip().decode("latin1")))
+    return status_line, headers, body
+
+
+def _pump(a: socket.socket, b: socket.socket) -> None:
+    sel = selectors.DefaultSelector()
+    sel.register(a, selectors.EVENT_READ)
+    sel.register(b, selectors.EVENT_READ)
+    try:
+        while True:
+            for key, _ in sel.select(timeout=60):
+                src = key.fileobj
+                dst = b if src is a else a
+                data = src.recv(65536)
+                if not data:
+                    return
+                dst.sendall(data)
+    except OSError:
+        return
+    finally:
+        for s in (a, b):
+            try:
+                s.close()
+            except OSError:
+                pass
