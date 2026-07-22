@@ -475,23 +475,70 @@ class PinProxy:
                 conn.close()
                 return
             parts = line.split(" ")
-            if parts[0] != "CONNECT":
-                conn.close()
+            if parts[0] == "CONNECT":
+                target = parts[1]  # host:port
+                # Drain the rest of the CONNECT headers.
+                while True:
+                    h = _read_line(conn)
+                    if h in ("", None):
+                        break
+                host = target.rsplit(":", 1)[0]
+                if host != UPSTREAM_HOST:
+                    self._blind_tunnel(target, conn)
+                    return
+                self._mitm(conn)
                 return
-            target = parts[1]  # host:port
-            # Drain the rest of the CONNECT headers.
-            while True:
-                h = _read_line(conn)
-                if h in ("", None):
-                    break
-            host = target.rsplit(":", 1)[0]
-            if host != UPSTREAM_HOST:
-                self._blind_tunnel(target, conn)
+            if len(parts) >= 2 and "://" in parts[1]:
+                # Absolute-form request (plain-proxy mode, no CONNECT). The
+                # native auto-updater and telemetry use axios this way; dropping
+                # them is what pins the "Auto-update failed" banner. Relay
+                # verbatim through the chain — no MITM, no swap.
+                self._plain_relay(line, conn)
                 return
-            self._mitm(conn)
+            conn.close()
         except Exception:
             try:
                 conn.close()
+            except OSError:
+                pass
+
+    def _plain_relay(self, request_line: str, conn: socket.socket) -> None:
+        """Forward an absolute-form proxy request through the chain (or direct).
+
+        Rewrites the request line to origin-form and dials the target host —
+        via the chain proxy if one is set (still absolute-form to it, as a
+        plain proxy expects), else straight to the origin.
+        """
+        rl = request_line.split(" ")
+        method, url = rl[0], rl[1] if len(rl) > 1 else "/"
+        headers = []
+        while True:
+            h = _read_line(conn)
+            if h in ("", None):
+                break
+            headers.append(h)
+        split = urlsplit(url)
+        host, port = split.hostname, split.port or 80
+        try:
+            if self._chain:
+                up = socket.create_connection(self._chain, timeout=15)
+                # A plain proxy takes the absolute-form line as-is.
+                head = f"{method} {url} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
+            else:
+                up = socket.create_connection((host, port), timeout=15)
+                path = split.path or "/"
+                if split.query:
+                    path += "?" + split.query
+                head = f"{method} {path} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
+        except OSError:
+            conn.close()
+            return
+        try:
+            up.sendall(head.encode("latin1"))
+            _pump(conn, up)
+        finally:
+            try:
+                up.close()
             except OSError:
                 pass
 

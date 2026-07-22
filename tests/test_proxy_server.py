@@ -354,3 +354,55 @@ class TestLoopbackChainTrust:
             proxy.stop()
             chain.stop()
             upstream.stop()
+
+
+class TestAbsoluteFormPassthrough:
+    """The native auto-updater and telemetry use axios in plain-proxy mode:
+    they send `GET http://host/path` (absolute-form, no CONNECT). The proxy
+    must relay these through the chain, not drop them (dropping = the
+    'Auto-update failed' banner). No MITM/swap — just forward."""
+
+    def test_absolute_form_get_is_relayed(self, certdir):
+        from claude_swap.pin_proxy import PinProxy
+
+        # A plain HTTP origin the "updater" fetches (absolute-form target).
+        origin_seen = {}
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        oport = srv.getsockname()[1]
+
+        def origin():
+            try:
+                c, _ = srv.accept()
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += c.recv(4096)
+                origin_seen["req"] = data.decode("latin1").splitlines()[0]
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                c.close()
+            except Exception:
+                pass
+        threading.Thread(target=origin, daemon=True).start()
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(
+                f"GET http://127.0.0.1:{oport}/releases/latest HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{oport}\r\n\r\n".encode()
+            )
+            resp = b""
+            raw.settimeout(5)
+            while b"OK" not in resp:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            raw.close()
+            assert b"200 OK" in resp
+            assert origin_seen.get("req", "").startswith("GET /releases/latest")
+        finally:
+            proxy.stop()
+            srv.close()
