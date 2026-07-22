@@ -434,6 +434,11 @@ class PinProxy:
         self._srv: socket.socket | None = None
         self._stop = False
         self.port = 0
+        # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
+        # request (method, path, whether it matched a pinned route and was
+        # swapped). Off by default; used to diagnose routing end to end.
+        debug_path = os.environ.get("CSWAP_PIN_DEBUG")
+        self._debug = open(debug_path, "a") if debug_path else None
 
     def start(self) -> None:
         self._srv = socket.socket()
@@ -518,13 +523,19 @@ class PinProxy:
                 headers.append((k.strip(), v.strip()))
         body = _read_body(tls, headers)
 
-        if is_pinned_route(path):
+        pinned = is_pinned_route(path)
+        swapped = False
+        if pinned:
             token = self._pin_token_provider()
             if token:
                 headers = [
                     (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
                     for k, v in headers
                 ]
+                swapped = True
+        if self._debug:
+            self._debug.write(f"{method} {path} pinned={pinned} swapped={swapped}\n")
+            self._debug.flush()
 
         self._forward(method, path, headers, body, tls)
         # Simplify: one request per MITM connection (Connection: close).

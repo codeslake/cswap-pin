@@ -487,3 +487,43 @@ class TestTuiPinMenu:
             assert load_pin(tmp_path) is None
 
         asyncio.run(scenario())
+
+
+class TestPinEnvCommand:
+    """`cswap pin-env` emits shell export lines for eval in a wrapper (like
+    cachefix-ensure / ssh-agent). It reuses ensure_proxy + wire_env, so when
+    ensure_proxy returns None (no pin / dangling pin) it emits nothing."""
+
+    def _seed(self, temp_home):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._init_sequence_file()
+        data = sw._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "pin@co.com", "uuid": "u1", "organizationUuid": "org-1",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        sw._write_json(sw.sequence_file, data)
+        return sw
+
+    def test_no_pin_emits_nothing(self, temp_home, capsys, monkeypatch):
+        from claude_swap import cli, pin_proxy
+        self._seed(temp_home)
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: None)
+        cli._pin_env_command([])
+        assert capsys.readouterr().out.strip() == ""
+
+    def test_pin_emits_proxy_exports(self, temp_home, capsys, monkeypatch):
+        from claude_swap import cli, pin_proxy
+        sw = self._seed(temp_home)
+        ca = sw.backup_dir / "pin-proxy" / "ca.pem"
+        ca.parent.mkdir(parents=True, exist_ok=True)
+        ca.write_text("CA\n")
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda s: (9955, ca))
+        cli._pin_env_command([])
+        out = capsys.readouterr().out
+        assert "export HTTPS_PROXY=http://127.0.0.1:9955" in out
+        assert "export https_proxy=http://127.0.0.1:9955" in out
+        assert f"export NODE_EXTRA_CA_CERTS={ca}" in out
