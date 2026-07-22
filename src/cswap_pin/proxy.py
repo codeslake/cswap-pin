@@ -558,6 +558,11 @@ class PinProxy:
         # own CA (test fakes), and NODE_EXTRA_CA_CERTS (a chained MITM proxy
         # like CCF presents ITS cert for api.anthropic.com, not the real one).
         ctx = ssl.create_default_context()
+        # Python 3.13+ turns on VERIFY_X509_STRICT, which rejects a leaf with
+        # no Authority Key Identifier — CCF's MITM cert is exactly that, and
+        # Node (the actual client this proxy fronts) doesn't enforce it.
+        # Chain-of-trust verification itself stays on.
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
         ctx.load_verify_locations(cafile=str(self._bundle.ca_path))
         extra = os.environ.get("NODE_EXTRA_CA_CERTS")
         if extra:
