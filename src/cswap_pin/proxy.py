@@ -53,8 +53,19 @@ def is_pinned_route(path: str) -> bool:
     that we want pinned — Remote-Control code sessions and Artifact ("frame")
     deploys. False for everything else, most importantly ``/v1/messages`` (which
     must keep billing the currently-swapped inference account).
+
+    ``/v1/sessions/<id>/...`` is the RC session-lifecycle sibling of
+    ``/v1/code/sessions`` — reconnect unarchives via ``/v1/sessions/{id}/
+    unarchive`` (measured). It MUST swap too: if unarchive keeps the disk
+    bearer while the bridge is swapped, the session's ownership splits and the
+    reconnect resolves on the disk account, so the pinned account never sees
+    it. The trailing ``/`` keeps a bare ``/v1/sessions`` list out.
     """
-    return path.startswith("/v1/code/sessions") or path.startswith("/api/frame/")
+    return (
+        path.startswith("/v1/code/sessions")
+        or path.startswith("/v1/sessions/")
+        or path.startswith("/api/frame/")
+    )
 
 
 @dataclass(frozen=True)

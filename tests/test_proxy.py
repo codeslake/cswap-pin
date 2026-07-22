@@ -44,6 +44,18 @@ class TestIsPinnedRoute:
         # Artifact publishes ("frames") are owned by the creating bearer too.
         assert is_pinned_route("/api/frame/deploy/init") is True
 
+    def test_session_unarchive_is_pinned(self):
+        # RC reconnect unarchives the session at /v1/sessions/{id}/unarchive
+        # (NOT /v1/code/sessions) before re-bridging. Measured: if this route
+        # keeps the disk bearer while the bridge is swapped, the session's
+        # ownership splits — unarchive lands it on the disk account, and the
+        # reconnect resolves there, so the pinned account never sees it.
+        assert is_pinned_route("/v1/sessions/cse_01ABC/unarchive") is True
+
+    def test_bare_sessions_list_not_pinned(self):
+        # A plain /v1/sessions or /v1/messages must not be swept in.
+        assert is_pinned_route("/v1/messages") is False
+
 
 class TestParseUpstreamProxy:
     def test_none_when_no_upstream(self):
