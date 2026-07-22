@@ -710,3 +710,50 @@ class TestPinEnvRefcount:
         # a shell exec that opens the FIFO on an inherited fd (CCF pattern)
         assert "<>" in out and "refcount.fifo" in out
         assert "exec" in out
+
+
+class TestAutoViewPinLabel:
+    """The auto-switch view marks the remote-control-pinned account so a user
+    running `auto` with a pin can see, at a glance, which account RC is on."""
+
+    def _label(self, backup_dir, accounts):
+        """Call _pinned_rc_label with a stand-in app, WITHOUT mutating the
+        AutoScreen class (a class-level property would leak into other tests)."""
+        from claude_swap.tui.autoview import AutoScreen
+        class _Snap:
+            pass
+        class _App:
+            class switcher:
+                pass
+        app = _App()
+        app.switcher.backup_dir = backup_dir
+        snap = _Snap(); snap.accounts = accounts
+        app.snapshot = snap
+        # Unbound method call with a minimal object exposing `.app`; no class
+        # patching, so nothing leaks.
+        class _Stub:
+            pass
+        stub = _Stub()
+        stub.app = app
+        return AutoScreen._pinned_rc_label(stub)
+
+    def _acct(self, num, email):
+        from claude_swap.models import AccountSnapshot
+        from claude_swap.usage_store import UsageEntry
+        return AccountSnapshot(
+            number=str(num), email=email, org_name="", org_uuid="",
+            is_active=False, kind="oauth", switchable=True,
+            usage=UsageEntry(last_good=None, fetched_at=None, age_s=None),
+        )
+
+    def test_label_shows_slot_and_email(self, tmp_path):
+        from claude_swap.pin_proxy import save_pin
+        save_pin(tmp_path, "codeslake@gmail.com", "org-1")
+        label = self._label(
+            tmp_path,
+            [self._acct(1, "codeslake@gmail.com"), self._acct(2, "j.lee8@samsung.com")],
+        )
+        assert label == "#1 codeslake@gmail.com"
+
+    def test_label_none_without_pin(self, tmp_path):
+        assert self._label(tmp_path, [self._acct(1, "a@co.com")]) is None
