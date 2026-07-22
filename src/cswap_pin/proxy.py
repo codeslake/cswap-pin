@@ -15,10 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from collections.abc import Callable
+
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+from claude_swap import oauth
 
 
 def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
@@ -182,6 +186,34 @@ def _write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
         )
     )
     os.chmod(path, 0o600)
+
+
+def resolve_pin_token(
+    credentials: str,
+    refresh: Callable[[str], "oauth.RefreshOutcome"],
+) -> tuple[str | None, str | None]:
+    """Return a live access token for the pinned account, refreshing if needed.
+
+    ``credentials`` is the pinned account's stored credential JSON. If its
+    access token is still valid the token is returned unchanged with no
+    rotation (second element ``None``). If it is near/at expiry, ``refresh`` is
+    invoked; on success the rotated credential JSON is returned as the second
+    element so the caller can persist it, and the new access token as the
+    first. On refresh failure (or no data) the token is ``None`` so the proxy
+    can fall back to leaving the request's original bearer in place.
+    """
+    data = oauth.extract_oauth_data(credentials)
+    if not data:
+        return None, None
+    access = data.get("accessToken")
+    if access and not oauth.is_oauth_token_expired(data.get("expiresAt")):
+        return access, None
+
+    outcome = refresh(credentials)
+    if not outcome.credentials:
+        return None, None
+    new_data = oauth.extract_oauth_data(outcome.credentials) or {}
+    return new_data.get("accessToken"), outcome.credentials
 
 
 def swap_authorization(headers: dict[str, str], pin_token: str) -> dict[str, str]:

@@ -148,3 +148,37 @@ class TestEnsureCA:
                 raw, server_hostname="api.anthropic.com"
             ) as tls:
                 tls.send(b"hi")  # handshake completed if we get here
+
+
+class TestResolvePinToken:
+    """resolve_pin_token returns a LIVE access token for the pinned account,
+    refreshing (via an injected callback) only when the stored one is near
+    expiry. The proxy calls this before swapping the bearer."""
+
+    def _creds(self, token, expires_at, refresh="rt-1"):
+        import json
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": token, "expiresAt": expires_at, "refreshToken": refresh}})
+
+    def test_returns_stored_token_when_fresh(self):
+        from claude_swap.pin_proxy import resolve_pin_token
+        # expiry far in the future -> no refresh, return as-is
+        future = 10_000_000_000_000
+        creds = self._creds("live-token", future)
+        def refresh(_c):
+            raise AssertionError("must not refresh a fresh token")
+        token, new_creds = resolve_pin_token(creds, refresh)
+        assert token == "live-token"
+        assert new_creds is None  # nothing rotated
+
+    def test_refreshes_when_expired(self):
+        from claude_swap.pin_proxy import resolve_pin_token
+        from claude_swap.oauth import RefreshOutcome
+        past = 1  # long expired
+        creds = self._creds("dead-token", past)
+        rotated = self._creds("fresh-token", 10_000_000_000_000, refresh="rt-2")
+        def refresh(_c):
+            return RefreshOutcome(rotated, None)
+        token, new_creds = resolve_pin_token(creds, refresh)
+        assert token == "fresh-token"
+        assert new_creds == rotated  # caller persists this
