@@ -182,3 +182,60 @@ class TestResolvePinToken:
         token, new_creds = resolve_pin_token(creds, refresh)
         assert token == "fresh-token"
         assert new_creds == rotated  # caller persists this
+
+
+class _FakeSwitcher:
+    """Duck-typed stand-in for ClaudeAccountSwitcher's provider-facing API."""
+
+    def __init__(self, active_num="1", backups=None):
+        self.active_num = active_num
+        self.backups = backups or {}
+        self.persisted = []
+
+    def current_account_number(self):
+        return self.active_num
+
+    def read_account_credentials(self, num, email):
+        return self.backups.get(num, "")
+
+    def persist_backup_credentials(self, num, email, credentials):
+        self.persisted.append((num, email, credentials))
+
+
+class TestMakePinTokenProvider:
+    def test_returns_none_when_pin_is_active_account(self):
+        # Disk bearer already IS the pin account: no swap needed, and never
+        # touch the live store the client owns.
+        from claude_swap.pin_proxy import make_pin_token_provider
+        sw = _FakeSwitcher(active_num="2")
+        provider = make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() is None
+
+    def test_returns_backup_token_when_pin_inactive(self):
+        import json
+        from claude_swap.pin_proxy import make_pin_token_provider
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-live", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() == "pin-live"
+        assert sw.persisted == []  # fresh token: nothing rotated
+
+    def test_refreshes_and_persists_when_backup_expired(self, monkeypatch):
+        import json
+        from claude_swap import pin_proxy
+        from claude_swap.oauth import RefreshOutcome
+        old = json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt-1"}})
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "fresh", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt-2"}})
+        monkeypatch.setattr(
+            pin_proxy.oauth, "try_refresh_oauth_credentials",
+            lambda _c: RefreshOutcome(rotated, None))
+        sw = _FakeSwitcher(active_num="1", backups={"2": old})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() == "fresh"
+        # Rotation persisted back to the backup store (refresh tokens rotate).
+        assert sw.persisted == [("2", "pin@example.com", rotated)]

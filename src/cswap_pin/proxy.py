@@ -232,6 +232,31 @@ def swap_authorization(headers: dict[str, str], pin_token: str) -> dict[str, str
     return out
 
 
+def make_pin_token_provider(switcher, account_num: str, email: str):
+    """Build the ``pin_token_provider`` callable for :class:`PinProxy`.
+
+    Reads the pinned account's credential from cswap's backup store and
+    returns a live access token, refreshing (and persisting the rotation back
+    to the store) when expired. Returns ``None`` — meaning "leave the
+    request's bearer alone" — when the pinned account is currently the ACTIVE
+    account (its live credential is already on disk and owned by the client;
+    the backup copy may be stale) or when no usable token can be produced.
+    """
+
+    def provider() -> str | None:
+        if switcher.current_account_number() == account_num:
+            return None
+        creds = switcher.read_account_credentials(account_num, email)
+        if not creds:
+            return None
+        token, rotated = resolve_pin_token(creds, oauth.try_refresh_oauth_credentials)
+        if rotated:
+            switcher.persist_backup_credentials(account_num, email, rotated)
+        return token
+
+    return provider
+
+
 UPSTREAM_HOST = "api.anthropic.com"
 UPSTREAM_PORT = 443
 
