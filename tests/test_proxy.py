@@ -389,3 +389,55 @@ class TestSessionWiring:
         with __import__("pytest").raises(SystemExit):
             self._manager(tmp_path)._exec("/bin/claude", [], env={"A": "1"})
         assert captured["env"] == {"A": "1"}
+
+
+class TestPinCommand:
+    """`cswap pin [NUM|EMAIL] | pin --clear | pin` (status)."""
+
+    def _seed(self, temp_home):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "pin@co.com", "uuid": "u2",
+            "organizationUuid": "org-2", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_pin_sets_and_status_shows(self, temp_home, capsys):
+        from unittest.mock import patch
+        from claude_swap import cli
+        from claude_swap.pin_proxy import load_pin
+        sw = self._seed(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._pin_command(["2"])
+        assert load_pin(sw.backup_dir) == ("pin@co.com", "org-2")
+        assert "pin@co.com" in capsys.readouterr().out
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._pin_command([])
+        assert "pin@co.com" in capsys.readouterr().out
+
+    def test_pin_clear(self, temp_home, capsys):
+        from unittest.mock import patch
+        from claude_swap import cli
+        from claude_swap.pin_proxy import load_pin
+        sw = self._seed(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._pin_command(["2"])
+            cli._pin_command(["--clear"])
+        assert load_pin(sw.backup_dir) is None
+
+    def test_pin_unknown_account_errors(self, temp_home, capsys):
+        import pytest
+        from unittest.mock import patch
+        from claude_swap import cli
+        self._seed(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(["999"])
+        assert exc.value.code == 1
