@@ -554,15 +554,18 @@ class PinProxy:
 
     def _forward(self, method, path, headers, body):
         raw = self._connect_upstream()
-        ctx = ssl.create_default_context(cafile=str(self._bundle.ca_path))
-        # The fake upstream (and the real one) present a cert for
-        # api.anthropic.com; validate against our CA (which signed the fake's
-        # leaf) — for the real upstream this is the system trust path instead.
-        try:
-            up = ctx.wrap_socket(raw, server_hostname=UPSTREAM_HOST)
-        except ssl.SSLError:
-            ctx2 = ssl.create_default_context()
-            up = ctx2.wrap_socket(raw, server_hostname=UPSTREAM_HOST)
+        # One context, three trust sources: system roots (real upstream), our
+        # own CA (test fakes), and NODE_EXTRA_CA_CERTS (a chained MITM proxy
+        # like CCF presents ITS cert for api.anthropic.com, not the real one).
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cafile=str(self._bundle.ca_path))
+        extra = os.environ.get("NODE_EXTRA_CA_CERTS")
+        if extra:
+            try:
+                ctx.load_verify_locations(cafile=extra)
+            except (OSError, ssl.SSLError):
+                pass
+        up = ctx.wrap_socket(raw, server_hostname=UPSTREAM_HOST)
         try:
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False

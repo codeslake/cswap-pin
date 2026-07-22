@@ -168,3 +168,28 @@ class TestPinProxyServer:
         finally:
             proxy.stop()
             upstream.stop()
+
+    def test_upstream_signed_by_foreign_ca_via_node_extra(self, certdir, tmp_path, monkeypatch):
+        # Chained through CCF, the "upstream" presents CCF's cert, not the
+        # real one. The proxy must trust whatever NODE_EXTRA_CA_CERTS names.
+        from claude_swap.pin_proxy import PinProxy
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        ensure_ca(foreign, "api.anthropic.com")
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", str(foreign / "ca.pem"))
+        upstream = _FakeUpstream(foreign)  # leaf signed by the FOREIGN CA
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert status == 200
+        finally:
+            proxy.stop()
+            upstream.stop()
