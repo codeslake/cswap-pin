@@ -232,6 +232,44 @@ def swap_authorization(headers: dict[str, str], pin_token: str) -> dict[str, str
     return out
 
 
+def load_pin(backup_root: Path) -> tuple[str, str] | None:
+    """Read the pinned account identity from settings.json.
+
+    Returns ``(email, organizationUuid)`` or ``None`` when nothing is pinned.
+    Identity is stored by (email, org) — slot numbers move (``cswap move``).
+    """
+    from claude_swap import settings as _settings
+
+    raw = _settings._read_raw(_settings.settings_path(backup_root))
+    section = raw.get("remoteControl")
+    if not isinstance(section, dict):
+        return None
+    email = section.get("pinnedEmail")
+    if not email:
+        return None
+    return email, section.get("pinnedOrganizationUuid", "") or ""
+
+
+def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None:
+    """Persist (or clear, with ``email=None``) the pin in settings.json.
+
+    Lives in its own ``remoteControl`` section; ``save_settings`` preserves
+    unknown sections, so autoswitch writes never clobber it.
+    """
+    from claude_swap import settings as _settings
+
+    path = _settings.settings_path(backup_root)
+    raw = _settings._read_raw(path)
+    if email:
+        raw["remoteControl"] = {
+            "pinnedEmail": email,
+            "pinnedOrganizationUuid": org_uuid or "",
+        }
+    else:
+        raw.pop("remoteControl", None)
+    _settings.atomic_write_json(path, raw)
+
+
 def make_pin_token_provider(switcher, account_num: str, email: str):
     """Build the ``pin_token_provider`` callable for :class:`PinProxy`.
 

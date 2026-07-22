@@ -239,3 +239,31 @@ class TestMakePinTokenProvider:
         assert provider() == "fresh"
         # Rotation persisted back to the backup store (refresh tokens rotate).
         assert sw.persisted == [("2", "pin@example.com", rotated)]
+
+
+class TestPinStore:
+    """The pin lives in settings.json's remoteControl section (identity by
+    (email, organizationUuid) — slot numbers are not stable)."""
+
+    def test_roundtrip(self, tmp_path):
+        from claude_swap.pin_proxy import load_pin, save_pin
+        assert load_pin(tmp_path) is None
+        save_pin(tmp_path, "pin@example.com", "org-uuid-1")
+        assert load_pin(tmp_path) == ("pin@example.com", "org-uuid-1")
+
+    def test_unpin(self, tmp_path):
+        from claude_swap.pin_proxy import load_pin, save_pin
+        save_pin(tmp_path, "pin@example.com", "org-uuid-1")
+        save_pin(tmp_path, None, None)
+        assert load_pin(tmp_path) is None
+
+    def test_coexists_with_autoswitch_settings(self, tmp_path):
+        # save_settings preserves unknown sections; the reverse must hold too.
+        from claude_swap.pin_proxy import load_pin, save_pin
+        from claude_swap.settings import AutoSwitchSettings, save_settings, load_settings
+        save_settings(tmp_path, AutoSwitchSettings(threshold=77.0))
+        save_pin(tmp_path, "pin@example.com", "org-1")
+        assert load_settings(tmp_path).threshold == 77.0
+        assert load_pin(tmp_path) == ("pin@example.com", "org-1")
+        save_settings(tmp_path, AutoSwitchSettings(threshold=88.0))
+        assert load_pin(tmp_path) == ("pin@example.com", "org-1")
