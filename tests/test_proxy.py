@@ -441,3 +441,49 @@ class TestPinCommand:
             with pytest.raises(SystemExit) as exc:
                 cli._pin_command(["999"])
         assert exc.value.code == 1
+
+
+class TestTuiPinMenu:
+    """Dashboard: 'Pin remote control…' menu row → pick an account → pin saved."""
+
+    def test_pin_menu(self, tmp_path):
+        import asyncio
+        import sys
+        sys.path.insert(0, "tests")
+        from test_tui import FakeSwitcher, make_account, make_app, menu_select, settle
+        from claude_swap.pin_proxy import load_pin
+
+        async def scenario():
+            fake = FakeSwitcher(
+                [make_account(1, active=True), make_account(2)], tmp_path
+            )
+            app = make_app(fake)
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                await menu_select(pilot, "pin-menu")
+                await menu_select(pilot, "pin:2")
+            assert load_pin(tmp_path) == ("user2@example.com", "")
+
+        asyncio.run(scenario())
+
+    def test_pin_menu_clear(self, tmp_path):
+        import asyncio
+        import sys
+        sys.path.insert(0, "tests")
+        from test_tui import FakeSwitcher, make_account, make_app, menu_select, settle
+        from claude_swap.pin_proxy import load_pin, save_pin
+
+        save_pin(tmp_path, "user2@example.com", "")
+
+        async def scenario():
+            fake = FakeSwitcher(
+                [make_account(1, active=True), make_account(2)], tmp_path
+            )
+            app = make_app(fake)
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                await menu_select(pilot, "pin-menu")
+                await menu_select(pilot, "pin:clear")
+            assert load_pin(tmp_path) is None
+
+        asyncio.run(scenario())
