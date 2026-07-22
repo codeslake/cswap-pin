@@ -99,12 +99,12 @@ def ensure_ca(ca_dir: Path, host: str) -> CertBundle:
         ca_priv = serialization.load_pem_private_key(ca_key.read_bytes(), password=None)
     else:
         ca_cert, ca_priv = _make_ca()
-        _write_pem(ca_pem, ca_cert.public_bytes(serialization.Encoding.PEM))
+        ca_pem.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
         _write_key(ca_key, ca_priv)
 
     if not (leaf_pem.exists() and leaf_key.exists()):
         leaf_cert, leaf_priv = _make_leaf(host, ca_cert, ca_priv)
-        _write_pem(leaf_pem, leaf_cert.public_bytes(serialization.Encoding.PEM))
+        leaf_pem.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
         _write_key(leaf_key, leaf_priv)
 
     return CertBundle(ca_path=ca_pem, leaf_path=leaf_pem, leaf_key_path=leaf_key)
@@ -177,10 +177,6 @@ def _make_leaf(
     return cert, key
 
 
-def _write_pem(path: Path, data: bytes) -> None:
-    path.write_bytes(data)
-
-
 def _write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
     path.write_bytes(
         key.private_bytes(
@@ -218,18 +214,6 @@ def resolve_pin_token(
         return None, None
     new_data = oauth.extract_oauth_data(outcome.credentials) or {}
     return new_data.get("accessToken"), outcome.credentials
-
-
-def swap_authorization(headers: dict[str, str], pin_token: str) -> dict[str, str]:
-    """Return ``headers`` with the ``Authorization`` bearer replaced by the pin.
-
-    Only the Authorization value changes; every other header is preserved.
-    """
-    out = dict(headers)
-    for name in out:
-        if name.lower() == "authorization":
-            out[name] = f"Bearer {pin_token}"
-    return out
 
 
 def load_pin(backup_root: Path) -> tuple[str, str] | None:
@@ -523,7 +507,7 @@ class PinProxy:
         request_line = _read_line(tls)
         if not request_line:
             return False
-        method, path, _ = _split_request_line(request_line)
+        method, path = _split_request_line(request_line)
         headers: list[tuple[str, str]] = []
         while True:
             h = _read_line(tls)
@@ -659,11 +643,9 @@ def _read_line(sock) -> str | None:
         buf += b
 
 
-def _split_request_line(line: str) -> tuple[str, str, str]:
+def _split_request_line(line: str) -> tuple[str, str]:
     parts = line.split(" ")
-    if len(parts) < 3:
-        return parts[0], parts[1] if len(parts) > 1 else "/", "HTTP/1.1"
-    return parts[0], parts[1], parts[2]
+    return parts[0], parts[1] if len(parts) > 1 else "/"
 
 
 def _read_body(sock, headers) -> bytes:

@@ -16,7 +16,6 @@ from claude_swap.pin_proxy import (
     ensure_ca,
     is_pinned_route,
     parse_upstream_proxy,
-    swap_authorization,
 )
 
 
@@ -44,18 +43,6 @@ class TestIsPinnedRoute:
     def test_frame_deploy_is_pinned(self):
         # Artifact publishes ("frames") are owned by the creating bearer too.
         assert is_pinned_route("/api/frame/deploy/init") is True
-
-
-class TestSwapAuthorization:
-    def test_replaces_bearer_with_pin_token(self):
-        headers = {"authorization": "Bearer disk-account-token", "content-type": "application/json"}
-        out = swap_authorization(headers, "pin-token")
-        assert out["authorization"] == "Bearer pin-token"
-
-    def test_leaves_other_headers_untouched(self):
-        headers = {"authorization": "Bearer disk-account-token", "content-type": "application/json"}
-        out = swap_authorization(headers, "pin-token")
-        assert out["content-type"] == "application/json"
 
 
 class TestParseUpstreamProxy:
