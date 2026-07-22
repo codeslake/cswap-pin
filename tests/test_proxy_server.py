@@ -406,3 +406,44 @@ class TestAbsoluteFormPassthrough:
         finally:
             proxy.stop()
             srv.close()
+
+
+class TestHealthEndpoint:
+    """The pin proxy answers GET /health (absolute-form or origin-form to its
+    own port) so a statusline/cc-update probe can tell it apart from CCF and
+    read the chain it forwards to (mirrors CCF's /health with https_proxy)."""
+
+    def test_health_reports_pin_and_chain(self, certdir):
+        from claude_swap.pin_proxy import PinProxy
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            chain_proxy=("127.0.0.1", 9901),
+        )
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            raw.sendall(
+                b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            raw.settimeout(5)
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            body = resp.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in resp else b""
+            # read a little more for the body
+            try:
+                body += raw.recv(4096)
+            except OSError:
+                pass
+            raw.close()
+            assert b"200" in resp.split(b"\r\n", 1)[0]
+            data = json.loads(body.decode() or "{}")
+            assert data.get("pin_proxy") is True
+            assert data.get("chain") == "127.0.0.1:9901"
+        finally:
+            proxy.stop()

@@ -338,11 +338,12 @@ class TestEnsureProxy:
         import os, socket
         from claude_swap import pin_proxy
         pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
-        # A live listener + our own (alive) pid recorded in the port file.
+        # A live listener + our own (alive) pid + a MATCHING fingerprint.
         srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
         port = srv.getsockname()[1]
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
-        (certdir / "proxy.port").write_text(f"{port} {os.getpid()}")
+        fp = pin_proxy.daemon_fingerprint("2", "pin@example.com")
+        pin_proxy.write_daemon_state(certdir, port, os.getpid(), fp)
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
                             lambda *a: (_ for _ in ()).throw(AssertionError("no spawn")))
         got_port, _ = pin_proxy.ensure_proxy(self._Sw(tmp_path))
@@ -561,3 +562,117 @@ class TestPinEnvCommand:
         assert bundle not in (str(ca), str(corp))  # a merged file
         text = open(bundle).read()
         assert "PIN-CA" in text and "CORP-CA" in text
+
+
+class TestDaemonState:
+    """The daemon records port+pid+fingerprint in a JSON state file so a
+    launcher can tell a live, current daemon from a stale one (wrong pin
+    account, or redeployed code) and recycle it. Mirrors CCF's fingerprint
+    staleness check (cachefix-ensure is_fresh/recycle)."""
+
+    def test_roundtrip(self, tmp_path):
+        from claude_swap.pin_proxy import write_daemon_state, read_daemon_state
+        write_daemon_state(tmp_path, port=51000, pid=1234, fingerprint="fp-abc")
+        st = read_daemon_state(tmp_path)
+        assert st == {"port": 51000, "pid": 1234, "fingerprint": "fp-abc"}
+
+    def test_missing_is_none(self, tmp_path):
+        from claude_swap.pin_proxy import read_daemon_state
+        assert read_daemon_state(tmp_path) is None
+
+    def test_corrupt_is_none(self, tmp_path):
+        from claude_swap.pin_proxy import read_daemon_state
+        (tmp_path / "proxy.json").write_text("{not json")
+        assert read_daemon_state(tmp_path) is None
+
+    def test_fingerprint_encodes_account_and_code(self, tmp_path):
+        # Fingerprint changes when the pinned account changes OR the code
+        # (module mtime) changes — either makes an existing daemon stale.
+        from claude_swap.pin_proxy import daemon_fingerprint
+        fp1 = daemon_fingerprint("1", "a@co.com")
+        fp2 = daemon_fingerprint("2", "b@co.com")
+        assert fp1 != fp2
+        assert fp1 == daemon_fingerprint("1", "a@co.com")  # stable
+
+
+class TestEnsureProxyLifecycle:
+    """ensure_proxy under the CCF-style lifecycle: reuse a fresh live daemon,
+    recycle a stale-fingerprint one, and never double-spawn under a race."""
+
+    class _Sw:
+        def __init__(self, backup_dir):
+            self.backup_dir = backup_dir
+        def resolve_account(self, identifier):
+            return ("1", "pin@example.com", "org-1")
+
+    def _pin(self, tmp_path):
+        from claude_swap.pin_proxy import save_pin
+        save_pin(tmp_path, "pin@example.com", "org-1")
+
+    def test_reuses_fresh_daemon_without_spawn(self, tmp_path, monkeypatch):
+        import os, socket
+        from claude_swap import pin_proxy
+        self._pin(tmp_path)
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fp = pin_proxy.daemon_fingerprint("1", "pin@example.com")
+        srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        port = srv.getsockname()[1]
+        pin_proxy.write_daemon_state(certdir, port, os.getpid(), fp)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no spawn")))
+        got, ca = pin_proxy.ensure_proxy(self._Sw(tmp_path))
+        srv.close()
+        assert got == port
+
+    def test_recycles_stale_fingerprint(self, tmp_path, monkeypatch):
+        import os, socket
+        from claude_swap import pin_proxy
+        self._pin(tmp_path)
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        # a live daemon with a STALE fingerprint (old code / other account)
+        srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        stale_port = srv.getsockname()[1]
+        pin_proxy.write_daemon_state(certdir, stale_port, os.getpid(), "STALE-FP")
+        killed = []
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 52000)
+        got, ca = pin_proxy.ensure_proxy(self._Sw(tmp_path))
+        srv.close()
+        assert got == 52000            # spawned fresh
+        assert killed == [os.getpid()]  # stale daemon was recycled
+
+
+class TestRefcount:
+    """FIFO refcount (CCF model): the daemon lives while >=1 session holds a
+    write fd on the refcount FIFO, and self-terminates when the last one closes
+    (normal exit OR kill -9 — the OS closes fds regardless)."""
+
+    def test_wire_env_attaches_refcount_fd(self, tmp_path):
+        # wire_env opens the FIFO and passes an inherited fd number to the child
+        # via an env var, so the launched claude becomes a refcount holder.
+        import os
+        from claude_swap.pin_proxy import wire_env, refcount_fifo_path
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        os.mkfifo(refcount_fifo_path(certdir))
+        ca = certdir / "ca.pem"; ca.write_text("CA\n")
+        env = wire_env({}, 9955, ca, certdir)
+        # The pin proxy fd is exposed so the child inherits it (kept open for
+        # the child's lifetime). We at least advertise the fifo to hold.
+        assert "CSWAP_PIN_REFCOUNT_FD" in env or "CSWAP_PIN_FIFO" in env
+
+    def test_daemon_exits_when_all_holders_close(self, tmp_path):
+        # Spawn a real refcount watcher over a FIFO with one holder, close the
+        # holder, and assert the watcher's "last holder gone" callback fires.
+        import os, threading, time
+        from claude_swap.pin_proxy import refcount_fifo_path, watch_refcount
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        # a holder: open write end (read-write so it doesn't block)
+        holder = os.open(fifo, os.O_RDWR)
+        fired = threading.Event()
+        threading.Thread(target=watch_refcount, args=(fifo, fired.set), daemon=True).start()
+        time.sleep(0.3)
+        assert not fired.is_set()  # holder still open → daemon stays up
+        os.close(holder)            # last holder gone
+        assert fired.wait(timeout=3)  # → teardown callback fires

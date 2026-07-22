@@ -311,37 +311,185 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         return None
     certdir = switcher.backup_dir / "pin-proxy"
     certdir.mkdir(parents=True, exist_ok=True)
-    port = _read_alive_port(certdir)
-    if port is None:
+    fp = daemon_fingerprint(account_num, email)
+
+    # Fast path (no lock): a fresh, current daemon is reused as-is.
+    port = _read_alive_port(certdir, fingerprint=fp)
+    if port is not None:
+        return port, certdir / "ca.pem"
+
+    # Slow path: take an exclusive lock so concurrent launches elect ONE
+    # spawner (CCF's mkdir election). Re-check under the lock — another launch
+    # may have spawned while we waited.
+    with _spawn_lock(certdir):
+        port = _read_alive_port(certdir, fingerprint=fp)
+        if port is not None:
+            return port, certdir / "ca.pem"
+        # A daemon exists but is stale (wrong account, or redeployed code) —
+        # recycle it before spawning, so a redeploy/repin takes effect instead
+        # of a stale daemon serving forever.
+        stale = read_daemon_state(certdir)
+        if stale and _pid_alive(int(stale["pid"])):
+            _kill_daemon(int(stale["pid"]))
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
             return None
     return port, certdir / "ca.pem"
 
 
-def _read_alive_port(certdir: Path) -> int | None:
-    """Port of a live recorded daemon, else None. File format: ``port pid``."""
+def _spawn_lock(certdir: Path):
+    """Exclusive file lock serializing daemon spawns (one elected spawner)."""
+    import fcntl
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _locked():
+        lockf = open(Path(certdir) / ".spawn.lock", "w")
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            finally:
+                lockf.close()
+
+    return _locked()
+
+
+def _kill_daemon(pid: int) -> None:
+    """TERM a daemon and give it a moment to release its port."""
+    import time
+
     try:
-        port_s, pid_s = (certdir / "proxy.port").read_text().split()
-        port, pid = int(port_s), int(pid_s)
-        os.kill(pid, 0)  # raises if the pid is gone
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
-            return port
+        os.kill(pid, 15)
+    except OSError:
+        return
+    for _ in range(20):  # up to ~2s for the port to free
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+
+
+_STATE_FILE = "proxy.json"
+_FIFO_NAME = "refcount.fifo"
+
+
+def refcount_fifo_path(certdir: Path) -> Path:
+    """Path of the refcount FIFO. Sessions hold a write fd on it; the daemon
+    reads it and exits when the last holder closes (CCF's FIFO refcount)."""
+    return Path(certdir) / _FIFO_NAME
+
+
+def watch_refcount(fifo: str | Path, on_last_holder_gone) -> None:
+    """Block on ``fifo`` until every write-holder closes, then call
+    ``on_last_holder_gone``. This is exactly CCF's supervisor `cat FIFO`:
+    a READ-ONLY open blocks until the first writer appears, and the subsequent
+    read returns EOF (b"") only once all writer fds have closed. A read-only
+    reader must NOT also hold a write end (that would mask EOF), which is why
+    sessions open O_RDWR while the daemon opens read-only here.
+    """
+    fd = os.open(str(fifo), os.O_RDONLY)  # blocks until the first holder attaches
+    try:
+        while True:
+            data = os.read(fd, 65536)  # blocks; returns b"" at EOF (no writers)
+            if data == b"":
+                on_last_holder_gone()
+                return
+            # A holder wrote an attach ping; drain and keep waiting.
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def write_daemon_state(certdir: Path, port: int, pid: int, fingerprint: str) -> None:
+    """Record the live daemon's identity atomically (temp-then-rename)."""
+    import json
+
+    tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps({"port": port, "pid": pid, "fingerprint": fingerprint}))
+    os.replace(tmp, Path(certdir) / _STATE_FILE)
+
+
+def read_daemon_state(certdir: Path) -> dict | None:
+    """The recorded daemon state (``{port, pid, fingerprint}``), or None if the
+    file is absent or corrupt."""
+    import json
+
+    try:
+        data = json.loads((Path(certdir) / _STATE_FILE).read_text())
     except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "port" not in data or "pid" not in data:
+        return None
+    return data
+
+
+def daemon_fingerprint(account_num: str, email: str) -> str:
+    """Identity of the daemon config: pinned account + the proxy code's own
+    mtime. A change in either (repin, or a redeploy of pin_proxy.py) makes a
+    running daemon stale so the launcher recycles it — mirrors CCF's
+    fingerprint staleness (cachefix-ensure)."""
+    import hashlib
+
+    try:
+        code_mtime = os.stat(__file__).st_mtime_ns
+    except OSError:
+        code_mtime = 0
+    raw = f"{account_num}\0{email}\0{code_mtime}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | None:
+    """Port of a live recorded daemon whose pid is alive, its port answers, and
+    (when ``fingerprint`` is given) its fingerprint matches. Else None."""
+    st = read_daemon_state(certdir)
+    if not st:
+        return None
+    if fingerprint is not None and st.get("fingerprint") != fingerprint:
+        return None
+    if not _pid_alive(int(st["pid"])):
+        return None
+    try:
+        with socket.create_connection(("127.0.0.1", int(st["port"])), timeout=1):
+            return int(st["port"])
+    except OSError:
         return None
 
 
 def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
-    """Start the proxy daemon detached; wait for its port file. None on failure."""
+    """Start the proxy daemon detached; wait for its state file. None on failure.
+
+    Creates the refcount FIFO up front so a session can attach a holder the
+    instant the daemon comes up (no gap where the daemon sees zero holders and
+    tears itself down).
+    """
     import subprocess
     import sys
     import time
 
-    port_file = certdir / "proxy.port"
-    try:
-        port_file.unlink()
-    except FileNotFoundError:
-        pass
+    certdir = Path(certdir)
+    for f in (certdir / _STATE_FILE, certdir / "proxy.port"):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+    fifo = refcount_fifo_path(certdir)
+    if not fifo.exists():
+        try:
+            os.mkfifo(fifo)
+        except FileExistsError:
+            pass
     subprocess.Popen(
         [sys.executable, "-m", "claude_swap.pin_proxy", account_num, email, str(certdir)],
         stdout=subprocess.DEVNULL,
@@ -360,10 +508,13 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     """Entry point for the detached proxy process (``-m claude_swap.pin_proxy``).
 
     Chains to whatever HTTPS_PROXY was in cswap's environment (CCF, corp, or
-    none) and serves until killed. Writes ``proxy.port`` once listening.
+    none). Records ``proxy.json`` (port/pid/fingerprint) once listening, serves
+    a ``/health`` probe, and self-terminates when the last refcount holder
+    closes the FIFO (idle teardown).
     """
     from claude_swap.switcher import ClaudeAccountSwitcher
 
+    certdir = Path(certdir)
     switcher = ClaudeAccountSwitcher()
     proxy = PinProxy(
         certdir=certdir,
@@ -373,8 +524,33 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         ),
     )
     proxy.start()
-    (certdir / "proxy.port").write_text(f"{proxy.port} {os.getpid()}")
-    threading.Event().wait()  # serve forever; lifecycle is kill-based
+    write_daemon_state(
+        certdir, proxy.port, os.getpid(), daemon_fingerprint(account_num, email)
+    )
+
+    fifo = refcount_fifo_path(certdir)
+    if not fifo.exists():
+        try:
+            os.mkfifo(fifo)
+        except FileExistsError:
+            pass
+
+    done = threading.Event()
+
+    def _teardown():
+        # Last session closed its holder — stop serving and clean up.
+        proxy.stop()
+        for f in (certdir / _STATE_FILE,):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        done.set()
+
+    threading.Thread(
+        target=watch_refcount, args=(fifo, _teardown), daemon=True
+    ).start()
+    done.wait()  # lives until the last refcount holder closes (or a signal)
 
 
 def wire_env(
@@ -403,6 +579,20 @@ def wire_env(
             out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
     else:
         out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
+
+    # Attach this launch as a refcount holder: open a write fd on the FIFO and
+    # mark it inheritable so the exec'd claude keeps it open for its lifetime.
+    # The daemon's reader sees EOF only when every such fd closes → idle
+    # teardown. O_RDWR so the open never blocks even if the daemon died.
+    fifo = refcount_fifo_path(certdir)
+    if fifo.exists():
+        try:
+            fd = os.open(str(fifo), os.O_RDWR)
+            os.set_inheritable(fd, True)
+            out["CSWAP_PIN_REFCOUNT_FD"] = str(fd)
+            out["CSWAP_PIN_FIFO"] = str(fifo)
+        except OSError:
+            pass
     return out
 
 
@@ -499,6 +689,12 @@ class PinProxy:
                     return
                 self._mitm(conn)
                 return
+            if len(parts) >= 2 and parts[1].startswith("/health"):
+                # Local health probe (origin-form GET /health to our own port).
+                # Lets a statusline/cc-update probe tell the pin proxy apart
+                # from CCF and read the chain it forwards to.
+                self._serve_health(conn)
+                return
             if len(parts) >= 2 and "://" in parts[1]:
                 # Absolute-form request (plain-proxy mode, no CONNECT). The
                 # native auto-updater and telemetry use axios this way; dropping
@@ -508,6 +704,25 @@ class PinProxy:
                 return
             conn.close()
         except Exception:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _serve_health(self, conn: socket.socket) -> None:
+        import json
+
+        chain = f"{self._chain[0]}:{self._chain[1]}" if self._chain else None
+        body = json.dumps({"pin_proxy": True, "port": self.port, "chain": chain})
+        try:
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("latin1")
+                + body.encode("latin1")
+            )
+        except OSError:
+            pass
+        finally:
             try:
                 conn.close()
             except OSError:
