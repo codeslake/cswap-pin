@@ -518,6 +518,8 @@ class TestPinEnvCommand:
     def test_pin_emits_proxy_exports(self, temp_home, capsys, monkeypatch):
         from claude_swap import cli, pin_proxy
         sw = self._seed(temp_home)
+        # No ambient CA → wire_env emits our CA directly (not a merged bundle).
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
         ca = sw.backup_dir / "pin-proxy" / "ca.pem"
         ca.parent.mkdir(parents=True, exist_ok=True)
         ca.write_text("CA\n")
@@ -527,3 +529,23 @@ class TestPinEnvCommand:
         assert "export HTTPS_PROXY=http://127.0.0.1:9955" in out
         assert "export https_proxy=http://127.0.0.1:9955" in out
         assert f"export NODE_EXTRA_CA_CERTS={ca}" in out
+
+    def test_pin_merges_ambient_ca(self, temp_home, capsys, monkeypatch):
+        # With an ambient CA (CCF/corp bundle), wire_env merges — the emitted
+        # NODE_EXTRA_CA_CERTS is a combined bundle, never a bare replacement.
+        from claude_swap import cli, pin_proxy
+        sw = self._seed(temp_home)
+        corp = temp_home / "corp-ca.pem"
+        corp.write_text("CORP-CA\n")
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", str(corp))
+        ca = sw.backup_dir / "pin-proxy" / "ca.pem"
+        ca.parent.mkdir(parents=True, exist_ok=True)
+        ca.write_text("PIN-CA\n")
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda s: (9955, ca))
+        cli._pin_env_command([])
+        out = capsys.readouterr().out
+        bundle = [l.split("=", 1)[1] for l in out.splitlines()
+                  if l.startswith("export NODE_EXTRA_CA_CERTS=")][0]
+        assert bundle not in (str(ca), str(corp))  # a merged file
+        text = open(bundle).read()
+        assert "PIN-CA" in text and "CORP-CA" in text
