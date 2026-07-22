@@ -7,6 +7,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 
 from __future__ import annotations
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.x509.oid import ExtendedKeyUsageOID
@@ -17,6 +18,18 @@ from claude_swap.pin_proxy import (
     parse_upstream_proxy,
     swap_authorization,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stdlib_ssl():
+    """cli.main() tests inject truststore into global ssl (OS-native verify),
+    which rejects our ad-hoc test CA. Undo it for real-handshake tests here."""
+    try:
+        import truststore
+        truststore.extract_from_ssl()
+    except ImportError:
+        pass
+    yield
 
 
 class TestIsPinnedRoute:

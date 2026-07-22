@@ -19,6 +19,18 @@ import pytest
 from claude_swap.pin_proxy import ensure_ca
 
 
+@pytest.fixture(autouse=True)
+def _stdlib_ssl():
+    """cli.main() tests inject truststore into global ssl (OS-native verify),
+    which rejects our ad-hoc test CA. Undo it for real-handshake tests here."""
+    try:
+        import truststore
+        truststore.extract_from_ssl()
+    except ImportError:
+        pass
+    yield
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
