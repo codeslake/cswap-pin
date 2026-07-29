@@ -1171,7 +1171,12 @@ class PinProxy:
     def _serve_health(self, conn: socket.socket) -> None:
         import json
 
-        chain = f"{self._chain[0]}:{self._chain[1]}" if self._chain else None
+        # Report the chain the relay would actually use, not the one this
+        # daemon was constructed with — those diverge the moment the egress
+        # proxy moves, and a health probe that says "no chain" while every
+        # request goes through one sends the next diagnosis the wrong way.
+        current = self._current_chain()
+        chain = f"{current[0]}:{current[1]}" if current else None
         body = json.dumps({"pin_proxy": True, "port": self.port, "chain": chain})
         try:
             conn.sendall(

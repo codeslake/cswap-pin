@@ -523,6 +523,29 @@ class TestChainRediscovery:
             chain.stop()
             upstream.stop()
 
+    def test_health_reports_the_chain_the_relay_would_use(self, certdir):
+        """A probe that says "no chain" while every request goes through one
+        sends the next diagnosis the wrong way. Measured after a cc-update
+        recycle: /health said chain=null with CCF live and recorded on disk."""
+        from claude_swap.pin_proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, None)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        try:
+            write_upstream_hint(certdir, "http://127.0.0.1:9901")
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+            conn.request("GET", "/health")
+            body = json.loads(conn.getresponse().read())
+            conn.close()
+            assert body["chain"] == "127.0.0.1:9901"
+        finally:
+            proxy.stop()
+
     def test_ignores_a_hint_pointing_at_our_own_port(self, tmp_path):
         """A shell that eval'd pin-env exports the pin proxy as HTTPS_PROXY.
         Recording that would make the daemon CONNECT to itself."""
