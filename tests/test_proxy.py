@@ -33,6 +33,59 @@ def _stdlib_ssl():
     yield
 
 
+class TestRepinIsLive:
+    """Switching accounts in cswap never asks you to restart a session, and
+    re-pinning should not either: a live session holds only the proxy's
+    address, so the daemon must be able to serve a different account
+    underneath it as soon as `cswap pin` writes one."""
+
+    class _Sw:
+        def __init__(self, backup_dir):
+            self.backup_dir = backup_dir
+            self.active = "9"
+            self.creds = {
+                ("1", "one@example.com"): '{"claudeAiOauth":{"accessToken":"TOK-1","expiresAt":99999999999999}}',
+                ("2", "two@example.com"): '{"claudeAiOauth":{"accessToken":"TOK-2","expiresAt":99999999999999}}',
+            }
+
+        def current_account_number(self):
+            return self.active
+
+        def resolve_account(self, identifier):
+            for (num, mail) in self.creds:
+                if identifier in (num, mail):
+                    return num, mail, "org"
+            raise KeyError(identifier)
+
+        def read_account_credentials(self, num, email):
+            return self.creds.get((num, email), "")
+
+    def test_provider_follows_a_repin_without_a_respawn(self, tmp_path):
+        from claude_swap.pin_proxy import make_pin_token_provider, save_pin
+
+        sw = self._Sw(tmp_path)
+        save_pin(tmp_path, "one@example.com", "org")
+        provider = make_pin_token_provider(sw, "1", "one@example.com")
+        assert provider() == "TOK-1"
+
+        # `cswap pin 2` — same daemon, same provider object.
+        save_pin(tmp_path, "two@example.com", "org")
+        assert provider() == "TOK-2", "the daemon stayed on the old account"
+
+        # Clearing the pin means "leave every bearer alone".
+        save_pin(tmp_path, None, None)
+        assert provider() is None
+
+    def test_fingerprint_ignores_the_account(self, tmp_path):
+        """Including the account would recycle the daemon on every re-pin,
+        and a recycle is exactly what a live session must not need."""
+        from claude_swap.pin_proxy import daemon_fingerprint
+
+        assert daemon_fingerprint("1", "one@example.com") == daemon_fingerprint(
+            "2", "two@example.com"
+        )
+
+
 class TestPinCodeResolvesItsNames:
     """The pin touches TUI code whose tests are async and skipped in this
     repo, so an undefined name there ships as a runtime crash rather than a
@@ -777,14 +830,16 @@ class TestDaemonState:
         (tmp_path / "proxy.json").write_text("{not json")
         assert read_daemon_state(tmp_path) is None
 
-    def test_fingerprint_encodes_account_and_code(self, tmp_path):
-        # Fingerprint changes when the pinned account changes OR the code
-        # (module mtime) changes — either makes an existing daemon stale.
+    def test_fingerprint_encodes_the_code_only(self, tmp_path):
+        # Identifies the CODE, so a redeploy makes a running daemon stale. The
+        # pinned account is NOT in it: that is re-read per request, and baking
+        # it in would recycle the daemon on every `cswap pin` — a restart a
+        # live session should never need (cswap's own account switch doesn't).
         from claude_swap.pin_proxy import daemon_fingerprint
-        fp1 = daemon_fingerprint("1", "a@co.com")
-        fp2 = daemon_fingerprint("2", "b@co.com")
-        assert fp1 != fp2
-        assert fp1 == daemon_fingerprint("1", "a@co.com")  # stable
+        assert daemon_fingerprint("1", "a@co.com") == daemon_fingerprint(
+            "2", "b@co.com"
+        )
+        assert daemon_fingerprint() == daemon_fingerprint("1", "a@co.com")
 
 
 class TestEnsureProxyLifecycle:
@@ -1142,11 +1197,19 @@ class TestPinTokenRefreshIsSerialized:
         state = {"creds": expired, "refreshes": 0}
         lock = threading.Lock()
 
+        # The provider resolves the pin per request, so the store must name
+        # one — otherwise it correctly reads as "pin cleared".
+        from claude_swap.pin_proxy import save_pin
+        save_pin(tmp_path, "a@b.c", "org")
+
         class FakeSwitcher:
             backup_dir = tmp_path
 
             def current_account_number(self):
                 return "2"  # pinned account is NOT active
+
+            def resolve_account(self, identifier):
+                return "1", "a@b.c", "org"
 
             def read_account_credentials(self, num, email):
                 return state["creds"]

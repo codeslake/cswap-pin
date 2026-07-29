@@ -604,6 +604,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     account (its live credential is already on disk and owned by the client;
     the backup copy may be stale) or when no usable token can be produced.
 
+    **Which account is pinned is re-read from disk per request**, not frozen
+    at spawn. Switching accounts in cswap never asks you to restart a session,
+    and re-pinning should not either: a live session holds only the proxy's
+    address, so the daemon can start serving a different account underneath it
+    the moment ``cswap pin`` writes one. ``account_num``/``email`` are the
+    fallback for when the pin cannot be resolved (a removed account).
+
     **Refresh is serialized.** The provider runs once per pinned request and
     each MITM connection is its own thread, so an expiry under load would
     otherwise have N threads POST the SAME one-time refresh token
@@ -624,10 +631,33 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return access
         return None
 
-    def provider() -> str | None:
-        if switcher.current_account_number() == account_num:
+    def _current_target() -> tuple[str, str] | None:
+        """The account to pin RIGHT NOW, re-read so `cswap pin <other>` takes
+        effect without restarting anything. Falls back to the one this daemon
+        was spawned for when the pin is unreadable, and returns None when the
+        pin was cleared outright (leave every bearer alone)."""
+        from claude_swap.exceptions import AccountNotFoundError, ConfigError
+
+        try:
+            pin = load_pin(switcher.backup_dir)
+        except Exception:
+            return account_num, email
+        if pin is None:
             return None
-        creds = switcher.read_account_credentials(account_num, email)
+        try:
+            num, mail, _ = switcher.resolve_account(pin[0])
+            return num, mail
+        except (AccountNotFoundError, ConfigError, Exception):
+            return account_num, email
+
+    def provider() -> str | None:
+        target = _current_target()
+        if target is None:
+            return None
+        num, mail = target
+        if switcher.current_account_number() == num:
+            return None
+        creds = switcher.read_account_credentials(num, mail)
         if not creds:
             return None
         token = _live_token(creds)
@@ -636,7 +666,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
 
         with refresh_lock:
             # Someone may have rotated it while we waited — re-read and reuse.
-            creds = switcher.read_account_credentials(account_num, email) or creds
+            creds = switcher.read_account_credentials(num, mail) or creds
             token = _live_token(creds)
             if token:
                 return token
@@ -644,7 +674,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 creds, oauth.try_refresh_oauth_credentials
             )
             if rotated:
-                switcher.persist_backup_credentials(account_num, email, rotated)
+                switcher.persist_backup_credentials(num, mail, rotated)
             return token
 
     return provider
@@ -899,19 +929,24 @@ def read_daemon_state(certdir: Path) -> dict | None:
     return data
 
 
-def daemon_fingerprint(account_num: str, email: str) -> str:
-    """Identity of the daemon config: pinned account + the proxy code's own
-    mtime. A change in either (repin, or a redeploy of pin_proxy.py) makes a
-    running daemon stale so the launcher recycles it — mirrors CCF's
-    fingerprint staleness (cachefix-ensure)."""
+def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
+    """Identity of the daemon's CODE, so a redeploy of pin_proxy.py makes a
+    running daemon stale and the launcher recycles it — mirrors CCF's
+    fingerprint staleness (cachefix-ensure).
+
+    The pinned account is deliberately NOT part of this. It is re-read per
+    request (see :func:`make_pin_token_provider`), so re-pinning takes effect
+    under a live daemon; including it here would recycle the daemon on every
+    `cswap pin`, and a recycle is exactly what a live session should not need.
+    The parameters are kept for call-site compatibility and ignored.
+    """
     import hashlib
 
     try:
         code_mtime = os.stat(__file__).st_mtime_ns
     except OSError:
         code_mtime = 0
-    raw = f"{account_num}\0{email}\0{code_mtime}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return hashlib.sha256(str(code_mtime).encode()).hexdigest()[:16]
 
 
 def _pid_alive(pid: int) -> bool:
