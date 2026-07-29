@@ -563,3 +563,118 @@ class TestKeepAlive:
         assert up.paths == sent, f"upstream saw {up.paths}"
         # pinned routes swapped, inference untouched — even when pipelined
         assert up.auths == ["Bearer PINTOKEN", "Bearer PINTOKEN", "Bearer DISK"]
+
+
+class _WebSocketUpstream:
+    """A TLS upstream that only accepts a proper WebSocket handshake.
+
+    Mirrors the real /worker/events/stream contract: without `Connection:
+    Upgrade` + `Upgrade: websocket` it answers 403, which is exactly what the
+    RC transport reported ("Transport closed: server rejected connection
+    (code 403)") when the proxy stripped those hop-by-hop headers.
+    """
+
+    def __init__(self, certdir: Path):
+        self.saw_upgrade = False
+        self.echo = b""
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._stop = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            head = buf.split(b"\r\n\r\n")[0].decode("latin1").lower()
+            if "upgrade: websocket" in head and "connection:" in head:
+                self.saw_upgrade = True
+                tls.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                )
+                # after the upgrade the connection is a raw byte tunnel
+                data = tls.recv(4096)
+                self.echo = data
+                tls.sendall(b"PONG")
+            else:
+                tls.sendall(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+                )
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+        self._srv.close()
+
+
+class TestWebSocketUpgrade:
+    """RC's transport is a WebSocket. Stripping Connection/Upgrade as
+    hop-by-hop made the server answer 403 — the whole reason /remote-control
+    never connected through the pin proxy."""
+
+    def test_upgrade_headers_reach_upstream_and_tunnel_opens(self, certdir):
+        from claude_swap.pin_proxy import PinProxy
+
+        up = _WebSocketUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PINTOKEN",
+            upstream=("127.0.0.1", up.port),
+        )
+        proxy.start()
+        try:
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(
+                b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                b"Host: api.anthropic.com:443\r\n\r\n"
+            )
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                resp += raw.recv(4096)
+            assert b"200" in resp.split(b"\r\n")[0]
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            tls.sendall(
+                b"GET /v1/code/sessions/cse_x/worker/events/stream HTTP/1.1\r\n"
+                b"Host: api.anthropic.com\r\n"
+                b"Authorization: Bearer DISK\r\n"
+                b"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                b"Sec-WebSocket-Version: 13\r\n"
+                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = tls.recv(4096)
+                assert chunk, "proxy closed during the upgrade"
+                head += chunk
+            status = head.split(b"\r\n")[0]
+            assert b"101" in status, f"expected 101, got {status!r}"
+            # the tunnel must carry raw frames both ways after the upgrade
+            tls.sendall(b"PING")
+            assert tls.recv(4096) == b"PONG"
+            tls.close()
+        finally:
+            proxy.stop()
+            up.stop()
+
+        assert up.saw_upgrade, "upstream never saw the Upgrade headers"

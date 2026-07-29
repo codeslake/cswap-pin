@@ -923,11 +923,22 @@ class PinProxy:
         """
         up = self._upstream_conn()
         try:
+            # A WebSocket handshake must keep Connection/Upgrade even though
+            # they are hop-by-hop: strip them and the server sees a plain GET
+            # and answers 403 — which is exactly how RC failed through this
+            # proxy. Detect the upgrade and relay those headers verbatim.
+            upgrading = any(
+                k.lower() == "upgrade" and v.strip() for k, v in headers
+            )
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
             for k, v in headers:
                 kl = k.lower()
-                if kl in _HOP_BY_HOP or kl.startswith("proxy-"):
+                if kl.startswith("proxy-"):
+                    continue
+                if kl in _HOP_BY_HOP and not (
+                    upgrading and kl in ("connection", "upgrade")
+                ):
                     continue
                 if kl == "host":
                     v = UPSTREAM_HOST
@@ -936,6 +947,15 @@ class PinProxy:
             if not sent_host:
                 out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
             up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
+            if upgrading:
+                # 101 turns the connection into an opaque byte stream (RC's
+                # WebSocket): relay the handshake response, then pump both
+                # directions until either side closes. Nothing further on this
+                # connection is HTTP, so the request loop must end.
+                if _relay_upgrade(up, client):
+                    _pump(up, client)
+                self._drop_upstream()
+                return False
             return _relay_response(up, client)
         except (OSError, ssl.SSLError):
             self._drop_upstream()
@@ -1078,6 +1098,26 @@ def _read_body(sock, headers) -> bytes:
             break
         body += chunk
     return bytes(body)
+
+
+def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
+    """Relay an upgrade handshake response verbatim; True when it was a 101.
+
+    Headers pass through untouched (Connection/Upgrade included — the client
+    needs them to accept the switch), and any bytes already read past the
+    header terminator are forwarded so no frame is lost.
+    """
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        try:
+            chunk = up.recv(65536)
+        except (ConnectionResetError, ssl.SSLError, OSError):
+            chunk = b""
+        if not chunk:
+            return False
+        buf += chunk
+    client.sendall(bytes(buf))
+    return buf.split(b"\r\n", 1)[0].split(b" ")[1:2] == [b"101"]
 
 
 def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
