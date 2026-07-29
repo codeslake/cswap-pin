@@ -447,3 +447,119 @@ class TestHealthEndpoint:
             assert data.get("chain") == "127.0.0.1:9901"
         finally:
             proxy.stop()
+
+
+class _KeepAliveUpstream:
+    """A TLS upstream that serves MULTIPLE requests per connection (HTTP/1.1
+    keep-alive, like the real api.anthropic.com) and records each one.
+
+    The RC worker holds one connection open and pipelines heartbeat/poll
+    requests over it; a proxy that closes after the first request forces an
+    endless reconnect loop ("Transport closed: server rejected connection").
+    """
+
+    def __init__(self, certdir: Path):
+        self.paths: list[str] = []
+        self.auths: list[str] = []
+        self.conns = 0
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._stop = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            self.conns += 1
+            buf = b""
+            while not self._stop:
+                while b"\r\n\r\n" not in buf:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        return
+                    buf += chunk
+                head, _, buf = buf.partition(b"\r\n\r\n")
+                text = head.decode("latin1")
+                lines = text.split("\r\n")
+                self.paths.append(lines[0].split(" ")[1])
+                for line in lines[1:]:
+                    if line.lower().startswith("authorization:"):
+                        self.auths.append(line.split(":", 1)[1].strip())
+                want = 0
+                for line in lines[1:]:
+                    if line.lower().startswith("content-length:"):
+                        want = int(line.split(":")[1])
+                while len(buf) < want:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        return
+                    buf += chunk
+                buf = buf[want:]
+                # keep-alive reply: no Connection: close
+                tls.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    b"Content-Type: application/json\r\n\r\n{}"
+                )
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+        self._srv.close()
+
+
+class TestKeepAlive:
+    """The RC worker pipelines many requests over ONE connection. Closing
+    after the first is what made /remote-control fail with 'Transport closed:
+    server rejected connection' while every individual route swapped fine."""
+
+    def test_multiple_requests_over_one_connection(self, certdir):
+        from claude_swap.pin_proxy import PinProxy
+
+        up = _KeepAliveUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PINTOKEN",
+            upstream=("127.0.0.1", up.port),
+        )
+        proxy.start()
+        try:
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            conn = http.client.HTTPSConnection(
+                "api.anthropic.com", context=ctx, timeout=10
+            )
+            conn.set_tunnel("api.anthropic.com", 443)
+            conn._create_connection = lambda *a, **k: socket.create_connection(
+                ("127.0.0.1", proxy.port), timeout=10
+            )
+            sent = [
+                "/v1/code/sessions/cse_x/worker",
+                "/v1/code/sessions/cse_x/worker",
+                "/v1/messages",
+            ]
+            for p in sent:
+                conn.request("GET", p, headers={"Authorization": "Bearer DISK"})
+                r = conn.getresponse()
+                r.read()
+                assert r.status == 200, f"{p} failed on a reused connection"
+            conn.close()
+        finally:
+            proxy.stop()
+            up.stop()
+
+        assert up.paths == sent, f"upstream saw {up.paths}"
+        # pinned routes swapped, inference untouched — even when pipelined
+        assert up.auths == ["Bearer PINTOKEN", "Bearer PINTOKEN", "Bearer DISK"]

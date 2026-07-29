@@ -720,6 +720,9 @@ class PinProxy:
             str(self._bundle.leaf_path), str(self._bundle.leaf_key_path)
         )
         self._srv: socket.socket | None = None
+        # Per-connection upstream socket. Each MITM connection is served on
+        # its own thread, so a thread-local keeps one upstream per client.
+        self._local = threading.local()
         self._stop = False
         self.port = 0
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
@@ -863,6 +866,7 @@ class PinProxy:
                 if not self._handle_one_request(tls):
                     break
         finally:
+            self._drop_upstream()
             try:
                 tls.close()
             except OSError:
@@ -897,13 +901,27 @@ class PinProxy:
             self._debug.write(f"{method} {path} pinned={pinned} swapped={swapped}\n")
             self._debug.flush()
 
-        self._forward(method, path, headers, body, tls)
-        # Simplify: one request per MITM connection (Connection: close).
-        return False
+        keep = self._forward(method, path, headers, body, tls)
+        # A client that asked to close gets closed regardless of the upstream.
+        for k, v in headers:
+            if k.lower() == "connection" and "close" in v.lower():
+                keep = False
+        return keep
 
-    def _forward(self, method, path, headers, body, client: ssl.SSLSocket):
-        raw = self._connect_upstream()
-        up = self._upstream_ctx().wrap_socket(raw, server_hostname=UPSTREAM_HOST)
+    def _forward(self, method, path, headers, body, client: ssl.SSLSocket) -> bool:
+        """Relay one request upstream and stream the response back.
+
+        Returns whether the MITM connection may carry another request. The RC
+        worker pipelines heartbeat/poll/stream requests over ONE connection,
+        so closing after the first turned every /remote-control into a
+        reconnect loop ("Transport closed: server rejected connection") even
+        though each individual route swapped correctly.
+
+        The upstream socket is kept open across requests (one upstream
+        connection per MITM connection) — reconnecting per request would make
+        an SSE stream impossible to hold.
+        """
+        up = self._upstream_conn()
         try:
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
@@ -917,11 +935,30 @@ class PinProxy:
                 out.append(f"{k}: {v}".encode("latin1"))
             if not sent_host:
                 out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
-            out.append(b"Connection: close")
             up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
-            _relay_response(up, client)
-        finally:
-            up.close()
+            return _relay_response(up, client)
+        except (OSError, ssl.SSLError):
+            self._drop_upstream()
+            return False
+
+    def _upstream_conn(self) -> ssl.SSLSocket:
+        """The live upstream TLS socket for this MITM connection, dialing on
+        first use. Reused across requests so keep-alive and SSE work."""
+        up = getattr(self._local, "up", None)
+        if up is None:
+            raw = self._connect_upstream()
+            up = self._upstream_ctx().wrap_socket(raw, server_hostname=UPSTREAM_HOST)
+            self._local.up = up
+        return up
+
+    def _drop_upstream(self) -> None:
+        up = getattr(self._local, "up", None)
+        if up is not None:
+            try:
+                up.close()
+            except OSError:
+                pass
+            self._local.up = None
 
     def _upstream_ctx(self) -> ssl.SSLContext:
         """TLS context for the hop to the real api.anthropic.com.
@@ -1043,14 +1080,20 @@ def _read_body(sock, headers) -> bytes:
     return bytes(body)
 
 
-def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> None:
-    """Stream the upstream response to the client as bytes arrive.
+def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
+    """Stream one upstream response to the client; return whether the
+    connection may be reused for another request.
 
-    Reads only up to the header terminator, forwards the status line + headers
-    (minus hop-by-hop), then pipes the remaining body verbatim without waiting
-    for EOF — so an SSE stream reaches the client event-by-event instead of
-    being buffered whole. A ``Content-Length``-then-close peer can surface as
-    a reset rather than a clean EOF; that's treated as the end of the body.
+    Response framing decides where this response ends, which is what makes
+    keep-alive possible at all:
+
+    - ``Content-Length``: exactly that many body bytes.
+    - ``Transfer-Encoding: chunked``: until the terminating zero-length chunk.
+    - neither (SSE / ``text/event-stream``, or a close-delimited body): pipe
+      until EOF, then the connection is spent.
+
+    Bytes are forwarded as they arrive, so an SSE stream reaches the client
+    event-by-event instead of being buffered whole.
     """
     buf = bytearray()
     while b"\r\n\r\n" not in buf:
@@ -1062,15 +1105,49 @@ def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> None:
             break
         buf += chunk
     head, sep, rest = bytes(buf).partition(b"\r\n\r\n")
+    if not sep:
+        return False
     lines = head.split(b"\r\n")
     status_line = lines[0] if lines and lines[0] else b"HTTP/1.1 502 Bad Gateway"
     out = [status_line]
+    length: int | None = None
+    chunked = False
+    keep = not status_line.startswith(b"HTTP/1.0")
     for line in lines[1:]:
-        if b":" in line and line.split(b":", 1)[0].strip().lower() in _HOP_BY_HOP:
+        if b":" not in line:
+            continue
+        k, v = line.split(b":", 1)
+        kl = k.strip().lower()
+        vl = v.strip().lower()
+        if kl == b"content-length":
+            try:
+                length = int(v.strip())
+            except ValueError:
+                length = None
+        elif kl == b"transfer-encoding" and b"chunked" in vl:
+            chunked = True
+        elif kl == b"connection" and b"close" in vl:
+            keep = False
+        if kl in _HOP_BY_HOP:
             continue
         out.append(line)
-    client.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (rest if sep else b""))
+    client.sendall(b"\r\n".join(out) + b"\r\n\r\n" + rest)
 
+    if chunked:
+        return _pipe_chunked(up, client, bytearray(rest)) and keep
+    if length is not None:
+        remaining = length - len(rest)
+        while remaining > 0:
+            try:
+                chunk = up.recv(min(65536, remaining))
+            except (ConnectionResetError, ssl.SSLError, OSError):
+                return False
+            if not chunk:
+                return False
+            client.sendall(chunk)
+            remaining -= len(chunk)
+        return keep
+    # No framing: body runs to EOF (SSE and close-delimited replies).
     while True:
         try:
             chunk = up.recv(65536)
@@ -1079,6 +1156,44 @@ def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> None:
         if not chunk:
             break
         client.sendall(chunk)
+    return False
+
+
+def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> bool:
+    """Forward a chunked body verbatim until the terminating 0-length chunk.
+
+    Parses only enough to find the end of the body (so the next response on
+    this connection starts at the right offset); every byte is relayed as-is.
+    """
+    while True:
+        while b"\r\n" not in buf:
+            try:
+                chunk = up.recv(65536)
+            except (ConnectionResetError, ssl.SSLError, OSError):
+                return False
+            if not chunk:
+                return False
+            client.sendall(chunk)
+            buf += chunk
+        line, _, tail = bytes(buf).partition(b"\r\n")
+        try:
+            size = int(line.split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            return False
+        need = size + 2  # chunk data + trailing CRLF
+        buf = bytearray(tail)
+        while len(buf) < need:
+            try:
+                chunk = up.recv(65536)
+            except (ConnectionResetError, ssl.SSLError, OSError):
+                return False
+            if not chunk:
+                return False
+            client.sendall(chunk)
+            buf += chunk
+        buf = bytearray(buf[need:])
+        if size == 0:
+            return True
 
 
 def _pump(a: socket.socket, b: socket.socket) -> None:
