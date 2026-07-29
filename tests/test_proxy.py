@@ -848,3 +848,55 @@ class TestWorkerJwtRoutesAreNotSwapped:
             "/api/frame/frames?limit=20",
         ):
             assert is_pinned_route(path), f"{path} must be pinned"
+
+
+class TestDaemonPortStability:
+    """A live session's HTTPS_PROXY is fixed at exec time. If a recycled
+    daemon comes back on a NEW port, every already-running session keeps
+    pointing at a dead one — and its requests then bypass the pin silently
+    (measured: an RC session created that way landed on the ACTIVE account
+    while the pin looked healthy). The daemon must therefore reclaim the port
+    recorded in proxy.json whenever it is free.
+    """
+
+    def test_daemon_reclaims_the_recorded_port(self, tmp_path):
+        import socket
+        from claude_swap.pin_proxy import PinProxy, ensure_ca, write_daemon_state
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        # a previous daemon recorded this port, then died
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        recorded = s.getsockname()[1]
+        s.close()
+        write_daemon_state(tmp_path, recorded, 999999, "fp")
+
+        proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
+        proxy.start()
+        try:
+            assert proxy.port == recorded, (
+                f"daemon came back on {proxy.port}, orphaning sessions "
+                f"pinned to {recorded}"
+            )
+        finally:
+            proxy.stop()
+
+    def test_falls_back_to_a_free_port_when_recorded_one_is_taken(self, tmp_path):
+        import socket
+        from claude_swap.pin_proxy import PinProxy, ensure_ca, write_daemon_state
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        squatter = socket.socket()
+        squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen(1)
+        taken = squatter.getsockname()[1]
+        write_daemon_state(tmp_path, taken, 999999, "fp")
+
+        proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
+        proxy.start()
+        try:
+            assert proxy.port != 0 and proxy.port != taken
+        finally:
+            proxy.stop()
+            squatter.close()

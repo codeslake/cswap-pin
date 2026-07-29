@@ -754,7 +754,21 @@ class PinProxy:
     def start(self) -> None:
         self._srv = socket.socket()
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._srv.bind((self._host, 0))
+        # Reclaim the port a previous daemon recorded, when it is free. A
+        # running session's HTTPS_PROXY is fixed at exec time, so coming back
+        # on a fresh port strands every live session on a dead one — and its
+        # requests then leave WITHOUT the pin instead of failing loudly
+        # (measured: an RC session created that way was owned by the active
+        # account while the pin still looked healthy).
+        prev = read_daemon_state(self._certdir)
+        want = prev.get("port") if isinstance(prev, dict) else None
+        for candidate in ([want] if isinstance(want, int) and want > 0 else []) + [0]:
+            try:
+                self._srv.bind((self._host, candidate))
+                break
+            except OSError:
+                continue  # taken by something else — fall through to an
+                          # ephemeral port
         self._srv.listen(64)
         self.port = self._srv.getsockname()[1]
         threading.Thread(target=self._accept_loop, daemon=True).start()
