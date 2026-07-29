@@ -69,23 +69,78 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     return parse_upstream_proxy(value) if value else None
 
 
-def write_upstream_hint(certdir: Path, value: str | None) -> None:
+def write_upstream_hint(
+    certdir: Path, value: str | None, ca: str | None = None
+) -> None:
     """Record the egress proxy for the daemon to chain through (see above).
 
     Written on every launch, including when there is no proxy — "none" is
-    itself the news when CCF has gone away.
+    itself the news when the upstream proxy has gone away. ``ca`` records the
+    CA that proxy signs with, so a later launch that cannot see it (a plain
+    shell, where a launcher's CA only exists at exec time) can still merge it.
     """
     path = Path(certdir) / _UPSTREAM_FILE
     tmp = path.with_suffix(".tmp")
+    keep = read_upstream_ca(certdir) if ca is None else ca
     try:
-        tmp.write_text(json.dumps({"proxy": value or ""}))
+        tmp.write_text(json.dumps({"proxy": value or "", "ca": keep or ""}))
         tmp.replace(path)
     except OSError:
         pass
 
 
+def read_upstream_ca(certdir: Path) -> str | None:
+    """The CA of the egress proxy, as last recorded. See above."""
+    try:
+        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    value = raw.get("ca") if isinstance(raw, dict) else None
+    return value or None
+
+
 _WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
 _WIRE_MARK = "_cswapPinWiredKeys"
+
+
+def _merged_ca(ca_path: Path, existing: str | None) -> Path:
+    """Our CA plus whatever the session already trusted, in one file.
+
+    ``NODE_EXTRA_CA_CERTS`` names a single file, so writing ours over an
+    existing value silently drops that trust. When another CA is in play — the
+    upstream cache proxy's, a corporate MITM's — hosts IT re-signs stop
+    verifying, which is how a pinned session ends up unable to reach the
+    updater. Merge instead; fall back to ours alone if the merge cannot be
+    written.
+    """
+    ca_path = Path(ca_path)
+    other = (
+        existing
+        or os.environ.get("NODE_EXTRA_CA_CERTS")
+        # A launcher's CA exists only in the environment it execs Claude Code
+        # with, which `cswap pin` never sees. Fall back to what a launch
+        # recorded (see write_upstream_hint).
+        or read_upstream_ca(ca_path.parent)
+    )
+    bundle = ca_path.parent / "ca-bundle.pem"
+    if not other or Path(other) == ca_path or Path(other) == bundle:
+        return ca_path
+    other_path = Path(other)
+    # Rebuild only when an input is newer than the output — the inputs are
+    # immutable per launch, so the steady state is two stats instead of
+    # rewriting the bundle on every launch (same trade CCF's ensure makes).
+    try:
+        if (
+            not bundle.exists()
+            or ca_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
+            or other_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
+        ):
+            bundle.write_bytes(
+                ca_path.read_bytes() + b"\n" + other_path.read_bytes()
+            )
+    except OSError:
+        return ca_path
+    return bundle
 
 
 def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
@@ -143,7 +198,14 @@ def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
         wanted = {
             "HTTPS_PROXY": proxy,
             "https_proxy": proxy,
-            "NODE_EXTRA_CA_CERTS": str(ca_path),
+            # Node takes exactly ONE file here, so replacing an existing CA
+            # blinds the session to every host the proxy behind us re-signs.
+            # Measured: with only our CA, `downloads.claude.ai` (MITM'd by the
+            # upstream cache proxy) failed to verify and the session showed
+            # "Auto-update failed · Run claude doctor".
+            "NODE_EXTRA_CA_CERTS": str(
+                _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
+            ),
         }
         # Remember what we are about to displace, so unwiring is lossless.
         raw[f"{_WIRE_MARK}Saved"] = {
@@ -545,7 +607,9 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     # This is what makes the daemon follow the environment instead of the
     # environment that happened to exist when it spawned: a wrapper that sets
     # CCF, a CCF that moved ports, or a CCF that went away entirely.
-    write_upstream_hint(certdir, _ambient_proxy())
+    write_upstream_hint(
+        certdir, _ambient_proxy(), os.environ.get("NODE_EXTRA_CA_CERTS")
+    )
     fp = daemon_fingerprint(account_num, email)
 
     ca = certdir / "ca.pem"

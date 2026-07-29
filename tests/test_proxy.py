@@ -370,6 +370,38 @@ class TestWireGlobalConfig:
         assert "env" not in raw
         assert "_cswapPinWiredKeys" not in raw
 
+    def test_merges_an_existing_ca_instead_of_replacing_it(
+        self, tmp_path, monkeypatch
+    ):
+        """NODE_EXTRA_CA_CERTS names ONE file, so overwriting it blinds the
+        session to every host the upstream proxy re-signs. Measured: with only
+        our CA, downloads.claude.ai failed to verify and the session showed
+        'Auto-update failed · Run claude doctor'."""
+        from pathlib import Path
+        from claude_swap.pin_proxy import wire_global_config
+
+        certdir = Path(tmp_path) / "pin-proxy"
+        certdir.mkdir()
+        ours = certdir / "ca.pem"
+        ours.write_bytes(b"-----BEGIN CERTIFICATE-----\nOURS\n")
+        theirs = Path(tmp_path) / "upstream-ca.pem"
+        theirs.write_bytes(b"-----BEGIN CERTIFICATE-----\nTHEIRS\n")
+
+        path = self._config(
+            tmp_path, monkeypatch,
+            {"env": {"NODE_EXTRA_CA_CERTS": str(theirs)}},
+        )
+        wire_global_config(9955, ours)
+
+        bundle = Path(json.loads(path.read_text())["env"]["NODE_EXTRA_CA_CERTS"])
+        body = bundle.read_bytes()
+        assert b"OURS" in body and b"THEIRS" in body, "the upstream CA was dropped"
+
+        # and clearing restores the user's own value untouched
+        wire_global_config(None, None)
+        env = json.loads(path.read_text())["env"]
+        assert env["NODE_EXTRA_CA_CERTS"] == str(theirs)
+
     def test_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
         from claude_swap.pin_proxy import wire_global_config
