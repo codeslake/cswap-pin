@@ -299,11 +299,13 @@ class _LoopbackConnectProxy:
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
+        self.connects = 0
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
         try:
             conn, _ = self._srv.accept()
+            self.connects += 1
             buf = b""
             while b"\r\n\r\n" not in buf:
                 buf += conn.recv(1)
@@ -354,6 +356,61 @@ class TestLoopbackChainTrust:
             proxy.stop()
             chain.stop()
             upstream.stop()
+
+
+class TestChainRediscovery:
+    """The daemon outlives the launch that spawned it, and CCF picks its port
+    from a family (9901 + walk range) and can restart. A chain bound once at
+    spawn therefore goes stale — and a stale chain does not degrade, it
+    BYPASSES the egress proxy, which behind a corporate proxy is a hard
+    failure. The daemon re-reads the hint every connection instead."""
+
+    def test_follows_a_chain_that_appears_after_the_daemon_started(
+        self, certdir, tmp_path
+    ):
+        from claude_swap.pin_proxy import PinProxy, write_upstream_hint
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        ensure_ca(foreign, "api.anthropic.com")
+        upstream = _FakeUpstream(foreign)
+        chain = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+
+        # Daemon starts with NO chain recorded — a direct dial to the fake
+        # upstream would fail TLS verification (foreign CA), so a request
+        # succeeding proves it went through the loopback chain instead.
+        write_upstream_hint(certdir, None)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+            rediscover_chain=True,
+        )
+        proxy.start()
+        try:
+            # A launch happens later and records the chain (what ensure_proxy
+            # does on every launch).
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert status == 200
+            assert chain.connects, "the daemon never used the newly-recorded chain"
+        finally:
+            proxy.stop()
+            chain.stop()
+            upstream.stop()
+
+    def test_ignores_a_hint_pointing_at_our_own_port(self, tmp_path):
+        """A shell that eval'd pin-env exports the pin proxy as HTTPS_PROXY.
+        Recording that would make the daemon CONNECT to itself."""
+        from claude_swap.pin_proxy import _ambient_proxy
+
+        env = {"HTTPS_PROXY": "http://127.0.0.1:45678", "CSWAP_PIN_PORT": "45678"}
+        assert _ambient_proxy(env) is None
+        # A DIFFERENT loopback proxy (CCF) is a legitimate chain.
+        env = {"HTTPS_PROXY": "http://127.0.0.1:9901", "CSWAP_PIN_PORT": "45678"}
+        assert _ambient_proxy(env) == "http://127.0.0.1:9901"
 
 
 class TestAbsoluteFormPassthrough:

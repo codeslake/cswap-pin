@@ -48,6 +48,156 @@ def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
     return host, split.port or 80
 
 
+def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
+    """The egress proxy the LAST launch was using, as recorded on disk.
+
+    The daemon outlives the launch that spawned it, and a session's own
+    ``HTTPS_PROXY`` is fixed at exec — so the daemon cannot ask "what should I
+    chain through now?" of anything but this file. Every launch re-stamps it
+    (``ensure_proxy``), so a CCF that moved ports or came up after the daemon
+    is picked up on the next connection rather than bypassed for the daemon's
+    whole life.
+
+    Returns ``None`` when the file is absent or records "no proxy" — the same
+    thing a direct dial means.
+    """
+    try:
+        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    value = raw.get("proxy") if isinstance(raw, dict) else None
+    return parse_upstream_proxy(value) if value else None
+
+
+def write_upstream_hint(certdir: Path, value: str | None) -> None:
+    """Record the egress proxy for the daemon to chain through (see above).
+
+    Written on every launch, including when there is no proxy — "none" is
+    itself the news when CCF has gone away.
+    """
+    path = Path(certdir) / _UPSTREAM_FILE
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps({"proxy": value or ""}))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+_WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
+_WIRE_MARK = "_cswapPinWiredKeys"
+
+
+def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
+    """Route hand-launched ``claude`` sessions through the pin proxy.
+
+    Claude Code applies the ``env`` block of its global config into
+    ``process.env`` at startup, so a session the user starts themselves — no
+    cswap, no wrapper, no shell edit — picks the pin up. That block lives in
+    ``.claude.json``, the same file cswap already rewrites to swap accounts,
+    so this touches nothing new: not ``settings.json`` (Claude Code's own),
+    not a shell rc, not a shim on PATH.
+
+    Only keys THIS function wrote are ever modified, tracked by name in
+    ``_WIRE_MARK``. A proxy the user (or their launcher) set themselves is
+    left exactly as found, and clearing the pin restores it rather than
+    deleting it — the ordering matters, because the env block is applied on
+    top of the process environment and would otherwise silently displace a
+    wrapper's own proxy.
+
+    Passing ``port=None`` unwires. Returns True when the file changed.
+
+    Not retroactive: a session already running keeps the environment it was
+    exec'd with (only a ``settings.json`` change re-applies env to a live
+    process, and that file is not ours to write). New sessions are wired.
+    """
+    from claude_swap.paths import get_global_config_path
+
+    path = get_global_config_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+
+    env = raw.get("env")
+    env = dict(env) if isinstance(env, dict) else {}
+    before = dict(env)
+    ours = raw.get(_WIRE_MARK)
+    ours = list(ours) if isinstance(ours, list) else []
+
+    # Drop what we wrote last time, restoring anything we displaced.
+    saved = raw.get(f"{_WIRE_MARK}Saved")
+    saved = dict(saved) if isinstance(saved, dict) else {}
+    for key in ours:
+        env.pop(key, None)
+    for key, value in saved.items():
+        env[key] = value
+
+    if port is None or ca_path is None:
+        raw.pop(_WIRE_MARK, None)
+        raw.pop(f"{_WIRE_MARK}Saved", None)
+    else:
+        proxy = f"http://127.0.0.1:{port}"
+        wanted = {
+            "HTTPS_PROXY": proxy,
+            "https_proxy": proxy,
+            "NODE_EXTRA_CA_CERTS": str(ca_path),
+        }
+        # Remember what we are about to displace, so unwiring is lossless.
+        raw[f"{_WIRE_MARK}Saved"] = {
+            k: env[k] for k in wanted if k in env
+        }
+        env.update(wanted)
+        raw[_WIRE_MARK] = list(wanted)
+
+    if env == before and _WIRE_MARK not in raw and not ours:
+        return False
+    if env:
+        raw["env"] = env
+    else:
+        raw.pop("env", None)
+    try:
+        tmp = path.with_suffix(".cswap-tmp")
+        tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        return False
+    return True
+
+
+def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
+    """The egress proxy this launch inherited, or ``None`` for a direct dial.
+
+    Skips a value that already points at OUR daemon: a shell that ran
+    ``pin-env`` (or a re-launch inside a pinned session) exports the pin proxy
+    itself, and recording that would make the daemon CONNECT to itself — every
+    request looping until the socket dies.
+    """
+    src = os.environ if env is None else env
+    value = src.get("HTTPS_PROXY") or src.get("https_proxy")
+    parsed = parse_upstream_proxy(value)
+    if parsed is None:
+        return None
+    host, port = parsed
+    if host in _LOOPBACK and port == _self_port(src):
+        return None
+    return value
+
+
+def _self_port(env: dict[str, str]) -> int | None:
+    """Our own daemon's port as this environment records it, if any."""
+    try:
+        return int(env.get("CSWAP_PIN_PORT", ""))
+    except ValueError:
+        return None
+
+
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+_UPSTREAM_FILE = "upstream.json"
+
 _WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
 
 
@@ -365,12 +515,20 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         return None
     certdir = switcher.backup_dir / "pin-proxy"
     certdir.mkdir(parents=True, exist_ok=True)
+    # Re-stamp the egress proxy on EVERY launch, before any reuse decision.
+    # This is what makes the daemon follow the environment instead of the
+    # environment that happened to exist when it spawned: a wrapper that sets
+    # CCF, a CCF that moved ports, or a CCF that went away entirely.
+    write_upstream_hint(certdir, _ambient_proxy())
     fp = daemon_fingerprint(account_num, email)
+
+    ca = certdir / "ca.pem"
 
     # Fast path (no lock): a fresh, current daemon is reused as-is.
     port = _read_alive_port(certdir, fingerprint=fp)
     if port is not None:
-        return port, certdir / "ca.pem"
+        wire_global_config(port, ca)
+        return port, ca
 
     # Slow path: take an exclusive lock so concurrent launches elect ONE
     # spawner (CCF's mkdir election). Re-check under the lock — another launch
@@ -378,7 +536,8 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     with _spawn_lock(certdir):
         port = _read_alive_port(certdir, fingerprint=fp)
         if port is not None:
-            return port, certdir / "ca.pem"
+            wire_global_config(port, ca)
+            return port, ca
         # A daemon exists but is stale (wrong account, or redeployed code) —
         # recycle it before spawning, so a redeploy/repin takes effect instead
         # of a stale daemon serving forever.
@@ -388,7 +547,12 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
             return None
-    return port, certdir / "ca.pem"
+    # Re-point hand-launched sessions at the port that is actually serving.
+    # Done on every launch, not just on pin: an idle teardown followed by a
+    # respawn would otherwise leave .claude.json naming a dead port, and a
+    # session wired to a dead port leaves WITHOUT the pin instead of failing.
+    wire_global_config(port, ca)
+    return port, ca
 
 
 def _spawn_lock(certdir: Path):
@@ -634,10 +798,12 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     """Entry point for the detached proxy process (``-m claude_swap.pin_proxy``).
 
-    Chains to whatever HTTPS_PROXY was in cswap's environment (CCF, corp, or
-    none). Records ``proxy.json`` (port/pid/fingerprint) once listening, serves
-    a ``/health`` probe, and self-terminates when the last refcount holder
-    closes the FIFO (idle teardown).
+    Chains through whatever egress proxy the most recent launch recorded in
+    ``upstream.json`` (CCF, corp, or none), re-read per connection so a CCF
+    that restarts on another port is followed rather than bypassed. Records
+    ``proxy.json`` (port/pid/fingerprint) once listening, serves a ``/health``
+    probe, and self-terminates when the last refcount holder closes the FIFO
+    (idle teardown).
     """
     from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -646,9 +812,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     proxy = PinProxy(
         certdir=certdir,
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
-        chain_proxy=parse_upstream_proxy(
-            os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        ),
+        rediscover_chain=True,
     )
     proxy.start()
     write_daemon_state(
@@ -708,6 +872,9 @@ def wire_env(
     proxy = f"http://127.0.0.1:{port}"
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
+    # Marks this env as already pinned, so a nested launch records the proxy
+    # we chain THROUGH as upstream rather than us (see _ambient_proxy).
+    out["CSWAP_PIN_PORT"] = str(port)
     existing = env.get("NODE_EXTRA_CA_CERTS")
     if existing and Path(existing) != ca_path:
         bundle = Path(certdir) / "ca-bundle.pem"
@@ -759,14 +926,18 @@ class PinProxy:
         upstream: tuple[str, int] | None = None,
         chain_proxy: tuple[str, int] | None = None,
         host: str = "127.0.0.1",
+        rediscover_chain: bool = False,
     ):
         self._certdir = Path(certdir)
         self._pin_token_provider = pin_token_provider
         # Where the MITM'd anthropic request is really sent. Defaults to the
         # real upstream; tests point it at a fake server.
         self._upstream = upstream or (UPSTREAM_HOST, UPSTREAM_PORT)
-        # A proxy to CONNECT through for egress (CCF 9901, corp proxy).
+        # A proxy to CONNECT through for egress (CCF 9901, corp proxy). Fixed
+        # when rediscover_chain is False (tests); otherwise re-read from the
+        # on-disk hint per connection, so the daemon follows a CCF that moved.
         self._chain = chain_proxy
+        self._rediscover_chain = rediscover_chain
         self._host = host
         self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
         self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1070,7 +1241,8 @@ class PinProxy:
         system roots (real cert) + our own CA (test fakes) + any corp CA on
         NODE_EXTRA_CA_CERTS.
         """
-        if self._chain and self._chain[0] in ("127.0.0.1", "::1", "localhost"):
+        chain = self._current_chain()
+        if chain and chain[0] in _LOOPBACK:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -1088,8 +1260,21 @@ class PinProxy:
                 pass
         return ctx
 
+    def _current_chain(self) -> tuple[str, int] | None:
+        """The egress proxy to CONNECT through, re-read per connection.
+
+        Not a snapshot: CCF picks its port from a family (9901 + a walk range)
+        and can be restarted, or come up only after this daemon did. Binding
+        the chain once at spawn would leave the daemon bypassing CCF — with a
+        corporate proxy behind it, that is a hard egress failure, not a
+        performance note. ``rediscover_chain=False`` keeps tests explicit.
+        """
+        if not self._rediscover_chain:
+            return self._chain
+        return read_upstream_hint(self._certdir)
+
     def _connect_upstream(self) -> socket.socket:
-        chain = self._chain
+        chain = self._current_chain()
         if chain:
             raw = socket.create_connection(chain, timeout=15)
             raw.sendall(
@@ -1110,9 +1295,10 @@ class PinProxy:
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
+        chain = self._current_chain()
         try:
-            if self._chain:
-                up = socket.create_connection(self._chain, timeout=15)
+            if chain:
+                up = socket.create_connection(chain, timeout=15)
                 up.sendall(
                     f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("latin1")
                 )

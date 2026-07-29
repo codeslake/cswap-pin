@@ -310,6 +310,76 @@ class TestWireEnv:
         assert "PIN-CA" in text and "CCF-CA" in text
 
 
+class TestWireGlobalConfig:
+    """Wiring hand-launched sessions through .claude.json — the file cswap
+    already rewrites to swap accounts. Claude Code applies its `env` block
+    into process.env at startup, so `claude` typed by hand picks the pin up
+    with no settings.json edit, no wrapper, and no shim on PATH."""
+
+    def _config(self, tmp_path, monkeypatch, initial: dict) -> "Path":
+        from pathlib import Path
+        path = Path(tmp_path) / ".claude.json"
+        path.write_text(json.dumps(initial), encoding="utf-8")
+        monkeypatch.setattr(
+            "claude_swap.paths.get_global_config_path", lambda: path
+        )
+        return path
+
+    def test_writes_proxy_env(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        from claude_swap.pin_proxy import wire_global_config
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
+
+        assert wire_global_config(9955, Path("/tmp/ca.pem")) is True
+        env = json.loads(path.read_text())["env"]
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:9955"
+        assert env["NODE_EXTRA_CA_CERTS"] == "/tmp/ca.pem"
+        # unrelated config must survive
+        assert json.loads(path.read_text())["projects"] == {}
+
+    def test_unwire_restores_a_displaced_value(self, tmp_path, monkeypatch):
+        """A launcher's own proxy is displaced while pinned and put BACK on
+        clear — the env block lands on top of process.env, so silently
+        dropping the user's value would leave them worse than before."""
+        from pathlib import Path
+        from claude_swap.pin_proxy import wire_global_config
+        path = self._config(
+            tmp_path, monkeypatch,
+            {"env": {"HTTPS_PROXY": "http://127.0.0.1:9901", "FOO": "bar"}},
+        )
+
+        wire_global_config(9955, Path("/tmp/ca.pem"))
+        assert json.loads(path.read_text())["env"]["HTTPS_PROXY"].endswith(":9955")
+
+        wire_global_config(None, None)
+        env = json.loads(path.read_text())["env"]
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:9901"  # restored
+        assert env["FOO"] == "bar"                            # never touched
+        assert "NODE_EXTRA_CA_CERTS" not in env               # ours, removed
+
+    def test_unwire_leaves_no_env_block_when_it_was_ours_alone(
+        self, tmp_path, monkeypatch
+    ):
+        from pathlib import Path
+        from claude_swap.pin_proxy import wire_global_config
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
+
+        wire_global_config(9955, Path("/tmp/ca.pem"))
+        wire_global_config(None, None)
+        raw = json.loads(path.read_text())
+        assert "env" not in raw
+        assert "_cswapPinWiredKeys" not in raw
+
+    def test_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        from claude_swap.pin_proxy import wire_global_config
+        monkeypatch.setattr(
+            "claude_swap.paths.get_global_config_path",
+            lambda: Path(tmp_path) / "absent.json",
+        )
+        assert wire_global_config(9955, Path("/tmp/ca.pem")) is False
+
+
 class TestEnsureProxy:
     """ensure_proxy: no pin → None; live daemon → reuse; else spawn."""
 
