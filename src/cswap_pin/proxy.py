@@ -10,6 +10,7 @@ relayed untouched, and non-anthropic hosts are blind-tunnelled.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import re
 import selectors

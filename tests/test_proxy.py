@@ -7,6 +7,8 @@ inference (/v1/messages) and everything else must pass through untouched.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import padding
