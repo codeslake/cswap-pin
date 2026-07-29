@@ -5,6 +5,12 @@ account's token on the Remote-Control and Artifact routes, so those operations
 stay on one account while inference follows whatever cswap has swapped onto
 disk. Everything else (inference at ``/v1/messages``, OAuth, telemetry, …) is
 relayed untouched, and non-anthropic hosts are blind-tunnelled.
+
+The daemon lifecycle here — fixed port across respawns, FIFO refcount, config
+fingerprint, idle teardown — follows the one in claude-code-cache-fix ("CCF"
+in the comments below), whose forward-proxy mode solves the same shape of
+problem in front of Claude Code. Nothing in this module requires it: a
+comment naming CCF is citing where a decision came from, not a dependency.
 """
 
 from __future__ import annotations
@@ -34,10 +40,10 @@ from claude_swap import oauth
 def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
     """Parse the proxy that was on ``HTTPS_PROXY`` before we displaced it.
 
-    Returns ``(host, port)`` to CONNECT through (CCF's ``127.0.0.1:9901``, a
-    corporate proxy, …), or ``None`` when there was none — in which case the
-    proxy dials the upstream directly. A bare ``host:port`` (no scheme) is
-    accepted; a scheme-only URL defaults to port 80.
+    Returns ``(host, port)`` to CONNECT through (a corporate proxy, another
+    local MITM, …), or ``None`` when there was none — in which case the proxy
+    dials the upstream directly. A bare ``host:port`` (no scheme) is accepted;
+    a scheme-only URL defaults to port 80.
     """
     if not value:
         return None
@@ -54,7 +60,7 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     The daemon outlives the launch that spawned it, and a session's own
     ``HTTPS_PROXY`` is fixed at exec — so the daemon cannot ask "what should I
     chain through now?" of anything but this file. Every launch re-stamps it
-    (``ensure_proxy``), so a CCF that moved ports or came up after the daemon
+    (``ensure_proxy``), so an egress proxy that moved ports or came up after the daemon
     is picked up on the next connection rather than bypassed for the daemon's
     whole life.
 
@@ -82,7 +88,7 @@ def write_upstream_hint(
     the same as "there is no proxy": `cswap pin` normally runs in an ordinary
     shell, while the launcher sets HTTPS_PROXY only in the environment it execs
     Claude Code with. Recording that as "none" would drop a live upstream —
-    measured: a re-pin from a plain shell blanked a recorded CCF and the daemon
+    measured: a re-pin from a plain shell blanked a recorded proxy and the daemon
     started bypassing it. So a previously recorded proxy is kept unless a
     launch positively reports a different one.
     """
@@ -668,7 +674,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     # Re-stamp the egress proxy on EVERY launch, before any reuse decision.
     # This is what makes the daemon follow the environment instead of the
     # environment that happened to exist when it spawned: a wrapper that sets
-    # CCF, a CCF that moved ports, or a CCF that went away entirely.
+    # a proxy, one that moved ports, or one that went away entirely.
     write_upstream_hint(
         certdir, _ambient_proxy(), os.environ.get("NODE_EXTRA_CA_CERTS")
     )
@@ -987,7 +993,8 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     """Entry point for the detached proxy process (``-m claude_swap.pin_proxy``).
 
     Chains through whatever egress proxy the most recent launch recorded in
-    ``upstream.json`` (CCF, corp, or none), re-read per connection so a CCF
+    ``upstream.json`` (corporate, another local MITM, or none), re-read per
+    connection so a proxy
     that restarts on another port is followed rather than bypassed. Records
     ``proxy.json`` (port/pid/fingerprint) once listening, serves a ``/health``
     probe, and self-terminates when the last refcount holder closes the FIFO
@@ -1046,7 +1053,8 @@ def wire_env(
 
     Sets ``HTTPS_PROXY``/``https_proxy`` to the proxy and makes Node trust our
     MITM CA. Node's ``NODE_EXTRA_CA_CERTS`` takes exactly one file, so when the
-    session already trusts another CA (CCF, corp) the two PEMs are merged into
+    session already trusts another CA (a corporate MITM, another local proxy)
+    the two PEMs are merged into
     ``certdir/ca-bundle.pem`` — never replaced.
 
     ``open_refcount`` controls the refcount holder. In-process callers
@@ -1121,9 +1129,10 @@ class PinProxy:
         # Where the MITM'd anthropic request is really sent. Defaults to the
         # real upstream; tests point it at a fake server.
         self._upstream = upstream or (UPSTREAM_HOST, UPSTREAM_PORT)
-        # A proxy to CONNECT through for egress (CCF 9901, corp proxy). Fixed
-        # when rediscover_chain is False (tests); otherwise re-read from the
-        # on-disk hint per connection, so the daemon follows a CCF that moved.
+        # A proxy to CONNECT through for egress (a corporate proxy, another
+        # local MITM). Fixed when rediscover_chain is False (tests); otherwise
+        # re-read from the on-disk hint per connection, so the daemon follows
+        # an egress proxy that moved or came up after it did.
         self._chain = chain_proxy
         self._rediscover_chain = rediscover_chain
         self._host = host
@@ -1213,7 +1222,7 @@ class PinProxy:
             if len(parts) >= 2 and parts[1].startswith("/health"):
                 # Local health probe (origin-form GET /health to our own port).
                 # Lets a statusline/cc-update probe tell the pin proxy apart
-                # from CCF and read the chain it forwards to.
+                # from another local proxy and read the chain it forwards to.
                 self._serve_health(conn)
                 return
             if len(parts) >= 2 and "://" in parts[1]:
@@ -1436,11 +1445,11 @@ class PinProxy:
     def _upstream_ctx(self) -> ssl.SSLContext:
         """TLS context for the hop to the real api.anthropic.com.
 
-        When we chain through a LOOPBACK proxy (CCF, or any local MITM), that
+        When we chain through a LOOPBACK proxy (any local MITM), that
         hop re-signs api.anthropic.com with its own CA whose path we can't know
         portably — and it terminates on localhost, having itself verified the
         real upstream. So we skip cert verification for a loopback chain,
-        exactly as the real client (Node) does by trusting the CCF CA blindly.
+        exactly as the real client (Node) does by trusting that CA blindly.
         For a direct dial or a remote proxy, full verification stays on:
         system roots (real cert) + our own CA (test fakes) + any corp CA on
         NODE_EXTRA_CA_CERTS.
@@ -1467,11 +1476,11 @@ class PinProxy:
     def _current_chain(self) -> tuple[str, int] | None:
         """The egress proxy to CONNECT through, re-read per connection.
 
-        Not a snapshot: CCF picks its port from a family (9901 + a walk range)
-        and can be restarted, or come up only after this daemon did. Binding
-        the chain once at spawn would leave the daemon bypassing CCF — with a
-        corporate proxy behind it, that is a hard egress failure, not a
-        performance note. ``rediscover_chain=False`` keeps tests explicit.
+        Not a snapshot: a local egress proxy can restart on another port, or
+        come up only after this daemon did. Binding the chain once at spawn
+        would leave the daemon bypassing it — and where that proxy is the only
+        route out, bypassing it is a hard failure, not a performance note.
+        ``rediscover_chain=False`` keeps tests explicit.
         """
         if not self._rediscover_chain:
             return self._chain
