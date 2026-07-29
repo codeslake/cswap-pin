@@ -123,8 +123,13 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
         or read_upstream_ca(ca_path.parent)
     )
     bundle = ca_path.parent / "ca-bundle.pem"
-    if not other or Path(other) == ca_path or Path(other) == bundle:
+    if not other or Path(other) == ca_path:
         return ca_path
+    if Path(other) == bundle:
+        # Already the merged file (a launch inside a pinned session inherits it
+        # from our own env block). Returning ca_path here would UN-merge it and
+        # lose the upstream proxy's CA on every later session.
+        return bundle
     other_path = Path(other)
     # Rebuild only when an input is newer than the output — the inputs are
     # immutable per launch, so the steady state is two stats instead of
@@ -166,9 +171,28 @@ def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
     exec'd with (only a ``settings.json`` change re-applies env to a live
     process, and that file is not ours to write). New sessions are wired.
     """
+    from claude_swap.claude_locks import claude_config_lock
     from claude_swap.paths import get_global_config_path
 
     path = get_global_config_path()
+    # Claude Code writes this file concurrently, and we replace it whole — a
+    # write landing between our read and our rename would be discarded along
+    # with the account, project history and settings it carried. Hold the same
+    # lock every other writer in this codebase takes, across read AND write.
+    try:
+        with claude_config_lock(timeout=5):
+            return _wire_global_config_locked(path, port, ca_path)
+    except Exception:
+        # A lock we cannot take is a reason to skip the write, not to fail a
+        # launch: the pin degrades to "not wired", which is the fail-open
+        # behaviour the rest of this module is built on.
+        return False
+
+
+def _wire_global_config_locked(
+    path: Path, port: int | None, ca_path: Path | None
+) -> bool:
+    """The read-modify-write of :func:`wire_global_config`, under its lock."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -206,6 +230,12 @@ def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
             "NODE_EXTRA_CA_CERTS": str(
                 _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
             ),
+            # Self-loop marker. Claude Code applies this block into
+            # process.env, which its Bash-tool children inherit — so a `cswap`
+            # run from inside a pinned session sees our own proxy as its
+            # ambient one. Without the marker it records THAT as the upstream
+            # and the daemon starts CONNECTing to itself.
+            "CSWAP_PIN_PORT": str(port),
         }
         # Remember what we are about to displace, so unwiring is lossless.
         raw[f"{_WIRE_MARK}Saved"] = {
@@ -524,6 +554,25 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     else:
         raw.pop("remoteControl", None)
     _settings.atomic_write_json(path, raw)
+
+
+def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
+    """Set (or clear, with ``email=None``) the pin AND bring the world in line.
+
+    Storing the pin is only half the job: hand-launched sessions read the
+    proxy out of the global config, so a pin that is saved but not wired does
+    nothing, and — worse — a pin CLEARED but not unwired leaves that config
+    pointing at a proxy which idle-tears-down, breaking egress for every new
+    `claude` with no way back but editing the file by hand.
+
+    Both entry points (the CLI and the TUI menu) go through here so they
+    cannot drift apart again. Returns whether a proxy is now serving.
+    """
+    save_pin(switcher.backup_dir, email, org_uuid)
+    if not email:
+        wire_global_config(None, None)
+        return False
+    return ensure_proxy(switcher) is not None
 
 
 def make_pin_token_provider(switcher, account_num: str, email: str):
@@ -1209,9 +1258,15 @@ class PinProxy:
             headers.append(h)
         split = urlsplit(url)
         host, port = split.hostname, split.port or 80
+        # Re-read like every other egress site: the daemon is constructed with
+        # chain_proxy=None, so reading self._chain here meant this path ALWAYS
+        # dialled the origin direct — bypassing the egress proxy on exactly the
+        # traffic (auto-updater, telemetry) it was added to rescue, and hard
+        # failing where there is no direct route out.
+        chain = self._current_chain()
         try:
-            if self._chain:
-                up = socket.create_connection(self._chain, timeout=15)
+            if chain:
+                up = socket.create_connection(chain, timeout=15)
                 # A plain proxy takes the absolute-form line as-is.
                 head = f"{method} {url} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
             else:

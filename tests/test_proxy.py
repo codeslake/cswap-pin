@@ -33,6 +33,52 @@ def _stdlib_ssl():
     yield
 
 
+class TestPinCodeResolvesItsNames:
+    """The pin touches TUI code whose tests are async and skipped in this
+    repo, so an undefined name there ships as a runtime crash rather than a
+    failing test: `autoview.py` referenced `ACCENT` without importing it, and
+    the auto-switch screen raised NameError for anyone who had set a pin.
+    Compile-and-resolve every module the pin feature reaches."""
+
+    @pytest.mark.parametrize(
+        "module",
+        [
+            "claude_swap.pin_proxy",
+            "claude_swap.tui.autoview",
+            "claude_swap.tui.dashboard",
+            "claude_swap.tui.widgets",
+            "claude_swap.cli",
+            "claude_swap.session",
+        ],
+    )
+    def test_no_undefined_globals(self, module):
+        import importlib
+
+        pyflakes_api = pytest.importorskip(
+            "pyflakes.api", reason="pyflakes not installed"
+        )
+        from pyflakes.reporter import Reporter
+
+        class _Collect(Reporter):
+            def __init__(self):
+                self.errors = []
+
+            def unexpectedError(self, filename, msg):
+                self.errors.append(f"{filename}: {msg}")
+
+            def syntaxError(self, filename, msg, lineno, offset, text):
+                self.errors.append(f"{filename}:{lineno}: {msg}")
+
+            def flake(self, message):
+                if "undefined name" in str(message):
+                    self.errors.append(str(message))
+
+        path = importlib.import_module(module).__file__
+        reporter = _Collect()
+        pyflakes_api.checkPath(path, reporter)
+        assert not reporter.errors, "\n".join(reporter.errors)
+
+
 class TestIsPinnedRoute:
     def test_code_sessions_is_pinned(self):
         # Remote Control creates/uses claude.ai code sessions here.
@@ -401,6 +447,48 @@ class TestWireGlobalConfig:
         wire_global_config(None, None)
         env = json.loads(path.read_text())["env"]
         assert env["NODE_EXTRA_CA_CERTS"] == str(theirs)
+
+    def test_wires_the_self_loop_marker(self, tmp_path, monkeypatch):
+        """Claude Code applies this env block into process.env, which its
+        Bash-tool children inherit — so a cswap run from inside a pinned
+        session sees OUR proxy as its ambient one. Without the marker it
+        records the daemon as its own upstream and it CONNECTs to itself."""
+        from pathlib import Path
+        from claude_swap.pin_proxy import _ambient_proxy, wire_global_config
+
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
+        wire_global_config(9955, Path(tmp_path) / "ca.pem")
+        env = json.loads(path.read_text())["env"]
+        assert env["CSWAP_PIN_PORT"] == "9955"
+        # That env, inherited by a child, must not read as an upstream proxy.
+        assert _ambient_proxy(env) is None
+
+    def test_apply_pin_clear_unwires(self, tmp_path, monkeypatch):
+        """Clearing must unwire, not just forget the pin. A cleared-but-wired
+        config keeps pointing at a proxy that idle-tears-down, and then every
+        hand-launched `claude` starts with HTTPS_PROXY on a dead port — with no
+        way back but editing the file by hand. ensure_proxy cannot repair it
+        either: it returns at its `no pin` guard before reaching the wiring."""
+        from pathlib import Path
+        from claude_swap import pin_proxy
+
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
+        backup = Path(tmp_path)
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, Path("/x/ca.pem")))
+        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1")
+        pin_proxy.wire_global_config(9955, Path(tmp_path) / "ca.pem")
+        assert "env" in json.loads(path.read_text())
+
+        pin_proxy.apply_pin(_Sw(), None, None)
+        raw = json.loads(path.read_text())
+        assert "env" not in raw, "clearing the pin left the proxy wired"
+        assert pin_proxy.load_pin(backup) is None
 
     def test_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
