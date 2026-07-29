@@ -898,7 +898,16 @@ class PinProxy:
                 ]
                 swapped = True
         if self._debug:
-            self._debug.write(f"{method} {path} pinned={pinned} swapped={swapped}\n")
+            hdrs = " | ".join(
+                f"{k}: {v[:60]}" for k, v in headers
+                if k.lower() in (
+                    "connection", "upgrade", "accept", "sec-websocket-key",
+                    "sec-websocket-version", "cache-control", "content-type",
+                )
+            )
+            self._debug.write(
+                f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n"
+            )
             self._debug.flush()
 
         keep = self._forward(method, path, headers, body, tls)
@@ -947,6 +956,7 @@ class PinProxy:
             if not sent_host:
                 out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
             up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
+            self._trace_upgrade = upgrading
             if upgrading:
                 # 101 turns the connection into an opaque byte stream (RC's
                 # WebSocket): relay the handshake response, then pump both
@@ -1056,6 +1066,12 @@ class PinProxy:
         _pump(conn, up)
 
 
+_TRACE = (
+    open(os.environ["CSWAP_PIN_DEBUG"], "a")
+    if os.environ.get("CSWAP_PIN_DEBUG")
+    else None
+)
+
 _HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -1116,6 +1132,13 @@ def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
         if not chunk:
             return False
         buf += chunk
+    if _TRACE is not None:
+        _TRACE.write(
+            "    <-UPGRADE "
+            + bytes(buf).split(b"\r\n\r\n")[0].decode("latin1", "replace")[:400]
+            + "\n"
+        )
+        _TRACE.flush()
     client.sendall(bytes(buf))
     return buf.split(b"\r\n", 1)[0].split(b" ")[1:2] == [b"101"]
 
@@ -1149,6 +1172,9 @@ def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
         return False
     lines = head.split(b"\r\n")
     status_line = lines[0] if lines and lines[0] else b"HTTP/1.1 502 Bad Gateway"
+    if _TRACE is not None:
+        _TRACE.write(f"    <- {status_line.decode('latin1', 'replace')}\n")
+        _TRACE.flush()
     out = [status_line]
     length: int | None = None
     chunked = False
