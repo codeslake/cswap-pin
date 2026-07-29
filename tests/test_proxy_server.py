@@ -391,6 +391,35 @@ class TestPortReclamationAcrossRespawn:
         finally:
             proxy.stop()
 
+    def test_recycling_a_stale_daemon_carries_its_port(self, tmp_path, monkeypatch):
+        """The stale-recycle path kills the old daemon first, and the daemon
+        unlinks its own state on TERM — so the port must be saved BEFORE the
+        kill or there is nothing left to reclaim from. Measured live: a
+        recycle moved 59704 -> 59857 while sessions stayed on 59704."""
+        from claude_swap import pin_proxy
+
+        backup = tmp_path
+        certdir = backup / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+        pin_proxy.write_daemon_state(certdir, 51000, 4242, "STALE-fingerprint")
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("1", "pin@example.com", "org-1")
+
+        killed = []
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: pid == 4242)
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 51000)
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
+
+        pin_proxy.ensure_proxy(_Sw())
+
+        assert killed == [4242], "the stale daemon was not recycled"
+        assert pin_proxy.read_port_hint(certdir) == 51000
+
     def test_spawn_carries_the_port_forward(self, tmp_path, monkeypatch):
         """_spawn_daemon must record the outgoing port BEFORE deleting the
         state file it lives in — the regression that let a recycle land on a

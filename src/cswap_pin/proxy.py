@@ -569,6 +569,12 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # of a stale daemon serving forever.
         stale = read_daemon_state(certdir)
         if stale and _pid_alive(int(stale["pid"])):
+            # Save the port BEFORE the kill: the daemon unlinks its own state
+            # on TERM, so afterwards there is nothing left to reclaim from and
+            # the successor would take a fresh port — stranding every session
+            # already wired to the old one.
+            if isinstance(stale.get("port"), int):
+                _write_port_hint(certdir, stale["port"])
             _kill_daemon(int(stale["pid"]))
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
