@@ -179,11 +179,37 @@ def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
     value = src.get("HTTPS_PROXY") or src.get("https_proxy")
     parsed = parse_upstream_proxy(value)
     if parsed is None:
-        return None
+        # Nothing in OUR environment — but a launcher may still put a proxy in
+        # the session's, and our env block displaces it. `cswap pin` runs in a
+        # plain shell where that value does not exist yet, so ask the config
+        # what the last session was actually told to use.
+        return _wired_over_proxy(src)
     host, port = parsed
     if host in _LOOPBACK and port == _self_port(src):
-        return None
+        return _wired_over_proxy(src)
     return value
+
+
+def _wired_over_proxy(env: dict[str, str]) -> str | None:
+    """The proxy our env block is currently displacing, if any.
+
+    Recorded by :func:`wire_global_config` when it wrote over a value that was
+    already there. Without this, wiring from a shell that has no proxy (the
+    normal case: a launcher sets one only when it execs Claude Code) would
+    record "no upstream" and the pinned session would bypass that launcher's
+    proxy entirely.
+    """
+    from claude_swap.paths import get_global_config_path
+
+    try:
+        raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    saved = raw.get(f"{_WIRE_MARK}Saved") if isinstance(raw, dict) else None
+    if not isinstance(saved, dict):
+        return None
+    value = saved.get("HTTPS_PROXY") or saved.get("https_proxy")
+    return value or None
 
 
 def _self_port(env: dict[str, str]) -> int | None:
