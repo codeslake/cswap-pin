@@ -33,6 +33,41 @@ def _stdlib_ssl():
     yield
 
 
+class TestLiveRemoteControlSessions:
+    """A re-pin cannot move an RC session that is already open (the server
+    fixed its owner at creation), so `cswap pin` names the ones affected
+    instead of telling everyone to restart something."""
+
+    def _sessions_dir(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        home = Path(tmp_path) / "cfg"
+        (home / "sessions").mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.paths.get_claude_config_home", lambda: home
+        )
+        return home / "sessions"
+
+    def test_lists_only_sessions_with_a_live_bridge(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import live_remote_control_sessions
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps(
+            {"sessionId": "a", "name": "with-rc", "bridgeSessionId": "cse_x"}))
+        (d / "2.json").write_text(json.dumps(
+            {"sessionId": "b", "name": "no-rc", "bridgeSessionId": None}))
+        (d / "3.json").write_text(json.dumps({"sessionId": "c", "name": "never"}))
+
+        assert live_remote_control_sessions() == ["with-rc"]
+
+    def test_unreadable_registry_is_not_an_error(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import live_remote_control_sessions
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "bad.json").write_text("{not json")
+        assert live_remote_control_sessions() == []
+
+
 class TestRepinIsLive:
     """Switching accounts in cswap never asks you to restart a session, and
     re-pinning should not either: a live session holds only the proxy's

@@ -575,6 +575,35 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     _settings.atomic_write_json(path, raw)
 
 
+def live_remote_control_sessions() -> list[str]:
+    """Names of sessions that currently hold a Remote Control binding.
+
+    Ownership of an RC session is fixed by the bearer that created it, so a
+    re-pin cannot move one that is already open — reconnecting inside it can
+    (that mints a new session under the new pin). Knowing which sessions those
+    are is what lets `cswap pin` say so instead of guessing.
+
+    Claude Code records one file per live session with a ``bridgeSessionId``
+    that is set only while RC is connected. Best-effort: an unreadable or
+    absent registry just yields nothing.
+    """
+    from claude_swap.paths import get_claude_config_home
+
+    names: list[str] = []
+    try:
+        entries = sorted((get_claude_config_home() / "sessions").glob("*.json"))
+    except OSError:
+        return names
+    for path in entries:
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("bridgeSessionId"):
+            names.append(str(rec.get("name") or rec.get("sessionId") or path.stem))
+    return names
+
+
 def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
     """Set (or clear, with ``email=None``) the pin AND bring the world in line.
 
