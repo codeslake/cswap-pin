@@ -358,6 +358,58 @@ class TestLoopbackChainTrust:
             upstream.stop()
 
 
+class TestPortReclamationAcrossRespawn:
+    """A respawn must come back on the SAME port. A live session's
+    HTTPS_PROXY is fixed at exec, so a new port strands it on a dead
+    address — and a request to a dead proxy leaves WITHOUT the pin rather
+    than failing loudly. proxy.json is deleted before the respawn (a stale
+    record must never read as live), so the port travels via a hint."""
+
+    def test_rebinds_the_port_carried_across_the_state_deletion(self, certdir):
+        """The real daemon is a separate process, so its listening socket is
+        gone by the time the successor binds. Model that by taking a free
+        port, recording it the way _spawn_daemon does, and checking the
+        successor lands on it rather than an ephemeral one."""
+        import socket as _socket
+        from claude_swap.pin_proxy import PinProxy, _write_port_hint
+
+        probe = _socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # now free, as after a daemon exits
+
+        # What _spawn_daemon does: carry the port forward, drop the state.
+        _write_port_hint(certdir, port)
+        (certdir / "proxy.json").unlink(missing_ok=True)
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            assert proxy.port == port, (
+                f"respawn landed on {proxy.port}, stranding sessions wired to {port}"
+            )
+        finally:
+            proxy.stop()
+
+    def test_spawn_carries_the_port_forward(self, tmp_path, monkeypatch):
+        """_spawn_daemon must record the outgoing port BEFORE deleting the
+        state file it lives in — the regression that let a recycle land on a
+        fresh port while .claude.json still named the old one."""
+        from claude_swap import pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.write_daemon_state(certdir, 54321, 999999, "fp")
+
+        import subprocess as _subprocess
+        monkeypatch.setattr(_subprocess, "Popen", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *a, **k: 54321)
+        monkeypatch.setattr(pin_proxy, "_sweep_orphan_daemons", lambda *a, **k: None)
+        pin_proxy._spawn_daemon("1", "pin@example.com", certdir)
+
+        assert pin_proxy.read_port_hint(certdir) == 54321
+
+
 class TestChainRediscovery:
     """The daemon outlives the launch that spawned it, and CCF picks its port
     from a family (9901 + walk range) and can restart. A chain bound once at

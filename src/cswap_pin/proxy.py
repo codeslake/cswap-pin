@@ -715,6 +715,29 @@ def watch_refcount(fifo: str | Path, on_last_holder_gone) -> None:
             pass
 
 
+_PORT_HINT_FILE = "port.hint"
+
+
+def _write_port_hint(certdir: Path, port: int) -> None:
+    """Remember the port to rebind across a respawn (see ``_spawn_daemon``)."""
+    try:
+        (Path(certdir) / _PORT_HINT_FILE).write_text(str(port))
+    except OSError:
+        pass
+
+
+def read_port_hint(certdir: Path) -> int | None:
+    """The port a previous daemon served on, recorded across its teardown.
+
+    ``proxy.json`` is deleted before a respawn (a stale record must never read
+    as live), so the port to reclaim is carried here instead.
+    """
+    try:
+        return int((Path(certdir) / _PORT_HINT_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def write_daemon_state(certdir: Path, port: int, pid: int, fingerprint: str) -> None:
     """Record the live daemon's identity atomically (temp-then-rename)."""
     import json
@@ -790,6 +813,13 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
     import time
 
     certdir = Path(certdir)
+    # Hand the outgoing port to the new daemon before clearing the state it
+    # lives in: it rebinds that port so live sessions — whose HTTPS_PROXY was
+    # fixed at exec — keep reaching the proxy instead of a dead address (and
+    # a session on a dead address leaves WITHOUT the pin, silently).
+    prev = read_daemon_state(certdir)
+    if isinstance(prev, dict) and isinstance(prev.get("port"), int):
+        _write_port_hint(certdir, prev["port"])
     for f in (certdir / _STATE_FILE, certdir / "proxy.port"):
         try:
             f.unlink()
@@ -993,6 +1023,10 @@ class PinProxy:
         # account while the pin still looked healthy).
         prev = read_daemon_state(self._certdir)
         want = prev.get("port") if isinstance(prev, dict) else None
+        if not isinstance(want, int):
+            # A respawn deletes proxy.json before starting us, so the port to
+            # reclaim arrives via the hint the spawner left instead.
+            want = read_port_hint(self._certdir)
         for candidate in ([want] if isinstance(want, int) and want > 0 else []) + [0]:
             try:
                 self._srv.bind((self._host, candidate))
