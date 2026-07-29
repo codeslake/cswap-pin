@@ -900,3 +900,95 @@ class TestDaemonPortStability:
         finally:
             proxy.stop()
             squatter.close()
+
+
+class TestUltrareviewIsPinned:
+    """Ultrareview is a claude.ai-side capability authenticated by the OAuth
+    bearer (binary: `/v1/ultrareview/preflight` with auth:"teleport-org"),
+    so it belongs to the pinned cloud account like RC and artifacts."""
+
+    def test_ultrareview_routes_are_pinned(self):
+        from claude_swap.pin_proxy import is_pinned_route
+
+        assert is_pinned_route("/v1/ultrareview/preflight")
+        assert is_pinned_route("/v1/ultrareview/run")
+
+    def test_neighbouring_v1_routes_stay_unpinned(self):
+        from claude_swap.pin_proxy import is_pinned_route
+
+        assert not is_pinned_route("/v1/messages")
+        assert not is_pinned_route("/v1/models")
+
+
+class TestPinTokenRefreshIsSerialized:
+    """Every pinned request calls the token provider, and each MITM
+    connection runs on its own thread. Without a lock, a token that expires
+    under load lets N threads refresh the SAME one-time refresh token at
+    once: one wins, the others get invalid_grant, and the last writer can
+    persist a credential whose grant was already consumed — killing the
+    pinned account's lineage. Refresh must therefore be serialized, and a
+    thread that waited must reuse the winner's result instead of refreshing
+    again.
+    """
+
+    def test_concurrent_expired_requests_refresh_once(self, tmp_path):
+        import json
+        import threading
+        from claude_swap.pin_proxy import make_pin_token_provider
+
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old", "refreshToken": "rt-1", "expiresAt": 1000,
+            }
+        })
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "new", "refreshToken": "rt-2",
+                "expiresAt": 9999999999000,
+            }
+        })
+        state = {"creds": expired, "refreshes": 0}
+        lock = threading.Lock()
+
+        class FakeSwitcher:
+            backup_dir = tmp_path
+
+            def current_account_number(self):
+                return "2"  # pinned account is NOT active
+
+            def read_account_credentials(self, num, email):
+                return state["creds"]
+
+            def persist_backup_credentials(self, num, email, creds):
+                state["creds"] = creds
+
+        def fake_refresh(creds):
+            with lock:
+                state["refreshes"] += 1
+            import time as _t
+            _t.sleep(0.05)  # widen the race window
+            from claude_swap import oauth as _o
+            return _o.RefreshOutcome(fresh, None)
+
+        import claude_swap.oauth as oauth_mod
+        real = oauth_mod.try_refresh_oauth_credentials
+        oauth_mod.try_refresh_oauth_credentials = fake_refresh
+        try:
+            provider = make_pin_token_provider(FakeSwitcher(), "1", "a@b.c")
+            results = []
+            threads = [
+                threading.Thread(target=lambda: results.append(provider()))
+                for _ in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            oauth_mod.try_refresh_oauth_credentials = real
+
+        assert state["refreshes"] == 1, (
+            f"refreshed {state['refreshes']}x — concurrent threads burned the "
+            "one-time refresh token (invalid_grant risk)"
+        )
+        assert results == ["new"] * 8, f"threads got inconsistent tokens: {results}"

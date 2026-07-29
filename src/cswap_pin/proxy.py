@@ -54,7 +54,8 @@ def is_pinned_route(path: str) -> bool:
     """Whether a request path's bearer must be swapped to the pinned account.
 
     True for the routes whose server-side ownership is decided by the OAuth
-    bearer — Remote-Control session lifecycle and Artifact ("frame") deploys.
+    bearer — Remote-Control session lifecycle, Artifact ("frame") deploys,
+    and Ultrareview (a claude.ai capability gated on the same bearer).
     False for everything else, most importantly ``/v1/messages`` (which must
     keep billing the currently-swapped inference account).
 
@@ -85,6 +86,7 @@ def is_pinned_route(path: str) -> bool:
         path.startswith("/v1/code/sessions")
         or path.startswith("/v1/sessions/")
         or path.startswith("/api/frame/")
+        or path.startswith("/v1/ultrareview/")
     )
 
 
@@ -294,7 +296,26 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     request's bearer alone" — when the pinned account is currently the ACTIVE
     account (its live credential is already on disk and owned by the client;
     the backup copy may be stale) or when no usable token can be produced.
+
+    **Refresh is serialized.** The provider runs once per pinned request and
+    each MITM connection is its own thread, so an expiry under load would
+    otherwise have N threads POST the SAME one-time refresh token
+    concurrently: one wins and the rest come back ``invalid_grant``, with the
+    last writer persisting a credential whose grant was already consumed —
+    exactly the lineage-death shape cswap exists to prevent. A thread that
+    waited on the lock re-reads the store first and uses the winner's
+    rotation instead of refreshing again.
     """
+    refresh_lock = threading.Lock()
+
+    def _live_token(creds: str) -> str | None:
+        data = oauth.extract_oauth_data(creds)
+        if not data:
+            return None
+        access = data.get("accessToken")
+        if access and not oauth.is_oauth_token_expired(data.get("expiresAt")):
+            return access
+        return None
 
     def provider() -> str | None:
         if switcher.current_account_number() == account_num:
@@ -302,10 +323,22 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         creds = switcher.read_account_credentials(account_num, email)
         if not creds:
             return None
-        token, rotated = resolve_pin_token(creds, oauth.try_refresh_oauth_credentials)
-        if rotated:
-            switcher.persist_backup_credentials(account_num, email, rotated)
-        return token
+        token = _live_token(creds)
+        if token:
+            return token  # common path: no lock, no network
+
+        with refresh_lock:
+            # Someone may have rotated it while we waited — re-read and reuse.
+            creds = switcher.read_account_credentials(account_num, email) or creds
+            token = _live_token(creds)
+            if token:
+                return token
+            token, rotated = resolve_pin_token(
+                creds, oauth.try_refresh_oauth_credentials
+            )
+            if rotated:
+                switcher.persist_backup_credentials(account_num, email, rotated)
+            return token
 
     return provider
 
