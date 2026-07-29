@@ -811,3 +811,40 @@ class TestOrphanSweep:
         monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
         pin_proxy._sweep_orphan_daemons(certdir, keep_pid=202)
         assert sorted(killed) == [101, 303]  # everything but the keeper
+
+
+class TestWorkerJwtRoutesAreNotSwapped:
+    """The RC worker authenticates with a session JWT (`auth:"session-jwt"`,
+    binary fn Ter/Kb), NOT the OAuth token. Overwriting its Authorization with
+    the pinned OAuth token makes the server reject every worker call with 403
+    — measured live: /client/presence (OAuth) returned 200 in the same trace
+    where every /worker call returned 403.
+
+    The pin only has to steer OWNERSHIP, and /bridge already decides that: it
+    is OAuth-authenticated, so it mints a worker JWT for the pinned account.
+    Once that JWT exists it must travel untouched.
+    """
+
+    def test_worker_routes_keep_their_own_token(self):
+        from claude_swap.pin_proxy import is_pinned_route
+
+        for path in (
+            "/v1/code/sessions/cse_x/worker",
+            "/v1/code/sessions/cse_x/worker/events",
+            "/v1/code/sessions/cse_x/worker/events/stream",
+        ):
+            assert not is_pinned_route(path), f"{path} must keep the worker JWT"
+
+    def test_ownership_deciding_routes_are_still_pinned(self):
+        from claude_swap.pin_proxy import is_pinned_route
+
+        for path in (
+            "/v1/code/sessions",
+            "/v1/code/sessions/cse_x/bridge",
+            "/v1/code/sessions/cse_x/client/presence",
+            "/v1/code/sessions/cse_x/archive",
+            "/v1/sessions/session_x/unarchive",
+            "/api/frame/deploy/init",
+            "/api/frame/frames?limit=20",
+        ):
+            assert is_pinned_route(path), f"{path} must be pinned"

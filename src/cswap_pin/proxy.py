@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import re
 import selectors
 import socket
 import ssl
@@ -46,13 +47,16 @@ def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
     return host, split.port or 80
 
 
+_WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
+
+
 def is_pinned_route(path: str) -> bool:
     """Whether a request path's bearer must be swapped to the pinned account.
 
-    True for the routes whose server-side ownership is set by the bearer and
-    that we want pinned — Remote-Control code sessions and Artifact ("frame")
-    deploys. False for everything else, most importantly ``/v1/messages`` (which
-    must keep billing the currently-swapped inference account).
+    True for the routes whose server-side ownership is decided by the OAuth
+    bearer — Remote-Control session lifecycle and Artifact ("frame") deploys.
+    False for everything else, most importantly ``/v1/messages`` (which must
+    keep billing the currently-swapped inference account).
 
     ``/v1/sessions/<id>/...`` is the RC session-lifecycle sibling of
     ``/v1/code/sessions`` — reconnect unarchives via ``/v1/sessions/{id}/
@@ -60,7 +64,23 @@ def is_pinned_route(path: str) -> bool:
     bearer while the bridge is swapped, the session's ownership splits and the
     reconnect resolves on the disk account, so the pinned account never sees
     it. The trailing ``/`` keeps a bare ``/v1/sessions`` list out.
+
+    **The ``/worker`` subtree is deliberately excluded.** Those calls do not
+    carry the OAuth token at all: the worker authenticates with a session JWT
+    (binary: ``auth:"session-jwt"`` → ``Ter()``/``Kb()``), minted per session
+    and carrying its own ``session_id``/``account_uuid`` claims. Swapping that
+    Authorization for the pinned OAuth token makes the server reject every
+    worker call — measured live as a 403 storm on ``GET/PUT .../worker`` while
+    ``POST .../client/presence`` (genuinely OAuth) returned 200 in the same
+    trace, leaving Remote Control stuck in a reconnect loop.
+
+    Ownership is still pinned, because the JWT's own issuance is: ``/bridge``
+    is OAuth-authenticated and IS swapped, so it mints a worker JWT for the
+    pinned account (verified by decoding it). After that the JWT must travel
+    untouched.
     """
+    if _WORKER_SUBTREE.search(path):
+        return False
     return (
         path.startswith("/v1/code/sessions")
         or path.startswith("/v1/sessions/")

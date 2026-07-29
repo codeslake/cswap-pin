@@ -545,8 +545,11 @@ class TestKeepAlive:
             conn._create_connection = lambda *a, **k: socket.create_connection(
                 ("127.0.0.1", proxy.port), timeout=10
             )
+            # /bridge is OAuth-pinned; /worker keeps its session JWT;
+            # /v1/messages keeps the inference account. All three pipelined
+            # over ONE connection.
             sent = [
-                "/v1/code/sessions/cse_x/worker",
+                "/v1/code/sessions/cse_x/bridge",
                 "/v1/code/sessions/cse_x/worker",
                 "/v1/messages",
             ]
@@ -562,7 +565,7 @@ class TestKeepAlive:
 
         assert up.paths == sent, f"upstream saw {up.paths}"
         # pinned routes swapped, inference untouched — even when pipelined
-        assert up.auths == ["Bearer PINTOKEN", "Bearer PINTOKEN", "Bearer DISK"]
+        assert up.auths == ["Bearer PINTOKEN", "Bearer DISK", "Bearer DISK"]
 
 
 class _WebSocketUpstream:
