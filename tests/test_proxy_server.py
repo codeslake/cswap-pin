@@ -439,6 +439,47 @@ class TestPortReclamationAcrossRespawn:
         assert pin_proxy.read_port_hint(certdir) == 54321
 
 
+class TestLongPollSurvives:
+    """Remote Control's inbound channel is a long poll: GET .../worker holds
+    its response open until the phone/web sends something. create_connection's
+    timeout stays ON the socket, so it silently became a read deadline and
+    killed that poll — heartbeats (answered at once) kept returning 200, so
+    the session looked healthy while no inbound message ever arrived."""
+
+    def test_upstream_socket_has_no_read_deadline(self, certdir):
+        import socket as _socket
+        import threading as _threading
+        from claude_swap.pin_proxy import PinProxy
+
+        # An upstream that accepts, then stays silent well past any dial budget.
+        srv = _socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        held = []
+
+        def _hold():
+            c, _ = srv.accept()
+            held.append(c)  # keep it open, send nothing
+
+        _threading.Thread(target=_hold, daemon=True).start()
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", srv.getsockname()[1]),
+        )
+        try:
+            up = proxy._connect_upstream()
+            assert up.gettimeout() is None, (
+                "a read deadline on the upstream kills the RC long poll"
+            )
+            up.close()
+        finally:
+            for c in held:
+                c.close()
+            srv.close()
+
+
 class TestChainRediscovery:
     """The daemon outlives the launch that spawned it, and CCF picks its port
     from a family (9901 + walk range) and can restart. A chain bound once at

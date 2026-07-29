@@ -1404,6 +1404,17 @@ class PinProxy:
         return read_upstream_hint(self._certdir)
 
     def _connect_upstream(self) -> socket.socket:
+        """Dial the upstream (through the chain when there is one).
+
+        The 15s budget covers CONNECTING only. It is cleared before the socket
+        carries requests, because ``create_connection``'s timeout stays on the
+        socket and would then apply to every read — and the Remote Control
+        inbound channel is a LONG POLL that deliberately holds its response
+        open until the phone/web sends something. With the timeout left on,
+        that poll died every 15s and no inbound message ever reached the CLI,
+        while heartbeats (which answer at once) kept succeeding — so the
+        session looked healthy and was silently deaf.
+        """
         chain = self._current_chain()
         if chain:
             raw = socket.create_connection(chain, timeout=15)
@@ -1419,8 +1430,11 @@ class PinProxy:
             if not status or " 200" not in status:
                 raw.close()
                 raise OSError(f"upstream CONNECT failed: {status}")
+            raw.settimeout(None)
             return raw
-        return socket.create_connection(self._upstream, timeout=15)
+        sock = socket.create_connection(self._upstream, timeout=15)
+        sock.settimeout(None)
+        return sock
 
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
@@ -1446,6 +1460,9 @@ class PinProxy:
         except OSError:
             conn.close()
             return
+        # Connect budget only — a tunnel is long-lived by definition, and a
+        # read timeout left on it would tear down an idle-but-healthy stream.
+        up.settimeout(None)
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         _pump(conn, up)
 
