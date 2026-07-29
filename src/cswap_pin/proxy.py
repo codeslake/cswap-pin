@@ -1275,6 +1275,7 @@ class PinProxy:
                 )
             )
             self._debug.write(
+                f"[c{threading.get_ident() % 100000}] "
                 f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n"
             )
             self._debug.flush()
@@ -1574,7 +1575,10 @@ def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
     lines = head.split(b"\r\n")
     status_line = lines[0] if lines and lines[0] else b"HTTP/1.1 502 Bad Gateway"
     if _TRACE is not None:
-        _TRACE.write(f"    <- {status_line.decode('latin1', 'replace')}\n")
+        _TRACE.write(
+            f"[c{threading.get_ident() % 100000}]     <- "
+            f"{status_line.decode('latin1', 'replace')}\n"
+        )
         _TRACE.flush()
     out = [status_line]
     length: int | None = None
