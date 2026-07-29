@@ -74,16 +74,28 @@ def write_upstream_hint(
 ) -> None:
     """Record the egress proxy for the daemon to chain through (see above).
 
-    Written on every launch, including when there is no proxy — "none" is
-    itself the news when the upstream proxy has gone away. ``ca`` records the
-    CA that proxy signs with, so a later launch that cannot see it (a plain
-    shell, where a launcher's CA only exists at exec time) can still merge it.
+    ``ca`` records the CA that proxy signs with, so a later launch that cannot
+    see it (a plain shell, where a launcher's CA only exists at exec time) can
+    still merge it.
+
+    A ``value`` of None means "this launch could not see a proxy", which is NOT
+    the same as "there is no proxy": `cswap pin` normally runs in an ordinary
+    shell, while the launcher sets HTTPS_PROXY only in the environment it execs
+    Claude Code with. Recording that as "none" would drop a live upstream —
+    measured: a re-pin from a plain shell blanked a recorded CCF and the daemon
+    started bypassing it. So a previously recorded proxy is kept unless a
+    launch positively reports a different one.
     """
     path = Path(certdir) / _UPSTREAM_FILE
     tmp = path.with_suffix(".tmp")
-    keep = read_upstream_ca(certdir) if ca is None else ca
+    keep_ca = read_upstream_ca(certdir) if ca is None else ca
+    if value:
+        keep_proxy = value
+    else:
+        prev = read_upstream_hint(certdir)
+        keep_proxy = f"http://{prev[0]}:{prev[1]}" if prev else ""
     try:
-        tmp.write_text(json.dumps({"proxy": value or "", "ca": keep or ""}))
+        tmp.write_text(json.dumps({"proxy": keep_proxy, "ca": keep_ca or ""}))
         tmp.replace(path)
     except OSError:
         pass
@@ -298,10 +310,11 @@ def _wired_over_proxy(env: dict[str, str]) -> str | None:
     except (OSError, ValueError):
         return None
     saved = raw.get(f"{_WIRE_MARK}Saved") if isinstance(raw, dict) else None
-    if not isinstance(saved, dict):
-        return None
-    value = saved.get("HTTPS_PROXY") or saved.get("https_proxy")
-    return value or None
+    if isinstance(saved, dict):
+        value = saved.get("HTTPS_PROXY") or saved.get("https_proxy")
+        if value:
+            return value
+    return None
 
 
 def _self_port(env: dict[str, str]) -> int | None:
@@ -1478,21 +1491,32 @@ class PinProxy:
         """
         chain = self._current_chain()
         if chain:
-            raw = socket.create_connection(chain, timeout=15)
-            raw.sendall(
-                f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
-                f"Host: {self._upstream[0]}:{self._upstream[1]}\r\n\r\n".encode("latin1")
-            )
-            status = _read_line(raw)
-            while True:
-                h = _read_line(raw)
-                if h in ("", None):
-                    break
-            if not status or " 200" not in status:
-                raw.close()
-                raise OSError(f"upstream CONNECT failed: {status}")
-            raw.settimeout(None)
-            return raw
+            try:
+                raw = socket.create_connection(chain, timeout=15)
+            except OSError:
+                # The recorded chain is gone. The hint is kept across launches
+                # that cannot see a proxy (a plain `cswap pin` shell has none),
+                # so it cannot expire on its own — fall through to a direct
+                # dial rather than failing every request until someone re-pins
+                # from a shell that happens to have the new address.
+                raw = None
+            if raw is not None:
+                raw.sendall(
+                    f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
+                    f"Host: {self._upstream[0]}:{self._upstream[1]}\r\n\r\n".encode(
+                        "latin1"
+                    )
+                )
+                status = _read_line(raw)
+                while True:
+                    h = _read_line(raw)
+                    if h in ("", None):
+                        break
+                if not status or " 200" not in status:
+                    raw.close()
+                    raise OSError(f"upstream CONNECT failed: {status}")
+                raw.settimeout(None)
+                return raw
         sock = socket.create_connection(self._upstream, timeout=15)
         sock.settimeout(None)
         return sock

@@ -523,6 +523,57 @@ class TestChainRediscovery:
             chain.stop()
             upstream.stop()
 
+    def test_a_launch_that_sees_no_proxy_keeps_the_recorded_one(self, certdir):
+        """`cswap pin` normally runs in an ordinary shell, while the launcher
+        sets HTTPS_PROXY only in the env it execs Claude Code with. Treating
+        "I can't see one" as "there is none" blanked a live upstream —
+        measured: a re-pin from a plain shell dropped a recorded CCF and the
+        daemon started bypassing it."""
+        from claude_swap.pin_proxy import read_upstream_hint, write_upstream_hint
+
+        write_upstream_hint(certdir, "http://127.0.0.1:9901")
+        assert read_upstream_hint(certdir) == ("127.0.0.1", 9901)
+
+        write_upstream_hint(certdir, None)  # a launch with nothing in its env
+        assert read_upstream_hint(certdir) == ("127.0.0.1", 9901), (
+            "a launch that could not see a proxy erased the recorded one"
+        )
+
+        # A launch that positively reports a DIFFERENT proxy still wins.
+        write_upstream_hint(certdir, "http://127.0.0.1:9902")
+        assert read_upstream_hint(certdir) == ("127.0.0.1", 9902)
+
+    def test_falls_back_to_direct_when_the_recorded_chain_is_gone(
+        self, certdir, tmp_path
+    ):
+        """The hint cannot expire on its own (see above), so a chain that dies
+        must not wedge every request — the relay dials direct instead."""
+        from claude_swap.pin_proxy import PinProxy, write_upstream_hint
+
+        upstream = _FakeUpstream(certdir)
+        # Point the chain at a port nothing is listening on.
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead_port}")
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+            rediscover_chain=True,
+        )
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert status == 200, "a dead chain wedged the request"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
     def test_health_reports_the_chain_the_relay_would_use(self, certdir):
         """A probe that says "no chain" while every request goes through one
         sends the next diagnosis the wrong way. Measured after a cc-update
