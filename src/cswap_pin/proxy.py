@@ -605,43 +605,6 @@ def live_remote_control_sessions() -> list[str]:
     return names
 
 
-_SEVERED_FILE = "severed-rc.json"
-
-
-def _record_severed_rc(certdir: Path, names: list[str]) -> None:
-    """Note which RC sessions a daemon recycle just cut off (see the caller).
-
-    Written rather than printed because the recycle happens inside
-    ``ensure_proxy``, which runs on a launch — there is no user watching it.
-    The next ``cswap`` command reads and clears it.
-    """
-    path = Path(certdir) / _SEVERED_FILE
-    if not names:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return
-    try:
-        path.write_text(json.dumps(sorted(set(names))), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def take_severed_rc(certdir: Path) -> list[str]:
-    """Read and CLEAR the sessions a recycle cut off. Empty when there were none."""
-    path = Path(certdir) / _SEVERED_FILE
-    try:
-        names = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    try:
-        path.unlink()
-    except OSError:
-        pass
-    return [str(n) for n in names] if isinstance(names, list) else []
-
-
 def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
     """Set (or clear, with ``email=None``) the pin AND bring the world in line.
 
@@ -804,18 +767,6 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # already wired to the old one.
             if isinstance(stale.get("port"), int):
                 _write_port_hint(certdir, stale["port"])
-            # Reclaiming the port keeps REQUESTS working, but it cannot save
-            # the tunnels: Remote Control RECEIVES over a WebSocket held open
-            # through this daemon, and killing the process drops it. CC does
-            # not rebuild it, so an open RC session survives looking perfectly
-            # healthy — heartbeat and presence keep answering 200, the pin
-            # still reads as applied — while anything sent from claude.ai
-            # never arrives again. Measured on work-mac: after a recycle the
-            # session held ONE socket where a healthy one held 38, and a
-            # `/rc → Disconnect → /rc` restored it immediately.
-            # Record who was cut so the caller can say so; silence here is
-            # what made this cost a whole debugging session.
-            _record_severed_rc(certdir, live_remote_control_sessions())
             _kill_daemon(int(stale["pid"]))
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
