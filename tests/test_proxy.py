@@ -996,51 +996,93 @@ class TestPinEnvRefcount:
         assert "exec" in out
 
 
-class TestAutoViewPinLabel:
-    """The auto-switch view marks the remote-control-pinned account so a user
-    running `auto` with a pin can see, at a glance, which account RC is on."""
+class TestAutoViewPinBadge:
+    """The auto-switch view marks the cloud-pinned account ON ITS OWN ROW.
 
-    def _label(self, backup_dir, accounts):
-        """Call _pinned_rc_label with a stand-in app, WITHOUT mutating the
-        AutoScreen class (a class-level property would leak into other tests)."""
+    It used to name the pin on the summary line instead, which made you match
+    an email against the list printed directly below it rather than just
+    reading the list — and pushed that line past 80 columns.
+    """
+
+    def _rows(self, backup_dir, accounts, active=None):
+        """Render _candidates_text with a stand-in app, WITHOUT patching the
+        AutoScreen class (that would leak into other tests)."""
         from claude_swap.tui.autoview import AutoScreen
+
         class _Snap:
             pass
+
+        class _Theme:
+            primary = secondary = foreground = "#fff"
+            success = warning = error = "#fff"
+            variables: dict = {}
+
         class _App:
             class switcher:
                 pass
+
+            current_theme = _Theme()
+
         app = _App()
         app.switcher.backup_dir = backup_dir
-        snap = _Snap(); snap.accounts = accounts
+        snap = _Snap()
+        snap.accounts = accounts
         app.snapshot = snap
-        # Unbound method call with a minimal object exposing `.app`; no class
-        # patching, so nothing leaks.
+
         class _Stub:
             pass
+
         stub = _Stub()
         stub.app = app
-        return AutoScreen._pinned_rc_label(stub)
+        stub._settings = None
+        # Bind the REAL helper, so the badge decision under test is the
+        # shipped one and not a stand-in.
+        stub._pinned_email = lambda: AutoScreen._pinned_email(stub)
+        return AutoScreen._candidates_text(stub, snap, active).plain
 
-    def _acct(self, num, email):
+    def _acct(self, num, email, pct=None):
         from claude_swap.models import AccountSnapshot
         from claude_swap.usage_store import UsageEntry
+
         return AccountSnapshot(
             number=str(num), email=email, org_name="", org_uuid="",
             is_active=False, kind="oauth", switchable=True,
             usage=UsageEntry(last_good=None, fetched_at=None, age_s=None),
         )
 
-    def test_label_shows_slot_and_email(self, tmp_path):
+    def test_badge_is_on_the_pinned_row_only(self, tmp_path):
         from claude_swap.pin_proxy import save_pin
+
         save_pin(tmp_path, "codeslake@gmail.com", "org-1")
-        label = self._label(
+        out = self._rows(
             tmp_path,
             [self._acct(1, "codeslake@gmail.com"), self._acct(2, "j.lee8@samsung.com")],
         )
-        assert label == "#1 codeslake@gmail.com"
+        pinned_line = next(l for l in out.splitlines() if "codeslake@gmail.com" in l)
+        other_line = next(l for l in out.splitlines() if "j.lee8@samsung.com" in l)
+        assert "○ cloud" in pinned_line
+        assert "○ cloud" not in other_line
 
-    def test_label_none_without_pin(self, tmp_path):
-        assert self._label(tmp_path, [self._acct(1, "a@co.com")]) is None
+    def test_badge_survives_unknown_usage(self, tmp_path):
+        """A pinned account still owns the claude.ai side when its usage
+        cannot be read, so the badge must not hang off a usage branch."""
+        from claude_swap.pin_proxy import save_pin
+
+        save_pin(tmp_path, "codeslake@gmail.com", "org-1")
+        out = self._rows(tmp_path, [self._acct(1, "codeslake@gmail.com")])
+        assert "usage unknown" in out and "○ cloud" in out
+
+    def test_no_badge_without_a_pin(self, tmp_path):
+        out = self._rows(tmp_path, [self._acct(1, "a@co.com"), self._acct(2, "b@co.com")])
+        assert "○ cloud" not in out
+
+    def test_summary_line_never_names_the_pin(self, tmp_path):
+        """The regression being fixed: the pin must not be spelled out twice."""
+        import inspect
+        from claude_swap.tui.autoview import AutoScreen
+
+        src = inspect.getsource(AutoScreen._update_summary)
+        assert "cloud" not in src, "the summary line names the pin again"
 
 
 class TestKillDaemon:
