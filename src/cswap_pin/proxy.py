@@ -56,6 +56,15 @@ def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
     return host, split.port or 80
 
 
+def _read_upstream(certdir: Path, key: str) -> str | None:
+    """One field out of the upstream record, or None when it is absent."""
+    try:
+        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    return (raw.get(key) or None) if isinstance(raw, dict) else None
+
+
 def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     """The egress proxy the LAST launch was using, as recorded on disk.
 
@@ -69,12 +78,7 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     Returns ``None`` when the file is absent or records "no proxy" — the same
     thing a direct dial means.
     """
-    try:
-        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
-    except (OSError, ValueError):
-        return None
-    value = raw.get("proxy") if isinstance(raw, dict) else None
-    return parse_upstream_proxy(value) if value else None
+    return parse_upstream_proxy(_read_upstream(certdir, "proxy"))
 
 
 def write_upstream_hint(
@@ -111,12 +115,7 @@ def write_upstream_hint(
 
 def read_upstream_ca(certdir: Path) -> str | None:
     """The CA of the egress proxy, as last recorded. See above."""
-    try:
-        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
-    except (OSError, ValueError):
-        return None
-    value = raw.get("ca") if isinstance(raw, dict) else None
-    return value or None
+    return _read_upstream(certdir, "ca")
 
 
 _WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
@@ -169,6 +168,45 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
 
 
 CA_TRUST_DIR = "ca-trust.d"
+CA_TRUST_FILE = "ca-trust.pem"
+
+
+def _trust_file(ca_path: Path, existing: str | None) -> Path:
+    """The single file to name in ``NODE_EXTRA_CA_CERTS``.
+
+    Prefers the shared merged bundle when a launcher has built one: it already
+    contains every component's CA plus the ambient roots, so a proxy added
+    later is trusted without cswap knowing it exists. Falls back to merging
+    ours with whatever the caller already trusted, and to ours alone when there
+    is nothing else — which is the no-launcher, no-other-MITM case and behaves
+    exactly as before.
+    """
+    try:
+        from claude_swap.paths import get_claude_config_home
+
+        shared = get_claude_config_home() / CA_TRUST_FILE
+        if shared.is_file() and shared.stat().st_size > 0:
+            ours = Path(ca_path).read_bytes().strip()
+            # Only trust it once it actually carries us; a launcher that has
+            # not rebuilt since we published would otherwise strand this
+            # session without its own CA.
+            if ours and ours in shared.read_bytes():
+                return shared
+    except Exception:
+        pass
+    # No shared bundle: merge with what THIS env trusts. Deliberately not
+    # _merged_ca, which also consults the ambient process environment and a
+    # recorded upstream CA — wire_env is handed the environment it must
+    # describe, and reaching past it would wire a session to trust something
+    # its caller never mentioned.
+    if not existing or Path(existing) == Path(ca_path):
+        return Path(ca_path)
+    bundle = Path(ca_path).parent / "ca-bundle.pem"
+    try:
+        bundle.write_bytes(Path(ca_path).read_bytes() + Path(existing).read_bytes())
+        return bundle
+    except OSError:
+        return Path(ca_path)
 
 
 def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
@@ -337,10 +375,10 @@ def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
         # the session's, and our env block displaces it. `cswap pin` runs in a
         # plain shell where that value does not exist yet, so ask the config
         # what the last session was actually told to use.
-        return _wired_over_proxy(src)
+        return _wired_over_proxy()
     host, port = parsed
     if host in _LOOPBACK and port == _self_port(src):
-        return _wired_over_proxy(src)
+        return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
     # behind. A launcher (cc-wrapper) starts a per-session cache proxy and
     # points HTTPS_PROXY at THAT; an ordinary shell, and every ssh shell, only
@@ -350,7 +388,7 @@ def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
     # privoxy:8118 while CCF on :9901 (whose own upstream IS 8118) was left
     # bypassed for every pinned session. Prefer the recorded one when it is
     # still serving — it is the inner link, and it reaches this one anyway.
-    prev = _wired_over_proxy(src)
+    prev = _wired_over_proxy()
     prev_parsed = parse_upstream_proxy(prev)
     if (
         prev_parsed is not None
@@ -372,7 +410,7 @@ def _port_is_serving(host: str, port: int) -> bool:
         return False
 
 
-def _wired_over_proxy(env: dict[str, str]) -> str | None:
+def _wired_over_proxy() -> str | None:
     """The proxy our env block is currently displacing, if any.
 
     Recorded by :func:`wire_global_config` when it wrote over a value that was
@@ -1196,7 +1234,6 @@ def wire_env(
     env: dict[str, str],
     port: int,
     ca_path: Path,
-    certdir: Path,
     open_refcount: bool = True,
 ) -> dict[str, str]:
     """Return a copy of ``env`` routed through the pin proxy.
@@ -1205,7 +1242,7 @@ def wire_env(
     MITM CA. Node's ``NODE_EXTRA_CA_CERTS`` takes exactly one file, so when the
     session already trusts another CA (a corporate MITM, another local proxy)
     the two PEMs are merged into
-    ``certdir/ca-bundle.pem`` — never replaced.
+    ``<ca dir>/ca-bundle.pem`` — never replaced.
 
     ``open_refcount`` controls the refcount holder. In-process callers
     (session.py, which execs claude and hands off its own fds) pass True: we
@@ -1221,24 +1258,15 @@ def wire_env(
     # Marks this env as already pinned, so a nested launch records the proxy
     # we chain THROUGH as upstream rather than us (see _ambient_proxy).
     out["CSWAP_PIN_PORT"] = str(port)
-    existing = env.get("NODE_EXTRA_CA_CERTS")
-    if existing and Path(existing) != ca_path:
-        bundle = Path(certdir) / "ca-bundle.pem"
-        try:
-            bundle.write_bytes(
-                Path(ca_path).read_bytes() + Path(existing).read_bytes()
-            )
-            out["NODE_EXTRA_CA_CERTS"] = str(bundle)
-        except OSError:
-            out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
-    else:
-        out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
+    out["NODE_EXTRA_CA_CERTS"] = str(
+        _trust_file(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
+    )
 
     # Attach this launch as a refcount holder: open a write fd on the FIFO and
     # mark it inheritable so the exec'd claude keeps it open for its lifetime.
     # The daemon's reader sees EOF only when every such fd closes → idle
     # teardown. O_RDWR so the open never blocks even if the daemon died.
-    fifo = refcount_fifo_path(certdir)
+    fifo = refcount_fifo_path(Path(ca_path).parent)
     out["CSWAP_PIN_FIFO"] = str(fifo)
     if open_refcount and fifo.exists():
         try:
@@ -1485,7 +1513,8 @@ class PinProxy:
         request_line = _read_line(tls)
         if not request_line:
             return False
-        method, path = _split_request_line(request_line)
+        _parts = request_line.split(" ")
+        method, path = _parts[0], _parts[1] if len(_parts) > 1 else "/"
         headers: list[tuple[str, str]] = []
         while True:
             h = _read_line(tls)
@@ -1846,11 +1875,6 @@ def _read_line(sock) -> str | None:
                 buf.pop()
             return buf.decode("latin1")
         buf += b
-
-
-def _split_request_line(line: str) -> tuple[str, str]:
-    parts = line.split(" ")
-    return parts[0], parts[1] if len(parts) > 1 else "/"
 
 
 def _read_body(sock, headers) -> bytes:

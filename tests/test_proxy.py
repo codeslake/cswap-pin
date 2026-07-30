@@ -8,6 +8,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from cryptography import x509
@@ -426,7 +427,7 @@ class TestWireEnv:
         from claude_swap.pin_proxy import wire_env
         ca = tmp_path / "ca.pem"
         ca.write_text("PIN-CA\n")
-        env = wire_env({}, 9955, ca, tmp_path)
+        env = wire_env({}, 9955, ca)
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:9955"
         assert env["https_proxy"] == "http://127.0.0.1:9955"
         assert env["NODE_EXTRA_CA_CERTS"] == str(ca)
@@ -437,7 +438,7 @@ class TestWireEnv:
         ca.write_text("PIN-CA\n")
         other = tmp_path / "ccf-ca.pem"
         other.write_text("CCF-CA\n")
-        env = wire_env({"NODE_EXTRA_CA_CERTS": str(other)}, 9955, ca, tmp_path)
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(other)}, 9955, ca)
         bundle = env["NODE_EXTRA_CA_CERTS"]
         assert bundle not in (str(ca), str(other))  # a merged file
         text = (tmp_path / "ca-bundle.pem").read_text()
@@ -937,7 +938,7 @@ class TestRefcount:
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         os.mkfifo(refcount_fifo_path(certdir))
         ca = certdir / "ca.pem"; ca.write_text("CA\n")
-        env = wire_env({}, 9955, ca, certdir)
+        env = wire_env({}, 9955, ca)
         # The pin proxy fd is exposed so the child inherits it (kept open for
         # the child's lifetime). We at least advertise the fifo to hold.
         assert "CSWAP_PIN_REFCOUNT_FD" in env or "CSWAP_PIN_FIFO" in env
@@ -1520,3 +1521,64 @@ class TestCaIsPublishedEveryLaunch:
 
         pp.ensure_proxy(self._switcher(tmp_path))
         assert (home / pp.CA_TRUST_DIR / "cswap-pin.pem").exists()
+
+
+class TestConsumesTheSharedTrustBundle:
+    """Publishing alone only helps components that read the dir. A pinned
+    session must also CONSUME the merged bundle, or a CA added by some future
+    proxy is trusted by everyone except the sessions cswap wires — which is
+    the whole point of the shared contract."""
+
+    def _cfg(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        return home
+
+    def _ca(self, tmp_path):
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ca = certdir / "ca.pem"
+        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
+        return ca
+
+    def test_uses_the_merged_bundle_when_it_carries_us(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        merged = home / CA_TRUST_FILE
+        merged.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nAMBIENT\n-----END CERTIFICATE-----\n"
+            + ca.read_bytes()
+            + b"\n-----BEGIN CERTIFICATE-----\nFUTURE-PROXY\n-----END CERTIFICATE-----\n"
+        )
+        env = wire_env({}, 9955, ca)
+        assert env["NODE_EXTRA_CA_CERTS"] == str(merged)
+
+    def test_ignores_a_merged_bundle_that_does_not_carry_us(
+        self, tmp_path, monkeypatch
+    ):
+        """A launcher that has not rebuilt since we published would otherwise
+        strand the session without its own CA."""
+        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        (home / CA_TRUST_FILE).write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nSOMEONE-ELSE\n-----END CERTIFICATE-----\n"
+        )
+        env = wire_env({}, 9955, ca)
+        assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE)
+        assert b"PIN" in Path(env["NODE_EXTRA_CA_CERTS"]).read_bytes()
+
+    def test_no_launcher_at_all_is_unchanged(self, tmp_path, monkeypatch):
+        """No merged bundle, no other MITM: name our own CA, exactly as before."""
+        import claude_swap.pin_proxy as pp
+        from claude_swap.pin_proxy import wire_env
+
+        self._cfg(tmp_path, monkeypatch)
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        monkeypatch.setattr(pp, "read_upstream_ca", lambda d: None)
+        ca = self._ca(tmp_path)
+        assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(ca)
