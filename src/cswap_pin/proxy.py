@@ -361,6 +361,16 @@ def _wire_global_config_locked(
         wanted = {
             "HTTPS_PROXY": proxy,
             "https_proxy": proxy,
+            # A launcher that sets ALL_PROXY leaves it naming the proxy we
+            # chain THROUGH, so the session runs with two proxy vars pointing
+            # at different hops. curl resolves that in our favour — measured,
+            # https_proxy=A + ALL_PROXY=B dials A, and B only when A is unset
+            # — but the split is one a client is free to resolve the other
+            # way, and it is unreadable for anyone diagnosing a route. Claim
+            # it so every var names the same hop. Scoped to this file, which
+            # Claude Code applies to itself; the shell path deliberately does
+            # not create one (see wire_env).
+            "ALL_PROXY": proxy,
             # Node takes exactly ONE file here, so replacing an existing CA
             # blinds the session to every host the proxy behind us re-signs.
             # Measured: with only our CA, `downloads.claude.ai` (MITM'd by the
@@ -1313,6 +1323,17 @@ def wire_env(
     proxy = f"http://127.0.0.1:{port}"
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
+    # Rewrite an ALL_PROXY the caller already had; never create one. It is a
+    # fallback consulted only when the scheme-specific vars are absent (curl,
+    # measured: https_proxy=A + ALL_PROXY=B dials A), and we always set those
+    # — so an absent one costs nothing, while a launcher's own would name the
+    # hop we chain through and read as a contradiction. Creating one here
+    # would be worse than useless: this env can be eval'd into the user's
+    # SHELL (pin-env), where an ALL_PROXY we invented would send that shell's
+    # git, uv and gh through an account-pinning MITM built for one client.
+    for key in ("ALL_PROXY", "all_proxy"):
+        if key in out:
+            out[key] = proxy
     # Marks this env as already pinned, so a nested launch records the proxy
     # we chain THROUGH as upstream rather than us (see _ambient_proxy).
     out["CSWAP_PIN_PORT"] = str(port)
