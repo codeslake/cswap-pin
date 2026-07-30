@@ -1670,3 +1670,86 @@ class TestTornPemCannotEscape:
         )
         env = wire_env({}, 9955, ca)
         assert env["NODE_EXTRA_CA_CERTS"] == str(home / CA_TRUST_FILE)
+
+
+class TestUpstreamSocketsProbeASilentPeer:
+    """These sockets carry NO read timeout on purpose — Remote Control's
+    inbound channel holds its response open until the phone or web sends
+    something, and a deadline killed it every 15s. The price is that a peer
+    which stops answering WITHOUT closing looks exactly like a healthy idle
+    long poll, and the relay waits forever. Measured on host-a: a compact
+    request parked at 95%, both socket queues zero for 8s, the relay thread in
+    wait_woken for 13 minutes, on a connection the kernel still reported
+    ESTABLISHED. Keepalive tells the two apart without reintroducing a
+    deadline."""
+
+    def test_keepalive_is_enabled(self):
+        import socket as s
+        from claude_swap.pin_proxy import _arm_keepalive
+
+        sock = s.socket()
+        try:
+            assert sock.getsockopt(s.SOL_SOCKET, s.SO_KEEPALIVE) == 0, "precondition"
+            _arm_keepalive(sock)
+            assert sock.getsockopt(s.SOL_SOCKET, s.SO_KEEPALIVE) == 1
+        finally:
+            sock.close()
+
+    def test_probing_starts_long_before_the_two_hour_default(self):
+        """The system default only begins probing after 7200s, which is far
+        past the point a user has given up on a stuck request."""
+        import socket as s
+        from claude_swap.pin_proxy import _arm_keepalive
+
+        idle_opt = getattr(s, "TCP_KEEPIDLE", None) or getattr(s, "TCP_KEEPALIVE", None)
+        if idle_opt is None:
+            pytest.skip("platform exposes no keepalive-idle knob")
+        sock = s.socket()
+        try:
+            _arm_keepalive(sock)
+            idle = sock.getsockopt(s.IPPROTO_TCP, idle_opt)
+            assert 0 < idle <= 120, idle
+        finally:
+            sock.close()
+
+    def test_a_dead_peer_surfaces_in_about_two_minutes(self):
+        """idle + intvl*cnt is the worst case before a read fails instead of
+        hanging. It must be minutes, not hours."""
+        import socket as s
+        from claude_swap.pin_proxy import _arm_keepalive
+
+        if not all(hasattr(s, n) for n in ("TCP_KEEPIDLE", "TCP_KEEPINTVL", "TCP_KEEPCNT")):
+            pytest.skip("platform exposes no full keepalive tuning")
+        sock = s.socket()
+        try:
+            _arm_keepalive(sock)
+            idle = sock.getsockopt(s.IPPROTO_TCP, s.TCP_KEEPIDLE)
+            intvl = sock.getsockopt(s.IPPROTO_TCP, s.TCP_KEEPINTVL)
+            cnt = sock.getsockopt(s.IPPROTO_TCP, s.TCP_KEEPCNT)
+            worst = idle + intvl * cnt
+            assert worst <= 300, f"a dead peer would take {worst}s to surface"
+        finally:
+            sock.close()
+
+    def test_arming_never_raises_on_a_closed_socket(self):
+        """Liveness plumbing must not be able to break a request path."""
+        import socket as s
+        from claude_swap.pin_proxy import _arm_keepalive
+
+        sock = s.socket()
+        sock.close()
+        _arm_keepalive(sock)  # must not raise
+
+    def test_no_read_deadline_is_reintroduced(self):
+        """The whole reason keepalive is the answer: a timeout here would kill
+        the RC long poll again, which is the bug this replaced."""
+        import socket as s
+        from claude_swap.pin_proxy import _arm_keepalive
+
+        sock = s.socket()
+        try:
+            sock.settimeout(None)
+            _arm_keepalive(sock)
+            assert sock.gettimeout() is None
+        finally:
+            sock.close()
