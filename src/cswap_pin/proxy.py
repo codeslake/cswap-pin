@@ -194,6 +194,19 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # and it says so only in a stderr warning, so the session dies on
             # "unable to verify the first certificate" with no visible cause.
             # Checking that we are in there cannot see that; count the markers.
+            #
+            # A bundle that is BALANCED and CONTAINS us but has silently lost
+            # other roots is deliberately NOT guarded here. A consumer cannot
+            # tell "narrowed" from "correctly small": measured across the three
+            # machines this runs on, a legitimate bundle is 2 certs on one and
+            # 132 on another, so any size floor that catches narrowing on one
+            # host rejects a healthy bundle on the next. Only the builder holds
+            # the previous state that makes narrowing a *regression* rather
+            # than a fact, which is why it keeps the last good bundle instead.
+            # The two cases below are also a different severity class: both
+            # leave the session unable to verify its OWN proxy, so every
+            # request dies. Narrowing keeps our chain intact and costs someone
+            # else's. Do not add a cert-count floor here.
             if (
                 ours
                 and ours in body
