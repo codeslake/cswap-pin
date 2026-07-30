@@ -165,7 +165,6 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
             )
     except OSError:
         return ca_path
-    publish_ca(ca_path)
     return bundle
 
 
@@ -813,6 +812,20 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     fp = daemon_fingerprint(account_num, email)
 
     ca = certdir / "ca.pem"
+    # Generate the CA here rather than leaving it to the daemon: publishing has
+    # to happen before the client is exec'd, and on the very first launch the
+    # daemon has not run yet, so there would be nothing to publish. ensure_ca is
+    # idempotent, so this only ever does work once.
+    try:
+        ensure_ca(certdir, UPSTREAM_HOST)
+    except Exception:
+        pass
+    # Publish on EVERY launch, not only when another CA happens to be in play.
+    # A launcher builds its merged bundle from this directory as it starts us,
+    # so a CA published later would miss that build, and a component whose cert
+    # dir was wiped must reappear on the next launch rather than stay silently
+    # absent.
+    publish_ca(ca)
 
     # Fast path (no lock): a fresh, current daemon is reused as-is.
     port = _read_alive_port(certdir, fingerprint=fp)

@@ -1444,3 +1444,79 @@ class TestCaIsPublishedToTheTrustDir:
         assert b"PIN" in out.read_bytes() and b"CCF" in out.read_bytes()
         # and the launcher's file is left exactly as it was
         assert launcher.read_bytes().count(b"BEGIN CERT") == 1
+
+
+class TestCaIsPublishedEveryLaunch:
+    """The launcher builds its merged bundle from ca-trust.d/ as it starts us,
+    so our CA has to be there BEFORE the client is exec'd, on every launch —
+    not only when another CA happens to be in play, and not only after the
+    daemon has run once. A component whose cert dir was wiped must reappear on
+    the next launch instead of staying silently absent."""
+
+    def _switcher(self, tmp_path):
+        class _Sw:
+            backup_dir = tmp_path
+
+            @staticmethod
+            def resolve_account(email):
+                return "1", "pinned@example.com", "org"
+
+        return _Sw()
+
+    def _cfg(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        return home
+
+    def test_first_ever_launch_publishes_before_any_daemon_ran(
+        self, tmp_path, monkeypatch
+    ):
+        import claude_swap.pin_proxy as pp
+
+        home = self._cfg(tmp_path, monkeypatch)
+        monkeypatch.setattr(pp, "load_pin", lambda d: ("pinned@example.com", "org"))
+        monkeypatch.setattr(pp, "write_upstream_hint", lambda *a, **k: None)
+        monkeypatch.setattr(pp, "_read_alive_port", lambda d, fingerprint=None: 51000)
+        monkeypatch.setattr(pp, "wire_global_config", lambda *a, **k: True)
+
+        pp.ensure_proxy(self._switcher(tmp_path))
+
+        published = home / pp.CA_TRUST_DIR / "cswap-pin.pem"
+        assert published.exists(), "nothing to merge on a cold start"
+        assert b"BEGIN CERTIFICATE" in published.read_bytes()
+
+    def test_a_wiped_trust_dir_is_repopulated_next_launch(self, tmp_path, monkeypatch):
+        import claude_swap.pin_proxy as pp
+
+        home = self._cfg(tmp_path, monkeypatch)
+        monkeypatch.setattr(pp, "load_pin", lambda d: ("pinned@example.com", "org"))
+        monkeypatch.setattr(pp, "write_upstream_hint", lambda *a, **k: None)
+        monkeypatch.setattr(pp, "_read_alive_port", lambda d, fingerprint=None: 51000)
+        monkeypatch.setattr(pp, "wire_global_config", lambda *a, **k: True)
+        sw = self._switcher(tmp_path)
+
+        pp.ensure_proxy(sw)
+        published = home / pp.CA_TRUST_DIR / "cswap-pin.pem"
+        published.unlink()
+
+        pp.ensure_proxy(sw)
+        assert published.exists(), "a wiped trust dir stayed empty"
+
+    def test_publishing_does_not_depend_on_another_ca_being_present(
+        self, tmp_path, monkeypatch
+    ):
+        """The earlier version only published from inside the merge path, so a
+        user running no other MITM never had a CA published at all."""
+        import claude_swap.pin_proxy as pp
+
+        home = self._cfg(tmp_path, monkeypatch)
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        monkeypatch.setattr(pp, "load_pin", lambda d: ("pinned@example.com", "org"))
+        monkeypatch.setattr(pp, "write_upstream_hint", lambda *a, **k: None)
+        monkeypatch.setattr(pp, "read_upstream_ca", lambda d: None)
+        monkeypatch.setattr(pp, "_read_alive_port", lambda d, fingerprint=None: 51000)
+        monkeypatch.setattr(pp, "wire_global_config", lambda *a, **k: True)
+
+        pp.ensure_proxy(self._switcher(tmp_path))
+        assert (home / pp.CA_TRUST_DIR / "cswap-pin.pem").exists()
