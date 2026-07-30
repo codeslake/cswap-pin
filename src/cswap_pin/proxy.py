@@ -398,7 +398,9 @@ def _wire_global_config_locked(
     return True
 
 
-def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
+def _ambient_proxy(
+    env: dict[str, str] | None = None, certdir: Path | None = None
+) -> str | None:
     """The egress proxy this launch inherited, or ``None`` for a direct dial.
 
     Skips a value that already points at OUR daemon: a shell that ran
@@ -427,17 +429,32 @@ def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
     # privoxy:8118 while CCF on :9901 (whose own upstream IS 8118) was left
     # bypassed for every pinned session. Prefer the recorded one when it is
     # still serving — it is the inner link, and it reaches this one anyway.
-    prev = _wired_over_proxy()
-    prev_parsed = parse_upstream_proxy(prev)
-    if (
-        prev_parsed is not None
-        and prev_parsed != parsed
-        and prev_parsed[0] in _LOOPBACK
-        and prev_parsed[1] != _self_port(src)
-        and _port_is_serving(*prev_parsed)
-    ):
-        return prev
+    # Two places can name the inner proxy: what our env block displaced on a
+    # previous launch, and what a previous launch recorded as the chain. Try
+    # the displaced value first — it is the most direct evidence — then the
+    # recorded one, which is the only source on a machine where our block has
+    # never displaced anything (measured: work-mac, where every shell exports
+    # the machine-wide proxy, so the displaced value is empty and re-pinning
+    # from any shell kept dropping the launcher's proxy out of the chain).
+    for prev in (_wired_over_proxy(), _recorded_upstream(certdir)):
+        prev_parsed = parse_upstream_proxy(prev)
+        if (
+            prev_parsed is not None
+            and prev_parsed != parsed
+            and prev_parsed[0] in _LOOPBACK
+            and prev_parsed[1] != _self_port(src)
+            and _port_is_serving(*prev_parsed)
+        ):
+            return prev
     return value
+
+
+def _recorded_upstream(certdir: Path | None) -> str | None:
+    """The chain a previous launch recorded, as a URL. See the caller."""
+    if certdir is None:
+        return None
+    prev = read_upstream_hint(certdir)
+    return f"http://{prev[0]}:{prev[1]}" if prev else None
 
 
 def _port_is_serving(host: str, port: int) -> bool:
@@ -884,7 +901,9 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     # environment that happened to exist when it spawned: a wrapper that sets
     # a proxy, one that moved ports, or one that went away entirely.
     write_upstream_hint(
-        certdir, _ambient_proxy(), os.environ.get("NODE_EXTRA_CA_CERTS")
+        certdir,
+        _ambient_proxy(certdir=certdir),
+        os.environ.get("NODE_EXTRA_CA_CERTS"),
     )
     fp = daemon_fingerprint(account_num, email)
 

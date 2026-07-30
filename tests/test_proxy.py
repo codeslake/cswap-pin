@@ -1766,3 +1766,67 @@ class TestNarrowingIsDeliberatelyUnguarded:
         # was [corp root + ours], now just ours
         merged.write_bytes(ca.read_bytes() + b"\n")
         assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(merged)
+
+
+class TestRecordedChainSurvivesARepin:
+    """Re-pinning from an ordinary shell must not drop the launcher's proxy
+    out of the chain.
+
+    A launcher starts a per-session cache proxy and points the SESSION at it;
+    every shell on the machine, including the one a re-pin runs in, sees only
+    the machine-wide egress proxy that cache proxy itself chains to. Taking the
+    shell's value silently shortens the chain. Measured on work-mac: chain went
+    127.0.0.1:9901 -> 127.0.0.1:8118 across a re-pin, i.e. the cache proxy was
+    bypassed for every pinned session afterwards, with nothing failing.
+
+    The earlier fix only consulted what our env block had displaced, which is
+    empty on a machine where it has never displaced anything — exactly the
+    machine that needed it."""
+
+    def _serving(self):
+        import socket as s
+        srv = s.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        return srv, srv.getsockname()[1]
+
+    def test_recorded_chain_wins_over_the_shell_value(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import _ambient_proxy, write_upstream_hint
+
+        srv, inner = self._serving()
+        try:
+            certdir = tmp_path / "pin-proxy"
+            certdir.mkdir()
+            write_upstream_hint(certdir, f"http://127.0.0.1:{inner}")
+            monkeypatch.setattr("claude_swap.paths.get_global_config_path",
+                                lambda: tmp_path / "absent.json")
+            got = _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}, certdir)
+            assert got == f"http://127.0.0.1:{inner}", "the chain was shortened"
+        finally:
+            srv.close()
+
+    def test_a_dead_recorded_chain_does_not_strand_us(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import _ambient_proxy, write_upstream_hint
+
+        srv, dead = self._serving()
+        srv.close()
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        monkeypatch.setattr("claude_swap.paths.get_global_config_path",
+                            lambda: tmp_path / "absent.json")
+        assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}, certdir) == (
+            "http://127.0.0.1:8118"
+        )
+
+    def test_no_record_and_no_displaced_value_keeps_the_shell(self, tmp_path, monkeypatch):
+        """A first-ever pin on a machine with no launcher: unchanged."""
+        from claude_swap.pin_proxy import _ambient_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_global_config_path",
+                            lambda: tmp_path / "absent.json")
+        assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}, certdir) == (
+            "http://127.0.0.1:8118"
+        )
