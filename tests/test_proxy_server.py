@@ -991,3 +991,109 @@ class TestBlindTunnelIsTraced:
         )
         # It must also say the pin cannot apply there — that is the whole point.
         assert "no pin" in text, text
+
+
+class TestBlindTunnelFallsBackWhenChainRefuses:
+    """Remote Control RECEIVES over a WebSocket to the ingress host the /bridge
+    response names — a host the egress proxy has no forwarding rule for. A
+    filtering chain (privoxy with per-domain forwards, a corporate MITM) can
+    refuse the CONNECT outright, and closing on that refusal made a session
+    silently deaf: heartbeat and worker/events kept answering 200 through the
+    MITM path, the pin still read as applied, and nothing sent from claude.ai
+    ever arrived. Measured on work-mac against a machine whose chain did let
+    the host through, where the same session received normally."""
+
+    def _refusing_chain(self):
+        """A proxy that answers every CONNECT with 403."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    while True:
+                        line = c.recv(4096)
+                        if not line or b"\r\n\r\n" in line:
+                            break
+                    c.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return srv
+
+    def test_direct_dial_when_the_chain_refuses_the_ingress_host(
+        self, certdir, tmp_path
+    ):
+        import claude_swap.pin_proxy as pp
+
+        chain = self._refusing_chain()
+
+        # Stands in for the ingress host: accepts and echoes, proving the
+        # tunnel reached it directly rather than dying at the chain.
+        peer = socket.socket()
+        peer.bind(("127.0.0.1", 0))
+        peer.listen(2)
+        peer_port = peer.getsockname()[1]
+        reached = threading.Event()
+
+        def serve_peer():
+            try:
+                c, _ = peer.accept()
+            except OSError:
+                return
+            reached.set()
+            try:
+                data = c.recv(64)
+                if data:
+                    c.sendall(b"PONG")
+            finally:
+                c.close()
+
+        threading.Thread(target=serve_peer, daemon=True).start()
+
+        log = tmp_path / "trace.log"
+        prev = pp._TRACE
+        pp._TRACE = open(log, "a")
+        try:
+            proxy = pp.PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: "PINTOKEN",
+                upstream=("127.0.0.1", 1),
+            )
+            # The recorded chain refuses everything.
+            proxy._current_chain = lambda: ("127.0.0.1", chain.getsockname()[1])
+            proxy.start()
+            try:
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+                raw.sendall(
+                    f"CONNECT 127.0.0.1:{peer_port} HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{peer_port}\r\n\r\n".encode()
+                )
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    assert chunk, "proxy closed instead of falling back to a direct dial"
+                    resp += chunk
+                assert b"200" in resp.split(b"\r\n")[0], resp[:80]
+                raw.sendall(b"PING")
+                assert raw.recv(16) == b"PONG", "tunnel did not reach the host"
+                raw.close()
+            finally:
+                proxy.stop()
+                peer.close()
+                chain.close()
+            pp._TRACE.flush()
+        finally:
+            pp._TRACE.close()
+            pp._TRACE = prev
+
+        assert reached.is_set(), "the ingress host was never dialled"
+        assert "chain refused" in log.read_text(), log.read_text()

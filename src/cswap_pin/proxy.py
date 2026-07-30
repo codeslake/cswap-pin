@@ -1651,8 +1651,19 @@ class PinProxy:
                 f"tunnelled (no pin: bearer never seen)\n"
             )
             _TRACE.flush()
-        try:
-            if chain:
+        up = None
+        if chain:
+            # Try the chain first, but never let it be the only answer. Remote
+            # Control RECEIVES over a WebSocket to the ingress host named in the
+            # /bridge response — a host the egress proxy has no rule for, and
+            # which a filtering proxy (privoxy with per-domain forwards, a
+            # corporate MITM) may refuse outright. Closing here made that
+            # refusal invisible: the session kept heartbeating and posting
+            # events through the MITM path at 200, the pin still read as
+            # applied, and nothing sent from claude.ai ever arrived. Measured
+            # on work-mac, where the same session on a machine whose chain let
+            # the host through received normally.
+            try:
                 up = socket.create_connection(chain, timeout=15)
                 up.sendall(
                     f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("latin1")
@@ -1663,14 +1674,24 @@ class PinProxy:
                     if h in ("", None):
                         break
                 if not status or " 200" not in status:
+                    # Refused BY the chain (not a transport failure) — the one
+                    # case where a direct dial is both correct and necessary.
+                    if _TRACE is not None:
+                        _TRACE.write(
+                            f"[c{getattr(self._local, 'cid', 0)}] chain refused "
+                            f"{target} ({(status or '').strip()}) — dialling direct\n"
+                        )
+                        _TRACE.flush()
                     up.close()
-                    conn.close()
-                    return
-            else:
+                    up = None
+            except OSError:
+                up = None
+        if up is None:
+            try:
                 up = socket.create_connection((host, port), timeout=15)
-        except OSError:
-            conn.close()
-            return
+            except OSError:
+                conn.close()
+                return
         # Connect budget only — a tunnel is long-lived by definition, and a
         # read timeout left on it would tear down an idle-but-healthy stream.
         up.settimeout(None)
