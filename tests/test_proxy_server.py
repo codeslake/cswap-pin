@@ -1267,3 +1267,98 @@ class TestTheTrustFileActuallyVerifies:
             assert self._handshake(proxy.port, None).startswith("FAIL:")
         finally:
             proxy.stop()
+
+
+class TestFailOpenIsNotSilent:
+    """The token swap fails OPEN by design — a pin that cannot resolve must
+    never block work. The cost is that nothing marks it: requests keep
+    succeeding, /health keeps answering, and the consequence surfaces days
+    later as Remote Control sessions owned by the wrong account, which the
+    server fixes at /bridge and never transfers. Measured: a daemon that could
+    not reach its credential store served 13 of 13 pinned routes unswapped, and
+    19 sessions had to be rebuilt by hand. Fail open, but say so."""
+
+    def _proxy(self, certdir, provider):
+        from claude_swap.pin_proxy import PinProxy
+        return PinProxy(certdir=certdir, pin_token_provider=provider,
+                        upstream=("127.0.0.1", 1))
+
+    def test_warns_when_the_token_cannot_be_minted(self, certdir, monkeypatch):
+        import io
+        import sys as _sys
+
+        buf = io.StringIO()
+        monkeypatch.setattr(_sys, "stderr", buf)
+        self._proxy(certdir, lambda: None)._warn_unpinnable()
+        err = buf.getvalue()
+        assert "UNPINNED" in err
+        assert "cswap pin" in err, "the message must name the fix"
+
+    def test_warns_only_once_per_daemon(self, certdir, monkeypatch):
+        """A pinned session makes these calls continuously; a line each would
+        bury the signal it exists to be."""
+        import io
+        import sys as _sys
+
+        buf = io.StringIO()
+        monkeypatch.setattr(_sys, "stderr", buf)
+        p = self._proxy(certdir, lambda: None)
+        for _ in range(5):
+            p._warn_unpinnable()
+        assert buf.getvalue().count("UNPINNED") == 1
+
+    def test_health_reports_whether_the_pin_can_apply(self, certdir):
+        """A daemon being up is not the same as the pin working. The sweep
+        needs the second fact, and only the daemon can answer it."""
+        import json as _json, socket as _s
+        for provider, expect in ((lambda: "TOK", True), (lambda: None, False)):
+            p = self._proxy(certdir, provider)
+            p.start()
+            try:
+                c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+                c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+                body = buf.partition(b"\r\n\r\n")[2]
+                while not body.endswith(b"}"):
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    body += d
+                c.close()
+                assert _json.loads(body)["can_pin"] is expect
+            finally:
+                p.stop()
+
+    def test_a_raising_provider_reports_cannot_pin(self, certdir):
+        """Health must never take the daemon down, whatever the store does."""
+        import json as _json, socket as _s
+
+        def boom():
+            raise RuntimeError("keychain unavailable")
+
+        p = self._proxy(certdir, boom)
+        p.start()
+        try:
+            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+            c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(4096)
+                if not d:
+                    break
+                buf += d
+            body = buf.partition(b"\r\n\r\n")[2]
+            while not body.endswith(b"}"):
+                d = c.recv(4096)
+                if not d:
+                    break
+                body += d
+            c.close()
+            assert _json.loads(body)["can_pin"] is False
+        finally:
+            p.stop()
