@@ -1073,12 +1073,46 @@ def _install_signal_teardown(cleanup) -> None:
 
 _STATE_FILE = "proxy.json"
 _FIFO_NAME = "refcount.fifo"
+_LOG_NAME = "daemon.log"
+_LOG_MAX_BYTES = 64 * 1024
 
 
 def refcount_fifo_path(certdir: Path) -> Path:
     """Path of the refcount FIFO. Sessions hold a write fd on it; the daemon
     reads it and exits when the last holder closes (CCF's FIFO refcount)."""
     return Path(certdir) / _FIFO_NAME
+
+
+def daemon_log_path(certdir: Path) -> Path:
+    """Where the detached daemon's stderr goes.
+
+    The daemon has no terminal, so a warning it writes to stderr reaches
+    nobody unless it is given a destination here. Measured on three machines:
+    with ``stderr=DEVNULL`` every fail-open was silent by construction, which
+    is precisely what :meth:`PinProxy._warn_unpinnable` exists to prevent.
+    """
+    return Path(certdir) / _LOG_NAME
+
+
+def _open_daemon_log(certdir: Path):
+    """Open :func:`daemon_log_path` for append, or fall back to DEVNULL.
+
+    Truncates once it passes ``_LOG_MAX_BYTES`` — a daemon that cannot mint
+    warns once per process, but nothing stops a supervisor respawning it, and
+    an unbounded log in the cert dir is its own defect. Returns a file object
+    the caller owns; a directory that cannot be written degrades to discarding
+    output rather than failing the spawn, because a pin must never block a
+    launch.
+    """
+    import subprocess
+
+    path = daemon_log_path(certdir)
+    try:
+        if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
+            path.unlink()
+        return open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except OSError:
+        return subprocess.DEVNULL
 
 
 def watch_refcount(fifo: str | Path, on_last_holder_gone) -> None:
@@ -1225,12 +1259,25 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
             os.mkfifo(fifo)
         except FileExistsError:
             pass
-    subprocess.Popen(
-        [sys.executable, "-m", "claude_swap.pin_proxy", account_num, email, str(certdir)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # stderr goes to a file, not DEVNULL: the daemon is detached and has no
+    # terminal, so _warn_unpinnable would otherwise write into nothing and
+    # every fail-open would stay silent — the exact outcome that warning
+    # exists to prevent. stdout stays discarded; the daemon prints nothing
+    # there and a log that also carries chatter buries the one line worth
+    # reading.
+    log = _open_daemon_log(certdir)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "claude_swap.pin_proxy", account_num, email, str(certdir)],
+            stdout=subprocess.DEVNULL,
+            stderr=log,
+            start_new_session=True,
+        )
+    finally:
+        # The child holds its own dup of the fd; ours would otherwise leak on
+        # every spawn.
+        if hasattr(log, "close"):
+            log.close()
     for _ in range(100):  # up to ~10s (first run generates RSA keys)
         port = _read_alive_port(certdir)
         if port is not None:

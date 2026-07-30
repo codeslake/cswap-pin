@@ -7,6 +7,7 @@ original on everything else.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import socket
@@ -1293,6 +1294,59 @@ class TestFailOpenIsNotSilent:
         err = buf.getvalue()
         assert "UNPINNED" in err
         assert "cswap pin" in err, "the message must name the fix"
+
+    def test_the_spawned_daemon_has_somewhere_to_warn(self, certdir, monkeypatch):
+        """The warning above is written to the daemon's stderr, and the daemon
+        is spawned detached — so whether it reaches anyone is decided by
+        spawn_daemon, not by the writer. Measured on all three machines: the
+        daemon's fd 2 was /dev/null, meaning every fail-open was silent by
+        construction while two tests above asserted the message "works" against
+        a substituted stderr. A warning with no destination is the bug it
+        exists to report."""
+        import subprocess as _sp
+        from claude_swap import pin_proxy as pp
+
+        seen = {}
+
+        class _FakePopen:
+            def __init__(self, argv, **kw):
+                seen.update(kw)
+                seen["argv"] = argv
+
+        monkeypatch.setattr(_sp, "Popen", _FakePopen)
+        # Return a port on the first poll so spawn_daemon stops immediately —
+        # we only care about how it tried to spawn, not about waiting out the
+        # ~10s window for a daemon this test never starts.
+        monkeypatch.setattr(pp, "_read_alive_port", lambda *a, **k: 4321)
+        monkeypatch.setattr(pp, "read_daemon_state", lambda *a, **k: None)
+        monkeypatch.setattr(pp, "_sweep_orphan_daemons", lambda *a, **k: None)
+        pp._spawn_daemon("1", "a@b.c", certdir)
+
+        assert seen["stderr"] is not _sp.DEVNULL, (
+            "stderr=DEVNULL gives _warn_unpinnable nowhere to land"
+        )
+        log = pp.daemon_log_path(certdir)
+        assert seen["stderr"].name == str(log), (
+            f"expected the daemon's stderr on {log}, got {seen['stderr']!r}"
+        )
+
+    def test_the_warning_lands_in_that_log(self, certdir):
+        """End to end through the real file object spawn_daemon opens: write
+        the warning to it and read it back off disk. The two tests above pass a
+        StringIO and so cannot see a destination that does not exist."""
+        from claude_swap import pin_proxy as pp
+
+        log = pp.daemon_log_path(certdir)
+        handle = pp._open_daemon_log(certdir)
+        try:
+            p = self._proxy(certdir, lambda: None)
+            with contextlib.redirect_stderr(handle):
+                p._warn_unpinnable()
+        finally:
+            handle.close()
+        body = log.read_text(encoding="utf-8")
+        assert "UNPINNED" in body
+        assert "cswap pin" in body
 
     def test_warns_only_once_per_daemon(self, certdir, monkeypatch):
         """A pinned session makes these calls continuously; a line each would
