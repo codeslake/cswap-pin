@@ -1076,13 +1076,64 @@ class TestAutoViewPinBadge:
         out = self._rows(tmp_path, [self._acct(1, "a@co.com"), self._acct(2, "b@co.com")])
         assert "○ cloud" not in out
 
-    def test_summary_line_never_names_the_pin(self, tmp_path):
-        """The regression being fixed: the pin must not be spelled out twice."""
-        import inspect
+    def test_summary_line_never_names_the_pin(self, tmp_path, monkeypatch):
+        """The regression being fixed: the pin must not be spelled out twice.
+
+        Asserts on the RENDERED line, not on the source. An earlier version of
+        this grepped _update_summary for the word "cloud"; putting the pin back
+        under any other wording — "pinned: <email>" — passed it. A source
+        search answers "is this token present", never "does this line name the
+        pin", and the rewording that defeats it is the one a future edit would
+        naturally use.
+        """
+        from claude_swap.pin_proxy import save_pin
         from claude_swap.tui.autoview import AutoScreen
 
-        src = inspect.getsource(AutoScreen._update_summary)
-        assert "cloud" not in src, "the summary line names the pin again"
+        email = "codeslake@gmail.com"
+        save_pin(tmp_path, email, "org-1")
+
+        class _T:
+            primary = secondary = foreground = "#fff"
+            success = warning = error = "#fff"
+            variables: dict = {}
+
+        class _App:
+            class switcher:
+                pass
+
+            current_theme = _T()
+
+        app = _App()
+        app.switcher.backup_dir = tmp_path
+
+        class _Settings:
+            threshold = 90.0
+            interval_seconds = 360.0
+            model = ""
+
+        written = {}
+
+        class _Widget:
+            def update(self, text):
+                written["line"] = text.plain
+
+        class _Stub:
+            pass
+
+        stub = _Stub()
+        stub.app = app
+        stub._settings = _Settings()
+        stub._configured_threshold = _Settings.threshold
+        stub._adjusting = False
+        stub.query_one = lambda *a, **k: _Widget()
+        stub._pinned_email = lambda: AutoScreen._pinned_email(stub)
+
+        AutoScreen._update_summary(stub)
+        line = written["line"]
+        # The load-bearing one: fails on ANY wording that spells the pin out.
+        assert email not in line, f"summary names the pin: {line!r}"
+        assert "cloud" not in line.lower(), line
+        assert "pinned" not in line.lower(), line
 
 
 class TestKillDaemon:
