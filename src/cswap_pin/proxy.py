@@ -23,6 +23,7 @@ import re
 import selectors
 import select
 import socket
+import sys
 import ssl
 import threading
 from dataclasses import dataclass
@@ -1463,6 +1464,38 @@ class PinProxy:
             except OSError:
                 pass
 
+    def _warn_unpinnable(self) -> None:
+        """Say once, on stderr, that the pin is not being applied.
+
+        The swap fails open on purpose, so nothing else marks this: requests
+        keep succeeding, the daemon keeps answering /health, and the only
+        visible consequence arrives later as Remote Control sessions owned by
+        the wrong account with no way to transfer them. Measured: a daemon that
+        could not reach its credential store served every pinned route
+        unswapped and 19 sessions had to be rebuilt by hand.
+
+        Once per daemon, not per request — a pinned session makes these calls
+        continuously and a line each would bury the signal it is meant to be.
+        """
+        if getattr(self, "_warned_unpinnable", False):
+            return
+        self._warned_unpinnable = True
+        try:
+            sys.stderr.write(
+                "cswap pin: the pinned account's token could not be read, so "
+                "requests are going out UNPINNED. Remote Control sessions "
+                "created now will belong to the active account permanently. "
+                "On macOS this is usually a daemon started outside the GUI "
+                "session, which cannot read the keychain; re-run `cswap pin` "
+                "from a normal terminal.\n"
+            )
+            sys.stderr.flush()
+        # Only a broken stderr — a bare `except Exception` here swallowed a
+        # missing import and left the warning silently dead, which is the same
+        # class of bug this warning exists to surface.
+        except OSError:
+            pass
+
     def _serve_health(self, conn: socket.socket) -> None:
         import json
 
@@ -1472,7 +1505,21 @@ class PinProxy:
         # request goes through one sends the next diagnosis the wrong way.
         current = self._current_chain()
         chain = f"{current[0]}:{current[1]}" if current else None
-        body = json.dumps({"pin_proxy": True, "port": self.port, "chain": chain})
+        # Whether the pin can actually be APPLIED, not merely that a daemon is
+        # up. The swap fails open by design — a request whose token cannot be
+        # minted still goes out, on the disk bearer — so a daemon that cannot
+        # read its own credential store serves unpinned traffic while every
+        # visible signal stays green. Measured: a daemon started over ssh
+        # cannot reach the macOS keychain, and 13 of 13 pinned routes went out
+        # unswapped; the RC sessions born in that window are owned by the
+        # active account forever, and nothing said so.
+        try:
+            can_pin = bool(self._pin_token_provider())
+        except Exception:
+            can_pin = False
+        body = json.dumps(
+            {"pin_proxy": True, "port": self.port, "chain": chain, "can_pin": can_pin}
+        )
         try:
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -1573,6 +1620,18 @@ class PinProxy:
                     for k, v in headers
                 ]
                 swapped = True
+            else:
+                # Fail-open: the request still goes, on the disk bearer. That is
+                # deliberate — a pin that cannot resolve must never block work —
+                # but it is silent, and silence here is expensive. A Remote
+                # Control session created on this path is owned by the ACTIVE
+                # account permanently; the server fixes ownership at /bridge and
+                # there is no transfer. Measured: a daemon that could not reach
+                # the credential store served 13 pinned routes unswapped, and
+                # every RC session born in that window had to be recreated by
+                # hand. Say it once per daemon so the cause is on the record
+                # before the consequence shows up days later.
+                self._warn_unpinnable()
         if self._debug:
             hdrs = " | ".join(
                 f"{k}: {v[:60]}" for k, v in headers
