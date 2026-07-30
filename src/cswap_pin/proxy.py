@@ -187,10 +187,19 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
         shared = get_claude_config_home() / CA_TRUST_FILE
         if shared.is_file() and shared.stat().st_size > 0:
             ours = Path(ca_path).read_bytes().strip()
-            # Only trust it once it actually carries us; a launcher that has
-            # not rebuilt since we published would otherwise strand this
-            # session without its own CA.
-            if ours and ours in shared.read_bytes():
+            body = shared.read_bytes()
+            # Carrying our CA is necessary but not sufficient. An unbalanced
+            # BEGIN/END anywhere in the file makes Node reject the WHOLE extras
+            # bundle — every component CA and every corporate root at once —
+            # and it says so only in a stderr warning, so the session dies on
+            # "unable to verify the first certificate" with no visible cause.
+            # Checking that we are in there cannot see that; count the markers.
+            if (
+                ours
+                and ours in body
+                and body.count(b"-----BEGIN CERTIFICATE-----")
+                == body.count(b"-----END CERTIFICATE-----")
+            ):
                 return shared
     except Exception:
         pass
@@ -229,6 +238,15 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
     Deliberately knows nothing about which proxies exist: with no launcher and
     no other MITM the directory is simply unread, and behaviour is unchanged.
     Best-effort — trust plumbing must never block a launch.
+
+    Written ATOMICALLY, which the contract needs rather than merely prefers: a
+    builder reads this directory while N producers write it on their own
+    schedules, and a reader that catches a half-written PEM does not get a
+    partial bundle — Node refuses the WHOLE extras file
+    (``PEM routines::bad end line``, on stderr, not an error) and then trusts
+    no component CA and no corporate root at all. The session dies on
+    ``unable to verify the first certificate`` with the cause in a warning
+    nobody reads. A truncate-then-write is exactly what produces that state.
     """
     try:
         from claude_swap.paths import get_claude_config_home
@@ -242,7 +260,14 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
         # launcher's own rebuild check keys on.
         if out.exists() and out.read_bytes().strip() == ours:
             return out
-        out.write_bytes(ours + b"\n")
+        # Same directory, so the rename cannot cross a filesystem and stays
+        # atomic; the pid keeps two concurrent launches off each other's temp.
+        tmp = out.with_name(f"{out.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_bytes(ours + b"\n")
+            os.replace(tmp, out)
+        finally:
+            tmp.unlink(missing_ok=True)
         return out
     except Exception:
         return None
