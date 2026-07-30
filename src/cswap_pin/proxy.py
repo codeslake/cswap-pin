@@ -299,7 +299,35 @@ def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
     host, port = parsed
     if host in _LOOPBACK and port == _self_port(src):
         return _wired_over_proxy(src)
+    # This shell has A proxy — but not necessarily the one Claude Code runs
+    # behind. A launcher (cc-wrapper) starts a per-session cache proxy and
+    # points HTTPS_PROXY at THAT; an ordinary shell, and every ssh shell, only
+    # has the machine-wide egress proxy the launcher itself chains to. Taking
+    # the shell's value then silently drops the launcher's proxy out of the
+    # chain: measured on work-mac, where `cswap pin` run over ssh recorded
+    # privoxy:8118 while CCF on :9901 (whose own upstream IS 8118) was left
+    # bypassed for every pinned session. Prefer the recorded one when it is
+    # still serving — it is the inner link, and it reaches this one anyway.
+    prev = _wired_over_proxy(src)
+    prev_parsed = parse_upstream_proxy(prev)
+    if (
+        prev_parsed is not None
+        and prev_parsed != parsed
+        and prev_parsed[0] in _LOOPBACK
+        and prev_parsed[1] != _self_port(src)
+        and _port_is_serving(*prev_parsed)
+    ):
+        return prev
     return value
+
+
+def _port_is_serving(host: str, port: int) -> bool:
+    """Whether something still accepts connections there. Cheap and local."""
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 
 def _wired_over_proxy(env: dict[str, str]) -> str | None:

@@ -1282,3 +1282,80 @@ class TestPinTokenRefreshIsSerialized:
             "one-time refresh token (invalid_grant risk)"
         )
         assert results == ["new"] * 8, f"threads got inconsistent tokens: {results}"
+
+
+class TestAmbientProxyPrefersTheLauncherProxy:
+    """cc-wrapper starts a per-session cache proxy (CCF) and points the
+    session's HTTPS_PROXY at it; CCF chains to the machine-wide egress proxy
+    (privoxy). An ssh shell has only the machine-wide one. Recording the
+    SHELL's value therefore drops CCF out of the chain — measured on work-mac,
+    where a `cswap pin` run over ssh recorded privoxy:8118 while CCF on :9901
+    stayed bypassed for every pinned session afterwards."""
+
+    def _serving_port(self):
+        import socket as s
+        srv = s.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        return srv, srv.getsockname()[1]
+
+    def _wire(self, tmp_path, monkeypatch, saved_proxy):
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"_cswapPinWiredKeysSaved": {"HTTPS_PROXY": saved_proxy}}))
+        monkeypatch.setattr("claude_swap.paths.get_global_config_path", lambda: cfg)
+
+    def test_recorded_launcher_proxy_wins_over_the_shell_one(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap.pin_proxy import _ambient_proxy
+
+        srv, ccf_port = self._serving_port()
+        try:
+            self._wire(tmp_path, monkeypatch, f"http://127.0.0.1:{ccf_port}")
+            # The ssh shell only knows the machine-wide egress proxy.
+            got = _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"})
+            assert got == f"http://127.0.0.1:{ccf_port}", (
+                "the launcher's proxy was dropped from the chain"
+            )
+        finally:
+            srv.close()
+
+    def test_shell_value_wins_when_the_recorded_one_is_dead(
+        self, tmp_path, monkeypatch
+    ):
+        """A stale record must never strand the chain on a port nothing serves."""
+        from claude_swap.pin_proxy import _ambient_proxy
+
+        srv, dead_port = self._serving_port()
+        srv.close()  # nothing listens there now
+        self._wire(tmp_path, monkeypatch, f"http://127.0.0.1:{dead_port}")
+        got = _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"})
+        assert got == "http://127.0.0.1:8118"
+
+    def test_same_proxy_in_both_places_is_unchanged(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import _ambient_proxy
+
+        self._wire(tmp_path, monkeypatch, "http://127.0.0.1:8118")
+        assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}) == (
+            "http://127.0.0.1:8118"
+        )
+
+    def test_a_non_loopback_record_is_not_preferred(self, tmp_path, monkeypatch):
+        """Only a LOCAL launcher proxy is the inner link worth restoring; a
+        corporate proxy recorded earlier must not override the live shell."""
+        from claude_swap.pin_proxy import _ambient_proxy
+
+        self._wire(tmp_path, monkeypatch, "http://proxy.corp.example:3128")
+        assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}) == (
+            "http://127.0.0.1:8118"
+        )
+
+    def test_our_own_port_is_never_recorded(self, tmp_path, monkeypatch):
+        """Unchanged behaviour: a shell that ran pin-env exports OUR port."""
+        from claude_swap.pin_proxy import _ambient_proxy
+
+        self._wire(tmp_path, monkeypatch, "http://127.0.0.1:8118")
+        got = _ambient_proxy(
+            {"HTTPS_PROXY": "http://127.0.0.1:44444", "CSWAP_PIN_PORT": "44444"}
+        )
+        assert got == "http://127.0.0.1:8118", "would have made the daemon loop to itself"
