@@ -165,38 +165,50 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
             )
     except OSError:
         return ca_path
-    _seed_launcher_bundle(ca_path, other_path)
+    publish_ca(ca_path)
     return bundle
 
 
-def _seed_launcher_bundle(ca_path: Path, other: Path) -> None:
-    """Also add our CA to the launcher's own bundle, in place.
+CA_TRUST_DIR = "ca-trust.d"
 
-    Our merged bundle only helps code that reads the env block we write.
-    Claude Code's Remote Control RECEIVE channel is an SSE stream opened
-    through a path that keeps the CA store the process was EXEC'd with — the
-    launcher's bundle — so a pinned session verified every request it sends
-    and failed every reconnect of the one it receives on, with
-    ``unable to verify the first certificate``, forever. Measured on work-mac:
-    13 consecutive SSE attempts, 0 connects, while worker/heartbeat and
-    client/presence answered 200 through the same proxy. The machine where
-    inbound worked had our CA in that bundle already.
 
-    Append-only and idempotent; a launcher that rebuilds its bundle simply
-    gets re-seeded on the next launch. Best-effort — the file belongs to
-    something else, so a failure here must never block a launch.
+def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
+    """Publish our CA where any component's launcher can pick it up.
+
+    ``NODE_EXTRA_CA_CERTS`` names ONE file, so every MITM in the chain that
+    writes it as an overwrite silently drops the others. Two already do it for
+    the same host, and each new one repeats the fight — which is how a pinned
+    session ended up verifying everything it SENDS while every Remote Control
+    SSE reconnect failed with ``unable to verify the first certificate``
+    (measured on work-mac: 13 attempts, 0 connects, while worker/heartbeat and
+    client/presence answered 200 in the same process).
+
+    So publish instead of overwrite: one file per component under
+    ``<claude-config>/ca-trust.d/``, named after the component, and nobody
+    touches anybody else's. A launcher concatenates the directory; a component
+    that only needs to be trusted just drops its file. Adding a proxy stops
+    being a negotiation.
+
+    Deliberately knows nothing about which proxies exist: with no launcher and
+    no other MITM the directory is simply unread, and behaviour is unchanged.
+    Best-effort — trust plumbing must never block a launch.
     """
     try:
-        ours = ca_path.read_bytes().strip()
+        from claude_swap.paths import get_claude_config_home
+
+        ours = Path(ca_path).read_bytes().strip()
         if not ours:
-            return
-        current = other.read_bytes()
-        if ours in current:
-            return
-        with open(other, "ab") as fh:
-            fh.write(b"\n" + ours + b"\n")
-    except OSError:
-        pass
+            return None
+        out = get_claude_config_home() / CA_TRUST_DIR / f"{name}.pem"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # Idempotent: rewriting on every launch would churn the mtime the
+        # launcher's own rebuild check keys on.
+        if out.exists() and out.read_bytes().strip() == ours:
+            return out
+        out.write_bytes(ours + b"\n")
+        return out
+    except Exception:
+        return None
 
 
 def wire_global_config(port: int | None, ca_path: Path | None) -> bool:

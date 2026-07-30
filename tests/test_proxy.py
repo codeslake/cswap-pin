@@ -1361,64 +1361,86 @@ class TestAmbientProxyPrefersTheLauncherProxy:
         assert got == "http://127.0.0.1:8118", "would have made the daemon loop to itself"
 
 
-class TestLauncherBundleIsSeeded:
-    """Remote Control's RECEIVE channel is an SSE stream, and it verifies
-    against the CA store the process was EXEC'd with — the launcher's bundle,
-    not the env block Claude Code applies at boot. So merging our CA only into
-    OUR bundle left a pinned session able to verify everything it SENDS while
-    every SSE reconnect failed with "unable to verify the first certificate".
-    Measured on work-mac: 13 attempts, 0 connects, while worker/heartbeat and
-    client/presence answered 200 through the same proxy. The machine where
-    inbound worked already had our CA in the launcher's bundle."""
+class TestCaIsPublishedToTheTrustDir:
+    """NODE_EXTRA_CA_CERTS names ONE file, so every MITM that writes it as an
+    overwrite drops the others. Two components already do that for the same
+    host. Measured consequence on work-mac: a pinned session verified every
+    request it SENDS while every Remote Control SSE reconnect failed with
+    "unable to verify the first certificate" — 13 attempts, 0 connects, while
+    worker/heartbeat and client/presence answered 200 in the same process.
 
-    def _setup(self, tmp_path):
+    So we publish one file under ca-trust.d/ and never touch anyone else's."""
+
+    def _cfg(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        return home
+
+    def _ca(self, tmp_path):
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir()
         ca = certdir / "ca.pem"
         ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
+        return ca
+
+    def test_publishes_one_file_named_after_the_component(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import CA_TRUST_DIR, publish_ca
+
+        home = self._cfg(tmp_path, monkeypatch)
+        out = publish_ca(self._ca(tmp_path))
+        assert out == home / CA_TRUST_DIR / "cswap-pin.pem"
+        assert b"PIN" in out.read_bytes()
+
+    def test_republishing_is_a_no_op(self, tmp_path, monkeypatch):
+        """Rewriting every launch would churn the mtime a launcher's own
+        rebuild check keys on."""
+        from claude_swap.pin_proxy import publish_ca
+
+        self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        first = publish_ca(ca)
+        before = first.stat().st_mtime_ns
+        assert publish_ca(ca) == first
+        assert first.stat().st_mtime_ns == before
+
+    def test_a_rotated_ca_replaces_our_file_only(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import CA_TRUST_DIR, publish_ca
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        publish_ca(ca)
+        # somebody else published theirs; it must survive our rotation
+        other = home / CA_TRUST_DIR / "ccf.pem"
+        other.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF\n-----END CERTIFICATE-----\n")
+        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN2\n-----END CERTIFICATE-----")
+        publish_ca(ca)
+        assert b"PIN2" in (home / CA_TRUST_DIR / "cswap-pin.pem").read_bytes()
+        assert b"CCF" in other.read_bytes(), "we clobbered another component's file"
+
+    def test_an_unwritable_config_home_does_not_raise(self, tmp_path, monkeypatch):
+        """Trust plumbing must never block a launch."""
+        import os
+        from claude_swap.pin_proxy import publish_ca
+
+        home = self._cfg(tmp_path, monkeypatch)
+        os.chmod(home, 0o500)
+        try:
+            assert publish_ca(self._ca(tmp_path)) is None
+        finally:
+            os.chmod(home, 0o700)
+
+    def test_merged_ca_still_returns_our_own_bundle(self, tmp_path, monkeypatch):
+        """Publishing is additive: the env block we write is unchanged."""
+        from claude_swap.pin_proxy import _merged_ca
+
+        self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
         launcher = tmp_path / "cache-fix-ca" / "combined-ca.pem"
         launcher.parent.mkdir(parents=True)
         launcher.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF\n-----END CERTIFICATE-----\n")
-        return ca, launcher
-
-    def test_our_ca_is_appended_to_the_launcher_bundle(self, tmp_path):
-        from claude_swap.pin_proxy import _merged_ca
-
-        ca, launcher = self._setup(tmp_path)
-        _merged_ca(ca, str(launcher))
-        text = launcher.read_bytes()
-        assert b"PIN" in text, "SSE would never verify the pin proxy"
-        assert b"CCF" in text, "the launcher's own CA must survive"
-
-    def test_seeding_is_idempotent(self, tmp_path):
-        from claude_swap.pin_proxy import _merged_ca
-
-        ca, launcher = self._setup(tmp_path)
-        _merged_ca(ca, str(launcher))
-        first = launcher.read_bytes()
-        _merged_ca(ca, str(launcher))
-        assert launcher.read_bytes() == first, "bundle grew on every launch"
-
-    def test_a_relaunch_after_the_launcher_rebuilt_reseeds(self, tmp_path):
-        from claude_swap.pin_proxy import _merged_ca
-
-        ca, launcher = self._setup(tmp_path)
-        _merged_ca(ca, str(launcher))
-        # launcher regenerates its bundle, dropping ours
-        launcher.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF2\n-----END CERTIFICATE-----\n")
-        _merged_ca(ca, str(launcher))
-        assert b"PIN" in launcher.read_bytes()
-
-    def test_an_unwritable_launcher_bundle_does_not_raise(self, tmp_path):
-        """The file belongs to something else; failing to seed must never
-        block a launch."""
-        import os
-        from claude_swap.pin_proxy import _merged_ca
-
-        ca, launcher = self._setup(tmp_path)
-        os.chmod(launcher, 0o444)
-        try:
-            out = _merged_ca(ca, str(launcher))
-        finally:
-            os.chmod(launcher, 0o644)
-        assert out.exists(), "the merged bundle must still be produced"
+        out = _merged_ca(ca, str(launcher))
+        assert out == ca.parent / "ca-bundle.pem"
+        assert b"PIN" in out.read_bytes() and b"CCF" in out.read_bytes()
+        # and the launcher's file is left exactly as it was
+        assert launcher.read_bytes().count(b"BEGIN CERT") == 1
