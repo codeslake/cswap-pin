@@ -1434,6 +1434,38 @@ class PinProxy:
             )
             self._debug.flush()
 
+        # Opt-in: when CSWAP_PIN_SHAPE names a file, record the message-array
+        # SHAPE of a /v1/messages request — role order and content-block types
+        # only, never text. A 400 like "role 'system' must precede an
+        # 'assistant' message or end the array" is a claim about that order,
+        # and the array is assembled at send time, so it exists nowhere on disk:
+        # this proxy is the only place it can be observed. Structure alone is
+        # enough to locate the offending position and keeps prompt text out of
+        # the log.
+        shape_path = os.environ.get("CSWAP_PIN_SHAPE")
+        if shape_path and body and path.startswith("/v1/messages"):
+            try:
+                payload = json.loads(body)
+                shape = [
+                    (m.get("role"),
+                     [b.get("type") for b in m["content"]]
+                     if isinstance(m.get("content"), list) else "str")
+                    for m in (payload.get("messages") or [])
+                ]
+                with open(shape_path, "a") as fh:
+                    fh.write(json.dumps({
+                        "cid": getattr(self._local, "cid", 0),
+                        "n": len(shape),
+                        "roles": [r for r, _ in shape],
+                        "head": shape[:4],
+                        "tail": shape[-4:],
+                        "has_output_config": any(
+                            "output_config" in m for m in (payload.get("messages") or [])
+                        ),
+                    }) + "\n")
+            except Exception:
+                pass
+
         keep = self._forward(method, path, headers, body, tls)
         # A client that asked to close gets closed regardless of the upstream.
         for k, v in headers:
