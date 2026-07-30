@@ -16,6 +16,7 @@ comment naming CCF is citing where a decision came from, not a dependency.
 from __future__ import annotations
 
 import datetime as _dt
+import itertools
 import json
 import os
 import re
@@ -1209,6 +1210,7 @@ class PinProxy:
         # Per-connection upstream socket. Each MITM connection is served on
         # its own thread, so a thread-local keeps one upstream per client.
         self._local = threading.local()
+        self._conn_seq = itertools.count(1)
         self._stop = False
         self.port = 0
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
@@ -1374,6 +1376,12 @@ class PinProxy:
                 pass
 
     def _mitm(self, conn: socket.socket) -> None:
+        # A per-CONNECTION id, not a thread id: threads are pooled and reused,
+        # so tagging with get_ident() made two sequential connections share a
+        # tag and the log could no longer pair a request with its response —
+        # which read as "this request never answered" and sent a live
+        # investigation down the wrong path twice.
+        self._local.cid = next(self._conn_seq)
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
         try:
@@ -1421,7 +1429,7 @@ class PinProxy:
                 )
             )
             self._debug.write(
-                f"[c{threading.get_ident() % 100000}] "
+                f"[c{getattr(self._local, 'cid', 0)}] "
                 f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n"
             )
             self._debug.flush()
@@ -1482,7 +1490,7 @@ class PinProxy:
                     _pump(up, client)
                 self._drop_upstream()
                 return False
-            return _relay_response(up, client)
+            return _relay_response(up, client, getattr(self._local, "cid", 0))
         except (OSError, ssl.SSLError):
             self._drop_upstream()
             return False
@@ -1702,7 +1710,7 @@ def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
     return buf.split(b"\r\n", 1)[0].split(b" ")[1:2] == [b"101"]
 
 
-def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
+def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket, cid: int = 0) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
 
@@ -1733,7 +1741,7 @@ def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
     status_line = lines[0] if lines and lines[0] else b"HTTP/1.1 502 Bad Gateway"
     if _TRACE is not None:
         _TRACE.write(
-            f"[c{threading.get_ident() % 100000}]     <- "
+            f"[c{cid}]     <- "
             f"{status_line.decode('latin1', 'replace')}\n"
         )
         _TRACE.flush()
