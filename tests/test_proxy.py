@@ -1359,3 +1359,66 @@ class TestAmbientProxyPrefersTheLauncherProxy:
             {"HTTPS_PROXY": "http://127.0.0.1:44444", "CSWAP_PIN_PORT": "44444"}
         )
         assert got == "http://127.0.0.1:8118", "would have made the daemon loop to itself"
+
+
+class TestLauncherBundleIsSeeded:
+    """Remote Control's RECEIVE channel is an SSE stream, and it verifies
+    against the CA store the process was EXEC'd with — the launcher's bundle,
+    not the env block Claude Code applies at boot. So merging our CA only into
+    OUR bundle left a pinned session able to verify everything it SENDS while
+    every SSE reconnect failed with "unable to verify the first certificate".
+    Measured on work-mac: 13 attempts, 0 connects, while worker/heartbeat and
+    client/presence answered 200 through the same proxy. The machine where
+    inbound worked already had our CA in the launcher's bundle."""
+
+    def _setup(self, tmp_path):
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ca = certdir / "ca.pem"
+        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
+        launcher = tmp_path / "cache-fix-ca" / "combined-ca.pem"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF\n-----END CERTIFICATE-----\n")
+        return ca, launcher
+
+    def test_our_ca_is_appended_to_the_launcher_bundle(self, tmp_path):
+        from claude_swap.pin_proxy import _merged_ca
+
+        ca, launcher = self._setup(tmp_path)
+        _merged_ca(ca, str(launcher))
+        text = launcher.read_bytes()
+        assert b"PIN" in text, "SSE would never verify the pin proxy"
+        assert b"CCF" in text, "the launcher's own CA must survive"
+
+    def test_seeding_is_idempotent(self, tmp_path):
+        from claude_swap.pin_proxy import _merged_ca
+
+        ca, launcher = self._setup(tmp_path)
+        _merged_ca(ca, str(launcher))
+        first = launcher.read_bytes()
+        _merged_ca(ca, str(launcher))
+        assert launcher.read_bytes() == first, "bundle grew on every launch"
+
+    def test_a_relaunch_after_the_launcher_rebuilt_reseeds(self, tmp_path):
+        from claude_swap.pin_proxy import _merged_ca
+
+        ca, launcher = self._setup(tmp_path)
+        _merged_ca(ca, str(launcher))
+        # launcher regenerates its bundle, dropping ours
+        launcher.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF2\n-----END CERTIFICATE-----\n")
+        _merged_ca(ca, str(launcher))
+        assert b"PIN" in launcher.read_bytes()
+
+    def test_an_unwritable_launcher_bundle_does_not_raise(self, tmp_path):
+        """The file belongs to something else; failing to seed must never
+        block a launch."""
+        import os
+        from claude_swap.pin_proxy import _merged_ca
+
+        ca, launcher = self._setup(tmp_path)
+        os.chmod(launcher, 0o444)
+        try:
+            out = _merged_ca(ca, str(launcher))
+        finally:
+            os.chmod(launcher, 0o644)
+        assert out.exists(), "the merged bundle must still be produced"

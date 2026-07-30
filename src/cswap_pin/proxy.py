@@ -165,7 +165,38 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
             )
     except OSError:
         return ca_path
+    _seed_launcher_bundle(ca_path, other_path)
     return bundle
+
+
+def _seed_launcher_bundle(ca_path: Path, other: Path) -> None:
+    """Also add our CA to the launcher's own bundle, in place.
+
+    Our merged bundle only helps code that reads the env block we write.
+    Claude Code's Remote Control RECEIVE channel is an SSE stream opened
+    through a path that keeps the CA store the process was EXEC'd with — the
+    launcher's bundle — so a pinned session verified every request it sends
+    and failed every reconnect of the one it receives on, with
+    ``unable to verify the first certificate``, forever. Measured on work-mac:
+    13 consecutive SSE attempts, 0 connects, while worker/heartbeat and
+    client/presence answered 200 through the same proxy. The machine where
+    inbound worked had our CA in that bundle already.
+
+    Append-only and idempotent; a launcher that rebuilds its bundle simply
+    gets re-seeded on the next launch. Best-effort — the file belongs to
+    something else, so a failure here must never block a launch.
+    """
+    try:
+        ours = ca_path.read_bytes().strip()
+        if not ours:
+            return
+        current = other.read_bytes()
+        if ours in current:
+            return
+        with open(other, "ab") as fh:
+            fh.write(b"\n" + ours + b"\n")
+    except OSError:
+        pass
 
 
 def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
