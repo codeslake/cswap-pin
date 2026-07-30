@@ -1200,3 +1200,70 @@ class TestOptimisticConnectIsDetected:
 
         assert reached.is_set(), "the host was never dialled directly"
         assert "already EOF" in log.read_text(), log.read_text()
+
+
+class TestTheTrustFileActuallyVerifies:
+    """Every other check on the CA-trust contract inspects file CONTENT — does
+    the bundle contain our CA, are its BEGIN/END markers balanced. Both are
+    necessary and neither is evidence: they are pre-flight guards, and only a
+    completed handshake proves the file yields a working trust path to the
+    proxy. Measured on lmd42 against the live daemon: with the merged bundle,
+    TLS OK, issuer "cswap pin-proxy CA"; with no extra CA,
+    UNABLE_TO_VERIFY_LEAF_SIGNATURE. This is that, in-process."""
+
+    def _handshake(self, proxy_port: int, cafile) -> str:
+        """CONNECT through the proxy and complete TLS, trusting only cafile."""
+        raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+        raw.sendall(
+            b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+            b"Host: api.anthropic.com:443\r\n\r\n"
+        )
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        assert b"200" in resp.split(b"\r\n")[0], resp[:80]
+        ctx = ssl.create_default_context(cafile=str(cafile)) if cafile else (
+            ssl.create_default_context()
+        )
+        try:
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            issuer = dict(x[0] for x in (tls.getpeercert() or {}).get("issuer", ()))
+            tls.close()
+            return issuer.get("commonName", "?")
+        except ssl.SSLError as e:
+            raw.close()
+            return f"FAIL:{e.reason}"
+
+    def test_the_named_trust_file_verifies_the_proxy(self, certdir, tmp_path, monkeypatch):
+        import claude_swap.pin_proxy as pp
+
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+
+        proxy = pp.PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PINTOKEN",
+            upstream=("127.0.0.1", 1),
+        )
+        proxy.start()
+        try:
+            ca = certdir / "ca.pem"
+            # A merged bundle exactly as a launcher would build it: someone
+            # else's root first, ours after.
+            merged = home / pp.CA_TRUST_FILE
+            merged.write_bytes(ca.read_bytes())
+            chosen = pp._trust_file(ca, None)
+            assert chosen == merged, "the contract's own selection did not pick it"
+
+            # The point of the test: what NODE_EXTRA_CA_CERTS names must
+            # actually verify the proxy, not merely mention it.
+            assert self._handshake(proxy.port, chosen) == "cswap pin-proxy CA"
+            # Control — without it the handshake must FAIL, or the assertion
+            # above proves nothing.
+            assert self._handshake(proxy.port, None).startswith("FAIL:")
+        finally:
+            proxy.stop()
