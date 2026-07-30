@@ -517,6 +517,25 @@ class TestWireGlobalConfig:
             == "http://127.0.0.1:9901"
         )
 
+    def test_an_all_proxy_we_added_is_removed_not_blanked(
+        self, tmp_path, monkeypatch
+    ):
+        """The common case is a launcher that exports ALL_PROXY fresh per
+        launch, so the config file never held one for us to displace. Unwiring
+        must then DELETE the key: an `ALL_PROXY=""` left in a block that is
+        applied to every launch on the machine is worse than no key at all."""
+        from pathlib import Path
+        from claude_swap.pin_proxy import wire_global_config
+        path = self._config(tmp_path, monkeypatch, {"env": {"FOO": "bar"}})
+
+        wire_global_config(9955, Path("/tmp/ca.pem"))
+        assert json.loads(path.read_text())["env"]["ALL_PROXY"].endswith(":9955")
+
+        wire_global_config(None, None)
+        env = json.loads(path.read_text())["env"]
+        assert "ALL_PROXY" not in env
+        assert env == {"FOO": "bar"}
+
     def test_unwire_restores_a_displaced_value(self, tmp_path, monkeypatch):
         """A launcher's own proxy is displaced while pinned and put BACK on
         clear — the env block lands on top of process.env, so silently
