@@ -1712,3 +1712,57 @@ class TestTornPemCannotEscape:
         )
         env = wire_env({}, 9955, ca)
         assert env["NODE_EXTRA_CA_CERTS"] == str(home / CA_TRUST_FILE)
+
+
+class TestNarrowingIsDeliberatelyUnguarded:
+    """A bundle that is balanced and contains our CA but has silently lost
+    OTHER roots is accepted on purpose.
+
+    A consumer cannot tell "narrowed" from "correctly small". Measured across
+    the three machines this runs on, a legitimate merged bundle is 2 certs on
+    one host and 132 on another, so any size floor that catches narrowing on
+    one rejects a healthy bundle on the next. Only the builder holds the
+    previous state that makes narrowing a regression rather than a fact.
+
+    The severity differs too: the two guarded cases leave the session unable to
+    verify its OWN proxy, so every request dies. Narrowing keeps our chain
+    intact and costs another component's. This test exists so a later change
+    that adds a cert-count floor fails here instead of breaking the host with
+    one component."""
+
+    def _cfg(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        return home
+
+    def _ca(self, tmp_path):
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ca = certdir / "ca.pem"
+        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
+        return ca
+
+    def test_a_single_cert_bundle_is_accepted(self, tmp_path, monkeypatch):
+        """The real shape on a host with one component and no corporate MITM."""
+        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        merged = home / CA_TRUST_FILE
+        merged.write_bytes(ca.read_bytes() + b"\n")
+        assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(merged)
+
+    def test_a_bundle_that_lost_other_roots_is_still_accepted(
+        self, tmp_path, monkeypatch
+    ):
+        """Narrowed but ours intact: our proxy still verifies, so refusing it
+        would trade a working session for a problem we cannot even diagnose."""
+        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        merged = home / CA_TRUST_FILE
+        # was [corp root + ours], now just ours
+        merged.write_bytes(ca.read_bytes() + b"\n")
+        assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(merged)
