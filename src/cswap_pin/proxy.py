@@ -21,6 +21,7 @@ import json
 import os
 import re
 import selectors
+import select
 import socket
 import ssl
 import threading
@@ -1635,6 +1636,25 @@ class PinProxy:
         sock.settimeout(None)
         return sock
 
+    @staticmethod
+    def _tunnel_is_open(up: socket.socket) -> bool:
+        """Whether a just-established tunnel is actually carrying, not EOF.
+
+        A CONNECT 200 means the proxy ACCEPTED the request, not that it reached
+        the host: privoxy answers optimistically and dials afterwards, closing
+        the socket when that dial fails. Peek for a closed read end — no client
+        byte has been sent yet, so a readable socket here can only mean EOF.
+        Never blocks: a healthy idle tunnel has nothing to read and reports not
+        ready, which is exactly the "open" answer.
+        """
+        try:
+            ready, _, _ = select.select([up], [], [], 0.35)
+            if not ready:
+                return True  # nothing to read == still open, the normal case
+            return bool(up.recv(1, socket.MSG_PEEK))
+        except OSError:
+            return False
+
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
@@ -1686,6 +1706,23 @@ class PinProxy:
                     up = None
             except OSError:
                 up = None
+        if up is not None and not self._tunnel_is_open(up):
+            # A 200 is not proof the chain reached the host. privoxy answers
+            # CONNECT optimistically and only then dials; when that dial fails
+            # it closes, so the tunnel is EOF the instant we look. Measured on
+            # work-mac against the RC ingress: "200 Connection established"
+            # followed by UNEXPECTED_EOF_WHILE_READING on the first TLS byte.
+            # Trusting the status alone made Remote Control silently deaf —
+            # everything Claude Code SENDS still went through the MITM path at
+            # 200 while the receive channel was a dead socket.
+            if _TRACE is not None:
+                _TRACE.write(
+                    f"[c{getattr(self._local, 'cid', 0)}] chain answered 200 but "
+                    f"the tunnel to {target} was already EOF — dialling direct\n"
+                )
+                _TRACE.flush()
+            up.close()
+            up = None
         if up is None:
             try:
                 up = socket.create_connection((host, port), timeout=15)

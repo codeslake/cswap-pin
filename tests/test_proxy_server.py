@@ -1097,3 +1097,106 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
 
         assert reached.is_set(), "the ingress host was never dialled"
         assert "chain refused" in log.read_text(), log.read_text()
+
+
+class TestOptimisticConnectIsDetected:
+    """A CONNECT 200 means the chain ACCEPTED the request, not that it reached
+    the host. privoxy answers optimistically and dials afterwards, closing the
+    socket when that dial fails — measured on work-mac against the Remote
+    Control ingress: "200 Connection established" followed immediately by
+    UNEXPECTED_EOF_WHILE_READING on the first TLS byte. Trusting the status
+    made RC silently deaf: everything Claude Code SENDS kept going through the
+    MITM path at 200 while the receive channel was a dead socket."""
+
+    def _optimistic_chain(self):
+        """Answers 200 to every CONNECT, then closes without connecting."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+                finally:
+                    c.close()          # the dial "failed" — EOF at once
+
+        threading.Thread(target=serve, daemon=True).start()
+        return srv
+
+    def test_falls_back_when_the_200_tunnel_is_already_eof(self, certdir, tmp_path):
+        import claude_swap.pin_proxy as pp
+
+        chain = self._optimistic_chain()
+
+        peer = socket.socket()
+        peer.bind(("127.0.0.1", 0))
+        peer.listen(2)
+        peer_port = peer.getsockname()[1]
+        reached = threading.Event()
+
+        def serve_peer():
+            try:
+                c, _ = peer.accept()
+            except OSError:
+                return
+            reached.set()
+            try:
+                if c.recv(64):
+                    c.sendall(b"PONG")
+            finally:
+                c.close()
+
+        threading.Thread(target=serve_peer, daemon=True).start()
+
+        log = tmp_path / "trace.log"
+        prev = pp._TRACE
+        pp._TRACE = open(log, "a")
+        try:
+            proxy = pp.PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: "PINTOKEN",
+                upstream=("127.0.0.1", 1),
+            )
+            proxy._current_chain = lambda: ("127.0.0.1", chain.getsockname()[1])
+            proxy.start()
+            try:
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+                raw.sendall(
+                    f"CONNECT 127.0.0.1:{peer_port} HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{peer_port}\r\n\r\n".encode()
+                )
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    assert chunk, "proxy closed instead of re-dialling"
+                    resp += chunk
+                assert b"200" in resp.split(b"\r\n")[0], resp[:80]
+                raw.sendall(b"PING")
+                assert raw.recv(16) == b"PONG", (
+                    "the tunnel was the chain's dead socket, not the host"
+                )
+                raw.close()
+            finally:
+                proxy.stop()
+                peer.close()
+                chain.close()
+            pp._TRACE.flush()
+        finally:
+            pp._TRACE.close()
+            pp._TRACE = prev
+
+        assert reached.is_set(), "the host was never dialled directly"
+        assert "already EOF" in log.read_text(), log.read_text()
