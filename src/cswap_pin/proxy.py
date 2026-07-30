@@ -1303,6 +1303,46 @@ def wire_env(
     return out
 
 
+def _arm_keepalive(sock: socket.socket) -> None:
+    """Make the kernel probe a silent peer, since nothing else will.
+
+    These sockets deliberately carry NO read timeout: Remote Control's inbound
+    channel holds its response open until the phone or web sends something, and
+    a deadline killed that every 15s. The cost of removing it is that a peer
+    which stops answering without closing is indistinguishable from a healthy
+    idle long poll, and the relay waits forever — measured: a compact request
+    parked at 95% with both socket queues at zero and the relay thread in
+    wait_woken for 13 minutes, on a connection the kernel still called
+    ESTABLISHED.
+
+    Keepalive separates the two without a deadline: an idle-but-live peer
+    answers the probe, a dead one does not and the read fails instead of
+    hanging. The system default only starts probing after two hours, which is
+    far past the point a user has given up. Best-effort — a platform without
+    these options simply keeps today's behaviour.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    # 60s idle, then probe every 15s, 4 strikes: a dead peer surfaces in ~2min,
+    # while a long poll that answers a probe is never disturbed.
+    for opt, value in (
+        ("TCP_KEEPIDLE", 60),
+        ("TCP_KEEPINTVL", 15),
+        ("TCP_KEEPCNT", 4),
+    ):
+        level = getattr(socket, opt, None)
+        if level is None:  # macOS spells IDLE differently, others lack them
+            level = getattr(socket, "TCP_KEEPALIVE", None) if opt == "TCP_KEEPIDLE" else None
+        if level is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, level, value)
+        except OSError:
+            pass
+
+
 UPSTREAM_HOST = "api.anthropic.com"
 UPSTREAM_PORT = 443
 
@@ -1769,9 +1809,11 @@ class PinProxy:
                     raw.close()
                     raise OSError(f"upstream CONNECT failed: {status}")
                 raw.settimeout(None)
+                _arm_keepalive(raw)
                 return raw
         sock = socket.create_connection(self._upstream, timeout=15)
         sock.settimeout(None)
+        _arm_keepalive(sock)
         return sock
 
     @staticmethod
@@ -1870,6 +1912,7 @@ class PinProxy:
         # Connect budget only — a tunnel is long-lived by definition, and a
         # read timeout left on it would tear down an idle-but-healthy stream.
         up.settimeout(None)
+        _arm_keepalive(up)
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         _pump(conn, up)
 
