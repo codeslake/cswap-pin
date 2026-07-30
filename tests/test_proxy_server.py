@@ -934,3 +934,60 @@ class TestWebSocketUpgrade:
             up.stop()
 
         assert up.saw_upgrade, "upstream never saw the Upgrade headers"
+
+
+class TestBlindTunnelIsTraced:
+    """Remote Control RECEIVES over a WebSocket to the ingress host named in
+    the /bridge response, not to api.anthropic.com — so it is blind-tunnelled,
+    never MITM'd. The tunnel used to log nothing, which made a session with no
+    inbound channel at all read exactly like a healthy one: everything CC
+    *sends* (worker/events, heartbeat, presence) showed 200 in the trace while
+    the channel it *receives* on left no line. Diagnosing that cost a live
+    debugging session; the tunnel must announce itself."""
+
+    def test_tunnel_to_a_foreign_host_writes_a_trace_line(self, certdir, tmp_path):
+        import claude_swap.pin_proxy as pp
+
+        # A plain TCP peer standing in for the ingress host.
+        peer = socket.socket()
+        peer.bind(("127.0.0.1", 0))
+        peer.listen(1)
+        peer_port = peer.getsockname()[1]
+
+        log = tmp_path / "trace.log"
+        prev = pp._TRACE
+        pp._TRACE = open(log, "a")
+        try:
+            proxy = pp.PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: "PINTOKEN",
+                upstream=("127.0.0.1", 1),  # unused: we tunnel elsewhere
+            )
+            proxy.start()
+            try:
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+                raw.sendall(
+                    f"CONNECT ingress.example.com:{peer_port} HTTP/1.1\r\n"
+                    f"Host: ingress.example.com:{peer_port}\r\n\r\n".encode()
+                )
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                raw.close()
+            finally:
+                proxy.stop()
+                peer.close()
+            pp._TRACE.flush()
+        finally:
+            pp._TRACE.close()
+            pp._TRACE = prev
+
+        text = log.read_text()
+        assert "CONNECT ingress.example.com" in text, (
+            f"blind tunnel left no trace line; log was:\n{text}"
+        )
+        # It must also say the pin cannot apply there — that is the whole point.
+        assert "no pin" in text, text

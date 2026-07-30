@@ -1266,6 +1266,13 @@ class PinProxy:
             ).start()
 
     def _handle_client(self, conn: socket.socket) -> None:
+        # A per-CONNECTION id, not a thread id: threads are pooled and reused,
+        # so tagging with get_ident() made two sequential connections share a
+        # tag and the log could no longer pair a request with its response —
+        # which read as "this request never answered" and sent a live
+        # investigation down the wrong path twice. Assigned here rather than in
+        # _mitm so a blind tunnel gets one too, on the same counter.
+        self._local.cid = next(self._conn_seq)
         try:
             line = _read_line(conn)
             if not line:
@@ -1376,12 +1383,6 @@ class PinProxy:
                 pass
 
     def _mitm(self, conn: socket.socket) -> None:
-        # A per-CONNECTION id, not a thread id: threads are pooled and reused,
-        # so tagging with get_ident() made two sequential connections share a
-        # tag and the log could no longer pair a request with its response —
-        # which read as "this request never answered" and sent a live
-        # investigation down the wrong path twice.
-        self._local.cid = next(self._conn_seq)
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
         try:
@@ -1638,6 +1639,18 @@ class PinProxy:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
         chain = self._current_chain()
+        # Trace the tunnel too. Remote Control receives over a WebSocket to the
+        # ingress host the /bridge response names — NOT api.anthropic.com — so
+        # it lands here, not in the MITM. Logging only the MITM made an absent
+        # inbound channel look identical to a healthy one: the routes CC sends
+        # (worker/events, heartbeat) were all 200 in the trace while the
+        # channel CC *receives* on left no line at all.
+        if _TRACE is not None:
+            _TRACE.write(
+                f"[c{getattr(self._local, 'cid', 0)}] CONNECT {target} "
+                f"tunnelled (no pin: bearer never seen)\n"
+            )
+            _TRACE.flush()
         try:
             if chain:
                 up = socket.create_connection(chain, timeout=15)
