@@ -8,6 +8,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1582,3 +1583,90 @@ class TestConsumesTheSharedTrustBundle:
         monkeypatch.setattr(pp, "read_upstream_ca", lambda d: None)
         ca = self._ca(tmp_path)
         assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(ca)
+
+
+class TestTornPemCannotEscape:
+    """One unbalanced PEM voids the ENTIRE extras bundle: Node prints
+    "PEM routines::bad end line" to stderr and then trusts no component CA and
+    no corporate root at all, so the session dies on "unable to verify the
+    first certificate" with the cause in a warning nobody reads. Measured by
+    cc-wrapper on lmd42: a torn file present alongside good ones dropped the
+    bundle from 131 certs to 128 plus the warning. Both sides of that: never
+    produce a torn file, never consume a torn bundle."""
+
+    def _cfg(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        return home
+
+    def _ca(self, tmp_path):
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ca = certdir / "ca.pem"
+        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
+        return ca
+
+    def test_publish_never_leaves_a_partial_file(self, tmp_path, monkeypatch):
+        """A reader must see either the old complete file or the new one."""
+        import claude_swap.pin_proxy as pp
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        seen = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            # At the moment of the swap the destination is still whatever it
+            # was — never a half-written file.
+            seen.append(Path(dst).read_bytes() if Path(dst).exists() else b"")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(pp.os, "replace", spy)
+        pp.publish_ca(ca)
+        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN2\n-----END CERTIFICATE-----")
+        pp.publish_ca(ca)
+
+        assert seen, "publish did not go through an atomic rename"
+        for snapshot in seen:
+            if snapshot:
+                assert snapshot.count(b"-----BEGIN CERTIFICATE-----") == snapshot.count(
+                    b"-----END CERTIFICATE-----"
+                ), "a reader could observe a torn file"
+
+    def test_no_temp_file_is_left_behind(self, tmp_path, monkeypatch):
+        """A stray .tmp in the dir is another file the builder has to reason
+        about; it must not survive the publish."""
+        import claude_swap.pin_proxy as pp
+
+        home = self._cfg(tmp_path, monkeypatch)
+        pp.publish_ca(self._ca(tmp_path))
+        leftovers = list((home / pp.CA_TRUST_DIR).glob("*.tmp"))
+        assert leftovers == [], leftovers
+
+    def test_a_torn_shared_bundle_is_refused(self, tmp_path, monkeypatch):
+        """Containing our CA is not enough — an unrelated torn entry voids the
+        whole file, and the size/contains checks cannot see that."""
+        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        (home / CA_TRUST_FILE).write_bytes(
+            ca.read_bytes()
+            + b"\n-----BEGIN CERTIFICATE-----\nTORN-NO-END\n"  # someone mid-write
+        )
+        env = wire_env({}, 9955, ca)
+        assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE)
+
+    def test_a_balanced_shared_bundle_is_still_used(self, tmp_path, monkeypatch):
+        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        (home / CA_TRUST_FILE).write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nOTHER\n-----END CERTIFICATE-----\n"
+            + ca.read_bytes()
+            + b"\n"
+        )
+        env = wire_env({}, 9955, ca)
+        assert env["NODE_EXTRA_CA_CERTS"] == str(home / CA_TRUST_FILE)
