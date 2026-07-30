@@ -433,6 +433,25 @@ class TestWireEnv:
         assert env["https_proxy"] == "http://127.0.0.1:9955"
         assert env["NODE_EXTRA_CA_CERTS"] == str(ca)
 
+    def test_rewrites_an_all_proxy_but_never_invents_one(self, tmp_path):
+        """An ALL_PROXY already in play names the hop we chain THROUGH, so it
+        is rewritten to us. An absent one stays absent: this env can be eval'd
+        into the user's SHELL (pin-env), where an ALL_PROXY we invented would
+        route that shell's git, uv and gh through a MITM built for one
+        client."""
+        from claude_swap.pin_proxy import wire_env
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+
+        env = wire_env({"ALL_PROXY": "http://127.0.0.1:9901"}, 9955, ca)
+        assert env["ALL_PROXY"] == "http://127.0.0.1:9955"
+
+        env = wire_env({"all_proxy": "http://127.0.0.1:9901"}, 9955, ca)
+        assert env["all_proxy"] == "http://127.0.0.1:9955"
+
+        env = wire_env({}, 9955, ca)
+        assert "ALL_PROXY" not in env and "all_proxy" not in env
+
     def test_merges_existing_node_extra_ca(self, tmp_path):
         from claude_swap.pin_proxy import wire_env
         ca = tmp_path / "ca.pem"
@@ -472,6 +491,31 @@ class TestWireGlobalConfig:
         assert env["NODE_EXTRA_CA_CERTS"] == "/tmp/ca.pem"
         # unrelated config must survive
         assert json.loads(path.read_text())["projects"] == {}
+
+    def test_all_proxy_names_the_same_hop(self, tmp_path, monkeypatch):
+        """A launcher that sets ALL_PROXY leaves it naming the proxy we chain
+        THROUGH, so the session would carry two proxy vars pointing at
+        different hops. curl resolves that in our favour (measured:
+        https_proxy=A + ALL_PROXY=B dials A), but a client is free to resolve
+        it the other way and land outside the pin."""
+        from pathlib import Path
+        from claude_swap.pin_proxy import wire_global_config
+        path = self._config(
+            tmp_path, monkeypatch,
+            {"env": {"ALL_PROXY": "http://127.0.0.1:9901"}},
+        )
+
+        wire_global_config(9955, Path("/tmp/ca.pem"))
+        env = json.loads(path.read_text())["env"]
+        assert env["ALL_PROXY"] == "http://127.0.0.1:9955"
+        assert env["ALL_PROXY"] == env["HTTPS_PROXY"]
+
+        # and it is ours to give back, like every other key we displace
+        wire_global_config(None, None)
+        assert (
+            json.loads(path.read_text())["env"]["ALL_PROXY"]
+            == "http://127.0.0.1:9901"
+        )
 
     def test_unwire_restores_a_displaced_value(self, tmp_path, monkeypatch):
         """A launcher's own proxy is displaced while pinned and put BACK on
