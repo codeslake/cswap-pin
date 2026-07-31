@@ -1024,6 +1024,53 @@ class TestRefcount:
         os.close(holder)            # last holder gone
         assert fired.wait(timeout=3)  # → teardown callback fires
 
+    def test_daemon_that_never_gets_a_holder_still_dies(self, tmp_path):
+        """A daemon nobody ever attaches to must tear down, not linger forever.
+
+        The read-only FIFO open blocks until the FIRST writer appears, so a
+        daemon spawned whose session dies before attaching (a crash between
+        spawn and attach, a killed test run) parked there for the life of the
+        machine — holding its port, never idle-tearing-down. Measured: three
+        such daemons left over from one test run, each on a /tmp/pytest-*
+        certdir that the per-certdir orphan sweep deliberately cannot see, so
+        nothing else would ever reap them.
+        """
+        import os, threading
+        from claude_swap.pin_proxy import refcount_fifo_path, watch_refcount
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        fired = threading.Event()
+        # No holder is ever opened.
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set),
+            kwargs={"first_holder_timeout": 0.5}, daemon=True,
+        ).start()
+        assert fired.wait(timeout=5), "daemon never torn down — it would linger forever"
+
+    def test_a_silent_holder_is_not_mistaken_for_no_holder(self, tmp_path):
+        """A holder that attaches and writes NOTHING must keep the daemon up.
+
+        The fd IS the reference; a session has no reason to send anything. An
+        earlier version of the timeout waited for BYTES, so it read a live
+        silent session as "nobody attached" and tore the daemon down under it.
+        """
+        import os, threading
+        from claude_swap.pin_proxy import refcount_fifo_path, watch_refcount
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        holder = os.open(fifo, os.O_RDWR)   # attaches, stays silent
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set),
+            kwargs={"first_holder_timeout": 0.5}, daemon=True,
+        ).start()
+        # Well past the first-holder timeout: a silent holder must NOT trip it.
+        assert not fired.wait(timeout=2), "tore down while a holder was still attached"
+        os.close(holder)
+        assert fired.wait(timeout=3), "did not tear down after the holder closed"
+
 
 class TestPinEnvRefcount:
     """pin-env (shell path) must emit a shell `exec {fd}<>fifo` so the SHELL
