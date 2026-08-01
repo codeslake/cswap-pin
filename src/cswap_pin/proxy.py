@@ -15,6 +15,7 @@ comment naming CCF is citing where a decision came from, not a dependency.
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
 import itertools
 import json
@@ -506,7 +507,10 @@ def _wire_global_config_locked(
         raw.pop(_WIRE_MARK, None)
         raw.pop(f"{_WIRE_MARK}Saved", None)
     else:
-        proxy = f"http://127.0.0.1:{port}"
+        # The CA lives in the cert dir, so its parent IS the cert dir — which
+        # is where the proxy credential lives too. Deriving it here keeps the
+        # public signature unchanged for every caller.
+        proxy = _proxy_url(port, Path(ca_path).parent)
         wanted = {
             "HTTPS_PROXY": proxy,
             "https_proxy": proxy,
@@ -614,6 +618,27 @@ def _recorded_upstream(certdir: Path | None) -> str | None:
         return None
     prev = read_upstream_hint(certdir)
     return f"http://{prev[0]}:{prev[1]}" if prev else None
+
+
+def _proxy_url(port: int, certdir: Path | None) -> str:
+    """The proxy URL to hand a client, carrying the credential when there is one.
+
+    Userinfo in the URL is how every client we wire (Node, curl, python) is
+    told to send ``Proxy-Authorization`` — measured: the real Claude Code
+    client sends ``Proxy-Authorization: Basic`` on CONNECT when HTTPS_PROXY
+    carries user:pass, and sends nothing when it does not. That measurement is
+    the whole reason this can be enforced without cutting every session off.
+
+    No secret (a cert dir we could not write) yields the bare URL, so the pin
+    keeps working unauthenticated rather than becoming unusable.
+    """
+    if certdir is not None:
+        secret = read_proxy_secret(certdir)
+        if secret:
+            from urllib.parse import quote
+
+            return f"http://cswap:{quote(secret, safe='')}@127.0.0.1:{port}"
+    return f"http://127.0.0.1:{port}"
 
 
 def _port_is_serving(host: str, port: int) -> bool:
@@ -1434,6 +1459,116 @@ def watch_refcount(
             pass
 
 
+_SECRET_FILE = "proxy.secret"
+
+
+def proxy_secret_path(certdir: Path) -> Path:
+    """Where the daemon's proxy credential lives (0600, in the cert dir)."""
+    return Path(certdir) / _SECRET_FILE
+
+
+def read_proxy_secret(certdir: Path) -> str | None:
+    """The daemon's proxy credential, or None when it has none.
+
+    None means "this daemon predates the credential" and every caller must
+    treat it as no-auth-required. A pin that starts rejecting traffic after an
+    upgrade is a worse failure than the one the credential prevents.
+    """
+    try:
+        val = proxy_secret_path(certdir).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return val or None
+
+
+def ensure_proxy_secret(certdir: Path) -> str:
+    """Mint (once) the credential a client must present to use this proxy.
+
+    THE PROBLEM: the daemon listens on unauthenticated loopback and swaps the
+    Authorization header of any request matching a pinned route. Loopback
+    carries no identity — the kernel does not check uid on a TCP connect — so
+    any process that can reach the port can CONNECT to api.anthropic.com with
+    a junk bearer and receive one minted from the pinned account's real
+    credential. cswap's own store is 0700/0600 precisely so that credential
+    cannot be read; the proxy hands out its effect to anyone who asks.
+
+    Loopback is not the boundary people assume. On a single-user laptop the
+    exposure is other processes running AS that user, which is a smaller
+    step-up than it sounds (a sandboxed tool, a compromised npm postinstall,
+    any code the user runs but does not trust with their Claude account). On a
+    shared or multi-account host it is other logins outright. Neither is
+    covered by file permissions, because the port is not a file.
+
+    So: a per-daemon secret, written 0600 next to the CA key that already
+    lives at 0600, and handed to clients through the same wiring that already
+    tells them the port. A client that can read the secret is a client that
+    could read the cert dir anyway — the credential adds nothing for an
+    attacker who already has that, and everything against one who does not.
+
+    Idempotent: an existing secret is reused, so a respawn does not invalidate
+    the wiring live sessions are already using.
+    """
+    import secrets
+
+    path = proxy_secret_path(certdir)
+    existing = read_proxy_secret(certdir)
+    if existing:
+        return existing
+    token = secrets.token_urlsafe(32)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        # 0600 from creation, never briefly world-readable: the umask decides
+        # the mode of a plain write, and a 022 umask would publish this at
+        # 0644 in the window before any chmod.
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, token.encode("ascii"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except OSError:
+        # Cannot persist it — fail OPEN rather than block the pin. An
+        # unauthenticated proxy is the status quo; a proxy nobody can use is a
+        # regression.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return ""
+    return token
+
+
+def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None) -> bool:
+    """Whether a CONNECT may use this proxy.
+
+    No secret configured => authorized, so a daemon from before this change
+    (or one that could not write its secret) keeps serving. Comparison is
+    constant-time; the value is a bearer for the pinned account in all but
+    name.
+    """
+    import hmac
+
+    if not secret:
+        return True
+    for key, value in headers:
+        if key.lower() != "proxy-authorization":
+            continue
+        scheme, _, param = value.partition(" ")
+        if scheme.lower() != "basic":
+            continue
+        try:
+            decoded = base64.b64decode(param.strip(), validate=True).decode(
+                "utf-8", "replace"
+            )
+        except Exception:
+            continue
+        # user:pass — the secret is the password; the user part is cosmetic.
+        _, _, presented = decoded.partition(":")
+        if hmac.compare_digest(presented, secret):
+            return True
+    return False
+
+
 _PORT_HINT_FILE = "port.hint"
 
 
@@ -1603,6 +1738,9 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
 
     certdir = Path(certdir)
     switcher = ClaudeAccountSwitcher()
+    # Before the listener exists, so there is no window in which the port is
+    # open and unauthenticated. PinProxy reads the value; it never mints one.
+    ensure_proxy_secret(certdir)
     proxy = PinProxy(
         certdir=certdir,
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
@@ -1680,7 +1818,9 @@ def wire_env(
     down at once); pin-env emits the `exec {fd}<>fifo` for the shell instead.
     """
     out = dict(env)
-    proxy = f"http://127.0.0.1:{port}"
+    # Same derivation as the global config path: the CA's directory is the
+    # cert dir, which holds the proxy credential.
+    proxy = _proxy_url(port, Path(ca_path).parent)
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
     # Rewrite an ALL_PROXY the caller already had; never create one. It is a
@@ -1753,6 +1893,12 @@ class PinProxy:
         self._chain = chain_proxy
         self._rediscover_chain = rediscover_chain
         self._host = host
+        # The credential a client must present on CONNECT. Read, never minted,
+        # here: the daemon entry point mints it before wiring so the value the
+        # clients are handed and the value we check are the same one. Empty or
+        # missing => no auth required (a pre-upgrade daemon, or a cert dir we
+        # could not write) — see ``ensure_proxy_secret``.
+        self._secret = read_proxy_secret(self._certdir)
         self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
         self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._server_ctx.load_cert_chain(
@@ -1833,11 +1979,23 @@ class PinProxy:
             parts = line.split(" ")
             if parts[0] == "CONNECT":
                 target = parts[1]  # host:port
-                # Drain the rest of the CONNECT headers.
+                # Keep the CONNECT headers rather than draining them: the
+                # proxy credential arrives here and nowhere else.
+                connect_headers: list[tuple[str, str]] = []
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
                         break
+                    if ":" in h:
+                        k, v = h.split(":", 1)
+                        connect_headers.append((k.strip(), v.strip()))
+                # A caller that cannot present the credential gets nothing —
+                # not the MITM (which would mint a bearer for it) and not the
+                # blind tunnel (which would make us an open forward proxy for
+                # any host). See ``ensure_proxy_secret``.
+                if not _proxy_authorized(connect_headers, self._secret):
+                    self._refuse_unauthorized(conn)
+                    return
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
                     self._blind_tunnel(target, conn)
@@ -1863,6 +2021,27 @@ class PinProxy:
                 conn.close()
             except OSError:
                 pass
+
+    def _refuse_unauthorized(self, conn: socket.socket) -> None:
+        """407 a CONNECT that did not present the proxy credential.
+
+        407 rather than a silent close so a misconfigured client says what is
+        wrong instead of retrying forever against a proxy that looks dead —
+        that failure mode cost a day when a dead port produced
+        "ConnectionRefused, attempt 14/300" and nothing named the cause.
+        """
+        try:
+            conn.sendall(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b'Proxy-Authenticate: Basic realm="cswap-pin"\r\n'
+                b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
 
     def _warn_unpinnable(self) -> None:
         """Say once, on stderr, that the pin is not being applied.
@@ -1951,11 +2130,27 @@ class PinProxy:
         rl = request_line.split(" ")
         method, url = rl[0], rl[1] if len(rl) > 1 else "/"
         headers = []
+        parsed: list[tuple[str, str]] = []
         while True:
             h = _read_line(conn)
             if h in ("", None):
                 break
+            if ":" in h:
+                k, v = h.split(":", 1)
+                parsed.append((k.strip(), v.strip()))
+                # Never forward OUR proxy credential onward. This path relays
+                # the client's headers verbatim to the chain (CCF, a corporate
+                # proxy), which would hand them a working credential for the
+                # pinned account's proxy. It is hop-by-hop by definition
+                # (RFC 9110): it authenticates to THIS proxy and stops here.
+                if k.strip().lower() == "proxy-authorization":
+                    continue
             headers.append(h)
+        # Same gate as CONNECT: an unauthenticated caller must not be able to
+        # use us as a forward proxy just by choosing absolute-form.
+        if not _proxy_authorized(parsed, self._secret):
+            self._refuse_unauthorized(conn)
+            return
         split = urlsplit(url)
         host, port = split.hostname, split.port or 80
         # Re-read like every other egress site: the daemon is constructed with
