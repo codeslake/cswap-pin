@@ -8,17 +8,28 @@ account while inference keeps following ``cswap switch`` / ``cswap auto``.
 
 Companion to claude-swap. Installed as ``claude-swap[pin]``; see
 https://github.com/realiti4/claude-swap/issues/198 for why it lives apart.
+
+**Nothing is imported from :mod:`cswap_pin.proxy` here.** That module reaches
+into claude-swap at import time, so re-exporting its symbols made
+``import cswap_pin`` itself raise ``HostMissing`` when the host was absent —
+from proxy.py line 43, naming neither package, and before any caller could
+catch it. Importing a package must never require the thing the package is
+meant to report on. Reach for ``cswap_pin.proxy`` directly; use
+:func:`host_available` first if you want to check rather than catch.
 """
 
-from cswap_pin.proxy import (  # noqa: F401
-    apply_pin,
-    ensure_proxy,
-    heal,
-    load_pin,
-    save_pin,
-    unwire_if_dead,
-    wire_env,
-    wire_global_config,
-)
+from __future__ import annotations
 
 __version__ = "0.1.0"
+
+__all__ = ["__version__", "host_available"]
+
+
+def host_available() -> bool:
+    """Whether claude-swap is importable, i.e. whether the pin can do anything.
+
+    Safe to call with the host missing — that is the case it exists for.
+    """
+    from cswap_pin._host import available
+
+    return available()
