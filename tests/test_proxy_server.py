@@ -1764,3 +1764,47 @@ class TestProxyRequiresACredential:
             "leaked our proxy credential to the chain"
         )
         assert base64.b64encode(f"cswap:{secret}".encode()).decode() not in seen[0]
+
+    def test_a_respawn_does_not_arm_the_gate(self, certdir, monkeypatch):
+        """The upgrade must not cut off sessions wired before it.
+
+        A live session's HTTPS_PROXY is fixed at exec time, so one started
+        before this change carries a URL with no credential. If a daemon
+        respawn (a fingerprint recycle, a deploy) minted the secret, every such
+        session would start getting 407 on its next request. Measured on linux
+        before landing this: .claude.json wired "http://127.0.0.1:36301" with
+        no userinfo and pid 142172 live on it.
+
+        Only apply_pin — the path that also REWRITES the wiring — may mint it,
+        so the gate and the URL that satisfies it arrive together.
+        """
+        import claude_swap.pin_proxy as pp
+        from claude_swap.pin_proxy import proxy_secret_path
+        monkeypatch.setattr(pp, "PinProxy", lambda **kw: (_ for _ in ()).throw(
+            _StopDaemon()))
+        try:
+            pp.daemon_main("1", "a@b.c", certdir)
+        except _StopDaemon:
+            pass
+        except Exception:
+            pass
+        assert not proxy_secret_path(certdir).exists(), (
+            "a respawn minted the credential — every live session would 407"
+        )
+
+    def test_apply_pin_mints_the_credential(self, certdir, monkeypatch):
+        """...and the path that rewrites the wiring DOES arm it."""
+        import claude_swap.pin_proxy as pp
+        from claude_swap.pin_proxy import apply_pin, proxy_secret_path
+
+        class _Sw:
+            backup_dir = certdir.parent
+
+        monkeypatch.setattr(pp, "save_pin", lambda *a, **k: None)
+        monkeypatch.setattr(pp, "ensure_proxy", lambda sw: None)
+        apply_pin(_Sw(), "a@b.c", "org")
+        assert proxy_secret_path(certdir.parent / "pin-proxy").exists()
+
+
+class _StopDaemon(Exception):
+    """Cuts daemon_main off once it is past the point under test."""
