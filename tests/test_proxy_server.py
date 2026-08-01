@@ -1765,6 +1765,34 @@ class TestProxyRequiresACredential:
         )
         assert base64.b64encode(f"cswap:{secret}".encode()).decode() not in seen[0]
 
+    def test_a_secret_written_under_a_running_daemon_takes_effect(self, certdir):
+        """The gate must arm when the secret is WRITTEN, not on a later respawn.
+
+        Measured by the cswap owner on linux, which is why this test exists:
+            07:04:19  daemon 3123508 respawned (no secret yet)
+            07:04:27  cswap pin -> proxy.secret written, .claude.json rewired
+                      daemon pid after the pin: 3123508 — THE SAME ONE
+            raw CONNECT, no credential, after the pin: 200 Connection Established
+        `cswap pin` goes through ensure_proxy, which reuses a live daemon with
+        a matching fingerprint. Caching the secret at construction meant the
+        running daemon held None and kept serving unauthenticated, so the gate
+        actually armed on the NEXT respawn — a fingerprint recycle, a deploy,
+        an idle teardown — with nothing a human would connect to the 407s.
+        """
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        p = self._proxy(certdir)
+        p.start()                      # constructed with NO secret on disk
+        try:
+            assert "407" not in self._connect(p.port)
+            secret = ensure_proxy_secret(certdir)   # `cswap pin`, same daemon
+            assert "407" in self._connect(p.port), (
+                "the running daemon ignored the new secret — it would only "
+                "arm on some later respawn"
+            )
+            assert "407" not in self._connect(p.port, cred=secret)
+        finally:
+            p.stop()
+
     def test_a_respawn_does_not_arm_the_gate(self, certdir, monkeypatch):
         """The upgrade must not cut off sessions wired before it.
 
