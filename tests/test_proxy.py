@@ -361,6 +361,31 @@ class TestMakePinTokenProvider:
         provider = make_pin_token_provider(sw, "2", "pin@example.com")
         assert provider() is None
 
+    def test_no_token_because_nothing_to_swap_is_not_a_failure(self):
+        """None has two opposite meanings and the caller must be able to tell.
+
+        The pinned account being the ACTIVE account means there is deliberately
+        nothing to swap — the live bearer already belongs to it. The other None
+        means the credential could not be read, which is the expensive one.
+        Conflating them made the fail-open warning fire on a machine where
+        nothing was wrong (personal-mac: pin == active, keychain read fine at
+        rc=0/509 bytes) and cost the reader ten minutes chasing a keychain
+        problem that did not exist.
+        """
+        from claude_swap.pin_proxy import make_pin_token_provider
+        sw = _FakeSwitcher(active_num="2")
+        provider = make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() is None
+        assert provider.pin_is_noop() is True, "pin == active is a no-op, not a failure"
+
+    def test_an_unreadable_store_is_still_a_failure(self):
+        """The split must not swallow the case the warning exists for."""
+        from claude_swap.pin_proxy import make_pin_token_provider
+        sw = _FakeSwitcher(active_num="1", backups={})  # cannot read account 2
+        provider = make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() is None
+        assert provider.pin_is_noop() is False, "unreadable credential must still warn"
+
     def test_returns_backup_token_when_pin_inactive(self):
         import json
         from claude_swap.pin_proxy import make_pin_token_provider

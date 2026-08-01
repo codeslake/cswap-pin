@@ -1031,7 +1031,46 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 switcher.persist_backup_credentials(num, mail, rotated)
             return token
 
+    def pin_is_noop() -> bool:
+        """True when returning no token is the CORRECT answer, not a failure.
+
+        ``provider`` returns None for two opposite reasons and the caller
+        cannot tell them apart: the credential could not be read (bad — every
+        pinned request goes out unpinned), or there is deliberately nothing to
+        swap. The second happens whenever the pinned account IS the active
+        account — the live bearer already belongs to it — and whenever the pin
+        was cleared outright.
+
+        Without this split the fail-open warning cries wolf. Measured on
+        personal-mac: pinned account == active account, so the provider
+        correctly returned None on the very first request and the daemon
+        logged "the pinned account token could not be read ... on macOS this
+        is usually a daemon started outside the GUI session". Nothing was
+        wrong; the keychain read was fine (rc=0, 509 bytes). It cost the
+        reader ten minutes down a keychain rabbit hole, and a warning that
+        fires when nothing is wrong is worse than no warning at all — this one
+        exists to be believed on the day it is real.
+        """
+        target = _current_target()
+        if target is None:
+            return True  # pin cleared: leaving every bearer alone IS the job
+        return switcher.current_account_number() == target[0]
+
+    provider.pin_is_noop = pin_is_noop
     return provider
+
+
+def _pin_is_noop(provider) -> bool:
+    """Ask a token provider whether None means "nothing to do" right now.
+
+    Tolerates a provider without the hook — tests inject bare lambdas, and a
+    plain callable must keep working — by answering False, which is the old
+    behaviour (treat None as a failure).
+    """
+    try:
+        return bool(getattr(provider, "pin_is_noop", None) and provider.pin_is_noop())
+    except Exception:
+        return False
 
 
 def ensure_proxy(switcher) -> tuple[int, Path] | None:
@@ -1874,8 +1913,15 @@ class PinProxy:
         # cannot reach the macOS keychain, and 13 of 13 pinned routes went out
         # unswapped; the RC sessions born in that window are owned by the
         # active account forever, and nothing said so.
+        #
+        # "No token" is not the same as "cannot mint one". With the pinned
+        # account already active there is deliberately nothing to swap, and
+        # reporting can_pin=false there tells a monitor the pin is broken on
+        # the one machine where it has nothing to do.
         try:
-            can_pin = bool(self._pin_token_provider())
+            can_pin = bool(self._pin_token_provider()) or _pin_is_noop(
+                self._pin_token_provider
+            )
         except Exception:
             can_pin = False
         body = json.dumps(
@@ -1992,7 +2038,13 @@ class PinProxy:
                 # every RC session born in that window had to be recreated by
                 # hand. Say it once per daemon so the cause is on the record
                 # before the consequence shows up days later.
-                self._warn_unpinnable()
+                #
+                # ...unless None is the RIGHT answer. When the pinned account
+                # is the active one there is nothing to swap, and warning then
+                # trains the reader to disbelieve the warning (see
+                # ``pin_is_noop``).
+                if not _pin_is_noop(self._pin_token_provider):
+                    self._warn_unpinnable()
         if self._debug:
             hdrs = " | ".join(
                 f"{k}: {v[:60]}" for k, v in headers
