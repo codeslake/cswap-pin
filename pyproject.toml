@@ -1,0 +1,42 @@
+[project]
+name = "cswap-pin"
+version = "0.1.0"
+description = "Keep Claude Code's Remote Control and Artifacts on one account while inference follows cswap's account swap"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Junyong Lee" }]
+keywords = ["claude", "claude-code", "claude-swap", "cswap", "proxy", "remote-control"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+# claude-swap is a PEER, not a dependency. cswap-pin is loaded BY claude-swap
+# (via `claude-swap[pin]`), so depending on it here would make the pair
+# circular and let `pip install cswap-pin` drag in the whole switcher for
+# someone who already has it. The import surface it needs is small and
+# declared in _host.py.
+dependencies = ["cryptography>=41.0"]
+
+[project.urls]
+Homepage = "https://github.com/codeslake/cswap-pin"
+Repository = "https://github.com/codeslake/cswap-pin"
+Issues = "https://github.com/codeslake/cswap-pin/issues"
+"Upstream discussion" = "https://github.com/realiti4/claude-swap/issues/198"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cswap_pin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
