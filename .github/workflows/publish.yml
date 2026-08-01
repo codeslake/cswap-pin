@@ -1,0 +1,50 @@
+name: Publish to PyPI
+
+# Trusted publishing: PyPI accepts the upload because GitHub vouches for this
+# workflow via OIDC, so there is no API token anywhere — not in the repo, not
+# in a secret, not on a laptop. A leaked token is the failure this avoids.
+#
+# Fires on a release tag rather than on push, so publishing is an act someone
+# takes deliberately. A version cannot be re-uploaded once it exists, which
+# makes an accidental publish permanent.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:  # first release, before any tag convention exists
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      # The wheel is what users install; a build that produces an importable
+      # package but a broken one still uploads cleanly. Import it from the
+      # built artifact, not from the checkout, so this tests what ships.
+      - name: The built wheel must import without claude-swap
+        run: |
+          python3 -m venv /tmp/check
+          /tmp/check/bin/pip install dist/*.whl
+          /tmp/check/bin/python -c '
+          import cswap_pin
+          assert cswap_pin.host_available() is False, "host_available lied with no host installed"
+          print("ok", cswap_pin.__version__)'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # mint the OIDC token PyPI verifies; nothing else needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
