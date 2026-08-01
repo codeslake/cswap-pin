@@ -1529,3 +1529,238 @@ class TestFailOpenIsNotSilent:
             assert _json.loads(body)["can_pin"] is False
         finally:
             p.stop()
+
+
+class TestProxyRequiresACredential:
+    """The daemon listens on unauthenticated loopback and swaps the bearer of
+    any request matching a pinned route. Loopback carries no identity — the
+    kernel does not check uid on a TCP connect — so without a credential ANY
+    local process can CONNECT with a junk bearer and get one minted from the
+    pinned account. cswap keeps that credential at 0700/0600 precisely so it
+    cannot be read; the proxy was handing out its effect to anyone who asked.
+    """
+
+    def _proxy(self, certdir, provider=lambda: "PINNED-TOKEN"):
+        from claude_swap.pin_proxy import PinProxy
+        return PinProxy(certdir=certdir, pin_token_provider=provider,
+                        upstream=("127.0.0.1", 1))
+
+    def _connect(self, port, cred=None, target="api.anthropic.com:443"):
+        """Send one CONNECT and return the status line."""
+        import base64, socket as _s
+        c = _s.create_connection(("127.0.0.1", port), timeout=10)
+        req = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+        if cred is not None:
+            blob = base64.b64encode(f"cswap:{cred}".encode()).decode()
+            req += f"Proxy-Authorization: Basic {blob}\r\n"
+        req += "\r\n"
+        c.sendall(req.encode())
+        c.settimeout(5)
+        try:
+            data = c.recv(256)
+        except OSError:
+            data = b""
+        c.close()
+        return data.decode("latin1", "replace").split("\r\n")[0]
+
+    def test_an_unauthenticated_connect_is_refused(self, certdir):
+        """The whole finding: no credential must not reach the swap path."""
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        ensure_proxy_secret(certdir)
+        p = self._proxy(certdir)
+        p.start()
+        try:
+            assert "407" in self._connect(p.port), (
+                "any local process could mint a bearer for the pinned account"
+            )
+        finally:
+            p.stop()
+
+    def test_a_wrong_credential_is_refused(self, certdir):
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        ensure_proxy_secret(certdir)
+        p = self._proxy(certdir)
+        p.start()
+        try:
+            assert "407" in self._connect(p.port, cred="not-the-secret")
+        finally:
+            p.stop()
+
+    def test_the_real_credential_is_accepted(self, certdir):
+        """The credential must not lock out the sessions it is meant to serve.
+
+        Getting past the gate means the CONNECT proceeds to the MITM, whose
+        upstream is port 1 and therefore fails — a closed connection with no
+        407 is the pass condition here.
+        """
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        secret = ensure_proxy_secret(certdir)
+        p = self._proxy(certdir)
+        p.start()
+        try:
+            assert "407" not in self._connect(p.port, cred=secret)
+        finally:
+            p.stop()
+
+    def test_a_blind_tunnel_also_needs_the_credential(self, certdir):
+        """Otherwise we are an open forward proxy to any host on the internet.
+
+        The non-anthropic branch does not touch the bearer, so it is easy to
+        assume it needs no gate — but an unauthenticated CONNECT to an
+        arbitrary host is exactly what an open proxy is.
+        """
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        ensure_proxy_secret(certdir)
+        p = self._proxy(certdir)
+        p.start()
+        try:
+            assert "407" in self._connect(p.port, target="example.com:443")
+        finally:
+            p.stop()
+
+    def test_absolute_form_also_needs_the_credential(self, certdir):
+        """The plain-proxy path must not be a way around the CONNECT gate."""
+        import socket as _s
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        ensure_proxy_secret(certdir)
+        p = self._proxy(certdir)
+        p.start()
+        try:
+            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+            c.sendall(b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            c.settimeout(5)
+            try:
+                data = c.recv(256)
+            except OSError:
+                data = b""
+            c.close()
+            assert "407" in data.decode("latin1", "replace")
+        finally:
+            p.stop()
+
+    def test_health_stays_open(self, certdir):
+        """The statusline and cc-update probe /health with no credential.
+
+        Gating it would make a working pin read as a dead one on every
+        machine, which is the failure the liveness work just finished fixing.
+        """
+        import json as _json, socket as _s
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        ensure_proxy_secret(certdir)
+        p = self._proxy(certdir)
+        p.start()
+        try:
+            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+            c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(4096)
+                if not d:
+                    break
+                buf += d
+            body = buf.partition(b"\r\n\r\n")[2]
+            while not body.endswith(b"}"):
+                d = c.recv(4096)
+                if not d:
+                    break
+                body += d
+            c.close()
+            assert _json.loads(body)["pin_proxy"] is True
+        finally:
+            p.stop()
+
+    def test_a_daemon_without_a_secret_still_serves(self, certdir):
+        """A pin that starts refusing traffic after an upgrade is worse than
+        the exposure it closes. No secret on disk => no auth required."""
+        p = self._proxy(certdir)  # nothing minted
+        p.start()
+        try:
+            assert "407" not in self._connect(p.port)
+        finally:
+            p.stop()
+
+    def test_the_secret_is_not_world_readable(self, certdir):
+        import stat
+        from claude_swap.pin_proxy import ensure_proxy_secret, proxy_secret_path
+        ensure_proxy_secret(certdir)
+        mode = proxy_secret_path(certdir).stat().st_mode
+        assert not (mode & (stat.S_IRGRP | stat.S_IROTH)), (
+            "the credential is readable by other users — it protects nothing"
+        )
+
+    def test_the_secret_is_stable_across_respawns(self, certdir):
+        """A new secret each spawn would strand every live session: their
+        HTTPS_PROXY is fixed at exec time and would carry the old one."""
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        assert ensure_proxy_secret(certdir) == ensure_proxy_secret(certdir)
+
+    def test_the_wiring_hands_clients_the_credential(self, certdir):
+        """Measured: the real Claude Code client sends Proxy-Authorization on
+        CONNECT only when HTTPS_PROXY carries user:pass. If the wiring does
+        not embed it, enforcing auth cuts off every session."""
+        from claude_swap.pin_proxy import ensure_proxy_secret, wire_env
+        secret = ensure_proxy_secret(certdir)
+        env = wire_env({}, 9955, certdir / "ca.pem", open_refcount=False)
+        assert secret in env["HTTPS_PROXY"]
+        assert "@127.0.0.1:9955" in env["HTTPS_PROXY"]
+
+    def test_the_credential_is_not_forwarded_upstream(self, certdir):
+        """It authenticates to THIS proxy and stops here (hop-by-hop).
+
+        The absolute-form path relays client headers verbatim to the chain, so
+        without stripping it we would hand CCF or a corporate proxy a working
+        credential for the pinned account's proxy.
+        """
+        import socket as _s, base64, threading
+        from claude_swap.pin_proxy import ensure_proxy_secret
+        secret = ensure_proxy_secret(certdir)
+        seen = []
+        srv = _s.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        chain_port = srv.getsockname()[1]
+
+        def accept():
+            c, _ = srv.accept()
+            buf = b""
+            try:
+                while b"\r\n\r\n" not in buf:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+            except OSError:
+                pass
+            seen.append(buf.decode("latin1", "replace"))
+            try:
+                c.close()
+            except OSError:
+                pass
+
+        t = threading.Thread(target=accept, daemon=True)
+        t.start()
+        p = self._proxy(certdir)
+        p._chain = ("127.0.0.1", chain_port)
+        p._rediscover_chain = False
+        p.start()
+        try:
+            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+            blob = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c.sendall(
+                f"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n"
+                f"Proxy-Authorization: Basic {blob}\r\n\r\n".encode()
+            )
+            t.join(timeout=5)
+            c.close()
+        finally:
+            p.stop()
+            srv.close()
+        assert seen, "the relay never reached the chain"
+        # Match on the header, not on the raw secret: it travels base64-encoded,
+        # so `secret not in text` passes even when the credential IS forwarded.
+        # (Measured — that assertion alone did not fail when the strip was
+        # removed, and the chain had received the full Proxy-Authorization.)
+        assert "proxy-authorization" not in seen[0].lower(), (
+            "leaked our proxy credential to the chain"
+        )
+        assert base64.b64encode(f"cswap:{secret}".encode()).decode() not in seen[0]
