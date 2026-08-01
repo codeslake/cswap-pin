@@ -38,7 +38,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from claude_swap import oauth
+from cswap_pin._host import require
+
+oauth = require("oauth")
 
 
 def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
@@ -215,7 +217,7 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
     exactly as before.
     """
     try:
-        from claude_swap.paths import get_claude_config_home
+        get_claude_config_home = require("paths").get_claude_config_home
 
         shared = get_claude_config_home() / CA_TRUST_FILE
         if shared.is_file() and shared.stat().st_size > 0:
@@ -297,7 +299,7 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
     nobody reads. A truncate-then-write is exactly what produces that state.
     """
     try:
-        from claude_swap.paths import get_claude_config_home
+        get_claude_config_home = require("paths").get_claude_config_home
 
         ours = Path(ca_path).read_bytes().strip()
         if not ours:
@@ -458,7 +460,7 @@ def _wired_port() -> int | None:
     truthful while the state file is absent (see ``unwire_if_dead``).
     """
     try:
-        from claude_swap.paths import get_global_config_path
+        get_global_config_path = require("paths").get_global_config_path
 
         raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
         env = raw.get("env") if isinstance(raw, dict) else None
@@ -493,8 +495,8 @@ def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
     exec'd with (only a ``settings.json`` change re-applies env to a live
     process, and that file is not ours to write). New sessions are wired.
     """
-    from claude_swap.claude_locks import claude_config_lock
-    from claude_swap.paths import get_global_config_path
+    claude_config_lock = require("claude_locks").claude_config_lock
+    get_global_config_path = require("paths").get_global_config_path
 
     path = get_global_config_path()
     # Claude Code writes this file concurrently, and we replace it whole — a
@@ -692,7 +694,7 @@ def _wired_over_proxy() -> str | None:
     record "no upstream" and the pinned session would bypass that launcher's
     proxy entirely.
     """
-    from claude_swap.paths import get_global_config_path
+    get_global_config_path = require("paths").get_global_config_path
 
     try:
         raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
@@ -926,7 +928,7 @@ def load_pin(backup_root: Path) -> tuple[str, str] | None:
     Returns ``(email, organizationUuid)`` or ``None`` when nothing is pinned.
     Identity is stored by (email, org) — slot numbers move (``cswap move``).
     """
-    from claude_swap import settings as _settings
+    _settings = require("settings")
 
     raw = _settings._read_raw(_settings.settings_path(backup_root))
     section = raw.get("remoteControl")
@@ -944,7 +946,7 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     Lives in its own ``remoteControl`` section; ``save_settings`` preserves
     unknown sections, so autoswitch writes never clobber it.
     """
-    from claude_swap import settings as _settings
+    _settings = require("settings")
 
     path = _settings.settings_path(backup_root)
     raw = _settings._read_raw(path)
@@ -970,7 +972,7 @@ def live_remote_control_sessions() -> list[str]:
     that is set only while RC is connected. Best-effort: an unreadable or
     absent registry just yields nothing.
     """
-    from claude_swap.paths import get_claude_config_home
+    get_claude_config_home = require("paths").get_claude_config_home
 
     names: list[str] = []
     try:
@@ -1061,7 +1063,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         effect without restarting anything. Falls back to the one this daemon
         was spawned for when the pin is unreadable, and returns None when the
         pin was cleared outright (leave every bearer alone)."""
-        from claude_swap.exceptions import AccountNotFoundError, ConfigError
+        _exc = require("exceptions")
+        AccountNotFoundError, ConfigError = _exc.AccountNotFoundError, _exc.ConfigError
 
         try:
             pin = load_pin(switcher.backup_dir)
@@ -1153,7 +1156,8 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     ``<backup>/pin-proxy/proxy.port`` (one proxy shared across sessions);
     otherwise spawns one.
     """
-    from claude_swap.exceptions import AccountNotFoundError, ConfigError
+    _exc = require("exceptions")
+    AccountNotFoundError, ConfigError = _exc.AccountNotFoundError, _exc.ConfigError
 
     pin = load_pin(switcher.backup_dir)
     if not pin:
@@ -1300,7 +1304,7 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
         return pids
     for line in out.splitlines():
         line = line.strip()
-        if "claude_swap.pin_proxy" not in line:
+        if not any(m in line for m in _DAEMON_MODULE_NAMES):
             continue
         if target not in line:
             continue
@@ -1339,6 +1343,18 @@ def _install_signal_teardown(cleanup) -> None:
         except (ValueError, OSError):
             pass  # not on the main thread (tests) — best effort
 
+
+_DAEMON_MODULE = "cswap_pin.proxy"
+
+# The orphan sweep finds daemons by matching their argv, so during the split it
+# must recognise BOTH module paths. A machine mid-cutover can have a daemon
+# spawned by the OLD in-tree module still serving while the new package is
+# installed; matching only the new name would make that daemon invisible to the
+# sweep and leave it holding its port forever — the exact leak aab7246 fixed.
+# The old name stays until every deployed machine has been re-pinned under
+# cswap-pin; removing it early costs a leaked daemon, removing it late costs
+# nothing.
+_DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 
 _STATE_FILE = "proxy.json"
 _FIFO_NAME = "refcount.fifo"
@@ -1745,7 +1761,7 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
     log = _open_daemon_log(certdir)
     try:
         subprocess.Popen(
-            [sys.executable, "-m", "claude_swap.pin_proxy", account_num, email, str(certdir)],
+            [sys.executable, "-m", _DAEMON_MODULE, account_num, email, str(certdir)],
             stdout=subprocess.DEVNULL,
             stderr=log,
             start_new_session=True,
@@ -1780,7 +1796,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     probe, and self-terminates when the last refcount holder closes the FIFO
     (idle teardown).
     """
-    from claude_swap.switcher import ClaudeAccountSwitcher
+    ClaudeAccountSwitcher = require("switcher").ClaudeAccountSwitcher
 
     certdir = Path(certdir)
     switcher = ClaudeAccountSwitcher()

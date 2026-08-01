@@ -16,7 +16,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-from claude_swap.pin_proxy import (
+from cswap_pin.proxy import (
     ensure_ca,
     is_pinned_route,
     parse_upstream_proxy,
@@ -51,7 +51,7 @@ class TestLiveRemoteControlSessions:
         return home / "sessions"
 
     def test_lists_only_sessions_with_a_live_bridge(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import live_remote_control_sessions
+        from cswap_pin.proxy import live_remote_control_sessions
 
         d = self._sessions_dir(tmp_path, monkeypatch)
         (d / "1.json").write_text(json.dumps(
@@ -63,7 +63,7 @@ class TestLiveRemoteControlSessions:
         assert live_remote_control_sessions() == ["with-rc"]
 
     def test_unreadable_registry_is_not_an_error(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import live_remote_control_sessions
+        from cswap_pin.proxy import live_remote_control_sessions
 
         d = self._sessions_dir(tmp_path, monkeypatch)
         (d / "bad.json").write_text("{not json")
@@ -98,7 +98,7 @@ class TestRepinIsLive:
             return self.creds.get((num, email), "")
 
     def test_provider_follows_a_repin_without_a_respawn(self, tmp_path):
-        from claude_swap.pin_proxy import make_pin_token_provider, save_pin
+        from cswap_pin.proxy import make_pin_token_provider, save_pin
 
         sw = self._Sw(tmp_path)
         save_pin(tmp_path, "one@example.com", "org")
@@ -116,7 +116,7 @@ class TestRepinIsLive:
     def test_fingerprint_ignores_the_account(self, tmp_path):
         """Including the account would recycle the daemon on every re-pin,
         and a recycle is exactly what a live session must not need."""
-        from claude_swap.pin_proxy import daemon_fingerprint
+        from cswap_pin.proxy import daemon_fingerprint
 
         assert daemon_fingerprint("1", "one@example.com") == daemon_fingerprint(
             "2", "two@example.com"
@@ -133,7 +133,7 @@ class TestPinCodeResolvesItsNames:
     @pytest.mark.parametrize(
         "module",
         [
-            "claude_swap.pin_proxy",
+            "cswap_pin.proxy",
             "claude_swap.tui.autoview",
             "claude_swap.tui.dashboard",
             "claude_swap.tui.widgets",
@@ -311,7 +311,7 @@ class TestResolvePinToken:
             "accessToken": token, "expiresAt": expires_at, "refreshToken": refresh}})
 
     def test_returns_stored_token_when_fresh(self):
-        from claude_swap.pin_proxy import resolve_pin_token
+        from cswap_pin.proxy import resolve_pin_token
         # expiry far in the future -> no refresh, return as-is
         future = 10_000_000_000_000
         creds = self._creds("live-token", future)
@@ -322,7 +322,7 @@ class TestResolvePinToken:
         assert new_creds is None  # nothing rotated
 
     def test_refreshes_when_expired(self):
-        from claude_swap.pin_proxy import resolve_pin_token
+        from cswap_pin.proxy import resolve_pin_token
         from claude_swap.oauth import RefreshOutcome
         past = 1  # long expired
         creds = self._creds("dead-token", past)
@@ -356,7 +356,7 @@ class TestMakePinTokenProvider:
     def test_returns_none_when_pin_is_active_account(self):
         # Disk bearer already IS the pin account: no swap needed, and never
         # touch the live store the client owns.
-        from claude_swap.pin_proxy import make_pin_token_provider
+        from cswap_pin.proxy import make_pin_token_provider
         sw = _FakeSwitcher(active_num="2")
         provider = make_pin_token_provider(sw, "2", "pin@example.com")
         assert provider() is None
@@ -372,7 +372,7 @@ class TestMakePinTokenProvider:
         rc=0/509 bytes) and cost the reader ten minutes chasing a keychain
         problem that did not exist.
         """
-        from claude_swap.pin_proxy import make_pin_token_provider
+        from cswap_pin.proxy import make_pin_token_provider
         sw = _FakeSwitcher(active_num="2")
         provider = make_pin_token_provider(sw, "2", "pin@example.com")
         assert provider() is None
@@ -380,7 +380,7 @@ class TestMakePinTokenProvider:
 
     def test_an_unreadable_store_is_still_a_failure(self):
         """The split must not swallow the case the warning exists for."""
-        from claude_swap.pin_proxy import make_pin_token_provider
+        from cswap_pin.proxy import make_pin_token_provider
         sw = _FakeSwitcher(active_num="1", backups={})  # cannot read account 2
         provider = make_pin_token_provider(sw, "2", "pin@example.com")
         assert provider() is None
@@ -388,7 +388,7 @@ class TestMakePinTokenProvider:
 
     def test_returns_backup_token_when_pin_inactive(self):
         import json
-        from claude_swap.pin_proxy import make_pin_token_provider
+        from cswap_pin.proxy import make_pin_token_provider
         creds = json.dumps({"claudeAiOauth": {
             "accessToken": "pin-live", "expiresAt": 10_000_000_000_000,
             "refreshToken": "rt"}})
@@ -399,7 +399,7 @@ class TestMakePinTokenProvider:
 
     def test_refreshes_and_persists_when_backup_expired(self, monkeypatch):
         import json
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         from claude_swap.oauth import RefreshOutcome
         old = json.dumps({"claudeAiOauth": {
             "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt-1"}})
@@ -421,20 +421,20 @@ class TestPinStore:
     (email, organizationUuid) — slot numbers are not stable)."""
 
     def test_roundtrip(self, tmp_path):
-        from claude_swap.pin_proxy import load_pin, save_pin
+        from cswap_pin.proxy import load_pin, save_pin
         assert load_pin(tmp_path) is None
         save_pin(tmp_path, "pin@example.com", "org-uuid-1")
         assert load_pin(tmp_path) == ("pin@example.com", "org-uuid-1")
 
     def test_unpin(self, tmp_path):
-        from claude_swap.pin_proxy import load_pin, save_pin
+        from cswap_pin.proxy import load_pin, save_pin
         save_pin(tmp_path, "pin@example.com", "org-uuid-1")
         save_pin(tmp_path, None, None)
         assert load_pin(tmp_path) is None
 
     def test_coexists_with_autoswitch_settings(self, tmp_path):
         # save_settings preserves unknown sections; the reverse must hold too.
-        from claude_swap.pin_proxy import load_pin, save_pin
+        from cswap_pin.proxy import load_pin, save_pin
         from claude_swap.settings import AutoSwitchSettings, save_settings, load_settings
         save_settings(tmp_path, AutoSwitchSettings(threshold=77.0))
         save_pin(tmp_path, "pin@example.com", "org-1")
@@ -450,7 +450,7 @@ class TestWireEnv:
     e.g. a CCF or corp CA)."""
 
     def test_sets_proxy_and_ca(self, tmp_path):
-        from claude_swap.pin_proxy import wire_env
+        from cswap_pin.proxy import wire_env
         ca = tmp_path / "ca.pem"
         ca.write_text("PIN-CA\n")
         env = wire_env({}, 9955, ca)
@@ -464,7 +464,7 @@ class TestWireEnv:
         into the user's SHELL (pin-env), where an ALL_PROXY we invented would
         route that shell's git, uv and gh through a MITM built for one
         client."""
-        from claude_swap.pin_proxy import wire_env
+        from cswap_pin.proxy import wire_env
         ca = tmp_path / "ca.pem"
         ca.write_text("PIN-CA\n")
 
@@ -478,7 +478,7 @@ class TestWireEnv:
         assert "ALL_PROXY" not in env and "all_proxy" not in env
 
     def test_merges_existing_node_extra_ca(self, tmp_path):
-        from claude_swap.pin_proxy import wire_env
+        from cswap_pin.proxy import wire_env
         ca = tmp_path / "ca.pem"
         ca.write_text("PIN-CA\n")
         other = tmp_path / "ccf-ca.pem"
@@ -507,7 +507,7 @@ class TestWireGlobalConfig:
 
     def test_writes_proxy_env(self, tmp_path, monkeypatch):
         from pathlib import Path
-        from claude_swap.pin_proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config
         path = self._config(tmp_path, monkeypatch, {"projects": {}})
 
         assert wire_global_config(9955, Path("/tmp/ca.pem")) is True
@@ -524,7 +524,7 @@ class TestWireGlobalConfig:
         https_proxy=A + ALL_PROXY=B dials A), but a client is free to resolve
         it the other way and land outside the pin."""
         from pathlib import Path
-        from claude_swap.pin_proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config
         path = self._config(
             tmp_path, monkeypatch,
             {"env": {"ALL_PROXY": "http://127.0.0.1:9901"}},
@@ -550,7 +550,7 @@ class TestWireGlobalConfig:
         must then DELETE the key: an `ALL_PROXY=""` left in a block that is
         applied to every launch on the machine is worse than no key at all."""
         from pathlib import Path
-        from claude_swap.pin_proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config
         path = self._config(tmp_path, monkeypatch, {"env": {"FOO": "bar"}})
 
         wire_global_config(9955, Path("/tmp/ca.pem"))
@@ -566,7 +566,7 @@ class TestWireGlobalConfig:
         clear — the env block lands on top of process.env, so silently
         dropping the user's value would leave them worse than before."""
         from pathlib import Path
-        from claude_swap.pin_proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config
         path = self._config(
             tmp_path, monkeypatch,
             {"env": {"HTTPS_PROXY": "http://127.0.0.1:9901", "FOO": "bar"}},
@@ -585,7 +585,7 @@ class TestWireGlobalConfig:
         self, tmp_path, monkeypatch
     ):
         from pathlib import Path
-        from claude_swap.pin_proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config
         path = self._config(tmp_path, monkeypatch, {"projects": {}})
 
         wire_global_config(9955, Path("/tmp/ca.pem"))
@@ -602,7 +602,7 @@ class TestWireGlobalConfig:
         our CA, downloads.claude.ai failed to verify and the session showed
         'Auto-update failed · Run claude doctor'."""
         from pathlib import Path
-        from claude_swap.pin_proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config
 
         certdir = Path(tmp_path) / "pin-proxy"
         certdir.mkdir()
@@ -632,7 +632,7 @@ class TestWireGlobalConfig:
         session sees OUR proxy as its ambient one. Without the marker it
         records the daemon as its own upstream and it CONNECTs to itself."""
         from pathlib import Path
-        from claude_swap.pin_proxy import _ambient_proxy, wire_global_config
+        from cswap_pin.proxy import _ambient_proxy, wire_global_config
 
         path = self._config(tmp_path, monkeypatch, {"projects": {}})
         wire_global_config(9955, Path(tmp_path) / "ca.pem")
@@ -648,7 +648,7 @@ class TestWireGlobalConfig:
         way back but editing the file by hand. ensure_proxy cannot repair it
         either: it returns at its `no pin` guard before reaching the wiring."""
         from pathlib import Path
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
 
         path = self._config(tmp_path, monkeypatch, {"projects": {}})
         backup = Path(tmp_path)
@@ -670,7 +670,7 @@ class TestWireGlobalConfig:
 
     def test_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
-        from claude_swap.pin_proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config
         monkeypatch.setattr(
             "claude_swap.paths.get_global_config_path",
             lambda: Path(tmp_path) / "absent.json",
@@ -688,11 +688,11 @@ class TestEnsureProxy:
             return ("2", "pin@example.com", "org-1")
 
     def test_none_when_no_pin(self, tmp_path):
-        from claude_swap.pin_proxy import ensure_proxy
+        from cswap_pin.proxy import ensure_proxy
         assert ensure_proxy(self._Sw(tmp_path)) is None
 
     def test_spawns_when_no_daemon(self, tmp_path, monkeypatch):
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
         spawned = []
         def fake_spawn(account_num, email, certdir):
@@ -706,7 +706,7 @@ class TestEnsureProxy:
 
     def test_reuses_live_daemon(self, tmp_path, monkeypatch):
         import os, socket
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
         # A live listener + our own (alive) pid + a MATCHING fingerprint.
         srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
@@ -721,7 +721,7 @@ class TestEnsureProxy:
         assert got_port == port
 
     def test_none_when_pin_account_gone(self, tmp_path):
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         from claude_swap.exceptions import AccountNotFoundError
         pin_proxy.save_pin(tmp_path, "gone@example.com", "org-x")
         class Sw(self._Sw):
@@ -730,208 +730,12 @@ class TestEnsureProxy:
         assert pin_proxy.ensure_proxy(Sw(tmp_path)) is None
 
 
-class TestSessionWiring:
-    """Every launch path funnels through SessionManager._exec — the pin hook
-    lives there so run/fast-path/exec_default all get proxy wiring."""
-
-    def _manager(self, tmp_path):
-        import logging
-        from claude_swap.session import SessionManager
-
-        class Sw:
-            backup_dir = tmp_path
-            _logger = logging.getLogger("test")
-
-        return SessionManager(Sw())
-
-    def test_exec_wires_pin_proxy_env(self, tmp_path, monkeypatch):
-        from claude_swap import pin_proxy, session
-        ca = tmp_path / "pin-proxy" / "ca.pem"
-        ca.parent.mkdir()
-        ca.write_text("CA\n")
-        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, ca))
-        captured = {}
-        def fake_execvpe(binary, argv, env):
-            captured["env"] = env
-            raise SystemExit(0)
-        monkeypatch.setattr(session.os, "execvpe", fake_execvpe)
-        with __import__("pytest").raises(SystemExit):
-            self._manager(tmp_path)._exec("/bin/claude", [], env={"A": "1"})
-        assert captured["env"]["HTTPS_PROXY"] == "http://127.0.0.1:9955"
-        assert captured["env"]["NODE_EXTRA_CA_CERTS"] == str(ca)
-        assert captured["env"]["A"] == "1"
-
-    def test_exec_untouched_without_pin(self, tmp_path, monkeypatch):
-        from claude_swap import pin_proxy, session
-        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: None)
-        captured = {}
-        def fake_execvpe(binary, argv, env):
-            captured["env"] = env
-            raise SystemExit(0)
-        monkeypatch.setattr(session.os, "execvpe", fake_execvpe)
-        with __import__("pytest").raises(SystemExit):
-            self._manager(tmp_path)._exec("/bin/claude", [], env={"A": "1"})
-        assert captured["env"] == {"A": "1"}
 
 
-class TestPinCommand:
-    """`cswap pin [NUM|EMAIL] | pin --clear | pin` (status)."""
-
-    def _seed(self, temp_home):
-        from claude_swap.switcher import ClaudeAccountSwitcher
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._init_sequence_file()
-        data = switcher._get_sequence_data()
-        data["accounts"]["2"] = {
-            "email": "pin@co.com", "uuid": "u2",
-            "organizationUuid": "org-2", "organizationName": "",
-            "added": "2024-01-01T00:00:00Z",
-        }
-        data["sequence"] = [2]
-        switcher._write_json(switcher.sequence_file, data)
-        return switcher
-
-    def test_pin_sets_and_status_shows(self, temp_home, capsys):
-        from unittest.mock import patch
-        from claude_swap import cli
-        from claude_swap.pin_proxy import load_pin
-        sw = self._seed(temp_home)
-        with patch("os.geteuid", return_value=1000, create=True):
-            cli._pin_command(["2"])
-        assert load_pin(sw.backup_dir) == ("pin@co.com", "org-2")
-        assert "pin@co.com" in capsys.readouterr().out
-        with patch("os.geteuid", return_value=1000, create=True):
-            cli._pin_command([])
-        assert "pin@co.com" in capsys.readouterr().out
-
-    def test_pin_clear(self, temp_home, capsys):
-        from unittest.mock import patch
-        from claude_swap import cli
-        from claude_swap.pin_proxy import load_pin
-        sw = self._seed(temp_home)
-        with patch("os.geteuid", return_value=1000, create=True):
-            cli._pin_command(["2"])
-            cli._pin_command(["--clear"])
-        assert load_pin(sw.backup_dir) is None
-
-    def test_pin_unknown_account_errors(self, temp_home, capsys):
-        import pytest
-        from unittest.mock import patch
-        from claude_swap import cli
-        self._seed(temp_home)
-        with patch("os.geteuid", return_value=1000, create=True):
-            with pytest.raises(SystemExit) as exc:
-                cli._pin_command(["999"])
-        assert exc.value.code == 1
 
 
-class TestTuiPinMenu:
-    """Dashboard: 'Pin remote control…' menu row → pick an account → pin saved."""
-
-    def test_pin_menu(self, tmp_path):
-        import asyncio
-        import sys
-        sys.path.insert(0, "tests")
-        from test_tui import FakeSwitcher, make_account, make_app, menu_select, settle
-        from claude_swap.pin_proxy import load_pin
-
-        async def scenario():
-            fake = FakeSwitcher(
-                [make_account(1, active=True), make_account(2)], tmp_path
-            )
-            app = make_app(fake)
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
-                await menu_select(pilot, "pin-menu")
-                await menu_select(pilot, "pin:2")
-            assert load_pin(tmp_path) == ("user2@example.com", "")
-
-        asyncio.run(scenario())
-
-    def test_pin_menu_clear(self, tmp_path):
-        import asyncio
-        import sys
-        sys.path.insert(0, "tests")
-        from test_tui import FakeSwitcher, make_account, make_app, menu_select, settle
-        from claude_swap.pin_proxy import load_pin, save_pin
-
-        save_pin(tmp_path, "user2@example.com", "")
-
-        async def scenario():
-            fake = FakeSwitcher(
-                [make_account(1, active=True), make_account(2)], tmp_path
-            )
-            app = make_app(fake)
-            async with app.run_test(size=(100, 32)) as pilot:
-                await settle(pilot)
-                await menu_select(pilot, "pin-menu")
-                await menu_select(pilot, "pin:clear")
-            assert load_pin(tmp_path) is None
-
-        asyncio.run(scenario())
 
 
-class TestPinEnvCommand:
-    """`cswap pin-env` emits shell export lines for eval in a wrapper (like
-    cachefix-ensure / ssh-agent). It reuses ensure_proxy + wire_env, so when
-    ensure_proxy returns None (no pin / dangling pin) it emits nothing."""
-
-    def _seed(self, temp_home):
-        from claude_swap.switcher import ClaudeAccountSwitcher
-        sw = ClaudeAccountSwitcher()
-        sw._setup_directories()
-        sw._init_sequence_file()
-        data = sw._get_sequence_data()
-        data["accounts"]["1"] = {
-            "email": "pin@co.com", "uuid": "u1", "organizationUuid": "org-1",
-            "organizationName": "", "added": "2024-01-01T00:00:00Z",
-        }
-        data["sequence"] = [1]
-        sw._write_json(sw.sequence_file, data)
-        return sw
-
-    def test_no_pin_emits_nothing(self, temp_home, capsys, monkeypatch):
-        from claude_swap import cli, pin_proxy
-        self._seed(temp_home)
-        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: None)
-        cli._pin_env_command([])
-        assert capsys.readouterr().out.strip() == ""
-
-    def test_pin_emits_proxy_exports(self, temp_home, capsys, monkeypatch):
-        from claude_swap import cli, pin_proxy
-        sw = self._seed(temp_home)
-        # No ambient CA → wire_env emits our CA directly (not a merged bundle).
-        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
-        ca = sw.backup_dir / "pin-proxy" / "ca.pem"
-        ca.parent.mkdir(parents=True, exist_ok=True)
-        ca.write_text("CA\n")
-        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda s: (9955, ca))
-        cli._pin_env_command([])
-        out = capsys.readouterr().out
-        assert "export HTTPS_PROXY=http://127.0.0.1:9955" in out
-        assert "export https_proxy=http://127.0.0.1:9955" in out
-        assert f"export NODE_EXTRA_CA_CERTS={ca}" in out
-
-    def test_pin_merges_ambient_ca(self, temp_home, capsys, monkeypatch):
-        # With an ambient CA (CCF/corp bundle), wire_env merges — the emitted
-        # NODE_EXTRA_CA_CERTS is a combined bundle, never a bare replacement.
-        from claude_swap import cli, pin_proxy
-        sw = self._seed(temp_home)
-        corp = temp_home / "corp-ca.pem"
-        corp.write_text("CORP-CA\n")
-        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", str(corp))
-        ca = sw.backup_dir / "pin-proxy" / "ca.pem"
-        ca.parent.mkdir(parents=True, exist_ok=True)
-        ca.write_text("PIN-CA\n")
-        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda s: (9955, ca))
-        cli._pin_env_command([])
-        out = capsys.readouterr().out
-        bundle = [l.split("=", 1)[1] for l in out.splitlines()
-                  if l.startswith("export NODE_EXTRA_CA_CERTS=")][0]
-        assert bundle not in (str(ca), str(corp))  # a merged file
-        text = open(bundle).read()
-        assert "PIN-CA" in text and "CORP-CA" in text
 
 
 class TestDaemonState:
@@ -941,17 +745,17 @@ class TestDaemonState:
     staleness check (cachefix-ensure is_fresh/recycle)."""
 
     def test_roundtrip(self, tmp_path):
-        from claude_swap.pin_proxy import write_daemon_state, read_daemon_state
+        from cswap_pin.proxy import write_daemon_state, read_daemon_state
         write_daemon_state(tmp_path, port=51000, pid=1234, fingerprint="fp-abc")
         st = read_daemon_state(tmp_path)
         assert st == {"port": 51000, "pid": 1234, "fingerprint": "fp-abc"}
 
     def test_missing_is_none(self, tmp_path):
-        from claude_swap.pin_proxy import read_daemon_state
+        from cswap_pin.proxy import read_daemon_state
         assert read_daemon_state(tmp_path) is None
 
     def test_corrupt_is_none(self, tmp_path):
-        from claude_swap.pin_proxy import read_daemon_state
+        from cswap_pin.proxy import read_daemon_state
         (tmp_path / "proxy.json").write_text("{not json")
         assert read_daemon_state(tmp_path) is None
 
@@ -960,7 +764,7 @@ class TestDaemonState:
         # pinned account is NOT in it: that is re-read per request, and baking
         # it in would recycle the daemon on every `cswap pin` — a restart a
         # live session should never need (cswap's own account switch doesn't).
-        from claude_swap.pin_proxy import daemon_fingerprint
+        from cswap_pin.proxy import daemon_fingerprint
         assert daemon_fingerprint("1", "a@co.com") == daemon_fingerprint(
             "2", "b@co.com"
         )
@@ -978,12 +782,12 @@ class TestEnsureProxyLifecycle:
             return ("1", "pin@example.com", "org-1")
 
     def _pin(self, tmp_path):
-        from claude_swap.pin_proxy import save_pin
+        from cswap_pin.proxy import save_pin
         save_pin(tmp_path, "pin@example.com", "org-1")
 
     def test_reuses_fresh_daemon_without_spawn(self, tmp_path, monkeypatch):
         import os, socket
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         self._pin(tmp_path)
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         fp = pin_proxy.daemon_fingerprint("1", "pin@example.com")
@@ -998,7 +802,7 @@ class TestEnsureProxyLifecycle:
 
     def test_recycles_stale_fingerprint(self, tmp_path, monkeypatch):
         import os, socket
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         self._pin(tmp_path)
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         # a live daemon with a STALE fingerprint (old code / other account)
@@ -1023,7 +827,7 @@ class TestRefcount:
         # wire_env opens the FIFO and passes an inherited fd number to the child
         # via an env var, so the launched claude becomes a refcount holder.
         import os
-        from claude_swap.pin_proxy import wire_env, refcount_fifo_path
+        from cswap_pin.proxy import wire_env, refcount_fifo_path
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         os.mkfifo(refcount_fifo_path(certdir))
         ca = certdir / "ca.pem"; ca.write_text("CA\n")
@@ -1036,7 +840,7 @@ class TestRefcount:
         # Spawn a real refcount watcher over a FIFO with one holder, close the
         # holder, and assert the watcher's "last holder gone" callback fires.
         import os, threading, time
-        from claude_swap.pin_proxy import refcount_fifo_path, watch_refcount
+        from cswap_pin.proxy import refcount_fifo_path, watch_refcount
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         fifo = refcount_fifo_path(certdir)
         os.mkfifo(fifo)
@@ -1061,7 +865,7 @@ class TestRefcount:
         nothing else would ever reap them.
         """
         import os, threading
-        from claude_swap.pin_proxy import refcount_fifo_path, watch_refcount
+        from cswap_pin.proxy import refcount_fifo_path, watch_refcount
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         fifo = refcount_fifo_path(certdir)
         os.mkfifo(fifo)
@@ -1081,7 +885,7 @@ class TestRefcount:
         silent session as "nobody attached" and tore the daemon down under it.
         """
         import os, threading
-        from claude_swap.pin_proxy import refcount_fifo_path, watch_refcount
+        from cswap_pin.proxy import refcount_fifo_path, watch_refcount
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         fifo = refcount_fifo_path(certdir)
         os.mkfifo(fifo)
@@ -1111,7 +915,7 @@ class TestRefcount:
         """
         import json as _json, os, threading
         import claude_swap.paths as paths
-        from claude_swap.pin_proxy import (
+        from cswap_pin.proxy import (
             refcount_fifo_path,
             watch_refcount,
             write_daemon_state,
@@ -1144,7 +948,7 @@ class TestRefcount:
         """
         import json as _json, os, threading
         import claude_swap.paths as paths
-        from claude_swap.pin_proxy import (
+        from cswap_pin.proxy import (
             refcount_fifo_path,
             watch_refcount,
             write_daemon_state,
@@ -1165,38 +969,6 @@ class TestRefcount:
         assert fired.wait(timeout=5), "orphan lingered — reaper disabled by a foreign pin"
 
 
-class TestPinEnvRefcount:
-    """pin-env (shell path) must emit a shell `exec {fd}<>fifo` so the SHELL
-    opens the refcount holder — not the transient cswap process (whose fd would
-    close the instant cswap exits, tearing the daemon down immediately)."""
-
-    def _seed(self, temp_home):
-        from claude_swap.switcher import ClaudeAccountSwitcher
-        sw = ClaudeAccountSwitcher()
-        sw._setup_directories(); sw._init_sequence_file()
-        data = sw._get_sequence_data()
-        data["accounts"]["1"] = {
-            "email": "pin@co.com", "uuid": "u1", "organizationUuid": "org-1",
-            "organizationName": "", "added": "2024-01-01T00:00:00Z",
-        }
-        data["sequence"] = [1]
-        sw._write_json(sw.sequence_file, data)
-        return sw
-
-    def test_pin_env_emits_shell_fifo_hold(self, temp_home, capsys, monkeypatch):
-        import os
-        from claude_swap import cli, pin_proxy
-        sw = self._seed(temp_home)
-        certdir = sw.backup_dir / "pin-proxy"; certdir.mkdir(parents=True)
-        (certdir / "ca.pem").write_text("CA\n")
-        os.mkfifo(str(pin_proxy.refcount_fifo_path(certdir)))
-        monkeypatch.setattr(pin_proxy, "ensure_proxy",
-                            lambda s: (9955, certdir / "ca.pem"))
-        cli._pin_env_command([])
-        out = capsys.readouterr().out
-        # a shell exec that opens the FIFO on an inherited fd (CCF pattern)
-        assert "<>" in out and "refcount.fifo" in out
-        assert "exec" in out
 
 
 class TestAutoViewPinBadge:
@@ -1254,7 +1026,7 @@ class TestAutoViewPinBadge:
         )
 
     def test_badge_is_on_the_pinned_row_only(self, tmp_path):
-        from claude_swap.pin_proxy import save_pin
+        from cswap_pin.proxy import save_pin
 
         save_pin(tmp_path, "codeslake@gmail.com", "org-1")
         out = self._rows(
@@ -1269,7 +1041,7 @@ class TestAutoViewPinBadge:
     def test_badge_survives_unknown_usage(self, tmp_path):
         """A pinned account still owns the claude.ai side when its usage
         cannot be read, so the badge must not hang off a usage branch."""
-        from claude_swap.pin_proxy import save_pin
+        from cswap_pin.proxy import save_pin
 
         save_pin(tmp_path, "codeslake@gmail.com", "org-1")
         out = self._rows(tmp_path, [self._acct(1, "codeslake@gmail.com")])
@@ -1289,7 +1061,7 @@ class TestAutoViewPinBadge:
         pin", and the rewording that defeats it is the one a future edit would
         naturally use.
         """
-        from claude_swap.pin_proxy import save_pin
+        from cswap_pin.proxy import save_pin
         from claude_swap.tui.autoview import AutoScreen
 
         email = "codeslake@gmail.com"
@@ -1345,7 +1117,7 @@ class TestKillDaemon:
 
     def test_escalates_to_kill(self, monkeypatch):
         import os
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         sent = []
         alive = {"pid": True}
         def fake_kill(pid, sig):
@@ -1367,7 +1139,7 @@ class TestDaemonSignalTeardown:
         # daemon_main should register a SIGTERM handler. We assert the wiring
         # exists by checking the helper it uses is called.
         import signal
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         installed = {}
         real_signal = pin_proxy.signal.signal if hasattr(pin_proxy, "signal") else None
         # daemon_main is heavy (starts a server); instead unit-test the helper.
@@ -1381,7 +1153,7 @@ class TestOrphanSweep:
     keep, so orphans never accumulate."""
 
     def test_sweeps_other_pin_daemons_for_this_certdir(self, monkeypatch, tmp_path):
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         certdir = tmp_path / "pin-proxy"; certdir.mkdir()
         # pretend three pin daemons exist for this certdir; keep 200, sweep others
         found = [101, 202, 303]
@@ -1406,7 +1178,7 @@ class TestWorkerJwtRoutesAreNotSwapped:
     """
 
     def test_worker_routes_keep_their_own_token(self):
-        from claude_swap.pin_proxy import is_pinned_route
+        from cswap_pin.proxy import is_pinned_route
 
         for path in (
             "/v1/code/sessions/cse_x/worker",
@@ -1416,7 +1188,7 @@ class TestWorkerJwtRoutesAreNotSwapped:
             assert not is_pinned_route(path), f"{path} must keep the worker JWT"
 
     def test_ownership_deciding_routes_are_still_pinned(self):
-        from claude_swap.pin_proxy import is_pinned_route
+        from cswap_pin.proxy import is_pinned_route
 
         for path in (
             "/v1/code/sessions",
@@ -1441,7 +1213,7 @@ class TestDaemonPortStability:
 
     def test_daemon_reclaims_the_recorded_port(self, tmp_path):
         import socket
-        from claude_swap.pin_proxy import PinProxy, ensure_ca, write_daemon_state
+        from cswap_pin.proxy import PinProxy, ensure_ca, write_daemon_state
 
         ensure_ca(tmp_path, "api.anthropic.com")
         # a previous daemon recorded this port, then died
@@ -1463,7 +1235,7 @@ class TestDaemonPortStability:
 
     def test_falls_back_to_a_free_port_when_recorded_one_is_taken(self, tmp_path):
         import socket
-        from claude_swap.pin_proxy import PinProxy, ensure_ca, write_daemon_state
+        from cswap_pin.proxy import PinProxy, ensure_ca, write_daemon_state
 
         ensure_ca(tmp_path, "api.anthropic.com")
         squatter = socket.socket()
@@ -1488,13 +1260,13 @@ class TestUltrareviewIsPinned:
     so it belongs to the pinned cloud account like RC and artifacts."""
 
     def test_ultrareview_routes_are_pinned(self):
-        from claude_swap.pin_proxy import is_pinned_route
+        from cswap_pin.proxy import is_pinned_route
 
         assert is_pinned_route("/v1/ultrareview/preflight")
         assert is_pinned_route("/v1/ultrareview/run")
 
     def test_neighbouring_v1_routes_stay_unpinned(self):
-        from claude_swap.pin_proxy import is_pinned_route
+        from cswap_pin.proxy import is_pinned_route
 
         assert not is_pinned_route("/v1/messages")
         assert not is_pinned_route("/v1/models")
@@ -1514,7 +1286,7 @@ class TestPinTokenRefreshIsSerialized:
     def test_concurrent_expired_requests_refresh_once(self, tmp_path):
         import json
         import threading
-        from claude_swap.pin_proxy import make_pin_token_provider
+        from cswap_pin.proxy import make_pin_token_provider
 
         expired = json.dumps({
             "claudeAiOauth": {
@@ -1532,7 +1304,7 @@ class TestPinTokenRefreshIsSerialized:
 
         # The provider resolves the pin per request, so the store must name
         # one — otherwise it correctly reads as "pin cleared".
-        from claude_swap.pin_proxy import save_pin
+        from cswap_pin.proxy import save_pin
         save_pin(tmp_path, "a@b.c", "org")
 
         class FakeSwitcher:
@@ -1605,7 +1377,7 @@ class TestAmbientProxyPrefersTheLauncherProxy:
     def test_recorded_launcher_proxy_wins_over_the_shell_one(
         self, tmp_path, monkeypatch
     ):
-        from claude_swap.pin_proxy import _ambient_proxy
+        from cswap_pin.proxy import _ambient_proxy
 
         srv, ccf_port = self._serving_port()
         try:
@@ -1622,7 +1394,7 @@ class TestAmbientProxyPrefersTheLauncherProxy:
         self, tmp_path, monkeypatch
     ):
         """A stale record must never strand the chain on a port nothing serves."""
-        from claude_swap.pin_proxy import _ambient_proxy
+        from cswap_pin.proxy import _ambient_proxy
 
         srv, dead_port = self._serving_port()
         srv.close()  # nothing listens there now
@@ -1631,7 +1403,7 @@ class TestAmbientProxyPrefersTheLauncherProxy:
         assert got == "http://127.0.0.1:8118"
 
     def test_same_proxy_in_both_places_is_unchanged(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import _ambient_proxy
+        from cswap_pin.proxy import _ambient_proxy
 
         self._wire(tmp_path, monkeypatch, "http://127.0.0.1:8118")
         assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}) == (
@@ -1641,7 +1413,7 @@ class TestAmbientProxyPrefersTheLauncherProxy:
     def test_a_non_loopback_record_is_not_preferred(self, tmp_path, monkeypatch):
         """Only a LOCAL launcher proxy is the inner link worth restoring; a
         corporate proxy recorded earlier must not override the live shell."""
-        from claude_swap.pin_proxy import _ambient_proxy
+        from cswap_pin.proxy import _ambient_proxy
 
         self._wire(tmp_path, monkeypatch, "http://proxy.corp.example:3128")
         assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}) == (
@@ -1650,7 +1422,7 @@ class TestAmbientProxyPrefersTheLauncherProxy:
 
     def test_our_own_port_is_never_recorded(self, tmp_path, monkeypatch):
         """Unchanged behaviour: a shell that ran pin-env exports OUR port."""
-        from claude_swap.pin_proxy import _ambient_proxy
+        from cswap_pin.proxy import _ambient_proxy
 
         self._wire(tmp_path, monkeypatch, "http://127.0.0.1:8118")
         got = _ambient_proxy(
@@ -1683,7 +1455,7 @@ class TestCaIsPublishedToTheTrustDir:
         return ca
 
     def test_publishes_one_file_named_after_the_component(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import CA_TRUST_DIR, publish_ca
+        from cswap_pin.proxy import CA_TRUST_DIR, publish_ca
 
         home = self._cfg(tmp_path, monkeypatch)
         out = publish_ca(self._ca(tmp_path))
@@ -1693,7 +1465,7 @@ class TestCaIsPublishedToTheTrustDir:
     def test_republishing_is_a_no_op(self, tmp_path, monkeypatch):
         """Rewriting every launch would churn the mtime a launcher's own
         rebuild check keys on."""
-        from claude_swap.pin_proxy import publish_ca
+        from cswap_pin.proxy import publish_ca
 
         self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1703,7 +1475,7 @@ class TestCaIsPublishedToTheTrustDir:
         assert first.stat().st_mtime_ns == before
 
     def test_a_rotated_ca_replaces_our_file_only(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import CA_TRUST_DIR, publish_ca
+        from cswap_pin.proxy import CA_TRUST_DIR, publish_ca
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1719,7 +1491,7 @@ class TestCaIsPublishedToTheTrustDir:
     def test_an_unwritable_config_home_does_not_raise(self, tmp_path, monkeypatch):
         """Trust plumbing must never block a launch."""
         import os
-        from claude_swap.pin_proxy import publish_ca
+        from cswap_pin.proxy import publish_ca
 
         home = self._cfg(tmp_path, monkeypatch)
         os.chmod(home, 0o500)
@@ -1730,7 +1502,7 @@ class TestCaIsPublishedToTheTrustDir:
 
     def test_merged_ca_still_returns_our_own_bundle(self, tmp_path, monkeypatch):
         """Publishing is additive: the env block we write is unchanged."""
-        from claude_swap.pin_proxy import _merged_ca
+        from cswap_pin.proxy import _merged_ca
 
         self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1770,7 +1542,7 @@ class TestCaIsPublishedEveryLaunch:
     def test_first_ever_launch_publishes_before_any_daemon_ran(
         self, tmp_path, monkeypatch
     ):
-        import claude_swap.pin_proxy as pp
+        import cswap_pin.proxy as pp
 
         home = self._cfg(tmp_path, monkeypatch)
         monkeypatch.setattr(pp, "load_pin", lambda d: ("pinned@example.com", "org"))
@@ -1785,7 +1557,7 @@ class TestCaIsPublishedEveryLaunch:
         assert b"BEGIN CERTIFICATE" in published.read_bytes()
 
     def test_a_wiped_trust_dir_is_repopulated_next_launch(self, tmp_path, monkeypatch):
-        import claude_swap.pin_proxy as pp
+        import cswap_pin.proxy as pp
 
         home = self._cfg(tmp_path, monkeypatch)
         monkeypatch.setattr(pp, "load_pin", lambda d: ("pinned@example.com", "org"))
@@ -1806,7 +1578,7 @@ class TestCaIsPublishedEveryLaunch:
     ):
         """The earlier version only published from inside the merge path, so a
         user running no other MITM never had a CA published at all."""
-        import claude_swap.pin_proxy as pp
+        import cswap_pin.proxy as pp
 
         home = self._cfg(tmp_path, monkeypatch)
         monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
@@ -1840,7 +1612,7 @@ class TestConsumesTheSharedTrustBundle:
         return ca
 
     def test_uses_the_merged_bundle_when_it_carries_us(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1858,7 +1630,7 @@ class TestConsumesTheSharedTrustBundle:
     ):
         """A launcher that has not rebuilt since we published would otherwise
         strand the session without its own CA."""
-        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1871,8 +1643,8 @@ class TestConsumesTheSharedTrustBundle:
 
     def test_no_launcher_at_all_is_unchanged(self, tmp_path, monkeypatch):
         """No merged bundle, no other MITM: name our own CA, exactly as before."""
-        import claude_swap.pin_proxy as pp
-        from claude_swap.pin_proxy import wire_env
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import wire_env
 
         self._cfg(tmp_path, monkeypatch)
         monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
@@ -1905,7 +1677,7 @@ class TestTornPemCannotEscape:
 
     def test_publish_never_leaves_a_partial_file(self, tmp_path, monkeypatch):
         """A reader must see either the old complete file or the new one."""
-        import claude_swap.pin_proxy as pp
+        import cswap_pin.proxy as pp
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1933,7 +1705,7 @@ class TestTornPemCannotEscape:
     def test_no_temp_file_is_left_behind(self, tmp_path, monkeypatch):
         """A stray .tmp in the dir is another file the builder has to reason
         about; it must not survive the publish."""
-        import claude_swap.pin_proxy as pp
+        import cswap_pin.proxy as pp
 
         home = self._cfg(tmp_path, monkeypatch)
         pp.publish_ca(self._ca(tmp_path))
@@ -1943,7 +1715,7 @@ class TestTornPemCannotEscape:
     def test_a_torn_shared_bundle_is_refused(self, tmp_path, monkeypatch):
         """Containing our CA is not enough — an unrelated torn entry voids the
         whole file, and the size/contains checks cannot see that."""
-        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1955,7 +1727,7 @@ class TestTornPemCannotEscape:
         assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE)
 
     def test_a_balanced_shared_bundle_is_still_used(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -1999,7 +1771,7 @@ class TestNarrowingIsDeliberatelyUnguarded:
 
     def test_a_single_cert_bundle_is_accepted(self, tmp_path, monkeypatch):
         """The real shape on a host with one component and no corporate MITM."""
-        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -2012,7 +1784,7 @@ class TestNarrowingIsDeliberatelyUnguarded:
     ):
         """Narrowed but ours intact: our proxy still verifies, so refusing it
         would trade a working session for a problem we cannot even diagnose."""
-        from claude_swap.pin_proxy import CA_TRUST_FILE, wire_env
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -2045,7 +1817,7 @@ class TestRecordedChainSurvivesARepin:
         return srv, srv.getsockname()[1]
 
     def test_recorded_chain_wins_over_the_shell_value(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import _ambient_proxy, write_upstream_hint
+        from cswap_pin.proxy import _ambient_proxy, write_upstream_hint
 
         srv, inner = self._serving()
         try:
@@ -2060,7 +1832,7 @@ class TestRecordedChainSurvivesARepin:
             srv.close()
 
     def test_a_dead_recorded_chain_does_not_strand_us(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import _ambient_proxy, write_upstream_hint
+        from cswap_pin.proxy import _ambient_proxy, write_upstream_hint
 
         srv, dead = self._serving()
         srv.close()
@@ -2075,7 +1847,7 @@ class TestRecordedChainSurvivesARepin:
 
     def test_no_record_and_no_displaced_value_keeps_the_shell(self, tmp_path, monkeypatch):
         """A first-ever pin on a machine with no launcher: unchanged."""
-        from claude_swap.pin_proxy import _ambient_proxy
+        from cswap_pin.proxy import _ambient_proxy
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir()
@@ -2110,7 +1882,7 @@ class TestUnwireWhenDead:
     def test_no_daemon_record_strips_the_wiring(self, tmp_path, monkeypatch):
         # The work-mac shape: the daemon never started, so there is no record
         # at all, but a previous run's wiring is still in the config.
-        from claude_swap.pin_proxy import unwire_if_dead
+        from cswap_pin.proxy import unwire_if_dead
         cfg, certdir = self._cfg(tmp_path, monkeypatch, {
             "HTTPS_PROXY": "http://127.0.0.1:59999",
             "CSWAP_PIN_PORT": "59999"})
@@ -2118,7 +1890,7 @@ class TestUnwireWhenDead:
         assert json.loads(cfg.read_text()).get("env", {}) == {}
 
     def test_dead_pid_strips_the_wiring(self, tmp_path, monkeypatch):
-        from claude_swap.pin_proxy import unwire_if_dead
+        from cswap_pin.proxy import unwire_if_dead
         cfg, certdir = self._cfg(tmp_path, monkeypatch,
                                  {"HTTPS_PROXY": "http://127.0.0.1:59999"})
         (certdir / "proxy.json").write_text(
@@ -2143,7 +1915,7 @@ class TestUnwireWhenDead:
         """
         import json as _json, socket, threading
         import claude_swap.paths as paths
-        from claude_swap.pin_proxy import unwire_if_dead
+        from cswap_pin.proxy import unwire_if_dead
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))
         srv.listen(1)
@@ -2168,7 +1940,7 @@ class TestUnwireWhenDead:
     def test_a_LIVE_daemon_is_left_alone(self, tmp_path, monkeypatch):
         """The guard must not disarm a working pin — that would be the worse bug."""
         import os, socket, threading
-        from claude_swap.pin_proxy import unwire_if_dead
+        from cswap_pin.proxy import unwire_if_dead
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))
         srv.listen(1)
@@ -2189,7 +1961,7 @@ class TestUnwireWhenDead:
     def test_teardown_restores_the_config(self):
         """The orderly path must unwire too, not only the crash path."""
         import inspect
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         src = inspect.getsource(pin_proxy.daemon_main)
         body = src[src.index("def _teardown"):]
         assert "wire_global_config(None, None)" in body, (
@@ -2208,7 +1980,7 @@ class TestHealRestoresWithoutRestart:
 
     def _root(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
-        from claude_swap.pin_proxy import save_pin
+        from cswap_pin.proxy import save_pin
         root = tmp_path / "backup"
         root.mkdir()
         (root / "pin-proxy").mkdir()
@@ -2222,7 +1994,7 @@ class TestHealRestoresWithoutRestart:
 
     def test_no_pin_is_a_no_op(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
-        from claude_swap.pin_proxy import heal
+        from cswap_pin.proxy import heal
         root = tmp_path / "backup"
         (root / "pin-proxy").mkdir(parents=True)
         cfg = tmp_path / ".claude.json"
@@ -2232,7 +2004,7 @@ class TestHealRestoresWithoutRestart:
 
     def test_a_serving_pin_is_left_alone(self, tmp_path, monkeypatch):
         """Must not restart a healthy daemon: it runs every few seconds."""
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         root, _ = self._root(tmp_path, monkeypatch)
         monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *a, **k: 40404)
         called = []
@@ -2243,7 +2015,7 @@ class TestHealRestoresWithoutRestart:
 
     def test_a_dangling_pin_does_not_spawn(self, tmp_path, monkeypatch):
         """Pinned to a slot that no longer exists: nothing to serve."""
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         root, _ = self._root(tmp_path, monkeypatch)
         (root / "sequence.json").write_text(json.dumps({"accounts": {}}))
         called = []
@@ -2253,7 +2025,7 @@ class TestHealRestoresWithoutRestart:
         assert not called
 
     def test_a_dead_daemon_is_respawned_and_rewired(self, tmp_path, monkeypatch):
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         root, cfg = self._root(tmp_path, monkeypatch)
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 45678)
         assert pin_proxy.heal(root) is True
@@ -2262,7 +2034,7 @@ class TestHealRestoresWithoutRestart:
 
     def test_a_failed_respawn_clears_the_wiring(self, tmp_path, monkeypatch):
         """If it cannot come back, it must not leave sessions dialling a corpse."""
-        from claude_swap import pin_proxy
+        from cswap_pin import proxy as pin_proxy
         root, cfg = self._root(tmp_path, monkeypatch)
         cfg.write_text(json.dumps({
             "env": {"HTTPS_PROXY": "http://127.0.0.1:59999"},
