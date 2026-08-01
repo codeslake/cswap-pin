@@ -287,6 +287,74 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
         return None
 
 
+def heal(backup_root: Path) -> bool:
+    """Bring the pin back if it is pinned but not serving. True when it did.
+
+    RECOVERY WITHOUT A SESSION RESTART. Everything else in this module reacts
+    to a launch: ``ensure_proxy`` runs when a NEW session starts, so if the
+    daemon dies while sessions are up, nothing brings it back — and if the dead
+    wiring has blocked every session, no new one can start to trigger it. That
+    is a deadlock, and it is exactly what happened on work-mac: a human had to
+    re-pin by hand.
+
+    So this is callable from anything that already runs periodically (the
+    status line does, every few seconds) and needs no switcher: the pinned
+    identity comes from settings.json and the slot from the account registry,
+    both on disk. Cheap when healthy — a state read plus one loopback connect,
+    and it returns immediately.
+
+    The port is REBOUND, not reallocated: the daemon reclaims the port recorded
+    in proxy.json, else port.hint. That is what makes live sessions recover on
+    their own — they are already wired to that address, so a daemon returning
+    to it is picked up by the next request with no restart and nothing to
+    reconnect by hand.
+
+    Serialized by the same spawn lock ``ensure_proxy`` takes, so N status lines
+    across N sessions elect ONE spawner instead of racing.
+    """
+    backup_root = Path(backup_root)
+    certdir = backup_root / "pin-proxy"
+    try:
+        pin = load_pin(backup_root)
+    except Exception:
+        return False
+    if not pin:
+        return False  # nothing pinned — not our business
+    email = pin[0]
+    if _read_alive_port(certdir) is not None:
+        return False  # already serving
+    # Resolve the slot the way the status line does: identity is stored by
+    # email because slots move (`cswap move`), so the number comes from the
+    # registry rather than being cached with the pin.
+    try:
+        seq = json.loads((backup_root / "sequence.json").read_text(encoding="utf-8"))
+        accounts = seq.get("accounts") or {}
+        account_num = next(
+            (num for num, rec in accounts.items()
+             if (rec.get("email") if isinstance(rec, dict) else rec) == email),
+            None,
+        )
+    except Exception:
+        account_num = None
+    if not account_num:
+        return False  # dangling pin: its slot is gone, nothing to serve
+    try:
+        with _spawn_lock(certdir):
+            # Re-check under the lock — another caller may have just spawned.
+            if _read_alive_port(certdir) is not None:
+                return False
+            port = _spawn_daemon(account_num, email, certdir)
+        if port is None:
+            # Could not start. Make sure a stale wiring is not left behind to
+            # block sessions; better unpinned than unusable.
+            unwire_if_dead(certdir)
+            return False
+        wire_global_config(port, certdir / "ca.pem")
+        return True
+    except Exception:
+        return False
+
+
 def unwire_if_dead(certdir: Path) -> bool:
     """Strip a pin wiring whose daemon is gone. True when it removed one.
 
