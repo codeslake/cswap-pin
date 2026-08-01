@@ -389,11 +389,51 @@ def unwire_if_dead(certdir: Path) -> bool:
                     return False  # serving — leave the wiring alone
         except (OSError, KeyError, TypeError, ValueError):
             pass
-    # No record, dead pid, or a port that does not answer.
+
+    # NO RECORD IS NOT PROOF OF DEATH. `_spawn_daemon` UNLINKS proxy.json as
+    # its first act, so between that unlink and a failed spawn the state file
+    # is missing while the original daemon is still happily serving. Deciding
+    # from the record alone unwired a live pin on linux: daemon 4035232 had
+    # been up 38h, pid alive, port answering, and the env block was stripped
+    # anyway because proxy.json had just been deleted out from under this
+    # check. (It fires on a code change, because ensure_proxy matches on a
+    # FINGERPRINT: same daemon, new fingerprint, so it tries to replace one
+    # that is fine, and the spawn fails on the port the healthy daemon holds.)
+    #
+    # So ask the WIRING itself, which is the thing we are about to remove: if
+    # the port it names still answers, something is serving on it and the
+    # wiring is correct regardless of what any file says.
+    port = _wired_port()
+    if port is not None:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return False  # the wired address is live — do not touch it
+        except OSError:
+            pass
+
     try:
         return wire_global_config(None, None)
     except Exception:
         return False
+
+
+def _wired_port() -> int | None:
+    """The pin port currently named in the global config, or None.
+
+    Read straight off the env block rather than from our own state, so it stays
+    truthful while the state file is absent (see ``unwire_if_dead``).
+    """
+    try:
+        from claude_swap.paths import get_global_config_path
+
+        raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
+        env = raw.get("env") if isinstance(raw, dict) else None
+        if not isinstance(env, dict):
+            return None
+        val = env.get("CSWAP_PIN_PORT")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
 
 
 def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
@@ -1070,10 +1110,15 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             _kill_daemon(int(stale["pid"]))
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
-            # The spawn failed and there is no daemon. Anything still wired in
-            # .claude.json names a port nothing serves, and Claude Code applies
-            # that block at boot — so leaving it would take the SESSION down,
-            # not just the pin. Strip it and let the launch proceed unpinned.
+            # The spawn failed. Anything still wired in .claude.json may name a
+            # port nothing serves, and Claude Code applies that block at boot —
+            # so a stale entry would take the SESSION down, not just the pin.
+            #
+            # unwire_if_dead re-checks liveness itself and leaves a SERVING
+            # daemon alone, which matters here: "our spawn failed" is not the
+            # same as "nothing is serving". A concurrent launch may have won
+            # the race and started one, and a spawn can fail precisely because
+            # a healthy daemon already owns the port.
             unwire_if_dead(certdir)
             return None
     # Re-point hand-launched sessions at the port that is actually serving.
