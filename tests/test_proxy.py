@@ -1071,6 +1071,74 @@ class TestRefcount:
         os.close(holder)
         assert fired.wait(timeout=3), "did not tear down after the holder closed"
 
+    def test_a_globally_wired_daemon_is_not_an_orphan(self, tmp_path, monkeypatch):
+        """Zero FIFO holders is the STEADY STATE of a healthy pin — not an orphan.
+
+        Only ``wire_env`` and ``pin-env`` open the refcount FIFO. The
+        ``.claude.json`` env block — the path every hand-launched ``claude``
+        takes — pins a session without ever touching it, so those sessions are
+        invisible to the refcount. Measured on linux: daemon 4035232 serving
+        36301 for 1d17h with not one holder anywhere in ``/proc/*/fd``.
+
+        The first-holder timeout read that as "nobody ever attached" and would
+        have torn the live pin down at the next respawn on every machine. The
+        wiring naming our port is itself the claim.
+        """
+        import json as _json, os, threading
+        import claude_swap.paths as paths
+        from claude_swap.pin_proxy import (
+            refcount_fifo_path,
+            watch_refcount,
+            write_daemon_state,
+            daemon_fingerprint,
+        )
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        # This process IS the daemon, serving port 40404, and the global config
+        # routes sessions there. No holder is ever opened — as in production.
+        write_daemon_state(certdir, 40404, os.getpid(), daemon_fingerprint())
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "40404"}}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set),
+            kwargs={"first_holder_timeout": 0.3}, daemon=True,
+        ).start()
+        assert not fired.wait(timeout=2), (
+            "tore down a daemon the global config still routes sessions to"
+        )
+
+    def test_an_unwired_daemon_still_dies(self, tmp_path, monkeypatch):
+        """The claim must be OUR port, not merely the presence of some wiring.
+
+        Otherwise the orphan reaper stops working the moment any pin is active
+        anywhere: the /tmp/pytest-* leftovers this timeout exists to kill would
+        read a live daemon's wiring as their own claim and linger forever.
+        """
+        import json as _json, os, threading
+        import claude_swap.paths as paths
+        from claude_swap.pin_proxy import (
+            refcount_fifo_path,
+            watch_refcount,
+            write_daemon_state,
+            daemon_fingerprint,
+        )
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        write_daemon_state(certdir, 40404, os.getpid(), daemon_fingerprint())
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "59999"}}))  # someone else
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set),
+            kwargs={"first_holder_timeout": 0.3}, daemon=True,
+        ).start()
+        assert fired.wait(timeout=5), "orphan lingered — reaper disabled by a foreign pin"
+
 
 class TestPinEnvRefcount:
     """pin-env (shell path) must emit a shell `exec {fd}<>fifo` so the SHELL
