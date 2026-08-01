@@ -164,11 +164,51 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
             or other_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
         ):
             _write_bundle_atomically(
-                bundle, ca_path.read_bytes() + b"\n" + other_path.read_bytes()
+                bundle, _join_pem(ca_path.read_bytes(), other_path.read_bytes())
             )
     except OSError:
         return ca_path
     return bundle
+
+
+def _join_pem(*parts: bytes) -> bytes:
+    """Concatenate PEM files so no block's terminator welds onto the next.
+
+    A byte concatenation of two PEM files whose first does not end in a newline
+    produces::
+
+        -----END CERTIFICATE----------BEGIN CERTIFICATE-----
+
+    openssl rejects that block and node then loads ZERO CAs — the session
+    silently loses all trust. Same outcome as a torn write, and the atomic
+    publish does NOT help: the fused file is written completely and correctly,
+    it is just invalid.
+
+    Measured: all three inputs on this fleet happen to end in a newline today
+    (our ca.pem, the shared ca-trust.pem, the system store), which is why this
+    has never fired. That is a property of the inputs, not of this code, and
+    one of those inputs is the ambient CA store — uncontrolled by us, and
+    deliberately passed through verbatim rather than filtered (dropping blocks
+    we do not recognise would silently narrow the bundle, which no reader can
+    detect).
+
+    Raised by the CCF session, whose read-side guard was accepting the fused
+    shape until e28abd0; their END matcher used ``indexOf``, so trailing
+    content on the marker line passed.
+
+    Adds a newline only where one is missing, so a file that already ends
+    cleanly is byte-identical to a plain concatenation — the bundle is
+    compared against the ambient store by certificate count elsewhere, and
+    padding would be a gratuitous difference.
+    """
+    out = bytearray()
+    for part in parts:
+        if not part:
+            continue
+        out += part
+        if not part.endswith(b"\n"):
+            out += b"\n"
+    return bytes(out)
 
 
 def _write_bundle_atomically(bundle: Path, body: bytes) -> None:
@@ -261,7 +301,7 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
     bundle = Path(ca_path).parent / "ca-bundle.pem"
     try:
         _write_bundle_atomically(
-            bundle, Path(ca_path).read_bytes() + Path(existing).read_bytes()
+            bundle, _join_pem(Path(ca_path).read_bytes(), Path(existing).read_bytes())
         )
         return bundle
     except OSError:
