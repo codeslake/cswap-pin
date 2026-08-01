@@ -271,13 +271,17 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # Checking that we are in there cannot see that; count the markers.
             #
             # A bundle that is BALANCED and CONTAINS us but has silently lost
-            # other roots is deliberately NOT guarded here. A consumer cannot
-            # tell "narrowed" from "correctly small": measured across the three
-            # machines this runs on, a legitimate bundle is 2 certs on one and
-            # 132 on another, so any size floor that catches narrowing on one
-            # host rejects a healthy bundle on the next. Only the builder holds
-            # the previous state that makes narrowing a *regression* rather
-            # than a fact, which is why it keeps the last good bundle instead.
+            # other roots is deliberately NOT guarded here, and not because we
+            # lack the information: a reader is the wrong PLACE to decide it.
+            # Even holding the previous bundle, a shrink is legitimate whenever
+            # a root was retired or a component uninstalled, and only the
+            # builder knows which happened — so a reader acting on a shrink
+            # would reject a correct bundle in exactly the cases the shrink was
+            # intended. Measured across the three machines this runs on, a
+            # legitimate bundle is 2 certs on one and 132 on another, so any
+            # size floor that catches narrowing on one host rejects a healthy
+            # bundle on the next. The builder keeps the last good bundle for
+            # this reason; that is where the decision belongs.
             # The two cases below are also a different severity class: both
             # leave the session unable to verify its OWN proxy, so every
             # request dies. Narrowing keeps our chain intact and costs someone
