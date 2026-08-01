@@ -1115,15 +1115,77 @@ def _open_daemon_log(certdir: Path):
         return subprocess.DEVNULL
 
 
-def watch_refcount(fifo: str | Path, on_last_holder_gone) -> None:
+_FIRST_HOLDER_TIMEOUT = 300.0
+
+
+def watch_refcount(
+    fifo: str | Path, on_last_holder_gone, first_holder_timeout: float | None = None
+) -> None:
     """Block on ``fifo`` until every write-holder closes, then call
     ``on_last_holder_gone``. This is exactly CCF's supervisor `cat FIFO`:
     a READ-ONLY open blocks until the first writer appears, and the subsequent
     read returns EOF (b"") only once all writer fds have closed. A read-only
     reader must NOT also hold a write end (that would mask EOF), which is why
     sessions open O_RDWR while the daemon opens read-only here.
+
+    A daemon that NEVER gets a first holder must still die. The read-only open
+    blocks forever when no writer ever appears, and "forever" is not a corner
+    case: it is what happens whenever a daemon is spawned and its session dies
+    before attaching (a crash between spawn and attach, a killed test). The
+    process then holds its port and never idle-teardowns — measured, three such
+    daemons left over from one test run, each on a ``/tmp/pytest-*`` certdir the
+    per-certdir orphan sweep deliberately cannot see.
+
+    So the FIRST open is bounded: O_NONBLOCK returns immediately (EOF-looking,
+    not blocking) instead of parking forever, and we poll for a writer up to
+    ``first_holder_timeout``. Once a holder has attached we switch to the
+    blocking semantics above, which are the ones that give a correct EOF.
+    Timeout with no holder => tear down, exactly as if the last holder left.
     """
-    fd = os.open(str(fifo), os.O_RDONLY)  # blocks until the first holder attaches
+    timeout = _FIRST_HOLDER_TIMEOUT if first_holder_timeout is None else first_holder_timeout
+    # O_NONBLOCK on a read-only FIFO open never blocks (POSIX), so this cannot
+    # park the way the plain open did. select() then tells us when a writer has
+    # actually attached; before that a read would just return EOF forever.
+    fd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        import select
+        import time as _time
+
+        # Detect a holder by REOPENING for write, never by reading. A holder
+        # that attaches and stays silent — which is the normal case, the fd IS
+        # the reference — writes nothing, so waiting for bytes reports "no
+        # holder" for a session that is perfectly alive and tears it down.
+        # (Caught by test_daemon_exits_when_all_holders_close.)
+        #
+        # O_WRONLY|O_NONBLOCK on a FIFO succeeds only while a READER is open,
+        # and we are that reader, so it always succeeds here and says nothing.
+        # The usable signal is the opposite one: with our read fd open, a
+        # non-blocking read returns EOF (b"") when there is no writer and
+        # EAGAIN when a writer exists but has sent nothing. EAGAIN is exactly
+        # "a holder is attached and quiet".
+        deadline = _time.monotonic() + timeout
+        while True:
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                break  # writer present, no data — a live silent holder
+            if data != b"":
+                break  # writer present and chatty (an attach ping)
+            # EOF: no writer at all yet.
+            if _time.monotonic() >= deadline:
+                on_last_holder_gone()  # nobody ever attached — do not linger
+                return
+            select.select([fd], [], [], 0.05)
+        # Back to blocking reads: with a writer present, EOF now means what the
+        # refcount needs it to mean (every holder closed), which a non-blocking
+        # read cannot distinguish from "no data yet".
+        os.set_blocking(fd, True)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
     try:
         while True:
             data = os.read(fd, 65536)  # blocks; returns b"" at EOF (no writers)
