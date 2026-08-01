@@ -161,12 +161,43 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
             or ca_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
             or other_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
         ):
-            bundle.write_bytes(
-                ca_path.read_bytes() + b"\n" + other_path.read_bytes()
+            _write_bundle_atomically(
+                bundle, ca_path.read_bytes() + b"\n" + other_path.read_bytes()
             )
     except OSError:
         return ca_path
     return bundle
+
+
+def _write_bundle_atomically(bundle: Path, body: bytes) -> None:
+    """Publish a CA bundle by temp-then-rename. Never write it in place.
+
+    A bundle is read by whoever launches next, so a writer that dies mid-write
+    leaves a TORN file that the next session names in ``NODE_EXTRA_CA_CERTS``.
+    Node aborts the entire extras load on any block it cannot decode — every
+    component CA and every corporate root at once — and says so only in a
+    stderr warning, so the session fails with "unable to verify the first
+    certificate" and nothing points at the bundle.
+
+    A BEGIN/END balance check does not cover this. Truncate just after an END
+    marker and the file is BALANCED with a corrupt base64 payload inside; that
+    shape passes the count and still costs the session all its trust.
+    (Measured by the CCF session against their read-side guard, which now
+    rejects it — but a reader's guard is a backstop, and the cause is here.)
+
+    ``os.replace`` is atomic on POSIX and Windows, so a reader sees either the
+    old bundle or the new one, never half of one.
+    """
+    tmp = bundle.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(body)
+        os.replace(tmp, bundle)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 CA_TRUST_DIR = "ca-trust.d"
@@ -227,7 +258,9 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
         return Path(ca_path)
     bundle = Path(ca_path).parent / "ca-bundle.pem"
     try:
-        bundle.write_bytes(Path(ca_path).read_bytes() + Path(existing).read_bytes())
+        _write_bundle_atomically(
+            bundle, Path(ca_path).read_bytes() + Path(existing).read_bytes()
+        )
         return bundle
     except OSError:
         return Path(ca_path)
