@@ -2064,3 +2064,78 @@ class TestUnwireWhenDead:
             "_teardown must restore .claude.json; otherwise an idle teardown "
             "leaves every later session dialling a port nobody serves")
 
+class TestHealRestoresWithoutRestart:
+    """A repaired pin must come back on the SAME port, with no session restart.
+
+    Every other entry point reacts to a launch: the daemon is started only by
+    ensure_proxy, which runs when a NEW session begins. So a daemon that dies
+    under running sessions was never replaced — and once its stale wiring
+    blocked every session, no new one could start to trigger the restart. That
+    deadlock is why work-mac needed a human to re-pin by hand.
+    """
+
+    def _root(self, tmp_path, monkeypatch):
+        import claude_swap.paths as paths
+        from claude_swap.pin_proxy import save_pin
+        root = tmp_path / "backup"
+        root.mkdir()
+        (root / "pin-proxy").mkdir()
+        save_pin(root, "a@example.com", "org-1")
+        (root / "sequence.json").write_text(json.dumps(
+            {"accounts": {"1": {"email": "a@example.com"}}}))
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text("{}")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        return root, cfg
+
+    def test_no_pin_is_a_no_op(self, tmp_path, monkeypatch):
+        import claude_swap.paths as paths
+        from claude_swap.pin_proxy import heal
+        root = tmp_path / "backup"
+        (root / "pin-proxy").mkdir(parents=True)
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text("{}")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        assert heal(root) is False  # nothing pinned — not our business
+
+    def test_a_serving_pin_is_left_alone(self, tmp_path, monkeypatch):
+        """Must not restart a healthy daemon: it runs every few seconds."""
+        from claude_swap import pin_proxy
+        root, _ = self._root(tmp_path, monkeypatch)
+        monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *a, **k: 40404)
+        called = []
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a: called.append(a) or 1)
+        assert pin_proxy.heal(root) is False
+        assert not called, "restarted a daemon that was already serving"
+
+    def test_a_dangling_pin_does_not_spawn(self, tmp_path, monkeypatch):
+        """Pinned to a slot that no longer exists: nothing to serve."""
+        from claude_swap import pin_proxy
+        root, _ = self._root(tmp_path, monkeypatch)
+        (root / "sequence.json").write_text(json.dumps({"accounts": {}}))
+        called = []
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a: called.append(a) or 1)
+        assert pin_proxy.heal(root) is False
+        assert not called
+
+    def test_a_dead_daemon_is_respawned_and_rewired(self, tmp_path, monkeypatch):
+        from claude_swap import pin_proxy
+        root, cfg = self._root(tmp_path, monkeypatch)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 45678)
+        assert pin_proxy.heal(root) is True
+        env = json.loads(cfg.read_text())["env"]
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:45678"
+
+    def test_a_failed_respawn_clears_the_wiring(self, tmp_path, monkeypatch):
+        """If it cannot come back, it must not leave sessions dialling a corpse."""
+        from claude_swap import pin_proxy
+        root, cfg = self._root(tmp_path, monkeypatch)
+        cfg.write_text(json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:59999"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY"]}))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: None)
+        assert pin_proxy.heal(root) is False
+        assert json.loads(cfg.read_text()).get("env", {}) == {}
+
