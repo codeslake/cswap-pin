@@ -287,6 +287,155 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
         return None
 
 
+def heal(backup_root: Path) -> bool:
+    """Bring the pin back if it is pinned but not serving. True when it did.
+
+    RECOVERY WITHOUT A SESSION RESTART. Everything else in this module reacts
+    to a launch: ``ensure_proxy`` runs when a NEW session starts, so if the
+    daemon dies while sessions are up, nothing brings it back — and if the dead
+    wiring has blocked every session, no new one can start to trigger it. That
+    is a deadlock, and it is exactly what happened on work-mac: a human had to
+    re-pin by hand.
+
+    So this is callable from anything that already runs periodically (the
+    status line does, every few seconds) and needs no switcher: the pinned
+    identity comes from settings.json and the slot from the account registry,
+    both on disk. Cheap when healthy — a state read plus one loopback connect,
+    and it returns immediately.
+
+    The port is REBOUND, not reallocated: the daemon reclaims the port recorded
+    in proxy.json, else port.hint. That is what makes live sessions recover on
+    their own — they are already wired to that address, so a daemon returning
+    to it is picked up by the next request with no restart and nothing to
+    reconnect by hand.
+
+    Serialized by the same spawn lock ``ensure_proxy`` takes, so N status lines
+    across N sessions elect ONE spawner instead of racing.
+    """
+    backup_root = Path(backup_root)
+    certdir = backup_root / "pin-proxy"
+    try:
+        pin = load_pin(backup_root)
+    except Exception:
+        return False
+    if not pin:
+        return False  # nothing pinned — not our business
+    email = pin[0]
+    if _read_alive_port(certdir) is not None:
+        return False  # already serving
+    # Resolve the slot the way the status line does: identity is stored by
+    # email because slots move (`cswap move`), so the number comes from the
+    # registry rather than being cached with the pin.
+    try:
+        seq = json.loads((backup_root / "sequence.json").read_text(encoding="utf-8"))
+        accounts = seq.get("accounts") or {}
+        account_num = next(
+            (num for num, rec in accounts.items()
+             if (rec.get("email") if isinstance(rec, dict) else rec) == email),
+            None,
+        )
+    except Exception:
+        account_num = None
+    if not account_num:
+        return False  # dangling pin: its slot is gone, nothing to serve
+    try:
+        with _spawn_lock(certdir):
+            # Re-check under the lock — another caller may have just spawned.
+            if _read_alive_port(certdir) is not None:
+                return False
+            port = _spawn_daemon(account_num, email, certdir)
+        if port is None:
+            # Could not start. Make sure a stale wiring is not left behind to
+            # block sessions; better unpinned than unusable.
+            unwire_if_dead(certdir)
+            return False
+        wire_global_config(port, certdir / "ca.pem")
+        return True
+    except Exception:
+        return False
+
+
+def unwire_if_dead(certdir: Path) -> bool:
+    """Strip a pin wiring whose daemon is gone. True when it removed one.
+
+    The teardown path restores ``.claude.json`` itself, but it only runs when
+    the daemon exits in an orderly way. A SIGKILL, an OOM kill, a crash — or a
+    daemon that never started at all, which is what happened on work-mac when
+    ``cryptography`` vanished from its environment — leaves the env block
+    naming a port nothing listens on. Claude Code applies that block at boot,
+    so every session from then on dials a dead proxy and retries forever while
+    the upstream proxies are perfectly healthy behind it.
+
+    Called at launch, before anything reads the wiring, so a broken pin costs
+    the PIN and never the session. The check is the same one
+    ``_read_alive_port`` makes — a recorded pid that is alive AND a port that
+    answers — because either alone lies: a wedged process keeps its pid, and a
+    port can be inherited by something else entirely.
+
+    Deliberately does NOT try to revive the daemon. That is ``ensure_proxy``'s
+    job and it needs the switcher; this runs on paths that may not have one,
+    and a launch must never block on starting a background service.
+    """
+    try:
+        st = read_daemon_state(certdir)
+    except Exception:
+        st = None
+    if st:
+        try:
+            if _pid_alive(int(st["pid"])):
+                with socket.create_connection(
+                    ("127.0.0.1", int(st["port"])), timeout=1
+                ):
+                    return False  # serving — leave the wiring alone
+        except (OSError, KeyError, TypeError, ValueError):
+            pass
+
+    # NO RECORD IS NOT PROOF OF DEATH. `_spawn_daemon` UNLINKS proxy.json as
+    # its first act, so between that unlink and a failed spawn the state file
+    # is missing while the original daemon is still happily serving. Deciding
+    # from the record alone unwired a live pin on linux: daemon 4035232 had
+    # been up 38h, pid alive, port answering, and the env block was stripped
+    # anyway because proxy.json had just been deleted out from under this
+    # check. (It fires on a code change, because ensure_proxy matches on a
+    # FINGERPRINT: same daemon, new fingerprint, so it tries to replace one
+    # that is fine, and the spawn fails on the port the healthy daemon holds.)
+    #
+    # So ask the WIRING itself, which is the thing we are about to remove: if
+    # the port it names still answers, something is serving on it and the
+    # wiring is correct regardless of what any file says.
+    port = _wired_port()
+    if port is not None:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return False  # the wired address is live — do not touch it
+        except OSError:
+            pass
+
+    try:
+        return wire_global_config(None, None)
+    except Exception:
+        return False
+
+
+def _wired_port() -> int | None:
+    """The pin port currently named in the global config, or None.
+
+    Read straight off the env block rather than from our own state, so it stays
+    truthful while the state file is absent (see ``unwire_if_dead``).
+    """
+    try:
+        from claude_swap.paths import get_global_config_path
+
+        raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
+        env = raw.get("env") if isinstance(raw, dict) else None
+        if not isinstance(env, dict):
+            return None
+        val = env.get("CSWAP_PIN_PORT")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+
 def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
     """Route hand-launched ``claude`` sessions through the pin proxy.
 
@@ -961,6 +1110,16 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             _kill_daemon(int(stale["pid"]))
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
+            # The spawn failed. Anything still wired in .claude.json may name a
+            # port nothing serves, and Claude Code applies that block at boot —
+            # so a stale entry would take the SESSION down, not just the pin.
+            #
+            # unwire_if_dead re-checks liveness itself and leaves a SERVING
+            # daemon alone, which matters here: "our spawn failed" is not the
+            # same as "nothing is serving". A concurrent launch may have won
+            # the race and started one, and a spawn can fail precisely because
+            # a healthy daemon already owns the port.
+            unwire_if_dead(certdir)
             return None
     # Re-point hand-launched sessions at the port that is actually serving.
     # Done on every launch, not just on pin: an idle teardown followed by a
@@ -1118,6 +1277,33 @@ def _open_daemon_log(certdir: Path):
 _FIRST_HOLDER_TIMEOUT = 300.0
 
 
+def _is_claimed(certdir: Path) -> bool:
+    """True when the global wiring names THIS daemon, holder or no holder.
+
+    A FIFO holder is not the only way to claim a daemon, and it is not even the
+    common one. Only ``wire_env`` and ``pin-env`` open the refcount FIFO; the
+    ``.claude.json`` env block — the path every hand-launched ``claude`` takes
+    — routes a session through the pin without ever touching it. So a healthy,
+    fully-used daemon sits at ZERO holders indefinitely: measured on linux,
+    daemon 4035232 serving 36301 for 1d17h with not one holder anywhere in
+    ``/proc/*/fd``. To the first-holder timeout that is indistinguishable from
+    the orphan it exists to reap, and it would tear the live pin down.
+
+    The wiring itself is the missing claim. If ``.claude.json`` points sessions
+    at our port, we are the thing they are pointed at, and that is a reference
+    whether or not anyone opened the FIFO. It also separates the two
+    populations exactly: a crashed spawn or a killed test leaves a daemon on a
+    certdir nothing was ever wired to, so those still time out as before.
+    """
+    try:
+        st = read_daemon_state(certdir)
+        if not st or int(st["pid"]) != os.getpid():
+            return False  # not our record — say nothing about our own liveness
+        return _wired_port() == int(st["port"])
+    except Exception:
+        return False
+
+
 def watch_refcount(
     fifo: str | Path, on_last_holder_gone, first_holder_timeout: float | None = None
 ) -> None:
@@ -1140,7 +1326,10 @@ def watch_refcount(
     not blocking) instead of parking forever, and we poll for a writer up to
     ``first_holder_timeout``. Once a holder has attached we switch to the
     blocking semantics above, which are the ones that give a correct EOF.
-    Timeout with no holder => tear down, exactly as if the last holder left.
+    Timeout with no holder AND no wiring claiming us => tear down, exactly as
+    if the last holder left. The wiring check is not optional: zero holders is
+    the STEADY STATE of a healthy daemon serving globally wired sessions, so
+    without it this timeout kills the working pin (see ``_is_claimed``).
     """
     timeout = _FIRST_HOLDER_TIMEOUT if first_holder_timeout is None else first_holder_timeout
     # O_NONBLOCK on a read-only FIFO open never blocks (POSIX), so this cannot
@@ -1173,6 +1362,12 @@ def watch_refcount(
                 break  # writer present and chatty (an attach ping)
             # EOF: no writer at all yet.
             if _time.monotonic() >= deadline:
+                # ...which is NOT the same as "nobody is using me". A globally
+                # wired session never opens the FIFO, so check the wiring
+                # before concluding we are an orphan (see ``_is_claimed``).
+                if _is_claimed(Path(fifo).parent):
+                    deadline = _time.monotonic() + timeout  # re-arm and re-check
+                    continue
                 on_last_holder_gone()  # nobody ever attached — do not linger
                 return
             select.select([fd], [], [], 0.05)
@@ -1396,6 +1591,23 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             (certdir / _STATE_FILE).unlink()
         except OSError:
             pass
+        # Put ``.claude.json`` back the way we found it. Without this the env
+        # block keeps naming the port we just stopped serving, and Claude Code
+        # applies that block at boot — so EVERY session started afterwards
+        # dials a dead proxy and retries forever, with privoxy and the cache
+        # proxy both healthy and unreachable behind it. Measured on work-mac:
+        # "Unable to connect to API (ConnectionRefused), attempt 14/300", and
+        # the only cure was a human re-pinning by hand.
+        #
+        # An optional feature must not be able to take the required path down
+        # with it. wire_global_config(None, None) restores whatever proxy the
+        # user or their launcher had before we wrote ours, which is exactly
+        # what `pin --clear` already does — the call simply never ran on the
+        # path where the daemon goes away by itself.
+        try:
+            wire_global_config(None, None)
+        except Exception:
+            pass  # teardown is best-effort; never raise on the way out
         done.set()
 
     # A recycle/cc-update TERM runs the same cleanup as an idle teardown.
