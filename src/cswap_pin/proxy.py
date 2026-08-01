@@ -925,6 +925,40 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     _settings.atomic_write_json(path, raw)
 
 
+def sessions_wired_without_credential(port: int) -> int:
+    """How many running processes hold this pin's port with NO credential.
+
+    Arming the proxy credential cuts these off: their ``HTTPS_PROXY`` was
+    fixed at exec time, so they cannot learn the new URL without relaunching,
+    and nothing in a request distinguishes one of them from an attacker.
+    Counting them is what lets ``cswap pin`` SAY so, instead of letting an
+    operator discover it as a wave of unexplained connection failures.
+
+    Best-effort and POSIX-only: ``/proc`` is the only place this is readable,
+    and a platform without it simply reports 0 rather than failing the pin.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return 0
+    needle = f":{port}"
+    count = 0
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            environ = (entry / "environ").read_bytes()
+        except OSError:
+            continue  # another user's process, or it exited — not ours to judge
+        for field in environ.split(b"\0"):
+            if not field.startswith(b"HTTPS_PROXY="):
+                continue
+            value = field.partition(b"=")[2].decode("utf-8", "replace")
+            if needle in value and "@" not in value:
+                count += 1
+            break
+    return count
+
+
 def live_remote_control_sessions() -> list[str]:
     """Names of sessions that currently hold a Remote Control binding.
 
@@ -972,10 +1006,11 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
         return False
     # Mint the proxy credential HERE, not in the daemon. This is the one path
     # that also rewrites the wiring, so the gate and the URL that satisfies it
-    # arrive together. A daemon respawn must never arm it by itself — sessions
-    # already running carry the pre-credential URL and would start getting 407.
-    # An existing secret is reused, so re-pinning does not invalidate live
-    # sessions either.
+    # arrive together, at a moment an operator chose. A daemon respawn must
+    # never arm it by itself: that would fire on a fingerprint recycle, a
+    # deploy or an idle teardown, with nothing a human could connect to the
+    # resulting failures. An existing secret is reused, so re-pinning does not
+    # invalidate anything.
     certdir = switcher.backup_dir / "pin-proxy"
     try:
         certdir.mkdir(parents=True, exist_ok=True)
@@ -1912,12 +1947,13 @@ class PinProxy:
         self._chain = chain_proxy
         self._rediscover_chain = rediscover_chain
         self._host = host
-        # The credential a client must present on CONNECT. Read, never minted,
-        # here: the daemon entry point mints it before wiring so the value the
-        # clients are handed and the value we check are the same one. Empty or
-        # missing => no auth required (a pre-upgrade daemon, or a cert dir we
-        # could not write) — see ``ensure_proxy_secret``.
-        self._secret = read_proxy_secret(self._certdir)
+        # The credential a client must present on CONNECT is re-read per
+        # connection, not cached here — ``_current_secret``. Caching it made
+        # the gate arm on the next RESPAWN rather than when the secret was
+        # written, which is the opposite of what the deploy needs (measured by
+        # the cswap owner: `cswap pin` minted the secret and rewired, but
+        # ensure_proxy reused the live daemon, so it kept serving with the
+        # None it had captured at construction).
         self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
         self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._server_ctx.load_cert_chain(
@@ -2012,7 +2048,7 @@ class PinProxy:
                 # not the MITM (which would mint a bearer for it) and not the
                 # blind tunnel (which would make us an open forward proxy for
                 # any host). See ``ensure_proxy_secret``.
-                if not _proxy_authorized(connect_headers, self._secret):
+                if not _proxy_authorized(connect_headers, self._current_secret()):
                     self._refuse_unauthorized(conn)
                     return
                 host = target.rsplit(":", 1)[0]
@@ -2040,6 +2076,26 @@ class PinProxy:
                 conn.close()
             except OSError:
                 pass
+
+    def _current_secret(self) -> str | None:
+        """The credential to require RIGHT NOW, or None to require none.
+
+        Re-read per connection, like ``_current_chain`` does for the egress
+        proxy, so a secret written under a running daemon takes effect without
+        a respawn. Caching it at construction meant the gate armed on the next
+        RESPAWN instead — a fingerprint recycle, a deploy, an idle teardown —
+        with nothing a human would connect to the resulting 407s.
+
+        Arming DOES cut off sessions wired before the credential existed —
+        their ``HTTPS_PROXY`` is fixed at exec time and cannot be updated in
+        place (measured: 67 such sessions on linux). That is unavoidable, not
+        a bug to design around: nothing in a request distinguishes one of them
+        from an attacker, so any rule that keeps serving them keeps the hole
+        open. What matters is that it happens WHEN AN OPERATOR ASKS, in one
+        step they can pair with a relaunch, instead of silently on some later
+        respawn. Hence: minted by ``apply_pin``, enforced from that instant.
+        """
+        return read_proxy_secret(self._certdir) or None
 
     def _refuse_unauthorized(self, conn: socket.socket) -> None:
         """407 a CONNECT that did not present the proxy credential.
@@ -2167,7 +2223,7 @@ class PinProxy:
             headers.append(h)
         # Same gate as CONNECT: an unauthenticated caller must not be able to
         # use us as a forward proxy just by choosing absolute-form.
-        if not _proxy_authorized(parsed, self._secret):
+        if not _proxy_authorized(parsed, self._current_secret()):
             self._refuse_unauthorized(conn)
             return
         split = urlsplit(url)
