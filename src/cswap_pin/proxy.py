@@ -1277,6 +1277,33 @@ def _open_daemon_log(certdir: Path):
 _FIRST_HOLDER_TIMEOUT = 300.0
 
 
+def _is_claimed(certdir: Path) -> bool:
+    """True when the global wiring names THIS daemon, holder or no holder.
+
+    A FIFO holder is not the only way to claim a daemon, and it is not even the
+    common one. Only ``wire_env`` and ``pin-env`` open the refcount FIFO; the
+    ``.claude.json`` env block — the path every hand-launched ``claude`` takes
+    — routes a session through the pin without ever touching it. So a healthy,
+    fully-used daemon sits at ZERO holders indefinitely: measured on linux,
+    daemon 4035232 serving 36301 for 1d17h with not one holder anywhere in
+    ``/proc/*/fd``. To the first-holder timeout that is indistinguishable from
+    the orphan it exists to reap, and it would tear the live pin down.
+
+    The wiring itself is the missing claim. If ``.claude.json`` points sessions
+    at our port, we are the thing they are pointed at, and that is a reference
+    whether or not anyone opened the FIFO. It also separates the two
+    populations exactly: a crashed spawn or a killed test leaves a daemon on a
+    certdir nothing was ever wired to, so those still time out as before.
+    """
+    try:
+        st = read_daemon_state(certdir)
+        if not st or int(st["pid"]) != os.getpid():
+            return False  # not our record — say nothing about our own liveness
+        return _wired_port() == int(st["port"])
+    except Exception:
+        return False
+
+
 def watch_refcount(
     fifo: str | Path, on_last_holder_gone, first_holder_timeout: float | None = None
 ) -> None:
@@ -1299,7 +1326,10 @@ def watch_refcount(
     not blocking) instead of parking forever, and we poll for a writer up to
     ``first_holder_timeout``. Once a holder has attached we switch to the
     blocking semantics above, which are the ones that give a correct EOF.
-    Timeout with no holder => tear down, exactly as if the last holder left.
+    Timeout with no holder AND no wiring claiming us => tear down, exactly as
+    if the last holder left. The wiring check is not optional: zero holders is
+    the STEADY STATE of a healthy daemon serving globally wired sessions, so
+    without it this timeout kills the working pin (see ``_is_claimed``).
     """
     timeout = _FIRST_HOLDER_TIMEOUT if first_holder_timeout is None else first_holder_timeout
     # O_NONBLOCK on a read-only FIFO open never blocks (POSIX), so this cannot
@@ -1332,6 +1362,12 @@ def watch_refcount(
                 break  # writer present and chatty (an attach ping)
             # EOF: no writer at all yet.
             if _time.monotonic() >= deadline:
+                # ...which is NOT the same as "nobody is using me". A globally
+                # wired session never opens the FIFO, so check the wiring
+                # before concluding we are an orphan (see ``_is_claimed``).
+                if _is_claimed(Path(fifo).parent):
+                    deadline = _time.monotonic() + timeout  # re-arm and re-check
+                    continue
                 on_last_holder_gone()  # nobody ever attached — do not linger
                 return
             select.select([fd], [], [], 0.05)
