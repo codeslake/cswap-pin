@@ -970,6 +970,18 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
     if not email:
         wire_global_config(None, None)
         return False
+    # Mint the proxy credential HERE, not in the daemon. This is the one path
+    # that also rewrites the wiring, so the gate and the URL that satisfies it
+    # arrive together. A daemon respawn must never arm it by itself — sessions
+    # already running carry the pre-credential URL and would start getting 407.
+    # An existing secret is reused, so re-pinning does not invalidate live
+    # sessions either.
+    certdir = switcher.backup_dir / "pin-proxy"
+    try:
+        certdir.mkdir(parents=True, exist_ok=True)
+        ensure_proxy_secret(certdir)
+    except OSError:
+        pass  # unwritable cert dir: serve unauthenticated rather than not at all
     return ensure_proxy(switcher) is not None
 
 
@@ -1738,9 +1750,16 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
 
     certdir = Path(certdir)
     switcher = ClaudeAccountSwitcher()
-    # Before the listener exists, so there is no window in which the port is
-    # open and unauthenticated. PinProxy reads the value; it never mints one.
-    ensure_proxy_secret(certdir)
+    # NOT minted here. A daemon respawn (a fingerprint recycle, a deploy) must
+    # not be able to turn the gate on: a live session's HTTPS_PROXY is fixed at
+    # exec time, so a session wired before the credential existed carries a URL
+    # without one and would start getting 407 on its next request — the upgrade
+    # cutting off the very sessions it protects. Measured on linux before
+    # landing this: .claude.json wired "http://127.0.0.1:36301" (no userinfo)
+    # with pid 142172 live on it.
+    #
+    # ``apply_pin`` mints it instead, so the gate arms exactly when the wiring
+    # is rewritten to carry it. PinProxy only ever READS the value.
     proxy = PinProxy(
         certdir=certdir,
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
