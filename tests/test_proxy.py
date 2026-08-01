@@ -2033,6 +2033,45 @@ class TestUnwireWhenDead:
         assert unwire_if_dead(certdir) is True
         assert json.loads(cfg.read_text()).get("env", {}) == {}
 
+    def test_a_live_daemon_with_NO_state_file_is_left_alone(self, tmp_path, monkeypatch):
+        """The incident: proxy.json absent while the daemon is still serving.
+
+        `_spawn_daemon` UNLINKS proxy.json as its first act. Between that unlink
+        and a failed spawn there is a window where the state file is gone and
+        the ORIGINAL daemon is still up — and it is not a narrow window, because
+        ensure_proxy matches on a FINGERPRINT: any code change makes it try to
+        replace a healthy daemon, and that spawn then fails on the port the
+        healthy one still holds.
+
+        Deciding from the state file alone unwired a live pin on linux (daemon
+        4035232, up 38h, pid alive, port answering). The wiring must be judged
+        by whether the port it NAMES answers, not by whether our bookkeeping
+        happens to exist at that instant.
+        """
+        import json as _json, socket, threading
+        import claude_swap.paths as paths
+        from claude_swap.pin_proxy import unwire_if_dead
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        threading.Thread(target=lambda: [srv.accept() for _ in range(8)],
+                         daemon=True).start()
+        try:
+            certdir = tmp_path / "pin-proxy"
+            certdir.mkdir()
+            cfg = tmp_path / ".claude.json"
+            cfg.write_text(_json.dumps({
+                "env": {"HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                        "CSWAP_PIN_PORT": str(port)},
+                "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"]}))
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+            assert not (certdir / "proxy.json").exists()  # mid-spawn
+            assert unwire_if_dead(certdir) is False
+            assert "HTTPS_PROXY" in _json.loads(cfg.read_text())["env"]
+        finally:
+            srv.close()
+
     def test_a_LIVE_daemon_is_left_alone(self, tmp_path, monkeypatch):
         """The guard must not disarm a working pin — that would be the worse bug."""
         import os, socket, threading
