@@ -68,3 +68,54 @@ class TestImportableWithoutTheHost:
         assert "claude-swap[pin]" in r.stderr, (
             "the failure does not name the fix:\n" + r.stderr[-900:]
         )
+
+
+class TestConcatenationCannotFuseBlocks:
+    """A byte concatenation must not weld one block's END onto the next BEGIN.
+
+    `_trust_file` joined two PEM files with no separator. If the first does not
+    end in a newline the result is:
+
+        -----END CERTIFICATE----------BEGIN CERTIFICATE-----
+
+    openssl rejects that block and node then loads ZERO CAs — the session
+    silently loses all trust, which is the same outcome as a torn write and
+    just as invisible.
+
+    Raised by the CCF session, whose read-side guard was accepting it until
+    e28abd0 (their END matcher used indexOf, so trailing content passed). It is
+    reachable from here in a way their base64/label classes are not, because
+    this writer concatenates whatever the ambient CA store holds.
+
+    Today all three live inputs happen to end in a newline. That is a property
+    of the inputs, not a guarantee of this code.
+    """
+
+    def _blocks_are_clean(self, body: bytes) -> bool:
+        return all(
+            line.strip() in ("", "-----END CERTIFICATE-----")
+            for line in body.decode().splitlines()
+            if "-----END" in line
+        )
+
+    def test_a_file_without_a_trailing_newline_does_not_fuse(self, tmp_path):
+        from cswap_pin.proxy import _join_pem
+
+        ours = tmp_path / "ca.pem"
+        ours.write_bytes(b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----")
+        other = tmp_path / "other.pem"
+        other.write_bytes(b"-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n")
+
+        body = _join_pem(ours.read_bytes(), other.read_bytes())
+        assert self._blocks_are_clean(body), (
+            f"welded a terminator onto the next block: {body!r}"
+        )
+
+    def test_a_file_that_already_ends_cleanly_is_not_padded(self, tmp_path):
+        """Do not add blank lines to inputs that were already fine — the file
+        is compared against the ambient store by cert count elsewhere."""
+        from cswap_pin.proxy import _join_pem
+
+        a = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+        b = b"-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n"
+        assert _join_pem(a, b) == a + b
