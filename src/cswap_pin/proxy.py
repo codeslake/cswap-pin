@@ -925,40 +925,6 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     _settings.atomic_write_json(path, raw)
 
 
-def sessions_wired_without_credential(port: int) -> int:
-    """How many running processes hold this pin's port with NO credential.
-
-    Arming the proxy credential cuts these off: their ``HTTPS_PROXY`` was
-    fixed at exec time, so they cannot learn the new URL without relaunching,
-    and nothing in a request distinguishes one of them from an attacker.
-    Counting them is what lets ``cswap pin`` SAY so, instead of letting an
-    operator discover it as a wave of unexplained connection failures.
-
-    Best-effort and POSIX-only: ``/proc`` is the only place this is readable,
-    and a platform without it simply reports 0 rather than failing the pin.
-    """
-    proc = Path("/proc")
-    if not proc.is_dir():
-        return 0
-    needle = f":{port}"
-    count = 0
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            environ = (entry / "environ").read_bytes()
-        except OSError:
-            continue  # another user's process, or it exited — not ours to judge
-        for field in environ.split(b"\0"):
-            if not field.startswith(b"HTTPS_PROXY="):
-                continue
-            value = field.partition(b"=")[2].decode("utf-8", "replace")
-            if needle in value and "@" not in value:
-                count += 1
-            break
-    return count
-
-
 def live_remote_control_sessions() -> list[str]:
     """Names of sessions that currently hold a Remote Control binding.
 
