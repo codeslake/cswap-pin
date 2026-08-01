@@ -1284,6 +1284,41 @@ class TestFailOpenIsNotSilent:
         return PinProxy(certdir=certdir, pin_token_provider=provider,
                         upstream=("127.0.0.1", 1))
 
+    def _drive_pinned_request(self, proxy):
+        """Run one PINNED request through the real swap path.
+
+        The fail-open warning lives in ``_handle_one_request``, so asserting on
+        ``_warn_unpinnable()`` directly proves nothing about whether a request
+        reaches the guard. Feeds a fake TLS socket instead: the relay fails
+        (upstream is port 1, deliberately dead), which is fine — the swap
+        decision, and the warning, happen before the relay.
+        """
+        class _FakeTLS:
+            def __init__(self):
+                self._in = (
+                    b"POST /v1/code/sessions HTTP/1.1\r\n"
+                    b"Host: api.anthropic.com\r\n"
+                    b"Authorization: Bearer disk-bearer\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                self.sent = b""
+
+            def recv(self, n):
+                out, self._in = self._in[:n], self._in[n:]
+                return out
+
+            def sendall(self, b):
+                self.sent += b
+
+            def close(self):
+                pass
+
+        try:
+            proxy._handle_one_request(_FakeTLS())
+        except Exception:
+            pass  # relay to the dead upstream fails; the swap already happened
+        return None
+
     def test_warns_when_the_token_cannot_be_minted(self, certdir, monkeypatch):
         import io
         import sys as _sys
@@ -1387,6 +1422,84 @@ class TestFailOpenIsNotSilent:
                 assert _json.loads(body)["can_pin"] is expect
             finally:
                 p.stop()
+
+    def test_a_noop_pin_does_not_warn(self, certdir, monkeypatch):
+        """Nothing-to-swap must not fire the keychain warning.
+
+        When the pinned account IS the active one the provider correctly
+        returns no token: the live bearer already belongs to it. Warning there
+        sends whoever reads the log after a macOS keychain fault that is not
+        there. Measured on personal-mac after the 79a665a deploy: daemon.log
+        carried "the pinned account token could not be read ... started
+        outside the GUI session" while the keychain read was fine (rc=0, 509
+        bytes), and it cost the reader ten minutes.
+
+        Drives the real swap path rather than asserting on a method call, so
+        it fails if the guard is put anywhere the request does not reach.
+        """
+        import io
+        import sys as _sys
+
+        def provider():
+            return None
+        provider.pin_is_noop = lambda: True
+
+        buf = io.StringIO()
+        monkeypatch.setattr(_sys, "stderr", buf)
+        p = self._proxy(certdir, provider)
+        # A pinned route with no token: the exact condition that warns.
+        assert self._drive_pinned_request(p) is None
+        assert "UNPINNED" not in buf.getvalue(), "warned when nothing was wrong"
+
+    def test_an_unreadable_store_still_warns(self, certdir, monkeypatch):
+        """The quieting must not swallow the case the warning exists for."""
+        import io
+        import sys as _sys
+
+        buf = io.StringIO()
+        monkeypatch.setattr(_sys, "stderr", buf)
+        # No pin_is_noop hook: "cannot read" is the default reading of None.
+        p = self._proxy(certdir, lambda: None)
+        assert self._drive_pinned_request(p) is None
+        assert "UNPINNED" in buf.getvalue(), "went silent on a real fail-open"
+
+    def test_a_noop_pin_reports_can_pin_on_health(self, certdir):
+        """/health must not call a pin broken on the machine where it is a no-op.
+
+        can_pin is what a fleet sweep reads. Reporting false where there is
+        deliberately nothing to swap is a false alarm in the machine-readable
+        channel, which is worse than the log line because nobody is there to
+        judge it.
+        """
+        import json as _json, socket as _s
+
+        def provider():
+            return None
+        provider.pin_is_noop = lambda: True
+
+        p = self._proxy(certdir, provider)
+        p.start()
+        try:
+            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+            c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(4096)
+                if not d:
+                    break
+                buf += d
+            body = buf.partition(b"\r\n\r\n")[2]
+            while not body.endswith(b"}"):
+                d = c.recv(4096)
+                if not d:
+                    break
+                body += d
+            c.close()
+            assert _json.loads(body)["can_pin"] is True, (
+                "reported the pin as broken on a machine where it has nothing to do"
+            )
+        finally:
+            p.stop()
 
     def test_a_raising_provider_reports_cannot_pin(self, certdir):
         """Health must never take the daemon down, whatever the store does."""
