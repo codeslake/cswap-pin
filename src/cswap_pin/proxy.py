@@ -287,6 +287,47 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
         return None
 
 
+def unwire_if_dead(certdir: Path) -> bool:
+    """Strip a pin wiring whose daemon is gone. True when it removed one.
+
+    The teardown path restores ``.claude.json`` itself, but it only runs when
+    the daemon exits in an orderly way. A SIGKILL, an OOM kill, a crash — or a
+    daemon that never started at all, which is what happened on work-mac when
+    ``cryptography`` vanished from its environment — leaves the env block
+    naming a port nothing listens on. Claude Code applies that block at boot,
+    so every session from then on dials a dead proxy and retries forever while
+    the upstream proxies are perfectly healthy behind it.
+
+    Called at launch, before anything reads the wiring, so a broken pin costs
+    the PIN and never the session. The check is the same one
+    ``_read_alive_port`` makes — a recorded pid that is alive AND a port that
+    answers — because either alone lies: a wedged process keeps its pid, and a
+    port can be inherited by something else entirely.
+
+    Deliberately does NOT try to revive the daemon. That is ``ensure_proxy``'s
+    job and it needs the switcher; this runs on paths that may not have one,
+    and a launch must never block on starting a background service.
+    """
+    try:
+        st = read_daemon_state(certdir)
+    except Exception:
+        st = None
+    if st:
+        try:
+            if _pid_alive(int(st["pid"])):
+                with socket.create_connection(
+                    ("127.0.0.1", int(st["port"])), timeout=1
+                ):
+                    return False  # serving — leave the wiring alone
+        except (OSError, KeyError, TypeError, ValueError):
+            pass
+    # No record, dead pid, or a port that does not answer.
+    try:
+        return wire_global_config(None, None)
+    except Exception:
+        return False
+
+
 def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
     """Route hand-launched ``claude`` sessions through the pin proxy.
 
@@ -961,6 +1002,11 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             _kill_daemon(int(stale["pid"]))
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
+            # The spawn failed and there is no daemon. Anything still wired in
+            # .claude.json names a port nothing serves, and Claude Code applies
+            # that block at boot — so leaving it would take the SESSION down,
+            # not just the pin. Strip it and let the launch proceed unpinned.
+            unwire_if_dead(certdir)
             return None
     # Re-point hand-launched sessions at the port that is actually serving.
     # Done on every launch, not just on pin: an idle teardown followed by a
@@ -1396,6 +1442,23 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             (certdir / _STATE_FILE).unlink()
         except OSError:
             pass
+        # Put ``.claude.json`` back the way we found it. Without this the env
+        # block keeps naming the port we just stopped serving, and Claude Code
+        # applies that block at boot — so EVERY session started afterwards
+        # dials a dead proxy and retries forever, with privoxy and the cache
+        # proxy both healthy and unreachable behind it. Measured on work-mac:
+        # "Unable to connect to API (ConnectionRefused), attempt 14/300", and
+        # the only cure was a human re-pinning by hand.
+        #
+        # An optional feature must not be able to take the required path down
+        # with it. wire_global_config(None, None) restores whatever proxy the
+        # user or their launcher had before we wrote ours, which is exactly
+        # what `pin --clear` already does — the call simply never ran on the
+        # path where the daemon goes away by itself.
+        try:
+            wire_global_config(None, None)
+        except Exception:
+            pass  # teardown is best-effort; never raise on the way out
         done.set()
 
     # A recycle/cc-update TERM runs the same cleanup as an idle teardown.
