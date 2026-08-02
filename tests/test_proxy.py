@@ -2043,3 +2043,112 @@ class TestHealRestoresWithoutRestart:
         assert pin_proxy.heal(root) is False
         assert json.loads(cfg.read_text()).get("env", {}) == {}
 
+
+
+class TestTheGateDisarmsWhenThePinIsCleared:
+    """Clearing the pin must remove the proxy credential.
+
+    An operator who turns the pin off and finds the proxy still demanding a
+    credential has no model for that state — and the real damage is the next
+    `cswap pin`, which re-arms the gate against every session started in
+    between. Measured on a live host: arming cut off 313 processes, including
+    the session that ran the command, each dying with `API Error: 407` and no
+    way to learn why.
+    """
+
+    def test_clear_removes_the_secret(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        pin_proxy.ensure_proxy_secret(certdir)
+        assert pin_proxy.read_proxy_secret(certdir) is not None
+
+        class _Sw:
+            backup_dir = tmp_path
+
+        monkeypatch.setattr(pin_proxy, "save_pin", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
+        pin_proxy.apply_pin(_Sw(), None, None)
+
+        assert pin_proxy.read_proxy_secret(certdir) is None, (
+            "the pin is off but the gate is still armed — the next pin will "
+            "407 every session started in between"
+        )
+
+    def test_clearing_without_a_secret_is_not_an_error(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        class _Sw:
+            backup_dir = tmp_path
+
+        monkeypatch.setattr(pin_proxy, "save_pin", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
+        assert pin_proxy.apply_pin(_Sw(), None, None) is False
+
+
+class TestArmingReportsWhoItCutsOff:
+    """`cswap pin` has to say that it armed the gate.
+
+    The code called the cutoff "unavoidable, pair it with a relaunch" and then
+    never reported that it had happened, so nobody could pair anything. That
+    is how a session killed itself and reported success in the same breath.
+    """
+
+    def test_the_count_is_sockets_not_environments(self, monkeypatch, tmp_path):
+        """A previous counter read /proc/*/environ and returned a DISJOINT set:
+        214 by environ against 7 actually connected, overlap ZERO. environ is
+        an exec-time snapshot, so it names whatever the launcher had forever.
+        A wrong number in the channel meant to inform a decision is worse than
+        no number."""
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        port = srv.getsockname()[1]
+        try:
+            n_idle = pin_proxy.clients_that_arming_would_cut_off(port)
+            if n_idle is None:
+                pytest.skip("no /proc/net/tcp on this platform")
+            assert n_idle == 0, "counted a client before anyone connected"
+            c = socket.create_connection(("127.0.0.1", port))
+            conn, _ = srv.accept()
+            try:
+                assert pin_proxy.clients_that_arming_would_cut_off(port) >= 1, (
+                    "a live client was not counted — the operator would be told "
+                    "nothing breaks"
+                )
+            finally:
+                conn.close()
+                c.close()
+        finally:
+            srv.close()
+
+    def test_a_repin_reports_nothing_because_it_arms_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """Only the FIRST pin mints the secret; re-pinning reuses it and cuts
+        off nobody. Reporting a cutoff there would cry wolf."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        pin_proxy.ensure_proxy_secret(certdir)
+
+        class _Sw:
+            backup_dir = tmp_path
+
+        monkeypatch.setattr(pin_proxy, "save_pin", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: None)
+        monkeypatch.setattr(
+            pin_proxy,
+            "clients_that_arming_would_cut_off",
+            lambda p: (_ for _ in ()).throw(AssertionError("counted on a re-pin")),
+        )
+        pin_proxy.apply_pin(_Sw(), "a@b.c", None)
+        assert pin_proxy.last_arm_cutoff() is None

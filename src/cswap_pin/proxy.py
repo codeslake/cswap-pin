@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import glob
 import itertools
 import json
 import os
@@ -1048,6 +1049,15 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
     save_pin(switcher.backup_dir, email, org_uuid)
     if not email:
         wire_global_config(None, None)
+        # DISARM. The gate is only meaningful while a pin exists, and leaving
+        # the secret behind means "I turned the pin off" and "the proxy still
+        # demands a credential" are both true at once — a state no user has a
+        # model for. Worse, the next `cswap pin` re-arms it against sessions
+        # wired in between, which is exactly the 407 storm this is fixed for.
+        try:
+            proxy_secret_path(switcher.backup_dir / "pin-proxy").unlink()
+        except OSError:
+            pass  # absent, or unwritable: nothing to disarm either way
         return False
     # Mint the proxy credential HERE, not in the daemon. This is the one path
     # that also rewrites the wiring, so the gate and the URL that satisfies it
@@ -1057,12 +1067,40 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
     # resulting failures. An existing secret is reused, so re-pinning does not
     # invalidate anything.
     certdir = switcher.backup_dir / "pin-proxy"
+    # Arming is a ONE-WAY DOOR for every session already running, so count
+    # them BEFORE minting — afterwards the connections are already being
+    # refused and the number is gone. Only when the secret does not exist
+    # yet: re-pinning reuses it and cuts off nobody.
+    global _last_arm_cutoff
+    _last_arm_cutoff = None
+    if read_proxy_secret(certdir) is None:
+        port = _read_alive_port(certdir)
+        if port is not None:
+            _last_arm_cutoff = clients_that_arming_would_cut_off(port)
     try:
         certdir.mkdir(parents=True, exist_ok=True)
         ensure_proxy_secret(certdir)
     except OSError:
         pass  # unwritable cert dir: serve unauthenticated rather than not at all
     return ensure_proxy(switcher) is not None
+
+
+# Set by the last apply_pin: how many live clients that call's arming cut off,
+# or None when it armed nothing (or could not measure). A module global rather
+# than a return value because apply_pin's bool is load-bearing for two callers
+# and the TUI menu; this is advisory, and a caller that ignores it is correct.
+_last_arm_cutoff: int | None = None
+
+
+def last_arm_cutoff() -> int | None:
+    """Live clients cut off by the most recent :func:`apply_pin`, if any.
+
+    None means nothing was armed — the usual case, since the secret is minted
+    once and reused. A number means those sessions will 407 on their next
+    request and only a relaunch fixes them, which is the thing an operator has
+    to be told at the moment they can still act on it.
+    """
+    return _last_arm_cutoff
 
 
 def make_pin_token_provider(switcher, account_num: str, email: str):
@@ -1585,6 +1623,53 @@ def read_proxy_secret(certdir: Path) -> str | None:
     except OSError:
         return None
     return val or None
+
+
+def clients_that_arming_would_cut_off(port: int) -> int | None:
+    """How many live processes are talking to the proxy right now.
+
+    Arming the gate rejects every client whose ``HTTPS_PROXY`` carries no
+    credential, and that variable is fixed at exec — a running session cannot
+    be updated in place. So the honest question before minting a secret is
+    "who is using this port", and the answer has to reach the operator, or the
+    docstring's "pair it with a relaunch" is advice nobody can act on.
+
+    COUNTS SOCKETS, NOT ENVIRONMENTS. A previous version of this counted
+    processes whose ``/proc/<pid>/environ`` named the port, and that number was
+    a different set entirely: 214 by environ against 7 actually connected, with
+    an overlap of ZERO. ``environ`` is an exec-time snapshot and Claude Code
+    applies ``.claude.json``'s env block at boot, so it keeps naming whatever
+    the launcher had. An operator reading "214 sessions will break" concludes
+    catastrophe and never arms the gate; a wrong number in the one channel
+    meant to inform a decision is worse than no number.
+
+    Returns None where it cannot be measured rather than 0 — a silent zero
+    reads as "nobody is affected", which is the same lie in the other
+    direction. Linux only: both macs answer no ``/proc/net/tcp``.
+    """
+    try:
+        rows = Path("/proc/net/tcp").read_text(encoding="utf-8").splitlines()[1:]
+    except OSError:
+        return None
+    target = f":{port:04X}"
+    inodes = set()
+    for line in rows:
+        f = line.split()
+        # state 01 = ESTABLISHED. Match the LOCAL side: these are the peers
+        # connected to us, not our own listening socket (state 0A).
+        if len(f) > 9 and f[3] == "01" and f[2].endswith(target):
+            inodes.add(f[9])
+    if not inodes:
+        return 0
+    pids = set()
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            link = os.readlink(fd)
+        except OSError:
+            continue
+        if link.startswith("socket:[") and link[8:-1] in inodes:
+            pids.add(fd.split("/")[2])
+    return len(pids)
 
 
 def ensure_proxy_secret(certdir: Path) -> str:
