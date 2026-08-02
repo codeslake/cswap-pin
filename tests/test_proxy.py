@@ -1188,12 +1188,20 @@ class TestWorkerJwtRoutesAreNotSwapped:
             assert not is_pinned_route(path), f"{path} must keep the worker JWT"
 
     def test_ownership_deciding_routes_are_still_pinned(self):
+        """NOT client/presence — it was listed here and it did not belong.
+
+        Presence posts {client_id, clear} and receives a poll interval: it
+        registers the PROCESS that will do the receiving, which is a different
+        question from who owns the session. Swapping it told the server the
+        pinned account was attached while the active account's process was the
+        one listening, and Remote Control inbound went silently dead — the call
+        returns 200, it just registers the wrong party.
+        """
         from cswap_pin.proxy import is_pinned_route
 
         for path in (
             "/v1/code/sessions",
             "/v1/code/sessions/cse_x/bridge",
-            "/v1/code/sessions/cse_x/client/presence",
             "/v1/code/sessions/cse_x/archive",
             "/v1/sessions/session_x/unarchive",
             "/api/frame/deploy/init",
