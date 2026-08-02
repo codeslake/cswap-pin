@@ -1623,19 +1623,28 @@ class TestProxyRequiresACredential:
         finally:
             p.stop()
 
-    def test_a_blind_tunnel_also_needs_the_credential(self, certdir):
-        """Otherwise we are an open forward proxy to any host on the internet.
+    def test_a_blind_tunnel_is_not_gated(self, certdir):
+        """It used to be, on "otherwise we are an open forward proxy". That
+        assumes the port is reachable; it binds 127.0.0.1 only, so the
+        population it could refuse is the same-user processes that can read
+        the 0600 secret anyway.
 
-        The non-anthropic branch does not touch the bearer, so it is easy to
-        assume it needs no gate — but an unauthenticated CONNECT to an
-        arbitrary host is exactly what an open proxy is.
+        What it cost is the reason it is gone. EVERY host that is not
+        api.anthropic.com takes this branch — git, pip, npm, the auto-updater
+        — so with the pin on, a session wired before the credential existed
+        got 200 for Claude and 407 for the entire rest of the internet.
+        Measured on lmd42: github.com, pypi.org and registry.npmjs.org all
+        407 while api.anthropic.com was 200. That reads as "the network
+        broke", and it broke this project's own `git push`.
         """
         from cswap_pin.proxy import ensure_proxy_secret
         ensure_proxy_secret(certdir)
         p = self._proxy(certdir)
         p.start()
         try:
-            assert "407" in self._connect(p.port, target="example.com:443")
+            assert "407" not in self._connect(p.port, target="example.com:443"), (
+                "turning the pin on severed general internet for live sessions"
+            )
         finally:
             p.stop()
 
