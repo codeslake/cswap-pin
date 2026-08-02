@@ -765,6 +765,9 @@ _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 
 _UPSTREAM_FILE = "upstream.json"
 
+# Registration of THIS client, not ownership of the session.
+_PRESENCE = re.compile(r"^/v1/(code/)?sessions/[^/]+/client/presence(/|$|\\?)")
+
 _WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
 
 
@@ -798,6 +801,19 @@ def is_pinned_route(path: str) -> bool:
     pinned account (verified by decoding it). After that the JWT must travel
     untouched.
     """
+    # ``client/presence`` is NOT ownership, it is REGISTRATION. It posts
+    # {client_id, clear} and gets a poll interval back — it is how this CLI
+    # tells the server "I am attached to this session, send me things". Swapped,
+    # the server registers the PINNED account as the attached client while the
+    # process actually listening is the active one, so inbound has nobody to go
+    # to. Measured: presence was the only route being swapped in a live window
+    # (3 calls, all 200) while Remote Control received nothing.
+    #
+    # The pin is about who OWNS the claude.ai-side assets, not about who is
+    # sitting at the terminal. Registration must stay with the account whose
+    # process will do the receiving.
+    if _PRESENCE.search(path):
+        return False
     if _WORKER_SUBTREE.search(path):
         return False
     return (

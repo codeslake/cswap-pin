@@ -2267,3 +2267,51 @@ class TestABlindDaemonIsNotReusedForever:
         assert "unpinnable" not in json.loads(state.read_text()), (
             "one daemon marked another's record"
         )
+
+
+class TestClientRegistrationIsNotSwapped:
+    """`client/presence` registers THIS process, not who owns the session.
+
+    It posts {client_id, clear} and gets a poll interval back — it is how the
+    running CLI tells the server "I am attached, send me things". Swapping it
+    registers the PINNED account as the attached client while the process
+    actually listening is the active one, so inbound has nobody to reach.
+
+    Measured live: presence was the ONLY route being swapped in a window where
+    Remote Control received nothing (3 calls, all 200 — a silent failure, since
+    the call succeeds and simply registers the wrong party). Turning the pin on
+    broke `/rc` reconnect; with the pin off it always worked.
+
+    The pin is about who OWNS the claude.ai-side assets, not about who is
+    sitting at the terminal.
+    """
+
+    def test_presence_is_never_swapped(self):
+        from cswap_pin.proxy import is_pinned_route
+
+        for p in (
+            "/v1/code/sessions/cse_X/client/presence",
+            "/v1/sessions/cse_X/client/presence",
+            "/v1/code/sessions/cse_X/client/presence?x=1",
+        ):
+            assert is_pinned_route(p) is False, f"registration swapped: {p}"
+
+    def test_ownership_routes_still_are(self):
+        """The fix must not disarm the feature: /bridge and the session list
+        decide claude.ai-side ownership and have to keep following the pin."""
+        from cswap_pin.proxy import is_pinned_route
+
+        for p in (
+            "/v1/code/sessions",
+            "/v1/code/sessions/cse_X/bridge",
+            "/v1/sessions/cse_X/unarchive",
+            "/api/frame/deploy",
+        ):
+            assert is_pinned_route(p) is True, f"ownership route stopped swapping: {p}"
+
+    def test_inference_and_worker_stay_untouched(self):
+        from cswap_pin.proxy import is_pinned_route
+
+        assert is_pinned_route("/v1/messages") is False
+        assert is_pinned_route("/v1/code/sessions/cse_X/worker/events") is False
+        assert is_pinned_route("/v1/code/sessions/cse_X/worker/events/stream") is False
