@@ -45,7 +45,11 @@ class _FakeUpstream:
     and replies 200. Uses the same leaf cert the proxy MITMs with, so the
     proxy's own upstream TLS (servername api.anthropic.com) validates it."""
 
-    def __init__(self, certdir: Path):
+    def __init__(self, certdir: Path, reject_bearer: str | None = None):
+        # reject_bearer: answer 403 to exactly this credential, 200 to any
+        # other. Models an endpoint the pinned account may not use — the shape
+        # that makes a misrouted swap terminal for the client.
+        self.reject_bearer = reject_bearer
         self.seen_auth: str | None = None
         self.seen_path: str | None = None
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -88,6 +92,16 @@ class _FakeUpstream:
                 for line in lines[1:]:
                     if line.lower().startswith("authorization:"):
                         self.seen_auth = line.split(":", 1)[1].strip()
+                if (
+                    self.reject_bearer
+                    and self.seen_auth == f"Bearer {self.reject_bearer}"
+                ):
+                    tls.sendall(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                    tls.close()
+                    continue
                 tls.sendall(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
                     b"Content-Type: application/json\r\n\r\n{}"
@@ -1994,6 +2008,67 @@ class TestTogglingThePinMidSessionActuallyWorks:
             assert "407" not in raw_connect(), "arming the pin 407'd a live session"
             proxy_secret_path(certdir).unlink()
             assert "407" not in raw_connect(), "clearing the pin 407'd a live session"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+
+class TestAMisroutedSwapCannotKillASession:
+    """A 401/403/404 caused by OUR swap must never reach the client.
+
+    Those three are terminal in Claude Code: SSETransport treats them as
+    permanent (M7y = new Set([401,403,404])), sets state="closed", and never
+    reconnects — so ONE misrouted request ends Remote Control for the life of
+    the process. Measured: a /worker-swap experiment produced 26 such
+    responses and severed the inbound channel of four sessions that were still
+    running hours later with bridgeSessionId gone.
+
+    That makes the route predicate a single point of PERMANENT failure, and no
+    amount of care in it removes the risk — a route we have not seen yet can
+    always be classified wrong. Retrying without the swap turns "wrong about
+    this route" into "this request went out unpinned", which is the failure
+    the module is already built to tolerate.
+    """
+
+    @pytest.fixture
+    def certdir(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        d = tmp_path / "pin-proxy"
+        d.mkdir(parents=True)
+        ensure_ca(d, "api.anthropic.com")
+        return d
+
+    def test_a_403_on_a_swapped_route_is_retried_unswapped(self, certdir):
+        """The upstream refuses the pinned bearer; the client must still get a
+        real answer, carrying its OWN bearer."""
+        from cswap_pin.proxy import PinProxy
+
+        seen = []
+
+        class Upstream(_FakeUpstream):
+            def handle(self, auth):  # pragma: no cover - shape only
+                seen.append(auth)
+
+        upstream = _FakeUpstream(certdir, reject_bearer="PIN-TOKEN")
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PIN-TOKEN",
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions", bearer="disk-token",
+            )
+            assert status != 403, (
+                "a swap the upstream refused reached the client — that is "
+                "terminal in SSETransport and ends Remote Control permanently"
+            )
+            assert upstream.seen_auth == "Bearer disk-token", (
+                "the retry did not fall back to the request's own bearer"
+            )
         finally:
             proxy.stop()
             upstream.stop()
