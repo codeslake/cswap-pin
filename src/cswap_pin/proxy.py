@@ -25,12 +25,14 @@ import re
 import selectors
 import select
 import socket
+import stat
 import sys
 import ssl
 import threading
 from dataclasses import dataclass
+from typing import NamedTuple
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from collections.abc import Callable
 
@@ -44,13 +46,41 @@ from cswap_pin._host import require
 oauth = require("oauth")
 
 
-def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
+class _Chain(NamedTuple):
+    """The egress proxy to CONNECT through.
+
+    A ``(host, port)`` NamedTuple so every existing comparison, unpack and
+    ``chain[0]`` keeps working, carrying the two things a bare pair threw
+    away: the credential the URL supplied, and whether the hop itself is
+    TLS. Dropping those sent an unauthenticated cleartext CONNECT to
+    authenticated and https:// corporate proxies — 407, or a plaintext dial
+    into a TLS port — which breaks ALL pinned traffic in those environments.
+
+    ``socket.create_connection`` takes exactly a 2-tuple, so call sites pass
+    ``chain.address`` rather than the chain itself.
+    """
+
+    host: str
+    port: int
+    auth: str | None = None   # value for Proxy-Authorization, already encoded
+    tls: bool = False         # the hop to the proxy is itself TLS
+
+    @property
+    def address(self) -> tuple[str, int]:
+        return self.host, self.port
+
+    def connect_headers(self) -> str:
+        return f"Proxy-Authorization: {self.auth}\r\n" if self.auth else ""
+
+
+def parse_upstream_proxy(value: str | None) -> _Chain | None:
     """Parse the proxy that was on ``HTTPS_PROXY`` before we displaced it.
 
-    Returns ``(host, port)`` to CONNECT through (a corporate proxy, another
-    local MITM, …), or ``None`` when there was none — in which case the proxy
-    dials the upstream directly. A bare ``host:port`` (no scheme) is accepted;
-    a scheme-only URL defaults to port 80.
+    Returns the chain to CONNECT through (a corporate proxy, another local
+    MITM, …), or ``None`` when there was none — in which case the proxy dials
+    the upstream directly. A bare ``host:port`` (no scheme) is accepted; the
+    default port follows the scheme (443 for https, else 80) rather than
+    always being 80, which pointed every https:// proxy at the wrong port.
     """
     if not value:
         return None
@@ -58,7 +88,14 @@ def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
     host = split.hostname
     if not host:
         return None
-    return host, split.port or 80
+    tls = split.scheme == "https"
+    auth = None
+    if split.username:
+        # userinfo is percent-encoded in a URL; the header carries the
+        # decoded bytes.
+        raw = f"{unquote(split.username)}:{unquote(split.password or '')}"
+        auth = "Basic " + base64.b64encode(raw.encode("utf-8")).decode("ascii")
+    return _Chain(host, split.port or (443 if tls else 80), auth, tls)
 
 
 def _read_upstream(certdir: Path, key: str) -> str | None:
@@ -634,11 +671,37 @@ def _wire_global_config_locked(
         raw.pop("env", None)
     try:
         tmp = path.with_suffix(".cswap-tmp")
-        tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        # 0600 from creation, and never wider than what we are replacing.
+        # ``.claude.json`` carries primaryApiKey, inline MCP credentials and
+        # (once the gate is armed) the proxy URL's own credential. A plain
+        # write takes its mode from the umask, so a normal 022 would publish
+        # all of that at 0644 — and because this is a rename, the mode
+        # SURVIVES: wiring the pin permanently downgrades a 0600 config.
+        # Measured: 0600 in, 0644 out.
+        mode = _mode_of(path, default=0o600)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.write(fd, json.dumps(raw, indent=2).encode("utf-8"))
+        finally:
+            os.close(fd)
+        # O_CREAT's mode is masked by the umask, so ask for it explicitly.
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
     except OSError:
         return False
     return True
+
+
+def _mode_of(path: Path, default: int) -> int:
+    """The file's current permission bits, or ``default`` when it has none yet.
+
+    Never widens: a config someone tightened to 0400 stays 0400, and a file
+    that does not exist yet is created owner-only rather than at the umask.
+    """
+    try:
+        return stat.S_IMODE(path.stat().st_mode) & 0o777
+    except OSError:
+        return default
 
 
 def _ambient_proxy(
@@ -660,8 +723,7 @@ def _ambient_proxy(
         # plain shell where that value does not exist yet, so ask the config
         # what the last session was actually told to use.
         return _wired_over_proxy()
-    host, port = parsed
-    if host in _LOOPBACK and port == _self_port(src):
+    if parsed.host in _LOOPBACK and parsed.port == _self_port(src):
         return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
     # behind. A launcher (cc-wrapper) starts a per-session cache proxy and
@@ -686,7 +748,7 @@ def _ambient_proxy(
             and prev_parsed != parsed
             and prev_parsed[0] in _LOOPBACK
             and prev_parsed[1] != _self_port(src)
-            and _port_is_serving(*prev_parsed)
+            and _port_is_serving(*prev_parsed.address)
         ):
             return prev
     return value
@@ -762,6 +824,39 @@ def _self_port(env: dict[str, str]) -> int | None:
 
 
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _as_chain(value) -> "_Chain | None":
+    """Coerce whatever named the chain into a ``_Chain``.
+
+    The chain reaches the dial from several directions — the parsed hint, a
+    constructor argument, a test's stub — and a plain ``(host, port)`` from
+    any of them must simply mean "no credential, not TLS" rather than raising
+    at the CONNECT. Normalizing at the point of USE covers all of them; doing
+    it at one producer covers only that producer.
+    """
+    if value is None:
+        return None
+    return value if isinstance(value, _Chain) else _Chain(*value)
+
+
+def _dial_chain(chain: "_Chain", timeout: float = 15) -> socket.socket:
+    """Connect to the egress proxy, wrapping in TLS when the URL said https.
+
+    Without this an ``https://`` proxy got a plaintext dial to what is a TLS
+    port, so the handshake never happened and every pinned request failed in
+    an environment where that proxy is the only route out.
+    """
+    sock = socket.create_connection(chain.address, timeout=timeout)
+    if not chain.tls:
+        return sock
+    try:
+        return ssl.create_default_context().wrap_socket(
+            sock, server_hostname=chain.host
+        )
+    except (OSError, ssl.SSLError):
+        sock.close()
+        raise
 
 _UPSTREAM_FILE = "upstream.json"
 
@@ -1006,11 +1101,21 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
 
     Lives in its own ``remoteControl`` section; ``save_settings`` preserves
     unknown sections, so autoswitch writes never clobber it.
+
+    Reads through the host's WRITE-side reader, which raises on a malformed
+    file instead of degrading to ``{}``. ``_read_raw``'s degrade is right for
+    a read — a corrupt settings file should not stop the app — but in a
+    read-modify-write it means starting from empty and then writing back only
+    the pin section, silently discarding autoswitch, UI and every unknown key
+    from a file that was probably still hand-recoverable.
     """
     _settings = require("settings")
 
     path = _settings.settings_path(backup_root)
-    raw = _settings._read_raw(path)
+    # ``_read_raw_for_write`` is newer than this package's floor on the host,
+    # so fall back rather than fail the pin outright on an older claude-swap.
+    read = getattr(_settings, "_read_raw_for_write", None) or _settings._read_raw
+    raw = read(path)
     if email:
         raw["remoteControl"] = {
             "pinnedEmail": email,
@@ -1144,8 +1249,36 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     exactly the lineage-death shape cswap exists to prevent. A thread that
     waited on the lock re-reads the store first and uses the winner's
     rotation instead of refreshing again.
+
+    **Across PROCESSES too.** A thread lock only binds this daemon, and this
+    daemon is not the only thing that refreshes a backup slot: the usage
+    collector and the autoswitcher do it from their own processes. Two
+    processes POSTing one one-time grant is the same lineage death by a
+    different door, so the refresh goes through the switcher's
+    ``consume_backup_grant`` gate, which holds a per-slot FILE lock across
+    re-read → POST → fingerprint-CAS. The gate persists the rotation itself;
+    the thread lock stays because it is cheaper for the in-process case and
+    keeps N threads off the file lock.
     """
     refresh_lock = threading.Lock()
+
+    def _consume(creds: str, num: str, mail: str) -> "oauth.RefreshOutcome":
+        """Refresh through the host's interprocess gate, direct POST as
+        fallback. An older claude-swap has no gate; a pinned request must
+        still be served, and a same-process race is still covered by
+        ``refresh_lock``.
+
+        The gate can answer ``consume-busy`` (another process holds the
+        slot). That yields no token, so this request goes out unpinned and
+        the next one retries — the same fail-open the provider already has
+        for an unreadable credential, and strictly better than the direct
+        POST it replaces, which answered ``invalid_grant`` and killed the
+        lineage outright.
+        """
+        gate = getattr(switcher, "consume_backup_grant", None)
+        if gate is None:
+            return oauth.try_refresh_oauth_credentials(creds)
+        return gate(num, mail, creds)
 
     def _live_token(creds: str) -> str | None:
         data = oauth.extract_oauth_data(creds)
@@ -1197,9 +1330,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             if token:
                 return token
             token, rotated = resolve_pin_token(
-                creds, oauth.try_refresh_oauth_credentials
+                creds, lambda c: _consume(c, num, mail)
             )
-            if rotated:
+            # The gate persists internally (under the slot lock, CAS on the
+            # refresh-token fingerprint). Persisting again here would write
+            # back OUTSIDE that lock and could clobber a racing writer's
+            # newer lineage — the exact failure the gate exists to prevent.
+            if rotated and not hasattr(switcher, "consume_backup_grant"):
                 switcher.persist_backup_credentials(num, mail, rotated)
             return token
 
@@ -1312,7 +1449,18 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # recycle it before spawning, so a redeploy/repin takes effect instead
         # of a stale daemon serving forever.
         stale = read_daemon_state(certdir)
-        if stale and _pid_alive(int(stale["pid"])):
+        # "Alive" is not "still ours". An unclean exit leaves proxy.json
+        # behind, and a pid is reused freely — so liveness alone would aim
+        # SIGTERM (then SIGKILL) at whatever unrelated process inherited the
+        # number. Ask whether the pid is a pin daemon for THIS certdir, which
+        # is exactly what the orphan sweep already asks.
+        #
+        # When the identity cannot be established at all (no ``ps``), this
+        # recycles nothing rather than killing on faith. The stale daemon
+        # keeps its port, the successor binds an ephemeral one and the
+        # wiring is rewritten to it — degraded, but nobody else's process
+        # gets killed. The same blind spot already bounds the orphan sweep.
+        if stale and int(stale["pid"]) in _pin_daemon_pids(certdir):
             # Save the port BEFORE the kill: the daemon unlinks its own state
             # on TERM, so afterwards there is nothing left to reclaim from and
             # the successor would take a fresh port — stranding every session
@@ -1500,8 +1648,15 @@ def _open_daemon_log(certdir: Path):
 
 _FIRST_HOLDER_TIMEOUT = 300.0
 
+# How long to wait before re-asking whether a daemon whose last FIFO holder
+# left is still claimed. A blocking read on a writer-less FIFO returns EOF
+# immediately and keeps doing so, so the re-check has to pace itself. The
+# cost of waiting is an idle daemon lingering this much longer; the cost of
+# not waiting is a busy loop.
+_CLAIM_RECHECK_INTERVAL = 5.0
 
-def _is_claimed(certdir: Path) -> bool:
+
+def _is_claimed(certdir: Path, live_clients=None) -> bool:
     """True when the global wiring names THIS daemon, holder or no holder.
 
     A FIFO holder is not the only way to claim a daemon, and it is not even the
@@ -1531,6 +1686,12 @@ def _is_claimed(certdir: Path) -> bool:
     them too. A daemon someone is actually connected to is not idle, whatever
     the config says, so serving that traffic until it drains is what makes
     turning the pin off as harmless as turning it on.
+
+    ``live_clients`` is that question asked of the daemon itself (its own
+    connection count). It must be, because the socket-scan answer is
+    Linux-only: on macOS it returns None, and None was being read as "not
+    claimed" — turning the one check that protects a live session into a
+    guaranteed false on the platform where the pin is used most.
     """
     try:
         st = read_daemon_state(certdir)
@@ -1539,14 +1700,34 @@ def _is_claimed(certdir: Path) -> bool:
         port = int(st["port"])
         if _wired_port() == port:
             return True
+        # Ask the daemon itself first. It is the only source that answers on
+        # every platform: the socket scan below reads /proc/net/tcp, which
+        # BOTH MACS lack, and its None was being coerced to "not claimed" —
+        # so on macOS a hand-launched session with a live connection was
+        # counted as idle and `pin --clear` tore its proxy out from under it.
+        if live_clients is not None:
+            try:
+                if live_clients() > 0:
+                    return True
+            except Exception:
+                pass
         live = clients_that_arming_would_cut_off(port)
-        return bool(live)  # None (unmeasurable) => not a claim
+        if live is None:
+            # Unmeasurable, and the daemon's own count said zero (or was not
+            # offered). Nothing established a claim; the caller's timeout
+            # decides. Distinct from a measured zero only in that we cannot
+            # corroborate it.
+            return False
+        return bool(live)
     except Exception:
         return False
 
 
 def watch_refcount(
-    fifo: str | Path, on_last_holder_gone, first_holder_timeout: float | None = None
+    fifo: str | Path,
+    on_last_holder_gone,
+    first_holder_timeout: float | None = None,
+    live_clients=None,
 ) -> None:
     """Block on ``fifo`` until every write-holder closes, then call
     ``on_last_holder_gone``. This is exactly CCF's supervisor `cat FIFO`:
@@ -1571,6 +1752,14 @@ def watch_refcount(
     if the last holder left. The wiring check is not optional: zero holders is
     the STEADY STATE of a healthy daemon serving globally wired sessions, so
     without it this timeout kills the working pin (see ``_is_claimed``).
+
+    **Both exits ask that question.** The claim check used to guard only the
+    first-holder timeout, so a daemon that HAD holders tore down the moment
+    the last one closed — no matter that the global wiring still named it or
+    that connections were still draining on it. Those sessions cannot be told
+    (their ``HTTPS_PROXY`` is fixed at exec), so they got ConnectionRefused
+    and retried forever. Teardown now means "no holder and nothing else
+    claims us", whichever door it arrives by.
     """
     timeout = _FIRST_HOLDER_TIMEOUT if first_holder_timeout is None else first_holder_timeout
     # O_NONBLOCK on a read-only FIFO open never blocks (POSIX), so this cannot
@@ -1606,7 +1795,7 @@ def watch_refcount(
                 # ...which is NOT the same as "nobody is using me". A globally
                 # wired session never opens the FIFO, so check the wiring
                 # before concluding we are an orphan (see ``_is_claimed``).
-                if _is_claimed(Path(fifo).parent):
+                if _is_claimed(Path(fifo).parent, live_clients):
                     deadline = _time.monotonic() + timeout  # re-arm and re-check
                     continue
                 on_last_holder_gone()  # nobody ever attached — do not linger
@@ -1622,10 +1811,24 @@ def watch_refcount(
         except OSError:
             pass
         raise
+    import time as _time
+
     try:
         while True:
             data = os.read(fd, 65536)  # blocks; returns b"" at EOF (no writers)
             if data == b"":
+                # A FIFO holder is not the only claim, and the first-holder
+                # timeout above already knows that — this end did not. The
+                # last WRAPPER-launched session closing says nothing about
+                # the globally-wired and hand-launched sessions that never
+                # open the FIFO at all, nor about live connections still
+                # draining. Tearing down on their behalf strands them on an
+                # HTTPS_PROXY fixed at exec: the ConnectionRefused loop
+                # ``_is_claimed`` exists to prevent, arriving by the one door
+                # that never asked it.
+                if _is_claimed(Path(fifo).parent, live_clients):
+                    _time.sleep(_CLAIM_RECHECK_INTERVAL)
+                    continue  # still referenced — keep serving, re-check
                 on_last_holder_gone()
                 return
             # A holder wrote an attach ping; drain and keep waiting.
@@ -1979,6 +2182,26 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
     return None
 
 
+def _release_daemon_state(certdir: Path) -> bool:
+    """Drop ``proxy.json`` if it still names us. True when it names SOMEONE
+    ELSE — i.e. we were superseded and must touch nothing further.
+
+    A successor publishes its own state (and rewires the config to its port)
+    before sweeping the orphans it replaces, so a departing daemon's cleanup
+    can land on the record of the daemon that is now serving. Deleting that
+    makes a LIVE daemon invisible: the next launch reads no state and spawns
+    another one on top of it.
+    """
+    try:
+        st = read_daemon_state(certdir)
+        if st and int(st["pid"]) != os.getpid():
+            return True
+        (Path(certdir) / _STATE_FILE).unlink()
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return False
+
+
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     """Entry point for the detached proxy process (``-m claude_swap.pin_proxy``).
 
@@ -2027,10 +2250,12 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # Last session closed its holder (or a signal arrived) — stop serving
         # and clean up our state so a launcher never reuses a dead record.
         proxy.stop()
-        try:
-            (certdir / _STATE_FILE).unlink()
-        except OSError:
-            pass
+        if _release_daemon_state(certdir):
+            # A successor owns the state now. Unwiring here would strip the
+            # config it just wrote and send every new session to no proxy at
+            # all, so the departing daemon leaves the wiring alone.
+            done.set()
+            return
         # Put ``.claude.json`` back the way we found it. Without this the env
         # block keeps naming the port we just stopped serving, and Claude Code
         # applies that block at boot — so EVERY session started afterwards
@@ -2054,7 +2279,12 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     _install_signal_teardown(_teardown)
 
     threading.Thread(
-        target=watch_refcount, args=(fifo, _teardown), daemon=True
+        target=watch_refcount,
+        args=(fifo, _teardown),
+        # The daemon's own connection count, so "is anyone using me" has an
+        # answer on macOS too (/proc/net/tcp does not exist there).
+        kwargs={"live_clients": proxy.live_client_count},
+        daemon=True,
     ).start()
     done.wait()  # lives until the last refcount holder closes (or a signal)
 
@@ -2173,6 +2403,11 @@ class PinProxy:
         # its own thread, so a thread-local keeps one upstream per client.
         self._local = threading.local()
         self._conn_seq = itertools.count(1)
+        # Clients connected right now. The daemon's own count, because the
+        # /proc-based probe is Linux-only and its None reads as "idle" on the
+        # machines that cannot answer (see ``_serve_client``).
+        self._live_clients = 0
+        self._live_lock = threading.Lock()
         self._stop = False
         self.port = 0
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
@@ -2224,8 +2459,31 @@ class PinProxy:
             except OSError:
                 return
             threading.Thread(
-                target=self._handle_client, args=(conn,), daemon=True
+                target=self._serve_client, args=(conn,), daemon=True
             ).start()
+
+    def _serve_client(self, conn: socket.socket) -> None:
+        """``_handle_client`` with the connection counted for its lifetime.
+
+        The daemon knows who is talking to it better than any external probe
+        can, and portably: the ``/proc/net/tcp`` scan behind
+        ``clients_that_arming_would_cut_off`` answers None on macOS, where it
+        was then read as "nobody is connected" and let the idle watcher stop
+        a daemon mid-conversation.
+        """
+        with self._live_lock:
+            self._live_clients += 1
+        try:
+            self._handle_client(conn)
+        finally:
+            with self._live_lock:
+                self._live_clients -= 1
+
+    def live_client_count(self) -> int:
+        """How many clients are connected right now. Never None: this is a
+        count the daemon keeps itself, not an inference about the OS."""
+        with self._live_lock:
+            return self._live_clients
 
     def _handle_client(self, conn: socket.socket) -> None:
         # A per-CONNECTION id, not a thread id: threads are pooled and reused,
@@ -2490,25 +2748,43 @@ class PinProxy:
             self._refuse_unauthorized(conn)
             return
         split = urlsplit(url)
-        host, port = split.hostname, split.port or 80
+        # The scheme decides the port. Defaulting every scheme to 80 pointed
+        # every https:// target at the wrong port, so those requests (the
+        # auto-updater, telemetry) could not succeed at all.
+        secure = split.scheme == "https"
+        host, port = split.hostname, split.port or (443 if secure else 80)
         # Re-read like every other egress site: the daemon is constructed with
         # chain_proxy=None, so reading self._chain here meant this path ALWAYS
         # dialled the origin direct — bypassing the egress proxy on exactly the
         # traffic (auto-updater, telemetry) it was added to rescue, and hard
         # failing where there is no direct route out.
-        chain = self._current_chain()
+        chain = _as_chain(self._current_chain())
         try:
             if chain:
-                up = socket.create_connection(chain, timeout=15)
-                # A plain proxy takes the absolute-form line as-is.
-                head = f"{method} {url} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
+                up = _dial_chain(chain)
+                # A plain proxy takes the absolute-form line as-is. Our own
+                # credential for the chain rides here, not the client's.
+                head = (
+                    f"{method} {url} HTTP/1.1\r\n"
+                    + "\r\n".join(headers)
+                    + "\r\n"
+                    + chain.connect_headers()
+                    + "\r\n"
+                )
             else:
                 up = socket.create_connection((host, port), timeout=15)
+                if secure:
+                    # An https:// origin dialled direct needs the handshake,
+                    # verified. Without it we sent cleartext HTTP at a TLS
+                    # port and the request simply failed.
+                    up = ssl.create_default_context().wrap_socket(
+                        up, server_hostname=host
+                    )
                 path = split.path or "/"
                 if split.query:
                     path += "?" + split.query
                 head = f"{method} {path} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
-        except OSError:
+        except (OSError, ssl.SSLError):
             conn.close()
             return
         try:
@@ -2675,6 +2951,13 @@ class PinProxy:
             )
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
+            # _read_body decoded a chunked body, and the transfer-coding
+            # header is dropped just below (hop-by-hop), so the framing has
+            # to be re-declared or the upstream reads a bodyless request.
+            dechunked = any(
+                k.lower() == "transfer-encoding" and "chunked" in v.lower()
+                for k, v in headers
+            )
             for k, v in headers:
                 kl = k.lower()
                 if kl.startswith("proxy-"):
@@ -2683,10 +2966,14 @@ class PinProxy:
                     upgrading and kl in ("connection", "upgrade")
                 ):
                     continue
+                if kl == "content-length" and dechunked:
+                    continue  # replaced below with the decoded length
                 if kl == "host":
                     v = UPSTREAM_HOST
                     sent_host = True
                 out.append(f"{k}: {v}".encode("latin1"))
+            if dechunked:
+                out.append(f"Content-Length: {len(body or b'')}".encode("latin1"))
             if not sent_host:
                 out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
             up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
@@ -2703,6 +2990,10 @@ class PinProxy:
             return _relay_response(
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
+                # A HEAD response carries the headers of the GET it mirrors,
+                # Content-Length included, but no body — only the request
+                # method says so.
+                method=method,
             )
         except (OSError, ssl.SSLError):
             self._drop_upstream()
@@ -2713,8 +3004,16 @@ class PinProxy:
         first use. Reused across requests so keep-alive and SSE work."""
         up = getattr(self._local, "up", None)
         if up is None:
-            raw = self._connect_upstream()
-            up = self._upstream_ctx().wrap_socket(raw, server_hostname=UPSTREAM_HOST)
+            # The context must describe the socket we ACTUALLY got, not the
+            # chain we hoped for. _connect_upstream falls back to a direct
+            # dial when the recorded chain is unreachable, and _upstream_ctx
+            # re-reading the (still loopback) hint would then hand a
+            # CERT_NONE context to a real internet connection carrying
+            # account bearers.
+            raw, via_loopback = self._connect_upstream()
+            up = self._upstream_ctx(via_loopback).wrap_socket(
+                raw, server_hostname=UPSTREAM_HOST
+            )
             self._local.up = up
         return up
 
@@ -2727,7 +3026,7 @@ class PinProxy:
                 pass
             self._local.up = None
 
-    def _upstream_ctx(self) -> ssl.SSLContext:
+    def _upstream_ctx(self, via_loopback: bool) -> ssl.SSLContext:
         """TLS context for the hop to the real api.anthropic.com.
 
         When we chain through a LOOPBACK proxy (any local MITM), that
@@ -2738,9 +3037,15 @@ class PinProxy:
         For a direct dial or a remote proxy, full verification stays on:
         system roots (real cert) + our own CA (test fakes) + any corp CA on
         NODE_EXTRA_CA_CERTS.
+
+        ``via_loopback`` is reported by the dial that actually happened, never
+        re-derived from the hint. Reading the hint independently meant an
+        unreachable loopback chain fell back to a DIRECT dial while this still
+        answered CERT_NONE — an unverified connection to the real
+        api.anthropic.com carrying account bearers, i.e. MITM-able exactly
+        when the local chain is down.
         """
-        chain = self._current_chain()
-        if chain and chain[0] in _LOOPBACK:
+        if via_loopback:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -2767,12 +3072,23 @@ class PinProxy:
         route out, bypassing it is a hard failure, not a performance note.
         ``rediscover_chain=False`` keeps tests explicit.
         """
-        if not self._rediscover_chain:
-            return self._chain
-        return read_upstream_hint(self._certdir)
+        # Normalized HERE, not at construction: this is the one path every
+        # egress site goes through, and `_chain` is also assigned directly
+        # (tests do). A plain (host, port) reaching a CONNECT would raise on
+        # the credential lookup instead of simply having none.
+        return _as_chain(
+            self._chain
+            if not self._rediscover_chain
+            else read_upstream_hint(self._certdir)
+        )
 
-    def _connect_upstream(self) -> socket.socket:
+    def _connect_upstream(self) -> tuple[socket.socket, bool]:
         """Dial the upstream (through the chain when there is one).
+
+        Returns ``(socket, via_loopback)``. The flag says how the socket was
+        REALLY obtained, because the chain can be unreachable and the dial
+        silently becomes direct — and the TLS context must follow the path
+        taken, not the path recorded (see :meth:`_upstream_ctx`).
 
         The 15s budget covers CONNECTING only. It is cleared before the socket
         carries requests, because ``create_connection``'s timeout stays on the
@@ -2783,10 +3099,10 @@ class PinProxy:
         while heartbeats (which answer at once) kept succeeding — so the
         session looked healthy and was silently deaf.
         """
-        chain = self._current_chain()
+        chain = _as_chain(self._current_chain())
         if chain:
             try:
-                raw = socket.create_connection(chain, timeout=15)
+                raw = _dial_chain(chain)
             except OSError:
                 # The recorded chain is gone. The hint is kept across launches
                 # that cannot see a proxy (a plain `cswap pin` shell has none),
@@ -2797,9 +3113,8 @@ class PinProxy:
             if raw is not None:
                 raw.sendall(
                     f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
-                    f"Host: {self._upstream[0]}:{self._upstream[1]}\r\n\r\n".encode(
-                        "latin1"
-                    )
+                    f"Host: {self._upstream[0]}:{self._upstream[1]}\r\n"
+                    f"{chain.connect_headers()}\r\n".encode("latin1")
                 )
                 status = _read_line(raw)
                 while True:
@@ -2810,10 +3125,10 @@ class PinProxy:
                     raw.close()
                     raise OSError(f"upstream CONNECT failed: {status}")
                 raw.settimeout(None)
-                return raw
+                return raw, chain[0] in _LOOPBACK
         sock = socket.create_connection(self._upstream, timeout=15)
         sock.settimeout(None)
-        return sock
+        return sock, False  # direct dial: verification stays on
 
     @staticmethod
     def _tunnel_is_open(up: socket.socket) -> bool:
@@ -2837,7 +3152,7 @@ class PinProxy:
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
-        chain = self._current_chain()
+        chain = _as_chain(self._current_chain())
         # Trace the tunnel too. Remote Control receives over a WebSocket to the
         # ingress host the /bridge response names — NOT api.anthropic.com — so
         # it lands here, not in the MITM. Logging only the MITM made an absent
@@ -2863,9 +3178,10 @@ class PinProxy:
             # on work-mac, where the same session on a machine whose chain let
             # the host through received normally.
             try:
-                up = socket.create_connection(chain, timeout=15)
+                up = _dial_chain(chain)
                 up.sendall(
-                    f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("latin1")
+                    f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                    f"{chain.connect_headers()}\r\n".encode("latin1")
                 )
                 status = _read_line(up)
                 while True:
@@ -2945,6 +3261,15 @@ _HOP_BY_HOP = {
     "upgrade",
 }
 
+# The response path parses raw bytes, and `b"transfer-encoding" in
+# {str, ...}` is silently False — so that filter did nothing at all and
+# every hop-by-hop header was relayed verbatim. It went unnoticed because
+# the one case anybody would have caught (chunked) is the one case where
+# forwarding the header happens to be RIGHT: we relay the chunk framing
+# byte-for-byte, so it really is our hop's encoding too. The others
+# (Keep-Alive, TE, Upgrade) describe the upstream's connection, not ours.
+_HOP_BY_HOP_BYTES = {k.encode("latin1") for k in _HOP_BY_HOP}
+
 
 def _read_line(sock) -> str | None:
     buf = bytearray()
@@ -2960,13 +3285,33 @@ def _read_line(sock) -> str | None:
 
 
 def _read_body(sock, headers) -> bytes:
+    """The request body, decoded.
+
+    Recognizing only ``Content-Length`` read ZERO bytes from a
+    ``Transfer-Encoding: chunked`` request while the forwarder stripped the
+    transfer-coding header (it is hop-by-hop), so the upstream received a
+    bodyless request — every chunked message or artifact upload silently lost
+    its payload.
+
+    The body is materialized whole either way, which the retry path already
+    requires: a swap the upstream refuses is re-sent unswapped, and a
+    streamed body could not be replayed.
+    """
     length = 0
+    chunked = False
     for k, v in headers:
-        if k.lower() == "content-length":
+        kl = k.lower()
+        if kl == "content-length":
             try:
                 length = int(v)
             except ValueError:
                 length = 0
+        elif kl == "transfer-encoding" and "chunked" in v.lower():
+            chunked = True
+    if chunked:
+        # Content-Length is ignored when a transfer-coding is present
+        # (RFC 9112 §6.3), so decode and let the forwarder re-frame.
+        return _read_chunked_body(sock)
     body = bytearray()
     while len(body) < length:
         chunk = sock.recv(length - len(body))
@@ -2974,6 +3319,35 @@ def _read_body(sock, headers) -> bytes:
             break
         body += chunk
     return bytes(body)
+
+
+def _read_chunked_body(sock) -> bytes:
+    """Decode a chunked request body to bytes, trailers discarded."""
+    body = bytearray()
+    while True:
+        line = _read_line(sock)
+        if line in ("", None):
+            return bytes(body)
+        try:
+            size = int(line.split(";")[0].strip() or "0", 16)
+        except ValueError:
+            return bytes(body)
+        if size == 0:
+            # Consume the trailer section so the socket is left at the start
+            # of the next request rather than mid-frame.
+            while True:
+                t = _read_line(sock)
+                if t in ("", None):
+                    break
+            return bytes(body)
+        need = size
+        while need > 0:
+            chunk = sock.recv(min(65536, need))
+            if not chunk:
+                return bytes(body)
+            body += chunk
+            need -= len(chunk)
+        _read_line(sock)  # the CRLF terminating this chunk
 
 
 def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
@@ -3003,11 +3377,32 @@ def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
     return buf.split(b"\r\n", 1)[0].split(b" ")[1:2] == [b"101"]
 
 
+def _status_has_no_body(status_line: bytes, method: str | None) -> bool:
+    """Whether RFC 9110 says this response cannot carry a body.
+
+    These are exactly the responses that legitimately arrive with neither
+    Content-Length nor Transfer-Encoding, so without this they read as
+    "close-delimited" and the relay blocks on recv until the upstream hangs
+    up — which a keep-alive server never has to do.
+    """
+    if method and method.upper() == "HEAD":
+        return True
+    parts = status_line.split(b" ", 2)
+    if len(parts) < 2:
+        return False
+    try:
+        code = int(parts[1])
+    except ValueError:
+        return False
+    return code in (204, 304) or 100 <= code < 200
+
+
 def _relay_response(
     up: ssl.SSLSocket,
     client: ssl.SSLSocket,
     cid: int = 0,
     reject_on_auth_error: bool = False,
+    method: str | None = None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -3060,6 +3455,7 @@ def _relay_response(
     length: int | None = None
     chunked = False
     keep = not status_line.startswith(b"HTTP/1.0")
+    bodyless = _status_has_no_body(status_line, method)
     for line in lines[1:]:
         if b":" not in line:
             continue
@@ -3075,9 +3471,24 @@ def _relay_response(
             chunked = True
         elif kl == b"connection" and b"close" in vl:
             keep = False
-        if kl in _HOP_BY_HOP:
+        if kl in _HOP_BY_HOP_BYTES:
             continue
         out.append(line)
+    if chunked:
+        # Transfer-Encoding is hop-by-hop, so the loop above drops it — but
+        # _pipe_chunked relays the chunk-size lines VERBATIM. Announcing no
+        # framing while sending chunk syntax leaves the client to read
+        # "1a\r\n" as body bytes, or to wait for a close that a keep-alive
+        # upstream never sends. This IS our hop's encoding: re-declare it.
+        out.append(b"Transfer-Encoding: chunked")
+    if bodyless:
+        # 204/304 (and 1xx) carry no body by definition and commonly send
+        # neither Content-Length nor Transfer-Encoding. Falling through to
+        # the close-delimited branch would block on recv until the upstream
+        # closes — which a keep-alive server need not ever do — and the
+        # client's request just hangs.
+        client.sendall(b"\r\n".join(out) + b"\r\n\r\n" + rest)
+        return keep
     client.sendall(b"\r\n".join(out) + b"\r\n\r\n" + rest)
 
     if chunked:
