@@ -1864,106 +1864,127 @@ class _StopDaemon(Exception):
     """Cuts daemon_main off once it is past the point under test."""
 
 
-class TestTogglingThePinNeverBreaksALiveSession:
-    """THE requirement: turn the pin on or off mid-session, no restart, no 407.
+class TestTogglingThePinMidSessionActuallyWorks:
+    """THE requirement, both halves: no restart, and the pin APPLIES.
 
-    A session's HTTPS_PROXY is fixed at exec. So the only way "toggle the pin
-    while sessions are running" can work is if the daemon never rejects a
-    connection over what that variable happens to contain. Refusing was the
-    old design and it made turning the pin ON destructive: 313 processes on a
-    live host, including the one that ran the command, each dying with
-    `API Error: 407` and no way to learn why.
+    A session's HTTPS_PROXY is fixed at exec, so anything the daemon keys off
+    that variable is unchangeable for a running session. The gate did key off
+    it, so turning the pin on 407'd every session that predated the credential
+    (measured: 313 processes, including the one that ran `cswap pin`).
 
-    These drive the real proxy over a real socket, because the failure was
-    exactly that unit-level reasoning said the design was fine.
+    Softening that to "serve them unpinned" fixes the 407 and fails the
+    feature: `cswap pin 1` would leave the sessions the user is looking at on
+    the active account. Both halves have to hold at once —
+
+        claude.ai side (RC / artifacts) -> PINNED account
+        CLI side       (inference)      -> ACTIVE account
+
+    — for a session that never carried a credential, across the toggle.
     """
 
-    @pytest.fixture
-    def certdir(self, tmp_path):
-        d = tmp_path / "pin-proxy"
-        d.mkdir(parents=True)
-        return d
+    def test_rc_swaps_and_inference_does_not_for_an_uncredentialed_session(
+        self, certdir
+    ):
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret
 
-    def _connect(self, port, cred=None):
+        upstream = _FakeUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PIN-TOKEN",
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            # `cswap pin 1` mints the secret under a session that has none.
+            ensure_proxy_secret(certdir)
+
+            assert _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions", bearer="disk-token",
+            ) == 200
+            assert upstream.seen_auth == "Bearer PIN-TOKEN", (
+                "the pin did not apply to a session that predates it — "
+                "`cswap pin` silently did nothing for the sessions in front "
+                "of the user"
+            )
+
+            assert _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/messages", bearer="disk-token",
+            ) == 200
+            assert upstream.seen_auth == "Bearer disk-token", (
+                "inference was billed to the pinned account"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_clearing_returns_rc_to_the_active_account(self, certdir):
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, proxy_secret_path
+
+        upstream = _FakeUpstream(certdir)
+        token = {"v": "PIN-TOKEN"}
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: token["v"],
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            ensure_proxy_secret(certdir)
+            _request_through_proxy(proxy.port, certdir / "ca.pem",
+                                   "/v1/code/sessions", bearer="disk-token")
+            assert upstream.seen_auth == "Bearer PIN-TOKEN"
+
+            # `cswap pin --clear`: the record goes, so the provider yields
+            # nothing and the route falls back to the request's own bearer.
+            proxy_secret_path(certdir).unlink()
+            token["v"] = None
+            assert _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions", bearer="disk-token",
+            ) == 200
+            assert upstream.seen_auth == "Bearer disk-token", (
+                "clearing the pin left RC on the pinned account"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_no_407_in_either_direction(self, certdir):
+        """The 407 itself, asserted directly: a raw CONNECT with no credential
+        must succeed before AND after arming."""
         import base64
         import socket as _s
 
-        c = _s.create_connection(("127.0.0.1", port), timeout=5)
-        req = "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n"
-        if cred:
-            blob = base64.b64encode(f"cswap:{cred}".encode()).decode()
-            req += f"Proxy-Authorization: Basic {blob}\r\n"
-        req += "\r\n"
-        c.sendall(req.encode())
-        c.settimeout(5)
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, proxy_secret_path
+
+        upstream = _FakeUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PIN-TOKEN",
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+
+        def raw_connect():
+            c = _s.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            c.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                      b"Host: api.anthropic.com:443\r\n\r\n")
+            c.settimeout(5)
+            try:
+                line = c.recv(128).decode("latin1", "replace").split("\r\n")[0]
+            except OSError:
+                line = "(closed)"
+            c.close()
+            return line
+
         try:
-            data = c.recv(256)
-        except OSError:
-            data = b""
-        c.close()
-        return data.decode("latin1", "replace").split("\r\n")[0]
-
-    def _proxy(self, certdir):
-        from cswap_pin.proxy import PinProxy
-
-        return PinProxy(certdir=certdir, pin_token_provider=lambda: None,
-                        upstream=("127.0.0.1", 1))
-
-    def test_a_session_wired_before_the_pin_survives_arming(self, certdir):
-        """The incident, reproduced: connect with no credential (a session that
-        started before the pin existed), then turn the pin ON under it."""
-        from cswap_pin.proxy import ensure_proxy_secret
-
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            before = self._connect(p.port)
-            assert "407" not in before, before
-
-            ensure_proxy_secret(certdir)  # `cswap pin 1` — arms the gate
-
-            after = self._connect(p.port)
-            assert "407" not in after, (
-                f"turning the pin ON killed a live session: {after!r} — this is "
-                "the 313-process incident"
-            )
+            assert "407" not in raw_connect()
+            ensure_proxy_secret(certdir)
+            assert "407" not in raw_connect(), "arming the pin 407'd a live session"
+            proxy_secret_path(certdir).unlink()
+            assert "407" not in raw_connect(), "clearing the pin 407'd a live session"
         finally:
-            p.stop()
-
-    def test_it_survives_clearing_too(self, certdir):
-        """And back off again, still on the same connectionless assumption."""
-        from cswap_pin.proxy import ensure_proxy_secret, proxy_secret_path
-
-        ensure_proxy_secret(certdir)
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            assert "407" not in self._connect(p.port)
-            proxy_secret_path(certdir).unlink()  # `cswap pin --clear`
-            assert "407" not in self._connect(p.port), (
-                "turning the pin OFF broke a live session"
-            )
-        finally:
-            p.stop()
-
-    def test_the_bearer_is_still_withheld_from_the_unauthorized(self, certdir):
-        """Serving them must not mean acting for them. This is the security
-        property the old refusal existed to protect, kept intact."""
-        from cswap_pin.proxy import _proxy_authorized, ensure_proxy_secret
-
-        secret = ensure_proxy_secret(certdir)
-        assert _proxy_authorized([], secret) is False
-        assert _proxy_authorized([("Proxy-Authorization", "Basic bogus")], secret) is False
-
-    def test_an_unauthorized_caller_is_served_unpinned_not_pinned(self, certdir):
-        """The swap itself must be gated, not just the docstring's promise.
-
-        Drives _handle_one_request's decision directly: may_pin=False must not
-        swap even on a route that IS pinned.
-        """
-        from cswap_pin.proxy import is_pinned_route
-
-        assert is_pinned_route("/api/organizations/x/chat_conversations") is False
-        path = "/api/bridge"
-        # the seam: `is_pinned_route(path) and may_pin`
-        assert (is_pinned_route(path) and False) is False
+            proxy.stop()
+            upstream.stop()
