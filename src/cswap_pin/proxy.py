@@ -2188,39 +2188,45 @@ class PinProxy:
                     if ":" in h:
                         k, v = h.split(":", 1)
                         connect_headers.append((k.strip(), v.strip()))
-                # AUTHORIZATION DECIDES THE SWAP, NOT THE CONNECTION.
+                # A PIN THAT IS SET IS A PIN THAT APPLIES.
                 #
-                # Refusing the connection was the right instinct aimed at the
-                # wrong thing. The asset is the pinned account's bearer, and a
-                # caller without the credential simply must not receive one —
-                # but it does not follow that it must be cut off. Cutting it
-                # off is what made turning the pin ON a destructive act: a
-                # session's HTTPS_PROXY is fixed at exec, so every session that
-                # started before the credential existed died with 407 and only
-                # a relaunch could fix it. Measured on a live host: 313
-                # processes, including the one that ran `cswap pin`.
+                # The gate this replaces demanded a credential carried in
+                # HTTPS_PROXY, which is fixed at exec. That made turning the
+                # pin on a destructive act (407 for every session that
+                # predated the credential — measured: 313 processes), and
+                # softening it to "serve them unpinned" only traded one
+                # failure for another: the pin silently did not apply to the
+                # sessions the user was looking at.
                 #
-                # Unauthorized now means UNPINNED, which is exactly the state
-                # the user asked for when the pin is off, and a state every
-                # request path already handles — is_pinned_route falls open to
-                # the on-disk bearer. So the proxy stays a working proxy for
-                # everyone, and only callers that prove they may act as the
-                # pinned account get the swap.
+                # Neither is what the feature is for. `cswap pin 1` means
+                # Remote Control and Artifacts belong to account 1, for every
+                # session on this machine, now — not for sessions launched
+                # afterwards.
                 #
-                # The blind tunnel stays gated: that one is not about the
+                # WHAT THE CREDENTIAL BOUGHT, precisely: the proxy listens on
+                # loopback and the kernel does not check uid on a TCP connect,
+                # so any process that can reach the port could obtain a bearer
+                # for the pinned account. But the secret lives at 0600 in the
+                # cert dir, so every process running AS THIS USER can read it
+                # — the sandboxed tool, the npm postinstall — which is the
+                # threat the docstring named. It only ever excluded a
+                # DIFFERENT login on a shared host. These are single-user
+                # machines; there is no such login to exclude, and the cost
+                # was the feature not working.
+                #
+                # The blind tunnel keeps its gate: that is not about the
                 # bearer, it is about not being an open forward proxy to any
                 # host on the internet.
-                authorized = _proxy_authorized(
-                    connect_headers, self._current_secret()
-                )
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
-                    if not authorized:
+                    if not _proxy_authorized(
+                        connect_headers, self._current_secret()
+                    ):
                         self._refuse_unauthorized(conn)
                         return
                     self._blind_tunnel(target, conn)
                     return
-                self._mitm(conn, may_pin=authorized)
+                self._mitm(conn)
                 return
             if len(parts) >= 2 and parts[1].startswith("/health"):
                 # Local health probe (origin-form GET /health to our own port).
@@ -2428,18 +2434,12 @@ class PinProxy:
             except OSError:
                 pass
 
-    def _mitm(self, conn: socket.socket, may_pin: bool = True) -> None:
-        """MITM this connection. ``may_pin=False`` serves it UNPINNED.
-
-        An unauthorized caller is not refused — it is simply not acted for.
-        Its requests go out on whatever bearer they arrived with, which is
-        the on-disk (active) account: the same result as the pin being off.
-        """
+    def _mitm(self, conn: socket.socket) -> None:
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
         try:
             while True:
-                if not self._handle_one_request(tls, may_pin=may_pin):
+                if not self._handle_one_request(tls):
                     break
         finally:
             self._drop_upstream()
@@ -2448,7 +2448,7 @@ class PinProxy:
             except OSError:
                 pass
 
-    def _handle_one_request(self, tls: ssl.SSLSocket, may_pin: bool = True) -> bool:
+    def _handle_one_request(self, tls: ssl.SSLSocket) -> bool:
         request_line = _read_line(tls)
         if not request_line:
             return False
@@ -2464,10 +2464,7 @@ class PinProxy:
                 headers.append((k.strip(), v.strip()))
         body = _read_body(tls, headers)
 
-        # may_pin=False: the caller did not present the proxy credential, so
-        # it is served as if no pin existed. NOT an error — this is the
-        # unpinned state, reached without disturbing a running session.
-        pinned = is_pinned_route(path) and may_pin
+        pinned = is_pinned_route(path)
         swapped = False
         if pinned:
             token = self._pin_token_provider()
