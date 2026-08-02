@@ -146,8 +146,14 @@ def write_upstream_hint(
     if value:
         keep_proxy = value
     else:
-        prev = read_upstream_hint(certdir)
-        keep_proxy = f"http://{prev[0]}:{prev[1]}" if prev else ""
+        # KEEP THE RAW STRING. Rebuilding the URL from the parsed pair threw
+        # away the two fields _Chain exists to carry: the credential and the
+        # https scheme. And this is the NORMAL path — `cswap pin` from a plain
+        # shell reports no proxy, and ensure_proxy re-stamps on every launch —
+        # so an authenticated or TLS corporate proxy survived exactly until the
+        # next re-pin, then every pinned request 407'd. Measured:
+        #   https://bob:***@corp.proxy:8443 -> http://corp.proxy:8443
+        keep_proxy = _read_upstream(certdir, "proxy") or ""
     try:
         tmp.write_text(json.dumps({"proxy": keep_proxy, "ca": keep_ca or ""}))
         tmp.replace(path)
@@ -670,7 +676,13 @@ def _wire_global_config_locked(
     else:
         raw.pop("env", None)
     try:
-        tmp = path.with_suffix(".cswap-tmp")
+        # PID-SUFFIXED AND O_EXCL, like every other atomic write in this file.
+        # A fixed name is two bugs: two processes wiring at once share it, and
+        # O_CREAT's mode argument is IGNORED for a file that already exists —
+        # so a leftover temp from an earlier crashed write dictates the final
+        # mode, and the rename makes it permanent. Measured: config 0600 +
+        # leftover tmp 0644 under umask 077 -> config 0644.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
         # 0600 from creation, and never wider than what we are replacing.
         # ``.claude.json`` carries primaryApiKey, inline MCP credentials and
         # (once the gate is armed) the proxy URL's own credential. A plain
@@ -679,7 +691,11 @@ def _wire_global_config_locked(
         # SURVIVES: wiring the pin permanently downgrades a 0600 config.
         # Measured: 0600 in, 0644 out.
         mode = _mode_of(path, default=0o600)
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            tmp.unlink()  # our own pid's leftover; O_EXCL would reject it
+        except OSError:
+            pass
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         try:
             os.write(fd, json.dumps(raw, indent=2).encode("utf-8"))
         finally:
@@ -756,8 +772,10 @@ def _recorded_upstream(certdir: Path | None) -> str | None:
     """The chain a previous launch recorded, as a URL. See the caller."""
     if certdir is None:
         return None
-    prev = read_upstream_hint(certdir)
-    return f"http://{prev[0]}:{prev[1]}" if prev else None
+    # Raw, for the same reason write_upstream_hint keeps it raw: this value
+    # feeds back INTO the hint, so reconstructing it here launders the
+    # credential out on the other side of the same round trip.
+    return _read_upstream(certdir, "proxy") or None
 
 
 def _proxy_url(port: int, certdir: Path | None) -> str:
@@ -838,6 +856,30 @@ def _as_chain(value) -> "_Chain | None":
     return value if isinstance(value, _Chain) else _Chain(*value)
 
 
+def _verifying_ctx(extra_ca: "Path | None" = None) -> ssl.SSLContext:
+    """A verifying TLS context that trusts what THIS machine trusts.
+
+    System roots, plus any corporate root on ``NODE_EXTRA_CA_CERTS`` — which
+    is where the corporate root actually lives in the environments this
+    package exists to work in. A bare ``create_default_context()`` trusts
+    only public roots, so an https:// corporate proxy (signed by that same
+    corporate root) fails to verify: the module is careful not to narrow the
+    CLIENT's trust and would then have narrowed its own.
+    """
+    ctx = ssl.create_default_context()
+    # Python 3.13+ VERIFY_X509_STRICT rejects a leaf with no Authority Key
+    # Identifier; a corp MITM leaf may lack one. Chain-of-trust stays on.
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    for cafile in (extra_ca, os.environ.get("NODE_EXTRA_CA_CERTS")):
+        if not cafile:
+            continue
+        try:
+            ctx.load_verify_locations(cafile=str(cafile))
+        except (OSError, ssl.SSLError):
+            pass  # unreadable/malformed: keep the roots we do have
+    return ctx
+
+
 def _dial_chain(chain: "_Chain", timeout: float = 15) -> socket.socket:
     """Connect to the egress proxy, wrapping in TLS when the URL said https.
 
@@ -849,9 +891,7 @@ def _dial_chain(chain: "_Chain", timeout: float = 15) -> socket.socket:
     if not chain.tls:
         return sock
     try:
-        return ssl.create_default_context().wrap_socket(
-            sock, server_hostname=chain.host
-        )
+        return _verifying_ctx().wrap_socket(sock, server_hostname=chain.host)
     except (OSError, ssl.SSLError):
         sock.close()
         raise
@@ -1276,7 +1316,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         gate = getattr(switcher, "consume_backup_grant", None)
         if gate is None:
             return oauth.try_refresh_oauth_credentials(creds)
-        return gate(num, mail, creds)
+        outcome = gate(num, mail, creds)
+        # Remember a DEFERRAL. "consume-busy" means another process holds the
+        # slot right now, which is a race with the usage collector, not a
+        # broken daemon — and the caller's only other signal is a None token,
+        # which it reads as "this daemon cannot pin" and records permanently.
+        if getattr(outcome, "error", None) == "consume-busy":
+            _deferred.add(1)
+        return outcome
 
     def _live_token(creds: str) -> str | None:
         data = oauth.extract_oauth_data(creds)
@@ -1307,7 +1354,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         except (AccountNotFoundError, ConfigError, Exception):
             return account_num, email
 
+    # A one-shot flag for the pass currently running: set when the refresh was
+    # DEFERRED rather than failed, so pin_is_noop can say "no token, but do not
+    # condemn this daemon". A set is used only for its atomic add/discard.
+    _deferred: set[int] = set()
+
     def provider() -> str | None:
+        _deferred.discard(1)
         target = _current_target()
         if target is None:
             return None
@@ -1358,6 +1411,15 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         fires when nothing is wrong is worse than no warning at all — this one
         exists to be believed on the day it is real.
         """
+        if 1 in _deferred:
+            # The refresh was DEFERRED, not failed: another process holds the
+            # slot's consume lock (the usage collector polls on its own
+            # schedule and contends for exactly this slot). This request goes
+            # out unpinned and the next one retries — but the caller's only
+            # other reading of a None token is "this daemon cannot pin", which
+            # it records into proxy.json permanently, so one lost race would
+            # condemn a healthy daemon for good.
+            return True
         target = _current_target()
         if target is None:
             return True  # pin cleared: leaving every bearer alone IS the job
@@ -1550,9 +1612,14 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
         line = line.strip()
         if not any(m in line for m in _DAEMON_MODULE_NAMES):
             continue
-        if target not in line:
+        # The certdir must be the LAST argv token, not merely present. This
+        # gate decides whether to SIGTERM-then-SIGKILL, and a substring match
+        # also selects anything that happens to MENTION both — a shell whose
+        # command line quotes them, a wrapper, a grep. Measured: a probe shell
+        # matched alongside the daemon it was probing for.
+        head, _, rest = line.partition(" ")
+        if not rest.rstrip().endswith(" " + target):
             continue
-        head = line.split(None, 1)[0]
         try:
             pids.append(int(head))
         except ValueError:
@@ -2775,9 +2842,7 @@ class PinProxy:
                     # An https:// origin dialled direct needs the handshake,
                     # verified. Without it we sent cleartext HTTP at a TLS
                     # port and the request simply failed.
-                    up = ssl.create_default_context().wrap_socket(
-                        up, server_hostname=host
-                    )
+                    up = _verifying_ctx().wrap_socket(up, server_hostname=host)
                 path = split.path or "/"
                 if split.query:
                     path += "?" + split.query
@@ -3048,18 +3113,8 @@ class PinProxy:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             return ctx
-        ctx = ssl.create_default_context()
-        # Python 3.13+ VERIFY_X509_STRICT rejects a leaf with no Authority Key
-        # Identifier; a corp MITM leaf may lack one. Chain-of-trust stays on.
-        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
-        ctx.load_verify_locations(cafile=str(self._bundle.ca_path))
-        extra = os.environ.get("NODE_EXTRA_CA_CERTS")
-        if extra:
-            try:
-                ctx.load_verify_locations(cafile=extra)
-            except (OSError, ssl.SSLError):
-                pass
-        return ctx
+        # Our own CA too, so a test's fake upstream verifies.
+        return _verifying_ctx(self._bundle.ca_path)
 
     def _current_chain(self) -> tuple[str, int] | None:
         """The egress proxy to CONNECT through, re-read per connection.
@@ -3389,7 +3444,44 @@ def _status_has_no_body(status_line: bytes, method: str | None) -> bool:
         code = int(parts[1])
     except ValueError:
         return False
-    return code in (204, 304) or 100 <= code < 200
+    # 205 Reset Content is also required to carry no content (RFC 9110
+    # §15.3.6). 1xx is deliberately NOT here: an interim response is not the
+    # final one, and treating it as complete would leave the real status in
+    # the upstream buffer for the next request to read — a desync. It gets
+    # its own handling in _relay_response.
+    return code in (204, 205, 304)
+
+
+def _is_interim(status_line: bytes) -> bool:
+    """A 1xx: an INTERIM response, to be forwarded and then read past."""
+    parts = status_line.split(b" ", 2)
+    if len(parts) < 2:
+        return False
+    try:
+        return 100 <= int(parts[1]) < 200
+    except ValueError:
+        return False
+
+
+class _Prefixed:
+    """A socket with bytes pushed back in front of it.
+
+    Reading a response head can consume the start of the NEXT one; a socket
+    has no unread, so the leftover travels here instead.
+    """
+
+    def __init__(self, sock, prefix: bytes):
+        self._sock = sock
+        self._buf = bytearray(prefix)
+
+    def recv(self, n: int) -> bytes:
+        if self._buf:
+            out, self._buf = bytes(self._buf[:n]), bytearray(self._buf[n:])
+            return out
+        return self._sock.recv(n)
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
 
 
 def _relay_response(
@@ -3451,6 +3543,7 @@ def _relay_response(
     chunked = False
     keep = not status_line.startswith(b"HTTP/1.0")
     bodyless = _status_has_no_body(status_line, method)
+    interim = _is_interim(status_line)
     for line in lines[1:]:
         if b":" not in line:
             continue
@@ -3476,6 +3569,32 @@ def _relay_response(
         # "1a\r\n" as body bytes, or to wait for a close that a keep-alive
         # upstream never sends. This IS our hop's encoding: re-declare it.
         out.append(b"Transfer-Encoding: chunked")
+    if not keep:
+        # Connection is hop-by-hop too, and `close` was read into `keep` and
+        # then dropped — so the proxy was about to close while the client
+        # still believed the connection reusable. Its next request then died
+        # on a dead socket instead of opening a new one. (Before
+        # _HOP_BY_HOP_BYTES the filter compared bytes to a str set and never
+        # matched, so the header was forwarded by accident and this was
+        # accidentally right.) Re-declare it for OUR hop, as with chunked.
+        out.append(b"Connection: close")
+    if interim:
+        # An interim (1xx) response is followed by the real one on the same
+        # connection. Returning here delivered the 103 as though it were the
+        # answer and left the 200 in the buffer, so the next request read a
+        # stale response. Forward it and loop for the final status.
+        client.sendall(b"\r\n".join(out) + b"\r\n\r\n")
+        if rest:
+            # Bytes already read past this head belong to the next response;
+            # they cannot be pushed back, so hand them to the recursion.
+            return _relay_response(
+                _Prefixed(up, rest), client, cid,
+                reject_on_auth_error=reject_on_auth_error, method=method,
+            )
+        return _relay_response(
+            up, client, cid,
+            reject_on_auth_error=reject_on_auth_error, method=method,
+        )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
         # neither Content-Length nor Transfer-Encoding. Falling through to

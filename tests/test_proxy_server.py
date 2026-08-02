@@ -315,7 +315,18 @@ class _FramingUpstream:
     which is the only thing that proves the framing we forward is parseable.
     """
 
-    def __init__(self, certdir: Path, response: bytes, keep_open: bool = True):
+    def __init__(
+        self,
+        certdir: Path,
+        response: bytes,
+        keep_open: bool = True,
+        parts: "list[bytes] | None" = None,
+    ):
+        # ``parts`` sends the response in separate writes with a gap. An
+        # interim response is only interesting when the final one has NOT
+        # arrived yet: sent in one write it rides along in the bytes already
+        # read past the head, and reaches the client whatever the relay does.
+        self.parts = parts
         self.response = response
         self.keep_open = keep_open
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -355,7 +366,13 @@ class _FramingUpstream:
                     if not chunk:
                         return
                     data += chunk
-                tls.sendall(self.response)
+                if self.parts:
+                    for i, part in enumerate(self.parts):
+                        if i:
+                            time.sleep(0.15)
+                        tls.sendall(part)
+                else:
+                    tls.sendall(self.response)
                 if not self.keep_open:
                     tls.close()
                     return
@@ -482,6 +499,147 @@ class TestResponseFramingIsParseable:
             got = self._get_twice(proxy.port, certdir / "ca.pem")
             assert [r.status for r, _ in got] == [304, 304]
             assert [b for _, b in got] == [b"", b""]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_connection_close_is_relayed_not_swallowed(self, certdir):
+        """`Connection` is hop-by-hop, so the filter drops it — but `close`
+        was read into the keep-alive verdict and never re-declared. The proxy
+        was about to close while the client still believed the connection
+        reusable, so its next request died on a dead socket instead of
+        opening a new one.
+
+        Accidentally right before `_HOP_BY_HOP_BYTES`: the filter compared
+        bytes against a str set and never matched, so the header rode along.
+        """
+        upstream = _FramingUpstream(
+            certdir,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            conn = self._connect(proxy.port, certdir / "ca.pem")
+            conn.request("GET", "/v1/messages", headers={"Authorization": "Bearer t"})
+            resp = conn.getresponse()
+            body = resp.read()
+            assert (resp.status, body) == (200, b"ok")
+            assert resp.getheader("Connection") == "close", (
+                "the close signal was swallowed — the client will reuse a "
+                "connection the proxy is closing"
+            )
+            assert resp.will_close, "http.client did not see the close"
+            conn.close()
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_a_keep_alive_response_is_not_marked_close(self, certdir):
+        """...and the re-declaration must not fire on a healthy response, or
+        every connection becomes single-use."""
+        upstream = _FramingUpstream(
+            certdir, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            got = self._get_twice(proxy.port, certdir / "ca.pem")
+            assert [r.status for r, _ in got] == [200, 200]
+            assert all(r.getheader("Connection") is None for r, _ in got)
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def _raw_exchange(self, proxy_port, ca_path, requests=1, stop_on=None):
+        """Two requests through the proxy with a RAW TLS client.
+
+        http.client cannot be the witness here: it discards interim (1xx)
+        responses before returning, and its bodyless set is {204, 304} — it
+        does not know 205, so it waits for a body a correct relay never
+        sends. Both would report our own correct behaviour as a failure.
+        """
+        raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=5)
+        raw.sendall(
+            b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+            b"Host: api.anthropic.com:443\r\n\r\n"
+        )
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += raw.recv(1)
+        ctx = ssl.create_default_context(cafile=str(ca_path))
+        tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+        try:
+            got = b""
+            for _ in range(requests):
+                tls.sendall(
+                    b"GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer t\r\n\r\n"
+                )
+                tls.settimeout(3)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    try:
+                        chunk = tls.recv(4096)
+                    except (OSError, ssl.SSLError):
+                        break
+                    if not chunk:
+                        break
+                    got += chunk
+                    if stop_on and stop_on in got:
+                        break
+                    if not stop_on and got.endswith(b"\r\n\r\n"):
+                        break
+            return got
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    def test_an_interim_1xx_is_not_delivered_as_the_final_response(self, certdir):
+        """A 1xx is INTERIM: the real response follows on the same connection.
+
+        Treating it as complete delivered the 103 as the answer and left the
+        200 in the upstream buffer, so the next request on that connection
+        read a stale response — a desync, not just a wrong status.
+        """
+        upstream = _FramingUpstream(
+            certdir,
+            b"",
+            parts=[
+                b"HTTP/1.1 103 Early Hints\r\nLink: </s.css>\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            ],
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            got = self._raw_exchange(
+                proxy.port, certdir / "ca.pem", stop_on=b"ok"
+            )
+            assert b"103 Early Hints" in got, "the interim head was dropped"
+            assert b"200 OK" in got and got.endswith(b"ok"), (
+                "the FINAL response never arrived — the interim was "
+                f"delivered as the answer:\n{got!r}"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_205_reset_content_carries_no_body(self, certdir):
+        """RFC 9110 §15.3.6 — same class as 204, and it was missing.
+
+        Raw client: http.client's bodyless set is {204, 304}, so it would
+        block waiting for a body that must not exist.
+        """
+        upstream = _FramingUpstream(
+            certdir, b"HTTP/1.1 205 Reset Content\r\nDate: now\r\n\r\n"
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            got = self._raw_exchange(proxy.port, certdir / "ca.pem", requests=2)
+            assert got.count(b"205 Reset Content") == 2, (
+                "the relay blocked on a body a 205 cannot have, so the "
+                f"second request was never served:\n{got!r}"
+            )
         finally:
             proxy.stop()
             upstream.stop()
@@ -1038,6 +1196,39 @@ class TestChainRediscovery:
         # A launch that positively reports a DIFFERENT proxy still wins.
         write_upstream_hint(certdir, "http://127.0.0.1:9902")
         assert read_upstream_hint(certdir).address == ("127.0.0.1", 9902)
+
+    def test_the_kept_hint_keeps_its_CREDENTIAL_and_scheme(self, certdir):
+        """Keeping the address is not keeping the chain.
+
+        The keep-previous branch rebuilt the URL from the parsed pair, which
+        threw away the two fields the chain exists to carry. And this is the
+        NORMAL path — `cswap pin` from a plain shell reports no proxy, and
+        ensure_proxy re-stamps on every launch — so on a machine whose only
+        route out is an authenticated or https:// corporate proxy, the
+        credential survived until the next re-pin and then every pinned
+        request 407'd.
+        """
+        from cswap_pin.proxy import read_upstream_hint, write_upstream_hint
+
+        write_upstream_hint(certdir, "https://bob:s3cr%40t@corp.proxy:8443")
+        first = read_upstream_hint(certdir)
+        assert first.auth and first.tls, first
+
+        write_upstream_hint(certdir, None)  # the re-stamp every launch does
+        kept = read_upstream_hint(certdir)
+        assert kept == first, (
+            f"the re-stamp laundered the chain: {first} -> {kept}"
+        )
+
+    def test_the_recorded_upstream_is_returned_raw(self, certdir):
+        """_recorded_upstream feeds back INTO the hint, so reconstructing the
+        URL there launders the credential on the other side of the same round
+        trip."""
+        from cswap_pin.proxy import _recorded_upstream, write_upstream_hint
+
+        url = "https://bob:s3cr%40t@corp.proxy:8443"
+        write_upstream_hint(certdir, url)
+        assert _recorded_upstream(certdir) == url
 
     def test_falls_back_to_direct_when_the_recorded_chain_is_gone(
         self, certdir, tmp_path
@@ -1765,6 +1956,55 @@ class TestTheTrustFileActuallyVerifies:
             proxy.stop()
 
 
+class TestTheKillGateIdentifiesItsTarget:
+    """`_pin_daemon_pids` decides who gets SIGTERM then SIGKILL.
+
+    Every other test stubs it, so the matcher itself was never exercised —
+    and it matched by plain substring over the whole `ps` line, which also
+    selects anything that merely MENTIONS the module and the certdir: a
+    shell whose command line quotes them, a wrapper, a grep.
+    """
+
+    def _pids(self, monkeypatch, lines, certdir):
+        import subprocess as _sp
+
+        from cswap_pin import proxy as pp
+
+        class _R:
+            stdout = "\n".join(lines)
+
+        monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
+        return pp._pin_daemon_pids(certdir)
+
+    def test_the_certdir_must_be_the_last_argv_token(self, tmp_path, monkeypatch):
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        t = str(certdir.resolve())
+        pids = self._pids(
+            monkeypatch,
+            [
+                f" 111 python3 -m cswap_pin.proxy 1 a@b.c {t}",       # the daemon
+                f" 222 /bin/zsh -c 'cswap_pin.proxy ... {t}' && ls",   # a shell
+                f" 333 grep cswap_pin.proxy {t} /var/log/x",           # a grep
+            ],
+            certdir,
+        )
+        assert pids == [111], (
+            f"the kill gate selected a process that only mentions the "
+            f"daemon: {pids}"
+        )
+
+    def test_a_different_certdir_is_never_matched(self, tmp_path, monkeypatch):
+        mine = tmp_path / "pin-proxy"; mine.mkdir()
+        other = tmp_path / "other-proxy"; other.mkdir()
+        pids = self._pids(
+            monkeypatch,
+            [f" 444 python3 -m cswap_pin.proxy 1 a@b.c {other.resolve()}"],
+            mine,
+        )
+        assert pids == [], "a daemon for another backup dir was selected"
+
+
 class TestFailOpenIsNotSilent:
     """The token swap fails OPEN by design — a pin that cannot resolve must
     never block work. The cost is that nothing marks it: requests keep
@@ -1813,6 +2053,64 @@ class TestFailOpenIsNotSilent:
         except Exception:
             pass  # relay to the dead upstream fails; the swap already happened
         return None
+
+    def test_a_deferred_refresh_does_not_condemn_the_daemon(self, tmp_path):
+        """"Busy right now" is not "cannot pin".
+
+        The gate answers ``consume-busy`` when another process holds the
+        slot's consume lock — the usage collector polls on its own schedule
+        and contends for exactly this slot. That is a race to retry, and the
+        provider's own docstring says so.
+
+        But the only other reading of a None token is "this daemon cannot
+        pin", which ``_warn_unpinnable`` records into proxy.json as
+        ``unpinnable: True`` — and ``_read_alive_port`` then refuses to reuse
+        that daemon FOREVER. One lost race would condemn a healthy daemon and
+        print macOS-keychain advice for a Linux lock contention.
+        """
+        import json
+
+        from claude_swap.oauth import RefreshOutcome
+        from cswap_pin import proxy as pp
+
+        expired = json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt"}})
+
+        class _Busy:
+            backup_dir = tmp_path
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return expired
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+            def consume_backup_grant(self, n, e, snap):
+                return RefreshOutcome(None, "consume-busy")
+
+        pp.save_pin(tmp_path, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Busy(), "2", "pin@example.com")
+
+        assert provider() is None, "a busy gate yields no token, by design"
+        assert provider.pin_is_noop() is True, (
+            "a deferral was reported as a failure — the daemon gets marked "
+            "unpinnable and is never reused again"
+        )
+
+    def test_a_real_unreadable_credential_IS_still_a_failure(self, tmp_path):
+        """...and the deferral must not swallow the case the warning exists
+        for. An unreadable store still has to condemn."""
+        from cswap_pin import proxy as pp
+
+        class _Unreadable:
+            backup_dir = tmp_path
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return ""
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(tmp_path, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Unreadable(), "2", "pin@example.com")
+
+        assert provider() is None
+        assert provider.pin_is_noop() is False, (
+            "an unreadable credential must still warn"
+        )
 
     def test_warns_when_the_token_cannot_be_minted(self, certdir, monkeypatch):
         import io

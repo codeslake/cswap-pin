@@ -705,6 +705,87 @@ class TestWireGlobalConfig:
         )
         return path
 
+    def test_the_config_is_never_published_wider_than_it_was(
+        self, tmp_path, monkeypatch
+    ):
+        """`.claude.json` holds primaryApiKey, inline MCP credentials and the
+        proxy URL's own credential. A plain write takes the umask, and because
+        this is a RENAME the mode sticks — so wiring the pin could permanently
+        downgrade a 0600 config to 0644.
+
+        Driven across umasks because that is the variable the bug rode on, and
+        it is invisible to a test that only runs under the harness's own.
+        """
+        import os
+        import stat
+        from pathlib import Path
+
+        from cswap_pin.proxy import wire_global_config
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+        old_umask = os.umask(0o022)
+        try:
+            for umask in (0o022, 0o077, 0o000):
+                for start in (0o600, 0o400, 0o644):
+                    os.umask(umask)
+                    d = tmp_path / f"u{umask:03o}m{start:03o}"
+                    d.mkdir()
+                    path = d / ".claude.json"
+                    path.write_text("{}", encoding="utf-8")
+                    os.chmod(path, start)
+                    monkeypatch.setattr(
+                        "claude_swap.paths.get_global_config_path", lambda p=path: p
+                    )
+                    wire_global_config(36301, ca)
+                    after = stat.S_IMODE(path.stat().st_mode)
+                    assert after <= start, (
+                        f"umask {umask:03o}: wiring widened {start:o} -> {after:o}"
+                    )
+        finally:
+            os.umask(old_umask)
+
+    def test_a_leftover_temp_file_cannot_dictate_the_mode(
+        self, tmp_path, monkeypatch
+    ):
+        """O_CREAT's mode argument is IGNORED for a file that already exists.
+
+        A crashed earlier write leaves the temp behind, so a fixed temp name
+        let that leftover's mode become the config's — permanently, via the
+        rename. The same fixed name is also why two processes wiring at once
+        would share one temp.
+        """
+        import os
+        import stat
+        from pathlib import Path
+
+        from cswap_pin.proxy import wire_global_config
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+        path = self._config(tmp_path, monkeypatch, {})
+        os.chmod(path, 0o600)
+
+        old_umask = os.umask(0o077)
+        try:
+            # Every temp name the writer might pick, pre-created world-readable.
+            for name in (
+                f"{path.name}.{os.getpid()}.cswap-tmp",
+                ".claude.cswap-tmp",
+                f"{path.name}.cswap-tmp",
+            ):
+                stale = path.with_name(name)
+                stale.write_text("stale", encoding="utf-8")
+                os.chmod(stale, 0o644)
+
+            wire_global_config(36301, ca)
+            after = stat.S_IMODE(path.stat().st_mode)
+            assert after == 0o600, (
+                f"a leftover temp dictated the config's mode: {after:o}"
+            )
+        finally:
+            os.umask(old_umask)
+
     def test_writes_proxy_env(self, tmp_path, monkeypatch):
         from pathlib import Path
         from cswap_pin.proxy import wire_global_config
