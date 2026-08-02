@@ -32,10 +32,36 @@ claude session
                    swaps bearer on: /v1/code/sessions*, /v1/sessions/*,
                                     /api/frame/*, /v1/ultrareview/*
                    passes through:  /v1/messages, /api/oauth/usage, everything else
+                   NEVER swapped:   .../worker/*, .../client/presence
 ```
 
 Inference keeps billing whichever account cswap has swapped onto. Only the
 claude.ai-side assets are pinned.
+
+Two exceptions inside the pinned prefix are worth naming, because both were
+learned by breaking them:
+
+- **`/worker/*`** carries the session's own channel credential, not an OAuth
+  bearer. Swapping it makes the server reject every worker call and leaves
+  Remote Control in a reconnect loop.
+- **`/client/presence`** is *registration*, not ownership: it tells the server
+  which process is attached and should receive events. Swapped, the server
+  registers the pinned account while the process actually listening belongs to
+  the active one — so inbound has nobody to reach. It returns `200` either way,
+  which is what made it hard to find.
+
+### A wrong guess cannot cost you a session
+
+Route classification used to be a single point of *permanent* failure. Claude
+Code treats `401/403/404` as terminal — its SSE transport sets `state="closed"`
+and never reconnects — so one misrouted swap ended that session's Remote
+Control for the life of the process (measured: 26 such responses severed four
+sessions that were still running hours later).
+
+Since 0.1.1 the proxy holds the response before any byte reaches the client,
+and when the *swap* is what was refused it re-sends the request exactly as it
+arrived. "Wrong about this route" degrades to "this request went out unpinned",
+which is the failure mode everything else here is already built to tolerate.
 
 ## Install
 
@@ -83,9 +109,19 @@ The proxy generates its own CA to re-sign `api.anthropic.com` and names it in
 otherwise the session silently loses trust in every host the other proxy
 re-signs.
 
-The proxy also requires a per-daemon credential on `CONNECT`: it listens on
-loopback, which carries no identity, and without one any local process could
-have a junk bearer replaced with the pinned account's real token.
+**The proxy does not authenticate its callers, deliberately.** It listens on
+`127.0.0.1` only, so the population it could turn away is other processes
+running *as you* — and an earlier version did exactly that, with a secret file
+in the cert dir. That defended against nobody: any process able to reach the
+port could also read a `0600` file in your own home. What it did cost was real,
+because a session's `HTTPS_PROXY` is fixed when it execs and cannot be updated
+in place: arming the credential instantly `407`'d every session that had
+started before it existed.
+
+So the honest boundary is the loopback interface plus your user account, not a
+credential. If you share a machine with logins you do not trust, do not run
+this — the pinned account's token is reachable by anything that can reach the
+port.
 
 ## License
 
