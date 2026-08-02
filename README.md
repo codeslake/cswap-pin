@@ -87,6 +87,22 @@ a Remote Control session that is **already open**: the server fixed its owner
 when it was created, so reconnecting inside it is what mints a new one under
 the new pin.
 
+## The port
+
+Nothing is hardcoded. The first daemon binds port `0` — the OS picks — and
+records what it got in `<cswap-backup>/pin-proxy/proxy.json`. Later starts try
+to reclaim that number and fall back to another ephemeral port if anything else
+already holds it, so a port you are using is never taken from you.
+
+Reclaiming matters because a running session's `HTTPS_PROXY` is fixed when it
+execs: coming back on a different port would leave that session dialling an
+address nothing answers, and its requests would then go out *unpinned* rather
+than fail loudly.
+
+`CSWAP_PIN_PORT` in a session's environment is an **output** — the daemon
+telling that session where it landed. Setting it yourself does not move the
+proxy; it only misinforms the session.
+
 ## Requirements
 
 - Python 3.10+
