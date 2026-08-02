@@ -203,14 +203,64 @@ class TestParseUpstreamProxy:
 
     def test_ccf_loopback(self):
         # The common case: CCF's forward proxy already on HTTPS_PROXY.
-        assert parse_upstream_proxy("http://127.0.0.1:9901") == ("127.0.0.1", 9901)
+        assert parse_upstream_proxy("http://127.0.0.1:9901").address == ("127.0.0.1", 9901)
 
     def test_bare_host_port(self):
         # Some proxies are set without a scheme.
-        assert parse_upstream_proxy("corp.example.net:8118") == ("corp.example.net", 8118)
+        assert parse_upstream_proxy("corp.example.net:8118").address == (
+            "corp.example.net", 8118
+        )
 
     def test_defaults_port_80(self):
-        assert parse_upstream_proxy("http://proxy.local") == ("proxy.local", 80)
+        assert parse_upstream_proxy("http://proxy.local").address == ("proxy.local", 80)
+
+    def test_an_https_proxy_defaults_to_443(self):
+        """The scheme decides the port.
+
+        Defaulting every scheme to 80 dialled a TLS proxy's plaintext port,
+        so in an environment where that proxy is the only route out, no
+        pinned request could succeed.
+        """
+        chain = parse_upstream_proxy("https://proxy.corp.example")
+        assert chain.address == ("proxy.corp.example", 443)
+        assert chain.tls is True
+
+    def test_an_explicit_port_still_wins_over_the_scheme(self):
+        chain = parse_upstream_proxy("https://proxy.corp.example:8443")
+        assert chain.address == ("proxy.corp.example", 8443)
+        assert chain.tls is True
+
+    def test_credentials_in_the_url_become_a_proxy_authorization_header(self):
+        """An authenticated corporate proxy answers 407 without this.
+
+        Reducing the URL to (host, port) discarded the userinfo entirely, so
+        the CONNECT went out unauthenticated and every pinned request failed.
+        """
+        import base64
+
+        chain = parse_upstream_proxy("http://alice:s3cr3t@proxy.corp:8080")
+        assert chain.address == ("proxy.corp", 8080)
+        expected = base64.b64encode(b"alice:s3cr3t").decode()
+        assert chain.auth == f"Basic {expected}"
+        assert chain.connect_headers() == f"Proxy-Authorization: Basic {expected}\r\n"
+
+    def test_percent_encoded_credentials_are_decoded(self):
+        """userinfo is percent-encoded in a URL; the header carries the bytes.
+
+        A password with an `@` or `:` MUST be encoded in the URL, so passing
+        the raw form through would send a credential the proxy never issued.
+        """
+        import base64
+
+        chain = parse_upstream_proxy("http://user%40corp:p%40ss%3Aword@proxy:3128")
+        expected = base64.b64encode(b"user@corp:p@ss:word").decode()
+        assert chain.auth == f"Basic {expected}"
+
+    def test_a_plain_proxy_sends_no_authorization_header(self):
+        chain = parse_upstream_proxy("http://127.0.0.1:9901")
+        assert chain.auth is None
+        assert chain.connect_headers() == ""
+        assert chain.tls is False
 
 
 class TestEnsureCA:
@@ -416,6 +466,131 @@ class TestMakePinTokenProvider:
         assert sw.persisted == [("2", "pin@example.com", rotated)]
 
 
+class TestRefreshGoesThroughTheInterprocessGate:
+    """A refresh token is one-time-use, and this daemon is not the only
+    process that spends one.
+
+    The provider's ``threading.Lock`` serializes its own threads and nothing
+    else. The usage collector and the autoswitcher refresh the same backup
+    slot from their own processes, so a POST straight to
+    ``try_refresh_oauth_credentials`` could consume a grant another process
+    was already consuming: one wins, the other gets ``invalid_grant``, and a
+    superseded generation gets persisted over the live one.
+
+    The host already owns the answer — ``consume_backup_grant`` holds a
+    per-slot FILE lock across re-read -> POST -> fingerprint-CAS. The pin
+    must use it rather than reach past it.
+    """
+
+    def _expired(self):
+        import json
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt-1"}})
+
+    def _rotated(self):
+        import json
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "fresh", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt-2"}})
+
+    def test_refresh_is_routed_through_consume_backup_grant(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+        from claude_swap.oauth import RefreshOutcome
+
+        rotated = self._rotated()
+        direct_posts = []
+        monkeypatch.setattr(
+            pin_proxy.oauth, "try_refresh_oauth_credentials",
+            lambda _c: direct_posts.append(_c) or RefreshOutcome(rotated, None))
+
+        class _GatedSwitcher(_FakeSwitcher):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.gated = []
+
+            def consume_backup_grant(self, num, email, snapshot):
+                self.gated.append((num, email, snapshot))
+                return RefreshOutcome(rotated, None)
+
+        sw = _GatedSwitcher(active_num="1", backups={"2": self._expired()})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "fresh"
+        assert sw.gated == [("2", "pin@example.com", self._expired())], (
+            "the refresh bypassed the host's interprocess consume gate"
+        )
+        assert direct_posts == [], (
+            "a direct POST can consume a grant another process is consuming"
+        )
+
+    def test_the_gate_persists_so_the_pin_must_not_write_again(self):
+        """A second write would land OUTSIDE the slot lock.
+
+        The gate persists under that lock and CASes on the refresh-token
+        fingerprint; writing the same bytes again afterwards can clobber a
+        racing writer's newer lineage — the very thing the gate serializes.
+        """
+        from cswap_pin import proxy as pin_proxy
+        from claude_swap.oauth import RefreshOutcome
+
+        rotated = self._rotated()
+
+        class _GatedSwitcher(_FakeSwitcher):
+            def consume_backup_grant(self, num, email, snapshot):
+                return RefreshOutcome(rotated, None)
+
+        sw = _GatedSwitcher(active_num="1", backups={"2": self._expired()})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "fresh"
+        assert sw.persisted == [], (
+            "the pin re-persisted what the gate already wrote under its lock"
+        )
+
+    def test_a_busy_gate_yields_instead_of_killing_the_lineage(self):
+        """``consume-busy`` means another process holds the slot.
+
+        No token, so this request goes out unpinned and the next retries —
+        the provider's existing fail-open. Strictly better than the direct
+        POST it replaces, which would answer ``invalid_grant`` and take the
+        refresh lineage down for good.
+        """
+        from cswap_pin import proxy as pin_proxy
+        from claude_swap.oauth import RefreshOutcome
+
+        class _BusySwitcher(_FakeSwitcher):
+            def consume_backup_grant(self, num, email, snapshot):
+                return RefreshOutcome(None, "consume-busy")
+
+        sw = _BusySwitcher(active_num="1", backups={"2": self._expired()})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() is None
+        assert sw.persisted == []
+
+    def test_an_older_host_without_the_gate_still_refreshes(self, monkeypatch):
+        """The gate is newer than the pin package's floor.
+
+        Falling back to the direct POST keeps a pinned request served on an
+        older claude-swap; the in-process lock still covers our own threads.
+        """
+        from cswap_pin import proxy as pin_proxy
+        from claude_swap.oauth import RefreshOutcome
+
+        rotated = self._rotated()
+        monkeypatch.setattr(
+            pin_proxy.oauth, "try_refresh_oauth_credentials",
+            lambda _c: RefreshOutcome(rotated, None))
+
+        sw = _FakeSwitcher(active_num="1", backups={"2": self._expired()})
+        assert not hasattr(sw, "consume_backup_grant")
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "fresh"
+        # No gate to persist for us, so the pin must do it itself.
+        assert sw.persisted == [("2", "pin@example.com", rotated)]
+
+
 class TestPinStore:
     """The pin lives in settings.json's remoteControl section (identity by
     (email, organizationUuid) — slot numbers are not stable)."""
@@ -431,6 +606,31 @@ class TestPinStore:
         save_pin(tmp_path, "pin@example.com", "org-uuid-1")
         save_pin(tmp_path, None, None)
         assert load_pin(tmp_path) is None
+
+    def test_a_malformed_settings_file_is_not_overwritten(self, tmp_path):
+        """A read-modify-write must not start from ``{}``.
+
+        The host's read-side reader degrades a corrupt settings.json to an
+        empty dict on purpose — the app should still start. Using that here
+        meant a pin change rewrote the file with ONLY the pin section,
+        destroying autoswitch, UI and every unknown key in a file that was
+        very likely still hand-recoverable.
+        """
+        import pytest
+        from claude_swap.exceptions import ConfigError
+        from claude_swap.settings import settings_path
+        from cswap_pin.proxy import save_pin
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        broken = '{"autoswitch": {"enabled": true},,,'  # truncated / corrupt
+        path.write_text(broken, encoding="utf-8")
+
+        with pytest.raises(ConfigError):
+            save_pin(tmp_path, "pin@example.com", "org-1")
+        assert path.read_text(encoding="utf-8") == broken, (
+            "a recoverable settings file was replaced with just the pin"
+        )
 
     def test_coexists_with_autoswitch_settings(self, tmp_path):
         # save_settings preserves unknown sections; the reverse must hold too.
@@ -810,6 +1010,10 @@ class TestEnsureProxyLifecycle:
         stale_port = srv.getsockname()[1]
         pin_proxy.write_daemon_state(certdir, stale_port, os.getpid(), "STALE-FP")
         killed = []
+        # This pid really is a pin daemon for this certdir. Say so: the
+        # recycle refuses to signal a pid it cannot identify as one of ours,
+        # and the pytest process is not (see test_a_reused_pid_is_not_killed).
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
         monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 52000)
         got, ca = pin_proxy.ensure_proxy(self._Sw(tmp_path))
@@ -967,6 +1171,91 @@ class TestRefcount:
             kwargs={"first_holder_timeout": 0.3}, daemon=True,
         ).start()
         assert fired.wait(timeout=5), "orphan lingered — reaper disabled by a foreign pin"
+
+    def test_the_last_holder_leaving_does_not_strand_wired_sessions(
+        self, tmp_path, monkeypatch
+    ):
+        """The claim check guarded ONE exit, and there are two.
+
+        A daemon that never got a holder consults the wiring (above). A
+        daemon that HAD holders did not: the moment the last wrapper-launched
+        session closed its fd, teardown ran unconditionally — even with the
+        global config still routing every hand-launched session to our port.
+        Those sessions carry an HTTPS_PROXY fixed at exec, so they cannot be
+        redirected; they just get ConnectionRefused and retry forever.
+
+        The two populations are different sets, and closing the last member
+        of one says nothing about the other.
+        """
+        import json as _json, os, threading, time
+        import claude_swap.paths as paths
+        from cswap_pin.proxy import (
+            refcount_fifo_path,
+            watch_refcount,
+            write_daemon_state,
+            daemon_fingerprint,
+        )
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        write_daemon_state(certdir, 40404, os.getpid(), daemon_fingerprint())
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "40404"}}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        # Re-check promptly so the test does not wait out the production pace.
+        monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
+
+        holder = os.open(fifo, os.O_RDWR)  # a wrapper-launched session attaches
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set), daemon=True
+        ).start()
+        # Let the watcher SEE the holder: it only switches to the blocking
+        # (real-EOF) read once a writer has attached, and this test is about
+        # that second phase, not the first-holder timeout.
+        time.sleep(0.4)
+        os.close(holder)  # ...and leaves, while the wiring still names us
+        assert not fired.wait(timeout=2), (
+            "tore down a daemon the global config still routes sessions "
+            "to — they get ConnectionRefused and cannot be redirected"
+        )
+
+    def test_the_last_holder_leaving_still_reaps_an_unclaimed_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        """...and the re-check must not disable the reaper it guards.
+
+        With no wiring naming us and nobody connected, the last holder
+        leaving means exactly what it always meant: nothing references this
+        daemon, so it must go.
+        """
+        import json as _json, os, threading, time
+        import claude_swap.paths as paths
+        from cswap_pin.proxy import (
+            refcount_fifo_path,
+            watch_refcount,
+            write_daemon_state,
+            daemon_fingerprint,
+        )
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        write_daemon_state(certdir, 40404, os.getpid(), daemon_fingerprint())
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "59999"}}))  # not us
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
+
+        holder = os.open(fifo, os.O_RDWR)
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set), daemon=True
+        ).start()
+        time.sleep(0.4)  # as above: reach the blocking phase before closing
+        os.close(holder)
+        assert fired.wait(timeout=5), (
+            "an unreferenced daemon lingered — the reaper stopped working"
+        )
 
 
 
@@ -2212,6 +2501,76 @@ class TestClearingThePinDoesNotStrandLiveSessions:
                 c.close()
         finally:
             srv.close()
+
+    def test_an_unmeasurable_platform_still_sees_its_own_clients(
+        self, tmp_path, monkeypatch
+    ):
+        """The claim above is Linux-only, and that is the bug.
+
+        ``clients_that_arming_would_cut_off`` reads /proc/net/tcp, which
+        NEITHER MAC HAS, so it answers None — and None was coerced to "not
+        claimed". On macOS a hand-launched session could therefore hold a
+        live connection while the watcher counted the daemon idle and, once
+        `pin --clear` removed the wiring, stopped it underneath. Its
+        HTTPS_PROXY is fixed at exec, so it cannot be redirected: it just
+        gets ConnectionRefused.
+
+        The daemon's own connection count has no such blind spot.
+        """
+        import json
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        (certdir / "proxy.json").write_text(
+            json.dumps({"pid": os.getpid(), "port": 45678})
+        )
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
+        # Model macOS: the socket scan cannot answer at all.
+        monkeypatch.setattr(
+            pin_proxy, "clients_that_arming_would_cut_off", lambda _p: None
+        )
+
+        assert pin_proxy._is_claimed(certdir, lambda: 0) is False, (
+            "an idle daemon must still time out"
+        )
+        assert pin_proxy._is_claimed(certdir, lambda: 1) is True, (
+            "a live client was ignored because the platform cannot be probed"
+        )
+
+    def test_the_daemon_counts_its_own_live_clients(self, tmp_path):
+        """The count must track real connections, not just exist."""
+        import socket
+        import time
+
+        from cswap_pin.proxy import PinProxy
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            assert proxy.live_client_count() == 0
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            try:
+                deadline = time.monotonic() + 5
+                while proxy.live_client_count() == 0:
+                    assert time.monotonic() < deadline, (
+                        "a connected client was never counted"
+                    )
+                    time.sleep(0.02)
+                assert proxy.live_client_count() == 1
+            finally:
+                c.close()
+            deadline = time.monotonic() + 5
+            while proxy.live_client_count() != 0:
+                assert time.monotonic() < deadline, (
+                    "the count did not drop when the client left"
+                )
+                time.sleep(0.02)
+        finally:
+            proxy.stop()
 
 
 class TestABlindDaemonIsNotReusedForever:
