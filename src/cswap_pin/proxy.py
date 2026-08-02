@@ -2231,16 +2231,24 @@ class PinProxy:
                 # machines; there is no such login to exclude, and the cost
                 # was the feature not working.
                 #
-                # The blind tunnel keeps its gate: that is not about the
-                # bearer, it is about not being an open forward proxy to any
-                # host on the internet.
+                # THE BLIND TUNNEL IS NOT GATED EITHER, and keeping it gated
+                # was my error. "Do not be an open forward proxy" assumes the
+                # port is reachable; this one binds 127.0.0.1 only, so the
+                # population it could refuse is the same-user processes that
+                # can read the 0600 secret anyway.
+                #
+                # What it actually cost: every host that is NOT api.anthropic.com
+                # takes this path — git, pip, npm, the auto-updater. Measured
+                # with the pin on and a session wired before the credential:
+                #   api.anthropic.com  200
+                #   github.com         407
+                #   pypi.org           407
+                #   registry.npmjs.org 407
+                # So turning the pin on severed general internet for every live
+                # session while leaving Claude itself working, which reads as
+                # "the network broke" and not as "the pin did something".
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
-                    if not _proxy_authorized(
-                        connect_headers, self._current_secret()
-                    ):
-                        self._refuse_unauthorized(conn)
-                        return
                     self._blind_tunnel(target, conn)
                     return
                 self._mitm(conn)
