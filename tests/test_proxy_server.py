@@ -13,6 +13,7 @@ import json
 import socket
 import ssl
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,8 @@ class _FakeUpstream:
         self.reject_bearer = reject_bearer
         self.seen_auth: str | None = None
         self.seen_path: str | None = None
+        self.seen_body: bytes = b""
+        self.seen_head: str = ""
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
         self._srv = socket.socket()
@@ -87,6 +90,8 @@ class _FakeUpstream:
                     if not chunk:
                         break
                     rest += chunk
+                self.seen_body = bytes(rest)
+                self.seen_head = head
                 lines = head.split("\r\n")
                 self.seen_path = lines[0].split(" ")[1]
                 for line in lines[1:]:
@@ -302,6 +307,343 @@ class TestStreamingRelay:
             upstream.stop()
 
 
+class _FramingUpstream:
+    """A TLS server that answers with a caller-chosen raw response.
+
+    Lets a test drive the exact framing shapes a real origin produces —
+    chunked, 204, 304 — and then read the result with a REAL HTTP client,
+    which is the only thing that proves the framing we forward is parseable.
+    """
+
+    def __init__(self, certdir: Path, response: bytes, keep_open: bool = True):
+        self.response = response
+        self.keep_open = keep_open
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._stop = False
+        self._held = []
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            threading.Thread(
+                target=self._serve, args=(conn,), daemon=True
+            ).start()
+
+    def _serve(self, conn):
+        try:
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            self._held.append(tls)
+            # A keep-alive origin serves request after request on the same
+            # connection and never closes on its own. That is what makes a
+            # mis-framed bodyless response detectable: the relay blocks on
+            # recv for a body that never comes, so the SECOND request on the
+            # client's connection is never served.
+            while not self._stop:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
+                tls.sendall(self.response)
+                if not self.keep_open:
+                    tls.close()
+                    return
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+        for t in self._held:
+            try:
+                t.close()
+            except OSError:
+                pass
+        self._srv.close()
+
+
+class TestResponseFramingIsParseable:
+    """What we forward must be framed the way we CLAIM it is.
+
+    The relay strips hop-by-hop headers (Transfer-Encoding among them) and
+    then forwards chunk-size lines verbatim, so the client saw chunk syntax
+    with no framing declared — free to read "1a\\r\\n" as payload or to wait
+    for a close a keep-alive origin never sends. And 204/304 carry no body by
+    definition but usually declare no framing either, so they fell into the
+    read-until-EOF branch and hung.
+
+    Every assertion here goes through http.client: a hand-rolled reader can
+    agree with a hand-rolled writer and still be wrong.
+    """
+
+    def _connect(self, proxy_port, ca_path):
+        ctx = ssl.create_default_context(cafile=str(ca_path))
+        conn = http.client.HTTPSConnection(
+            "api.anthropic.com", context=ctx, timeout=5
+        )
+        conn.set_tunnel("api.anthropic.com", 443)
+        conn._create_connection = lambda *a, **k: socket.create_connection(
+            ("127.0.0.1", proxy_port), timeout=5
+        )
+        return conn
+
+    def _get(self, proxy_port, ca_path, method="GET"):
+        conn = self._connect(proxy_port, ca_path)
+        conn.request(method, "/v1/messages", headers={"Authorization": "Bearer t"})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp, body
+
+    def _get_twice(self, proxy_port, ca_path, method="GET"):
+        """Two requests on ONE connection.
+
+        A bodyless response the relay mis-frames does not fail the FIRST
+        request: http.client knows 204/304/HEAD carry no body and returns
+        without waiting, while the relay thread is still blocked on recv for
+        a body that will never come. The damage shows on the next request —
+        the connection is never released back, so it never gets served. Only
+        the second request can see the bug.
+        """
+        conn = self._connect(proxy_port, ca_path)
+        out = []
+        try:
+            for _ in range(2):
+                conn.request(
+                    method, "/v1/messages", headers={"Authorization": "Bearer t"}
+                )
+                resp = conn.getresponse()
+                out.append((resp, resp.read()))
+        finally:
+            conn.close()
+        return out
+
+    def _proxy(self, certdir, upstream):
+        from cswap_pin.proxy import PinProxy
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        return proxy
+
+    def test_a_chunked_response_stays_framed_as_chunked(self, certdir):
+        upstream = _FramingUpstream(
+            certdir,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            resp, body = self._get(proxy.port, certdir / "ca.pem")
+            assert resp.status == 200
+            assert body == b"hello world", (
+                "chunk syntax reached the client as payload — the framing "
+                "header was stripped while the chunk lines were kept"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_204_completes_without_waiting_for_a_close(self, certdir):
+        upstream = _FramingUpstream(
+            certdir, b"HTTP/1.1 204 No Content\r\nDate: now\r\n\r\n"
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            got = self._get_twice(proxy.port, certdir / "ca.pem")
+            assert [r.status for r, _ in got] == [204, 204], (
+                "the relay blocked waiting for a body a 204 cannot have"
+            )
+            assert [b for _, b in got] == [b"", b""]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_304_completes_without_waiting_for_a_close(self, certdir):
+        upstream = _FramingUpstream(
+            certdir, b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n"
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            got = self._get_twice(proxy.port, certdir / "ca.pem")
+            assert [r.status for r, _ in got] == [304, 304]
+            assert [b for _, b in got] == [b"", b""]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_a_head_response_does_not_wait_for_its_absent_body(self, certdir):
+        """HEAD mirrors GET's headers — Content-Length included — with no
+        body. Only the request method says so."""
+        upstream = _FramingUpstream(
+            certdir, b"HTTP/1.1 200 OK\r\nContent-Length: 12345\r\n\r\n"
+        )
+        proxy = self._proxy(certdir, upstream)
+        try:
+            got = self._get_twice(proxy.port, certdir / "ca.pem", method="HEAD")
+            assert [r.status for r, _ in got] == [200, 200], (
+                "the relay waited for a body the HEAD response does not carry"
+            )
+            assert [b for _, b in got] == [b"", b""]
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+
+class TestChunkedRequestBodiesReachUpstream:
+    """A chunked request arrived upstream with NO body.
+
+    `_read_body` recognized only `Content-Length`, so it read zero bytes,
+    while the forwarder stripped `Transfer-Encoding` (it is hop-by-hop). The
+    upstream therefore saw a bodyless request and every chunked message or
+    artifact upload silently lost its payload.
+    """
+
+    def test_a_chunked_body_is_decoded_and_reframed(self, certdir):
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            raw.sendall(
+                b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                b"Host: api.anthropic.com:443\r\n\r\n"
+            )
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += raw.recv(1)
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            tls.sendall(
+                b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                b"Authorization: Bearer t\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+                b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+            )
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            tls.close()
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+        assert upstream.seen_body == b"hello world", (
+            "the upstream received a bodyless request — the chunked payload "
+            f"was dropped (got {upstream.seen_body!r})"
+        )
+        head = upstream.seen_head.lower()
+        # The body is decoded, so the chunk framing must NOT be claimed...
+        assert "transfer-encoding" not in head, (
+            "a decoded body was announced as chunked — the upstream would "
+            f"read the payload as a chunk-size line:\n{upstream.seen_head!r}"
+        )
+        # ...and the framing that IS true has to be declared, or a
+        # standards-conforming upstream reads no body at all.
+        assert "content-length: 11" in head, (
+            "the decoded body was sent with no framing declared:\n"
+            f"{upstream.seen_head!r}"
+        )
+
+
+class TestTheChainsCredentialIsSent:
+    """An authenticated corporate proxy answers 407 without it.
+
+    Reducing the inherited proxy URL to ``(host, port)`` discarded the
+    userinfo, so every CONNECT went out unauthenticated — and where that
+    proxy is the only route out, ALL pinned traffic fails.
+    """
+
+    def _recording_chain(self):
+        """A CONNECT proxy that records the request head and then refuses.
+
+        Refusing is enough: the credential rides on the CONNECT itself, so
+        the head is captured before anything downstream matters.
+        """
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        seen = []
+
+        def loop():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = conn.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    seen.append(buf.decode("latin1"))
+                    conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                finally:
+                    conn.close()
+
+        threading.Thread(target=loop, daemon=True).start()
+        return srv, srv.getsockname()[1], seen
+
+    def test_connect_carries_proxy_authorization(self, certdir):
+        import base64
+
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        srv, port, seen = self._recording_chain()
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        write_upstream_hint(certdir, f"http://alice:s3cr3t@127.0.0.1:{port}")
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            raw.sendall(
+                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+            )
+            deadline = time.monotonic() + 5
+            while not seen and time.monotonic() < deadline:
+                time.sleep(0.02)
+            raw.close()
+        finally:
+            proxy.stop()
+            srv.close()
+
+        assert seen, "the proxy never reached the chain"
+        expected = base64.b64encode(b"alice:s3cr3t").decode()
+        assert f"Proxy-Authorization: Basic {expected}" in seen[0], (
+            "the CONNECT went out unauthenticated — an authenticated "
+            f"corporate proxy answers 407 to this:\n{seen[0]!r}"
+        )
+
+
 class _LoopbackConnectProxy:
     """A localhost CONNECT proxy (stands in for CCF) that forwards to a fake
     upstream signed by a CA the pin proxy does NOT trust. Proves the pin proxy
@@ -372,6 +714,66 @@ class TestLoopbackChainTrust:
             chain.stop()
             upstream.stop()
 
+    def test_a_dead_loopback_chain_does_not_disarm_verification(
+        self, certdir, tmp_path
+    ):
+        """Skipping verification is a property of the HOP, not of the hint.
+
+        The dial falls back to a direct socket when the recorded chain is
+        unreachable. Deriving the TLS context from the (still loopback) hint
+        instead of from the dial meant that fallback reached the real
+        api.anthropic.com with CERT_NONE, carrying account bearers — a MITM
+        window that opens exactly when the local proxy is down.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        ensure_ca(foreign, "api.anthropic.com")
+        upstream = _FakeUpstream(foreign)  # cert the pin proxy cannot trust
+
+        # A loopback chain that is recorded but NOT listening: bind a port,
+        # learn it, close it. The hint stays loopback; the dial must fail.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+        probe.close()
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+            rediscover_chain=True,
+        )
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead_port}")
+        proxy.start()
+        try:
+            raw, via_loopback = proxy._connect_upstream()
+            raw.close()
+            assert via_loopback is False, (
+                "the chain was unreachable, so this dial was direct"
+            )
+            assert (
+                proxy._upstream_ctx(via_loopback).verify_mode is ssl.CERT_REQUIRED
+            ), "a direct dial to the real upstream must verify the certificate"
+
+            # End to end: the foreign-signed upstream must now be REJECTED.
+            # The proxy drops the connection on a TLS failure, so "no reply"
+            # and "a non-200 reply" are both the refusal this asserts; only a
+            # 200 would mean the bad cert was accepted.
+            try:
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+                )
+            except (OSError, http.client.HTTPException):
+                status = None
+            assert status != 200, (
+                "an untrusted cert was accepted on a direct dial"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
 
 class TestPortReclamationAcrossRespawn:
     """A respawn must come back on the SAME port. A live session's
@@ -425,7 +827,8 @@ class TestPortReclamationAcrossRespawn:
                 return ("1", "pin@example.com", "org-1")
 
         killed = []
-        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: pid == 4242)
+        # 4242 is a pin daemon for THIS certdir — the recycle is legitimate.
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [4242])
         monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 51000)
         monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
@@ -434,6 +837,84 @@ class TestPortReclamationAcrossRespawn:
 
         assert killed == [4242], "the stale daemon was not recycled"
         assert pin_proxy.read_port_hint(certdir) == 51000
+
+    def test_a_reused_pid_is_not_killed(self, tmp_path, monkeypatch):
+        """Alive is not "still ours".
+
+        An unclean exit leaves proxy.json behind, and the OS reuses pids
+        freely. Recycling on liveness alone therefore aims SIGTERM — then
+        SIGKILL — at whatever unrelated process inherited the number, purely
+        because a dead daemon once had it.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        backup = tmp_path
+        certdir = backup / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+        pin_proxy.write_daemon_state(certdir, 51000, 4242, "STALE-fingerprint")
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("1", "pin@example.com", "org-1")
+
+        killed = []
+        # The pid is alive, but it is somebody else's process now: no pin
+        # daemon for this certdir carries it.
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [])
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 51000)
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
+
+        pin_proxy.ensure_proxy(_Sw())
+
+        assert killed == [], (
+            "SIGTERM/SIGKILL sent to a process that is not our daemon"
+        )
+
+    def test_a_superseded_daemon_leaves_the_successors_state_alone(
+        self, tmp_path
+    ):
+        """The other half of the same root: cleanup must check ownership too.
+
+        _spawn_daemon publishes the successor's proxy.json and only THEN
+        sweeps the orphans it replaces. So the old daemon's SIGTERM arrives
+        after the file already names the successor — and an unconditional
+        unlink deletes the record of the daemon that is currently serving.
+        The next launch then reads no state and spawns another one on top.
+        """
+        import os as _os
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        # State published by the SUCCESSOR (a pid that is not ours).
+        successor_pid = _os.getpid() + 1
+        pin_proxy.write_daemon_state(certdir, 51000, successor_pid, "fp")
+
+        assert pin_proxy._release_daemon_state(certdir) is True, (
+            "a superseded daemon must report that it no longer owns the state"
+        )
+        st = pin_proxy.read_daemon_state(certdir)
+        assert st is not None and int(st["pid"]) == successor_pid, (
+            "the departing daemon deleted the serving successor's state"
+        )
+
+    def test_a_daemon_still_owning_its_state_clears_it(self, tmp_path):
+        """The normal teardown must still leave nothing behind — a stale
+        record reads as live and the next launch reuses a dead port."""
+        import os as _os
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.write_daemon_state(certdir, 51000, _os.getpid(), "fp")
+
+        assert pin_proxy._release_daemon_state(certdir) is False
+        assert pin_proxy.read_daemon_state(certdir) is None
 
     def test_spawn_carries_the_port_forward(self, tmp_path, monkeypatch):
         """_spawn_daemon must record the outgoing port BEFORE deleting the
@@ -484,7 +965,7 @@ class TestLongPollSurvives:
             upstream=("127.0.0.1", srv.getsockname()[1]),
         )
         try:
-            up = proxy._connect_upstream()
+            up, _via_loopback = proxy._connect_upstream()
             assert up.gettimeout() is None, (
                 "a read deadline on the upstream kills the RC long poll"
             )
@@ -547,16 +1028,16 @@ class TestChainRediscovery:
         from cswap_pin.proxy import read_upstream_hint, write_upstream_hint
 
         write_upstream_hint(certdir, "http://127.0.0.1:9901")
-        assert read_upstream_hint(certdir) == ("127.0.0.1", 9901)
+        assert read_upstream_hint(certdir).address == ("127.0.0.1", 9901)
 
         write_upstream_hint(certdir, None)  # a launch with nothing in its env
-        assert read_upstream_hint(certdir) == ("127.0.0.1", 9901), (
+        assert read_upstream_hint(certdir).address == ("127.0.0.1", 9901), (
             "a launch that could not see a proxy erased the recorded one"
         )
 
         # A launch that positively reports a DIFFERENT proxy still wins.
         write_upstream_hint(certdir, "http://127.0.0.1:9902")
-        assert read_upstream_hint(certdir) == ("127.0.0.1", 9902)
+        assert read_upstream_hint(certdir).address == ("127.0.0.1", 9902)
 
     def test_falls_back_to_direct_when_the_recorded_chain_is_gone(
         self, certdir, tmp_path
