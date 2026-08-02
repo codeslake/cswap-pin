@@ -1809,6 +1809,30 @@ def write_daemon_state(certdir: Path, port: int, pid: int, fingerprint: str) -> 
     os.replace(tmp, Path(certdir) / _STATE_FILE)
 
 
+def mark_daemon_unpinnable(certdir: Path) -> None:
+    """Record that THIS daemon cannot read the pinned account's credential.
+
+    Only the running daemon can discover this, and only ensure_proxy can act
+    on it — it reuses any daemon whose fingerprint matches, so without a mark
+    a blind daemon is reused forever and `cswap pin` keeps reporting success
+    over a pin that never applies. Rewrites the state file in place, keeping
+    port/pid/fingerprint, and only when the record is ours.
+    """
+    import json
+
+    path = Path(certdir) / _STATE_FILE
+    try:
+        st = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(st, dict) or st.get("pid") != os.getpid():
+        return
+    st["unpinnable"] = True
+    tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, path)
+
+
 def read_daemon_state(certdir: Path) -> dict | None:
     """The recorded daemon state (``{port, pid, fingerprint}``), or None if the
     file is absent or corrupt."""
@@ -1858,6 +1882,14 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
     if not st:
         return None
     if fingerprint is not None and st.get("fingerprint") != fingerprint:
+        return None
+    # A daemon that has proven it cannot read the pinned credential is not a
+    # daemon worth reusing. It answers /health, serves every request, and
+    # silently applies no pin — so reusing it makes `cswap pin` report success
+    # forever while Remote Control sessions keep landing on the wrong account.
+    # Only the caller asking for a SPECIFIC fingerprint is spawning a pin, so
+    # only that caller recycles; a bare liveness probe still sees it.
+    if fingerprint is not None and st.get("unpinnable"):
         return None
     if not _pid_alive(int(st["pid"])):
         return None
@@ -2330,6 +2362,19 @@ class PinProxy:
         if getattr(self, "_warned_unpinnable", False):
             return
         self._warned_unpinnable = True
+        # RECORD IT, do not only say it. The advice this prints — "re-run
+        # `cswap pin` from a normal terminal" — cannot work on its own:
+        # ensure_proxy reuses any daemon whose fingerprint matches, so the
+        # re-run finds this same blind daemon and returns it. Measured on
+        # macOS: `cswap pin 1` from a GUI tmux window left pid 56790 (spawned
+        # over ssh, keychain rc=36) serving, unchanged, still unpinnable.
+        #
+        # Written to the state file so the NEXT ensure_proxy can see what only
+        # this process could learn, and recycle instead of reusing.
+        try:
+            mark_daemon_unpinnable(self._certdir)
+        except Exception:  # noqa: BLE001 — advisory; never break a request
+            pass
         try:
             sys.stderr.write(
                 "cswap pin: the pinned account's token could not be read, so "

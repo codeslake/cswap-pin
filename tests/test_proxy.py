@@ -2204,3 +2204,66 @@ class TestClearingThePinDoesNotStrandLiveSessions:
                 c.close()
         finally:
             srv.close()
+
+
+class TestABlindDaemonIsNotReusedForever:
+    """A daemon that cannot read the pinned credential must be recycled.
+
+    On macOS the daemon inherits its spawner's session, and an ssh session
+    cannot reach the GUI keychain (measured: `security find-generic-password`
+    rc=36 over ssh, rc=0 from a GUI tmux window). Such a daemon serves every
+    request unpinned and warns to a log nobody reads.
+
+    Its own advice — "re-run `cswap pin` from a normal terminal" — could not
+    work, because ensure_proxy reuses any daemon whose fingerprint matches.
+    Measured: `cswap pin 1` from a GUI tmux window on work-mac left pid 56790
+    (ssh-spawned, keychain-blind) serving unchanged. So the daemon records the
+    fact and the reuse check honours it.
+    """
+
+    def test_a_marked_daemon_is_not_reused(self, tmp_path):
+        import json
+        import os
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        state = certdir / "proxy.json"
+        state.write_text(
+            json.dumps({"port": port, "pid": os.getpid(), "fingerprint": "fp"})
+        )
+        try:
+            assert pin_proxy._read_alive_port(certdir, fingerprint="fp") == port
+
+            pin_proxy.mark_daemon_unpinnable(certdir)
+            assert json.loads(state.read_text())["unpinnable"] is True
+            assert pin_proxy._read_alive_port(certdir, fingerprint="fp") is None, (
+                "a keychain-blind daemon was reused — `cswap pin` reports "
+                "success while no pin is applied"
+            )
+            # A bare liveness probe still finds it: it IS serving, and the
+            # monitor asking "is anything there" must not be told no.
+            assert pin_proxy._read_alive_port(certdir) == port
+        finally:
+            srv.close()
+
+    def test_marking_a_daemon_that_is_not_ours_does_nothing(self, tmp_path):
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        state = certdir / "proxy.json"
+        state.write_text(json.dumps({"port": 1, "pid": 999999, "fingerprint": "fp"}))
+        pin_proxy.mark_daemon_unpinnable(certdir)
+        assert "unpinnable" not in json.loads(state.read_text()), (
+            "one daemon marked another's record"
+        )
