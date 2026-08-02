@@ -1502,12 +1502,29 @@ def _is_claimed(certdir: Path) -> bool:
     whether or not anyone opened the FIFO. It also separates the two
     populations exactly: a crashed spawn or a killed test leaves a daemon on a
     certdir nothing was ever wired to, so those still time out as before.
+
+    A LIVE CONNECTION IS ALSO A CLAIM, and it is the one that matters when the
+    pin is turned OFF. `cswap pin --clear` removes the wiring, so the two
+    checks above both go false at once — and the daemon tore itself down while
+    real sessions were still talking to it. Their HTTPS_PROXY is fixed at exec,
+    so they could not be told; they got ConnectionRefused and retried forever
+    (measured: 312 processes, `attempt 6/300`, plus "Auto-update failed").
+
+    That is the same root as the 407 — env cannot be updated in a running
+    process — pointing the other way: arming broke them, and disarming broke
+    them too. A daemon someone is actually connected to is not idle, whatever
+    the config says, so serving that traffic until it drains is what makes
+    turning the pin off as harmless as turning it on.
     """
     try:
         st = read_daemon_state(certdir)
         if not st or int(st["pid"]) != os.getpid():
             return False  # not our record — say nothing about our own liveness
-        return _wired_port() == int(st["port"])
+        port = int(st["port"])
+        if _wired_port() == port:
+            return True
+        live = clients_that_arming_would_cut_off(port)
+        return bool(live)  # None (unmeasurable) => not a claim
     except Exception:
         return False
 
