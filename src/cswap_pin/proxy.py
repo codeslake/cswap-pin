@@ -684,8 +684,6 @@ def _wire_global_config_locked(
             os.write(fd, json.dumps(raw, indent=2).encode("utf-8"))
         finally:
             os.close(fd)
-        # O_CREAT's mode is masked by the umask, so ask for it explicitly.
-        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except OSError:
         return False
@@ -3072,15 +3070,12 @@ class PinProxy:
         route out, bypassing it is a hard failure, not a performance note.
         ``rediscover_chain=False`` keeps tests explicit.
         """
-        # Normalized HERE, not at construction: this is the one path every
-        # egress site goes through, and `_chain` is also assigned directly
-        # (tests do). A plain (host, port) reaching a CONNECT would raise on
-        # the credential lookup instead of simply having none.
-        return _as_chain(
-            self._chain
-            if not self._rediscover_chain
-            else read_upstream_hint(self._certdir)
-        )
+        # Returned RAW; every consumer runs it through _as_chain, which they
+        # must anyway — `_chain` is also assigned directly and this method is
+        # stubbed outright in tests, so normalizing here covers neither.
+        if not self._rediscover_chain:
+            return self._chain
+        return read_upstream_hint(self._certdir)
 
     def _connect_upstream(self) -> tuple[socket.socket, bool]:
         """Dial the upstream (through the chain when there is one).
