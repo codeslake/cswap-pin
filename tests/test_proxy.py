@@ -2152,3 +2152,55 @@ class TestArmingReportsWhoItCutsOff:
         )
         pin_proxy.apply_pin(_Sw(), "a@b.c", None)
         assert pin_proxy.last_arm_cutoff() is None
+
+
+class TestClearingThePinDoesNotStrandLiveSessions:
+    """`cswap pin --clear` must not kill a proxy people are still using.
+
+    The daemon idles out when nothing claims it, and the claims were "a FIFO
+    holder" or "the wiring names my port". --clear removes the wiring, so both
+    went false at once and the daemon exited while 312 processes were still
+    connected. Their HTTPS_PROXY is fixed at exec, so they could not be
+    redirected: ConnectionRefused, `attempt 6/300`, forever.
+
+    Same root as the 407 (env cannot be updated in a running process), other
+    direction: arming broke them, disarming broke them too.
+    """
+
+    def test_a_live_connection_claims_the_daemon(self, tmp_path, monkeypatch):
+        import json
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        port = srv.getsockname()[1]
+        (certdir / "proxy.json").write_text(
+            json.dumps({"pid": __import__("os").getpid(), "port": port})
+        )
+        # the pin is OFF: no wiring names this port
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
+        try:
+            if pin_proxy.clients_that_arming_would_cut_off(port) is None:
+                pytest.skip("no /proc/net/tcp on this platform")
+            assert pin_proxy._is_claimed(certdir) is False, (
+                "an idle unwired daemon should still time out"
+            )
+            c = socket.create_connection(("127.0.0.1", port))
+            conn, _ = srv.accept()
+            try:
+                assert pin_proxy._is_claimed(certdir) is True, (
+                    "--clear tore the daemon down under live sessions — they "
+                    "get ConnectionRefused and cannot be redirected"
+                )
+            finally:
+                conn.close()
+                c.close()
+        finally:
+            srv.close()
