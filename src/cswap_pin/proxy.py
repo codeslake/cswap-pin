@@ -2188,18 +2188,39 @@ class PinProxy:
                     if ":" in h:
                         k, v = h.split(":", 1)
                         connect_headers.append((k.strip(), v.strip()))
-                # A caller that cannot present the credential gets nothing —
-                # not the MITM (which would mint a bearer for it) and not the
-                # blind tunnel (which would make us an open forward proxy for
-                # any host). See ``ensure_proxy_secret``.
-                if not _proxy_authorized(connect_headers, self._current_secret()):
-                    self._refuse_unauthorized(conn)
-                    return
+                # AUTHORIZATION DECIDES THE SWAP, NOT THE CONNECTION.
+                #
+                # Refusing the connection was the right instinct aimed at the
+                # wrong thing. The asset is the pinned account's bearer, and a
+                # caller without the credential simply must not receive one —
+                # but it does not follow that it must be cut off. Cutting it
+                # off is what made turning the pin ON a destructive act: a
+                # session's HTTPS_PROXY is fixed at exec, so every session that
+                # started before the credential existed died with 407 and only
+                # a relaunch could fix it. Measured on a live host: 313
+                # processes, including the one that ran `cswap pin`.
+                #
+                # Unauthorized now means UNPINNED, which is exactly the state
+                # the user asked for when the pin is off, and a state every
+                # request path already handles — is_pinned_route falls open to
+                # the on-disk bearer. So the proxy stays a working proxy for
+                # everyone, and only callers that prove they may act as the
+                # pinned account get the swap.
+                #
+                # The blind tunnel stays gated: that one is not about the
+                # bearer, it is about not being an open forward proxy to any
+                # host on the internet.
+                authorized = _proxy_authorized(
+                    connect_headers, self._current_secret()
+                )
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
+                    if not authorized:
+                        self._refuse_unauthorized(conn)
+                        return
                     self._blind_tunnel(target, conn)
                     return
-                self._mitm(conn)
+                self._mitm(conn, may_pin=authorized)
                 return
             if len(parts) >= 2 and parts[1].startswith("/health"):
                 # Local health probe (origin-form GET /health to our own port).
@@ -2365,8 +2386,14 @@ class PinProxy:
                 if k.strip().lower() == "proxy-authorization":
                     continue
             headers.append(h)
-        # Same gate as CONNECT: an unauthenticated caller must not be able to
-        # use us as a forward proxy just by choosing absolute-form.
+        # STILL A HARD GATE here, unlike CONNECT. This path is plain-HTTP
+        # forwarding to an arbitrary host: there is no bearer to withhold, so
+        # "serve it unpinned" is not a weaker option — it just makes us an open
+        # forward proxy. The CONNECT path could soften because refusing there
+        # bought nothing the swap decision does not already buy.
+        #
+        # Nothing Claude Code does reaches here (it CONNECTs), so this refusal
+        # cannot cut off the sessions the pin toggle is about.
         if not _proxy_authorized(parsed, self._current_secret()):
             self._refuse_unauthorized(conn)
             return
@@ -2401,12 +2428,18 @@ class PinProxy:
             except OSError:
                 pass
 
-    def _mitm(self, conn: socket.socket) -> None:
+    def _mitm(self, conn: socket.socket, may_pin: bool = True) -> None:
+        """MITM this connection. ``may_pin=False`` serves it UNPINNED.
+
+        An unauthorized caller is not refused — it is simply not acted for.
+        Its requests go out on whatever bearer they arrived with, which is
+        the on-disk (active) account: the same result as the pin being off.
+        """
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
         try:
             while True:
-                if not self._handle_one_request(tls):
+                if not self._handle_one_request(tls, may_pin=may_pin):
                     break
         finally:
             self._drop_upstream()
@@ -2415,7 +2448,7 @@ class PinProxy:
             except OSError:
                 pass
 
-    def _handle_one_request(self, tls: ssl.SSLSocket) -> bool:
+    def _handle_one_request(self, tls: ssl.SSLSocket, may_pin: bool = True) -> bool:
         request_line = _read_line(tls)
         if not request_line:
             return False
@@ -2431,7 +2464,10 @@ class PinProxy:
                 headers.append((k.strip(), v.strip()))
         body = _read_body(tls, headers)
 
-        pinned = is_pinned_route(path)
+        # may_pin=False: the caller did not present the proxy credential, so
+        # it is served as if no pin existed. NOT an error — this is the
+        # unpinned state, reached without disturbing a running session.
+        pinned = is_pinned_route(path) and may_pin
         swapped = False
         if pinned:
             token = self._pin_token_provider()
