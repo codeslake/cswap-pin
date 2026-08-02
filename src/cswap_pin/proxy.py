@@ -2552,6 +2552,7 @@ class PinProxy:
 
         pinned = is_pinned_route(path)
         swapped = False
+        original_headers = list(headers)
         if pinned:
             token = self._pin_token_provider()
             if token:
@@ -2624,14 +2625,33 @@ class PinProxy:
             except Exception:
                 pass
 
-        keep = self._forward(method, path, headers, body, tls)
+        keep = self._forward(method, path, headers, body, tls, swapped=swapped)
+        if keep is _AUTH_REJECTED:
+            # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived.
+            #
+            # A 401/403/404 is terminal to the client — SSETransport treats
+            # those as permanent (M7y = new Set([401,403,404])), sets
+            # state="closed", and never reconnects, so one misrouted request
+            # kills Remote Control for the life of the process. Measured: a
+            # /worker-swap experiment produced 26 such responses and severed
+            # the inbound channel of four sessions that are still running
+            # hours later with bridgeSessionId gone.
+            #
+            # That makes route classification a single point of permanent
+            # failure, and no amount of care in the predicate removes the
+            # risk. Retrying without the swap turns "I guessed wrong about
+            # this route" into "this request went out unpinned", which is the
+            # failure mode the whole module is already built to tolerate.
+            self._drop_upstream()
+            keep = self._forward(method, path, original_headers, body, tls)
         # A client that asked to close gets closed regardless of the upstream.
         for k, v in headers:
             if k.lower() == "connection" and "close" in v.lower():
                 keep = False
         return keep
 
-    def _forward(self, method, path, headers, body, client: ssl.SSLSocket) -> bool:
+    def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
+                 swapped: bool = False) -> bool:
         """Relay one request upstream and stream the response back.
 
         Returns whether the MITM connection may carry another request. The RC
@@ -2680,7 +2700,10 @@ class PinProxy:
                     _pump(up, client)
                 self._drop_upstream()
                 return False
-            return _relay_response(up, client, getattr(self._local, "cid", 0))
+            return _relay_response(
+                up, client, getattr(self._local, "cid", 0),
+                reject_on_auth_error=swapped,
+            )
         except (OSError, ssl.SSLError):
             self._drop_upstream()
             return False
@@ -2898,6 +2921,22 @@ _TRACE = (
     else None
 )
 
+class _AuthRejected:
+    """Sentinel: the upstream refused the SWAPPED credential, nothing sent.
+
+    Distinct from True/False, which both mean "the client already has its
+    response". This says the opposite — the client has received NOTHING and
+    the caller must retry.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:  # never mistaken for "keep the connection"
+        return False
+
+
+_AUTH_REJECTED = _AuthRejected()
+
 _HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -2964,7 +3003,12 @@ def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
     return buf.split(b"\r\n", 1)[0].split(b" ")[1:2] == [b"101"]
 
 
-def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket, cid: int = 0) -> bool:
+def _relay_response(
+    up: ssl.SSLSocket,
+    client: ssl.SSLSocket,
+    cid: int = 0,
+    reject_on_auth_error: bool = False,
+) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
 
@@ -2993,6 +3037,19 @@ def _relay_response(up: ssl.SSLSocket, client: ssl.SSLSocket, cid: int = 0) -> b
         return False
     lines = head.split(b"\r\n")
     status_line = lines[0] if lines and lines[0] else b"HTTP/1.1 502 Bad Gateway"
+    # Nothing has reached the client yet, so a swap the upstream refused can
+    # still be taken back. 401/403/404 are the three the client treats as
+    # permanent; anything else is the origin's own answer and belongs to it.
+    if reject_on_auth_error and any(
+        status_line.startswith(b"HTTP/1.1 " + c) for c in (b"401", b"403", b"404")
+    ):
+        if _TRACE is not None:
+            _TRACE.write(
+                f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
+                " (swap refused — retrying unswapped)\n"
+            )
+            _TRACE.flush()
+        return _AUTH_REJECTED
     if _TRACE is not None:
         _TRACE.write(
             f"[c{cid}]     <- "
