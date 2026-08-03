@@ -235,11 +235,50 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
             or other_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
         ):
             _write_bundle_atomically(
-                bundle, _join_pem(ca_path.read_bytes(), other_path.read_bytes())
+                bundle,
+                _drop_unreadable_blocks(
+                    _join_pem(ca_path.read_bytes(), other_path.read_bytes())
+                ),
             )
     except OSError:
         return ca_path
     return bundle
+
+
+def _drop_unreadable_blocks(body: bytes) -> bytes:
+    """Every block that parses, in order, and nothing that does not.
+
+    THE ONLY FILTER APPLIED AT EMISSION, and it is not the "drop what we do not
+    recognise" that `_join_pem` argues against. It drops what NO LOADER CAN
+    READ, which is a different set: an unrecognised label is kept (the block
+    parses, we simply have no opinion on it), a torn one is not.
+
+    Why emission and not just refusal. Measured by a peer session against the
+    REAL client binary (Bun/BoringSSL, not node), with a CA supplied through a
+    mechanism we never touch:
+
+        SSL_CERT_DIR=certdir, NODE_EXTRA_CA_CERTS unset      CONNECTS
+        SSL_CERT_DIR=certdir, NODE_EXTRA_CA_CERTS=DAMAGED    FAILS
+
+    A fatal block in OUR file takes down a CA we did not supply and cannot see.
+    So a torn merge does not merely cost the session the corporate roots it was
+    carrying — it poisons trust the user configured elsewhere. `_join_pem`'s
+    verbatim pass-through was written when the cost of a bad block was thought
+    to be that block; it is the whole store.
+
+    `_salvage_bundle` already had this property by construction: it reassembles
+    from parsed blocks, so it cannot emit damage. Measured, its two sibling
+    emission sites did not:
+
+        CONTROL _merged_ca healthy         blocks=2 DAMAGED=False
+        _merged_ca + torn ambient          blocks=1 DAMAGED=True
+        _trust_file tail + torn existing   blocks=1 DAMAGED=True
+
+    Both concatenate `read_bytes()` with no inspection of the other file, and
+    the other file is the ambient store — uncontrolled by us.
+    """
+    kept = [block for label, _h, _e, block in _pem_blocks(body) if label is not None]
+    return _join_pem(*kept) if kept else body
 
 
 def _join_pem(*parts: bytes) -> bytes:
@@ -1008,7 +1047,10 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
     bundle = Path(ca_path).parent / "ca-bundle.pem"
     try:
         _write_bundle_atomically(
-            bundle, _join_pem(Path(ca_path).read_bytes(), Path(existing).read_bytes())
+            bundle,
+            _drop_unreadable_blocks(
+                _join_pem(Path(ca_path).read_bytes(), Path(existing).read_bytes())
+            ),
         )
         return bundle
     except OSError:

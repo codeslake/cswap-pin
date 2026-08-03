@@ -6038,3 +6038,101 @@ class TestTheFourthDoorIsTheOneTheOthersFallInto:
             "a nested launch was un-merged: the session loses every upstream "
             f"CA while {bundle.name} sits on disk intact. returned {out.name}"
         )
+
+
+class TestNoEmissionSiteCanHandOverATornFile:
+    """Three functions write the file that becomes `NODE_EXTRA_CA_CERTS`.
+    `_salvage_bundle` reassembles block-by-block and structurally cannot emit a
+    torn one. The other two concatenate their inputs unread.
+
+    Measured before this guard, a torn ambient CA on the input side:
+
+        CONTROL _merged_ca healthy         blocks=2 DAMAGED=False
+        site 237  _merged_ca + torn        blocks=1 DAMAGED=True
+        site 1010 _trust_file tail + torn  blocks=1 DAMAGED=True
+
+    Why a torn file is worse than a file merely missing a CA, measured by a
+    peer session against the REAL client binary (Bun/BoringSSL, not node):
+
+        SSL_CERT_DIR=certdir, NODE_EXTRA_CA_CERTS unset      CONNECTS
+        SSL_CERT_DIR=certdir, NODE_EXTRA_CA_CERTS=DAMAGED    FAILS
+
+    A fatal block in OUR file takes down a CA supplied by a completely
+    different mechanism. BoringSSL's all-or-nothing is per FILE for the load,
+    but a discarded file still sinks the session when it carried the proxy CA —
+    so emitting damage does not merely lose us the corporate roots, it poisons
+    trust the user configured elsewhere. `_bundle_is_usable` refusing damaged
+    INPUT is not enough; the guarantee has to be at emission.
+
+    The repair keeps every block that parses and drops only the bad one, which
+    is `_salvage_bundle`'s existing contract — so the corporate roots these
+    merges exist to carry survive, minus the block no loader could read.
+    """
+
+    def _torn(self, tmp_path, name):
+        pem = _other_ca(tmp_path / name)
+        return pem.replace(b"-----END CERTIFICATE-----", b" \n-----END CERTIFICATE-----", 1)
+
+    def _damaged(self, body):
+        from cswap_pin.proxy import _pem_blocks
+
+        return any(b[0] is None for b in _pem_blocks(body))
+
+    def _blocks(self, body):
+        from cswap_pin.proxy import _pem_blocks
+
+        return len([b for b in _pem_blocks(body) if b[0] is not None])
+
+    def test_merged_ca_does_not_pass_a_torn_ambient_file_through(self, tmp_path):
+        from cswap_pin.proxy import _merged_ca, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        upstream = tmp_path / "upstream.pem"
+        upstream.write_bytes(self._torn(tmp_path, "up"))
+
+        out = _merged_ca(ours, str(upstream))
+        body = out.read_bytes()
+
+        assert not self._damaged(body), (
+            "_merged_ca wrote a file with an unreadable block — the session "
+            "discards the WHOLE file and loses CAs from SSL_CERT_DIR too. "
+            f"blocks={self._blocks(body)}"
+        )
+
+    def test_merged_ca_still_carries_a_healthy_ambient_file(self, tmp_path):
+        """CONTROL. Without this the assertion above passes on a function that
+        merges nothing at all."""
+        from cswap_pin.proxy import _merged_ca, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        upstream = tmp_path / "upstream.pem"
+        upstream.write_bytes(_other_ca(tmp_path / "up"))
+
+        out = _merged_ca(ours, str(upstream))
+
+        assert self._blocks(out.read_bytes()) == 2, "a healthy merge lost a CA"
+
+    def test_the_trust_file_tail_does_not_pass_a_torn_existing_through(
+        self, tmp_path, monkeypatch
+    ):
+        import cswap_pin.proxy as proxy
+        from cswap_pin.proxy import ensure_ca
+
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setattr(
+            proxy, "require", lambda _n: type(
+                "P", (), {"get_claude_config_home": staticmethod(lambda: home / ".claude")}
+            )
+        )
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        corp = tmp_path / "corp.pem"
+        corp.write_bytes(self._torn(tmp_path, "corp"))
+
+        out = proxy._trust_file(ours, str(corp))
+        body = out.read_bytes()
+
+        assert not self._damaged(body), (
+            "the no-shared-bundle tail wrote a file with an unreadable block "
+            f"— blocks={self._blocks(body)}"
+        )
