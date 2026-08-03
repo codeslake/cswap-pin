@@ -5863,3 +5863,66 @@ class TestTheEmptyCAGuardIsOnBothSidesOfTheSeam:
         assert proxy._bundle_is_usable(body, raw.strip()) is True, (
             "the repaired bundle does not carry our CA"
         )
+
+
+class TestTheEmptyCAGuardCoversTheOTHERMergeToo:
+    """`_merged_ca` is the third site reading `ca_path` as OUR CA, and it
+    gated on mtime rather than content.
+
+    The seam has three doors, not two. `_publish_ca` guarded emptiness,
+    `_trust_file`'s salvage arm did not (fixed in the same release), and this
+    one rebuilds on `not bundle.exists() or <mtime comparison>` and then
+    concatenates `ca_path.read_bytes()` unconditionally. An empty `ca.pem`
+    passes every one of those conditions.
+
+    Measured, with a control so a zero is not mistaken for "this fixture never
+    merges anything":
+
+        ours                blocks out   carries ours
+        real CA (control)        2           True
+        EMPTY                    1           False
+        whitespace only          1           False
+
+    The result goes straight into the session's `NODE_EXTRA_CA_CERTS`
+    (`wire_env`), so this is the same consumer the salvage arm feeds: a
+    session that trusts the upstream proxy's CA and cannot verify OUR proxy,
+    which is the hop it is actually routed through. Every request through the
+    pin fails to verify.
+
+    Unreachable on the normal path for the same reason as the salvage arm —
+    `_write_public` is temp-then-rename and `_certs_consistent` regenerates an
+    unparseable pair — so this is an asymmetry, not a live bug. It is fixed
+    because a guard that exists at one door and not the other two is not a
+    guard, it is a coincidence.
+    """
+
+    def test_an_empty_ca_does_not_produce_a_merge_without_us(self, tmp_path):
+        from cswap_pin.proxy import _merged_ca
+
+        ca = tmp_path / "ca.pem"
+        ca.write_bytes(b"")
+        upstream = tmp_path / "upstream.pem"
+        upstream.write_bytes(_other_ca(tmp_path / "up"))
+
+        out = _merged_ca(ca, str(upstream))
+
+        assert out == ca, (
+            "_merged_ca built a bundle from an EMPTY ca.pem — it carries the "
+            "upstream CA and nothing of ours, and this value goes straight "
+            f"into NODE_EXTRA_CA_CERTS. returned {out.name}"
+        )
+
+    def test_a_real_ca_still_merges(self, tmp_path):
+        """The control: the guard must not cost the merge it sits in front of."""
+        from cswap_pin.proxy import _merged_ca, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        upstream = tmp_path / "upstream.pem"
+        upstream.write_bytes(_other_ca(tmp_path / "up"))
+
+        out = _merged_ca(ours, str(upstream))
+
+        assert out.name == "ca-bundle.pem", "a healthy merge was refused"
+        assert out.read_bytes().count(b"-----BEGIN") == 2, (
+            "the merge lost a CA"
+        )
