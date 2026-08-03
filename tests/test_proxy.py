@@ -5767,3 +5767,99 @@ class TestTheLastLineRuleAppliesToCertificatesToo:
         assert _bundle_is_usable(
             (a + raw).replace(b"\n", b"\r\n"), raw.strip()
         ) is True, "healthy CRLF refused"
+
+
+class TestTheEmptyCAGuardIsOnBothSidesOfTheSeam:
+    """`_publish_ca` refuses an empty `ours`; the salvage arm of `_trust_file`
+    did not — and the unguarded site is the expensive one.
+
+    Two call sites read the same `ca_path` and reach code that treats the
+    bytes as OUR CA:
+
+        proxy.py:972  `_publish_ca`   `if not ours: return None`   present
+        proxy.py:827  `_trust_file`   no such check                ABSENT
+
+    The failures are not symmetric. `_publish_ca` skipping a write costs one
+    file in `ca-trust.d`, which the next launch rewrites. The salvage arm
+    decides what the SESSION gets: `_salvage_bundle(body, b"")` returns the
+    peer blocks with nothing of ours appended, because the append is gated on
+    `_bundle_is_usable(kept, ours)` and that predicate answers False for an
+    empty `ours` by its own vacuity guard — not because containment failed.
+    Measured before the fix:
+
+        salvage(peer, ours=b"")  ->  1 block, ours ABSENT
+        _bundle_is_usable(out, b"")  ->  False   (the vacuous-empty guard)
+
+    A session wired to that bundle trusts the peer's certificates and cannot
+    verify the proxy it is routed through — the failure `_bundle_is_usable`
+    exists to prevent, arriving through the repair path.
+
+    NOT REACHABLE ON THE NORMAL PATH, and the guard is still worth having.
+    `_write_public` is temp-then-rename so a reader never sees a half-written
+    ca.pem, and `_certs_consistent` rejects an unparseable one and regenerates
+    the pair. So `ours` cannot be empty here today. It is an asymmetry rather
+    than a live bug — but "unreachable today" is what the round-4 comment on
+    the blank-line rule said about a shape round 5 then reached, and the cost
+    of the guard is one line.
+    """
+
+    def test_salvage_is_not_reached_with_an_empty_ca(self, tmp_path, monkeypatch):
+        import cswap_pin.proxy as proxy
+        from cswap_pin.proxy import ensure_ca
+
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setattr(
+            proxy, "require", lambda _n: type(
+                "P", (), {"get_claude_config_home": staticmethod(lambda: home / ".claude")}
+            )
+        )
+        shared = home / ".claude" / proxy.CA_TRUST_FILE
+        peer = _other_ca(tmp_path / "peer")
+        shared.write_bytes(peer)
+
+        # ours: present as a file, EMPTY as content — the state the seam has
+        # no guard for. A wiped ca.pem, an external truncation, a caller that
+        # did not validate the path it passed.
+        ca_path = tmp_path / "certdir" / "ca.pem"
+        ca_path.parent.mkdir(parents=True)
+        ca_path.write_bytes(b"")
+
+        out = proxy._trust_file(ca_path, None)
+
+        # Whatever it returns must not be a bundle that carries a peer CA and
+        # not ours. The honest answer with no CA of our own is "our own path",
+        # never a merged file we cannot appear in.
+        if out is not None and out.name == "ca-bundle.pem" and out.exists():
+            body = out.read_bytes()
+            assert b"-----BEGIN" not in body or ca_path.read_bytes().strip(), (
+                "the salvage arm wrote a merged bundle from an EMPTY ca.pem — "
+                "the session trusts the peer and cannot verify its own proxy. "
+                f"bundle carries {body.count(b'-----BEGIN')} blocks"
+            )
+
+    def test_salvage_still_repairs_normally_when_the_ca_is_present(self, tmp_path, monkeypatch):
+        """The guard must not cost the repair it sits in front of."""
+        import cswap_pin.proxy as proxy
+        from cswap_pin.proxy import ensure_ca
+
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setattr(
+            proxy, "require", lambda _n: type(
+                "P", (), {"get_claude_config_home": staticmethod(lambda: home / ".claude")}
+            )
+        )
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        peer = _other_ca(tmp_path / "peer")
+        torn = b"-----BEGIN X509 CRL-----\nQUFB=\n-----END X509 CRL-----\n"
+        shared = home / ".claude" / proxy.CA_TRUST_FILE
+        shared.write_bytes(peer + torn + raw)
+
+        out = proxy._trust_file(ours, None)
+        body = out.read_bytes()
+        assert b"QUFB=" not in body, "the torn block survived the repair"
+        assert proxy._bundle_is_usable(body, raw.strip()) is True, (
+            "the repaired bundle does not carry our CA"
+        )
