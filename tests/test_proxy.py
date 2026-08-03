@@ -1827,11 +1827,19 @@ class TestCaIsPublishedToTheTrustDir:
         return home
 
     def _ca(self, tmp_path):
+        """A REAL CA, because the bundle guard parses rather than pattern-matches.
+
+        These fixtures used a placeholder body ("PIN") that no X.509 reader can
+        decode. That passed while the guard only counted BEGIN/END markers —
+        and it meant the tests certified the guard against a bundle node itself
+        would refuse, which is exactly the false accept the guard now exists to
+        stop. A fixture that cannot occur in reality proves nothing about one
+        that can.
+        """
+        from cswap_pin.proxy import ensure_ca
+
         certdir = tmp_path / "pin-proxy"
-        certdir.mkdir()
-        ca = certdir / "ca.pem"
-        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
-        return ca
+        return ensure_ca(certdir, "api.anthropic.com").ca_path
 
     def test_publishes_one_file_named_after_the_component(self, tmp_path, monkeypatch):
         from cswap_pin.proxy import CA_TRUST_DIR, publish_ca
@@ -1839,7 +1847,9 @@ class TestCaIsPublishedToTheTrustDir:
         home = self._cfg(tmp_path, monkeypatch)
         out = publish_ca(self._ca(tmp_path))
         assert out == home / CA_TRUST_DIR / "cswap-pin.pem"
-        assert b"PIN" in out.read_bytes()
+        # Compare CONTENT, not a placeholder word: the fixture now mints a
+        # real CA because the guard parses rather than pattern-matches.
+        assert out.read_bytes().strip() == self._ca(tmp_path).read_bytes().strip()
 
     def test_republishing_is_a_no_op(self, tmp_path, monkeypatch):
         """Rewriting every launch would churn the mtime a launcher's own
@@ -1862,9 +1872,10 @@ class TestCaIsPublishedToTheTrustDir:
         # somebody else published theirs; it must survive our rotation
         other = home / CA_TRUST_DIR / "ccf.pem"
         other.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF\n-----END CERTIFICATE-----\n")
-        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN2\n-----END CERTIFICATE-----")
+        second = _other_ca(tmp_path / "regen")
+        ca.write_bytes(second + b"\n")
         publish_ca(ca)
-        assert b"PIN2" in (home / CA_TRUST_DIR / "cswap-pin.pem").read_bytes()
+        assert second in (home / CA_TRUST_DIR / "cswap-pin.pem").read_bytes()
         assert b"CCF" in other.read_bytes(), "we clobbered another component's file"
 
     def test_an_unwritable_config_home_does_not_raise(self, tmp_path, monkeypatch):
@@ -1890,7 +1901,9 @@ class TestCaIsPublishedToTheTrustDir:
         launcher.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF\n-----END CERTIFICATE-----\n")
         out = _merged_ca(ca, str(launcher))
         assert out == ca.parent / "ca-bundle.pem"
-        assert b"PIN" in out.read_bytes() and b"CCF" in out.read_bytes()
+        body = out.read_bytes()
+        assert self._ca(tmp_path).read_bytes().strip() in body
+        assert b"CCF" in body or ccf.read_bytes().strip() in body
         # and the launcher's file is left exactly as it was
         assert launcher.read_bytes().count(b"BEGIN CERT") == 1
 
@@ -1971,6 +1984,16 @@ class TestCaIsPublishedEveryLaunch:
         assert (home / pp.CA_TRUST_DIR / "cswap-pin.pem").exists()
 
 
+def _other_ca(certdir):
+    """Another component's real CA, for multi-writer bundle fixtures."""
+    from cswap_pin.proxy import ensure_ca
+
+    # Trailing newline INCLUDED. Concatenating stripped PEMs fuses
+    # `-----END-----` into `-----BEGIN-----`, producing a bundle no reader can
+    # parse — a fixture bug that reads exactly like a guard bug.
+    return ensure_ca(certdir, "api.anthropic.com").ca_path.read_bytes().strip() + b"\n"
+
+
 class TestConsumesTheSharedTrustBundle:
     """Publishing alone only helps components that read the dir. A pinned
     session must also CONSUME the merged bundle, or a CA added by some future
@@ -1984,11 +2007,19 @@ class TestConsumesTheSharedTrustBundle:
         return home
 
     def _ca(self, tmp_path):
+        """A REAL CA, because the bundle guard parses rather than pattern-matches.
+
+        These fixtures used a placeholder body ("PIN") that no X.509 reader can
+        decode. That passed while the guard only counted BEGIN/END markers —
+        and it meant the tests certified the guard against a bundle node itself
+        would refuse, which is exactly the false accept the guard now exists to
+        stop. A fixture that cannot occur in reality proves nothing about one
+        that can.
+        """
+        from cswap_pin.proxy import ensure_ca
+
         certdir = tmp_path / "pin-proxy"
-        certdir.mkdir()
-        ca = certdir / "ca.pem"
-        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
-        return ca
+        return ensure_ca(certdir, "api.anthropic.com").ca_path
 
     def test_uses_the_merged_bundle_when_it_carries_us(self, tmp_path, monkeypatch):
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
@@ -1997,9 +2028,12 @@ class TestConsumesTheSharedTrustBundle:
         ca = self._ca(tmp_path)
         merged = home / CA_TRUST_FILE
         merged.write_bytes(
-            b"-----BEGIN CERTIFICATE-----\nAMBIENT\n-----END CERTIFICATE-----\n"
-            + ca.read_bytes()
-            + b"\n-----BEGIN CERTIFICATE-----\nFUTURE-PROXY\n-----END CERTIFICATE-----\n"
+            # Real certificates: a bundle whose siblings do not decode is one
+            # node refuses outright, so placeholders would test the wrong file.
+            _other_ca(tmp_path / "ambient")
+            + ca.read_bytes().strip()
+            + b"\n"
+            + _other_ca(tmp_path / "future")
         )
         env = wire_env({}, 9955, ca)
         assert env["NODE_EXTRA_CA_CERTS"] == str(merged)
@@ -2018,7 +2052,7 @@ class TestConsumesTheSharedTrustBundle:
         )
         env = wire_env({}, 9955, ca)
         assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE)
-        assert b"PIN" in Path(env["NODE_EXTRA_CA_CERTS"]).read_bytes()
+        assert ca.read_bytes().strip() in Path(env["NODE_EXTRA_CA_CERTS"]).read_bytes()
 
     def test_no_launcher_at_all_is_unchanged(self, tmp_path, monkeypatch):
         """No merged bundle, no other MITM: name our own CA, exactly as before."""
@@ -2048,11 +2082,19 @@ class TestTornPemCannotEscape:
         return home
 
     def _ca(self, tmp_path):
+        """A REAL CA, because the bundle guard parses rather than pattern-matches.
+
+        These fixtures used a placeholder body ("PIN") that no X.509 reader can
+        decode. That passed while the guard only counted BEGIN/END markers —
+        and it meant the tests certified the guard against a bundle node itself
+        would refuse, which is exactly the false accept the guard now exists to
+        stop. A fixture that cannot occur in reality proves nothing about one
+        that can.
+        """
+        from cswap_pin.proxy import ensure_ca
+
         certdir = tmp_path / "pin-proxy"
-        certdir.mkdir()
-        ca = certdir / "ca.pem"
-        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
-        return ca
+        return ensure_ca(certdir, "api.anthropic.com").ca_path
 
     def test_publish_never_leaves_a_partial_file(self, tmp_path, monkeypatch):
         """A reader must see either the old complete file or the new one."""
@@ -2071,7 +2113,8 @@ class TestTornPemCannotEscape:
 
         monkeypatch.setattr(pp.os, "replace", spy)
         pp.publish_ca(ca)
-        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN2\n-----END CERTIFICATE-----")
+        second = _other_ca(tmp_path / "regen")
+        ca.write_bytes(second + b"\n")
         pp.publish_ca(ca)
 
         assert seen, "publish did not go through an atomic rename"
@@ -2110,10 +2153,11 @@ class TestTornPemCannotEscape:
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
+        # A REAL sibling CA. "OTHER" as a certificate body is precisely the
+        # torn block node refuses to load, so a fixture using it described a
+        # bundle that cannot occur and asserted the guard should accept it.
         (home / CA_TRUST_FILE).write_bytes(
-            b"-----BEGIN CERTIFICATE-----\nOTHER\n-----END CERTIFICATE-----\n"
-            + ca.read_bytes()
-            + b"\n"
+            _other_ca(tmp_path / "other") + ca.read_bytes().strip() + b"\n"
         )
         env = wire_env({}, 9955, ca)
         assert env["NODE_EXTRA_CA_CERTS"] == str(home / CA_TRUST_FILE)
@@ -2142,11 +2186,19 @@ class TestNarrowingIsDeliberatelyUnguarded:
         return home
 
     def _ca(self, tmp_path):
+        """A REAL CA, because the bundle guard parses rather than pattern-matches.
+
+        These fixtures used a placeholder body ("PIN") that no X.509 reader can
+        decode. That passed while the guard only counted BEGIN/END markers —
+        and it meant the tests certified the guard against a bundle node itself
+        would refuse, which is exactly the false accept the guard now exists to
+        stop. A fixture that cannot occur in reality proves nothing about one
+        that can.
+        """
+        from cswap_pin.proxy import ensure_ca
+
         certdir = tmp_path / "pin-proxy"
-        certdir.mkdir()
-        ca = certdir / "ca.pem"
-        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nPIN\n-----END CERTIFICATE-----")
-        return ca
+        return ensure_ca(certdir, "api.anthropic.com").ca_path
 
     def test_a_single_cert_bundle_is_accepted(self, tmp_path, monkeypatch):
         """The real shape on a host with one component and no corporate MITM."""
@@ -2381,16 +2433,50 @@ class TestHealRestoresWithoutRestart:
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         assert heal(root) is False  # nothing pinned — not our business
 
-    def test_a_serving_pin_is_left_alone(self, tmp_path, monkeypatch):
-        """Must not restart a healthy daemon: it runs every few seconds."""
+    def test_a_serving_and_wired_pin_is_left_alone(self, tmp_path, monkeypatch):
+        """Must not restart a healthy daemon: it runs every few seconds.
+
+        SERVING AND WIRED, both. This test used to leave the config empty
+        (`{}`) while claiming to describe a healthy pin — but a daemon serving
+        on a port no session is told about is NOT healthy, it is the state a
+        recovery leaves behind, and treating it as "nothing to do" is what kept
+        a pin down until someone re-typed `cswap pin` by hand.
+        """
         from cswap_pin import proxy as pin_proxy
-        root, _ = self._root(tmp_path, monkeypatch)
+        root, cfg = self._root(tmp_path, monkeypatch)
+        cfg.write_text(json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:40404",
+                    "CSWAP_PIN_PORT": "40404"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"]}))
         monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *a, **k: 40404)
         called = []
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
                             lambda *a: called.append(a) or 1)
+        before = cfg.read_text()
         assert pin_proxy.heal(root) is False
         assert not called, "restarted a daemon that was already serving"
+        assert cfg.read_text() == before, "rewrote an already-correct wiring"
+
+    def test_a_serving_but_UNWIRED_pin_is_rewired(self, tmp_path, monkeypatch):
+        """Serving is not the same as wired.
+
+        Measured: an unwire ran against a live daemon, and because heal read
+        "already serving" as "nothing to do", the proxy went on serving a port
+        no session was ever told about. Only a hand-typed `cswap pin <n>` fixed
+        it. Re-wiring here is what makes the pin come back BY ITSELF.
+        """
+        from cswap_pin import proxy as pin_proxy
+        root, cfg = self._root(tmp_path, monkeypatch)  # cfg is "{}" — unwired
+        monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *a, **k: 40404)
+        called = []
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a: called.append(a) or 1)
+        assert pin_proxy.heal(root) is True
+        assert not called, "respawned a daemon that was already serving"
+        raw = json.loads(cfg.read_text())
+        assert raw.get("_cswapPinWiredKeys"), "the wiring was not restored"
+        assert (raw.get("env") or {}).get("CSWAP_PIN_PORT") == "40404", (
+            "re-wired to the wrong port — live sessions would not reattach")
 
     def test_a_dangling_pin_does_not_spawn(self, tmp_path, monkeypatch):
         """Pinned to a slot that no longer exists: nothing to serve."""
@@ -2862,3 +2948,242 @@ class TestTheDaemonLogRecordsItsOwnDeath:
 
         monkeypatch.setattr("builtins.print", _boom)
         proxy._log_lifecycle("this must not raise")  # no assertion needed
+
+
+class TestHealReWiresAServingDaemon:
+    """Serving is NOT the same as wired, and heal owns both.
+
+    MEASURED: a daemon can be up while ``.claude.json`` names nothing — an
+    unwire ran against a live daemon, or a recovery removed the wiring to save
+    the session and the daemon then came back. `heal` returned False on
+    "already serving" and left that permanent: the proxy served on a port no
+    session was ever told about, and only a hand-typed `cswap pin <n>` fixed
+    it. Re-wiring is the whole point of a heal, and it is what makes the pin
+    return BY ITSELF once cswap is healthy again — with no session restart,
+    because the port is reclaimed rather than reallocated.
+    """
+
+    def _fixture(self, tmp_path, monkeypatch, wired_port=None):
+        """A serving daemon + a pin record. ``wired_port`` sets what the config
+        claims (None = not wired at all)."""
+        import socket
+
+        from cswap_pin import proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        proxy.write_daemon_state(certdir, port, os.getpid(), "fp")
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {"remoteControl": {"pinnedEmail": "c@e.com", "pinnedOrganizationUuid": ""}}
+            )
+        )
+        (tmp_path / "sequence.json").write_text(
+            json.dumps({"accounts": {"1": {"email": "c@e.com"}}})
+        )
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            "{}"
+            if wired_port is None
+            else json.dumps(
+                {
+                    "env": {
+                        "HTTPS_PROXY": f"http://127.0.0.1:{wired_port}",
+                        "CSWAP_PIN_PORT": str(wired_port),
+                    },
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                }
+            )
+        )
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        return srv, port, cfg
+
+    def test_serving_but_unwired_gets_rewired(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy
+
+        srv, port, cfg = self._fixture(tmp_path, monkeypatch, wired_port=None)
+        try:
+            assert proxy.heal(tmp_path) is True
+            raw = json.loads(cfg.read_text())
+            assert raw.get("_cswapPinWiredKeys"), "the wiring was not restored"
+            assert (raw.get("env") or {}).get("CSWAP_PIN_PORT") == str(port), (
+                "re-wired to the wrong port — live sessions would not reattach"
+            )
+        finally:
+            srv.close()
+
+    def test_serving_and_already_wired_is_a_no_op(self, tmp_path, monkeypatch):
+        """Called from the status line on a timer. The healthy case must not
+        rewrite the config every few seconds."""
+        from cswap_pin import proxy
+
+        srv, port, cfg = self._fixture(tmp_path, monkeypatch, wired_port=None)
+        try:
+            proxy.heal(tmp_path)  # wire it once
+            before = cfg.read_text()
+            mtime = cfg.stat().st_mtime_ns
+            assert proxy.heal(tmp_path) is False, "claimed to heal a correct wiring"
+            assert cfg.read_text() == before
+            assert cfg.stat().st_mtime_ns == mtime, "rewrote an already-correct config"
+        finally:
+            srv.close()
+
+    def test_wired_to_the_WRONG_port_is_corrected(self, tmp_path, monkeypatch):
+        """The dangerous middle case: a wiring that looks present but names a
+        port this daemon is not on. Every session it sends there fails."""
+        import socket
+
+        from cswap_pin import proxy
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        stale = s.getsockname()[1]
+        s.close()
+        srv, port, cfg = self._fixture(tmp_path, monkeypatch, wired_port=stale)
+        try:
+            assert stale != port
+            assert proxy.heal(tmp_path) is True
+            raw = json.loads(cfg.read_text())
+            assert (raw.get("env") or {}).get("CSWAP_PIN_PORT") == str(port)
+        finally:
+            srv.close()
+
+    def test_no_pin_record_means_no_rewire(self, tmp_path, monkeypatch):
+        """A serving daemon with nothing pinned is not our business — writing a
+        wiring here would pin a user who never asked."""
+        from cswap_pin import proxy
+
+        srv, _port, cfg = self._fixture(tmp_path, monkeypatch, wired_port=None)
+        (tmp_path / "settings.json").write_text(json.dumps({"remoteControl": {}}))
+        try:
+            assert proxy.heal(tmp_path) is False
+            assert "_cswapPinWiredKeys" not in cfg.read_text()
+        finally:
+            srv.close()
+
+
+class TestSharedBundleGuardMatchesNode:
+    """The merged `ca-trust.pem` guard must agree with node's CA loader.
+
+    Counting BEGIN/END markers cannot tell whether a block DECODES, and node
+    aborts the ENTIRE extras load on one it cannot — so a torn certificate
+    sitting before ours voids every component CA and corporate root at once.
+    Measured on this host with a real TLS handshake through
+    NODE_EXTRA_CA_CERTS: the marker count ACCEPTED that bundle, and the
+    handshake failed. The session then cannot verify the very proxy it is
+    routed through, so every request dies.
+
+    The two directions are not symmetric, which is why the guard may refuse
+    where it cannot tell:
+      - accepting a bundle node rejects -> the whole session is dead
+      - rejecting a bundle node accepts -> we lose the OTHER components' CAs
+    See cnighswonger/claude-code-cache-fix#296, which found this same guard
+    wrong in both directions in the sibling implementation.
+    """
+
+    @staticmethod
+    def _ca(tmp_path):
+        from cswap_pin import proxy
+
+        b = proxy.ensure_ca(tmp_path / "cd", "api.anthropic.com")
+        return b.ca_path.read_bytes().strip()
+
+    def test_a_torn_block_before_ours_is_refused(self, tmp_path):
+        """THE FALSE ACCEPT. Markers balance, our CA is present verbatim, and
+        node still refuses the file."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        torn = (
+            b"-----BEGIN CERTIFICATE-----\nQUJD!!!not-base64\n"
+            b"-----END CERTIFICATE-----\n"
+        )
+        bundle = torn + ours + b"\n"
+        # The old guard's exact test, kept here so the regression is visible.
+        assert ours in bundle
+        assert bundle.count(b"-----BEGIN CERTIFICATE-----") == bundle.count(
+            b"-----END CERTIFICATE-----"
+        )
+        assert _bundle_is_usable(bundle, ours) is False
+
+    def test_a_healthy_multi_component_bundle_is_accepted(self, tmp_path):
+        """The case the shared bundle exists FOR: two MITMs, both CAs present.
+        A guard that refuses this silently drops the sibling's CA."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        sibling = self._ca(tmp_path / "other")
+        assert _bundle_is_usable(ours + b"\n" + sibling + b"\n", ours) is True
+        assert _bundle_is_usable(sibling + b"\n" + ours + b"\n", ours) is True
+
+    def test_non_certificate_blocks_are_tolerated(self, tmp_path):
+        """A real corporate bundle carries CRLs and key blocks. Node skips
+        well-formed ones, so demanding X.509 of everything would reject a
+        healthy bundle — the false reject that costs every sibling CA."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        crl = (
+            b"-----BEGIN X509 CRL-----\nMIIBpDCBjQIBATANBgkqhkiG9w0BAQsFADBF\n"
+            b"-----END X509 CRL-----\n"
+        )
+        assert _bundle_is_usable(crl + ours + b"\n", ours) is True
+
+    def test_a_corrupt_non_certificate_block_is_refused(self, tmp_path):
+        """Node aborts on any block it cannot decode, whatever the label —
+        'skip non-certificates' is only safe for WELL-FORMED ones."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        bad = b"-----BEGIN X509 CRL-----\n!!!not base64!!!\n-----END X509 CRL-----\n"
+        assert _bundle_is_usable(bad + ours + b"\n", ours) is False
+
+    def test_a_bundle_without_our_ca_is_refused(self, tmp_path):
+        """Wiring a session to a bundle that does not carry us means it cannot
+        verify our own proxy."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        other = self._ca(tmp_path / "other")
+        assert _bundle_is_usable(other + b"\n", ours) is False
+
+    def test_an_empty_ca_never_makes_the_check_vacuous(self, tmp_path):
+        """`b"" in anything` is True. An unreadable ca.pem must refuse, not
+        accept every bundle on earth."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        assert _bundle_is_usable(ours + b"\n", b"") is False
+        assert _bundle_is_usable(ours + b"\n", b"not a pem at all") is False
+
+    def test_identity_is_by_der_not_by_substring(self, tmp_path):
+        """A re-encoded copy of our CA is still our CA. A substring test calls
+        it a stranger and drops the whole bundle."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        cert = x509.load_pem_x509_certificate(ours)
+        # Same certificate, different bytes on the page (CRLF line endings).
+        recoded = cert.public_bytes(serialization.Encoding.PEM).replace(b"\n", b"\r\n")
+        assert recoded != ours
+        assert _bundle_is_usable(recoded, ours) is True
+
+    def test_an_unterminated_block_cannot_borrow_a_later_END(self, tmp_path):
+        """With an unbounded END search a torn block swallows the next entry
+        and the slice spans two certificates."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ca(tmp_path)
+        bundle = b"-----BEGIN CERTIFICATE-----\nQUJD\n" + ours + b"\n"
+        assert _bundle_is_usable(bundle, ours) is False
