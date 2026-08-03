@@ -488,6 +488,26 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
         return None
 
 
+def _resolve_pinned_slot(backup_root: Path, email: str) -> str | None:
+    """The slot number that currently holds ``email``, or None.
+
+    Identity is stored by email because slots move (`cswap move`), so the
+    number comes from the registry rather than being cached with the pin.
+    None means a DANGLING pin — the account it names is gone — and every
+    caller must treat that as "nothing to serve" rather than as an error.
+    """
+    try:
+        seq = json.loads((backup_root / "sequence.json").read_text(encoding="utf-8"))
+        accounts = seq.get("accounts") or {}
+        return next(
+            (num for num, rec in accounts.items()
+             if (rec.get("email") if isinstance(rec, dict) else rec) == email),
+            None,
+        )
+    except Exception:
+        return None
+
+
 def heal(backup_root: Path) -> bool:
     """Bring the pin back if it is pinned but not serving. True when it did.
 
@@ -539,9 +559,38 @@ def heal(backup_root: Path) -> bool:
     # Deliberately NOT reusing the ensure_proxy fast path: this must be the
     # slow, locked path so the recycle is serialized against every other
     # status line on the box.
+    # RESOLVE THE SLOT BEFORE KILLING ANYTHING. The recycle below used to run
+    # first, and the account lookup afterwards — so a DANGLING pin (the pinned
+    # email no longer in sequence.json: `cswap remove`, a slot rename, a
+    # restored registry) killed a perfectly healthy daemon and then returned at
+    # `if not account_num`, before the spawn AND before `unwire_if_dead`.
+    #
+    # Measured against a real process holding a real socket, with a real kill:
+    #   0.1.3  heal=False  killed=no   -> daemon kept serving
+    #   0.1.4  heal=False  killed=YES  -> port dead, .claude.json still naming it
+    # which is the ConnectionRefused outage this module documents twice, caused
+    # by the code meant to prevent it. A dangling pin must be a no-op, exactly
+    # as it was before the recycle existed.
+    account_num = _resolve_pinned_slot(backup_root, email)
+    if not account_num:
+        return False  # dangling pin: its slot is gone, nothing to serve
+
     fp = daemon_fingerprint()
     alive = _read_alive_port(certdir, fingerprint=fp)
-    if alive is None and _read_alive_port(certdir) is not None:
+    # `_read_alive_port` returns None for an `unpinnable` daemon REGARDLESS of
+    # fingerprint, so "fingerprinted read failed but a bare read succeeded" is
+    # true for a daemon running the NEWEST code that merely cannot read its
+    # credential (the macOS keychain rc=36 case). Recycling that daemon does
+    # not fix it: the successor re-marks itself unpinnable and the next tick
+    # recycles again — measured, 5 ticks 5 kills, no convergence, each one
+    # costing live sessions their in-flight requests.
+    #
+    # Ask the record directly instead of inferring staleness from two probes
+    # that differ for more than one reason.
+    stale_st = read_daemon_state(certdir)
+    stale_fp = (stale_st or {}).get("fingerprint")
+    recycled = False
+    if alive is None and stale_fp is not None and stale_fp != fp and _read_alive_port(certdir) is not None:
         # Serving, but running code we no longer ship. Recycle it: the spawn
         # below rebinds the SAME port, so live sessions never see the swap.
         try:
@@ -563,6 +612,7 @@ def heal(backup_root: Path) -> bool:
                     if isinstance(stale.get("port"), int):
                         _write_port_hint(certdir, stale["port"])
                     _kill_daemon(int(stale["pid"]))
+            recycled = True
         except Exception:  # noqa: BLE001 — a heal must never raise
             return False
         # Fall through to the spawn path below, which reclaims that port.
@@ -584,21 +634,6 @@ def heal(backup_root: Path) -> bool:
             return True
         except Exception:  # noqa: BLE001 — a heal must never raise
             return False
-    # Resolve the slot the way the status line does: identity is stored by
-    # email because slots move (`cswap move`), so the number comes from the
-    # registry rather than being cached with the pin.
-    try:
-        seq = json.loads((backup_root / "sequence.json").read_text(encoding="utf-8"))
-        accounts = seq.get("accounts") or {}
-        account_num = next(
-            (num for num, rec in accounts.items()
-             if (rec.get("email") if isinstance(rec, dict) else rec) == email),
-            None,
-        )
-    except Exception:
-        account_num = None
-    if not account_num:
-        return False  # dangling pin: its slot is gone, nothing to serve
     try:
         with _spawn_lock(certdir):
             # Re-check under the lock — another caller may have just spawned.
@@ -610,7 +645,30 @@ def heal(backup_root: Path) -> bool:
             # forever — the exact staleness this path exists to end. Asking for
             # the current fingerprint means "someone spawned a daemon running
             # the code we ship", which is the only thing that makes this a no-op.
-            if _read_alive_port(certdir, fingerprint=fp) is not None:
+            # ANYTHING SERVING IS ENOUGH — unless we just recycled.
+            #
+            # A fingerprinted check here loops forever on a daemon that runs
+            # CURRENT code but is marked `unpinnable` (it cannot read the
+            # credential — the macOS keychain rc=36 case). `_read_alive_port`
+            # returns None for that daemon whatever the fingerprint, so a
+            # fingerprinted guard reads "nothing is serving", spawns a
+            # successor that re-marks itself unpinnable, and the next tick does
+            # it again. Measured: 5 ticks, 5 respawns, no convergence.
+            #
+            # heal's job is "make the pin serve". Something IS serving, so heal
+            # is done — the pin is fail-open and a respawn cannot fix a
+            # credential it also cannot read.
+            #
+            # The exception is the branch above: it killed the daemon whose
+            # record this would find, and a kill that did not complete leaves
+            # that record behind. There the fingerprint is the right question,
+            # because only a successor running OUR code means the work is done.
+            probe = (
+                _read_alive_port(certdir, fingerprint=fp)
+                if recycled
+                else _read_alive_port(certdir)
+            )
+            if probe is not None:
                 return False
             port = _spawn_daemon(account_num, email, certdir)
         if port is None:
@@ -1314,19 +1372,35 @@ def _certs_consistent(
             leaf.signature_hash_algorithm,
         )
         return True
-    except (AttributeError, TypeError):
-        # NOT the same as a cert failure. These mean the CODE is wrong for the
-        # cryptography that is installed — a renamed property, a changed
-        # signature — and "regenerate" is the worst possible response: it is
-        # deterministic, so it fires on EVERY launch and the daemon serves a
-        # leaf under a CA the session was never handed. That is how a floor of
-        # `cryptography>=41.0` turned into CERTIFICATE_VERIFY_FAILED on every
-        # request, silently, for anyone whose resolver picked 41.x.
+    except AttributeError as exc:
+        # NOT the same as a cert failure. A MISSING API means the CODE is wrong
+        # for the cryptography that is installed — and "regenerate" is the
+        # worst possible response: it is deterministic, so it fires on EVERY
+        # launch and the daemon serves a leaf under a CA the session was never
+        # handed. That is how a floor of `cryptography>=41.0` turned into
+        # CERTIFICATE_VERIFY_FAILED on every request, silently, for anyone
+        # whose resolver picked 41.x (`not_valid_after_utc` landed in 42.0).
         #
-        # Re-raise so it is a loud failure at the seam (which fails open to an
-        # unpinned launch) instead of an invisible regeneration loop. The floor
-        # is 42.0 precisely so this cannot happen in a supported install.
-        raise
+        # BUT ONLY FOR THE VERSION MISMATCH. The same AttributeError is raised
+        # by a perfectly valid cert dir that simply is not RSA — this function
+        # uses `public_numbers()` and PKCS1v15, so a self-consistent Ed25519
+        # pair (a restored backup, someone's own openssl run) hit the re-raise
+        # too. 0.1.3 returned False there and regenerated on the next launch;
+        # propagating instead kills `PinProxy.__init__`, which does NOT fail
+        # open, so the daemon dies at construction and can never repair a
+        # directory the previous release healed by itself.
+        #
+        # Name the API this code requires. Absent -> the library moved, be
+        # loud. Present -> the certs are simply of another kind, regenerate.
+        if not hasattr(x509.Certificate, "not_valid_after_utc"):
+            raise
+        return False
+    except TypeError:
+        # Same reasoning, and the same narrow intent: a changed SIGNATURE in
+        # the library. Anything a cert itself can cause is a cert failure.
+        if not hasattr(x509.Certificate, "not_valid_after_utc"):
+            raise
+        return False
     except Exception:  # noqa: BLE001 — any failure to prove it means regenerate
         return False
 

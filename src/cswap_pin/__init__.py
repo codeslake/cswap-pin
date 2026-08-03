@@ -20,7 +20,7 @@ meant to report on. Reach for ``cswap_pin.proxy`` directly; use
 
 from __future__ import annotations
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 __all__ = ["__version__", "host_available"]
 
