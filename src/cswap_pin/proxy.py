@@ -295,92 +295,168 @@ _ORACLE_SENTINEL = b"\x02"
 _ORACLE_TIMEOUT_S = 10.0
 
 
-def _bundle_loads_in_node(bundle: Path, ours: bytes) -> bool | None:
-    """Ask node's OWN loader whether it loads this bundle, and ours with it.
+def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
+    """Ask node whether it will VERIFY OUR LEAF when handed this bundle.
 
     THREE OUTCOMES, never two:
 
-        True   the loader ran and our CA is in what it loaded
-        False  the loader ran and our CA is NOT in what it loaded
+        True   node completed a TLS handshake against a leaf we signed
+        False  node refused it
         None   THE ORACLE WAS NOT CONSULTED — the caller must decide alone
 
-    STOP PREDICTING, ASK. :func:`_bundle_is_usable` predicts what node's loader
-    will accept from file syntax, and a predicate over syntax is a losing race:
-    five rounds of it in the sibling implementation each found shapes the last
-    missed. Measured here against node's real loader, ours disagreed on a shape
-    that matters —
+    STOP PREDICTING, ASK. `_bundle_is_usable` predicts what node's loader will
+    accept from file syntax, and a predicate over syntax is a losing race.
+    Measured against node's real loader, ours called a bundle usable that node
+    reads as ZERO extra CAs — and we hand that file to a session as
+    NODE_EXTRA_CA_CERTS, so it trusts nothing: not our CA, not a sibling
+    proxy's, not the corporate roots.
 
-        `-----BEGIN PUBLIC KEY----------BEGIN CERTIFICATE-----` on one line
-        our predicate  : usable
-        node loaded    : 0 extra CAs
+    ASK THE CONTRACT, NOT A PROXY FOR IT. The first version of this asked
+    `tls.getCACertificates("extra")` — a census of what was loaded. That API
+    landed in node v22.15, so on anything older the probe wrote nothing, the
+    sentinel was absent, and EVERY verdict was None. The caller reads None as
+    "could not ask" and falls back, so on those runtimes the oracle was not
+    conservative, it was ABSENT — and it looked like a working guard on a dev
+    box running a new node. A sibling implementation shipped that exact bug and
+    measured it (v20.19 undefined, v22.14 undefined, v22.15 function).
 
-    and we hand that file to a session as NODE_EXTRA_CA_CERTS, so the session
-    trusts nothing extra: not our CA, not a sibling proxy's, not the corporate
-    roots. Every request then fails to verify the proxy it is routed through.
-    The loader does not care who published a cert, so asking it is
-    publisher-agnostic in a way parsing can never be.
-
-    EXIT STATUS CANNOT TELL "the loader loaded nothing" FROM "the probe never
-    ran" — node exits 0 after loading zero extras. So the probe writes a
-    sentinel byte BEFORE the certificate list, and only that byte proves the
-    loader ran to completion. No sentinel means not consulted, whatever the
-    exit code said.
+    "Will you verify our leaf" is answerable on every node back to v12, and it
+    is the question that actually matters: a session's failure mode is a failed
+    handshake, not a wrong census. It also makes the verdict immune to bundle
+    SIZE — a census echoed every certificate back on stdout, so a large
+    corporate bundle could overflow the pipe and become None.
 
     None is the point of this function, not an afterthought: an oracle that
     could not ask must not answer. Returning False when node is merely absent
     would drop a healthy machine to its own CA and take every corporate root
     with it — the exact damage this exists to prevent, caused by the fix.
+
+    THE LEAF LIVES BESIDE OUR CA, NOT BESIDE THE BUNDLE. The first version
+    looked for `leaf.pem` next to the file under test, which is right for the
+    tests (they write the bundle into the certdir) and wrong for every real
+    launch: the shared `ca-trust.pem` lives in the Claude config home while our
+    leaf lives in the pin-proxy certdir. So in production the leaf was never
+    found, every verdict was None, and the predicate the oracle exists to
+    correct went on deciding alone — an oracle that was green in tests and
+    absent in the field. Takes the CA PATH now, so the question is set up from
+    where the answer actually lives.
     """
-    import re as _re
     import shutil
     import subprocess
+    import tempfile
 
     node = shutil.which("node")
     if not node:
         return None
+    # The leaf must be signed by the CA we are asking about, or the handshake
+    # answers a different question.
+    try:
+        ca_dir = Path(ca_path).parent
+        leaf_pem, leaf_key = ca_dir / "leaf.pem", ca_dir / "leaf.key"
+        if not (leaf_pem.exists() and leaf_key.exists()):
+            return None
+        # ...and that leaf must actually be OURS, else a passing handshake
+        # proves nothing about the CA in question.
+        issuer = x509.load_pem_x509_certificate(leaf_pem.read_bytes()).issuer
+        ours = Path(ca_path).read_bytes()
+        if issuer != x509.load_pem_x509_certificate(ours).subject:
+            return None
+    except Exception:  # noqa: BLE001 — cannot set the question up: not an answer
+        return None
+
     probe = (
-        'const c=require("node:tls").getCACertificates("extra");'
-        'process.stdout.write("\\x02"+c.join("\\n"));'
+        "const tls=require('tls'),fs=require('fs');"
+        "const s=tls.createServer("
+        "{key:fs.readFileSync(process.argv[2]),cert:fs.readFileSync(process.argv[3])},"
+        "c=>c.end());"
+        "s.listen(0,'127.0.0.1',()=>{"
+        "const c=tls.connect({host:'127.0.0.1',port:s.address().port,"
+        "servername:'api.anthropic.com'},()=>{"
+        "process.stdout.write('\\x02OK');c.destroy();s.close();});"
+        "c.on('error',()=>{process.stdout.write('\\x02NO');s.close();});});"
     )
     # The proxy variables must not reach the child: it would try to route its
-    # own (nonexistent) traffic through us while we are deciding what to trust.
+    # own loopback connection through us while we are deciding what to trust.
     env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
     env["NODE_EXTRA_CA_CERTS"] = str(bundle)
     try:
-        r = subprocess.run(
-            [node, "-e", probe],
-            capture_output=True,
-            env=env,
-            timeout=_ORACLE_TIMEOUT_S,
-        )
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "probe.js"
+            script.write_text(probe, encoding="utf-8")
+            r = subprocess.run(
+                [node, str(script), str(leaf_key), str(leaf_pem)],
+                capture_output=True,
+                env=env,
+                timeout=_ORACLE_TIMEOUT_S,
+            )
     except Exception:  # noqa: BLE001 — cannot ask: not an answer
         return None
-    if r.returncode != 0 or not r.stdout.startswith(_ORACLE_SENTINEL):
+    # EXIT STATUS CANNOT SEPARATE "it answered no" FROM "it never ran". The
+    # sentinel written before the verdict is the only proof the probe reached
+    # its own conclusion.
+    if not r.stdout.startswith(_ORACLE_SENTINEL):
         return None
-    loaded = r.stdout[len(_ORACLE_SENTINEL):]
-    try:
-        ours_der = x509.load_pem_x509_certificate(ours).public_bytes(
-            serialization.Encoding.DER
-        )
-    except Exception:  # noqa: BLE001 — our own CA is unreadable: cannot judge
-        return None
-    # DER, not a fingerprint: a fingerprint is a hash OF the DER, so it adds a
-    # hash without adding discrimination, and its hex formatting would need
-    # normalising — a small predicate of exactly the kind being removed here.
-    #
-    # The per-block try/except is required, not defensive: the loader can hand
-    # back a block our parser chokes on, and one throw must not void the scan.
-    for block in _re.split(rb"(?=-----BEGIN)", loaded):
-        if not block.strip():
+    return r.stdout[len(_ORACLE_SENTINEL):].startswith(b"OK")
+
+
+def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
+    """Every block of ``body`` node can actually load, plus our own CA.
+
+    REFUSING THE BUNDLE MUST NOT COST THE CORPORATE ROOTS. The old fallback
+    for an unusable shared bundle was "our CA alone", which on a corporate
+    network is a session that can verify our proxy and nothing else — every
+    https destination fails. That made the oracle's verdict a cliff: a single
+    torn block, or merely having no node on PATH, and the machine lost 131
+    working roots to protect against one broken one.
+
+    Node's failure mode is what makes salvage the right answer rather than a
+    hedge: it aborts the WHOLE extras load on one undecodable block, but the
+    blocks beside it are still perfectly valid certificates. Dropping only the
+    bad block is not a guess about intent, it is the minimum edit that turns a
+    file node refuses into the same file node accepts.
+
+    Deliberately drops nothing else. A block that decodes is kept verbatim,
+    including CRLs and key blocks a real corporate bundle carries — narrowing
+    what we do not understand is how a reader silently shrinks a bundle, which
+    `_bundle_is_usable`'s docstring already refuses to do.
+    """
+    import base64
+    import re as _re
+
+    begin = _re.compile(rb"^-----BEGIN ([A-Z0-9 ]+)-----[ \t]*\r?$", _re.M)
+    kept: list[bytes] = []
+    pos = 0
+    while True:
+        m = begin.search(body, pos)
+        if not m:
+            break
+        label = m.group(1)
+        nxt = begin.search(body, m.end())
+        limit = nxt.start() if nxt else len(body)
+        end = body.find(b"-----END " + label + b"-----", m.end(), limit)
+        if end == -1:
+            # Unterminated: nothing to keep, and the scan must not fall into
+            # the next block's terminator looking for one.
+            pos = limit
             continue
-        try:
-            if x509.load_pem_x509_certificate(block).public_bytes(
-                serialization.Encoding.DER
-            ) == ours_der:
-                return True
-        except Exception:  # noqa: BLE001
-            continue
-    return False
+        block = body[m.start() : end] + b"-----END " + label + b"-----\n"
+        pos = end
+        if label == b"CERTIFICATE":
+            try:
+                x509.load_pem_x509_certificate(block)
+            except Exception:  # noqa: BLE001
+                continue
+        else:
+            try:
+                base64.b64decode(b"".join(body[m.end() : end].split()), validate=True)
+            except Exception:  # noqa: BLE001
+                continue
+        kept.append(block)
+    # Ours goes in unconditionally — a bundle that dropped it is exactly the
+    # case where the session could not verify the proxy it is routed through.
+    if not _bundle_is_usable(b"".join(kept), ours):
+        kept.append(ours.strip() + b"\n")
+    return _join_pem(*kept)
 
 
 def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
@@ -520,7 +596,7 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # own CA and take every corporate root with it, which is the exact
             # damage this is meant to prevent. So fall back to the predicate,
             # which is the only judge left, and say which arm decided.
-            verdict = _bundle_loads_in_node(shared, ours)
+            verdict = _bundle_loads_in_node(shared, Path(ca_path))
             if verdict is None:
                 verdict = _bundle_is_usable(body, ours)
                 _log_lifecycle(
@@ -529,6 +605,14 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
                 )
             if verdict:
                 return shared
+            # REFUSED — but refusing the FILE must not mean refusing its
+            # CONTENTS. Falling through to "our CA alone" costs the session
+            # every corporate root to avoid one bad block, so keep every block
+            # that does decode and drop only the ones that do not. That makes
+            # both the False and the None arms cost at most the broken block.
+            salvaged = Path(ca_path).parent / "ca-bundle.pem"
+            _write_bundle_atomically(salvaged, _salvage_bundle(body, ours))
+            return salvaged
     except Exception:
         pass
     # No shared bundle: merge with what THIS env trusts. Deliberately not
