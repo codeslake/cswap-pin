@@ -21,6 +21,7 @@ import glob
 import itertools
 import json
 import os
+import warnings
 import re
 import selectors
 import select
@@ -325,6 +326,36 @@ def _carries(body: bytes, ca_path: Path) -> bool:
     return False
 
 
+def _load_cert(block: bytes):
+    """Parse a CERTIFICATE block, or None when no loader could read it.
+
+    WARNINGS ARE NOT PARSE FAILURES, and a bare `except Exception` cannot tell
+    them apart: `CryptographyDeprecationWarning` subclasses `UserWarning` ->
+    `Warning` -> `Exception`, so any ambient filter that promotes warnings to
+    errors turns a LOADABLE certificate into a dropped one. Measured on this
+    box's real 125-block ambient store:
+
+        default filter   125 source -> 125 kept
+        python -W error  125 source -> 119 kept
+
+    The six are zero-serial roots (Starfield Services Root G2 among them, the
+    anchor for Amazon-fronted endpoints), and openssl and python `ssl` both
+    accept every one. Counts on the other two machines: 8 and 11.
+
+    Nothing promotes the warning today. The reason this is a guard rather than
+    a note is that the warning's own text is a scheduled promise — "Loading
+    this certificate will cause an exception in a future release" — and the
+    floor is `cryptography>=42.0` with no ceiling, so one `uv tool upgrade`
+    turns a silent 6-to-11 root drop permanent, absorbed by the same `except`.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            return x509.load_pem_x509_certificate(block)
+        except Exception:  # noqa: BLE001 — no loader can read it: not a block
+            return None
+
+
 def _parseable_blocks(body: bytes) -> list[bytes]:
     """Every block a loader can read, RESUMING PAST DAMAGE rather than stopping.
 
@@ -340,7 +371,10 @@ def _parseable_blocks(body: bytes) -> list[bytes]:
 
         ambient store        before   after
         CONTROL untouched      125     125
-        tear at idx 0            0     125
+        tear at idx 0            0     124   (`_salvage_bundle` reaches 125
+                                              only because it re-appends
+                                              `ours`; this filter has no
+                                              such append and cannot)
         tear at idx 5            5     124
         tear at idx 62          62     124
 
@@ -374,9 +408,7 @@ def _parseable_blocks(body: bytes) -> list[bytes]:
                 stopped = True
                 break
             if label == b"CERTIFICATE":
-                try:
-                    x509.load_pem_x509_certificate(block)
-                except Exception:  # noqa: BLE001
+                if _load_cert(block) is None:
                     continue
             else:
                 body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
@@ -999,12 +1031,10 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
             return False  # malformed on either edge — node truncates there
         seen_any = True
         if label == b"CERTIFICATE":
-            try:
-                der = x509.load_pem_x509_certificate(block).public_bytes(
-                    serialization.Encoding.DER
-                )
-            except Exception:  # noqa: BLE001
+            cert = _load_cert(block)
+            if cert is None:
                 return False
+            der = cert.public_bytes(serialization.Encoding.DER)
             if der == want:
                 carries_us = True
         else:
