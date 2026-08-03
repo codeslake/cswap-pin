@@ -291,6 +291,39 @@ CA_TRUST_DIR = "ca-trust.d"
 CA_TRUST_FILE = "ca-trust.pem"
 
 
+# WHAT COUNTS AS THE START OF A PEM BLOCK. One pattern, because the predicate
+# and the salvage scanner are meant to be the same scan and drifted apart once
+# already.
+#
+# Three properties, each of which a naive version gets wrong:
+#
+#   1. A WELDED marker is still a block. This read `^-----BEGIN ...` and a
+#      publisher that wrote no trailing newline produces
+#      `-----END CERTIFICATE----------BEGIN CERTIFICATE-----`, where the second
+#      marker does not start a line. Both scanners were blind to it, so the
+#      predicate found nothing wrong and returned True while node — which does
+#      not require the anchor — could not decode the fused line and truncated
+#      there. Measured on 0.1.12 with node present: 3 blocks declared, 2 seen,
+#      both judges True, wired as-is, node loaded 1. With node ABSENT (the
+#      normal case here, cswap is Python) and OUR CA as the welded one, node
+#      loaded ZERO — the session could not verify the proxy it was routed
+#      through. `_join_pem` already guards this shape in what WE write; the
+#      readers were never taught to see it in what someone else wrote.
+#
+#   2. A marker QUOTED IN PROSE is not a block. Dropping the left anchor
+#      outright makes `# see -----BEGIN CERTIFICATE-----` a block — measured, 2
+#      found where there is 1 — which is the false ACCEPT the anchor was there
+#      for. So the left side is constrained to a line start or a welded
+#      `-----`, not to nothing.
+#
+#   3. CRLF still reads. `\r?` stays: a `$`-only anchor made every CRLF bundle
+#      invisible, which reads as "carries no CA" and drops the whole shared
+#      file — the false REJECT that costs every sibling component its trust.
+#
+# Verified against all four shapes (plain LF, CRLF, welded, prose) before it
+# replaced the anchored version.
+_BEGIN_MARKER = rb"(?:^|-----)-----BEGIN ([A-Z0-9 ]+)-----[ \t]*(?:\r?\n|\Z)"
+
 _ORACLE_SENTINEL = b"\x02"
 _ORACLE_TIMEOUT_S = 10.0
 
@@ -386,9 +419,29 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
         "process.stdout.write('\\x02OK');c.destroy();s.close();});"
         "c.on('error',()=>{process.stdout.write('\\x02NO');s.close();});});"
     )
-    # The proxy variables must not reach the child: it would try to route its
-    # own loopback connection through us while we are deciding what to trust.
+    # The child must not inherit anything that answers a DIFFERENT question.
+    #
+    # `*_proxy` was already stripped: the child would otherwise route its own
+    # loopback connect through us while we are deciding what to trust. (That
+    # filter also catches NODE_USE_ENV_PROXY, which node >= 24 honours.)
+    #
+    # But two more change what a successful handshake MEANS, and neither ends
+    # in `_proxy`. Measured against a bundle carrying NO CA at all:
+    #
+    #     NODE_TLS_REJECT_UNAUTHORIZED unset   verdict False   (correct)
+    #     NODE_TLS_REJECT_UNAUTHORIZED=0       verdict True    (a lie)
+    #
+    # A True from that state is not "this bundle verifies our leaf", it is
+    # "this node was told not to check" — and `_trust_file` then wires the
+    # shared file on a verdict about nothing. NODE_OPTIONS is the same class:
+    # it can carry --use-openssl-ca and friends, so the child would consult a
+    # different trust store than the one under test.
+    #
+    # Raised by the CCF session, whose probe had the mirror-image gap: they
+    # cleared these two and not the proxy family.
     env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+    for leak in ("NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS"):
+        env.pop(leak, None)
     env["NODE_EXTRA_CA_CERTS"] = str(bundle)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -447,7 +500,7 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
     import base64
     import re as _re
 
-    begin = _re.compile(rb"^-----BEGIN ([A-Z0-9 ]+)-----[ \t]*\r?$", _re.M)
+    begin = _re.compile(_BEGIN_MARKER, _re.M)
     kept: list[bytes] = []
     pos = 0
     while True:
@@ -456,14 +509,21 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
             break
         label = m.group(1)
         nxt = begin.search(body, m.end())
-        limit = nxt.start() if nxt else len(body)
+        limit = body.index(b"-----BEGIN ", nxt.start()) if nxt else len(body)
         end = body.find(b"-----END " + label + b"-----", m.end(), limit)
         if end == -1:
             # Unterminated: nothing to keep, and the scan must not fall into
             # the next block's terminator looking for one.
             pos = limit
             continue
-        block = body[m.start() : end] + b"-----END " + label + b"-----\n"
+        # FROM THE MARKER, not from the match. `_BEGIN_MARKER` may consume a
+        # welded `-----` (the tail of the previous block's END) to prove this
+        # is a real block start, so `m.start()` can sit before the BEGIN.
+        # Slicing from there carries that tail into the salvaged block, which
+        # is the same fused shape we are repairing — measured: the block was
+        # emitted with a leading `-----` and dropped again.
+        head = body.index(b"-----BEGIN ", m.start())
+        block = body[head:end] + b"-----END " + label + b"-----\n"
         pos = end
         if label == b"CERTIFICATE":
             try:
@@ -544,7 +604,7 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
     # CRLF bundle invisible to this scan — which reads as "carries no CA" and
     # drops the whole shared file, the false reject that costs every sibling
     # component its trust. Measured: a CRLF copy of our own CA was refused.
-    begin = _re.compile(rb"^-----BEGIN ([A-Z0-9 ]+)-----[ \t]*\r?$", _re.M)
+    begin = _re.compile(_BEGIN_MARKER, _re.M)
     carries_us = False
     pos = 0
     while True:
@@ -554,8 +614,21 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
         label = m.group(1)
         # Bound the END search at the next BEGIN: an unterminated block must
         # not borrow a later block's terminator and swallow it whole.
+        # BOUND AT THE NEXT MARKER, not at the next MATCH. `_BEGIN_MARKER` may
+        # consume a welded `-----` to prove a block start, so `nxt.start()` can
+        # sit BEFORE the previous block's END — measured: that cut the END out
+        # of range and every healthy multi-cert bundle read as unterminated,
+        # 11 tests red. Bound on where the marker itself begins.
         nxt = begin.search(body, m.end())
-        limit = nxt.start() if nxt else len(body)
+        limit = body.index(b"-----BEGIN ", nxt.start()) if nxt else len(body)
+        head = body.index(b"-----BEGIN ", m.start())
+        # A WELDED marker means the file is already fused. Every block here may
+        # decode perfectly on its own and node still truncates at the fused
+        # line, because openssl cannot read a BEGIN that shares a line with the
+        # previous END. `head != m.start()` is exactly that: the marker had to
+        # consume a `-----` to prove it was a block start.
+        if head != m.start():
+            return False
         end = body.find(b"-----END " + label + b"-----", m.end(), limit)
         if end == -1:
             return False  # unterminated — node cannot parse it
@@ -563,7 +636,7 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
         if label == b"CERTIFICATE":
             try:
                 der = x509.load_pem_x509_certificate(
-                    body[m.start() : end] + b"-----END CERTIFICATE-----\n"
+                    body[head:end] + b"-----END CERTIFICATE-----\n"
                 ).public_bytes(serialization.Encoding.DER)
             except Exception:  # noqa: BLE001
                 return False
