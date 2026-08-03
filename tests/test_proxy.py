@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -3187,3 +3188,147 @@ class TestSharedBundleGuardMatchesNode:
         ours = self._ca(tmp_path)
         bundle = b"-----BEGIN CERTIFICATE-----\nQUJD\n" + ours + b"\n"
         assert _bundle_is_usable(bundle, ours) is False
+
+
+class TestAnUpgradeCostsNoSession:
+    """Restarting the daemon must not cost a session its requests OR its port.
+
+    A running session's HTTPS_PROXY is fixed at exec, so it cannot be told
+    about a new address. Everything below follows from that one fact: an
+    upgrade, a recycle, even a full uninstall/reinstall has to come back on the
+    SAME port, and has to leave in-flight requests intact on the way out.
+
+    Where it fails, it fails as Remote Control going deaf — claude.ai sends,
+    and the CLI is waiting at a port nothing serves. That is the symptom this
+    class exists to keep from coming back.
+    """
+
+    def _proxy(self, certdir):
+        from cswap_pin.proxy import PinProxy
+
+        p = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: (None, None),
+            rediscover_chain=False,
+        )
+        p.start()
+        return p
+
+    def test_the_listening_port_is_released_for_the_next_daemon(self, tmp_path):
+        """`close()` alone does NOT release it while a thread sits in
+        `accept()` — measured, the port stayed `Address already in use` with
+        `_srv.fileno()` already -1. The socket looked shut while the kernel
+        still held the address, so the next daemon could not reclaim it."""
+        import socket
+
+        certdir = tmp_path / "cd"
+        certdir.mkdir()
+        p = self._proxy(certdir)
+        port = p.port
+        p.stop()
+
+        probe = socket.socket()
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))  # raises if still held
+        finally:
+            probe.close()
+
+    def test_a_restart_reclaims_the_same_port(self, tmp_path):
+        from cswap_pin.proxy import _write_port_hint
+
+        certdir = tmp_path / "cd"
+        certdir.mkdir()
+        p = self._proxy(certdir)
+        port = p.port
+        _write_port_hint(certdir, port)
+        p.stop()
+
+        p2 = self._proxy(certdir)
+        try:
+            assert p2.port == port, (
+                f"came back on {p2.port}, leaving every live session dialling "
+                f"{port} — this is Remote Control going deaf"
+            )
+        finally:
+            p2.stop()
+
+    def test_a_wiped_cert_dir_still_reclaims_from_claude_json(
+        self, tmp_path, monkeypatch
+    ):
+        """Uninstall/reinstall: proxy.json AND port.hint are gone. The sessions
+        do not know that — `.claude.json` is cswap's file, it survives, and it
+        holds the very port they are using."""
+        import json
+        import shutil
+
+        import claude_swap.paths as paths
+
+        certdir = tmp_path / "cd"
+        certdir.mkdir()
+        cfg = tmp_path / ".claude.json"
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        p = self._proxy(certdir)
+        port = p.port
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                        "CSWAP_PIN_PORT": str(port),
+                    },
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                }
+            )
+        )
+        p.stop()
+        shutil.rmtree(certdir)
+        certdir.mkdir()
+
+        p2 = self._proxy(certdir)
+        try:
+            assert p2.port == port, (
+                "a reinstall stranded every running session on a dead port"
+            )
+        finally:
+            p2.stop()
+
+    def test_stop_closes_open_connections_rather_than_resetting_them(
+        self, tmp_path
+    ):
+        """Draining is not enough on its own. Measured: a request that had
+        transferred every byte STILL reached the client as
+        ConnectionResetError, because the teardown ends in `os._exit(0)` and a
+        process exiting without closing its sockets makes the kernel answer
+        with RST instead of FIN. The data had arrived; the client discarded it
+        over the reset."""
+        import socket
+
+        certdir = tmp_path / "cd"
+        certdir.mkdir()
+        p = self._proxy(certdir)
+        client = socket.create_connection(("127.0.0.1", p.port))
+        client.settimeout(5)
+        time.sleep(0.2)
+        assert p.live_client_count() == 1
+        assert len(p._open_conns) == 1, "the connection is not tracked for close"
+
+        p.stop(drain=2.0)
+        try:
+            assert client.recv(100) == b"", "expected a clean EOF"
+        except ConnectionResetError:  # pragma: no cover - the bug being fixed
+            raise AssertionError("client saw RST; stop() did not close the socket")
+        finally:
+            client.close()
+
+    def test_draining_is_a_ceiling_not_a_wait(self, tmp_path):
+        """The status line and every launch can trigger a stop, so the idle
+        case must be instant."""
+        certdir = tmp_path / "cd"
+        certdir.mkdir()
+        p = self._proxy(certdir)
+        started = time.monotonic()
+        p.stop(drain=30.0)  # nobody connected
+        assert time.monotonic() - started < 2.0
