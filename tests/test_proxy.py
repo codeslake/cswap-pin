@@ -1899,12 +1899,18 @@ class TestCaIsPublishedToTheTrustDir:
         ca = self._ca(tmp_path)
         launcher = tmp_path / "cache-fix-ca" / "combined-ca.pem"
         launcher.parent.mkdir(parents=True)
-        launcher.write_bytes(b"-----BEGIN CERTIFICATE-----\nCCF\n-----END CERTIFICATE-----\n")
+        # A REAL certificate, not a `CCF` placeholder. The emission filter
+        # validates CERTIFICATE blocks with x509 (it shares `_salvage_bundle`'s
+        # loop), so a placeholder is dropped and the merge carries only ours —
+        # which is correct behaviour and made this test's own `ccf` NameError
+        # reachable for the first time.
+        launcher_pem = _other_ca(tmp_path / "ccf-ca")
+        launcher.write_bytes(launcher_pem)
         out = _merged_ca(ca, str(launcher))
         assert out == ca.parent / "ca-bundle.pem"
         body = out.read_bytes()
         assert self._ca(tmp_path).read_bytes().strip() in body
-        assert b"CCF" in body or ccf.read_bytes().strip() in body
+        assert launcher_pem.strip() in body
         # and the launcher's file is left exactly as it was
         assert launcher.read_bytes().count(b"BEGIN CERT") == 1
 
@@ -6242,3 +6248,81 @@ class TestTheUnMergeBranchReadsTheFileItReturns:
                 out.read_bytes()
             ) if b[0] is not None]
         ) == 2, "the upstream CA was lost"
+
+
+class TestTheFilterKeepsBlocksAfterTheTearToo:
+    """`_drop_unreadable_blocks` stopped at the first damaged marker and threw
+    away everything after it.
+
+    `_pem_blocks` ends its scan at the first damage — every damage arm is
+    `yield ...; return` — so a plain comprehension over it never sees a block
+    past the tear. `_salvage_bundle` handles that with a restart loop
+    (`proxy.py:857-892`); the filter had no equivalent, while its docstring and
+    this file's own class docstring both claimed parity with it.
+
+    Measured on `/etc/ssl/certs/ca-certificates.crt`, this box's real ambient
+    store, 125 blocks, control first:
+
+        ambient store        drop_unreadable   salvage
+        CONTROL untouched          125           125
+        tear at idx 0                0           125
+        tear at idx 1                1           124
+        tear at idx 5                5           124
+        tear at idx 62              62           124
+        tear at idx 124            124           124
+
+    One damaged block near the front of a corporate root bundle — an
+    interrupted `update-ca-certificates`, a partially synced store — and the
+    session is handed a file that LOADS CLEANLY carrying 6 roots instead of
+    125. Nothing downstream flags it: it is not torn, so `_bundle_is_usable`
+    says usable and the node oracle says True (our CA is at index 0, ahead of
+    everything lost).
+
+    The old suite could not see this. Replacing the comprehension with the
+    restart loop — which takes the idx-5 row from 6 to 124 — killed ZERO tests,
+    because every emission test asserts `not _damaged(body)` and only the
+    healthy control asserts a block count. A filter that keeps one block and a
+    filter that keeps 124 are indistinguishable to `not _damaged`.
+    """
+
+    def _store(self):
+        import pathlib
+
+        from cswap_pin.proxy import _pem_blocks
+
+        real = pathlib.Path("/etc/ssl/certs/ca-certificates.crt")
+        if not real.exists():
+            pytest.skip("no ambient store on this box")
+        blocks = [b for label, _h, _e, b in _pem_blocks(real.read_bytes()) if label]
+        if len(blocks) < 10:
+            pytest.skip(f"ambient store too small to tear meaningfully: {len(blocks)}")
+        return blocks
+
+    def _kept(self, body):
+        from cswap_pin.proxy import _drop_unreadable_blocks, _pem_blocks
+
+        out = _drop_unreadable_blocks(body)
+        return len([1 for label, _h, _e, _b in _pem_blocks(out) if label])
+
+    def test_a_tear_near_the_front_does_not_cost_the_whole_tail(self):
+        blocks = self._store()
+        torn = list(blocks)
+        torn[5] = torn[5].replace(
+            b"-----END CERTIFICATE-----", b" \n-----END CERTIFICATE-----", 1
+        )
+
+        kept = self._kept(b"".join(torn))
+
+        assert kept >= len(blocks) - 1, (
+            f"the filter stopped at the tear: kept {kept} of {len(blocks)} blocks. "
+            "Everything after the damaged one was dropped, so the session is "
+            "handed a bundle that loads cleanly and carries a fraction of the "
+            "roots it should"
+        )
+
+    def test_an_undamaged_store_is_unchanged(self):
+        """CONTROL. Without it the assertion above passes on a filter that
+        returns its input untouched."""
+        blocks = self._store()
+
+        assert self._kept(b"".join(blocks)) == len(blocks), "a healthy store lost blocks"
