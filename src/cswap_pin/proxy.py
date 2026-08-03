@@ -325,6 +325,69 @@ def _carries(body: bytes, ca_path: Path) -> bool:
     return False
 
 
+def _parseable_blocks(body: bytes) -> list[bytes]:
+    """Every block a loader can read, RESUMING PAST DAMAGE rather than stopping.
+
+    `_pem_blocks` ends its scan at the first damaged marker — every damage arm
+    is `yield ...; return` — so iterating it once yields only the prefix. That
+    is correct for a PREDICATE (a torn file is refused whole) and wrong for a
+    REPAIR, which has to look at what is behind the tear.
+
+    Extracted from `_salvage_bundle`, which had this loop and was the only
+    caller that resumed. `_drop_unreadable_blocks` iterated `_pem_blocks`
+    directly and silently kept only the prefix. Measured on
+    `/etc/ssl/certs/ca-certificates.crt`, 125 blocks:
+
+        ambient store        before   after
+        CONTROL untouched      125     125
+        tear at idx 0            0     125
+        tear at idx 5            5     124
+        tear at idx 62          62     124
+
+    Six roots instead of 125, in a file that LOADS CLEANLY — so nothing
+    downstream flags it: not torn, so the predicate says usable and the node
+    oracle says True, our CA being at index 0 ahead of everything lost.
+    """
+    kept: list[bytes] = []
+    offset = 0
+    while offset < len(body):
+        stopped = False
+        for label, head, _end, block in _pem_blocks(body[offset:]):
+            if label is None:
+                # RESUME AT THE NEXT MARKER, not one byte past this one. A
+                # WELDED block's own BEGIN sits at `head`, so `head + 1` skips
+                # the very block salvage exists to recover — measured, the
+                # welded third-party CA was dropped again.
+                # RESUME AT THE DAMAGED BLOCK'S OWN BEGIN, not past it. For a
+                # WELD that BEGIN sits at `head` itself, and restarting there
+                # makes it a clean line start — which is the whole repair.
+                # Measured: skipping past it dropped the third-party CA on the
+                # RIGHT of the weld, the defect this arm exists to fix.
+                if block == b"weld" and head:
+                    offset += head        # its BEGIN is here: recoverable
+                else:
+                    nxt = body.find(b"-----BEGIN ", offset + head + 1)
+                    if nxt == -1:
+                        stopped = False
+                        break
+                    offset = nxt          # this marker is damaged: move on
+                stopped = True
+                break
+            if label == b"CERTIFICATE":
+                try:
+                    x509.load_pem_x509_certificate(block)
+                except Exception:  # noqa: BLE001
+                    continue
+            else:
+                body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
+                if not _armor_decodes(body_only):
+                    continue
+            kept.append(block)
+        if not stopped:
+            break
+    return kept
+
+
 def _drop_unreadable_blocks(body: bytes) -> bytes:
     """Every block that parses, in order, and nothing that does not.
 
@@ -347,12 +410,18 @@ def _drop_unreadable_blocks(body: bytes) -> bytes:
     to be that block; it is the whole store.
 
     `_salvage_bundle` already had this property by construction: it reassembles
-    from parsed blocks, so it cannot emit damage. Measured, its two sibling
-    emission sites did not:
+    from parsed blocks via `_parseable_blocks`, so it cannot emit damage.
+    Measured, its two sibling emission sites did not:
 
         CONTROL _merged_ca healthy         blocks=2 DAMAGED=False
         _merged_ca + torn ambient          blocks=1 DAMAGED=True
         _trust_file tail + torn existing   blocks=1 DAMAGED=True
+
+    `blocks=1` there is a TWO-block fixture losing its bad half, not a repair
+    rate. On a real store the same code kept only the PREFIX before the tear —
+    6 of 125 for damage at index 5 — until both sites were routed through
+    `_parseable_blocks`, which resumes. See that function; the count is the
+    thing this table does not report and the reason the truncation shipped.
 
     Both concatenate `read_bytes()` with no inspection of the other file, and
     the other file is the ambient store — uncontrolled by us.
@@ -397,7 +466,7 @@ def _drop_unreadable_blocks(body: bytes) -> bytes:
     # Separating "torn" from "shaped unusually" needs a distinction `_pem_blocks` does
     # not currently make. Both cases still lose every CA in the file, so the
     # gap is a failure to REPAIR, not a new failure introduced here.
-    kept = [block for label, _h, _e, block in _pem_blocks(body) if label is not None]
+    kept = _parseable_blocks(body)
     return _join_pem(*kept) if kept else body
 
 
@@ -854,42 +923,7 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
     # damage is exactly what the session loses otherwise — the narrowing this
     # file refuses everywhere else. So walk the body in segments, restarting
     # one byte past each broken marker, rather than recursing.
-    offset = 0
-    while offset < len(body):
-        stopped = False
-        for label, head, _end, block in _pem_blocks(body[offset:]):
-            if label is None:
-                # RESUME AT THE NEXT MARKER, not one byte past this one. A
-                # WELDED block's own BEGIN sits at `head`, so `head + 1` skips
-                # the very block salvage exists to recover — measured, the
-                # welded third-party CA was dropped again.
-                # RESUME AT THE DAMAGED BLOCK'S OWN BEGIN, not past it. For a
-                # WELD that BEGIN sits at `head` itself, and restarting there
-                # makes it a clean line start — which is the whole repair.
-                # Measured: skipping past it dropped the third-party CA on the
-                # RIGHT of the weld, the defect this arm exists to fix.
-                if block == b"weld" and head:
-                    offset += head        # its BEGIN is here: recoverable
-                else:
-                    nxt = body.find(b"-----BEGIN ", offset + head + 1)
-                    if nxt == -1:
-                        stopped = False
-                        break
-                    offset = nxt          # this marker is damaged: move on
-                stopped = True
-                break
-            if label == b"CERTIFICATE":
-                try:
-                    x509.load_pem_x509_certificate(block)
-                except Exception:  # noqa: BLE001
-                    continue
-            else:
-                body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
-                if not _armor_decodes(body_only):
-                    continue
-            kept.append(block)
-        if not stopped:
-            break
+    kept = _parseable_blocks(body)
     # Ours goes in unconditionally — a bundle that dropped it is exactly the
     # case where the session could not verify the proxy it is routed through.
     if not _bundle_is_usable(b"".join(kept), ours):
