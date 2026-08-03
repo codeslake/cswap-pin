@@ -5407,3 +5407,164 @@ class TestTheArmorCheckIsNotAcceptingEmptiness:
         assert _bundle_is_usable(good + raw, raw.strip()) is True, (
             "a healthy CRLF key block was refused"
         )
+
+
+class TestAnEmptyArmorIsNotIntactArmor:
+    """`TestTheArmorCheckIsNotAcceptingEmptiness` fixed the SLICE and left the
+    EMPTINESS — the class asserted a property the code did not have.
+
+    0.1.16's own diagnosis named two mechanisms: the slice returned the whole
+    block, AND empty base64 decodes fine. Only the first was fixed. The
+    corrected slice still yields `b''` for a body that is empty or only
+    whitespace, and `base64.b64decode(b"", validate=True)` succeeds, so the
+    check passes a block openssl refuses.
+
+    Measured, node v24.11.1, corp-A + block + ours (correct answer is 2):
+
+        shape              predicate   node loads
+        empty body         True        1
+        whitespace only    True        1
+        over-padded QUFB=  True        1
+        trailing blank ln  True        1
+        healthy control    True        2
+
+    On the real 132-cert bundle one such block costs 132 of 133 roots, in
+    BOTH judge arms: the oracle ANDs with a predicate that says True, and
+    salvage shares this slice so it re-emits the poison verbatim. The empty
+    and whitespace cases produce no openssl warning at all — the session
+    loses every corporate root with nothing on stderr.
+
+    Standing defect, not a regression (0.1.14 and 0.1.15 accept these too),
+    but it is the same defect this class was named for.
+
+    openssl needs at least one full base64 quantum and refuses a blank line
+    before END, which is exactly what the three conditions below encode.
+    """
+
+    def _ours(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+
+    def test_an_empty_or_whitespace_body_is_refused(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        for name, body in (
+            ("empty", b""),
+            ("whitespace", b"   \n"),
+        ):
+            blk = b"-----BEGIN X509 CRL-----\n" + body + b"-----END X509 CRL-----\n"
+            assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
+                f"a {name} armor body was accepted — node loads 1 of 2 from it"
+            )
+
+    def test_a_body_that_is_not_whole_base64_quanta_is_refused(self, tmp_path):
+        """`QUFB=` is 5 characters: base64 accepts it, openssl does not."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        blk = b"-----BEGIN X509 CRL-----\nQUFB=\n-----END X509 CRL-----\n"
+        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
+            "an over-padded armor body was accepted — openssl reports "
+            "'bad base64 decode' and node loads 1 of 2"
+        )
+
+    def test_a_blank_line_before_END_is_refused(self, tmp_path):
+        """openssl reports 'bad end line' for this; the armor bytes are fine."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        blk = b"-----BEGIN X509 CRL-----\nQUFBQQ==\n\n-----END X509 CRL-----\n"
+        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
+            "a blank line before END was accepted — node loads 1 of 2"
+        )
+
+    def test_a_body_with_stray_characters_is_refused(self, tmp_path):
+        """`validate=True` is not redundant with the quantum check. A body
+        that is a whole number of quanta but carries a non-base64 character
+        is only caught by the strict decoder — swept 200k random bodies that
+        reach the decoder at all, and the two modes disagree on 8636 of them.
+
+        `B+0=cA/-` is one: 8 characters, so the quantum check passes it, and
+        lax base64 decodes it while openssl does not. That shape is what a
+        concatenating builder produces on a torn seam.
+        """
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        blk = b"-----BEGIN X509 CRL-----\nB+0=cA/-\n-----END X509 CRL-----\n"
+        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
+            "a body carrying stray characters was accepted — whole quanta is "
+            "necessary but not sufficient, the decoder must be strict"
+        )
+
+    def test_healthy_non_certificate_blocks_are_still_accepted(self, tmp_path):
+        """The false-REJECT direction. A real corporate bundle carries CRLs and
+        key blocks; refusing them costs every sibling component its trust."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        for name, blk in (
+            ("one line", b"-----BEGIN X509 CRL-----\nQUFBQQ==\n-----END X509 CRL-----\n"),
+            ("CRLF", b"-----BEGIN PUBLIC KEY-----\r\nQUFBQQ==\r\n-----END PUBLIC KEY-----\r\n"),
+            ("wrapped", b"-----BEGIN X509 CRL-----\nQUFB\nQUFB\n-----END X509 CRL-----\n"),
+        ):
+            assert _bundle_is_usable(blk + raw, raw.strip()) is True, (
+                f"a healthy {name} non-certificate block was refused"
+            )
+
+
+class TestSalvageRefusesTheSameArmorThePredicateDoes:
+    """The salvage arm's armor check had NO test — deleting it left the whole
+    suite green, in the same function 0.1.16 edited.
+
+    Every existing salvage fixture uses `!!!not base64!!!`, which the ARMOR
+    check and nothing else refuses — so the fixture cannot tell the branches
+    apart, and the branch was never exercised. Instrumented: the salvage
+    armor path was entered ZERO times across the suite.
+
+    That matters because salvage is the REPAIR path. When the predicate
+    refuses a file, salvage decides what the session actually gets. If it
+    keeps a block openssl cannot read, the repaired file is as dead as the
+    input — measured:
+
+        torn CRL, CRLF endings, through _salvage_bundle
+          shipped        salvage kept 2 blocks, node loads 2, handshake OK
+          check deleted  salvage kept 4 blocks, node loads 1, handshake NO
+
+    This is exactly the class 0.1.16 was written to close (a guard with no
+    test), which is why it is worth a test rather than a comment.
+    """
+
+    def test_salvage_drops_a_block_whose_armor_openssl_refuses(self, tmp_path):
+        from cswap_pin.proxy import _salvage_bundle, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        # VALID base64 that openssl still refuses: 5 chars is not a whole
+        # quantum. `!!!not base64!!!` would be caught by any check, so it
+        # cannot isolate this one.
+        poison = b"-----BEGIN X509 CRL-----\nQUFB=\n-----END X509 CRL-----\n"
+        out = _salvage_bundle(a + poison + raw, raw.strip())
+        assert b"QUFB=" not in out, (
+            "salvage kept a block whose armor openssl refuses — the repaired "
+            "file is as unreadable as the input it was meant to fix"
+        )
+
+    def test_salvage_keeps_a_HEALTHY_non_certificate_block(self, tmp_path):
+        """The false-REJECT direction: salvage must not narrow the bundle by
+        dropping the CRLs and key blocks a real corporate store carries."""
+        from cswap_pin.proxy import _salvage_bundle, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        torn = b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n"
+        good = b"-----BEGIN X509 CRL-----\nQUFBQQ==\n-----END X509 CRL-----\n"
+        out = _salvage_bundle(good + torn + raw, raw.strip())
+        assert b"QUFBQQ==" in out, "salvage dropped a healthy CRL"
