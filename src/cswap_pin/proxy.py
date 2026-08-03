@@ -521,7 +521,31 @@ def _armor_decodes(body: bytes) -> bool:
     data = b"".join(body.split())
     if not data or len(data) % 4:
         return False
-    if b"\n\n" in body.replace(b"\r\n", b"\n"):
+    # ANCHORED TO THE LAST LINE, and "blank" means whitespace-only.
+    #
+    # This was `b"\n\n" in body`, wrong in BOTH directions and with a
+    # docstring claiming otherwise. It matched only a LITERAL blank line,
+    # anywhere:
+    #
+    #   WS-only line before END   accepted   node loaded 1 of 2   <- MISSED
+    #   blank right AFTER BEGIN   refused    node loaded 2 of 2   <- FALSE REJECT
+    #
+    # The miss is the dangerous half: on the real 132-cert bundle a poisoned
+    # CRL ahead of our CA gives extras=0 and a failed handshake on both node
+    # runtimes, with the predicate saying True and salvage re-emitting it.
+    # The false reject is the RFC 1421 header form (`Proc-Type:` / `DEK-Info:`
+    # / blank / body) that `openssl genrsa -traditional` writes; refusing it
+    # drops the session to a per-launch snapshot instead of the live file.
+    #
+    # openssl objects to a blank line ONLY immediately before the terminator.
+    # Strip that terminator's own newline and look at what precedes it —
+    # treating whitespace as blank, which `b"".join(body.split())` above
+    # already assumes. Verified on 10 shapes including CRLF and no-trailing-
+    # newline.
+    norm = body.replace(b"\r\n", b"\n")
+    if norm.endswith(b"\n"):
+        norm = norm[:-1]
+    if norm.rsplit(b"\n", 1)[-1].strip() == b"":
         return False
     try:
         base64.b64decode(data, validate=True)
