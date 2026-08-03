@@ -20,7 +20,34 @@ meant to report on. Reach for ``cswap_pin.proxy`` directly; use
 
 from __future__ import annotations
 
-__version__ = "0.1.8"
+def _derive_version() -> str:
+    """The version of the INSTALLED distribution, never a second literal.
+
+    This was `__version__ = "0.1.8"`, a constant kept in sync with
+    pyproject.toml by hand. 0.1.9 shipped with the two disagreeing:
+
+        dist metadata          0.1.9
+        cswap_pin.__version__  0.1.8
+
+    A test for exactly that drift existed and was in the released tree; it
+    simply was not run before the tag, and a PyPI version cannot be
+    re-uploaded, so that wheel is wrong forever. An upgraded machine reporting
+    the old number looks un-upgraded to anything asking the package itself.
+
+    Reading the metadata removes the second source rather than adding a third
+    check on it. The fallback is for a source checkout with no distribution
+    installed (this repo's own test run, `PYTHONPATH=src`), where there is no
+    metadata to disagree with.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("cswap-pin")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
+__version__ = _derive_version()
 
 __all__ = ["__version__", "host_available"]
 

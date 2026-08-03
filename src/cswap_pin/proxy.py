@@ -572,10 +572,25 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # builder knows which happened — so a reader acting on a shrink
             # would reject a correct bundle in exactly the cases the shrink was
             # intended. Measured across the three machines this runs on, a
-            # legitimate bundle is 2 certs on one and 132 on another, so any
-            # size floor that catches narrowing on one host rejects a healthy
-            # bundle on the next. The builder keeps the last good bundle for
-            # this reason; that is where the decision belongs.
+            # legitimate bundle is 5 certs on one and 168 on another, so any
+            # ABSOLUTE size floor that catches narrowing on one host rejects a
+            # healthy bundle on the next. The builder keeps the last good
+            # bundle for this reason; that is where the decision belongs.
+            #
+            # This comment previously read "2 certs on one and 132 on another".
+            # The 132 was right for this host; the 2 was the COMPONENT COUNT
+            # (ca-trust.d holds ccf.pem and cswap-pin.pem, one certificate
+            # each), not a bundle size — two different quantities reported as
+            # one measurement. The real spread, measured on all three by the
+            # CCF session after this claim was quoted at them: host-a 132,
+            # work-mac 168, personal-mac 5. The conclusion survives and is in
+            # fact stronger, but it was not supported by the numbers cited.
+            #
+            # NOTE what this rules out and what it does not. It rules out an
+            # ABSOLUTE floor in a READER. It does not rule out a builder
+            # comparing its output against the inputs IT just read, which is a
+            # per-build quantity rather than a constant and does not need to
+            # hold across hosts.
             # The two cases below are also a different severity class: both
             # leave the session unable to verify its OWN proxy, so every
             # request dies. Narrowing keeps our chain intact and costs someone
