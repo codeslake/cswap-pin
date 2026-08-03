@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -2763,3 +2764,101 @@ class TestClientRegistrationIsNotSwapped:
         assert is_pinned_route("/v1/messages") is False
         assert is_pinned_route("/v1/code/sessions/cse_X/worker/events") is False
         assert is_pinned_route("/v1/code/sessions/cse_X/worker/events/stream") is False
+
+
+class TestTheDaemonLogRecordsItsOwnDeath:
+    """A daemon that vanishes must leave a reason behind.
+
+    MEASURED (2026-08-02): every session on a machine went down behind a pin
+    whose daemon was gone, and ``daemon.log`` was ZERO BYTES. The log carried
+    warnings only, so a daemon that started, served for hours and disappeared
+    wrote nothing at all. There was no way to tell an idle teardown from a
+    signal from a crash, and with several agents working on the box the cause
+    stayed unattributable. An outage you cannot attribute is one you cannot
+    prevent.
+    """
+
+    def test_a_lifecycle_line_reaches_the_log(self, tmp_path):
+        """_log_lifecycle writes to STDERR, and the daemon's stderr IS
+        daemon.log — assert through that plumbing rather than by patching it,
+        because the plumbing is the part that was silently unused."""
+        import subprocess
+        import sys
+        import textwrap
+
+        from cswap_pin import proxy
+
+        certdir = tmp_path / "certdir"
+        certdir.mkdir()
+        src = str(Path(proxy.__file__).resolve().parent.parent)
+        child = textwrap.dedent(f"""
+            import sys; sys.path.insert(0, {src!r})
+            from cswap_pin import proxy
+            proxy._log_lifecycle("serving on port 12345 for account 1")
+            proxy._log_lifecycle("stopping (signal SIGTERM)")
+        """)
+        fh = proxy._open_daemon_log(certdir)
+        subprocess.run(
+            [sys.executable, "-c", child],
+            stdout=subprocess.DEVNULL,
+            stderr=fh,
+            check=True,
+        )
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+        text = proxy.daemon_log_path(certdir).read_text()
+        assert "serving on port 12345" in text, text
+        assert "stopping (signal SIGTERM)" in text, text
+        # The timestamp is the whole point: "when did it go away" was the
+        # question the empty log could not answer.
+        assert re.search(r"\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\]", text), text
+        assert "pid=" in text, text
+
+    def test_the_teardown_reason_distinguishes_signal_from_idle(self):
+        """A TERM from a recycle and an idle teardown are the same code path.
+        Before this they left the same (empty) trace, so a daemon that was
+        KILLED could not be told from one that timed out by itself."""
+        import signal as _signal
+
+        from cswap_pin import proxy
+
+        seen = []
+        handlers = {}
+
+        def _fake_signal(sig, handler):
+            handlers[sig] = handler
+            return None
+
+        real = _signal.signal
+        _signal.signal = _fake_signal
+        try:
+            proxy._install_signal_teardown(lambda reason="refcount": seen.append(reason))
+        finally:
+            _signal.signal = real
+
+        assert _signal.SIGTERM in handlers, "SIGTERM was never registered"
+        # os._exit would kill the test runner; the handler calls it in a
+        # `finally`, so intercept it and let the cleanup run first.
+        real_exit = os._exit
+        os._exit = lambda code: (_ for _ in ()).throw(SystemExit(code))
+        try:
+            with pytest.raises(SystemExit):
+                handlers[_signal.SIGTERM](_signal.SIGTERM, None)
+        finally:
+            os._exit = real_exit
+
+        assert seen == ["signal SIGTERM"], seen
+
+    def test_lifecycle_logging_never_kills_the_daemon(self, monkeypatch):
+        """Called on the way out, including from a signal handler. A daemon
+        must not die trying to record that it is dying."""
+        from cswap_pin import proxy
+
+        def _boom(*a, **k):
+            raise OSError("stderr is gone")
+
+        monkeypatch.setattr("builtins.print", _boom)
+        proxy._log_lifecycle("this must not raise")  # no assertion needed
