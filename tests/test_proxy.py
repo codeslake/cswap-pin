@@ -5165,3 +5165,160 @@ class TestTheENDLineIsBoundedToo:
         assert b"=-----END" not in out and b"-----END CERTIFICATE-----\n" in out, (
             f"salvage emitted a block whose END is welded to its body: {out[:120]!r}"
         )
+
+
+class TestBothMarkersMustOwnTheirLine:
+    """A PEM marker has TWO edges and each release guarded one of them.
+
+        BEGIN  left edge  0.1.13 (welds)      right edge  UNGUARDED
+        END    left edge  UNGUARDED           right edge  0.1.14
+
+    The two unguarded edges are the same defect class as the two that were
+    fixed, reachable today, and they land in the dangerous direction.
+
+    LEFT EDGE OF END. The predicate rebuilt the terminator in memory —
+    `body[head:end] + b"-----END CERTIFICATE-----\\n"` — so when the input's
+    END already sat on the base64 line, the slice ended mid-base64 and the
+    appended terminator REPAIRED the block for the parser. cryptography read
+    it happily and the predicate answered True about a file that is still
+    fused on disk. `_find_end` cannot catch it: a fused END does terminate
+    its line. 0.1.14 added exactly this guard to `_salvage_bundle` and the
+    predicate 115 lines away never got it. Measured:
+
+        predicate  : True
+        node loads : 1 (CORP-A)      <- OUR CA gone, cannot verify our proxy
+
+    RIGHT EDGE OF BEGIN. `_BEGIN_MARKER` requires a line terminator AFTER the
+    marker, so `-----BEGIN CERTIFICATE-----garbage` does not match at all —
+    the block becomes INVISIBLE to the scan rather than refused. openssl
+    rejects it and truncates from there. Measured, damage on the FIRST of
+    three blocks:
+
+        predicate  : True
+        node loads : 2 of 3          <- CORP-A silently lost
+        control    : 3 of 3
+
+    This one fires even with node PRESENT: our CA sits after the damage, so
+    the handshake still succeeds and the oracle cannot veto either.
+
+    THE FIX IS ONE SCANNER, NOT FOUR PATCHES. Both readers now consume
+    `_pem_blocks`, which yields a block only when its BEGIN and its END each
+    own their line, and hands out the bytes VERBATIM — reconstructing a
+    terminator is what let the predicate lie about what is on disk.
+    """
+
+    def _ours(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+
+    def test_an_END_welded_to_the_base64_line_is_not_usable(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ours(tmp_path)
+        raw = ours.read_bytes().strip() + b"\n"
+        corp = _other_ca(tmp_path / "corp-a")
+        fused = raw.replace(b"\n-----END CERTIFICATE-----", b"-----END CERTIFICATE-----")
+        assert _bundle_is_usable(corp + fused, raw.strip()) is False, (
+            "the predicate rebuilt the terminator in memory and called a "
+            "fused file usable — node loads 1 of 2 from it and the session "
+            "cannot verify its own proxy"
+        )
+
+    def test_a_BEGIN_with_trailing_text_is_not_usable(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ours(tmp_path)
+        raw = ours.read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        c = _other_ca(tmp_path / "corp-c")
+        # TRAILING TEXT ONLY, leaving the block otherwise INTACT — its base64
+        # and its END line are untouched. That is what isolates this guard:
+        # with a truncated body the END matcher catches it anyway, and the
+        # mutation survives. Measured: with the BEGIN check disabled the
+        # scanner yields this block as healthy.
+        damaged = a.replace(
+            b"-----BEGIN CERTIFICATE-----\n", b"-----BEGIN CERTIFICATE-----garbage\n", 1
+        )
+        assert _bundle_is_usable(damaged + raw + c, raw.strip()) is False, (
+            "a BEGIN carrying trailing text was INVISIBLE to the scan, so the "
+            "predicate never saw the block and approved a file node truncates "
+            "at — 2 of 3 roots loaded, and the oracle cannot veto it either "
+            "because our CA sits after the damage"
+        )
+
+    def test_a_damaged_BEGIN_on_a_NON_certificate_block_is_caught_too(
+        self, tmp_path
+    ):
+        """THE SHAPE ONLY THIS GUARD CATCHES, and finding it took measuring
+        rather than reasoning.
+
+        For a CERTIFICATE the x509 parse refuses a block whose BEGIN carries
+        trailing text anyway, so removing the marker guard changes nothing and
+        the mutation SURVIVES. A CRL or a PUBLIC KEY is only checked for
+        intact base64 armor — deliberately, since a real corporate bundle
+        carries those — so nothing else refuses it:
+
+            shape                      node  shipped  guard-removed
+            BEGIN+garbage on a CERT    2     False    False
+            BEGIN+garbage on a PUBKEY  2     False    TRUE    <- approved
+
+        node loads 2 of 3 either way. The predicate is the only thing standing
+        between that file and a session that silently lost a root.
+        """
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ours(tmp_path)
+        raw = ours.read_bytes().strip() + b"\n"
+        c = _other_ca(tmp_path / "corp-c")
+        damaged_key = (
+            b"-----BEGIN PUBLIC KEY-----garbage\nQUFBQQ==\n-----END PUBLIC KEY-----\n"
+        )
+        assert _bundle_is_usable(damaged_key + raw + c, raw.strip()) is False, (
+            "a damaged BEGIN on a non-certificate block was approved — only "
+            "the armor is checked there, so nothing else refuses it"
+        )
+
+    def test_salvage_recovers_a_block_damaged_on_either_edge(self, tmp_path):
+        """Refusing is only half the answer: the repair must then keep every
+        block that is still readable, whichever edge was damaged."""
+        from cswap_pin.proxy import _salvage_bundle
+
+        ours = self._ours(tmp_path)
+        raw = ours.read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        c = _other_ca(tmp_path / "corp-c")
+        damaged = a.replace(
+            b"-----BEGIN CERTIFICATE-----", b"-----BEGIN CERTIFICATE-----garbage", 1
+        )
+        out = _salvage_bundle(damaged + raw + c, raw.strip())
+
+        def der(pem: bytes) -> bytes:
+            from cryptography.hazmat.primitives import serialization
+
+            return x509.load_pem_x509_certificate(pem).public_bytes(
+                serialization.Encoding.DER
+            )
+
+        import re as _r
+
+        carried = {
+            der(b)
+            for b in _r.findall(
+                rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", out, _r.S
+            )
+        }
+        assert der(c) in carried, "a healthy block after the damage was dropped"
+        assert der(raw) in carried, "lost our own CA"
+
+    def test_a_healthy_bundle_is_still_usable(self, tmp_path):
+        """The false-REJECT direction, for all four edges at once."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        ours = self._ours(tmp_path)
+        raw = ours.read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        assert _bundle_is_usable(a + raw, raw.strip()) is True, "healthy LF refused"
+        assert _bundle_is_usable(
+            (a + raw).replace(b"\n", b"\r\n"), raw.strip()
+        ) is True, "healthy CRLF refused"
