@@ -47,4 +47,43 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # Trusted publishing needs a publisher registered on PyPI's side, and it
+      # is NOT registered for this project: both 0.1.1 and 0.1.2 failed here
+      # with `invalid-publisher` while the release itself went out by hand.
+      # A workflow that fails on every release trains people to ignore it, and
+      # the manual fallback leaves no record of what was uploaded.
+      #
+      # So: OIDC when the publisher exists, an API token when it does not, and
+      # a loud failure when NEITHER is available — rather than the silent
+      # divergence where the tag says released and PyPI says otherwise.
+      - name: Publish via trusted publishing
+        id: oidc
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@release/v1
+      # `secrets` is not available in an `if:` expression, so the presence of
+      # the token is hoisted into a job-level output first. Referencing it
+      # directly makes the condition silently false and the step never runs.
+      - name: Note whether a token is configured
+        id: tok
+        if: steps.oidc.outcome == 'failure'
+        env:
+          TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "have=true" >> "$GITHUB_OUTPUT"
+          else echo "have=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Publish with an API token
+        if: steps.oidc.outcome == 'failure' && steps.tok.outputs.have == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Fail if nothing published
+        if: steps.oidc.outcome == 'failure' && steps.tok.outputs.have != 'true'
+        run: |
+          echo "::error::Trusted publishing was refused (invalid-publisher) and"
+          echo "::error::no PYPI_API_TOKEN secret is set, so NOTHING was uploaded."
+          echo "::error::Register the publisher at"
+          echo "::error::https://pypi.org/manage/project/cswap-pin/settings/publishing/"
+          echo "::error::  owner: codeslake   repo: cswap-pin"
+          echo "::error::  workflow: publish.yml   environment: pypi"
+          echo "::error::or add a PYPI_API_TOKEN repository secret."
+          exit 1
