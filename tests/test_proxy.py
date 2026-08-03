@@ -6136,3 +6136,109 @@ class TestNoEmissionSiteCanHandOverATornFile:
             "the no-shared-bundle tail wrote a file with an unreadable block "
             f"— blocks={self._blocks(body)}"
         )
+
+
+class TestTheUnMergeBranchReadsTheFileItReturns:
+    """`_merged_ca`'s un-merge branch returned `ca-bundle.pem` on a PATH match
+    without ever opening it. Every other path in that function checks content
+    or freshness; this one returns before both.
+
+    Measured on 0.1.22, `other == <certdir>/ca-bundle.pem`, control first:
+
+        bundle state           returned        exists  blocks  carries LIVE ca
+        CONTROL healthy        ca-bundle.pem   True     2       True
+        EMPTY                  ca-bundle.pem   True     0       False
+        STALE (dead CA only)   ca-bundle.pem   True     2       False
+        TORN                   ca-bundle.pem   True     0       False
+        ABSENT                 ca-bundle.pem   FALSE   -        n/a
+
+    The last row wires a path that does not exist. The stale row is the one
+    that happens without anyone doing anything wrong: `ensure_ca` regenerates
+    the CA whenever `_certs_consistent` is False — expiry (it renews 30 days
+    early), a partial cert-dir wipe, a mismatched pair — and `ca-bundle.pem`
+    is not in the consistency set, so it survives carrying the RETIRED CA.
+    Not self-healing: every later launch takes the same branch and returns the
+    same stale file while the live `ca.pem` sits one directory entry away.
+
+    It matters because `wire_global_config` writes `.claude.json`'s env block,
+    which Claude Code applies at boot and which therefore BEATS the exec'd env
+    from `wire_env`. The wrong writer wins, and a session wired to a bundle
+    without the live CA cannot verify the proxy it is routed through.
+
+    Pre-existing in 0.1.19 through 0.1.22 — this is the door the empty-CA
+    sweep moved its guards PAST rather than through.
+    """
+
+    def _live_and_bundle(self, tmp_path, bundle_content):
+        from cswap_pin.proxy import ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        bundle = ours.parent / "ca-bundle.pem"
+        if bundle_content is not None:
+            bundle.write_bytes(bundle_content)
+        return ours, bundle
+
+    def _carries(self, body, pem_path):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+
+        from cswap_pin.proxy import _pem_blocks
+
+        want = x509.load_pem_x509_certificate(pem_path.read_bytes()).public_bytes(
+            serialization.Encoding.DER
+        )
+        for label, _h, _e, block in _pem_blocks(body):
+            if label != b"CERTIFICATE":
+                continue
+            try:
+                if (
+                    x509.load_pem_x509_certificate(block).public_bytes(
+                        serialization.Encoding.DER
+                    )
+                    == want
+                ):
+                    return True
+            except Exception:  # noqa: BLE001 — a block we cannot read is not a match
+                pass
+        return False
+
+    @pytest.mark.parametrize("state", ["stale", "empty", "absent"])
+    def test_a_bundle_without_the_live_ca_is_not_handed_back(self, tmp_path, state):
+        from cswap_pin.proxy import _merged_ca
+
+        content = {
+            # the realistic one: a CA regeneration left the old bundle behind
+            "stale": _other_ca(tmp_path / "dead") + _other_ca(tmp_path / "peer"),
+            "empty": b"",
+            "absent": None,
+        }[state]
+        ours, bundle = self._live_and_bundle(tmp_path, content)
+
+        out = _merged_ca(ours, str(bundle))
+        body = out.read_bytes() if out.exists() else b""
+
+        assert self._carries(body, ours), (
+            f"the un-merge branch returned {out.name} for a {state} bundle "
+            "without reading it — the session is wired to a file that does not "
+            "carry the CA it must verify the proxy with, and the live ca.pem "
+            f"is right there. exists={out.exists()}"
+        )
+
+    def test_a_healthy_bundle_is_still_returned_unmerged(self, tmp_path):
+        """CONTROL, and the property the branch exists for: a nested launch
+        must keep its merged bundle rather than un-merging back to ca.pem and
+        losing the upstream proxy's CA on every later session."""
+        from cswap_pin.proxy import _merged_ca, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        bundle = ours.parent / "ca-bundle.pem"
+        bundle.write_bytes(ours.read_bytes() + _other_ca(tmp_path / "up"))
+
+        out = _merged_ca(ours, str(bundle))
+
+        assert out == bundle, f"a healthy nested bundle was un-merged to {out.name}"
+        assert len(
+            [b for b in __import__("cswap_pin.proxy", fromlist=["x"])._pem_blocks(
+                out.read_bytes()
+            ) if b[0] is not None]
+        ) == 2, "the upstream CA was lost"
