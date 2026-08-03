@@ -493,6 +493,43 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
 
 
 
+def _armor_decodes(body: bytes) -> bool:
+    """Whether openssl will read this non-certificate block's armor.
+
+    ONE FUNCTION, because the predicate and salvage must agree and had
+    already drifted: 0.1.16 fixed the slice in both and the emptiness in
+    neither, so a block openssl refuses was kept by both readers.
+
+    `base64.b64decode(..., validate=True)` is necessary and NOT sufficient —
+    it accepts three shapes openssl rejects, each measured against node with
+    a corp root beside the block (correct answer 2, node loaded 1):
+
+        empty / whitespace-only body   no openssl warning at all
+        `QUFB=`  (5 chars)             bad base64 decode
+        a blank line before END        bad end line
+
+    The first is the dangerous one: the session loses every corporate root
+    with nothing on stderr to say why. openssl needs at least one whole
+    4-character quantum and will not tolerate a blank line before the
+    terminator, which is exactly what the three conditions encode.
+
+    `validate=True` stays: a body carrying stray dashes (what a concatenating
+    builder produces on a torn seam) is accepted without it.
+    """
+    import base64
+
+    data = b"".join(body.split())
+    if not data or len(data) % 4:
+        return False
+    if b"\n\n" in body.replace(b"\r\n", b"\n"):
+        return False
+    try:
+        base64.b64decode(data, validate=True)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def _pem_blocks(body: bytes):
     """Every block whose BEGIN **and** END each own their line.
 
@@ -643,9 +680,7 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
                     continue
             else:
                 body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
-                try:
-                    base64.b64decode(b"".join(body_only.split()), validate=True)
-                except Exception:  # noqa: BLE001
+                if not _armor_decodes(body_only):
                     continue
             kept.append(block)
         if not stopped:
@@ -748,9 +783,7 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
             # block has only this, which is why a certificate-only test hides
             # it.
             body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
-            try:
-                base64.b64decode(b"".join(body_only.split()), validate=True)
-            except Exception:  # noqa: BLE001
+            if not _armor_decodes(body_only):
                 return False
     del seen_any
     return carries_us
