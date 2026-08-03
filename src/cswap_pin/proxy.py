@@ -2155,6 +2155,122 @@ _FIRST_HOLDER_TIMEOUT = 300.0
 _CLAIM_RECHECK_INTERVAL = 5.0
 
 
+_WIRED_ONCE_MARKER = ".was-wired"
+
+
+def _mark_wired_once(certdir: Path, port: int) -> None:
+    """Record that the global wiring named ``port`` for THIS cert dir.
+
+    On disk rather than in a process global: the qualification belongs to the
+    daemon-and-certdir pair, and a module-level set is shared by everything in
+    the interpreter. In tests that is a silent cross-contamination (one case
+    wires a port, the next reuses the number for an orphan and inherits the
+    qualification); in production a single process can serve more than one
+    certdir over its life. Best-effort — a lost mark costs one skipped repair,
+    which the next tick retries.
+    """
+    try:
+        (certdir / _WIRED_ONCE_MARKER).write_text(str(port), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _was_wired_once(certdir: Path, port: int) -> bool:
+    try:
+        return (certdir / _WIRED_ONCE_MARKER).read_text(encoding="utf-8").strip() == str(port)
+    except OSError:
+        return False
+
+
+def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
+    """Re-point a pin wiring that names a DEAD port back at this daemon.
+
+    RECOVERY HAS TO LIVE IN THE PACKAGE THAT HAS THE BUG. Until now the only
+    thing that ever repaired a pin without a human was one developer's
+    status line, spawning ``cswap pin --heal`` on a timer. A census of the
+    host found exactly one caller of ``heal`` — the CLI, i.e. a person typing
+    it. So anyone who installs cswap-pin and does not also install that
+    person's dotfiles has NO automatic recovery: a wiring that points at a
+    dead port stays broken, and what they see is "new sessions cannot reach
+    the API", with nothing connecting that to the pin.
+
+    The daemon is the right host because it needs no external timer, no TUI
+    and no shell integration — it is already running, and it already re-reads
+    the wiring every few seconds (``_is_claimed``, from ``watch_refcount``).
+    That check asked "does the config still name me?" purely to decide
+    whether to keep serving; the answer "no" was equally consistent with
+    "someone unpinned" and with "the config is broken", and both were treated
+    as the former.
+
+    THE TWO ARE DISTINGUISHED BY WHETHER THE WIRED PORT ANSWERS:
+
+      * it answers            -> another daemon owns the pin, or the user
+                                 re-pinned elsewhere. NOT ours to touch.
+      * nothing is wired      -> the pin was cleared. Leave it cleared.
+      * wired, and DEAD       -> the wiring is broken and we are the daemon it
+                                 should name. Repair it.
+
+    Measured, and this is the state that motivated it: a config rewritten to
+    port 52000 while this daemon served 36301. Every running session was fine
+    (their env is fixed at exec) and every NEW session inherited a port
+    nothing listened on. The daemon was healthy the whole time, so nothing
+    that watches the daemon could see it.
+
+    Never raises: a repair that can crash the refcount watcher would trade a
+    broken wiring for a dead pin.
+    """
+    try:
+        # ONLY A REAL, SERVING DAEMON MAY REPAIR. ``live_clients`` is the
+        # daemon's own connection counter, handed in by the process that owns
+        # the listening socket — so its presence IS the proof that a server
+        # exists here. A bare refcount watcher with no server (a test harness,
+        # a helper thread) must never rewrite a user's config: it cannot honour
+        # the port it would advertise.
+        #
+        # Measured: without this, a leaked watcher thread from one test kept
+        # running past its fixture and rewrote the NEXT test's config to a port
+        # nothing served — the same class of cross-contamination as writing to
+        # a live config, one scope up.
+        if live_clients is None:
+            return False
+        # ONLY A DAEMON THE WIRING ONCE NAMED MAY RECLAIM IT. Without this the
+        # repair is indistinguishable from a hijack, and it disables the orphan
+        # reaper outright: a daemon left behind by a crashed spawn — one the
+        # config never named — would see a wiring it does not match, call it
+        # "broken", and rewrite the user's config to point at ITSELF. It then
+        # counts as claimed forever and never times out. Measured: two reaper
+        # tests went red, and the shape they describe is a real leak, not a
+        # fixture artifact.
+        #
+        # Being wired at least once is what separates the two populations. The
+        # daemon this exists for was serving a wiring that named it and then
+        # lost it; an orphan never had one.
+        if not _was_wired_once(certdir, port):
+            return False
+        wired = _wired_port()
+        if wired is None or wired == port:
+            return False  # unpinned, or already correct — not our business
+        # Does the port the config names actually answer? If it does, someone
+        # else legitimately owns the pin and rewriting would steal it.
+        try:
+            with socket.create_connection(("127.0.0.1", wired), timeout=1):
+                return False
+        except OSError:
+            pass  # dead, as expected for the broken case
+        # And the record must still be OURS — checked by the caller, but the
+        # connect above took time, so re-read rather than trust the gap.
+        st = read_daemon_state(certdir)
+        if not st or int(st.get("pid") or 0) != os.getpid():
+            return False
+        if int(st.get("port") or 0) != port:
+            return False
+        wire_global_config(port, certdir / "ca.pem")
+        _log_lifecycle(f"repaired a wiring that named dead port {wired} -> {port}")
+        return True
+    except Exception:  # noqa: BLE001 — never break the watcher
+        return False
+
+
 def _is_claimed(certdir: Path, live_clients=None) -> bool:
     """True when the global wiring names THIS daemon, holder or no holder.
 
@@ -2198,7 +2314,11 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
             return False  # not our record — say nothing about our own liveness
         port = int(st["port"])
         if _wired_port() == port:
+            # Remember it, because this is the ONLY moment that proves we are
+            # the pin's daemon rather than an orphan. See _repair_wiring_if_ours.
+            _mark_wired_once(certdir, port)
             return True
+        _repair_wiring_if_ours(certdir, port, live_clients)
         # Ask the daemon itself first. It is the only source that answers on
         # every platform: the socket scan below reads /proc/net/tcp, which
         # BOTH MACS lack, and its None was being coerced to "not claimed" —
