@@ -2978,7 +2978,14 @@ class TestHealReWiresAServingDaemon:
         srv.bind(("127.0.0.1", 0))
         srv.listen(4)
         port = srv.getsockname()[1]
-        proxy.write_daemon_state(certdir, port, os.getpid(), "fp")
+        # The REAL fingerprint, not a literal. These tests are about a daemon
+        # that is serving CURRENT code and merely unwired; a literal made it
+        # indistinguishable from one running code we no longer ship, which heal
+        # now recycles. Writing the real one keeps each case testing the thing
+        # it names — the stale case has its own test below.
+        proxy.write_daemon_state(
+            certdir, port, os.getpid(), proxy.daemon_fingerprint()
+        )
         (tmp_path / "settings.json").write_text(
             json.dumps(
                 {"remoteControl": {"pinnedEmail": "c@e.com", "pinnedOrganizationUuid": ""}}
@@ -3332,3 +3339,210 @@ class TestAnUpgradeCostsNoSession:
         started = time.monotonic()
         p.stop(drain=30.0)  # nobody connected
         assert time.monotonic() - started < 2.0
+
+
+class TestAnUpgradeDoesNotWaitForALaunch:
+    """Installing a new cswap-pin must take effect BY ITSELF.
+
+    MEASURED FAILURE: 0.1.3 landed on disk at 22:11 and the daemon was still
+    the 20:04 process running 0.1.1 half an hour later — on a box whose entire
+    release note was that upgrading no longer costs a session anything. The
+    installer rewrites files; nothing on the machine told the running daemon it
+    was now obsolete.
+
+    `ensure_proxy` DOES recycle a stale daemon, but it only runs when a NEW
+    session starts. On a box with long-lived sessions that can be never. `heal`
+    is the one thing that already runs periodically (the status line, every few
+    seconds), and it read a stale daemon as healthy because it asked
+    `_read_alive_port` without a fingerprint.
+    """
+
+    def _serving_daemon(self, tmp_path, monkeypatch, fingerprint):
+        """A daemon serving under ``fingerprint``, with a pin record."""
+        import socket
+
+        from cswap_pin import proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        proxy.write_daemon_state(certdir, port, os.getpid(), fingerprint)
+        (tmp_path / "settings.json").write_text(
+            json.dumps(
+                {"remoteControl": {"pinnedEmail": "c@e.com", "pinnedOrganizationUuid": ""}}
+            )
+        )
+        (tmp_path / "sequence.json").write_text(
+            json.dumps({"accounts": {"1": {"email": "c@e.com"}}})
+        )
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                        "CSWAP_PIN_PORT": str(port),
+                    },
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                }
+            )
+        )
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        return srv, port, cfg, certdir
+
+    def test_a_daemon_running_OLD_code_is_recycled(self, tmp_path, monkeypatch):
+        """The upgrade case. Serving, wired correctly, and obsolete."""
+        from cswap_pin import proxy
+
+        srv, port, _cfg, certdir = self._serving_daemon(
+            tmp_path, monkeypatch, "an-old-release"
+        )
+        killed, spawned = [], []
+        # It must be recognised as OURS before being signalled — a pid is
+        # reused freely, and killing on liveness alone aims TERM at whatever
+        # unrelated process inherited the number.
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: killed.append(pid))
+
+        def _spawn(num, email, cd):
+            spawned.append((num, email))
+            return port  # a real respawn reclaims the SAME port
+
+        monkeypatch.setattr(proxy, "_spawn_daemon", _spawn)
+        try:
+            assert proxy.heal(tmp_path) is True, "an obsolete daemon was left running"
+            assert killed == [os.getpid()], "the stale daemon was not recycled"
+            assert spawned, "nothing replaced it"
+        finally:
+            srv.close()
+
+    def test_the_port_is_reclaimed_so_live_sessions_survive(self, tmp_path, monkeypatch):
+        """A session's HTTPS_PROXY is fixed at exec and cannot be told a new
+        address. So the recycle MUST hand the successor the old port — the hint
+        has to be written BEFORE the kill, because the daemon unlinks its own
+        state on TERM and afterwards there is nothing left to reclaim from."""
+        from cswap_pin import proxy
+
+        srv, port, _cfg, certdir = self._serving_daemon(
+            tmp_path, monkeypatch, "an-old-release"
+        )
+        hint_at_kill = {}
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
+
+        def _kill(pid):
+            # Whatever the successor can reclaim, it can only be what was on
+            # disk at THIS moment.
+            hint_at_kill["port"] = proxy.read_port_hint(certdir)
+
+        monkeypatch.setattr(proxy, "_kill_daemon", _kill)
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: port)
+        try:
+            proxy.heal(tmp_path)
+            assert hint_at_kill.get("port") == port, (
+                "the port hint was not written before the kill — the successor "
+                "would take a fresh port and strand every wired session"
+            )
+        finally:
+            srv.close()
+
+    def test_a_CURRENT_daemon_is_never_recycled(self, tmp_path, monkeypatch):
+        """The guard must not turn the status line into a restart loop. heal
+        runs every few seconds; recycling a healthy daemon would cost every
+        session its in-flight requests, over and over."""
+        from cswap_pin import proxy
+
+        srv, _port, _cfg, _certdir = self._serving_daemon(
+            tmp_path, monkeypatch, proxy.daemon_fingerprint()
+        )
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
+        monkeypatch.setattr(
+            proxy,
+            "_kill_daemon",
+            lambda pid: pytest.fail("recycled a daemon running CURRENT code"),
+        )
+        try:
+            assert proxy.heal(tmp_path) is False
+        finally:
+            srv.close()
+
+    def test_an_unidentifiable_pid_is_never_signalled(self, tmp_path, monkeypatch):
+        """When `ps` cannot prove the pid is ours, kill NOTHING. Being unable
+        to identify a process is not a reason to signal it."""
+        from cswap_pin import proxy
+
+        srv, _port, _cfg, _certdir = self._serving_daemon(
+            tmp_path, monkeypatch, "an-old-release"
+        )
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [])  # no ps
+        monkeypatch.setattr(
+            proxy,
+            "_kill_daemon",
+            lambda pid: pytest.fail("signalled a pid it could not identify"),
+        )
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: None)
+        try:
+            proxy.heal(tmp_path)
+        finally:
+            srv.close()
+
+
+class TestTheKillBudgetOutlastsTheDrain:
+    """A recycle must not SIGKILL the drain it is waiting for.
+
+    MEASURED: `_kill_daemon` waited a fixed ~2s for TERM while `_teardown`
+    runs `stop(drain=30)`. Against a real streaming client the recycle killed
+    the daemon mid-drain — the client got 4 of 10 SSE events and the drain
+    never completed. So the release's headline guarantee (in-flight requests
+    survive an upgrade) held only for a signal sent by hand, never for the
+    recycle the package itself performs.
+    """
+
+    def test_the_term_budget_exceeds_the_drain_ceiling(self):
+        """Derived, not chosen. Two independently-picked timeouts that must be
+        ordered is a bug that returns every time either is tuned."""
+        import inspect
+
+        from cswap_pin import proxy
+
+        src = inspect.getsource(proxy._kill_daemon)
+        assert "_DRAIN_SECONDS" in src, (
+            "the TERM budget is not derived from the drain ceiling — a literal "
+            "here silently cancels the drain the next time either is tuned"
+        )
+
+    def test_a_draining_daemon_is_not_killed_before_it_finishes(self, monkeypatch):
+        """Behaviour, not source: a process that exits just under the drain
+        ceiling must be reaped by TERM, never escalated to KILL."""
+        import time
+
+        from cswap_pin import proxy
+
+        # A daemon that used its full drain and exited cleanly, counted in
+        # LOOP ITERATIONS rather than wall-clock: `_kill_daemon` imports `time`
+        # inside the function, so `time.sleep` cannot be patched from out here
+        # and a real-time test would take 30 seconds to answer a question about
+        # arithmetic. Each iteration is one 0.1s tick by construction.
+        ticks = {"n": 0}
+        exits_after = int((proxy._DRAIN_SECONDS - 0.5) * 10)
+
+        def _alive(pid):
+            ticks["n"] += 1
+            return ticks["n"] < exits_after
+
+        monkeypatch.setattr(proxy, "_pid_alive", _alive)
+        signals = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: signals.append(sig))
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        proxy._kill_daemon(4242)
+        assert 15 in signals, "never sent TERM"
+        assert 9 not in signals, (
+            "escalated to SIGKILL while the daemon was still draining — "
+            "in-flight requests die on the upgrade path"
+        )

@@ -1,6 +1,6 @@
 [project]
 name = "cswap-pin"
-version = "0.1.3"
+version = "0.1.4"
 description = "Keep Claude Code's Remote Control and Artifacts on one account while inference follows cswap's account swap"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,16 @@ classifiers = [
 # circular and let `pip install cswap-pin` drag in the whole switcher for
 # someone who already has it. The import surface it needs is small and
 # declared in _host.py.
-dependencies = ["cryptography>=41.0"]
+# 42.0, NOT 41.0. `_certs_consistent` reads `not_valid_after_utc`, which landed
+# in 42.0 — on 41.x the attribute does not exist, the AttributeError is caught,
+# and the function returns False FOREVER. Every launch then regenerates the CA
+# and the daemon serves a leaf signed by a CA the session was never told about.
+# Measured on a clean 41.0.7 venv: `not_valid_after_utc` MISSING, CA unstable
+# across two ensure_ca calls, and the handshake fails with
+# CERTIFICATE_VERIFY_FAILED. 42.0.0 is stable. `pip install cswap-pin` resolves
+# whatever satisfies the floor, so a constrained environment can land on 41.x
+# and get a pin that breaks every request, silently.
+dependencies = ["cryptography>=42.0"]
 
 [project.urls]
 Homepage = "https://github.com/codeslake/cswap-pin"
