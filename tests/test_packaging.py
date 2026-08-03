@@ -148,7 +148,14 @@ def test_an_installed_build_reports_the_version_it_was_built_as():
     )
     assert declared, "pyproject.toml has no version"
 
-    if subprocess.run(["uv", "--version"], capture_output=True).returncode != 0:
+    # shutil.which FIRST. `subprocess.run(["uv", ...])` raises FileNotFoundError
+    # when uv is not on PATH — it never reaches the returncode this checked, so
+    # the skip could not fire. Measured under `PATH=/usr/bin:/bin`, which is how
+    # this suite is run against the box's older node:
+    #     FileNotFoundError: [Errno 2] No such file or directory: 'uv'
+    import shutil
+
+    if shutil.which("uv") is None:
         pytest.skip("uv unavailable — cannot build a wheel to inspect")
 
     import tempfile
