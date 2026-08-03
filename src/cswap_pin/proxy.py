@@ -207,16 +207,23 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     # NODE_EXTRA_CA_CERTS — so the session would trust the UPSTREAM proxy's CA
     # while unable to verify OUR proxy, the hop it is actually routed through.
     # Returning `ca_path` is the same fallback every other error here takes.
+    if Path(other) == bundle:
+        # Already the merged file (a launch inside a pinned session inherits it
+        # from our own env block). Returning ca_path here would UN-merge it and
+        # lose the upstream proxy's CA on every later session.
+        #
+        # AHEAD OF THE EMPTY-CA GUARD, deliberately. 0.1.20 put the guard first
+        # and made this case strictly worse than 0.1.19: an empty ca.pem in a
+        # nested launch returned ca.pem and wired ZERO CAs, while the good
+        # bundle sat on disk untouched. Measured — 0.1.19 wired 2, 0.1.20
+        # wired 0. Returning a merge we did not build from the empty file
+        # costs nothing and keeps every upstream root.
+        return bundle
     try:
         if not ca_path.read_bytes().strip():
             return ca_path
     except OSError:
         return ca_path
-    if Path(other) == bundle:
-        # Already the merged file (a launch inside a pinned session inherits it
-        # from our own env block). Returning ca_path here would UN-merge it and
-        # lose the upstream proxy's CA on every later session.
-        return bundle
     other_path = Path(other)
     # Rebuild only when an input is newer than the output — the inputs are
     # immutable per launch, so the steady state is two stats instead of
@@ -860,10 +867,24 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # so the session trusted the peer's certificates and could not
             # verify the proxy it was routed through — the exact failure
             # `_bundle_is_usable` exists to prevent, arriving through the
-            # REPAIR path. Falling through returns our own path, which is the
-            # honest answer when we have no CA to be carried by a merge.
+            # REPAIR path.
+            #
+            # RETURN, NOT RAISE. 0.1.20 raised here and said in this comment
+            # that it fell through to "our own path". It did not: the raise
+            # landed in the blanket `except Exception: pass` below, and control
+            # continued into the tail merge, which concatenates `ca_path`
+            # unconditionally and produced the SAME bundle the guard was
+            # written to prevent. Measured with `existing` set — the shape
+            # every machine with `NODE_EXTRA_CA_CERTS` runs:
+            #
+            #   ours            returned         blocks  carries ours
+            #   real (CONTROL)  ca-bundle.pem    2       True
+            #   EMPTY           ca-bundle.pem    1       False
+            #
+            # Control flow by exception into a handler 90 lines away puts the
+            # landing site out of the author's sight. Say where it goes.
             if not ours:
-                raise ValueError("no CA of our own to be carried by a merge")
+                return Path(ca_path)
             body = shared.read_bytes()
             # Carrying our CA is necessary but not sufficient. An unbalanced
             # BEGIN/END anywhere in the file makes Node reject the WHOLE extras
@@ -964,6 +985,25 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
     # describe, and reaching past it would wire a session to trust something
     # its caller never mentioned.
     if not existing or Path(existing) == Path(ca_path):
+        return Path(ca_path)
+    # DOOR FOUR. Same shape as `_merged_ca`: reads `ca_path`, concatenates it
+    # unconditionally, returns the merge. 0.1.20 guarded the salvage arm and
+    # `_merged_ca` and shipped a commit titled "three doors" — this is the
+    # fourth, and it is the one the other guards FALL INTO, because a refusal
+    # above lands here rather than at a return.
+    #
+    # It is also the live path wherever `NODE_EXTRA_CA_CERTS` is already set,
+    # which `wire_env` passes straight in as `existing`:
+    #
+    #   hostname -s            host-a
+    #   NODE_EXTRA_CA_CERTS    /etc/ssl/certs/ca-certificates.crt
+    #
+    # so the `if not existing` return above is never taken there and an empty
+    # ca.pem produced a bundle carrying the corporate CA and nothing of ours.
+    try:
+        if not Path(ca_path).read_bytes().strip():
+            return Path(ca_path)
+    except OSError:
         return Path(ca_path)
     bundle = Path(ca_path).parent / "ca-bundle.pem"
     try:
