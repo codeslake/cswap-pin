@@ -825,6 +825,26 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
         shared = get_claude_config_home() / CA_TRUST_FILE
         if shared.is_file() and shared.stat().st_size > 0:
             ours = Path(ca_path).read_bytes().strip()
+            # SYMMETRIC WITH `_publish_ca`, and this is the site that needed it
+            # more. Both read the same `ca_path` and treat the bytes as OUR CA;
+            # `_publish_ca` refused an empty one and this arm did not. The
+            # failures are not the same size: `_publish_ca` skipping a write
+            # costs one file in `ca-trust.d` that the next launch rewrites,
+            # while this arm decides what the SESSION gets. With an empty
+            # `ours`, `_salvage_bundle` appends nothing — the append is gated
+            # on `_bundle_is_usable(kept, ours)`, and that answers False here
+            # by its own vacuity guard rather than because containment failed.
+            # Measured before this line existed:
+            #
+            #   salvage(peer, ours=b"")   1 block, ours ABSENT
+            #
+            # so the session trusted the peer's certificates and could not
+            # verify the proxy it was routed through — the exact failure
+            # `_bundle_is_usable` exists to prevent, arriving through the
+            # REPAIR path. Falling through returns our own path, which is the
+            # honest answer when we have no CA to be carried by a merge.
+            if not ours:
+                raise ValueError("no CA of our own to be carried by a merge")
             body = shared.read_bytes()
             # Carrying our CA is necessary but not sufficient. An unbalanced
             # BEGIN/END anywhere in the file makes Node reject the WHOLE extras
