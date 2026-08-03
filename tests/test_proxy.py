@@ -1985,6 +1985,21 @@ class TestCaIsPublishedEveryLaunch:
         assert (home / pp.CA_TRUST_DIR / "cswap-pin.pem").exists()
 
 
+def _config_home(tmp_path, monkeypatch):
+    """A throwaway Claude config home, where the shared bundle is read from.
+
+    Module-level rather than a per-class helper: four classes had a verbatim
+    copy of it, and the one thing it does that must not drift is patching
+    `claude_swap.paths.get_claude_config_home` — the path `_trust_file`
+    resolves the shared bundle through. A copy that patched something else
+    would test a bundle nothing reads.
+    """
+    home = tmp_path / "cfg"
+    home.mkdir()
+    monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+    return home
+
+
 def _other_ca(certdir):
     """Another component's real CA, for multi-writer bundle fixtures."""
     from cswap_pin.proxy import ensure_ca
@@ -4372,12 +4387,6 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
     refused both cost at most the torn block, never the corporate roots.
     """
 
-    def _home(self, tmp_path, monkeypatch):
-        home = tmp_path / "cfg"
-        home.mkdir()
-        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
-        return home
-
     def _ca(self, tmp_path):
         from cswap_pin.proxy import ensure_ca
 
@@ -4433,7 +4442,7 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         if not _node_available():
             pytest.skip("node cannot answer here — the oracle cannot be asked")
 
-        home = self._home(tmp_path, monkeypatch)
+        home = _config_home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         ours = ca.read_bytes()
         merged = home / CA_TRUST_FILE
@@ -4466,7 +4475,7 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         if not _node_available():
             pytest.skip("node cannot answer here — the oracle cannot be asked")
 
-        home = self._home(tmp_path, monkeypatch)
+        home = _config_home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         corp = _other_ca(tmp_path / "corp-root")
         (home / CA_TRUST_FILE).write_bytes(
@@ -4495,7 +4504,7 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         """
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
-        home = self._home(tmp_path, monkeypatch)
+        home = _config_home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         corp = _other_ca(tmp_path / "corp-root")
         (home / CA_TRUST_FILE).write_bytes(
@@ -4520,7 +4529,7 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         as before this existed."""
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
-        home = self._home(tmp_path, monkeypatch)
+        home = _config_home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         (home / CA_TRUST_FILE).write_bytes(
             b"-----BEGIN CERTIFICATE-----\n!!!junk!!!\n-----END CERTIFICATE-----\n"
@@ -4539,7 +4548,7 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         if not _node_available():
             pytest.skip("node cannot answer here — the oracle cannot be asked")
 
-        home = self._home(tmp_path, monkeypatch)
+        home = _config_home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         corp = _other_ca(tmp_path / "corp-root")
         (home / proxy.CA_TRUST_FILE).write_bytes(
@@ -4576,7 +4585,7 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         """
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
-        home = self._home(tmp_path, monkeypatch)
+        home = _config_home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         shared = home / CA_TRUST_FILE
         shared.write_bytes(
@@ -4659,4 +4668,253 @@ class TestTheOracleTestsRunWhereTheyClaimTo:
             f"node {'.'.join(map(str, version))} at {path} could not answer "
             f"(verdict={verdict!r}) — every test guarded on "
             f"`shutil.which('node')` would run against it and measure nothing"
+        )
+
+
+class TestTheOracleIsAVetoNeverAnApproval:
+    """`_bundle_loads_in_node`'s True must be necessary, never sufficient, for
+    wiring the shared file as-is.
+
+    Measured on this host (node v24.11.1), asking two independent questions
+    about the SAME bundle — how many extras did the loader keep, and will it
+    complete a handshake against OUR leaf:
+
+        bundle                    node v24.11.1 extras   handshake vs our leaf
+        ours + corp (healthy)     2                      OK
+        ours + TORN + corp        1   <- corp LOST       OK      <-- the hole
+
+    Node TRUNCATES at the first bad block and keeps everything before it. With
+    our CA before the tear, the handshake still succeeds — the oracle answers
+    True — while every corporate root after the tear silently vanished. On the
+    real 132-cert bundle with a tear placed after our CA, a reviewer measured
+    68 corporate roots lost this way, with `_salvage_bundle` already computing
+    the correct 133-cert answer that the verdict declined to use.
+
+    Today's real bundle happens to put our CA LAST, which is the lucky order.
+    Nothing pins that position — the builder is not ours.
+    """
+
+    def _ca(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+
+    @staticmethod
+    def _handshake_ok(node, bundle, leaf_key, leaf_pem):
+        """The same question `_bundle_loads_in_node` asks, pointed at a
+        DIFFERENT leaf (corp's own) — proving corp's root specifically made
+        it through node's loader, not merely that SOME extra did."""
+        import subprocess
+        import tempfile
+
+        probe = (
+            "const tls=require('tls'),fs=require('fs');"
+            "const s=tls.createServer("
+            "{key:fs.readFileSync(process.argv[2]),cert:fs.readFileSync(process.argv[3])},"
+            "c=>c.end());"
+            "s.listen(0,'127.0.0.1',()=>{"
+            "const c=tls.connect({host:'127.0.0.1',port:s.address().port,"
+            "servername:'api.anthropic.com'},()=>{"
+            "process.stdout.write('\\x02OK');c.destroy();s.close();});"
+            "c.on('error',()=>{process.stdout.write('\\x02NO');s.close();});});"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+        env["NODE_EXTRA_CA_CERTS"] = str(bundle)
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "probe.js"
+            script.write_text(probe, encoding="utf-8")
+            r = subprocess.run(
+                [node, str(script), str(leaf_key), str(leaf_pem)],
+                capture_output=True,
+                env=env,
+                timeout=10,
+            )
+        return r.stdout.startswith(b"\x02OK")
+
+    def test_a_tear_AFTER_our_CA_must_not_silently_drop_the_corporate_root(
+        self, tmp_path, monkeypatch
+    ):
+        import shutil
+
+        from cswap_pin.proxy import CA_TRUST_FILE, ensure_ca, wire_env
+
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
+        node = shutil.which("node")
+
+        home = _config_home(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        corp_dir = tmp_path / "corp-root"
+        corp_ca_path = ensure_ca(corp_dir, "api.anthropic.com").ca_path
+        corp_leaf, corp_key = corp_dir / "leaf.pem", corp_dir / "leaf.key"
+
+        TORN = (
+            b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n"
+            b"-----END CERTIFICATE-----\n"
+        )
+        # THE TEAR IS AFTER OUR CA — the lucky order today's real bundle
+        # happens to avoid, and nothing pins that position.
+        (home / CA_TRUST_FILE).write_bytes(
+            ca.read_bytes().strip() + b"\n" + TORN + corp_ca_path.read_bytes()
+        )
+
+        wired = wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"]
+        assert self._handshake_ok(node, wired, corp_key, corp_leaf), (
+            "the wired file cannot verify the corporate leaf — the oracle's "
+            "True (it verified OUR leaf) was treated as proof the whole "
+            "bundle loaded, but node truncates at the tear and silently "
+            "drops everything after it, including the corporate root"
+        )
+
+
+class TestTheSalvageArmLogsWhatItDid:
+    """A machine that silently switched off the shared bundle onto a private
+    salvage snapshot is exactly the state whose cause nobody can find later —
+    and the shared bundle stays broken because its builder is never told.
+    `_log_lifecycle` already fires on the `verdict is None` arm; the
+    refusal/salvage arm must name the shared path and how many blocks were
+    kept vs. found."""
+
+    def test_salvage_names_the_shared_path_and_the_block_count(
+        self, tmp_path, monkeypatch
+    ):
+        import contextlib
+        import io
+
+        from cswap_pin import proxy
+
+        home = _config_home(tmp_path, monkeypatch)
+        ca = proxy.ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        corp = _other_ca(tmp_path / "corp-root")
+        shared = home / proxy.CA_TRUST_FILE
+        shared.write_bytes(
+            corp
+            + b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n"
+            b"-----END CERTIFICATE-----\n"
+            + ca.read_bytes().strip()
+            + b"\n"
+        )
+        # No node on PATH: the oracle cannot be consulted, the predicate
+        # decides, and this torn bundle is unusable — the refusal/salvage arm
+        # runs regardless of what node is installed on this box.
+        monkeypatch.setattr("shutil.which", lambda name: None)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            proxy._trust_file(ca, None)
+        out = buf.getvalue()
+        assert str(shared) in out, (
+            f"the salvage arm did not name the refused shared path: {out!r}"
+        )
+        # 3 BEGIN blocks found (corp, the torn one, ours); 2 kept (corp, ours).
+        assert "2" in out and "3" in out, (
+            f"the salvage arm did not say how many blocks were kept vs found: "
+            f"{out!r}"
+        )
+
+
+class TestTheOwnershipGuardCannotBeFakedByName:
+    """`_make_ca` gives EVERY cswap-pin CA the identical subject
+    ``CN=cswap pin-proxy CA``, so a name-equality guard cannot tell OUR CA
+    from a completely different one with the same name. The guard must check
+    that the CA at ``ca_path`` actually SIGNED the leaf, not that its subject
+    string matches.
+    """
+
+    def test_a_leaf_signed_by_a_DIFFERENT_ca_of_the_same_name_is_rejected(
+        self, tmp_path
+    ):
+        """A certdir whose leaf.pem was NOT signed by ca_path's own CA — same
+        subject name, different key — must not pass the ownership guard.
+
+        A bundle carrying only the FOREIGN CA that actually signed the leaf
+        must not yield True: that would wire a session to a shared bundle
+        that cannot verify anything ca_path's own daemon will ever serve.
+        """
+        from cswap_pin import proxy
+        from cswap_pin.proxy import ensure_ca
+
+        real = tmp_path / "real"
+        real.mkdir()
+        ensure_ca(real, "api.anthropic.com")
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        ensure_ca(foreign, "api.anthropic.com")
+
+        # Same subject name on both (guaranteed by `_make_ca`) — verified so
+        # this test fails loudly if that assumption ever stops holding,
+        # rather than silently testing nothing.
+        real_ca = x509.load_pem_x509_certificate((real / "ca.pem").read_bytes())
+        foreign_ca = x509.load_pem_x509_certificate(
+            (foreign / "ca.pem").read_bytes()
+        )
+        assert real_ca.subject == foreign_ca.subject, (
+            "fixture assumption broken: cswap-pin CAs no longer share a subject"
+        )
+
+        # Plant the FOREIGN leaf beside the REAL ca.pem — same shape as a
+        # corrupted or cross-wired certdir.
+        (real / "leaf.pem").write_bytes((foreign / "leaf.pem").read_bytes())
+        (real / "leaf.key").write_bytes((foreign / "leaf.key").read_bytes())
+
+        # The bundle under test carries ONLY the foreign root — the one that
+        # actually signed the leaf now sitting in `real`, not `real`'s own CA.
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes((foreign / "ca.pem").read_bytes())
+
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
+
+        verdict = proxy._bundle_loads_in_node(bundle, real / "ca.pem")
+        assert verdict is None, (
+            "a leaf signed by a DIFFERENT CA than ca_path, sharing only its "
+            "subject NAME, passed the ownership guard — verdict was "
+            f"{verdict!r}, expected None (cannot ask: not our leaf)"
+        )
+
+
+class TestTheMissingLeafArmStaysUnknown:
+    """The first-launch race `ensure_ca`'s lock exists for: a certdir holding
+    `ca.pem` but no `leaf.pem` yet. `_bundle_loads_in_node` cannot set up its
+    own question there (no leaf to hand the probe) and must answer `None`,
+    never `False` — `False` means "asked and refused", which this call never
+    did.
+
+    THE OBSERVABLE DIFFERENCE, against a HEALTHY shared bundle:
+        None  -> `_trust_file` falls back to the predicate, which approves,
+                 and wires the LIVE shared file — later launcher repairs to
+                 it keep reaching this session.
+        False -> `_trust_file` treats it as a refusal and salvages: a PRIVATE
+                 SNAPSHOT written into the certdir, which goes stale and dies
+                 with the certdir instead of tracking the shared file.
+
+    Mutating the missing-leaf arm from `return None` to `return False` leaves
+    the rest of the suite green — nothing else asks which file got wired in
+    exactly this fixture — so this test is the one that has to catch it.
+    """
+
+    def test_missing_leaf_plus_healthy_bundle_wires_the_LIVE_shared_file(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin.proxy import CA_TRUST_FILE, ensure_ca, wire_env
+
+        home = _config_home(tmp_path, monkeypatch)
+        certdir = tmp_path / "pin-proxy"
+        ca = ensure_ca(certdir, "api.anthropic.com").ca_path
+        # THE RACE: ca.pem exists, leaf.pem does not yet — `ensure_ca`'s own
+        # lock is what this window exists between.
+        (certdir / "leaf.pem").unlink()
+        (certdir / "leaf.key").unlink()
+
+        corp = _other_ca(tmp_path / "corp-root")
+        shared = home / CA_TRUST_FILE
+        shared.write_bytes(corp + ca.read_bytes().strip() + b"\n")
+
+        wired = wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"]
+        assert wired == str(shared), (
+            "a missing leaf.pem (the ensure_ca race, not a refusal) wired a "
+            f"private salvage snapshot ({wired!r}) instead of the live shared "
+            f"file ({shared!r}) — the missing-leaf arm answered False "
+            "(refused) rather than None (could not ask)"
         )
