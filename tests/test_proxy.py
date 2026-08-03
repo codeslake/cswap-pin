@@ -5926,3 +5926,115 @@ class TestTheEmptyCAGuardCoversTheOTHERMergeToo:
         assert out.read_bytes().count(b"-----BEGIN") == 2, (
             "the merge lost a CA"
         )
+
+
+class TestTheFourthDoorIsTheOneTheOthersFallInto:
+    """0.1.20 guarded doors 2 and 3 and shipped a commit titled "three doors".
+    There are four, the fourth is the live path on a machine with
+    `NODE_EXTRA_CA_CERTS` set, and door 3's guard lands IN it.
+
+    `_trust_file`'s tail merges `ca_path` with `existing` and returns the
+    merged file, with no content check — the same shape as `_merged_ca`. It is
+    reached whenever there is no usable shared bundle, which includes the case
+    door 3's new guard creates: that guard raises `ValueError`, the blanket
+    `except Exception: pass` above swallows it, and control arrives here. The
+    guard's own comment claimed "falling through returns our own path". It
+    returns our own path only when `existing` is empty, and on the deploy
+    target it never is:
+
+        hostname -s                 lambda-docker
+        NODE_EXTRA_CA_CERTS         /etc/ssl/certs/ca-certificates.crt
+
+    Measured through `_trust_file(ca, existing=<corp>)`, controls included:
+
+        shared  ours            returned         blocks  carries_ours
+        False   real (CONTROL)  ca-bundle.pem    2       True
+        False   EMPTY           ca-bundle.pem    1       False
+        True    real (CONTROL)  ca-bundle.pem    2       True
+        True    EMPTY           ca-bundle.pem    1       False
+
+    The last row is the one that matters: door 3's guard fired and the result
+    is byte-identical to not having it. The session is handed a bundle
+    carrying the corporate CA and nothing of ours, so it trusts the upstream
+    hop and cannot verify the proxy it is actually routed through.
+
+    Two lessons in the fix, both from the review that caught this:
+
+    - Control flow by exception into a 118-line blanket handler puts the
+      landing site out of sight of the author. The `raise` is replaced by a
+      plain fallthrough so intent and destination are the same line.
+    - A test that passes `existing=None` cannot see this door at all. The
+      0.1.20 test did exactly that.
+    """
+
+    def _corp(self, tmp_path):
+        return _other_ca(tmp_path / "corp")
+
+    def test_an_empty_ca_is_not_merged_with_the_ambient_store(self, tmp_path, monkeypatch):
+        import cswap_pin.proxy as proxy
+
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setattr(
+            proxy, "require", lambda _n: type(
+                "P", (), {"get_claude_config_home": staticmethod(lambda: home / ".claude")}
+            )
+        )
+        corp = tmp_path / "corp.pem"
+        corp.write_bytes(self._corp(tmp_path))
+        ca = tmp_path / "certdir" / "ca.pem"
+        ca.parent.mkdir(parents=True)
+        ca.write_bytes(b"")
+
+        out = proxy._trust_file(ca, str(corp))
+
+        assert out == ca, (
+            "the no-shared-bundle tail merged a CONTENTLESS ca.pem with the "
+            "ambient store — the session trusts the corporate CA and cannot "
+            f"verify its own proxy. returned {out.name} with "
+            f"{out.read_bytes().count(b'-----BEGIN')} blocks"
+        )
+
+    def test_a_real_ca_is_still_merged_with_the_ambient_store(self, tmp_path, monkeypatch):
+        """CONTROL. Without this row the assertion above passes on a function
+        that merges nothing at all."""
+        import cswap_pin.proxy as proxy
+        from cswap_pin.proxy import ensure_ca
+
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setattr(
+            proxy, "require", lambda _n: type(
+                "P", (), {"get_claude_config_home": staticmethod(lambda: home / ".claude")}
+            )
+        )
+        corp = tmp_path / "corp.pem"
+        corp.write_bytes(self._corp(tmp_path))
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+
+        out = proxy._trust_file(ours, str(corp))
+
+        assert out.name == "ca-bundle.pem", "a healthy merge was refused"
+        assert out.read_bytes().count(b"-----BEGIN") == 2, "the merge lost a CA"
+
+    def test_a_nested_launch_keeps_its_merged_bundle(self, tmp_path):
+        """`_merged_ca`'s new guard sat AHEAD of the un-merge branch, so an
+        empty ca.pem in a nested launch threw away a good bundle that was
+        still on disk — strictly worse than 0.1.19, which returned it.
+
+            0.1.19  -> ca-bundle.pem, 2 CAs wired
+            0.1.20  -> ca.pem,        0 CAs wired, good bundle untouched on disk
+        """
+        from cswap_pin.proxy import _merged_ca
+
+        ca = tmp_path / "ca.pem"
+        ca.write_bytes(b"")
+        bundle = tmp_path / "ca-bundle.pem"
+        bundle.write_bytes(_other_ca(tmp_path / "up") + _other_ca(tmp_path / "up2"))
+
+        out = _merged_ca(ca, str(bundle))
+
+        assert out == bundle, (
+            "a nested launch was un-merged: the session loses every upstream "
+            f"CA while {bundle.name} sits on disk intact. returned {out.name}"
+        )
