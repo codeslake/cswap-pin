@@ -29,6 +29,7 @@ import stat
 import sys
 import ssl
 import threading
+import time
 from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
@@ -2055,6 +2056,16 @@ def _log_lifecycle(what: str) -> None:
         pass
 
 
+# How long a departing daemon lets in-flight requests finish before it exits.
+#
+# A CEILING, not a wait: an idle daemon returns immediately, so this costs
+# nothing in the common case. It is sized for a streaming `/v1/messages`
+# response rather than for a whole conversation — the point is that an upgrade
+# or a recycle does not cut a reply in half, not that the daemon lingers for a
+# client that has gone quiet. A request still running at the end is cut, which
+# is the same outcome as before this existed.
+_DRAIN_SECONDS = 30.0
+
 _FIRST_HOLDER_TIMEOUT = 300.0
 
 # How long to wait before re-asking whether a daemon whose last FIFO holder
@@ -2662,7 +2673,13 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # Last session closed its holder (or a signal arrived) — stop serving
         # and clean up our state so a launcher never reuses a dead record.
         _log_lifecycle(f"stopping ({reason})")
-        proxy.stop()
+        # DRAIN, because this is the only place that decides whether an upgrade
+        # or a recycle costs sessions their in-flight requests. The signal path
+        # ends in os._exit(0), so anything still being served when this returns
+        # is cut mid-response — measured as ConnectionResetError at a client
+        # reading a streaming reply. An idle daemon returns from here at once.
+        proxy.stop(drain=_DRAIN_SECONDS)
+        _log_lifecycle(f"drained, {proxy.live_client_count()} client(s) still open")
         if _release_daemon_state(certdir):
             # A successor owns the state now. Unwiring here would strip the
             # config it just wrote and send every new session to no proxy at
@@ -2826,6 +2843,10 @@ class PinProxy:
         # machines that cannot answer (see ``_serve_client``).
         self._live_clients = 0
         self._live_lock = threading.Lock()
+        # The connections themselves, not just a count. `stop()` has to CLOSE
+        # them before the process exits — see the note there on why a drained
+        # request still ends in RST without this.
+        self._open_conns: set = set()
         self._stop = False
         self.port = 0
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
@@ -2849,6 +2870,20 @@ class PinProxy:
             # A respawn deletes proxy.json before starting us, so the port to
             # reclaim arrives via the hint the spawner left instead.
             want = read_port_hint(self._certdir)
+        if not isinstance(want, int):
+            # BOTH state files gone — an uninstall/reinstall, a wiped cert dir,
+            # a restored backup. The sessions do not know that: their
+            # HTTPS_PROXY was fixed at exec and still names the old port, so
+            # coming up anywhere else leaves them dialling an address nobody
+            # serves. Remote Control is where that shows: claude.ai sends, and
+            # the CLI is waiting at a port with nothing behind it.
+            #
+            # `.claude.json` is the one record that survives a wiped cert dir,
+            # because it is CSWAP's file rather than the proxy's — and it holds
+            # the very number those sessions are using. Reclaiming from it is
+            # what makes "delete the package and install it again" survivable
+            # without restarting a single session.
+            want = _wired_port()
         for candidate in ([want] if isinstance(want, int) and want > 0 else []) + [0]:
             try:
                 self._srv.bind((self._host, candidate))
@@ -2860,11 +2895,71 @@ class PinProxy:
         self.port = self._srv.getsockname()[1]
         threading.Thread(target=self._accept_loop, daemon=True).start()
 
-    def stop(self) -> None:
+    def stop(self, drain: float = 0.0) -> None:
+        """Stop accepting, and optionally let in-flight requests FINISH.
+
+        Closing the listener is instant and correct — a new connection should
+        go to whoever takes the port next. The connections already open are a
+        different matter: they are carrying REQUESTS, and this proxy sits on
+        `HTTPS_PROXY`, so one of them is very likely a `/v1/messages` response
+        streaming into a session right now.
+
+        Measured before this existed: with the listener closed and the process
+        calling ``os._exit(0)`` a moment later, a client mid-response got
+        ``ConnectionResetError`` — 34 connections were open on the live daemon
+        at the time. That turned "upgrade the pin" into "every session routed
+        through it loses whatever it was doing", which is the thing an
+        optional feature must never be able to do.
+
+        ``drain`` is a CEILING, not a wait: the common case is zero clients and
+        returns at once. A request that outlives the budget is still cut, but
+        the budget exists so that the normal case — a few seconds of streaming
+        — completes.
+        """
         self._stop = True
         if self._srv:
+            # SHUTDOWN BEFORE CLOSE, and the order is the whole point. A thread
+            # blocked in `accept()` keeps the listening socket alive across a
+            # bare `close()`: measured, the port stayed `Address already in
+            # use` afterwards and `_srv.fileno()` was already -1, so the socket
+            # looked shut while the kernel still held the address.
+            #
+            # That is not a tidiness problem. The next daemon then cannot
+            # reclaim the recorded port, comes up on a fresh one, and every
+            # session whose HTTPS_PROXY was fixed at exec is left dialling a
+            # dead address — which is exactly how Remote Control goes deaf:
+            # claude.ai sends, and the CLI is listening at a port nobody
+            # serves. `shutdown()` wakes the accept and releases the address.
+            try:
+                self._srv.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # never listened, or already down
             try:
                 self._srv.close()
+            except OSError:
+                pass
+        if drain > 0:
+            deadline = time.monotonic() + drain
+            while time.monotonic() < deadline:
+                if self.live_client_count() == 0:
+                    break
+                time.sleep(0.05)
+        # CLOSE THEM. Draining alone is not enough and the difference is not
+        # subtle: measured, a request that had transferred every one of its
+        # bytes STILL reached the client as ConnectionResetError, because the
+        # teardown path ends in os._exit(0) and a process exiting without
+        # closing its sockets makes the kernel answer with RST instead of FIN.
+        # The data had arrived; the client threw it away over the reset. One
+        # shutdown(SHUT_WR) per connection turns that into a clean EOF.
+        with self._live_lock:
+            conns, self._open_conns = list(self._open_conns), set()
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            try:
+                conn.close()
             except OSError:
                 pass
 
@@ -2891,11 +2986,13 @@ class PinProxy:
         """
         with self._live_lock:
             self._live_clients += 1
+            self._open_conns.add(conn)
         try:
             self._handle_client(conn)
         finally:
             with self._live_lock:
                 self._live_clients -= 1
+                self._open_conns.discard(conn)
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
