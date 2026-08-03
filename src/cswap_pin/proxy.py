@@ -291,6 +291,98 @@ CA_TRUST_DIR = "ca-trust.d"
 CA_TRUST_FILE = "ca-trust.pem"
 
 
+_ORACLE_SENTINEL = b"\x02"
+_ORACLE_TIMEOUT_S = 10.0
+
+
+def _bundle_loads_in_node(bundle: Path, ours: bytes) -> bool | None:
+    """Ask node's OWN loader whether it loads this bundle, and ours with it.
+
+    THREE OUTCOMES, never two:
+
+        True   the loader ran and our CA is in what it loaded
+        False  the loader ran and our CA is NOT in what it loaded
+        None   THE ORACLE WAS NOT CONSULTED — the caller must decide alone
+
+    STOP PREDICTING, ASK. :func:`_bundle_is_usable` predicts what node's loader
+    will accept from file syntax, and a predicate over syntax is a losing race:
+    five rounds of it in the sibling implementation each found shapes the last
+    missed. Measured here against node's real loader, ours disagreed on a shape
+    that matters —
+
+        `-----BEGIN PUBLIC KEY----------BEGIN CERTIFICATE-----` on one line
+        our predicate  : usable
+        node loaded    : 0 extra CAs
+
+    and we hand that file to a session as NODE_EXTRA_CA_CERTS, so the session
+    trusts nothing extra: not our CA, not a sibling proxy's, not the corporate
+    roots. Every request then fails to verify the proxy it is routed through.
+    The loader does not care who published a cert, so asking it is
+    publisher-agnostic in a way parsing can never be.
+
+    EXIT STATUS CANNOT TELL "the loader loaded nothing" FROM "the probe never
+    ran" — node exits 0 after loading zero extras. So the probe writes a
+    sentinel byte BEFORE the certificate list, and only that byte proves the
+    loader ran to completion. No sentinel means not consulted, whatever the
+    exit code said.
+
+    None is the point of this function, not an afterthought: an oracle that
+    could not ask must not answer. Returning False when node is merely absent
+    would drop a healthy machine to its own CA and take every corporate root
+    with it — the exact damage this exists to prevent, caused by the fix.
+    """
+    import re as _re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        return None
+    probe = (
+        'const c=require("node:tls").getCACertificates("extra");'
+        'process.stdout.write("\\x02"+c.join("\\n"));'
+    )
+    # The proxy variables must not reach the child: it would try to route its
+    # own (nonexistent) traffic through us while we are deciding what to trust.
+    env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+    env["NODE_EXTRA_CA_CERTS"] = str(bundle)
+    try:
+        r = subprocess.run(
+            [node, "-e", probe],
+            capture_output=True,
+            env=env,
+            timeout=_ORACLE_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — cannot ask: not an answer
+        return None
+    if r.returncode != 0 or not r.stdout.startswith(_ORACLE_SENTINEL):
+        return None
+    loaded = r.stdout[len(_ORACLE_SENTINEL):]
+    try:
+        ours_der = x509.load_pem_x509_certificate(ours).public_bytes(
+            serialization.Encoding.DER
+        )
+    except Exception:  # noqa: BLE001 — our own CA is unreadable: cannot judge
+        return None
+    # DER, not a fingerprint: a fingerprint is a hash OF the DER, so it adds a
+    # hash without adding discrimination, and its hex formatting would need
+    # normalising — a small predicate of exactly the kind being removed here.
+    #
+    # The per-block try/except is required, not defensive: the loader can hand
+    # back a block our parser chokes on, and one throw must not void the scan.
+    for block in _re.split(rb"(?=-----BEGIN)", loaded):
+        if not block.strip():
+            continue
+        try:
+            if x509.load_pem_x509_certificate(block).public_bytes(
+                serialization.Encoding.DER
+            ) == ours_der:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
     """Would Node actually LOAD this bundle, and does it carry our CA?
 
@@ -412,7 +504,30 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # leave the session unable to verify its OWN proxy, so every
             # request dies. Narrowing keeps our chain intact and costs someone
             # else's. Do not add a cert-count floor here.
-            if _bundle_is_usable(body, ours):
+            # ASK THE LOADER FIRST, PREDICT ONLY IF IT CANNOT BE ASKED.
+            #
+            # `_bundle_is_usable` predicts what node's loader will accept from
+            # file syntax, and measured against node's real loader it was wrong
+            # in the dangerous direction: it called a bundle usable that node
+            # reads as ZERO extra CAs, and we then hand that file to the
+            # session as NODE_EXTRA_CA_CERTS. The session trusts nothing —
+            # not our CA, not a sibling proxy's, not the corporate roots — so
+            # every request fails to verify the proxy it is routed through.
+            #
+            # None from the oracle is NOT "unusable": it means the probe never
+            # ran (no node on PATH, which is normal here — cswap is Python).
+            # Answering "unusable" there would drop a healthy machine to its
+            # own CA and take every corporate root with it, which is the exact
+            # damage this is meant to prevent. So fall back to the predicate,
+            # which is the only judge left, and say which arm decided.
+            verdict = _bundle_loads_in_node(shared, ours)
+            if verdict is None:
+                verdict = _bundle_is_usable(body, ours)
+                _log_lifecycle(
+                    f"ca-bundle: node not consulted, predicate says "
+                    f"{'usable' if verdict else 'unusable'}"
+                )
+            if verdict:
                 return shared
     except Exception:
         pass
@@ -571,9 +686,6 @@ def heal(backup_root: Path) -> bool:
     # which is the ConnectionRefused outage this module documents twice, caused
     # by the code meant to prevent it. A dangling pin must be a no-op, exactly
     # as it was before the recycle existed.
-    account_num = _resolve_pinned_slot(backup_root, email)
-    if not account_num:
-        return False  # dangling pin: its slot is gone, nothing to serve
 
     fp = daemon_fingerprint()
     alive = _read_alive_port(certdir, fingerprint=fp)
@@ -587,12 +699,36 @@ def heal(backup_root: Path) -> bool:
     #
     # Ask the record directly instead of inferring staleness from two probes
     # that differ for more than one reason.
+    # RESOLVED BEFORE ANY KILL. A dangling pin (the account gone from the
+    # registry) has nothing to spawn afterwards, so recycling first and looking
+    # the slot up after left the wiring naming a port nobody serves — the
+    # outage this recycle exists to prevent, caused by the recycle. Measured
+    # with a real kill: 0.1.3 left the daemon alive; 0.1.4 killed it.
+    #
+    # It does NOT gate the serving-but-unwired re-wire below, which needs no
+    # registry: gating that made an unreadable sequence.json block a repair
+    # that would otherwise have worked (measured: serving daemon on 33967, the
+    # config left `{}`).
+    account_num = _resolve_pinned_slot(backup_root, email)
+
     stale_st = read_daemon_state(certdir)
     stale_fp = (stale_st or {}).get("fingerprint")
     recycled = False
-    if alive is None and stale_fp is not None and stale_fp != fp and _read_alive_port(certdir) is not None:
+    # `stale_fp is None` is a record with no fingerprint at all, which
+    # `read_daemon_state` accepts (it requires only port and pin). Excluding it
+    # made such a daemon IMMORTAL — it can never match the current fingerprint,
+    # so it is stale by definition, and 0.1.5 recycled it. Treat a missing
+    # fingerprint as stale, which is what it means.
+    if alive is None and stale_fp != fp and _read_alive_port(certdir) is not None:
         # Serving, but running code we no longer ship. Recycle it: the spawn
         # below rebinds the SAME port, so live sessions never see the swap.
+        #
+        # NOT WITHOUT A SLOT. A dangling pin (its account gone from the
+        # registry) has nothing to spawn afterwards, so killing here would
+        # leave the wiring naming a port nobody serves — the outage this
+        # recycle exists to prevent, caused by the recycle.
+        if not account_num:
+            return False
         try:
             with _spawn_lock(certdir):
                 if _read_alive_port(certdir, fingerprint=fp) is not None:
@@ -612,7 +748,14 @@ def heal(backup_root: Path) -> bool:
                     if isinstance(stale.get("port"), int):
                         _write_port_hint(certdir, stale["port"])
                     _kill_daemon(int(stale["pid"]))
-            recycled = True
+                    # ONLY AFTER A KILL. `recycled` decides whether the spawn
+                    # guard below is fingerprinted, and setting it merely for
+                    # ENTERING this branch made a no-op recycle look like a
+                    # real one: with no `ps` (the documented blind spot) the
+                    # identity gate kills nothing, and heal then spawned a
+                    # successor over a daemon that is still serving. Measured:
+                    # killed=[] spawned=['1'].
+                    recycled = True
         except Exception:  # noqa: BLE001 — a heal must never raise
             return False
         # Fall through to the spawn path below, which reclaims that port.
@@ -634,6 +777,12 @@ def heal(backup_root: Path) -> bool:
             return True
         except Exception:  # noqa: BLE001 — a heal must never raise
             return False
+    # The SPAWN needs a slot, and a dangling pin has none. Gated here rather
+    # than at the top so the serving-but-unwired re-wire above still runs: that
+    # path needs no registry, and gating it made an unreadable sequence.json
+    # block a repair that would otherwise have worked.
+    if not account_num:
+        return False  # dangling pin: its slot is gone, nothing to serve
     try:
         with _spawn_lock(certdir):
             # Re-check under the lock — another caller may have just spawned.
@@ -2392,7 +2541,22 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
             # the pin's daemon rather than an orphan. See _repair_wiring_if_ours.
             _mark_wired_once(certdir, port)
             return True
-        _repair_wiring_if_ours(certdir, port, live_clients)
+        # A SUCCESSFUL REPAIR IS ITSELF A CLAIM. Discarding this return value
+        # meant the daemon re-pointed the wiring at itself and then, in the
+        # same call, reported "nobody references me" — and `watch_refcount`
+        # answers that by tearing the daemon down, running
+        # `wire_global_config(None, None)` and undoing the repair microseconds
+        # after making it. The wiring was broken-but-pointing-somewhere before;
+        # afterwards there is no daemon and no pin at all.
+        #
+        # It is the LIKELY path on macOS, not a corner: the socket scan below
+        # reads /proc/net/tcp, which macs do not have, so only `live_clients()
+        # > 0` can save it — and a repair fires precisely when new sessions
+        # cannot reach the daemon, i.e. when that count is trending to zero.
+        # Measured through the real watch_refcount loop:
+        #     events: [('wire', 34209), ('TEARDOWN', None)]
+        if _repair_wiring_if_ours(certdir, port, live_clients):
+            return True
         # Ask the daemon itself first. It is the only source that answers on
         # every platform: the socket scan below reads /proc/net/tcp, which
         # BOTH MACS lack, and its None was being coerced to "not claimed" —

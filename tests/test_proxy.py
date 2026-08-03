@@ -2067,6 +2067,13 @@ class TestConsumesTheSharedTrustBundle:
         assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(ca)
 
 
+def _node_available() -> bool:
+    """Whether the oracle can be consulted at all on this box."""
+    import shutil
+
+    return shutil.which("node") is not None
+
+
 class TestTornPemCannotEscape:
     """One unbalanced PEM voids the ENTIRE extras bundle: Node prints
     "PEM routines::bad end line" to stderr and then trusts no component CA and
@@ -2136,18 +2143,59 @@ class TestTornPemCannotEscape:
         assert leftovers == [], leftovers
 
     def test_a_torn_shared_bundle_is_refused(self, tmp_path, monkeypatch):
-        """Containing our CA is not enough — an unrelated torn entry voids the
-        whole file, and the size/contains checks cannot see that."""
+        """Containing our CA is not enough — a torn entry BEFORE ours voids it.
+
+        POSITION IS THE WHOLE PROPERTY, and this fixture used to have it
+        backwards: it put the torn block AFTER our CA, where node loads
+        everything up to the tear and our CA comes through fine. Measured
+        against node's real loader:
+
+            ours + trailing TORN-NO-END        node loads 1   (ours)
+            TORN-NO-END first, then ours       node loads 0
+            ours + corp + trailing TORN        node loads 2   (ours + corp)
+            undecodable CERT first, then ours  node loads 0
+            ours, then undecodable CERT        node loads 1   (ours)
+
+        So node parses sequentially and stops at the first block it cannot
+        decode; it does not void the file retroactively. The dangerous shape is
+        damage BEFORE the CA you need, which is what the docstring always
+        described and what the original incident measured — the fixture simply
+        did not match it.
+        """
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
+
+        home = self._cfg(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        (home / CA_TRUST_FILE).write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nTORN-NO-END\n"  # someone mid-write
+            + ca.read_bytes()
+        )
+        env = wire_env({}, 9955, ca)
+        assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE)
+
+    def test_damage_AFTER_our_CA_still_uses_the_shared_bundle(
+        self, tmp_path, monkeypatch
+    ):
+        """Refusing is not the safe direction — the fallback drops every peer.
+
+        A bundle whose tail is damaged still delivers our CA AND every
+        corporate root that precedes the tear. Refusing it falls back to our
+        own CA alone, so a session that would have had the corporate roots
+        loses them — trading a partial bundle for a narrower one.
+        """
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         (home / CA_TRUST_FILE).write_bytes(
             ca.read_bytes()
-            + b"\n-----BEGIN CERTIFICATE-----\nTORN-NO-END\n"  # someone mid-write
+            + b"\n-----BEGIN CERTIFICATE-----\nTORN-NO-END\n"
         )
         env = wire_env({}, 9955, ca)
-        assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE)
+        if _node_available():
+            assert env["NODE_EXTRA_CA_CERTS"] == str(home / CA_TRUST_FILE), (
+                "refused a bundle node loads our CA from, narrowing the session"
+            )
 
     def test_a_balanced_shared_bundle_is_still_used(self, tmp_path, monkeypatch):
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
@@ -2391,14 +2439,46 @@ class TestUnwireWhenDead:
             srv.close()
 
     def test_teardown_restores_the_config(self):
-        """The orderly path must unwire too, not only the crash path."""
+        """The orderly path must unwire too, not only the crash path.
+
+        ASSERTED ON THE PARSE TREE, not on source text. This used to grep
+        `daemon_main` for `"wire_global_config(None, None)"`, and the COMMENT
+        four lines above the real call contains that exact string — so deleting
+        the call and keeping the comment left the test green while every later
+        session was left dialling a port nobody serves.
+
+        The AST cannot be satisfied by a comment: a `Call` node exists only if
+        the call does. Executing the teardown for real would be better still,
+        but it is a closure over a live daemon's sockets and state file, and a
+        harness that reconstructs that is a harness that can be wrong in its
+        own right — this asserts exactly one fact and cannot drift from it.
+        """
+        import ast
         import inspect
+        import textwrap
+
         from cswap_pin import proxy as pin_proxy
-        src = inspect.getsource(pin_proxy.daemon_main)
-        body = src[src.index("def _teardown"):]
-        assert "wire_global_config(None, None)" in body, (
-            "_teardown must restore .claude.json; otherwise an idle teardown "
-            "leaves every later session dialling a port nobody serves")
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+        teardown = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "_teardown"),
+            None,
+        )
+        assert teardown is not None, "daemon_main no longer defines _teardown"
+
+        restores = [
+            n for n in ast.walk(teardown)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "wire_global_config"
+            and len(n.args) == 2
+            and all(isinstance(a, ast.Constant) and a.value is None for a in n.args)
+        ]
+        assert restores, (
+            "_teardown must CALL wire_global_config(None, None); otherwise an "
+            "idle teardown leaves every later session dialling a dead port"
+        )
+
 
 class TestHealRestoresWithoutRestart:
     """A repaired pin must come back on the SAME port, with no session restart.
@@ -3657,6 +3737,12 @@ class TestTheDaemonRepairsItsOwnWiring:
         srv, other_port = TestAnUpgradeDoesNotWaitForALaunch._serving_listener()
         try:
             certdir = self._ours(tmp_path, monkeypatch, 36301)
+            # QUALIFY IT, or this test never reaches the guard it names:
+            # `_was_wired_once` is the FIRST check, so without a marker the
+            # repair returns False there and the pytest.fail below is
+            # unreachable. Measured: removing the liveness probe entirely
+            # left this test green.
+            proxy._mark_wired_once(certdir, 36301)
             monkeypatch.setattr(proxy, "_wired_port", lambda: other_port)
             monkeypatch.setattr(
                 proxy,
@@ -3673,6 +3759,12 @@ class TestTheDaemonRepairsItsOwnWiring:
         from cswap_pin import proxy
 
         certdir = self._ours(tmp_path, monkeypatch, 36301)
+        # QUALIFY IT, or this test never reaches the guard it names:
+        # `_was_wired_once` is the FIRST check, so without a marker the
+        # repair returns False there and the pytest.fail below is
+        # unreachable. Measured: removing the liveness probe entirely
+        # left this test green.
+        proxy._mark_wired_once(certdir, 36301)
         monkeypatch.setattr(proxy, "_wired_port", lambda: None)
         monkeypatch.setattr(
             proxy,
@@ -3699,6 +3791,12 @@ class TestTheDaemonRepairsItsOwnWiring:
         certdir.mkdir(parents=True, exist_ok=True)
         # A record owned by SOMEONE ELSE.
         proxy.write_daemon_state(certdir, 36301, os.getpid() + 1, "fp")
+        # QUALIFY IT, or this test never reaches the guard it names:
+        # `_was_wired_once` is the FIRST check, so without a marker the
+        # repair returns False there and the pytest.fail below is
+        # unreachable. Measured: removing the liveness probe entirely
+        # left this test green.
+        proxy._mark_wired_once(certdir, 36301)
         monkeypatch.setattr(proxy, "_wired_port", lambda: dead_port)
         monkeypatch.setattr(
             proxy,
@@ -3846,3 +3944,290 @@ class TestTheCryptographyFloorIsLoadBearing:
             tmp_path / "leaf.pem", tmp_path / "leaf.key",
             "api.anthropic.com",
         ), "ensure_ca did not repair a non-RSA cert dir"
+
+
+class TestTheRecycleCannotBecomeTheOutage:
+    """The 0.1.6 fixes, each with the reproduction that motivated it.
+
+    All three shipped with ZERO regression coverage: reverting any of them left
+    the suite fully green. The release notes said each was "reproduced before
+    changing", and they were — but the reproductions were not committed, so the
+    next refactor silently restores the outage.
+    """
+
+    def _fixture(self, tmp_path, monkeypatch, *, in_registry=True,
+                 unpinnable=False, fp=None):
+        import socket
+        import threading
+
+        from cswap_pin import proxy
+        import claude_swap.paths as paths
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(exist_ok=True)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+        threading.Thread(
+            target=lambda: [srv.accept()[0].close() for _ in iter(int, 1)],
+            daemon=True,
+        ).start()
+        st = {"pid": os.getpid(), "port": port,
+              "fingerprint": fp if fp is not None else "an-old-release"}
+        if unpinnable:
+            st["unpinnable"] = True
+        (certdir / "proxy.json").write_text(json.dumps(st))
+        (certdir / "ca.pem").write_bytes(b"x")
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": "c@e.com"}})
+        )
+        acc = {"1": {"email": "c@e.com"}} if in_registry else {"1": {"email": "z@e.com"}}
+        (tmp_path / "sequence.json").write_text(json.dumps({"accounts": acc}))
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"CSWAP_PIN_PORT": str(port),
+                    "HTTPS_PROXY": f"http://127.0.0.1:{port}"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        return certdir, port, cfg, srv
+
+    def test_a_DANGLING_pin_never_kills_its_healthy_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        """The slot must be resolved BEFORE anything is signalled.
+
+        `heal` used to recycle first and look the account up afterwards, so a
+        pin whose email is no longer in sequence.json (`cswap remove`, a slot
+        rename, a restored registry) killed a perfectly healthy daemon and then
+        returned at "nothing to serve" — before the spawn AND before
+        `unwire_if_dead`. Measured with a real kill: the port went dead and
+        `.claude.json` still named it, which is the ConnectionRefused outage
+        this module documents twice, caused by the code meant to prevent it.
+        """
+        from cswap_pin import proxy
+
+        certdir, port, cfg, srv = self._fixture(
+            tmp_path, monkeypatch, in_registry=False
+        )
+        killed = []
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: None)
+        try:
+            proxy.heal(tmp_path)
+            assert not killed, (
+                "killed a healthy daemon for a pin whose account is gone"
+            )
+        finally:
+            srv.close()
+
+    def test_an_UNPINNABLE_daemon_on_CURRENT_code_is_not_recycled(
+        self, tmp_path, monkeypatch
+    ):
+        """Staleness is a fact about the RECORD, not about two probes.
+
+        `_read_alive_port` returns None for an `unpinnable` daemon whatever the
+        fingerprint, so "fingerprinted read failed AND bare read succeeded" was
+        also true for a daemon running the NEWEST code that merely cannot read
+        its credential — the macOS keychain rc=36 case. Nothing clears that
+        mark, so the successor re-marks itself and the next tick recycles
+        again. Measured: 5 ticks, 5 kills, no convergence, each costing live
+        sessions their in-flight requests.
+        """
+        from cswap_pin import proxy
+
+        certdir, port, cfg, srv = self._fixture(
+            tmp_path, monkeypatch, unpinnable=True, fp=proxy.daemon_fingerprint()
+        )
+        kills = []
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: kills.append(pid))
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: port)
+        try:
+            for _ in range(5):
+                proxy.heal(tmp_path)
+            assert not kills, f"recycled a CURRENT daemon {len(kills)}x in 5 ticks"
+        finally:
+            srv.close()
+
+    def test_an_UNPINNABLE_daemon_is_not_respawned_over_either(
+        self, tmp_path, monkeypatch
+    ):
+        """The spawn guard had the same confusion as the recycle trigger.
+
+        A fingerprinted re-check under the lock reads "nothing is serving" for
+        the same `unpinnable` daemon, so heal spawned a fresh successor every
+        tick — which re-marks itself and is spawned over again. Anything
+        serving is enough here, because a respawn cannot fix a credential the
+        successor also cannot read.
+        """
+        from cswap_pin import proxy
+
+        certdir, port, cfg, srv = self._fixture(
+            tmp_path, monkeypatch, unpinnable=True, fp=proxy.daemon_fingerprint()
+        )
+        spawns = []
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: None)
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda n, e, c: spawns.append(n) or port
+        )
+        try:
+            for _ in range(5):
+                proxy.heal(tmp_path)
+            assert not spawns, f"spawned {len(spawns)} successors over a live daemon"
+        finally:
+            srv.close()
+
+    def test_an_unidentifiable_pid_is_not_spawned_over_either(
+        self, tmp_path, monkeypatch
+    ):
+        """`recycled` must mean "killed something", not "entered the branch".
+
+        It decides whether the spawn guard is fingerprinted. Set merely for
+        reaching the branch, a no-op recycle looked like a real one: with no
+        `ps` — the documented blind spot — the identity gate kills nothing, and
+        heal then spawned a successor over a daemon that is still serving.
+        Measured before the fix: killed=[] spawned=['1'].
+        """
+        from cswap_pin import proxy
+
+        certdir, port, cfg, srv = self._fixture(tmp_path, monkeypatch)
+        kills, spawns = [], []
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [])  # no ps
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: kills.append(pid))
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda n, e, c: spawns.append(n) or port
+        )
+        try:
+            proxy.heal(tmp_path)
+            assert not kills, "signalled a pid it could not identify"
+            assert not spawns, (
+                "spawned a successor over a daemon it could not identify and "
+                "did not kill"
+            )
+        finally:
+            srv.close()
+
+
+class TestTheOracleMustNotAnswerWhenItCannotAsk:
+    """`_bundle_loads_in_node` has THREE outcomes, and None is the point.
+
+    STOP PREDICTING, ASK. `_bundle_is_usable` predicts what node's loader will
+    accept from file syntax, and measured against the real loader it was wrong
+    in the dangerous direction: it called a bundle usable that node reads as
+    ZERO extra CAs. We hand that file to a session as NODE_EXTRA_CA_CERTS, so
+    the session trusts nothing at all — not our CA, not a sibling proxy's, not
+    the corporate roots — and every request fails to verify the proxy it is
+    routed through.
+
+    But an oracle that cannot ask must not answer. cswap is Python and a box
+    may have no node on PATH, where returning "unusable" would drop a healthy
+    machine to its own CA and take every corporate root with it — the exact
+    damage this exists to prevent, caused by the fix.
+    """
+
+    @staticmethod
+    def _ca(cn="pin-ca"):
+        import datetime
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        n = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, cn)])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (x509.CertificateBuilder().subject_name(n).issuer_name(n)
+                .public_key(k.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=365))
+                .add_extension(x509.BasicConstraints(ca=True, path_length=None),
+                               critical=True)
+                .sign(k, hashes.SHA256())).public_bytes(serialization.Encoding.PEM)
+
+    def test_no_node_is_UNKNOWN_not_unusable(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy
+
+        ours = self._ca()
+        f = tmp_path / "b.pem"
+        f.write_bytes(ours)
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        assert proxy._bundle_loads_in_node(f, ours) is None, (
+            "answered a question it could not ask — a node-less machine would "
+            "lose every corporate root"
+        )
+
+    def test_a_probe_that_cannot_run_is_UNKNOWN(self, tmp_path, monkeypatch):
+        """Exit status alone cannot separate 'the loader loaded nothing' from
+        'the probe never ran' — node exits 0 after loading zero extras. The
+        sentinel byte written BEFORE the list is what proves the loader ran."""
+        import subprocess
+
+        from cswap_pin import proxy
+
+        ours = self._ca()
+        f = tmp_path / "b.pem"
+        f.write_bytes(ours)
+
+        class _R:
+            returncode = 0
+            stdout = b"no sentinel here"
+            stderr = b""
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _R())
+        assert proxy._bundle_loads_in_node(f, ours) is None, (
+            "a probe whose output lacks the sentinel was treated as an answer"
+        )
+
+    def test_a_bundle_node_reads_as_zero_is_UNUSABLE(self, tmp_path):
+        """The finding that motivated the oracle. A malformed header running
+        into a certificate header on one line: our predicate says usable, node
+        loads nothing."""
+        import shutil
+
+        from cswap_pin import proxy
+
+        if shutil.which("node") is None:
+            pytest.skip("no node on this box — the oracle cannot be asked")
+
+        ours = self._ca()
+        bundle = b"-----BEGIN PUBLIC KEY----------BEGIN CERTIFICATE-----\n" + ours
+        f = tmp_path / "b.pem"
+        f.write_bytes(bundle)
+        assert proxy._bundle_loads_in_node(f, ours) is False
+        # And this is exactly where the predicate disagreed.
+        assert proxy._bundle_is_usable(bundle, ours) is True, (
+            "the predicate no longer disagrees — this test has lost its subject"
+        )
+
+    def test_a_healthy_bundle_is_USABLE(self, tmp_path):
+        import shutil
+
+        from cswap_pin import proxy
+
+        if shutil.which("node") is None:
+            pytest.skip("no node on this box — the oracle cannot be asked")
+
+        ours, corp = self._ca(), self._ca("corp-root")
+        f = tmp_path / "b.pem"
+        f.write_bytes(corp + ours)
+        assert proxy._bundle_loads_in_node(f, ours) is True
+
+    def test_a_bundle_without_our_CA_is_UNUSABLE(self, tmp_path):
+        """Loading fine is not enough: the file has to carry OUR CA, or the
+        session cannot verify the proxy it is routed through."""
+        import shutil
+
+        from cswap_pin import proxy
+
+        if shutil.which("node") is None:
+            pytest.skip("no node on this box — the oracle cannot be asked")
+
+        ours, corp = self._ca(), self._ca("corp-root")
+        f = tmp_path / "b.pem"
+        f.write_bytes(corp)
+        assert proxy._bundle_loads_in_node(f, ours) is False
