@@ -5568,3 +5568,138 @@ class TestSalvageRefusesTheSameArmorThePredicateDoes:
         good = b"-----BEGIN X509 CRL-----\nQUFBQQ==\n-----END X509 CRL-----\n"
         out = _salvage_bundle(good + torn + raw, raw.strip())
         assert b"QUFBQQ==" in out, "salvage dropped a healthy CRL"
+
+
+class TestTheBlankLineRuleIsAnchoredAndMeansWhitespace:
+    """0.1.17's blank-line rule was wrong in BOTH directions, and its docstring
+    asserted the opposite.
+
+    `if b"\\n\\n" in body.replace(b"\\r\\n", b"\\n")` matches only a LITERAL
+    blank line, anywhere. Two consequences, both measured with node deciding
+    (corp-A + block + ours, correct answer 2):
+
+        shape                     predicate   node loads
+        WS-only line before END   True        1     <- MISSED
+        tab-only line before END  True        1     <- MISSED
+        blank right AFTER BEGIN   False       2     <- FALSE REJECT
+        blank mid-body            False       2     <- FALSE REJECT
+        healthy control           True        2
+
+    The misses are the dangerous half. On the real 132-cert bundle a poisoned
+    CRL ahead of our CA gives `extras=0` and a failed handshake on node
+    v24.11.1 AND v12.22.9: the session cannot verify the proxy it is routed
+    through, with the predicate answering True and salvage re-emitting the
+    poison because it shares this function.
+
+    The false rejects are a regression this rule introduced. openssl refuses a
+    blank line only IMMEDIATELY BEFORE the terminator; node does not care at
+    all. A blank after BEGIN is the RFC 1421 header form (`Proc-Type:` /
+    `DEK-Info:` / blank / body) that `openssl genrsa -traditional` emits, and
+    refusing it drops the session to a per-launch snapshot instead of the live
+    shared file.
+
+    The rule is now ANCHORED to the last line and treats whitespace-only as
+    blank — which is what `b"".join(body.split())` three lines above already
+    assumed. One rule, one meaning.
+    """
+
+    def _ours(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+
+    def test_a_whitespace_only_line_before_END_is_refused(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        for name, filler in (("space", b"   "), ("tab", b"\t"), ("formfeed", b"\x0c")):
+            blk = (
+                b"-----BEGIN X509 CRL-----\nQUFBQQ==\n"
+                + filler
+                + b"\n-----END X509 CRL-----\n"
+            )
+            assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
+                f"a {name}-only line before END was accepted — openssl refuses "
+                "it and node loads 1 of 2"
+            )
+
+    def test_the_same_shape_in_CRLF_is_refused(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        blk = b"-----BEGIN X509 CRL-----\r\nQUFBQQ==\r\n   \r\n-----END X509 CRL-----\r\n"
+        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
+            "the CRLF form of a whitespace-only line before END was accepted"
+        )
+
+    def test_a_blank_line_elsewhere_in_the_body_is_ACCEPTED(self, tmp_path):
+        """The false-REJECT direction. openssl only objects immediately before
+        the terminator; node loads these at full count."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        for name, body in (
+            ("blank after BEGIN", b"\nQUFBQQ==\n"),
+            ("blank mid-body", b"QUFB\n\nQUFB\n"),
+        ):
+            blk = b"-----BEGIN X509 CRL-----\n" + body + b"-----END X509 CRL-----\n"
+            assert _bundle_is_usable(blk + raw, raw.strip()) is True, (
+                f"a {name} was refused — node loads it fine, and refusing "
+                "drops the session to a stale per-launch snapshot"
+            )
+
+
+class TestATruncatedBundleIsRefusedNotAccepted:
+    """The unterminated-block signal had no test — deleting the `yield` and
+    keeping the bare `return` left the whole suite green.
+
+    A block with a BEGIN and no END is what a dying writer leaves behind:
+    `_write_bundle_atomically`'s own docstring names a torn write as the
+    reason it exists. `_pem_blocks` signals it by yielding the `None` label,
+    which is how both readers learn the file is damaged. Without the signal
+    the scan simply ends, so every block BEFORE the truncation looks like the
+    whole file and the predicate approves it.
+
+    Measured with the signal removed:
+
+        input                          shipped   mutant   node loads
+        truncated CERT at the tail     False     True     2 of 3
+        real 132-cert + truncated tail False     True     133 of 134
+        torn write of the real bundle  False     True     132 of 133
+
+    Every row loses a root the file was supposed to carry, and the mutant
+    calls the file fine. The END-welded route to the same sentinel IS tested;
+    the unterminated route was not — the same blindness this release was
+    written to hunt, one function away.
+    """
+
+    def test_a_bundle_whose_last_block_is_unterminated_is_refused(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        # A BEGIN with no END: the shape a dying writer leaves.
+        truncated = b"-----BEGIN CERTIFICATE-----\nQUFBQQ==\n"
+        assert _bundle_is_usable(a + raw + truncated, raw.strip()) is False, (
+            "a bundle ending in an unterminated block was approved — the "
+            "blocks before the truncation look like the whole file"
+        )
+
+    def test_a_torn_write_of_a_real_sized_bundle_is_refused(self, tmp_path):
+        """The same shape at the size the fleet actually carries: chop the
+        tail off mid-block, as an interrupted write would."""
+        from cswap_pin.proxy import _bundle_is_usable, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        blocks = b"".join(
+            _other_ca(tmp_path / f"corp-{i}") for i in range(3)
+        )
+        torn = (blocks + raw)[:-400]
+        assert _bundle_is_usable(torn, raw.strip()) is False, (
+            "a torn write was approved — node loads only the blocks before "
+            "the cut and the session silently trusts less than the file names"
+        )
