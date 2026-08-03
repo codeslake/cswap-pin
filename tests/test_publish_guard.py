@@ -41,3 +41,58 @@ def test_a_child_cannot_publish_into_the_real_config_home(tmp_path, capsys):
         assert str(pathlib.Path.home() / ".claude") not in r.stdout, (
             "a child resolved the REAL config home"
         )
+
+
+import os
+import pathlib
+
+
+class TestTheGuardCoversTheACCOUNTSTORE:
+    """The autouse guard redirected the CONFIG but not the ACCOUNT STORE.
+
+    Found during a live incident on host-a: the real
+    `~/.local/share/claude-swap/sequence.json` was overwritten with test
+    fixture accounts (`a@example.com`, `b@example.com`) and matching 88-byte
+    `.creds-*.enc` files. That damage was not traced to this suite — this
+    suite constructs no real switcher, so nothing here reaches
+    `switcher.backup_dir` today. But "no test happens to do it" is luck, not a
+    guard, and the roster syncs by WHOLE-FILE COPY with newest-wins, so a
+    corrupt store on one machine is one sync away from both Macs.
+
+    `tests/conftest.py` redirected `get_global_config_path`,
+    `get_default_global_config_path`, `get_claude_config_home` and
+    `CLAUDE_CONFIG_DIR` — every CONFIG accessor and none of the STORE ones.
+    `get_backup_root` resolves the credential store, and it reads
+    `XDG_DATA_HOME` then falls back to `Path.home()`, so all three need
+    redirecting: the function for in-process callers, the env var for the
+    children this suite spawns, and `Path.home` for anything that computes the
+    path itself.
+    """
+
+    def test_the_backup_root_is_not_the_real_one(self, tmp_path):
+        """The store a test would write to must be under tmp, never $HOME."""
+        from claude_swap.paths import get_backup_root
+
+        real = pathlib.Path.home() / ".local/share/claude-swap"
+        got = pathlib.Path(get_backup_root())
+        assert real not in got.parents and got != real, (
+            f"get_backup_root() resolves to the REAL account store ({got}) — a "
+            "test that builds a switcher would overwrite the machine's own "
+            "credentials and roster"
+        )
+
+    def test_the_env_the_children_inherit_does_not_name_the_real_store(self):
+        """A monkeypatched attribute does not cross a process boundary; the
+        daemons and probes this suite spawns obey XDG_DATA_HOME."""
+        xdg = os.environ.get("XDG_DATA_HOME")
+        assert xdg, "XDG_DATA_HOME is unset — a spawned child falls back to $HOME"
+        assert pathlib.Path.home() not in pathlib.Path(xdg).parents, (
+            f"XDG_DATA_HOME points inside the real home ({xdg})"
+        )
+
+    def test_path_home_is_redirected(self):
+        """`get_backup_root`'s fallback computes the path from Path.home()."""
+        assert pathlib.Path.home() != pathlib.Path(os.path.expanduser("~")), (
+            "Path.home() returns the REAL home, so any code computing the "
+            "store path itself lands on the machine's own credentials"
+        )
