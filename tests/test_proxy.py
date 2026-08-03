@@ -2143,59 +2143,73 @@ class TestTornPemCannotEscape:
         assert leftovers == [], leftovers
 
     def test_a_torn_shared_bundle_is_refused(self, tmp_path, monkeypatch):
-        """Containing our CA is not enough — a torn entry BEFORE ours voids it.
+        """Containing our CA is not enough — a tear can void the whole load.
 
-        POSITION IS THE WHOLE PROPERTY, and this fixture used to have it
-        backwards: it put the torn block AFTER our CA, where node loads
-        everything up to the tear and our CA comes through fine. Measured
-        against node's real loader:
+        THE VARIABLE IS THE TORN BODY, NOT ITS POSITION. I got this wrong once
+        in each direction, so the measurement is here rather than in prose:
 
-            ours + trailing TORN-NO-END        node loads 1   (ours)
-            TORN-NO-END first, then ours       node loads 0
-            ours + corp + trailing TORN        node loads 2   (ours + corp)
-            undecodable CERT first, then ours  node loads 0
-            ours, then undecodable CERT        node loads 1   (ours)
+            complete-DER tear FIRST    node loads 1   (it recovers the tear)
+            junk tear FIRST            node loads 0
+            complete-DER tear AFTER    node loads 1
+            junk tear AFTER            node loads 1
 
-        So node parses sequentially and stops at the first block it cannot
-        decode; it does not void the file retroactively. The dangerous shape is
-        damage BEFORE the CA you need, which is what the docstring always
-        described and what the original incident measured — the fixture simply
-        did not match it.
+        openssl's decoder treats the next `-` as end-of-data rather than an
+        error, so a tear yields a valid entry or garbage depending only on
+        whether what it consumed happens to be complete DER — from the SAME
+        position, either answer. An earlier fixture put the tear after our CA
+        (where its body was a whole certificate and node delivered ours fine),
+        and "fixing" it by MOVING the tear would have asserted a positional
+        rule that does not hold.
+
+        Whether a truncated body happens to be complete DER is exactly the
+        question a predicate cannot answer from outside — which is why the
+        oracle asks the loader instead of guessing.
         """
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
         (home / CA_TRUST_FILE).write_bytes(
-            b"-----BEGIN CERTIFICATE-----\nTORN-NO-END\n"  # someone mid-write
+            # Junk in an unterminated block: nothing recoverable, so the load
+            # stops here and our CA never arrives.
+            b"-----BEGIN CERTIFICATE-----\nc3RvbGVuLW1pZC13cml0ZQ==\n"
             + ca.read_bytes()
         )
         env = wire_env({}, 9955, ca)
         assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE)
 
-    def test_damage_AFTER_our_CA_still_uses_the_shared_bundle(
+    def test_a_RECOVERED_tear_that_still_loses_our_CA_is_refused(
         self, tmp_path, monkeypatch
     ):
-        """Refusing is not the safe direction — the fallback drops every peer.
+        """"The loader read something" is not "the loader read OURS".
 
-        A bundle whose tail is damaged still delivers our CA AND every
-        corporate root that precedes the tear. Refusing it falls back to our
-        own CA alone, so a session that would have had the corporate roots
-        loses them — trading a partial bundle for a narrower one.
+        This is the case that killed a positional rule AND a count-based one.
+        A tear whose body is complete DER is recovered by openssl — so node
+        reports a cert loaded and a marker count looks fine — but what it
+        recovered is the TORN block, and everything after the tear is dropped.
+        Measured, subjects read back from the loader:
+
+            bundle = <other CA, END line removed> + <our CA>
+            node loads 1  ->  CN=cswap pin-proxy CA   (the TORN one)
+            our CA        ->  ABSENT
+
+        So a session handed that bundle cannot verify the proxy it is routed
+        through, while every count and balance check calls the file healthy.
+        Only "is OUR CA in what the loader actually loaded" separates it, which
+        is exactly what the oracle asks and what no predicate over file syntax
+        can answer.
         """
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
         home = self._cfg(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
-        (home / CA_TRUST_FILE).write_bytes(
-            ca.read_bytes()
-            + b"\n-----BEGIN CERTIFICATE-----\nTORN-NO-END\n"
-        )
+        other = _other_ca(tmp_path)
+        torn_but_complete = other.replace(b"-----END CERTIFICATE-----\n", b"")
+        (home / CA_TRUST_FILE).write_bytes(torn_but_complete + ca.read_bytes())
         env = wire_env({}, 9955, ca)
-        if _node_available():
-            assert env["NODE_EXTRA_CA_CERTS"] == str(home / CA_TRUST_FILE), (
-                "refused a bundle node loads our CA from, narrowing the session"
-            )
+        assert env["NODE_EXTRA_CA_CERTS"] != str(home / CA_TRUST_FILE), (
+            "used a bundle the loader reads WITHOUT our CA"
+        )
 
     def test_a_balanced_shared_bundle_is_still_used(self, tmp_path, monkeypatch):
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env

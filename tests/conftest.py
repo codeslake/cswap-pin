@@ -65,6 +65,26 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
     if hasattr(paths, "get_claude_config_home"):
         monkeypatch.setattr(paths, "get_claude_config_home", lambda home=home: home)
 
+    # AND THROUGH THE ENVIRONMENT, because a monkeypatched attribute does not
+    # cross a process boundary. `get_claude_config_home` reads CLAUDE_CONFIG_DIR
+    # first, so setting it redirects the CHILDREN this suite spawns — the
+    # daemons, the packaging probes, the oracle's node — none of which inherit
+    # a patched module object.
+    #
+    # That gap was not theoretical. After the in-process redirect was added and
+    # the real `~/.claude/ca-trust.d/cswap-pin.pem` restored, the file was
+    # overwritten AGAIN by a test-minted CA — and the published CA then could
+    # not verify the leaf the live daemon serves:
+    #
+    #     openssl verify -CAfile ca-trust.d/cswap-pin.pem  pin-proxy/leaf.pem
+    #       error 20: unable to get local issuer certificate
+    #     openssl verify -CAfile pin-proxy/ca.pem          pin-proxy/leaf.pem
+    #       OK
+    #
+    # Every session on the box was handed a bundle carrying a CA that signs
+    # nothing it talks to. An env var is the only redirect a child obeys.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+
     # The seam re-imports these INSIDE functions (`from claude_swap.paths
     # import ...`), which reads the attribute at call time — so patching the
     # module attribute above is enough for those. But any module that bound
