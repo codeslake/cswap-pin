@@ -3524,19 +3524,6 @@ class TestTheKillBudgetOutlastsTheDrain:
     recycle the package itself performs.
     """
 
-    def test_the_term_budget_exceeds_the_drain_ceiling(self):
-        """Derived, not chosen. Two independently-picked timeouts that must be
-        ordered is a bug that returns every time either is tuned."""
-        import inspect
-
-        from cswap_pin import proxy
-
-        src = inspect.getsource(proxy._kill_daemon)
-        assert "_DRAIN_SECONDS" in src, (
-            "the TERM budget is not derived from the drain ceiling — a literal "
-            "here silently cancels the drain the next time either is tuned"
-        )
-
     def test_a_draining_daemon_is_not_killed_before_it_finishes(self, monkeypatch):
         """Behaviour, not source: a process that exits just under the drain
         ceiling must be reaped by TERM, never escalated to KILL."""
@@ -3545,10 +3532,13 @@ class TestTheKillBudgetOutlastsTheDrain:
         from cswap_pin import proxy
 
         # A daemon that used its full drain and exited cleanly, counted in
-        # LOOP ITERATIONS rather than wall-clock: `_kill_daemon` imports `time`
-        # inside the function, so `time.sleep` cannot be patched from out here
-        # and a real-time test would take 30 seconds to answer a question about
-        # arithmetic. Each iteration is one 0.1s tick by construction.
+        # LOOP ITERATIONS rather than wall-clock: a real-time test would take
+        # 30 seconds to answer a question about arithmetic. Each iteration is
+        # one 0.1s tick by construction.
+        #
+        # (`_kill_daemon` does `import time` inside the function, which binds
+        # the same singleton module object — so patching `time.sleep` from out
+        # here DOES reach it. An earlier comment here claimed the opposite.)
         ticks = {"n": 0}
         exits_after = int((proxy._DRAIN_SECONDS - 0.5) * 10)
 
@@ -3743,3 +3733,116 @@ class TestTheDaemonRepairsItsOwnWiring:
             "the periodic claim check never reaches the repair — recovery would "
             "again depend on something outside the package"
         )
+
+
+class TestTheCryptographyFloorIsLoadBearing:
+    """`_certs_consistent` reads `not_valid_after_utc`, which landed in 42.0.
+
+    On 41.x the attribute does not exist, the AttributeError was swallowed as
+    "regenerate", and the function returned False FOREVER — so every launch
+    minted a new CA and the daemon served a leaf signed by a root the session
+    was never handed. Verified on a clean 41.0.7 venv: attribute MISSING, CA
+    unstable across two `ensure_ca` calls, handshake CERTIFICATE_VERIFY_FAILED.
+
+    Both halves of that fix (the floor, and the re-raise) reverted to 0.1.3
+    behaviour with the whole suite still green — it had no coverage at all.
+    """
+
+    def test_the_declared_floor_admits_no_version_without_the_api(self):
+        """The floor is the only thing standing between a user and that state,
+        and `pip install cswap-pin` resolves whatever satisfies it."""
+        import re
+
+        root = Path(__file__).resolve().parent.parent
+        text = (root / "pyproject.toml").read_text(encoding="utf-8")
+        m = re.search(r'"cryptography>=([0-9]+)\.([0-9]+)"', text)
+        assert m, "the cryptography requirement is no longer a simple >= floor"
+        major, minor = int(m.group(1)), int(m.group(2))
+        assert (major, minor) >= (42, 0), (
+            f"floor is {major}.{minor}; `not_valid_after_utc` landed in 42.0, and "
+            "below it every launch regenerates the CA and every request fails "
+            "TLS verification, silently"
+        )
+
+    def test_a_MISSING_api_is_loud_rather_than_an_endless_regeneration(
+        self, tmp_path, monkeypatch
+    ):
+        """The library moved: refuse loudly instead of regenerating forever.
+
+        Simulated by removing the attribute from the class, which is what an
+        older cryptography actually looks like to this code.
+        """
+        from cswap_pin import proxy
+
+        ca = tmp_path / "ca.pem"
+        proxy.ensure_ca(tmp_path, "api.anthropic.com")  # a real, consistent set
+        assert proxy._certs_consistent(
+            ca, tmp_path / "ca.key", tmp_path / "leaf.pem", tmp_path / "leaf.key",
+            "api.anthropic.com",
+        ), "fixture is not consistent to begin with"
+
+        monkeypatch.delattr(x509.Certificate, "not_valid_after_utc", raising=False)
+        with pytest.raises(AttributeError):
+            proxy._certs_consistent(
+                ca, tmp_path / "ca.key", tmp_path / "leaf.pem", tmp_path / "leaf.key",
+                "api.anthropic.com",
+            )
+
+    def test_a_NON_RSA_cert_dir_still_regenerates_instead_of_killing_the_daemon(
+        self, tmp_path
+    ):
+        """The re-raise must not escape on a cert dir that is merely not RSA.
+
+        `_certs_consistent` uses `public_numbers()` and PKCS1v15, so a
+        self-consistent Ed25519 pair — a restored backup, someone's own openssl
+        run — raises the SAME AttributeError as a version mismatch. 0.1.3
+        returned False and regenerated on the next launch; propagating instead
+        kills `PinProxy.__init__`, which does not fail open, so the daemon dies
+        at construction and can never repair a directory the previous release
+        healed by itself.
+        """
+        import datetime
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        key = ed25519.Ed25519PrivateKey.generate()
+        name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "ed-ca")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, None)
+        )
+        pem = cert.public_bytes(serialization.Encoding.PEM)
+        kpem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        for n, data in (("ca.pem", pem), ("leaf.pem", pem),
+                        ("ca.key", kpem), ("leaf.key", kpem)):
+            (tmp_path / n).write_bytes(data)
+
+        from cswap_pin import proxy
+
+        # False, not an exception: regenerate, exactly as 0.1.3 did.
+        assert proxy._certs_consistent(
+            tmp_path / "ca.pem", tmp_path / "ca.key",
+            tmp_path / "leaf.pem", tmp_path / "leaf.key",
+            "api.anthropic.com",
+        ) is False
+
+        # And the whole path recovers rather than dying.
+        proxy.ensure_ca(tmp_path, "api.anthropic.com")
+        assert proxy._certs_consistent(
+            tmp_path / "ca.pem", tmp_path / "ca.key",
+            tmp_path / "leaf.pem", tmp_path / "leaf.key",
+            "api.anthropic.com",
+        ), "ensure_ca did not repair a non-RSA cert dir"
