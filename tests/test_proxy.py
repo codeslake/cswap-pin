@@ -5703,3 +5703,67 @@ class TestATruncatedBundleIsRefusedNotAccepted:
             "a torn write was approved — node loads only the blocks before "
             "the cut and the session silently trusts less than the file names"
         )
+
+
+class TestTheLastLineRuleAppliesToCertificatesToo:
+    """0.1.18 fixed the branch the real bundle never takes.
+
+    `_armor_decodes` is called only in the `else` arm — non-certificate
+    labels. A CERTIFICATE goes to `x509.load_pem_x509_certificate`, and
+    `cryptography` parses a whitespace-only line before END happily. So the
+    exact shape 0.1.18 was named for sails through when it lands in a
+    certificate.
+
+    Instrumented on the file this machine actually carries:
+
+        real bundle labels                 {CERTIFICATE: 132}
+        _armor_decodes CALLS on it          0
+
+    The fixed branch is unreachable there. And the shape is fatal, measured
+    with node deciding on the real 132-cert bundle plus ours:
+
+        damage before the first END   predicate   node loads
+        blank line                    False       0 of 133
+        spaces                        True        0 of 133   <- HOLE
+        tab                           True        0 of 133   <- HOLE
+        healthy control               True      133 of 133
+
+    `extras=0`, not a truncation — node drops the WHOLE extras load, so the
+    session cannot verify the proxy it is routed through and every request
+    dies. Both judges pass it (the oracle's False routes to salvage, which
+    shares the predicate and re-emits the block), and with node absent — the
+    normal case here — the poisoned file is wired directly.
+
+    The check belongs in `_pem_blocks`, where both labels and both readers
+    pass through, rather than in one arm of one of them.
+    """
+
+    def _ours(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+
+    def test_a_whitespace_line_before_a_CERTIFICATE_END_is_refused(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        at = a.index(b"-----END CERTIFICATE-----")
+        for name, ins in (("spaces", b"   \n"), ("tab", b"\t\n"), ("blank", b"\n")):
+            poisoned = a[:at] + ins + a[at:]
+            assert _bundle_is_usable(poisoned + raw, raw.strip()) is False, (
+                f"a {name} line before a CERTIFICATE's END was accepted — node "
+                "loads ZERO extras from it and the session cannot verify its "
+                "own proxy"
+            )
+
+    def test_a_healthy_certificate_bundle_is_still_accepted(self, tmp_path):
+        """The false-REJECT direction, on the label that carries the fleet."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
+        a = _other_ca(tmp_path / "corp-a")
+        assert _bundle_is_usable(a + raw, raw.strip()) is True, "healthy LF refused"
+        assert _bundle_is_usable(
+            (a + raw).replace(b"\n", b"\r\n"), raw.strip()
+        ) is True, "healthy CRLF refused"

@@ -521,32 +521,13 @@ def _armor_decodes(body: bytes) -> bool:
     data = b"".join(body.split())
     if not data or len(data) % 4:
         return False
-    # ANCHORED TO THE LAST LINE, and "blank" means whitespace-only.
-    #
-    # This was `b"\n\n" in body`, wrong in BOTH directions and with a
-    # docstring claiming otherwise. It matched only a LITERAL blank line,
-    # anywhere:
-    #
-    #   WS-only line before END   accepted   node loaded 1 of 2   <- MISSED
-    #   blank right AFTER BEGIN   refused    node loaded 2 of 2   <- FALSE REJECT
-    #
-    # The miss is the dangerous half: on the real 132-cert bundle a poisoned
-    # CRL ahead of our CA gives extras=0 and a failed handshake on both node
-    # runtimes, with the predicate saying True and salvage re-emitting it.
-    # The false reject is the RFC 1421 header form (`Proc-Type:` / `DEK-Info:`
-    # / blank / body) that `openssl genrsa -traditional` writes; refusing it
-    # drops the session to a per-launch snapshot instead of the live file.
-    #
-    # openssl objects to a blank line ONLY immediately before the terminator.
-    # Strip that terminator's own newline and look at what precedes it —
-    # treating whitespace as blank, which `b"".join(body.split())` above
-    # already assumes. Verified on 10 shapes including CRLF and no-trailing-
-    # newline.
-    norm = body.replace(b"\r\n", b"\n")
-    if norm.endswith(b"\n"):
-        norm = norm[:-1]
-    if norm.rsplit(b"\n", 1)[-1].strip() == b"":
-        return False
+    # THE BLANK-LAST-LINE RULE LIVES IN `_pem_blocks` NOW, not here. It was
+    # added in this arm first, which is exactly why it missed: a CERTIFICATE
+    # never reaches this function, and the real bundle is 132 CERTIFICATE
+    # blocks and nothing else. Measured, `_armor_decodes` was called ZERO
+    # times on the file this machine loads. Keeping a copy here would be dead
+    # code — `_pem_blocks` refuses the shape before yielding, verified — and a
+    # dead guard is worse than none: it reads as protection.
     try:
         base64.b64decode(data, validate=True)
     except Exception:  # noqa: BLE001
@@ -623,6 +604,21 @@ def _pem_blocks(body: bytes):
         # the last base64 character is what openssl refuses while a rebuilt
         # copy parses fine.
         if end > 0 and body[end - 1 : end] != b"\n":
+            yield None, head, -1, b""
+            return
+        # AND THE LINE BEFORE THE TERMINATOR MUST CARRY SOMETHING. openssl
+        # refuses a blank-or-whitespace-only last line whatever the LABEL is,
+        # and this is the only place both labels and both readers pass
+        # through. It lived in `_armor_decodes` — the NON-certificate arm —
+        # so a CERTIFICATE went to `x509.load_pem_x509_certificate` instead,
+        # and cryptography parses the shape happily. Measured: the real
+        # bundle is 132 CERTIFICATE blocks and ZERO others, so
+        # `_armor_decodes` was called 0 times on the file this machine
+        # actually loads. A whitespace line before the first END gave
+        # predicate True and node extras=0 of 133 — the whole extras load
+        # dropped, so the session could not verify its own proxy.
+        line = body[max(0, body.rfind(b"\n", 0, end - 1) + 1) : end - 1]
+        if line.strip() == b"":
             yield None, head, -1, b""
             return
         term = b"-----END " + label + b"-----"
