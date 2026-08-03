@@ -522,7 +522,50 @@ def heal(backup_root: Path) -> bool:
     if not pin:
         return False  # nothing pinned — not our business
     email = pin[0]
-    alive = _read_alive_port(certdir)
+    # AN UPGRADE MUST NOT WAIT FOR A LAUNCH. `ensure_proxy` recycles a stale
+    # daemon, but it only runs when a NEW session starts — so installing a fix
+    # left every running daemon on the old code until someone happened to open
+    # a session. Measured: 0.1.3 landed on disk at 22:11 and the daemon was
+    # still the 20:04 process running 0.1.1 half an hour later, on a box where
+    # the whole point of the release was that upgrading no longer costs a
+    # session anything. The installer changes files; nothing told the daemon.
+    #
+    # This function already runs every few seconds from the status line, which
+    # makes it the one periodic caller that can notice. It just never asked:
+    # `_read_alive_port` without a fingerprint reads a stale daemon as healthy.
+    # Ask WITH one, and an upgrade takes effect on its own, on the same port,
+    # with no session restarted and no command typed.
+    #
+    # Deliberately NOT reusing the ensure_proxy fast path: this must be the
+    # slow, locked path so the recycle is serialized against every other
+    # status line on the box.
+    fp = daemon_fingerprint()
+    alive = _read_alive_port(certdir, fingerprint=fp)
+    if alive is None and _read_alive_port(certdir) is not None:
+        # Serving, but running code we no longer ship. Recycle it: the spawn
+        # below rebinds the SAME port, so live sessions never see the swap.
+        try:
+            with _spawn_lock(certdir):
+                if _read_alive_port(certdir, fingerprint=fp) is not None:
+                    return False  # another status line just did it
+                stale = read_daemon_state(certdir)
+                # "Alive" is not "still ours" — a pid is reused freely, so ask
+                # whether it is a pin daemon for THIS certdir before signalling
+                # it. Same gate ensure_proxy uses; when identity cannot be
+                # established (no ``ps``) this kills nothing rather than
+                # killing on faith.
+                if stale and int(stale.get("pid") or 0) in _pin_daemon_pids(certdir):
+                    # Save the port BEFORE the kill. The daemon unlinks its own
+                    # state on TERM, so afterwards there is nothing to reclaim
+                    # from and the successor would take a FRESH port — which
+                    # strands every session already wired to the old one, the
+                    # exact damage this recycle exists to avoid.
+                    if isinstance(stale.get("port"), int):
+                        _write_port_hint(certdir, stale["port"])
+                    _kill_daemon(int(stale["pid"]))
+        except Exception:  # noqa: BLE001 — a heal must never raise
+            return False
+        # Fall through to the spawn path below, which reclaims that port.
     if alive is not None:
         # SERVING IS NOT THE SAME AS WIRED. A daemon can be up while
         # ``.claude.json`` names nothing — `pin --clear` raced a respawn, a
@@ -559,7 +602,15 @@ def heal(backup_root: Path) -> bool:
     try:
         with _spawn_lock(certdir):
             # Re-check under the lock — another caller may have just spawned.
-            if _read_alive_port(certdir) is not None:
+            #
+            # WITH THE FINGERPRINT. A bare liveness check re-reads the very
+            # daemon the recycle above was for: its state file outlives a kill
+            # that did not complete (and, when a caller stubs the kill, always),
+            # so heal would bail here and the obsolete daemon would serve
+            # forever — the exact staleness this path exists to end. Asking for
+            # the current fingerprint means "someone spawned a daemon running
+            # the code we ship", which is the only thing that makes this a no-op.
+            if _read_alive_port(certdir, fingerprint=fp) is not None:
                 return False
             port = _spawn_daemon(account_num, email, certdir)
         if port is None:
@@ -1263,6 +1314,19 @@ def _certs_consistent(
             leaf.signature_hash_algorithm,
         )
         return True
+    except (AttributeError, TypeError):
+        # NOT the same as a cert failure. These mean the CODE is wrong for the
+        # cryptography that is installed — a renamed property, a changed
+        # signature — and "regenerate" is the worst possible response: it is
+        # deterministic, so it fires on EVERY launch and the daemon serves a
+        # leaf under a CA the session was never handed. That is how a floor of
+        # `cryptography>=41.0` turned into CERTIFICATE_VERIFY_FAILED on every
+        # request, silently, for anyone whose resolver picked 41.x.
+        #
+        # Re-raise so it is a loud failure at the seam (which fails open to an
+        # unpinned launch) instead of an invisible regeneration loop. The floor
+        # is 42.0 precisely so this cannot happen in a supported install.
+        raise
     except Exception:  # noqa: BLE001 — any failure to prove it means regenerate
         return False
 
@@ -1889,14 +1953,29 @@ def _spawn_lock(certdir: Path, name: str = ".spawn.lock"):
 def _kill_daemon(pid: int) -> None:
     """TERM a daemon, then escalate to KILL if it does not exit — so a daemon
     that ignores TERM (or hangs mid-teardown) never lingers as an orphan
-    holding a port. Mirrors CCF's recycle_supervisor bounded-wait-then-force."""
+    holding a port. Mirrors CCF's recycle_supervisor bounded-wait-then-force.
+
+    THE TERM BUDGET IS DERIVED FROM THE DRAIN, NOT CHOSEN. A daemon answering
+    TERM runs ``stop(drain=_DRAIN_SECONDS)``, so a fixed 2s wait here SIGKILLed
+    it mid-drain and the release's headline guarantee — in-flight requests
+    survive an upgrade — held only for a signal sent by hand, never for the
+    recycle the code itself performs. Measured against a real streaming client:
+    the client received 4 of 10 SSE events and the drain marker was never
+    written, because the process was killed before ``stop`` returned.
+
+    Two independently-chosen timeouts that must be ordered is a bug that comes
+    back every time either is tuned, so the ordering is computed. The slack
+    covers teardown that is not draining (closing conns, unlinking state).
+    """
     import time
 
     try:
         os.kill(pid, 15)  # SIGTERM
     except OSError:
         return
-    for _ in range(20):  # up to ~2s for a clean exit
+    # +2s of slack past the drain ceiling; the loop exits the moment it dies,
+    # so a daemon with no live clients still returns in milliseconds.
+    for _ in range(int(_DRAIN_SECONDS * 10) + 20):
         if not _pid_alive(pid):
             return
         time.sleep(0.1)
