@@ -642,7 +642,7 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
                 except Exception:  # noqa: BLE001
                     continue
             else:
-                body_only = block.split(b"-----\n", 1)[-1].rsplit(b"-----END", 1)[0]
+                body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
                 try:
                     base64.b64decode(b"".join(body_only.split()), validate=True)
                 except Exception:  # noqa: BLE001
@@ -735,7 +735,19 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
                 carries_us = True
         else:
             # Not a certificate: node skips it, but only if the armor decodes.
-            body_only = block.split(b"-----\n", 1)[-1].rsplit(b"-----END", 1)[0]
+            #
+            # SPLIT ON THE DASHES, not on `-----\n`. `_find_end` and
+            # `_BEGIN_MARKER` deliberately tolerate CRLF and trailing
+            # whitespace on a marker line — refusing those is the false reject
+            # that costs every sibling component its trust. A separator that
+            # demands a bare LF therefore does not exist in those blocks:
+            # `[-1]` returned the WHOLE block, `rsplit(b"-----END")` left
+            # `b""`, and empty base64 decodes fine, so the check was a no-op.
+            # Measured: `b'-----BEGIN X509 CRL-----\r\n!!!bad!!!\r\n---'` sliced
+            # to `b''`. A CERTIFICATE is saved by its x509 parse; a CRL or key
+            # block has only this, which is why a certificate-only test hides
+            # it.
+            body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
             try:
                 base64.b64decode(b"".join(body_only.split()), validate=True)
             except Exception:  # noqa: BLE001
