@@ -119,3 +119,28 @@ class TestConcatenationCannotFuseBlocks:
         a = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
         b = b"-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n"
         assert _join_pem(a, b) == a + b
+
+
+def test_the_two_version_strings_agree():
+    """`pyproject.toml` and `__init__.py` each carry a version, and nothing
+    tied them together — so a release could ship a wheel labelled 0.1.2 whose
+    `cswap_pin.__version__` still said 0.1.1. The host's install floor compares
+    the RUNTIME value, so the drift would make an upgraded machine look
+    un-upgraded, silently and permanently (a PyPI version cannot be re-uploaded).
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    declared = re.search(
+        r'^version\s*=\s*"([^"]+)"', (root / "pyproject.toml").read_text(), re.M
+    )
+    runtime = re.search(
+        r'^__version__\s*=\s*"([^"]+)"',
+        (root / "src" / "cswap_pin" / "__init__.py").read_text(),
+        re.M,
+    )
+    assert declared and runtime, "a version string went missing"
+    assert declared.group(1) == runtime.group(1), (
+        f"pyproject says {declared.group(1)}, __init__ says {runtime.group(1)}"
+    )
