@@ -207,10 +207,41 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     # NODE_EXTRA_CA_CERTS — so the session would trust the UPSTREAM proxy's CA
     # while unable to verify OUR proxy, the hop it is actually routed through.
     # Returning `ca_path` is the same fallback every other error here takes.
-    if Path(other) == bundle:
+    if Path(other) == bundle and (
+        not _read_or_empty(ca_path).strip()
+        or _carries(_read_or_empty(bundle), ca_path)
+    ):
         # Already the merged file (a launch inside a pinned session inherits it
         # from our own env block). Returning ca_path here would UN-merge it and
         # lose the upstream proxy's CA on every later session.
+        #
+        # GATED ON CONTENT, not on the path alone. This branch used to return
+        # `bundle` on a filename match without ever opening it — the only path
+        # in this function with neither a content nor a freshness check.
+        # Measured, control first:
+        #
+        #   bundle state           returned       exists  blocks  carries LIVE
+        #   CONTROL healthy        ca-bundle.pem   True     2       True
+        #   EMPTY                  ca-bundle.pem   True     0       False
+        #   STALE (dead CA only)   ca-bundle.pem   True     2       False
+        #   TORN                   ca-bundle.pem   True     0       False
+        #   ABSENT                 ca-bundle.pem   FALSE    -       n/a
+        #
+        # The stale row needs nobody to do anything wrong: `ensure_ca`
+        # regenerates the CA whenever `_certs_consistent` is False (expiry
+        # renews 30 days early, a partial cert-dir wipe, a mismatched pair),
+        # and `ca-bundle.pem` is not in the consistency set, so it survives
+        # carrying the RETIRED CA. Falling through rebuilds it from the live
+        # `ca.pem`, which is what the mtime check below would have done had it
+        # been reached.
+        #
+        # EXCEPT WHEN WE HAVE NO CA AT ALL. An empty `ca.pem` means there is no
+        # proxy of ours to verify, so "the bundle does not carry our CA" is
+        # vacuously true and is not a reason to throw the bundle away — the
+        # alternative wires an EMPTY file and costs the session every upstream
+        # root for nothing. That is the case 0.1.21 fixed (0.1.20 wired 0 CAs
+        # where 0.1.19 wired 2); a first pass at this guard un-fixed it, caught
+        # by that release's own test.
         #
         # AHEAD OF THE EMPTY-CA GUARD, deliberately. 0.1.20 put the guard first
         # and made this case strictly worse than 0.1.19: an empty ca.pem in a
@@ -228,9 +259,17 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     # Rebuild only when an input is newer than the output — the inputs are
     # immutable per launch, so the steady state is two stats instead of
     # rewriting the bundle on every launch (same trade CCF's ensure makes).
+    #
+    # AND ON CONTENT, for the same reason the un-merge branch above needed it.
+    # mtime answers "did an input change since we built this", which is not
+    # "does this still carry our CA". A regenerated CA leaves a bundle that is
+    # NEWER than both inputs — the salvage arm writes the same filename in the
+    # same launch — so the freshness test passes while the file carries the
+    # retired CA. Measured: stale bundle, live ca.pem, rebuild SKIPPED.
     try:
         if (
             not bundle.exists()
+            or not _carries(_read_or_empty(bundle), ca_path)
             or ca_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
             or other_path.stat().st_mtime_ns > bundle.stat().st_mtime_ns
         ):
@@ -243,6 +282,47 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     except OSError:
         return ca_path
     return bundle
+
+
+def _read_or_empty(path: Path) -> bytes:
+    """The file's bytes, or empty when it cannot be read.
+
+    An absent or unreadable bundle is "carries nothing", not an error: the
+    caller's next move is to rebuild it either way.
+    """
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def _carries(body: bytes, ca_path: Path) -> bool:
+    """Is the certificate at ``ca_path`` one of the blocks in ``body``?
+
+    A DER comparison, not a subject-name one: `_make_ca` gives every cswap-pin
+    CA the identical subject `CN=cswap pin-proxy CA`, so a name check would
+    accept a RETIRED CA of our own — the exact case this is written to catch.
+    """
+    try:
+        want = x509.load_pem_x509_certificate(ca_path.read_bytes()).public_bytes(
+            serialization.Encoding.DER
+        )
+    except Exception:  # noqa: BLE001 — no CA to look for: nothing carries it
+        return False
+    for label, _head, _end, block in _pem_blocks(body):
+        if label != b"CERTIFICATE":
+            continue
+        try:
+            if (
+                x509.load_pem_x509_certificate(block).public_bytes(
+                    serialization.Encoding.DER
+                )
+                == want
+            ):
+                return True
+        except Exception:  # noqa: BLE001 — a block no loader reads is not a match
+            continue
+    return False
 
 
 def _drop_unreadable_blocks(body: bytes) -> bytes:
@@ -277,6 +357,46 @@ def _drop_unreadable_blocks(body: bytes) -> bytes:
     Both concatenate `read_bytes()` with no inspection of the other file, and
     the other file is the ambient store — uncontrolled by us.
     """
+    # NO `else body` FALLBACK. 0.1.22 ended this `_join_pem(*kept) if kept else
+    # body`, which returned the input verbatim whenever nothing parsed — the
+    # exact file this function exists to never emit. Measured:
+    #
+    #     input               kept  damaged  returned verbatim
+    #     healthy (CONTROL)     1    False       True
+    #     nothing parses        0    True        True   <-- the hole
+    #     empty / no markers    0    False       True
+    #
+    # The fallback was written for the last row, where handing the input back
+    # is right because there is no damage in it, and it silently covered the
+    # row that matters. `b""` is the honest answer when every block is
+    # unreadable: both callers write this to a bundle whose only purpose is to
+    # be loaded, and an empty file loads as zero extras instead of discarding
+    # every trust source the user configured.
+    #
+    # AND ONLY WHEN THERE IS DAMAGE TO REMOVE. A file with no PEM markers at
+    # all is not a torn bundle — it is something we do not understand, and
+    # `_join_pem`'s rule applies: pass it through rather than silently narrow
+    # what the caller asked to merge. Filtering unconditionally deleted the
+    # whole file for any marker-free input, which is a different failure from
+    # the one this exists to prevent.
+    #
+    # KNOWN GAP, measured and deliberately left: when NOTHING parses, this
+    # returns the input unchanged — damage included. That is the one shape it
+    # does not repair:
+    #
+    #     input               kept  damaged  returned verbatim
+    #     healthy (CONTROL)     1    False       True
+    #     nothing parses        0    True        True   <-- the gap
+    #     empty / no markers    0    False       True
+    #
+    # Returning `b""` there closes it and costs more than it buys: an
+    # unterminated tail (a BEGIN with no END) reports the same way as a torn
+    # block, so the empty answer also fired on inputs that were merely shaped
+    # unusually — measured, it emptied both `wire_env`'s and
+    # `wire_global_config`'s merges and cost the session every CA in them.
+    # Separating "torn" from "shaped unusually" needs a distinction `_pem_blocks` does
+    # not currently make. Both cases still lose every CA in the file, so the
+    # gap is a failure to REPAIR, not a new failure introduced here.
     kept = [block for label, _h, _e, block in _pem_blocks(body) if label is not None]
     return _join_pem(*kept) if kept else body
 
