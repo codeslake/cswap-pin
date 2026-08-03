@@ -4146,31 +4146,30 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
     """
 
     @staticmethod
-    def _ca(cn="pin-ca"):
-        import datetime
+    def _certdir(tmp_path, cn="pin-ca"):
+        """A REAL cert dir: ca.pem + a leaf signed by it, as production has.
 
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
+        The probe asks "will node verify our leaf", so a bare CA with no leaf
+        beside it is a question it cannot set up — it answers None, which is
+        correct and useless for these assertions. `ensure_ca` builds exactly
+        what a running daemon has.
+        """
+        from cswap_pin.proxy import ensure_ca
 
-        k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        n = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, cn)])
-        now = datetime.datetime.now(datetime.timezone.utc)
-        return (x509.CertificateBuilder().subject_name(n).issuer_name(n)
-                .public_key(k.public_key()).serial_number(x509.random_serial_number())
-                .not_valid_before(now - datetime.timedelta(days=1))
-                .not_valid_after(now + datetime.timedelta(days=365))
-                .add_extension(x509.BasicConstraints(ca=True, path_length=None),
-                               critical=True)
-                .sign(k, hashes.SHA256())).public_bytes(serialization.Encoding.PEM)
+        d = tmp_path / cn
+        d.mkdir(exist_ok=True)
+        ensure_ca(d, "api.anthropic.com")
+        return d
 
     def test_no_node_is_UNKNOWN_not_unusable(self, tmp_path, monkeypatch):
         from cswap_pin import proxy
 
-        ours = self._ca()
-        f = tmp_path / "b.pem"
+        d = self._certdir(tmp_path)
+        ours = (d / "ca.pem").read_bytes()
+        f = d / "b.pem"
         f.write_bytes(ours)
         monkeypatch.setattr("shutil.which", lambda name: None)
-        assert proxy._bundle_loads_in_node(f, ours) is None, (
+        assert proxy._bundle_loads_in_node(f, d / "ca.pem") is None, (
             "answered a question it could not ask — a node-less machine would "
             "lose every corporate root"
         )
@@ -4183,8 +4182,9 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
 
         from cswap_pin import proxy
 
-        ours = self._ca()
-        f = tmp_path / "b.pem"
+        d = self._certdir(tmp_path)
+        ours = (d / "ca.pem").read_bytes()
+        f = d / "b.pem"
         f.write_bytes(ours)
 
         class _R:
@@ -4193,7 +4193,7 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
             stderr = b""
 
         monkeypatch.setattr(subprocess, "run", lambda *a, **k: _R())
-        assert proxy._bundle_loads_in_node(f, ours) is None, (
+        assert proxy._bundle_loads_in_node(f, d / "ca.pem") is None, (
             "a probe whose output lacks the sentinel was treated as an answer"
         )
 
@@ -4208,11 +4208,12 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
         if shutil.which("node") is None:
             pytest.skip("no node on this box — the oracle cannot be asked")
 
-        ours = self._ca()
+        d = self._certdir(tmp_path)
+        ours = (d / "ca.pem").read_bytes()
         bundle = b"-----BEGIN PUBLIC KEY----------BEGIN CERTIFICATE-----\n" + ours
-        f = tmp_path / "b.pem"
+        f = d / "b.pem"
         f.write_bytes(bundle)
-        assert proxy._bundle_loads_in_node(f, ours) is False
+        assert proxy._bundle_loads_in_node(f, d / "ca.pem") is False
         # And this is exactly where the predicate disagreed.
         assert proxy._bundle_is_usable(bundle, ours) is True, (
             "the predicate no longer disagrees — this test has lost its subject"
@@ -4226,10 +4227,12 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
         if shutil.which("node") is None:
             pytest.skip("no node on this box — the oracle cannot be asked")
 
-        ours, corp = self._ca(), self._ca("corp-root")
-        f = tmp_path / "b.pem"
+        d = self._certdir(tmp_path)
+        ours = (d / "ca.pem").read_bytes()
+        corp = (self._certdir(tmp_path, "corp-root") / "ca.pem").read_bytes()
+        f = d / "b.pem"
         f.write_bytes(corp + ours)
-        assert proxy._bundle_loads_in_node(f, ours) is True
+        assert proxy._bundle_loads_in_node(f, d / "ca.pem") is True
 
     def test_a_bundle_without_our_CA_is_UNUSABLE(self, tmp_path):
         """Loading fine is not enough: the file has to carry OUR CA, or the
@@ -4241,7 +4244,314 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
         if shutil.which("node") is None:
             pytest.skip("no node on this box — the oracle cannot be asked")
 
-        ours, corp = self._ca(), self._ca("corp-root")
-        f = tmp_path / "b.pem"
+        d = self._certdir(tmp_path)
+        ours = (d / "ca.pem").read_bytes()
+        corp = (self._certdir(tmp_path, "corp-root") / "ca.pem").read_bytes()
+        f = d / "b.pem"
         f.write_bytes(corp)
-        assert proxy._bundle_loads_in_node(f, ours) is False
+        assert proxy._bundle_loads_in_node(f, d / "ca.pem") is False
+
+
+class TestTheOracleWorksOnRUNTIMESWEDoNotDevelopOn:
+    """The oracle must not answer UNKNOWN for every input on an older node.
+
+    `tls.getCACertificates` landed in node v22.15 / v23.10. On anything older
+    the probe writes nothing, the sentinel is absent, and every verdict is
+    `None` — which the caller reads as "could not ask" and falls back to the
+    predicate. So on those runtimes the oracle is not conservative, it is
+    ABSENT, and the bug looks like a working guard on a dev box that happens to
+    run a new node.
+
+    A sibling implementation shipped exactly this and measured it:
+        v20.19.0  undefined
+        v22.14.0  undefined
+        v22.15.0  function
+
+    ASK THE CONTRACT, NOT A PROXY FOR IT. "Will you verify our leaf" is
+    answerable on every node back to v12, and it is the question that actually
+    matters — a session's failure mode is a handshake, not a census.
+    """
+
+    @staticmethod
+    def _ca_and_leaf(tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        d = tmp_path / "cd"
+        d.mkdir()
+        ensure_ca(d, "api.anthropic.com")
+        return d
+
+    def test_the_probe_does_not_depend_on_getCACertificates(self):
+        """The API that is missing on half the runtimes we would run under."""
+        import inspect
+
+        from cswap_pin import proxy
+
+        # THE PARSE TREE, not the text: the docstring explains WHY the API is
+        # avoided and naming it there must not fail the check, while a real
+        # call must. Stripping `#` comments was not enough — that is the same
+        # source-text mistake this suite has already been burned by.
+        import ast
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(proxy._bundle_loads_in_node)))
+        code = "\n".join(
+            ast.unparse(n)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.Call, ast.Assign, ast.Return))
+        )
+        assert "getCACertificates" not in code, (
+            "the probe calls tls.getCACertificates, which does not exist before "
+            "node v22.15 — every verdict is UNKNOWN there and the guard is "
+            "absent rather than conservative"
+        )
+
+
+class TestARefusedBundleMustNotCostTheCorporateROOTS:
+    """Refusing the shared bundle must never mean trusting ONLY our own CA.
+
+    THE DANGEROUS ARM IS THE ONE THAT REFUSES. `_trust_file` asks whether the
+    merged `ca-trust.pem` is usable; when the answer is no it falls through to
+    "our CA alone", and on a corporate network that is a machine that can no
+    longer verify anything except our own proxy. Every https call a session
+    makes to anywhere else fails. The bundle being unusable is not a reason to
+    throw away the parts of it that ARE usable — node's failure mode is
+    per-block, so one torn block does not make the other 131 roots any less
+    valid.
+
+    Two independent measurements say this arm is reached in production:
+
+      A. THE ORACLE IS NEVER CONSULTED THERE. `_bundle_loads_in_node` looks
+         for the leaf beside the BUNDLE (`Path(bundle).parent / "leaf.pem"`),
+         but the shared bundle lives in the Claude config home while our leaf
+         lives in the pin-proxy certdir. So in production the leaf is never
+         found, every verdict is None, and the predicate — the thing the
+         oracle exists to correct — decides alone. The oracle looked healthy
+         because every test handed it a bundle written INTO the certdir.
+
+      B. A REVIEWER MUTATED THE None ARM AND THE SUITE STAYED GREEN. Forcing
+         `verdict = False` when node cannot be consulted swapped the wired file
+         from a 132-cert corporate bundle to our own single CA, and 259 tests
+         passed. The five oracle tests all call `_bundle_loads_in_node`
+         directly, so nothing asserted what the CALLER does with each of the
+         three outcomes.
+
+    Once a refusal salvages, the three outcomes stop being a cliff: unknown and
+    refused both cost at most the torn block, never the corporate roots.
+    """
+
+    def _home(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        return home
+
+    def _ca(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+
+    @staticmethod
+    def _der(pem: bytes) -> bytes:
+        from cryptography.hazmat.primitives import serialization
+
+        return x509.load_pem_x509_certificate(pem).public_bytes(
+            serialization.Encoding.DER
+        )
+
+    @staticmethod
+    def _ders(path) -> set:
+        """Every certificate the wired file actually carries, by DER."""
+        import re as _re
+
+        from cryptography.hazmat.primitives import serialization
+
+        out = set()
+        body = Path(path).read_bytes()
+        for m in _re.finditer(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            body,
+            _re.S,
+        ):
+            try:
+                out.add(
+                    x509.load_pem_x509_certificate(m.group(0)).public_bytes(
+                        serialization.Encoding.DER
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
+    def test_the_oracle_is_consulted_on_the_bundle_we_actually_ship(
+        self, tmp_path, monkeypatch
+    ):
+        """A. The production bundle lives somewhere else than our leaf.
+
+        This fixture is the one the oracle was built for: the predicate calls
+        it usable and node loads ZERO certificates from it. If the oracle is
+        reached, the file is refused. If the leaf lookup misses — as it does in
+        production — the verdict is None, the predicate decides, and we wire a
+        session to a bundle it cannot verify anything with.
+        """
+        import shutil
+
+        from cswap_pin.proxy import CA_TRUST_FILE, _bundle_is_usable, wire_env
+
+        if shutil.which("node") is None:
+            pytest.skip("no node on this box — the oracle cannot be asked")
+
+        home = self._home(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        ours = ca.read_bytes()
+        merged = home / CA_TRUST_FILE
+        merged.write_bytes(
+            b"-----BEGIN PUBLIC KEY----------BEGIN CERTIFICATE-----\n" + ours
+        )
+        # The predicate is wrong about this file, which is the whole point.
+        assert _bundle_is_usable(merged.read_bytes(), ours) is True
+
+        wired = wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"]
+        assert wired != str(merged), (
+            "wired a session to a bundle node reads as ZERO CAs — the oracle "
+            "was not consulted, because it looks for our leaf beside the "
+            "bundle and the shared bundle does not live in our certdir"
+        )
+
+    def test_a_refused_bundle_keeps_every_root_that_still_decodes(
+        self, tmp_path, monkeypatch
+    ):
+        """B, direction one: node REFUSES. Salvage, do not surrender.
+
+        One torn block does not invalidate the corporate roots beside it.
+        Dropping to our CA alone costs the session every https destination
+        except our own proxy.
+        """
+        import shutil
+
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
+
+        if shutil.which("node") is None:
+            pytest.skip("no node on this box — the oracle cannot be asked")
+
+        home = self._home(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        corp = _other_ca(tmp_path / "corp-root")
+        (home / CA_TRUST_FILE).write_bytes(
+            corp
+            + b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n"
+            b"-----END CERTIFICATE-----\n"
+            + ca.read_bytes().strip()
+            + b"\n"
+        )
+        carried = self._ders(wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"])
+        assert self._der(ca.read_bytes()) in carried, "lost our own CA"
+        assert self._der(corp) in carried, (
+            "a torn block cost the session every corporate root — node's "
+            "failure mode is per-block, so the roots beside it are still valid"
+        )
+
+    def test_no_node_and_a_refused_bundle_still_keeps_the_roots(
+        self, tmp_path, monkeypatch
+    ):
+        """B, direction two: the oracle cannot be asked AT ALL.
+
+        cswap is Python; a box with no node is normal, not an edge case. That
+        is the arm where a wrong answer is silent and permanent, so it must
+        salvage too — a machine without node must not be a machine without
+        corporate trust.
+        """
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
+
+        home = self._home(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        corp = _other_ca(tmp_path / "corp-root")
+        (home / CA_TRUST_FILE).write_bytes(
+            corp
+            + b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n"
+            b"-----END CERTIFICATE-----\n"
+            + ca.read_bytes().strip()
+            + b"\n"
+        )
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        carried = self._ders(wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"])
+        assert self._der(ca.read_bytes()) in carried, "lost our own CA"
+        assert self._der(corp) in carried, (
+            "no node on PATH cost the session every corporate root"
+        )
+
+    def test_a_bundle_with_nothing_salvageable_still_names_our_own_CA(
+        self, tmp_path, monkeypatch
+    ):
+        """The floor. Salvage must never leave a session with LESS than it had:
+        when nothing in the shared file decodes, the answer is our CA, exactly
+        as before this existed."""
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
+
+        home = self._home(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        (home / CA_TRUST_FILE).write_bytes(
+            b"-----BEGIN CERTIFICATE-----\n!!!junk!!!\n-----END CERTIFICATE-----\n"
+        )
+        wired = wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"]
+        assert self._der(ca.read_bytes()) in self._ders(wired)
+
+    def test_the_salvaged_file_is_one_node_will_actually_load(
+        self, tmp_path, monkeypatch
+    ):
+        """Salvage is worthless if node refuses the result too. Ask it."""
+        import shutil
+
+        from cswap_pin import proxy
+
+        if shutil.which("node") is None:
+            pytest.skip("no node on this box — the oracle cannot be asked")
+
+        home = self._home(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        corp = _other_ca(tmp_path / "corp-root")
+        (home / proxy.CA_TRUST_FILE).write_bytes(
+            corp
+            + b"-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n"
+            b"-----END CERTIFICATE-----\n"
+            + ca.read_bytes().strip()
+            + b"\n"
+        )
+        wired = Path(proxy.wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"])
+        assert proxy._bundle_loads_in_node(wired, ca) is True, (
+            "salvaged a file node still will not load"
+        )
+
+    def test_no_node_and_a_HEALTHY_bundle_still_names_the_SHARED_file(
+        self, tmp_path, monkeypatch
+    ):
+        """Salvage is the floor, not the default. The predicate still decides.
+
+        Once a refusal salvages, "treat UNKNOWN as unusable" stops being
+        catastrophic — both arms keep the roots — so the mutation that collapses
+        the three outcomes to two survives a suite that only checks for damage.
+        It is still wrong, and measurably: on a node-less machine with a
+        perfectly good bundle it wires a SNAPSHOT of that bundle instead of the
+        bundle itself.
+
+            SHIPPED : <config-home>/ca-trust.pem      the live shared file
+            collapsed: <certdir>/ca-bundle.pem        a copy, written every launch
+
+        The copy costs a write per launch and stops tracking the file the
+        launcher rebuilds, so a root added between two launches reaches every
+        component except our sessions — which is the whole reason we consume
+        the shared bundle instead of building our own.
+        """
+        from cswap_pin.proxy import CA_TRUST_FILE, wire_env
+
+        home = self._home(tmp_path, monkeypatch)
+        ca = self._ca(tmp_path)
+        shared = home / CA_TRUST_FILE
+        shared.write_bytes(
+            _other_ca(tmp_path / "corp-root") + ca.read_bytes().strip() + b"\n"
+        )
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(shared), (
+            "a healthy shared bundle was copied instead of used — the UNKNOWN "
+            "arm collapsed into the refusal arm"
+        )
