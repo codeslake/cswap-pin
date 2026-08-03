@@ -193,6 +193,25 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     bundle = ca_path.parent / "ca-bundle.pem"
     if not other or Path(other) == ca_path:
         return ca_path
+    # THE THIRD DOOR. `_publish_ca` refuses an empty `ours` and so does
+    # `_trust_file`'s salvage arm; this one gated on mtime and never on
+    # content, then concatenated `ca_path.read_bytes()` regardless. An empty
+    # ca.pem satisfies every one of those conditions. Measured, with a control
+    # so a zero is not read as "this fixture never merges":
+    #
+    #   ours                blocks out   carries ours
+    #   real CA (control)        2           True
+    #   EMPTY                    1           False
+    #
+    # and the return value goes straight into the session's
+    # NODE_EXTRA_CA_CERTS — so the session would trust the UPSTREAM proxy's CA
+    # while unable to verify OUR proxy, the hop it is actually routed through.
+    # Returning `ca_path` is the same fallback every other error here takes.
+    try:
+        if not ca_path.read_bytes().strip():
+            return ca_path
+    except OSError:
+        return ca_path
     if Path(other) == bundle:
         # Already the merged file (a launch inside a pinned session inherits it
         # from our own env block). Returning ca_path here would UN-merge it and
