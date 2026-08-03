@@ -38,7 +38,7 @@ from collections.abc import Callable
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from cswap_pin._host import require
@@ -880,21 +880,135 @@ def _verifying_ctx(extra_ca: "Path | None" = None) -> ssl.SSLContext:
     return ctx
 
 
-def _dial_chain(chain: "_Chain", timeout: float = 15) -> socket.socket:
+class _TLSInTLS:
+    """An inner TLS session carried over a socket that is ALREADY TLS.
+
+    ``SSLContext.wrap_socket`` re-wraps the underlying FILE DESCRIPTOR, not the
+    TLS stream, so calling it on an ``SSLSocket`` does not layer — it starts a
+    second handshake in the clear on a socket whose peer is speaking TLS, and
+    destroys the outer session doing it. Measured: the second wrap raises
+    (UNEXPECTED_MESSAGE / ECONNRESET, depending on which side notices first)
+    and the outer socket's ``fileno()`` is -1 afterwards, so the connection is
+    unrecoverable and every pinned request through an ``https://`` egress
+    proxy died at EOF with no response ever reaching the client.
+
+    An ``https://`` proxy needs exactly that layering: the CONNECT rides the
+    outer TLS, the origin's TLS rides inside it. Memory BIOs are the only way
+    to get it — the inner session never touches the fd.
+
+    Presents the subset of the socket surface this module uses upstream:
+    ``sendall`` / ``recv`` / ``pending`` / ``settimeout`` / ``fileno`` /
+    ``close``.
+    """
+
+    def __init__(self, ctx: ssl.SSLContext, sock, server_hostname: str) -> None:
+        self._sock = sock
+        self._in = ssl.MemoryBIO()
+        self._out = ssl.MemoryBIO()
+        self._obj = ctx.wrap_bio(self._in, self._out, server_hostname=server_hostname)
+        self._drive(self._obj.do_handshake)
+
+    def _drive(self, fn, *args):
+        """Run one SSLObject operation, moving bytes until it completes."""
+        while True:
+            try:
+                out = fn(*args)
+            except ssl.SSLWantReadError:
+                self._flush()
+                chunk = self._sock.recv(65536)
+                if chunk:
+                    self._in.write(chunk)
+                else:
+                    self._in.write_eof()
+                continue
+            except ssl.SSLWantWriteError:
+                self._flush()
+                continue
+            self._flush()
+            return out
+
+    def _flush(self) -> None:
+        data = self._out.read()
+        if data:
+            self._sock.sendall(data)
+
+    def sendall(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            view = view[self._drive(self._obj.write, view) :]
+
+    def recv(self, n: int = 65536, flags: int = 0) -> bytes:
+        if flags:
+            raise ValueError("flags are not supported on a layered TLS socket")
+        try:
+            return self._drive(self._obj.read, n)
+        except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+            return b""
+
+    def pending(self) -> int:
+        return self._obj.pending()
+
+    def settimeout(self, value) -> None:
+        self._sock.settimeout(value)
+
+    def gettimeout(self):
+        return self._sock.gettimeout()
+
+    def fileno(self) -> int:
+        return self._sock.fileno()
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def _wrap_upstream(ctx: ssl.SSLContext, sock, server_hostname: str):
+    """TLS to the origin — layered when the socket underneath is already TLS."""
+    if isinstance(sock, ssl.SSLSocket):
+        return _TLSInTLS(ctx, sock, server_hostname)
+    return ctx.wrap_socket(sock, server_hostname=server_hostname)
+
+
+def _dial_chain(
+    chain: "_Chain", timeout: float = 15, extra_ca: "Path | None" = None
+) -> socket.socket:
     """Connect to the egress proxy, wrapping in TLS when the URL said https.
 
     Without this an ``https://`` proxy got a plaintext dial to what is a TLS
     port, so the handshake never happened and every pinned request failed in
     an environment where that proxy is the only route out.
+
+    ``extra_ca`` is the CA recorded alongside the proxy in ``upstream.json``.
+    Passing it matters because the daemon is spawned from a plain shell, which
+    normally has no ``NODE_EXTRA_CA_CERTS`` — so a corporate root that exists
+    only in the hint would otherwise never be consulted, and verification of
+    the very proxy it describes would fail.
     """
     sock = socket.create_connection(chain.address, timeout=timeout)
     if not chain.tls:
         return sock
     try:
-        return _verifying_ctx().wrap_socket(sock, server_hostname=chain.host)
+        return _verifying_ctx(extra_ca).wrap_socket(sock, server_hostname=chain.host)
     except (OSError, ssl.SSLError):
         sock.close()
         raise
+
+
+def _connect_ok(status: "str | None") -> bool:
+    """Whether a CONNECT status line reports success.
+
+    ``" 200" in status`` reads the whole line, reason phrase included, so a
+    refusal that merely MENTIONS 200 was accepted as one. Measured on real
+    shapes a filtering proxy emits: ``502 Bad Gateway (upstream returned
+    200)``, ``403 Blocked by policy rule 200`` and ``HTTP/1.1 2000 Nonsense``
+    all passed. The blind tunnel then pumped the proxy's HTML error page to
+    the client as if it were the origin's TLS bytes, and the "chain refused →
+    dial direct" rescue never ran.
+    """
+    parts = (status or "").split()
+    return len(parts) >= 2 and parts[0].startswith("HTTP/") and parts[1] == "200"
 
 _UPSTREAM_FILE = "upstream.json"
 
@@ -988,26 +1102,104 @@ def ensure_ca(ca_dir: Path, host: str) -> CertBundle:
     CA SKI, which is why the CA must carry it.
     """
     ca_dir = Path(ca_dir)
-    ca_dir.mkdir(parents=True, exist_ok=True)
+    ca_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     ca_pem = ca_dir / "ca.pem"
     ca_key = ca_dir / "ca.key"
     leaf_pem = ca_dir / "leaf.pem"
     leaf_key = ca_dir / "leaf.key"
 
-    if ca_pem.exists() and ca_key.exists():
-        ca_cert = x509.load_pem_x509_certificate(ca_pem.read_bytes())
-        ca_priv = serialization.load_pem_private_key(ca_key.read_bytes(), password=None)
-    else:
-        ca_cert, ca_priv = _make_ca()
-        ca_pem.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
-        _write_key(ca_key, ca_priv)
-
-    if not (leaf_pem.exists() and leaf_key.exists()):
-        leaf_cert, leaf_priv = _make_leaf(host, ca_cert, ca_priv)
-        leaf_pem.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
-        _write_key(leaf_key, leaf_priv)
+    # Serialized, because the CA test and the leaf test used to be independent
+    # conditions over four separately-written files with nothing holding them
+    # together. Two sessions starting in the same second (first pin, or after
+    # a cert-dir wipe) could interleave so that ca.pem did not sign leaf.pem —
+    # measured on repeated trials — and since this function is idempotent it
+    # NEVER self-healed: every later launch reused the mismatched pair and
+    # Node reported "unable to verify the first certificate" until a human
+    # deleted the directory.
+    with _spawn_lock(ca_dir, name=".ca.lock"):
+        if not _certs_consistent(ca_pem, ca_key, leaf_pem, leaf_key, host):
+            # Regenerate BOTH. Keeping a CA whose leaf must be reissued would
+            # leave already-wired sessions trusting a root that no longer
+            # matches what this proxy serves.
+            ca_cert, ca_priv = _make_ca()
+            _write_public(ca_pem, ca_cert.public_bytes(serialization.Encoding.PEM))
+            _write_key(ca_key, ca_priv)
+            leaf_cert, leaf_priv = _make_leaf(host, ca_cert, ca_priv)
+            _write_public(leaf_pem, leaf_cert.public_bytes(serialization.Encoding.PEM))
+            _write_key(leaf_key, leaf_priv)
 
     return CertBundle(ca_path=ca_pem, leaf_path=leaf_pem, leaf_key_path=leaf_key)
+
+
+def _certs_consistent(
+    ca_pem: Path, ca_key: Path, leaf_pem: Path, leaf_key: Path, host: str
+) -> bool:
+    """Whether the four files on disk form ONE usable, unexpired set.
+
+    Every existence test here used to stand alone, so a dir holding a CA from
+    one generation and a leaf from another passed. What the client actually
+    needs is a single question: does the CA it will trust sign the leaf this
+    proxy will serve, for this host, today. Answering it directly also covers
+    expiry — the previous code tested only ``exists()``, so a CA reaching its
+    ``not_valid_after`` would have been reused forever.
+    """
+    try:
+        if not all(p.exists() for p in (ca_pem, ca_key, leaf_pem, leaf_key)):
+            return False
+        ca = x509.load_pem_x509_certificate(ca_pem.read_bytes())
+        leaf = x509.load_pem_x509_certificate(leaf_pem.read_bytes())
+        serialization.load_pem_private_key(ca_key.read_bytes(), password=None)
+        lkey = serialization.load_pem_private_key(leaf_key.read_bytes(), password=None)
+        if lkey.public_key().public_numbers() != leaf.public_key().public_numbers():
+            return False
+        # Renew a month early: a cert that expires mid-session takes the
+        # session with it, and regenerating is cheap.
+        soon = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=30)
+        if min(ca.not_valid_after_utc, leaf.not_valid_after_utc) <= soon:
+            return False
+        san = leaf.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value.get_values_for_type(x509.DNSName)
+        if host not in san:
+            return False
+        ca.public_key().verify(
+            leaf.signature,
+            leaf.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            leaf.signature_hash_algorithm,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — any failure to prove it means regenerate
+        return False
+
+
+def _write_public(path: Path, data: bytes) -> None:
+    """A world-readable PEM, written whole or not at all.
+
+    ``write_bytes`` on the live path leaves a truncated file readable by a
+    concurrent reader; the temp-then-replace makes the swap atomic. The pid
+    suffix is not decoration: ``O_CREAT``'s mode argument is IGNORED for a
+    file that already exists, so a fixed temp name left behind by a crashed
+    write would dictate the final mode and the rename would make it permanent.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _make_ca() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
@@ -1078,14 +1270,40 @@ def _make_leaf(
 
 
 def _write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
-    path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
+    """A private key that is never briefly world-readable.
+
+    ``write_bytes`` then ``chmod`` creates the file at the process umask —
+    0644 under the usual 022 — and the complete key bytes sit at that mode
+    until the chmod lands. A reader that opens the path inside that window
+    keeps a valid fd afterwards, so the later chmod does not close it. The CA
+    key is the one secret here whose compromise no restart can undo, so it is
+    created at 0600 and never exists at anything wider. Pid-suffixed and
+    O_EXCL because ``O_CREAT``'s mode is IGNORED for an existing file: a
+    leftover temp from a crashed write would otherwise dictate the mode.
+    """
+    data = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
     )
-    os.chmod(path, 0o600)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def resolve_pin_token(
@@ -1549,14 +1767,19 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     return port, ca
 
 
-def _spawn_lock(certdir: Path):
-    """Exclusive file lock serializing daemon spawns (one elected spawner)."""
+def _spawn_lock(certdir: Path, name: str = ".spawn.lock"):
+    """Exclusive file lock serializing daemon spawns (one elected spawner).
+
+    ``name`` picks which lock: cert generation takes its own so it cannot
+    deadlock against a spawn that is itself waiting on cert generation.
+    """
     import fcntl
     from contextlib import contextmanager
 
     @contextmanager
     def _locked():
-        lockf = open(Path(certdir) / ".spawn.lock", "w")
+        Path(certdir).mkdir(parents=True, exist_ok=True)
+        lockf = open(Path(certdir) / name, "w")
         try:
             fcntl.flock(lockf, fcntl.LOCK_EX)
             yield
@@ -1644,7 +1867,12 @@ def _install_signal_teardown(cleanup) -> None:
 
     def _handler(signum, frame):
         try:
-            cleanup()
+            # NAME THE SIGNAL. A TERM from a recycle and an idle teardown are
+            # the same code path and left the same (empty) trace, so a daemon
+            # that vanished could not be told from one that was killed.
+            cleanup(f"signal {signal.Signals(signum).name}")
+        except TypeError:
+            cleanup()  # a cleanup that takes no reason (tests)
         finally:
             os._exit(0)
 
@@ -1709,6 +1937,29 @@ def _open_daemon_log(certdir: Path):
         return open(path, "a", buffering=1, encoding="utf-8", errors="replace")
     except OSError:
         return subprocess.DEVNULL
+
+
+def _log_lifecycle(what: str) -> None:
+    """Record one daemon lifecycle event, with a timestamp, to stderr.
+
+    The daemon's stderr IS ``daemon.log`` (see :func:`_open_daemon_log`), so
+    this needs no file handling of its own and cannot fight the spawner for
+    the fd.
+
+    WHY THIS EXISTS. The log carried warnings only, so a daemon that started,
+    served for hours and disappeared left a ZERO-BYTE file. When every session
+    on a machine went down behind a dead pin, the log could not say when the
+    daemon went away, or whether it was an idle teardown, a signal, or a crash
+    — and with several agents working on the box at the time, the cause stayed
+    unattributable. An outage you cannot attribute is one you cannot prevent.
+
+    Never raises: a daemon must not die trying to record that it is dying.
+    """
+    try:
+        stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"[{stamp}] pid={os.getpid()} {what}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 _FIRST_HOLDER_TIMEOUT = 300.0
@@ -2301,6 +2552,9 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     write_daemon_state(
         certdir, proxy.port, os.getpid(), daemon_fingerprint(account_num, email)
     )
+    # A start line means the log is never empty for a daemon that ran, so
+    # "no teardown line" becomes evidence of a CRASH rather than of nothing.
+    _log_lifecycle(f"serving on port {proxy.port} for account {account_num}")
 
     fifo = refcount_fifo_path(certdir)
     if not fifo.exists():
@@ -2311,9 +2565,10 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
 
     done = threading.Event()
 
-    def _teardown():
+    def _teardown(reason: str = "refcount") -> None:
         # Last session closed its holder (or a signal arrived) — stop serving
         # and clean up our state so a launcher never reuses a dead record.
+        _log_lifecycle(f"stopping ({reason})")
         proxy.stop()
         if _release_daemon_state(certdir):
             # A successor owns the state now. Unwiring here would strip the
@@ -2336,8 +2591,13 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # path where the daemon goes away by itself.
         try:
             wire_global_config(None, None)
-        except Exception:
-            pass  # teardown is best-effort; never raise on the way out
+            _log_lifecycle("unwired .claude.json — sessions fall back")
+        except Exception as exc:  # noqa: BLE001
+            # NAME THE FAILURE. If the unwire does not happen, every session
+            # started afterwards dials a port nothing serves, and that is the
+            # outage this whole path exists to prevent. Silently swallowing it
+            # is what made one such outage unattributable for hours.
+            _log_lifecycle(f"COULD NOT unwire .claude.json: {exc!r}")
         done.set()
 
     # A recycle/cc-update TERM runs the same cleanup as an idle teardown.
@@ -2826,7 +3086,7 @@ class PinProxy:
         chain = _as_chain(self._current_chain())
         try:
             if chain:
-                up = _dial_chain(chain)
+                up = _dial_chain(chain, extra_ca=self._chain_ca())
                 # A plain proxy takes the absolute-form line as-is. Our own
                 # credential for the chain rides here, not the client's.
                 head = (
@@ -3074,8 +3334,8 @@ class PinProxy:
             # CERT_NONE context to a real internet connection carrying
             # account bearers.
             raw, via_loopback = self._connect_upstream()
-            up = self._upstream_ctx(via_loopback).wrap_socket(
-                raw, server_hostname=UPSTREAM_HOST
+            up = _wrap_upstream(
+                self._upstream_ctx(via_loopback), raw, UPSTREAM_HOST
             )
             self._local.up = up
         return up
@@ -3116,6 +3376,19 @@ class PinProxy:
         # Our own CA too, so a test's fake upstream verifies.
         return _verifying_ctx(self._bundle.ca_path)
 
+    def _chain_ca(self) -> "Path | None":
+        """The egress proxy's own CA, as recorded beside the proxy address.
+
+        ``write_upstream_hint`` records it precisely so a later launch that
+        cannot see the proxy's environment can still verify it. The daemon is
+        one of those launches — it is spawned from whatever shell ran
+        ``cswap pin``, which normally has no ``NODE_EXTRA_CA_CERTS`` — so
+        without this the recorded CA was never consulted and an ``https://``
+        corporate proxy failed verification against the public roots alone.
+        """
+        ca = read_upstream_ca(self._certdir)
+        return Path(ca) if ca else None
+
     def _current_chain(self) -> tuple[str, int] | None:
         """The egress proxy to CONNECT through, re-read per connection.
 
@@ -3152,7 +3425,7 @@ class PinProxy:
         chain = _as_chain(self._current_chain())
         if chain:
             try:
-                raw = _dial_chain(chain)
+                raw = _dial_chain(chain, extra_ca=self._chain_ca())
             except OSError:
                 # The recorded chain is gone. The hint is kept across launches
                 # that cannot see a proxy (a plain `cswap pin` shell has none),
@@ -3171,7 +3444,7 @@ class PinProxy:
                     h = _read_line(raw)
                     if h in ("", None):
                         break
-                if not status or " 200" not in status:
+                if not _connect_ok(status):
                     raw.close()
                     raise OSError(f"upstream CONNECT failed: {status}")
                 raw.settimeout(None)
@@ -3181,23 +3454,34 @@ class PinProxy:
         return sock, False  # direct dial: verification stays on
 
     @staticmethod
-    def _tunnel_is_open(up: socket.socket) -> bool:
-        """Whether a just-established tunnel is actually carrying, not EOF.
+    def _tunnel_is_open(up: socket.socket):
+        """The tunnel if it is actually carrying, None if it is already EOF.
 
         A CONNECT 200 means the proxy ACCEPTED the request, not that it reached
         the host: privoxy answers optimistically and dials afterwards, closing
-        the socket when that dial fails. Peek for a closed read end — no client
+        the socket when that dial fails. Look for a closed read end — no client
         byte has been sent yet, so a readable socket here can only mean EOF.
         Never blocks: a healthy idle tunnel has nothing to read and reports not
         ready, which is exactly the "open" answer.
+
+        Reads rather than peeks, because ``MSG_PEEK`` is not available on
+        every socket this receives: ``ssl.SSLSocket.recv`` rejects ANY non-zero
+        flag with ``ValueError`` — which is not an ``OSError``, so the except
+        below could not catch it and it escaped to the connection handler.
+        An ``https://`` chain therefore did not merely fail this check, it
+        killed the connection AND the direct-dial rescue this check exists to
+        trigger. The byte a read consumes is pushed back via :class:`_Prefixed`
+        so the caller's stream is unchanged; the socket is returned rather
+        than a bool for exactly that reason.
         """
         try:
             ready, _, _ = select.select([up], [], [], 0.35)
             if not ready:
-                return True  # nothing to read == still open, the normal case
-            return bool(up.recv(1, socket.MSG_PEEK))
-        except OSError:
-            return False
+                return up  # nothing to read == still open, the normal case
+            first = up.recv(1)
+            return _Prefixed(up, first) if first else None
+        except (OSError, ValueError):
+            return None
 
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
@@ -3228,7 +3512,7 @@ class PinProxy:
             # on work-mac, where the same session on a machine whose chain let
             # the host through received normally.
             try:
-                up = _dial_chain(chain)
+                up = _dial_chain(chain, extra_ca=self._chain_ca())
                 up.sendall(
                     f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
                     f"{chain.connect_headers()}\r\n".encode("latin1")
@@ -3238,7 +3522,7 @@ class PinProxy:
                     h = _read_line(up)
                     if h in ("", None):
                         break
-                if not status or " 200" not in status:
+                if not _connect_ok(status):
                     # Refused BY the chain (not a transport failure) — the one
                     # case where a direct dial is both correct and necessary.
                     if _TRACE is not None:
@@ -3251,7 +3535,7 @@ class PinProxy:
                     up = None
             except OSError:
                 up = None
-        if up is not None and not self._tunnel_is_open(up):
+        if up is not None and (carrying := self._tunnel_is_open(up)) is None:
             # A 200 is not proof the chain reached the host. privoxy answers
             # CONNECT optimistically and only then dials; when that dial fails
             # it closes, so the tunnel is EOF the instant we look. Measured on
@@ -3268,6 +3552,8 @@ class PinProxy:
                 _TRACE.flush()
             up.close()
             up = None
+        elif up is not None:
+            up = carrying  # the peeked byte, pushed back in front of the stream
         if up is None:
             try:
                 up = socket.create_connection((host, port), timeout=15)
@@ -3669,6 +3955,26 @@ def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> b
 
 
 def _pump(a: socket.socket, b: socket.socket) -> None:
+    """Shuttle bytes both ways until either side closes.
+
+    Drains each side's TLS buffer before going back to ``select``. One TLS
+    record can decrypt to more than a single ``recv`` returns, and select sees
+    the SOCKET, not the SSL buffer — so bytes already decrypted and waiting
+    are invisible to it. Measured: after a recv returning 10 bytes, 90 more
+    sat in the buffer while the selector reported not-readable. A long poll or
+    SSE stream through such a tunnel stalls on data that has already arrived.
+    """
+
+    def _drain(src) -> bytes:
+        data = src.recv(65536)
+        pending = getattr(src, "pending", None)
+        while data and pending and pending():
+            more = src.recv(65536)
+            if not more:
+                break
+            data += more
+        return data
+
     sel = selectors.DefaultSelector()
     sel.register(a, selectors.EVENT_READ)
     sel.register(b, selectors.EVENT_READ)
@@ -3677,7 +3983,7 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
             for key, _ in sel.select(timeout=60):
                 src = key.fileobj
                 dst = b if src is a else a
-                data = src.recv(65536)
+                data = _drain(src)
                 if not data:
                     return
                 dst.sendall(data)
