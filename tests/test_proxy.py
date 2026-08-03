@@ -5271,9 +5271,23 @@ class TestBothMarkersMustOwnTheirLine:
         ours = self._ours(tmp_path)
         raw = ours.read_bytes().strip() + b"\n"
         c = _other_ca(tmp_path / "corp-c")
+        # ARMOR-VALID body, so only the BEGIN guard can refuse it. An
+        # invalid body would be caught by the armor check first and this
+        # test would pass with the guard deleted — measured: it did, once
+        # the armor slice was fixed to actually see CRLF/whitespace bodies.
+        # THE TRAILER MUST ITSELF BE VALID BASE64. With `garbage` the armor
+        # check refuses the block first and the BEGIN guard is never reached
+        # — measured: the guard's mutation survived, because the test was
+        # really exercising the armor check. `QUFB` decodes, so only the
+        # BEGIN guard can refuse this one.
         damaged_key = (
-            b"-----BEGIN PUBLIC KEY-----garbage\nQUFBQQ==\n-----END PUBLIC KEY-----\n"
+            b"-----BEGIN PUBLIC KEY-----QUFB\nQUFBQQ==\n-----END PUBLIC KEY-----\n"
         )
+        assert _bundle_is_usable(
+            b"-----BEGIN PUBLIC KEY-----\nQUFBQQ==\n-----END PUBLIC KEY-----\n"
+            + raw,
+            raw.strip(),
+        ) is True, "fixture invalid: the same body must pass when BEGIN is clean"
         assert _bundle_is_usable(damaged_key + raw + c, raw.strip()) is False, (
             "a damaged BEGIN on a non-certificate block was approved — only "
             "the armor is checked there, so nothing else refuses it"
@@ -5322,3 +5336,74 @@ class TestBothMarkersMustOwnTheirLine:
         assert _bundle_is_usable(
             (a + raw).replace(b"\n", b"\r\n"), raw.strip()
         ) is True, "healthy CRLF refused"
+
+
+class TestTheArmorCheckIsNotAcceptingEmptiness:
+    """The non-certificate armor check went vacuous on any BEGIN line whose
+    ending is not a bare LF.
+
+    `_find_end` and `_BEGIN_MARKER` deliberately tolerate CRLF and trailing
+    whitespace — a builder concatenating files leaves those, and refusing them
+    is the false reject that costs every sibling component its trust. But the
+    armor slice was `block.split(b"-----\\n", 1)[-1]`, which needs the marker to
+    end in a bare LF *immediately*. On a CRLF block the separator is absent,
+    `[-1]` returns the WHOLE block, `rsplit(b"-----END")` leaves `b""`, and
+    `base64.b64decode(b"", validate=True)` SUCCEEDS. Measured on the real
+    slice:
+
+        block      b'-----BEGIN X509 CRL-----\\r\\n!!!bad!!!\\r\\n---'
+        old slice  b''          <- empty: the check is a no-op
+        new slice  b'\\r\\n!!!bad!!!\\r\\n'
+
+    A CERTIFICATE is saved by its x509 parse; a CRL or PUBLIC KEY has only
+    this check, so this is where a certificate-only test hides the defect.
+
+    REGRESSION against 0.1.14, measured end to end with node deciding — a CRLF
+    bundle carrying one torn CRL between two good certs:
+
+        0.1.14  predicate False  ->  salvage yields 3 certs
+        0.1.15  predicate True   ->  wired as-is, node loads 1
+
+    0.1.14 refused it and repaired it; 0.1.15 approved it and the session
+    keeps one root.
+    """
+
+    def _blocks(self, tmp_path):
+        from cswap_pin.proxy import ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        return ours.read_bytes().strip() + b"\n"
+
+    def test_a_torn_CRL_with_CRLF_endings_is_refused(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._blocks(tmp_path)
+        a = _other_ca(tmp_path / "corp-a")
+        torn = b"-----BEGIN X509 CRL-----\r\n!!!not base64!!!\r\n-----END X509 CRL-----\r\n"
+        assert _bundle_is_usable(a + torn + raw, raw.strip()) is False, (
+            "a torn CRL with CRLF endings was approved — the armor slice found "
+            "no separator, returned empty, and empty base64 decodes fine"
+        )
+
+    def test_a_torn_key_block_with_a_trailing_space_is_refused(self, tmp_path):
+        """Same hole through the other tolerance `_find_end` grants."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._blocks(tmp_path)
+        a = _other_ca(tmp_path / "corp-a")
+        torn = b"-----BEGIN PUBLIC KEY----- \n!!!not base64!!!\n-----END PUBLIC KEY-----\n"
+        assert _bundle_is_usable(a + torn + raw, raw.strip()) is False, (
+            "a torn key block whose BEGIN line carries a trailing space was "
+            "approved — the armor check never saw its body"
+        )
+
+    def test_a_HEALTHY_CRLF_key_block_is_still_accepted(self, tmp_path):
+        """The false-REJECT direction: real corporate bundles carry CRLs and
+        key blocks, and refusing them costs every sibling component."""
+        from cswap_pin.proxy import _bundle_is_usable
+
+        raw = self._blocks(tmp_path)
+        good = b"-----BEGIN PUBLIC KEY-----\r\nQUFBQQ==\r\n-----END PUBLIC KEY-----\r\n"
+        assert _bundle_is_usable(good + raw, raw.strip()) is True, (
+            "a healthy CRLF key block was refused"
+        )
