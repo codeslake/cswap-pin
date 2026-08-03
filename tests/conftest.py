@@ -28,6 +28,7 @@ throws it away.
 """
 
 import json
+import pathlib
 
 import pytest
 
@@ -85,6 +86,37 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
     # nothing it talks to. An env var is the only redirect a child obeys.
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
 
+    # AND THE ACCOUNT STORE, which is a THIRD question the config redirects
+    # above do not answer. Everything so far points at the CONFIG
+    # (`.claude.json`, `~/.claude/`). The credentials and the roster live
+    # somewhere else entirely — `~/.local/share/claude-swap/` — reached
+    # through `get_backup_root`, and nothing here redirected it.
+    #
+    # This was found during a live incident on lmd42: the real
+    # `sequence.json` was overwritten with test fixture accounts
+    # (`a@example.com`, `b@example.com`) plus matching 88-byte `.creds-*.enc`
+    # files. That damage was NOT traced to this suite — no test here builds a
+    # real switcher, so nothing reaches `switcher.backup_dir` today. But that
+    # is a property of the tests, not a guard, and it is exactly the shape
+    # every other hole in this file had before it fired. The roster syncs by
+    # WHOLE-FILE COPY with newest-wins, so a store corrupted on one machine is
+    # one sync away from overwriting both Macs.
+    #
+    # Three redirects because `get_backup_root` can be reached three ways:
+    # the function itself (in-process callers), `XDG_DATA_HOME` (the children
+    # this suite spawns, which do not inherit a patched module object), and
+    # `Path.home()` (its fallback when XDG is unset, and anything that
+    # computes the path itself).
+    store = tmp_path / "data-home"
+    store.mkdir(exist_ok=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(store))
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path / "fake-home")
+    (tmp_path / "fake-home").mkdir(exist_ok=True)
+    if hasattr(paths, "get_backup_root"):
+        monkeypatch.setattr(
+            paths, "get_backup_root", lambda store=store: store / "claude-swap"
+        )
+
     # The seam re-imports these INSIDE functions (`from claude_swap.paths
     # import ...`), which reads the attribute at call time — so patching the
     # module attribute above is enough for those. But any module that bound
@@ -104,4 +136,11 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
         if hasattr(mod, "get_claude_config_home"):
             monkeypatch.setattr(
                 mod, "get_claude_config_home", lambda home=home: home, raising=False
+            )
+        if hasattr(mod, "get_backup_root"):
+            monkeypatch.setattr(
+                mod,
+                "get_backup_root",
+                lambda store=store: store / "claude-swap",
+                raising=False,
             )
