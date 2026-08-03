@@ -3357,6 +3357,26 @@ class TestAnUpgradeDoesNotWaitForALaunch:
     `_read_alive_port` without a fingerprint.
     """
 
+    @staticmethod
+    def _serving_listener(port=0):
+        """A listener that ACCEPTS, so repeated probes keep answering."""
+        import socket, threading
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(8)
+
+        def _drain():
+            while True:
+                try:
+                    c, _ = srv.accept(); c.close()
+                except OSError:
+                    return
+
+        threading.Thread(target=_drain, daemon=True).start()
+        return srv, srv.getsockname()[1]
+
     def _serving_daemon(self, tmp_path, monkeypatch, fingerprint):
         """A daemon serving under ``fingerprint``, with a pin record."""
         import socket
@@ -3545,4 +3565,181 @@ class TestTheKillBudgetOutlastsTheDrain:
         assert 9 not in signals, (
             "escalated to SIGKILL while the daemon was still draining — "
             "in-flight requests die on the upgrade path"
+        )
+
+
+class TestTheDaemonRepairsItsOwnWiring:
+    """Recovery must not depend on one developer's status line.
+
+    A census of the host found exactly ONE caller of `heal`: the CLI — a human
+    typing `cswap pin --heal`. Not the TUI, not the auto-switch engine, not the
+    daemon. The only thing that ever repaired a pin automatically was a
+    statusline script in a personal dotfiles repo, spawning that command on a
+    timer. So every installation without those dotfiles had no recovery at all:
+    a wiring pointing at a dead port stayed broken, and the symptom was "new
+    sessions cannot reach the API" with nothing connecting it to the pin.
+
+    MEASURED STATE THAT MOTIVATED THIS: `.claude.json` rewritten to port 52000
+    while the daemon served 36301. Running sessions were fine (env fixed at
+    exec); every NEW session inherited a port nothing listened on. The daemon
+    was healthy throughout, so nothing watching the DAEMON could see it.
+
+    The daemon already re-reads the wiring every few seconds to decide whether
+    to keep serving. It just never acted on a mismatch.
+    """
+
+    def _ours(self, tmp_path, monkeypatch, port):
+        """A daemon record owned by THIS process, on ``port``."""
+        from cswap_pin import proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        proxy.write_daemon_state(certdir, port, os.getpid(), proxy.daemon_fingerprint())
+        (certdir / "ca.pem").write_bytes(b"-----BEGIN CERTIFICATE-----\nx\n")
+        return certdir
+
+    def test_a_wiring_naming_a_DEAD_port_is_repaired(self, tmp_path, monkeypatch):
+        import socket
+
+        from cswap_pin import proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()  # genuinely refusing
+
+        certdir = self._ours(tmp_path, monkeypatch, 36301)
+        # This daemon WAS the pin's: the wiring named it before it broke. That
+        # is what separates it from an orphan (see the hijack test below).
+        proxy._mark_wired_once(certdir, 36301)
+        monkeypatch.setattr(proxy, "_wired_port", lambda: dead_port)
+        wired = []
+        monkeypatch.setattr(
+            proxy, "wire_global_config", lambda p, ca: wired.append(p) or True
+        )
+        try:
+            assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is True
+            assert wired == [36301], "did not re-point the wiring at this daemon"
+        finally:
+            pass
+
+    def test_a_daemon_the_wiring_NEVER_named_cannot_hijack_it(
+        self, tmp_path, monkeypatch
+    ):
+        """An orphan must not rewrite the user's config to point at itself.
+
+        This is the repair's dangerous direction, and it disables the orphan
+        reaper as a side effect: a daemon left behind by a crashed spawn sees a
+        wiring it does not match, calls it "broken", claims it, and then counts
+        as referenced forever — so the first-holder timeout never fires and it
+        holds its port for good.
+
+        Being named by the wiring at least once is the qualification. The
+        daemon this repair exists for HAD one and lost it; an orphan never had
+        one at all.
+        """
+        import socket
+
+        from cswap_pin import proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        certdir = self._ours(tmp_path, monkeypatch, 36301)
+        # never wired: an orphan. No marker file is written.
+        monkeypatch.setattr(proxy, "_wired_port", lambda: dead_port)
+        monkeypatch.setattr(
+            proxy,
+            "wire_global_config",
+            lambda p, ca: pytest.fail(
+                "an orphan hijacked the wiring — the reaper can never reap it"
+            ),
+        )
+        assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+
+    def test_a_wiring_that_ANSWERS_is_never_stolen(self, tmp_path, monkeypatch):
+        """Another daemon legitimately owns the pin — leave it alone. A repair
+        that fires here would fight the real owner every few seconds."""
+        from cswap_pin import proxy
+
+        srv, other_port = TestAnUpgradeDoesNotWaitForALaunch._serving_listener()
+        try:
+            certdir = self._ours(tmp_path, monkeypatch, 36301)
+            monkeypatch.setattr(proxy, "_wired_port", lambda: other_port)
+            monkeypatch.setattr(
+                proxy,
+                "wire_global_config",
+                lambda p, ca: pytest.fail("stole a LIVE wiring from another daemon"),
+            )
+            assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+        finally:
+            srv.close()
+
+    def test_an_UNPINNED_config_is_left_unpinned(self, tmp_path, monkeypatch):
+        """`pin --clear` removed the wiring on purpose. Re-adding it would
+        re-pin a user who just asked not to be."""
+        from cswap_pin import proxy
+
+        certdir = self._ours(tmp_path, monkeypatch, 36301)
+        monkeypatch.setattr(proxy, "_wired_port", lambda: None)
+        monkeypatch.setattr(
+            proxy,
+            "wire_global_config",
+            lambda p, ca: pytest.fail("re-pinned a user who had cleared the pin"),
+        )
+        assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+
+    def test_another_daemons_record_is_not_repaired_on_its_behalf(
+        self, tmp_path, monkeypatch
+    ):
+        """Only the daemon named by the record may claim the wiring. Otherwise
+        two daemons repair to two different ports, forever."""
+        import socket
+
+        from cswap_pin import proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        # A record owned by SOMEONE ELSE.
+        proxy.write_daemon_state(certdir, 36301, os.getpid() + 1, "fp")
+        monkeypatch.setattr(proxy, "_wired_port", lambda: dead_port)
+        monkeypatch.setattr(
+            proxy,
+            "wire_global_config",
+            lambda p, ca: pytest.fail("repaired on another daemon's behalf"),
+        )
+        assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+
+    def test_the_repair_is_reached_from_the_periodic_claim_check(
+        self, tmp_path, monkeypatch
+    ):
+        """A capability with no caller is the defect this whole evening kept
+        finding. `_is_claimed` runs every few seconds from watch_refcount, so
+        the repair must be wired into it — not merely defined."""
+        import socket
+
+        from cswap_pin import proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        certdir = self._ours(tmp_path, monkeypatch, 36301)
+        monkeypatch.setattr(proxy, "_wired_port", lambda: dead_port)
+        called = []
+        monkeypatch.setattr(
+            proxy, "_repair_wiring_if_ours", lambda cd, p, lc=None: called.append(p) or True
+        )
+        proxy._is_claimed(certdir, live_clients=lambda: 0)
+        assert called == [36301], (
+            "the periodic claim check never reaches the repair — recovery would "
+            "again depend on something outside the package"
         )
