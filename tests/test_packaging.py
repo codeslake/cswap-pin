@@ -121,26 +121,123 @@ class TestConcatenationCannotFuseBlocks:
         assert _join_pem(a, b) == a + b
 
 
-def test_the_two_version_strings_agree():
-    """`pyproject.toml` and `__init__.py` each carry a version, and nothing
-    tied them together — so a release could ship a wheel labelled 0.1.2 whose
-    `cswap_pin.__version__` still said 0.1.1. The host's install floor compares
-    the RUNTIME value, so the drift would make an upgraded machine look
-    un-upgraded, silently and permanently (a PyPI version cannot be re-uploaded).
+def test_an_installed_build_reports_the_version_it_was_built_as():
+    """What the package reports must be what pyproject declared.
+
+    This used to compare the two SOURCE LITERALS, because `__version__` was one
+    — and it caught the 0.1.9 drift and did not prevent it, since a check only
+    fails when someone runs it. `__version__` is now derived from the installed
+    distribution, so the literal it read is gone and the question changes: not
+    "do two files agree" but "does a real build report what it declared".
+
+    Built and inspected in a subprocess against the ACTUAL wheel, because the
+    failure was in a wheel and this worktree runs from `PYTHONPATH=src` where
+    there is no distribution to disagree with — the tree where the release is
+    cut is precisely the one that cannot see the bug in-process.
     """
+    import json
     import re
+    import venv
     from pathlib import Path
+
+    import pytest
 
     root = Path(__file__).resolve().parent.parent
     declared = re.search(
         r'^version\s*=\s*"([^"]+)"', (root / "pyproject.toml").read_text(), re.M
     )
-    runtime = re.search(
-        r'^__version__\s*=\s*"([^"]+)"',
-        (root / "src" / "cswap_pin" / "__init__.py").read_text(),
-        re.M,
+    assert declared, "pyproject.toml has no version"
+
+    if subprocess.run(["uv", "--version"], capture_output=True).returncode != 0:
+        pytest.skip("uv unavailable — cannot build a wheel to inspect")
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        out = subprocess.run(
+            ["uv", "build", "--wheel", "-o", td],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+        assert out.returncode == 0, out.stderr[-900:]
+        wheel = next(Path(td).glob("*.whl"))
+        env = Path(td) / "v"
+        venv.create(env, with_pip=True)
+        py = env / "bin" / "python"
+        if not py.exists():
+            py = env / "Scripts" / "python.exe"
+        r = subprocess.run(
+            [str(py), "-m", "pip", "install", "-q", str(wheel)],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr[-900:]
+        r = subprocess.run(
+            [
+                str(py),
+                "-c",
+                "import cswap_pin, importlib.metadata as m, json;"
+                "print(json.dumps({'runtime': cswap_pin.__version__,"
+                "'dist': m.version('cswap-pin')}))",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr[-900:]
+        got = json.loads(r.stdout)
+
+    assert got["dist"] == declared.group(1), (
+        f"the wheel is labelled {got['dist']}, pyproject says {declared.group(1)}"
     )
-    assert declared and runtime, "a version string went missing"
-    assert declared.group(1) == runtime.group(1), (
-        f"pyproject says {declared.group(1)}, __init__ says {runtime.group(1)}"
+    assert got["runtime"] == declared.group(1), (
+        f"the installed package reports {got['runtime']} but was built as "
+        f"{declared.group(1)} — an upgraded machine looks un-upgraded"
     )
+
+
+def test_the_runtime_version_is_not_a_hand_maintained_constant():
+    """`cswap_pin.__version__` must be DERIVED, not typed a second time.
+
+    THE SOURCE-FILE COMPARISON ABOVE IS NECESSARY AND WAS NOT SUFFICIENT. It
+    caught the drift and 0.1.9 shipped anyway, because a check only fails when
+    someone runs it and the release run did not include this file. The
+    published wheel:
+
+        dist metadata          0.1.9
+        cswap_pin.__version__  0.1.8
+
+    A PyPI version cannot be re-uploaded, so that wheel is wrong forever.
+
+    An upgraded machine that reports the old number looks un-upgraded to
+    anything asking the package itself — the same class as an install floor
+    comparing a stale value and skipping the upgrade it exists to force.
+
+    WHY THIS ASSERTS ON THE MECHANISM RATHER THAN THE VALUE. The obvious test
+    is "__version__ == importlib.metadata.version(...)", and it SKIPS in this
+    worktree, which runs from PYTHONPATH=src with no distribution installed —
+    silent in exactly the tree where the release is cut. Two hand-maintained
+    constants will drift again; one derived from the distribution cannot. So
+    the requirement is that there is only ONE source, and a literal in
+    __init__.py is a second one.
+    """
+    import ast
+    from pathlib import Path
+
+    init = Path(__file__).resolve().parent.parent / "src" / "cswap_pin" / "__init__.py"
+    tree = ast.parse(init.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets
+        ):
+            continue
+        assert not isinstance(node.value, ast.Constant), (
+            "__version__ is a literal, so it is a SECOND place the version is "
+            "written by hand — it drifted from pyproject.toml in 0.1.9 and "
+            "that wheel can never be corrected. Derive it from the installed "
+            "distribution instead."
+        )
+        return
+    raise AssertionError("__version__ is not assigned at module level in __init__.py")
