@@ -322,7 +322,7 @@ CA_TRUST_FILE = "ca-trust.pem"
 #
 # Verified against all four shapes (plain LF, CRLF, welded, prose) before it
 # replaced the anchored version.
-_BEGIN_MARKER = rb"(?:^|-----)-----BEGIN ([A-Z0-9 ]+)-----[ \t]*(?:\r?\n|\Z)"
+_BEGIN_MARKER = rb"(?:^|-----)-----BEGIN ([A-Z0-9 ]+)-----([ \t]*)(\r?\n|\Z|.)"
 
 def _find_end(body: bytes, label: bytes, start: int, limit: int) -> int:
     """Where ``-----END <label>-----`` TERMINATES ITS LINE, or -1.
@@ -492,6 +492,83 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
     return r.stdout[len(_ORACLE_SENTINEL):].startswith(b"OK")
 
 
+
+def _pem_blocks(body: bytes):
+    """Every block whose BEGIN **and** END each own their line.
+
+    ONE SCANNER FOR BOTH READERS. A PEM marker has two edges, and this file
+    fixed them one at a time: welds on the left of BEGIN, then a terminator
+    on the right of END. The other two were never guarded, and both landed in
+    the dangerous direction — measured, node deciding:
+
+        END welded to the base64 line   predicate True, node loaded 1 of 2
+                                        (OUR CA gone: cannot verify our proxy)
+        BEGIN carrying trailing text    predicate True, node loaded 2 of 3
+                                        (fires with node PRESENT too — our CA
+                                         is after the damage, so the handshake
+                                         still succeeds and cannot veto)
+
+    Four edges, two readers, and they had already drifted apart once. Yielding
+    from one place is what stops the next edge from being fixed in only one of
+    them.
+
+    HANDS OUT BYTES VERBATIM, never a repaired copy. The predicate used to
+    rebuild the terminator (`body[head:end] + b"-----END ...-----\n"`), which
+    REPAIRS a fused block for the parser — cryptography read it happily and
+    the predicate then answered True about a file that is still fused on disk.
+    A reader that reconstructs what it is judging cannot judge it.
+
+    Yields ``(label, head, body_end, block)``: `head` is the BEGIN, `body_end`
+    is where the terminator starts, `block` is the whole thing including its
+    END line. A malformed block is simply not yielded; the callers decide what
+    that means, which differs between them (refuse vs skip).
+    """
+    import re as _re
+
+    begin = _re.compile(_BEGIN_MARKER, _re.M)
+    pos = 0
+    while True:
+        m = begin.search(body, pos)
+        if not m:
+            return
+        label = m.group(1)
+        nxt = begin.search(body, m.end())
+        limit = body.index(b"-----BEGIN ", nxt.start()) if nxt else len(body)
+        head = body.index(b"-----BEGIN ", m.start())
+        # A WELDED BEGIN means the file is already fused: openssl cannot read a
+        # marker sharing a line with the previous END, whatever the blocks
+        # around it look like.
+        if head != m.start():
+            # A WELD: this block's own BEGIN is at `head`, so a caller that
+            # restarts THERE sees a clean line start and recovers it.
+            yield None, head, -1, b"weld"
+            return
+        # AND THE BEGIN MUST END ITS OWN LINE. The marker now MATCHES a BEGIN
+        # carrying trailing text instead of skipping past it — skipping made
+        # the block INVISIBLE, so the predicate never saw it and approved a
+        # file node truncates at. Group 3 is the byte that follows: a newline
+        # or end-of-input is a real marker, anything else is damage.
+        if m.group(3) not in (b"\n", b"\r\n", b""):
+            # The marker itself is damaged; restarting here would re-reject it
+            # forever. Only a LATER block can be recovered.
+            yield None, head, -1, b"marker"
+            return
+        end = _find_end(body, label, m.end(), limit)
+        if end == -1:
+            yield None, head, -1, b""
+            return
+        # AND THE END MUST START ITS OWN LINE. `_find_end` bounds the RIGHT
+        # side of the terminator; this is the left. A terminator welded onto
+        # the last base64 character is what openssl refuses while a rebuilt
+        # copy parses fine.
+        if end > 0 and body[end - 1 : end] != b"\n":
+            yield None, head, -1, b""
+            return
+        term = b"-----END " + label + b"-----"
+        yield label, head, end, body[head : end + len(term)] + b"\n"
+        pos = end
+
+
 def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
     """Every block of ``body`` node can actually load, plus our own CA.
 
@@ -529,52 +606,50 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
     import base64
     import re as _re
 
-    begin = _re.compile(_BEGIN_MARKER, _re.M)
     kept: list[bytes] = []
-    pos = 0
-    while True:
-        m = begin.search(body, pos)
-        if not m:
+    # THE SCANNER STOPS AT DAMAGE; SALVAGE MUST NOT. Its whole job is to keep
+    # every block that still decodes, and a healthy root sitting AFTER the
+    # damage is exactly what the session loses otherwise — the narrowing this
+    # file refuses everywhere else. So walk the body in segments, restarting
+    # one byte past each broken marker, rather than recursing.
+    offset = 0
+    while offset < len(body):
+        stopped = False
+        for label, head, _end, block in _pem_blocks(body[offset:]):
+            if label is None:
+                # RESUME AT THE NEXT MARKER, not one byte past this one. A
+                # WELDED block's own BEGIN sits at `head`, so `head + 1` skips
+                # the very block salvage exists to recover — measured, the
+                # welded third-party CA was dropped again.
+                # RESUME AT THE DAMAGED BLOCK'S OWN BEGIN, not past it. For a
+                # WELD that BEGIN sits at `head` itself, and restarting there
+                # makes it a clean line start — which is the whole repair.
+                # Measured: skipping past it dropped the third-party CA on the
+                # RIGHT of the weld, the defect this arm exists to fix.
+                if block == b"weld" and head:
+                    offset += head        # its BEGIN is here: recoverable
+                else:
+                    nxt = body.find(b"-----BEGIN ", offset + head + 1)
+                    if nxt == -1:
+                        stopped = False
+                        break
+                    offset = nxt          # this marker is damaged: move on
+                stopped = True
+                break
+            if label == b"CERTIFICATE":
+                try:
+                    x509.load_pem_x509_certificate(block)
+                except Exception:  # noqa: BLE001
+                    continue
+            else:
+                body_only = block.split(b"-----\n", 1)[-1].rsplit(b"-----END", 1)[0]
+                try:
+                    base64.b64decode(b"".join(body_only.split()), validate=True)
+                except Exception:  # noqa: BLE001
+                    continue
+            kept.append(block)
+        if not stopped:
             break
-        label = m.group(1)
-        nxt = begin.search(body, m.end())
-        limit = body.index(b"-----BEGIN ", nxt.start()) if nxt else len(body)
-        end = _find_end(body, label, m.end(), limit)
-        if end == -1:
-            # Unterminated: nothing to keep, and the scan must not fall into
-            # the next block's terminator looking for one.
-            pos = limit
-            continue
-        # FROM THE MARKER, not from the match. `_BEGIN_MARKER` may consume a
-        # welded `-----` (the tail of the previous block's END) to prove this
-        # is a real block start, so `m.start()` can sit before the BEGIN.
-        # Slicing from there carries that tail into the salvaged block, which
-        # is the same fused shape we are repairing — measured: the block was
-        # emitted with a leading `-----` and dropped again.
-        head = body.index(b"-----BEGIN ", m.start())
-        # AND THE TERMINATOR NEEDS ITS OWN LINE. Appending it to a slice that
-        # does not end in a newline welds it onto the body's last base64 line
-        # — the same fused shape this function exists to repair, manufactured
-        # by the repair. Measured on an input whose END already sat on the
-        # base64 line: salvage emitted `...HVgR1si5MmI=-----END CERTIFICATE-----`
-        # and node loaded 2 of 3. `_join_pem` guards the seam BETWEEN blocks,
-        # never inside one, so it cannot catch this.
-        body_part = body[head:end]
-        if not body_part.endswith(b"\n"):
-            body_part += b"\n"
-        block = body_part + b"-----END " + label + b"-----\n"
-        pos = end
-        if label == b"CERTIFICATE":
-            try:
-                x509.load_pem_x509_certificate(block)
-            except Exception:  # noqa: BLE001
-                continue
-        else:
-            try:
-                base64.b64decode(b"".join(body[m.end() : end].split()), validate=True)
-            except Exception:  # noqa: BLE001
-                continue
-        kept.append(block)
     # Ours goes in unconditionally — a bundle that dropped it is exactly the
     # case where the session could not verify the proxy it is routed through.
     if not _bundle_is_usable(b"".join(kept), ours):
@@ -643,51 +718,29 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
     # CRLF bundle invisible to this scan — which reads as "carries no CA" and
     # drops the whole shared file, the false reject that costs every sibling
     # component its trust. Measured: a CRLF copy of our own CA was refused.
-    begin = _re.compile(_BEGIN_MARKER, _re.M)
     carries_us = False
-    pos = 0
-    while True:
-        m = begin.search(body, pos)
-        if not m:
-            break
-        label = m.group(1)
-        # Bound the END search at the next BEGIN: an unterminated block must
-        # not borrow a later block's terminator and swallow it whole.
-        # BOUND AT THE NEXT MARKER, not at the next MATCH. `_BEGIN_MARKER` may
-        # consume a welded `-----` to prove a block start, so `nxt.start()` can
-        # sit BEFORE the previous block's END — measured: that cut the END out
-        # of range and every healthy multi-cert bundle read as unterminated,
-        # 11 tests red. Bound on where the marker itself begins.
-        nxt = begin.search(body, m.end())
-        limit = body.index(b"-----BEGIN ", nxt.start()) if nxt else len(body)
-        head = body.index(b"-----BEGIN ", m.start())
-        # A WELDED marker means the file is already fused. Every block here may
-        # decode perfectly on its own and node still truncates at the fused
-        # line, because openssl cannot read a BEGIN that shares a line with the
-        # previous END. `head != m.start()` is exactly that: the marker had to
-        # consume a `-----` to prove it was a block start.
-        if head != m.start():
-            return False
-        end = _find_end(body, label, m.end(), limit)
-        if end == -1:
-            return False  # unterminated — node cannot parse it
-        b64 = b"".join(body[m.end() : end].split())
+    seen_any = False
+    for label, _head, _end, block in _pem_blocks(body):
+        if label is None:
+            return False  # malformed on either edge — node truncates there
+        seen_any = True
         if label == b"CERTIFICATE":
             try:
-                der = x509.load_pem_x509_certificate(
-                    body[head:end] + b"-----END CERTIFICATE-----\n"
-                ).public_bytes(serialization.Encoding.DER)
+                der = x509.load_pem_x509_certificate(block).public_bytes(
+                    serialization.Encoding.DER
+                )
             except Exception:  # noqa: BLE001
                 return False
             if der == want:
                 carries_us = True
         else:
             # Not a certificate: node skips it, but only if the armor decodes.
+            body_only = block.split(b"-----\n", 1)[-1].rsplit(b"-----END", 1)[0]
             try:
-                base64.b64decode(b64, validate=True)
+                base64.b64decode(b"".join(body_only.split()), validate=True)
             except Exception:  # noqa: BLE001
                 return False
-        pos = end
+    del seen_any
     return carries_us
 
 
