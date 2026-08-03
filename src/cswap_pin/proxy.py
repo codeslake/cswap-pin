@@ -356,11 +356,22 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
         if not (leaf_pem.exists() and leaf_key.exists()):
             return None
         # ...and that leaf must actually be OURS, else a passing handshake
-        # proves nothing about the CA in question.
-        issuer = x509.load_pem_x509_certificate(leaf_pem.read_bytes()).issuer
-        ours = Path(ca_path).read_bytes()
-        if issuer != x509.load_pem_x509_certificate(ours).subject:
-            return None
+        # proves nothing about the CA in question. A SUBJECT-NAME comparison
+        # cannot tell: `_make_ca` gives every cswap-pin CA the identical
+        # subject `CN=cswap pin-proxy CA`, so a leaf from any OTHER cswap-pin
+        # certdir — a different key entirely — would pass a name check.
+        # Measured consequence: a certdir whose leaf is signed by a different
+        # CA, plus a bundle carrying only that foreign CA, yielded True and
+        # wired a session to a proxy it cannot verify. Verify the SIGNATURE
+        # instead, same shape as `_certs_consistent`.
+        leaf = x509.load_pem_x509_certificate(leaf_pem.read_bytes())
+        ca_cert = x509.load_pem_x509_certificate(Path(ca_path).read_bytes())
+        ca_cert.public_key().verify(
+            leaf.signature,
+            leaf.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            leaf.signature_hash_algorithm,
+        )
     except Exception:  # noqa: BLE001 — cannot set the question up: not an answer
         return None
 
@@ -410,10 +421,23 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
     working roots to protect against one broken one.
 
     Node's failure mode is what makes salvage the right answer rather than a
-    hedge: it aborts the WHOLE extras load on one undecodable block, but the
-    blocks beside it are still perfectly valid certificates. Dropping only the
-    bad block is not a guess about intent, it is the minimum edit that turns a
-    file node refuses into the same file node accepts.
+    hedge — and it is TRUNCATE, not abort. Measured on this host (node
+    v24.11.1), asking two independent questions about the same ours+TORN+corp
+    bundle — how many extras did the loader keep, and will it complete a
+    handshake against our leaf:
+
+        bundle                    node v24.11.1 extras   handshake vs our leaf
+        ours + corp (healthy)     2                      OK
+        ours + TORN + corp        1   <- corp LOST       OK      <-- the hole
+
+    node keeps every block BEFORE the first undecodable one and drops
+    everything from there on, including blocks that are themselves perfectly
+    valid. That is exactly why a handshake-only verdict ("will you verify our
+    leaf") is not sufficient proof the bundle survived intact: with our CA
+    ahead of the tear, the handshake still succeeds while roots after the tear
+    vanished silently. Dropping only the bad block is not a guess about
+    intent, it is the minimum edit that turns a file node truncates into the
+    same file node loads whole.
 
     Deliberately drops nothing else. A block that decodes is kept verbatim,
     including CRLs and key blocks a real corporate bundle carries — narrowing
@@ -470,15 +494,30 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
     through and every request dies. That is the dangerous direction, and the
     marker count waved it through.
 
-    Node aborts the entire extras load on ONE block it cannot decode, whatever
-    the label, so every block has to be proven decodable — not just ours, and
-    not just the ones labelled CERTIFICATE. What "decodable" means differs by
-    label: a CERTIFICATE must parse as X.509 (valid base64 is not enough, a
-    well-formed body that is not a certificate still kills the load), while a
-    CRL or a PUBLIC KEY needs only intact base64 armor. Demanding X.509 of
-    those would reject the CRLs and key blocks a real corporate bundle
-    legitimately carries — a false reject costs every sibling CA for the whole
-    session, which is the failure this shared bundle exists to prevent.
+    Node does NOT abort the whole extras load on one undecodable block — it
+    TRUNCATES at the first one and keeps everything before it. Measured on
+    this host (node v24.11.1), asking two independent questions about the
+    same ours+TORN+corp bundle — how many extras did the loader keep, and
+    will it complete a handshake against our leaf:
+
+        bundle                    node v24.11.1 extras   handshake vs our leaf
+        ours + corp (healthy)     2                      OK
+        ours + TORN + corp        1   <- corp LOST       OK      <-- the hole
+
+    That is why a handshake-only verdict is not sufficient: with our CA ahead
+    of the tear, node still verifies our leaf (True) while every block after
+    the tear, including corporate roots, is gone. So every block still has to
+    be proven decodable here — not just ours, and not just the ones labelled
+    CERTIFICATE — because a bundle that is usable in the sense this function
+    means (nothing silently dropped anywhere in it) requires the WHOLE file
+    to be clean, not merely the prefix node's loader happened to keep. What
+    "decodable" means differs by label: a CERTIFICATE must parse as X.509
+    (valid base64 is not enough, a well-formed body that is not a certificate
+    still truncates the load from there on), while a CRL or a PUBLIC KEY
+    needs only intact base64 armor. Demanding X.509 of those would reject the
+    CRLs and key blocks a real corporate bundle legitimately carries — a
+    false reject costs every sibling CA for the whole session, which is the
+    failure this shared bundle exists to prevent.
 
     Identity is by DER, not by substring: a re-encoded or CRLF-normalized copy
     of our CA is still our CA, and a substring test calls it a stranger.
@@ -618,6 +657,20 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
                     f"ca-bundle: node not consulted, predicate says "
                     f"{'usable' if verdict else 'unusable'}"
                 )
+            elif verdict:
+                # THE ORACLE'S True IS A VETO'S ABSENCE, NOT AN APPROVAL. It
+                # only asked "will you verify our leaf", and node TRUNCATES
+                # the extras load at the first bad block rather than aborting
+                # it — so True survives even when every block after a tear,
+                # including corporate roots placed after ours, was silently
+                # dropped. Measured on the real 132-cert bundle with a tear
+                # placed after our CA: 68 corporate roots lost while the
+                # oracle still answered True. AND it with the predicate,
+                # which inspects the WHOLE file: the oracle keeps its power to
+                # REFUSE a file the predicate wrongly approves (0.1.9's fix,
+                # must not regress), but loses the power to APPROVE a file
+                # the predicate says is torn.
+                verdict = _bundle_is_usable(body, ours)
             if verdict:
                 return shared
             # REFUSED — but refusing the FILE must not mean refusing its
@@ -626,7 +679,13 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # that does decode and drop only the ones that do not. That makes
             # both the False and the None arms cost at most the broken block.
             salvaged = Path(ca_path).parent / "ca-bundle.pem"
-            _write_bundle_atomically(salvaged, _salvage_bundle(body, ours))
+            salvage = _salvage_bundle(body, ours)
+            _write_bundle_atomically(salvaged, salvage)
+            _log_lifecycle(
+                f"ca-bundle: {shared} refused, salvaged "
+                f"{salvage.count(b'-----BEGIN')} of {body.count(b'-----BEGIN')} "
+                f"blocks to {salvaged}"
+            )
             return salvaged
     except Exception:
         pass
