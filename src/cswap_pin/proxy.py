@@ -290,6 +290,87 @@ CA_TRUST_DIR = "ca-trust.d"
 CA_TRUST_FILE = "ca-trust.pem"
 
 
+def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
+    """Would Node actually LOAD this bundle, and does it carry our CA?
+
+    Counting ``BEGIN``/``END`` markers cannot answer the first question, and
+    the gap is not academic: measured on this host against a real TLS
+    handshake through ``NODE_EXTRA_CA_CERTS``, a bundle with a torn
+    certificate BEFORE ours passes the marker count and node refuses the whole
+    extras load — so the session cannot verify the very proxy it is routed
+    through and every request dies. That is the dangerous direction, and the
+    marker count waved it through.
+
+    Node aborts the entire extras load on ONE block it cannot decode, whatever
+    the label, so every block has to be proven decodable — not just ours, and
+    not just the ones labelled CERTIFICATE. What "decodable" means differs by
+    label: a CERTIFICATE must parse as X.509 (valid base64 is not enough, a
+    well-formed body that is not a certificate still kills the load), while a
+    CRL or a PUBLIC KEY needs only intact base64 armor. Demanding X.509 of
+    those would reject the CRLs and key blocks a real corporate bundle
+    legitimately carries — a false reject costs every sibling CA for the whole
+    session, which is the failure this shared bundle exists to prevent.
+
+    Identity is by DER, not by substring: a re-encoded or CRLF-normalized copy
+    of our CA is still our CA, and a substring test calls it a stranger.
+
+    Where it cannot tell, it REFUSES. Refusing costs one session's sibling
+    CAs; accepting costs the session entirely. See
+    cnighswonger/claude-code-cache-fix#296, which measured this same guard
+    wrong in both directions in the sibling implementation.
+    """
+    import base64
+    import re as _re
+
+    if not ours:
+        return False  # an empty CA makes any containment test vacuous
+    try:
+        want = x509.load_pem_x509_certificate(ours).public_bytes(
+            serialization.Encoding.DER
+        )
+    except Exception:  # noqa: BLE001 — our own CA is unreadable; trust nothing
+        return False
+
+    # `\r?$` because a bundle builder that concatenates files can leave CRLF
+    # endings, and openssl loads those happily. A `$`-only anchor made every
+    # CRLF bundle invisible to this scan — which reads as "carries no CA" and
+    # drops the whole shared file, the false reject that costs every sibling
+    # component its trust. Measured: a CRLF copy of our own CA was refused.
+    begin = _re.compile(rb"^-----BEGIN ([A-Z0-9 ]+)-----[ \t]*\r?$", _re.M)
+    carries_us = False
+    pos = 0
+    while True:
+        m = begin.search(body, pos)
+        if not m:
+            break
+        label = m.group(1)
+        # Bound the END search at the next BEGIN: an unterminated block must
+        # not borrow a later block's terminator and swallow it whole.
+        nxt = begin.search(body, m.end())
+        limit = nxt.start() if nxt else len(body)
+        end = body.find(b"-----END " + label + b"-----", m.end(), limit)
+        if end == -1:
+            return False  # unterminated — node cannot parse it
+        b64 = b"".join(body[m.end() : end].split())
+        if label == b"CERTIFICATE":
+            try:
+                der = x509.load_pem_x509_certificate(
+                    body[m.start() : end] + b"-----END CERTIFICATE-----\n"
+                ).public_bytes(serialization.Encoding.DER)
+            except Exception:  # noqa: BLE001
+                return False
+            if der == want:
+                carries_us = True
+        else:
+            # Not a certificate: node skips it, but only if the armor decodes.
+            try:
+                base64.b64decode(b64, validate=True)
+            except Exception:  # noqa: BLE001
+                return False
+        pos = end
+    return carries_us
+
+
 def _trust_file(ca_path: Path, existing: str | None) -> Path:
     """The single file to name in ``NODE_EXTRA_CA_CERTS``.
 
@@ -330,12 +411,7 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # leave the session unable to verify its OWN proxy, so every
             # request dies. Narrowing keeps our chain intact and costs someone
             # else's. Do not add a cert-count floor here.
-            if (
-                ours
-                and ours in body
-                and body.count(b"-----BEGIN CERTIFICATE-----")
-                == body.count(b"-----END CERTIFICATE-----")
-            ):
+            if _bundle_is_usable(body, ours):
                 return shared
     except Exception:
         pass
@@ -445,8 +521,25 @@ def heal(backup_root: Path) -> bool:
     if not pin:
         return False  # nothing pinned — not our business
     email = pin[0]
-    if _read_alive_port(certdir) is not None:
-        return False  # already serving
+    alive = _read_alive_port(certdir)
+    if alive is not None:
+        # SERVING IS NOT THE SAME AS WIRED. A daemon can be up while
+        # ``.claude.json`` names nothing — `pin --clear` raced a respawn, a
+        # heal unwired it and the daemon came back, or (measured) an unwire ran
+        # against a live daemon. Returning False here left that state
+        # permanent: the proxy served on a port no session was told about, and
+        # only a hand-typed `cswap pin <n>` restored it.
+        #
+        # Re-wiring is the whole point of a heal. It costs one config read when
+        # the wiring is already correct, and it is what makes the pin come back
+        # BY ITSELF once the daemon is healthy again.
+        if _wired_port() == alive:
+            return False  # serving AND wired — genuinely nothing to do
+        try:
+            wire_global_config(alive, certdir / "ca.pem")
+            return True
+        except Exception:  # noqa: BLE001 — a heal must never raise
+            return False
     # Resolve the slot the way the status line does: identity is stored by
     # email because slots move (`cswap move`), so the number comes from the
     # registry rather than being cached with the pin.
