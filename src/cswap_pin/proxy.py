@@ -324,6 +324,35 @@ CA_TRUST_FILE = "ca-trust.pem"
 # replaced the anchored version.
 _BEGIN_MARKER = rb"(?:^|-----)-----BEGIN ([A-Z0-9 ]+)-----[ \t]*(?:\r?\n|\Z)"
 
+def _find_end(body: bytes, label: bytes, start: int, limit: int) -> int:
+    """Where ``-----END <label>-----`` TERMINATES ITS LINE, or -1.
+
+    A bare `find` was not enough, and the gap is the same class as the welded
+    BEGIN: openssl requires the terminator to end its line, so trailing text
+    (`-----END CERTIFICATE-----garbage`) is not a terminator to it — it rejects
+    the block and node loads ZERO extras with `PEM routines::bad end line`.
+    The scanner walked straight past and called the file usable. Measured with
+    node ABSENT, which is the arm with no oracle to veto it: predicate True,
+    session trusts nothing, including its own CA.
+
+    Trailing whitespace IS allowed, and `\r` with it: a builder concatenating
+    files leaves CRLF, openssl loads those happily, and refusing them is the
+    false reject that costs every sibling component its trust.
+
+    The sibling CCF implementation reached this from the other side — their END
+    matcher used `indexOf`, so trailing content passed, fixed in e28abd0.
+    """
+    needle = b"-----END " + label + b"-----"
+    at = body.find(needle, start, limit)
+    while at != -1:
+        rest = body[at + len(needle) : limit]
+        stripped = rest.lstrip(b" \t\r")
+        if not stripped or stripped.startswith(b"\n"):
+            return at
+        at = body.find(needle, at + 1, limit)
+    return -1
+
+
 _ORACLE_SENTINEL = b"\x02"
 _ORACLE_TIMEOUT_S = 10.0
 
@@ -510,7 +539,7 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
         label = m.group(1)
         nxt = begin.search(body, m.end())
         limit = body.index(b"-----BEGIN ", nxt.start()) if nxt else len(body)
-        end = body.find(b"-----END " + label + b"-----", m.end(), limit)
+        end = _find_end(body, label, m.end(), limit)
         if end == -1:
             # Unterminated: nothing to keep, and the scan must not fall into
             # the next block's terminator looking for one.
@@ -523,7 +552,17 @@ def _salvage_bundle(body: bytes, ours: bytes) -> bytes:
         # is the same fused shape we are repairing — measured: the block was
         # emitted with a leading `-----` and dropped again.
         head = body.index(b"-----BEGIN ", m.start())
-        block = body[head:end] + b"-----END " + label + b"-----\n"
+        # AND THE TERMINATOR NEEDS ITS OWN LINE. Appending it to a slice that
+        # does not end in a newline welds it onto the body's last base64 line
+        # — the same fused shape this function exists to repair, manufactured
+        # by the repair. Measured on an input whose END already sat on the
+        # base64 line: salvage emitted `...HVgR1si5MmI=-----END CERTIFICATE-----`
+        # and node loaded 2 of 3. `_join_pem` guards the seam BETWEEN blocks,
+        # never inside one, so it cannot catch this.
+        body_part = body[head:end]
+        if not body_part.endswith(b"\n"):
+            body_part += b"\n"
+        block = body_part + b"-----END " + label + b"-----\n"
         pos = end
         if label == b"CERTIFICATE":
             try:
@@ -629,7 +668,7 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
         # consume a `-----` to prove it was a block start.
         if head != m.start():
             return False
-        end = body.find(b"-----END " + label + b"-----", m.end(), limit)
+        end = _find_end(body, label, m.end(), limit)
         if end == -1:
             return False  # unterminated — node cannot parse it
         b64 = b"".join(body[m.end() : end].split())

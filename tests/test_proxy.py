@@ -4987,7 +4987,17 @@ class TestAWeldedBEGINIsNotInvisible:
 
         ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
         corp = _other_ca(tmp_path / "corp-root")
-        body = ours.read_bytes().strip() + corp  # OURS welded to CORP
+        # A HEALTHY BLOCK BEFORE THE WELD. With only two blocks the weld lands
+        # on the first pair, where the old `limit` (the next MATCH start) and
+        # the new one (the next MARKER start) coincide — so the two-block
+        # fixture cannot tell them apart, and reverting the bound silently
+        # dropped a third-party CA with the whole suite green. Measured:
+        # shipped keeps 3, the reverted bound keeps 2 and loses `first`.
+        first = _other_ca(tmp_path / "first-ca")
+        # OURS FIRST, then the weld between two THIRD-PARTY CAs. The victim
+        # must not be ours: salvage appends ours unconditionally, so a weld on
+        # our own block self-heals by accident and hides the bound bug.
+        body = ours.read_bytes().strip() + b"\n" + first.rstrip(b"\n") + corp
         out = _salvage_bundle(body, ours.read_bytes().strip())
 
         def der(pem: bytes) -> bytes:
@@ -5005,6 +5015,12 @@ class TestAWeldedBEGINIsNotInvisible:
                 rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", out, _r.S
             )
         }
+        assert der(first) in carried, (
+            "the CA on the LEFT of the weld was dropped — the scan resumed "
+            "past it because the bound came from the welded MATCH (5 bytes "
+            "early) rather than from the MARKER, so the block could no "
+            "longer be found"
+        )
         assert der(corp) in carried, (
             "the welded THIRD-PARTY CA was dropped by salvage and nothing said "
             "so — the repair path recovers a block only when it is ours"
@@ -5079,4 +5095,73 @@ class TestTheProbeAsksAboutTHISBundle:
             "the probe inherited NODE_TLS_REJECT_UNAUTHORIZED=0, so node "
             "accepted a bundle carrying no CA at all — the verdict describes "
             "the operator's environment, not the bundle"
+        )
+
+
+class TestTheENDLineIsBoundedToo:
+    """0.1.13 taught the BEGIN scanner about welds and left the END matcher
+    unbounded — `body.find(b"-----END <label>-----")` with no requirement that
+    anything follow it.
+
+    openssl requires the terminator to END ITS LINE. Trailing text on an END
+    line makes it reject the block and load ZERO extras (`PEM routines::bad
+    end line`), while the predicate walks straight past and calls the file
+    usable. Measured on 0.1.13, node ABSENT (the normal case here — cswap is
+    Python):
+
+        predicate _bundle_is_usable : True
+        node from the shared file   : 0
+        wired                       : ca-trust.pem (as-is)
+        session trusts              : nothing, including its own CA
+
+    Same failure the welded BEGIN produced, reached by a different byte, and
+    on the arm with no oracle to veto it. The sibling CCF implementation hit
+    this exact shape from the other side: their END matcher used `indexOf`, so
+    trailing content passed, and they fixed it in e28abd0.
+    """
+
+    def test_trailing_text_on_an_END_line_is_not_a_terminator(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        corp = _other_ca(tmp_path / "corp-root")
+        raw = ours.read_bytes().strip() + b"\n"
+        poisoned = raw.replace(
+            b"-----END CERTIFICATE-----\n", b"-----END CERTIFICATE-----garbage\n", 1
+        )
+        assert _bundle_is_usable(poisoned + corp, raw.strip()) is False, (
+            "an END line carrying trailing text was accepted as a terminator "
+            "— openssl refuses it and node loads ZERO extras, so the session "
+            "cannot verify even its own proxy"
+        )
+
+    def test_a_healthy_END_is_still_a_terminator(self, tmp_path):
+        """The false-REJECT direction: a normal bundle, and a CRLF one, must
+        still read. Bounding the END is where a too-strict pattern would cost
+        every sibling component its trust."""
+        from cswap_pin.proxy import _bundle_is_usable, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        corp = _other_ca(tmp_path / "corp-root")
+        assert _bundle_is_usable(corp + raw, raw.strip()) is True, "healthy LF refused"
+        assert _bundle_is_usable(
+            (corp + raw).replace(b"\n", b"\r\n"), raw.strip()
+        ) is True, "healthy CRLF refused — the false reject the \\r? guard exists for"
+
+    def test_salvage_does_not_emit_a_block_it_made_unreadable(self, tmp_path):
+        """`body[head:end] + b"-----END ..."` re-emits the terminator with no
+        newline guard, so an input whose END sat on the base64 line comes back
+        out fused. `_join_pem` guards the seam BETWEEN blocks, not inside one.
+        """
+        from cswap_pin.proxy import _salvage_bundle, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        corp = _other_ca(tmp_path / "corp-root")
+        # END welded onto the last base64 line of the corporate block.
+        fused = corp.replace(b"\n-----END CERTIFICATE-----", b"-----END CERTIFICATE-----")
+        out = _salvage_bundle(fused + raw, raw.strip())
+        assert b"=-----END" not in out and b"-----END CERTIFICATE-----\n" in out, (
+            f"salvage emitted a block whose END is welded to its body: {out[:120]!r}"
         )
