@@ -2068,10 +2068,42 @@ class TestConsumesTheSharedTrustBundle:
 
 
 def _node_available() -> bool:
-    """Whether the oracle can be consulted at all on this box."""
-    import shutil
+    """Whether the oracle can ANSWER here — not merely whether node exists.
 
-    return shutil.which("node") is not None
+    "Is node on PATH" is the wrong question and the difference is where the
+    bug lives: the oracle exists because `tls.getCACertificates` is missing
+    before v22.15, so the runtimes that matter are the OLD ones, and a node
+    too old to answer satisfies `shutil.which`. Measured against 0.1.7 by a
+    reviewer, with this box's /usr/bin/node at v12.22.9:
+
+        PATH=/usr/bin pytest ...  ->  4 failed
+
+    Asks the real question by running the real probe against a bundle that
+    must come back True. Cached, because every guarded test would otherwise
+    spawn node twice.
+    """
+    global _NODE_ANSWERS
+    try:
+        return _NODE_ANSWERS
+    except NameError:
+        pass
+    import shutil
+    import tempfile
+
+    if shutil.which("node") is None:
+        _NODE_ANSWERS = False
+        return False
+    from cswap_pin.proxy import _bundle_loads_in_node, ensure_ca
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "cd"
+        d.mkdir()
+        ensure_ca(d, "api.anthropic.com")
+        ca = d / "ca.pem"
+        bundle = d / "b.pem"
+        bundle.write_bytes(ca.read_bytes())
+        _NODE_ANSWERS = _bundle_loads_in_node(bundle, ca) is True
+    return _NODE_ANSWERS
 
 
 class TestTornPemCannotEscape:
@@ -4205,8 +4237,8 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
 
         from cswap_pin import proxy
 
-        if shutil.which("node") is None:
-            pytest.skip("no node on this box — the oracle cannot be asked")
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
 
         d = self._certdir(tmp_path)
         ours = (d / "ca.pem").read_bytes()
@@ -4224,8 +4256,8 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
 
         from cswap_pin import proxy
 
-        if shutil.which("node") is None:
-            pytest.skip("no node on this box — the oracle cannot be asked")
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
 
         d = self._certdir(tmp_path)
         ours = (d / "ca.pem").read_bytes()
@@ -4241,8 +4273,8 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
 
         from cswap_pin import proxy
 
-        if shutil.which("node") is None:
-            pytest.skip("no node on this box — the oracle cannot be asked")
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
 
         d = self._certdir(tmp_path)
         ours = (d / "ca.pem").read_bytes()
@@ -4398,8 +4430,8 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
 
         from cswap_pin.proxy import CA_TRUST_FILE, _bundle_is_usable, wire_env
 
-        if shutil.which("node") is None:
-            pytest.skip("no node on this box — the oracle cannot be asked")
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
 
         home = self._home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -4431,8 +4463,8 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
 
         from cswap_pin.proxy import CA_TRUST_FILE, wire_env
 
-        if shutil.which("node") is None:
-            pytest.skip("no node on this box — the oracle cannot be asked")
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
 
         home = self._home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -4504,8 +4536,8 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
 
         from cswap_pin import proxy
 
-        if shutil.which("node") is None:
-            pytest.skip("no node on this box — the oracle cannot be asked")
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
 
         home = self._home(tmp_path, monkeypatch)
         ca = self._ca(tmp_path)
@@ -4554,4 +4586,77 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         assert wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"] == str(shared), (
             "a healthy shared bundle was copied instead of used — the UNKNOWN "
             "arm collapsed into the refusal arm"
+        )
+
+
+class TestTheOracleTestsRunWhereTheyClaimTo:
+    """A skip guard must ask "can node answer", not "is node on PATH".
+
+    THE TWO ARE DIFFERENT QUESTIONS AND THE GAP IS WHERE THE BUG LIVES. The
+    oracle exists because `tls.getCACertificates` does not exist before node
+    v22.15, so the runtimes that matter most are the OLD ones — and every
+    guard here reads `shutil.which("node") is None`, which is satisfied by a
+    node too old to answer. A reviewer measured exactly that against 0.1.7:
+
+        PATH=/usr/bin pytest ...   ->  4 failed  (this box: /usr/bin/node v12.22.9)
+
+    The sibling CCF implementation shipped the mirror image in the same round:
+    its implementation deliberately avoided the API while its TESTS called it,
+    so the tests could not run on the runtimes the avoidance exists for.
+
+    Measured here after the handshake rewrite: the oracle DOES answer on
+    v12.22.9 (`_bundle_loads_in_node` returns True on a healthy bundle), and
+    all 25 oracle-adjacent tests pass under `PATH=/usr/bin:/bin`. So the
+    predicate is currently harmless — and it is one API change away from
+    silently skipping the whole suite again on the runtime it is for.
+    """
+
+    def test_the_probe_answers_on_the_oldest_node_on_this_box(self, tmp_path):
+        """Not "a node exists" — "the node we would actually consult answers".
+
+        Deliberately NOT a source-text check on the skip predicate: what
+        matters is that the probe returns a VERDICT rather than None on an old
+        runtime, and a comment satisfies a grep.
+        """
+        import shutil
+        import subprocess
+
+        from cswap_pin.proxy import _bundle_loads_in_node, ensure_ca
+
+        oldest = None
+        for cand in ("/usr/bin/node", shutil.which("node")):
+            if not cand or not Path(cand).exists():
+                continue
+            v = subprocess.run([cand, "--version"], capture_output=True, text=True)
+            if v.returncode != 0:
+                continue
+            parts = v.stdout.strip().lstrip("v").split(".")
+            key = tuple(int(p) for p in parts[:2] if p.isdigit())
+            if oldest is None or key < oldest[0]:
+                oldest = (key, cand)
+        if oldest is None:
+            pytest.skip("no node on this box at all")
+
+        version, path = oldest
+        d = tmp_path / "cd"
+        d.mkdir()
+        ensure_ca(d, "api.anthropic.com")
+        ca = d / "ca.pem"
+        bundle = d / "b.pem"
+        bundle.write_bytes(ca.read_bytes())
+
+        # Consult THAT node, not whatever `which` finds first.
+        import os
+
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = str(Path(path).parent)
+        try:
+            verdict = _bundle_loads_in_node(bundle, ca)
+        finally:
+            os.environ["PATH"] = old_path
+
+        assert verdict is True, (
+            f"node {'.'.join(map(str, version))} at {path} could not answer "
+            f"(verdict={verdict!r}) — every test guarded on "
+            f"`shutil.which('node')` would run against it and measure nothing"
         )
