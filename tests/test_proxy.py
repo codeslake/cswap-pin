@@ -4261,9 +4261,16 @@ class TestTheOracleMustNotAnswerWhenItCannotAsk:
         f = d / "b.pem"
         f.write_bytes(bundle)
         assert proxy._bundle_loads_in_node(f, d / "ca.pem") is False
-        # And this is exactly where the predicate disagreed.
-        assert proxy._bundle_is_usable(bundle, ours) is True, (
-            "the predicate no longer disagrees — this test has lost its subject"
+        # THE PREDICATE USED TO DISAGREE HERE, and this test existed to record
+        # that it did: its line-anchored scan could not see the welded BEGIN,
+        # found nothing wrong, and returned True while node loaded zero. That
+        # is the C1 defect, and the scan now sees the weld — so the two judges
+        # AGREE, and the oracle is no longer the only one who can catch this
+        # shape. Asserting the old disagreement would now be asserting the bug.
+        assert proxy._bundle_is_usable(bundle, ours) is False, (
+            "the predicate accepted a FUSED file — a welded BEGIN is invisible "
+            "to openssl, so node truncates there while this says the file is "
+            "fine"
         )
 
     def test_a_healthy_bundle_is_USABLE(self, tmp_path):
@@ -4449,8 +4456,11 @@ class TestARefusedBundleMustNotCostTheCorporateROOTS:
         merged.write_bytes(
             b"-----BEGIN PUBLIC KEY----------BEGIN CERTIFICATE-----\n" + ours
         )
-        # The predicate is wrong about this file, which is the whole point.
-        assert _bundle_is_usable(merged.read_bytes(), ours) is True
+        # THE PREDICATE WAS WRONG ABOUT THIS FILE, which was the point when
+        # only the oracle could catch a fused bundle. Both judges now refuse
+        # it; what this test still pins is that the ORACLE is asked about the
+        # file we actually ship, which the assertions below check.
+        assert _bundle_is_usable(merged.read_bytes(), ours) is False
 
         wired = wire_env({}, 9955, ca)["NODE_EXTRA_CA_CERTS"]
         assert wired != str(merged), (
@@ -4917,4 +4927,156 @@ class TestTheMissingLeafArmStaysUnknown:
             f"private salvage snapshot ({wired!r}) instead of the live shared "
             f"file ({shared!r}) — the missing-leaf arm answered False "
             "(refused) rather than None (could not ask)"
+        )
+
+
+class TestAWeldedBEGINIsNotInvisible:
+    """A `BEGIN` fused onto the previous block's `END` must still be a block.
+
+    `_join_pem` exists because concatenating two PEM files where the first
+    lacks a trailing newline produces `-----END CERTIFICATE----------BEGIN
+    CERTIFICATE-----`, which node cannot decode. That guards what WE write.
+    Nothing taught the READERS to see the same shape in a file someone else
+    wrote, and both of them scanned with a line-anchored `^-----BEGIN`.
+
+    So a welded BEGIN was invisible: the predicate never saw the block, found
+    nothing wrong, and returned True; the oracle answered True because our own
+    CA still verified. Both judges approved and the shared file was wired
+    as-is. Measured on 0.1.12 with node present:
+
+        declared BEGIN occurrences      3
+        line-anchored (what we scanned) 2      <- blind to one block
+        _bundle_is_usable               True
+        oracle                          True
+        wired                           ca-trust.pem (as-is)
+        node actually loads             1 :: CN=cswap pin-proxy CA
+
+    Two of three roots gone, nothing logged. At the real 132-cert scale the
+    reviewer measured 69 of 133 lost — the same magnitude as the tear shape
+    0.1.12 was cut to fix, still shipping.
+
+    WORSE WITH NO NODE, which is the normal case here (cswap is Python): with
+    OUR CA as the welded one the predicate still says usable, and the session
+    loads ZERO extras — it cannot verify the proxy it is routed through, so
+    every request dies.
+
+    The scan must not require the marker to START a line, but must still
+    refuse a marker quoted inside prose (the false-accept the anchor was
+    protecting against) and must still tolerate CRLF (the false-reject that
+    put the `\\r?$` there). Only a line start or a welded `-----` may precede
+    a real block.
+    """
+
+    def test_the_predicate_sees_a_welded_block(self, tmp_path):
+        from cswap_pin.proxy import _bundle_is_usable, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        corp = _other_ca(tmp_path / "corp-root")
+        mid = _other_ca(tmp_path / "mid-ca")
+        # mid written with NO trailing newline: its END welds to corp's BEGIN.
+        body = ours.read_bytes().strip() + b"\n" + mid.strip() + corp
+        assert _bundle_is_usable(body, ours.read_bytes().strip()) is False, (
+            "a welded BEGIN was invisible to the predicate, so a bundle node "
+            "truncates was called usable and wired as-is"
+        )
+
+    def test_salvage_recovers_a_welded_THIRD_PARTY_ca(self, tmp_path):
+        """Salvage force-adds OUR CA, so a weld on ours self-heals by accident.
+        Nothing does that for anyone else — the asymmetry is the bug."""
+        from cswap_pin.proxy import _salvage_bundle, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        corp = _other_ca(tmp_path / "corp-root")
+        body = ours.read_bytes().strip() + corp  # OURS welded to CORP
+        out = _salvage_bundle(body, ours.read_bytes().strip())
+
+        def der(pem: bytes) -> bytes:
+            from cryptography.hazmat.primitives import serialization
+
+            return x509.load_pem_x509_certificate(pem).public_bytes(
+                serialization.Encoding.DER
+            )
+
+        import re as _r
+
+        carried = {
+            der(b)
+            for b in _r.findall(
+                rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", out, _r.S
+            )
+        }
+        assert der(corp) in carried, (
+            "the welded THIRD-PARTY CA was dropped by salvage and nothing said "
+            "so — the repair path recovers a block only when it is ours"
+        )
+        assert der(ours.read_bytes()) in carried, "lost our own CA"
+
+    def test_a_marker_quoted_in_prose_is_still_not_a_block(self, tmp_path):
+        """The anchor was also preventing a false ACCEPT. Un-anchoring it
+        naively (`(?:\\r?\\n|\\Z)` with no left-hand constraint) makes
+        `# see -----BEGIN CERTIFICATE-----` read as a block — measured: 2
+        blocks found where there is 1."""
+        from cswap_pin.proxy import _salvage_bundle, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        body = (
+            b"# provenance: -----BEGIN CERTIFICATE-----\n"
+            + ours.read_bytes().strip()
+            + b"\n"
+        )
+        out = _salvage_bundle(body, ours.read_bytes().strip())
+        assert out.count(b"-----BEGIN") == 1, (
+            f"a marker quoted in prose was treated as a block: {out[:200]!r}"
+        )
+
+    def test_a_CRLF_bundle_is_still_readable(self, tmp_path):
+        """And the false REJECT the `\\r?$` was added for must not come back."""
+        from cswap_pin.proxy import _bundle_is_usable, ensure_ca
+
+        ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        raw = ours.read_bytes().strip() + b"\n"
+        assert _bundle_is_usable(raw.replace(b"\n", b"\r\n"), raw.strip()) is True, (
+            "a CRLF copy of our own CA was refused — the false reject that "
+            "costs every sibling component its trust"
+        )
+
+
+class TestTheProbeAsksAboutTHISBundle:
+    """The child must not inherit env that answers a different question.
+
+    The probe stripped `*_proxy` (so its own loopback connect is not routed
+    through us while we are deciding what to trust) and nothing else. Two
+    inherited variables change what a handshake MEANS:
+
+        NODE_TLS_REJECT_UNAUTHORIZED=0   node accepts any certificate
+        NODE_OPTIONS                     can carry --use-openssl-ca and more
+
+    Measured against a bundle carrying NO CA at all:
+
+        NODE_TLS_REJECT_UNAUTHORIZED unset   oracle says False   (correct)
+        NODE_TLS_REJECT_UNAUTHORIZED=0       oracle says True    (a lie)
+
+    A True from that state is not "the bundle verifies our leaf", it is "this
+    node was told not to check". `_trust_file` then wires the shared file on a
+    verdict about nothing. Raised by the CCF session, who had the mirror-image
+    gap: they cleared these two and not the proxy family, while this cleared
+    the proxy family and not these two.
+    """
+
+    def test_a_disabled_tls_check_does_not_manufacture_a_verdict(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin.proxy import _bundle_loads_in_node, ensure_ca
+
+        if not _node_available():
+            pytest.skip("node cannot answer here — the oracle cannot be asked")
+        ca = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        empty = tmp_path / "empty.pem"
+        empty.write_bytes(b"# carries no CA at all\n")
+
+        monkeypatch.setenv("NODE_TLS_REJECT_UNAUTHORIZED", "0")
+        assert _bundle_loads_in_node(empty, ca) is not True, (
+            "the probe inherited NODE_TLS_REJECT_UNAUTHORIZED=0, so node "
+            "accepted a bundle carrying no CA at all — the verdict describes "
+            "the operator's environment, not the bundle"
         )
