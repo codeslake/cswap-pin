@@ -1012,7 +1012,7 @@ class TestEnsureProxy:
         from cswap_pin import proxy as pin_proxy
         pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
         spawned = []
-        def fake_spawn(account_num, email, certdir):
+        def fake_spawn(account_num, email, certdir, **kw):
             spawned.append((account_num, email))
             return 9955
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", fake_spawn)
@@ -1705,14 +1705,188 @@ class TestDaemonPortStability:
             os.environ.pop("LISTEN_PID", None)
             lsn.close()
 
+    def test_a_handover_never_leaves_the_port_unbound(self, tmp_path):
+        """THE GAP, measured: a successor must inherit the SOCKET, not the port.
+
+        Two processes handing one port over sequentially always leave a hole,
+        and it is not the kernel's: rebinding the same port after close takes
+        0.0000s, but co-binding it while the predecessor still listens is
+        refused (EADDRINUSE with SO_REUSEADDR *and* with SO_REUSEPORT), and a
+        fresh interpreter takes ~50ms to reach bind(). So the window is the
+        successor's START-UP and nothing inside this package can overlap it
+        away — measured on a live box as 6 refused requests over 0.27s, and
+        unchanged by every drain fix.
+
+        Passing the listening socket down closes it: the port is never
+        unbound, because it is the SAME socket. This hammers the port across
+        the whole handover — release, a successor's start-up, the adopt — and
+        a single refusal fails it.
+        """
+        import os
+        import socket
+        import threading
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        old = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
+        old.start()
+        port = old.port
+
+        refused = []
+        served = []
+        stop_hammer = threading.Event()
+
+        def _hammer():
+            while not stop_hammer.is_set():
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                    served.append(1)
+                except OSError as exc:
+                    refused.append(repr(exc))
+                time.sleep(0.002)
+
+        h = threading.Thread(target=_hammer, daemon=True)
+        h.start()
+        time.sleep(0.1)  # a baseline of served connections before we touch it
+        assert served, "premise: the hammer never reached the old daemon"
+
+        # What a successor reclaims when it is handed nothing — so a release
+        # that closes the port still produces a WORKING successor on the same
+        # port, and the only difference the hammer can see is the gap.
+        pin_proxy.write_daemon_state(tmp_path, port, os.getpid(), "fp")
+
+        new = None
+        try:
+            fd = old.release_listener(hand_down=True)
+            # THE SUCCESSOR'S START-UP, the whole window this exists to
+            # cover. A real one is a fresh interpreter (~50ms measured);
+            # this is longer, so a gap could not hide inside scheduling. The
+            # socket is still LISTENING, so arrivals queue in the backlog
+            # instead of being refused.
+            time.sleep(0.3)
+
+            if fd is not None:
+                os.environ[pin_proxy._HANDDOWN_FD_ENV] = str(fd)
+                os.environ[pin_proxy._HANDDOWN_FROM_ENV] = str(os.getppid())
+            try:
+                new = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
+                new.start()
+            finally:
+                os.environ.pop(pin_proxy._HANDDOWN_FD_ENV, None)
+                os.environ.pop(pin_proxy._HANDDOWN_FROM_ENV, None)
+
+            assert new.port == port, (
+                f"successor came up on {new.port}, stranding every session "
+                f"whose HTTPS_PROXY was fixed at {port}"
+            )
+            time.sleep(0.2)
+        finally:
+            stop_hammer.set()
+            h.join(timeout=5)
+            old.await_inflight(0)
+            if new is not None:
+                new.stop(drain=0)
+
+        assert not refused, (
+            f"{len(refused)} of {len(refused) + len(served)} connections were "
+            f"refused across the handover: {refused[:3]}"
+        )
+        assert fd is not None, (
+            "no connection was refused, but nothing was handed down either — "
+            "the successor rebound fast enough to hide the window this time, "
+            "which is luck, not the fix"
+        )
+
+    def test_a_spawn_without_a_handdown_does_not_pass_the_variables_on(
+        self, tmp_path, monkeypatch
+    ):
+        """A daemon that was handed a socket must not tell its child it was.
+
+        These variables live in the successor's own environment for the rest
+        of its life, so a LATER spawn that passes no fd would hand the child a
+        number naming a descriptor it does not have. The parentage guard
+        refuses it today, but an environment that lies is one pid reuse from
+        being believed — and the fd it names is whatever that number became.
+        """
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+
+        seen = {}
+
+        class _P:
+            def __init__(self, *a, **kw):
+                seen.update(kw)
+
+        monkeypatch.setattr(pin_proxy.__dict__.get("subprocess", None) or
+                            __import__("subprocess"), "Popen", _P)
+        monkeypatch.setenv(pin_proxy._HANDDOWN_FD_ENV, "7")
+        monkeypatch.setenv(pin_proxy._HANDDOWN_FROM_ENV, "12345")
+
+        certdir = tmp_path / "certs"
+        certdir.mkdir()
+        pin_proxy._spawn_daemon("1", "a@b.c", certdir)  # no listen_fd
+
+        env = seen.get("env") or {}
+        assert pin_proxy._HANDDOWN_FD_ENV not in env, (
+            f"the child was told to adopt fd {env[pin_proxy._HANDDOWN_FD_ENV]} "
+            f"which it was never given")
+        assert pin_proxy._HANDDOWN_FROM_ENV not in env, env
+        assert not seen.get("pass_fds"), seen.get("pass_fds")
+
+    def test_the_predecessor_stops_accepting_before_it_hands_the_socket_over(
+        self, tmp_path
+    ):
+        """EXACTLY ONE ACCEPTOR, or the socket-handdown loses requests outright.
+
+        The kernel gives each connection to ONE of the fd holders calling
+        ``accept()``, so a predecessor still inside its loop dequeues
+        connections the successor was meant to serve — and drops them, because
+        it has stopped serving. Measured by a peer whose launcher kept
+        accepting alongside its child: 19 of 60 requests LOST in steady state,
+        no restart involved. That is worse than the 0.27s gap this replaces.
+
+        ``release_listener`` must therefore JOIN the accept loop, not merely
+        set a flag: the loop polls with a 0.5s timeout and can be inside
+        ``accept()`` at that very moment, and it must not still be there when
+        the successor starts.
+        """
+        import socket
+
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        old = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
+        old.start()
+        try:
+            fd = old.release_listener(hand_down=True)
+            assert fd is not None, "nothing was handed down"
+            assert old._accept_thread is None, (
+                "release_listener returned while its accept loop was still "
+                "running — a predecessor that keeps accepting steals "
+                "connections from the successor and drops them"
+            )
+        finally:
+            old.await_inflight(0)
+            try:
+                socket.socket(fileno=fd).close()
+            except OSError:
+                pass
+
     def test_a_passed_fd_that_is_not_a_listener_is_refused(self, tmp_path):
         """A wrong fd must send us back to binding our own port, not down.
 
-        LISTEN_FDS/LISTEN_PID are inherited by every descendant, so a
-        grandchild trusting the count alone serves on whatever its fd 3
-        happens to be — a log file, a pipe — and the port goes unserved with
-        no error. Each refusal below leaves the daemon able to bind for
-        itself.
+        Both paths are here because both pass an fd and both are inherited by
+        descendants that were never meant to have it. LISTEN_FDS/LISTEN_PID
+        reach every descendant, so a grandchild trusting the count alone
+        serves on whatever its fd 3 happens to be — a log file, a pipe — and
+        the port goes unserved with no error. The hand-down variables have the
+        same reach, and its guard is the same shape: the fd is addressed to
+        whoever's parent is the process that passed it. Each refusal below
+        leaves the daemon able to bind for itself.
         """
         import os
         import socket
@@ -1749,6 +1923,38 @@ class TestDaemonPortStability:
             os.environ.pop("LISTEN_FDS", None)
             os.environ.pop("LISTEN_PID", None)
             lsn.close()
+
+        # The hand-down variables, same guard. A grandchild inherits them but
+        # NOT the fd (Popen closes what it does not pass), so without the
+        # parentage check it adopts whatever that number now refers to.
+        lsn2 = socket.socket()
+        lsn2.bind(("127.0.0.1", 0))
+        lsn2.listen(1)
+        os.environ[pin_proxy._HANDDOWN_FD_ENV] = str(lsn2.fileno())
+        try:
+            os.environ[pin_proxy._HANDDOWN_FROM_ENV] = str(os.getppid() + 1)
+            assert pin_proxy._handed_down_listener() is None, (
+                "adopted an fd handed to a different process")
+
+            os.environ[pin_proxy._HANDDOWN_FROM_ENV] = str(os.getppid())
+            adopted = pin_proxy._handed_down_listener()
+            assert adopted is not None, (
+                "refused the fd its own parent passed — nothing would ever "
+                "be handed down and the gap stays open")
+            # The adopted object OWNS the fd; letting it be collected would
+            # close lsn2's descriptor out from under the fixture.
+            adopted.detach()
+
+            s3 = socket.socket()
+            s3.bind(("127.0.0.1", 0))
+            os.environ[pin_proxy._HANDDOWN_FD_ENV] = str(s3.fileno())
+            assert pin_proxy._handed_down_listener() is None, (
+                "adopted a socket that was never listening")
+            s3.close()
+        finally:
+            os.environ.pop(pin_proxy._HANDDOWN_FD_ENV, None)
+            os.environ.pop(pin_proxy._HANDDOWN_FROM_ENV, None)
+            lsn2.close()
 
     def test_falls_back_to_a_free_port_when_recorded_one_is_taken(self, tmp_path):
         import socket
@@ -2684,6 +2890,30 @@ class TestUnwireWhenDead:
         )
 
 
+def _recording_server(events):
+    """A stand-in for PinProxy that records the handover calls it receives.
+
+    Shared rather than re-declared per test, because every copy has to track
+    the real server's signature: a stub that no longer resembles the callee
+    fails on the method the code actually calls, and six copies means six
+    places to miss. ``release_listener`` returns the fd it would hand down —
+    None here, which is what a server with nothing to pass returns too.
+    """
+
+    class _Srv:
+        def release_listener(self, hand_down=False):
+            events.append(("stop", None))
+            return None
+
+        def await_inflight(self, budget):
+            events.append(("drain", budget))
+
+        def stop(self, drain=None):
+            events.append(("stop", drain))
+
+    return _Srv
+
+
 class TestTheDaemonWatchesItsOwnCode:
     """A daemon must notice its own code was replaced and hand over.
 
@@ -2730,21 +2960,10 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: next(fps))
 
-        class _Srv:
-            # Mirrors the real split: the handover releases the port, spawns,
-            # and only then drains. A stub with just stop() no longer resembles
-            # the callee and would fail on the method the code actually calls.
-            def release_listener(self):
-                events.append(("stop", None))
-
-            def await_inflight(self, budget):
-                events.append(("drain", budget))
-
-            def stop(self, drain=None):
-                events.append(("stop", drain))
+        _Srv = _recording_server(events)
 
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
-                            lambda n, e, c: events.append(("spawn", n)) or 41234)
+                            lambda n, e, c, **k: events.append(("spawn", n)) or 41234)
 
         certdir = self._certdir(tmp_path)
         done = threading.Event()
@@ -2788,20 +3007,9 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: "fp-same")
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
-                            lambda n, e, c: events.append(("spawn", n)) or 1)
+                            lambda n, e, c, **k: events.append(("spawn", n)) or 1)
 
-        class _Srv:
-            # Mirrors the real split: the handover releases the port, spawns,
-            # and only then drains. A stub with just stop() no longer resembles
-            # the callee and would fail on the method the code actually calls.
-            def release_listener(self):
-                events.append(("stop", None))
-
-            def await_inflight(self, budget):
-                events.append(("drain", budget))
-
-            def stop(self, drain=None):
-                events.append(("stop", drain))
+        _Srv = _recording_server(events)
 
         certdir = self._certdir(tmp_path)
         done = threading.Event()
@@ -2837,22 +3045,11 @@ class TestTheDaemonWatchesItsOwnCode:
         fps = iter(["fp-old", "fp-new", "fp-new"])
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: next(fps))
-        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c: None)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         monkeypatch.setattr(pin_proxy, "_resume_serving",
                             lambda srv: events.append(("resume", True)) or True)
 
-        class _Srv:
-            # Mirrors the real split: the handover releases the port, spawns,
-            # and only then drains. A stub with just stop() no longer resembles
-            # the callee and would fail on the method the code actually calls.
-            def release_listener(self):
-                events.append(("stop", None))
-
-            def await_inflight(self, budget):
-                events.append(("drain", budget))
-
-            def stop(self, drain=None):
-                events.append(("stop", drain))
+        _Srv = _recording_server(events)
 
         certdir = self._certdir(tmp_path)
         done = threading.Event()
@@ -2883,21 +3080,10 @@ class TestTheDaemonWatchesItsOwnCode:
         fps = iter(["fp-old", "fp-new", "fp-new"])
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: next(fps))
-        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c: None)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         monkeypatch.setattr(pin_proxy, "_resume_serving", lambda srv: False)
 
-        class _Srv:
-            # Mirrors the real split: the handover releases the port, spawns,
-            # and only then drains. A stub with just stop() no longer resembles
-            # the callee and would fail on the method the code actually calls.
-            def release_listener(self):
-                events.append(("stop", None))
-
-            def await_inflight(self, budget):
-                events.append(("drain", budget))
-
-            def stop(self, drain=None):
-                events.append(("stop", drain))
+        _Srv = _recording_server(events)
 
         certdir = self._certdir(tmp_path)
         done = threading.Event()
@@ -2932,6 +3118,20 @@ class TestTheDaemonWatchesItsOwnCode:
 
         assert pin_proxy._resume_serving(srv) is True
         assert srv.port == port
+        socket.create_connection(("127.0.0.1", port), timeout=1.0).close()
+
+        # A RESUME AFTER A HAND-DOWN takes the same descriptor back. The spawn
+        # failed, so nobody adopted it and it never stopped listening — there
+        # is no port to reclaim and nothing can have taken it in between. A
+        # resume that instead bound a fresh socket would find its OWN
+        # still-listening socket in the way and land on an ephemeral port,
+        # stranding every session whose HTTPS_PROXY was fixed at exec.
+        fd = srv.release_listener(hand_down=True)
+        assert fd is not None, "nothing was handed down"
+        assert pin_proxy._resume_serving(srv) is True, (
+            "could not take back a socket nobody adopted")
+        assert srv.port == port, (
+            f"resumed on {srv.port} while the sessions expect {port}")
         socket.create_connection(("127.0.0.1", port), timeout=1.0).close()
         srv.stop(drain=0)
 
@@ -3033,23 +3233,12 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: next(fps))
 
-        def _boom(n, e, c):
+        def _boom(n, e, c, **kw):
             raise OSError(11, "Resource temporarily unavailable")
 
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", _boom)
 
-        class _Srv:
-            # Mirrors the real split: the handover releases the port, spawns,
-            # and only then drains. A stub with just stop() no longer resembles
-            # the callee and would fail on the method the code actually calls.
-            def release_listener(self):
-                events.append(("stop", None))
-
-            def await_inflight(self, budget):
-                events.append(("drain", budget))
-
-            def stop(self, drain=None):
-                events.append(("stop", drain))
+        _Srv = _recording_server(events)
 
         certdir = self._certdir(tmp_path)
         done = threading.Event()
@@ -3094,20 +3283,10 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: next(fps))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
-                            lambda n, e, c: spawned.append(n) or 41234)
+                            lambda n, e, c, **k: spawned.append(n) or 41234)
 
         stopped = []
-
-        class _Srv:
-            # Same split as the real server: release, spawn, then drain.
-            def release_listener(self):
-                stopped.append(None)
-
-            def await_inflight(self, budget):
-                pass
-
-            def stop(self, drain=None):
-                stopped.append(drain)
+        _Srv = _recording_server(stopped)
 
         # Hold the spawn lock from another thread for the whole handover. If
         # the watchdog takes it, it cannot spawn while we hold it.
@@ -3200,16 +3379,7 @@ class TestTheDaemonWatchesItsOwnCode:
                             lambda *a, **k: next(fps))
         handover_done = threading.Event()
 
-        class _Srv:
-            # Same split as the real server: release, spawn, then drain.
-            def release_listener(self):
-                pass
-
-            def await_inflight(self, budget):
-                pass
-
-            def stop(self, drain=None):
-                pass
+        _Srv = _recording_server([])
 
         threading.Thread(
             target=lambda: (pin_proxy._watch_own_code(
@@ -3456,7 +3626,7 @@ class TestHealRestoresWithoutRestart:
     def test_a_dead_daemon_is_respawned_and_rewired(self, tmp_path, monkeypatch):
         from cswap_pin import proxy as pin_proxy
         root, cfg = self._root(tmp_path, monkeypatch)
-        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 45678)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 45678)
         assert pin_proxy.heal(root) is True
         env = json.loads(cfg.read_text())["env"]
         assert env["HTTPS_PROXY"] == "http://127.0.0.1:45678"
@@ -3468,7 +3638,7 @@ class TestHealRestoresWithoutRestart:
         cfg.write_text(json.dumps({
             "env": {"HTTPS_PROXY": "http://127.0.0.1:59999"},
             "_cswapPinWiredKeys": ["HTTPS_PROXY"]}))
-        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: None)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: None)
         assert pin_proxy.heal(root) is False
         assert json.loads(cfg.read_text()).get("env", {}) == {}
 
@@ -4394,7 +4564,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
         monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: killed.append(pid))
 
-        def _spawn(num, email, cd):
+        def _spawn(num, email, cd, **kw):
             spawned.append((num, email))
             return port  # a real respawn reclaims the SAME port
 
@@ -4425,7 +4595,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
             hint_at_kill["port"] = proxy.read_port_hint(certdir)
 
         monkeypatch.setattr(proxy, "_kill_daemon", _kill)
-        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: port)
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: port)
         try:
             proxy.heal(tmp_path)
             assert hint_at_kill.get("port") == port, (
@@ -4469,7 +4639,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
             "_kill_daemon",
             lambda pid: pytest.fail("signalled a pid it could not identify"),
         )
-        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: None)
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         try:
             proxy.heal(tmp_path)
         finally:
@@ -4908,7 +5078,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         killed = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
         monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: killed.append(pid))
-        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: None)
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         try:
             proxy.heal(tmp_path)
             assert not killed, (
@@ -4938,7 +5108,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         kills = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
         monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: kills.append(pid))
-        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c: port)
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: port)
         try:
             for _ in range(5):
                 proxy.heal(tmp_path)
@@ -4966,7 +5136,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
         monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: None)
         monkeypatch.setattr(
-            proxy, "_spawn_daemon", lambda n, e, c: spawns.append(n) or port
+            proxy, "_spawn_daemon", lambda n, e, c, **k: spawns.append(n) or port
         )
         try:
             for _ in range(5):
@@ -4993,7 +5163,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [])  # no ps
         monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: kills.append(pid))
         monkeypatch.setattr(
-            proxy, "_spawn_daemon", lambda n, e, c: spawns.append(n) or port
+            proxy, "_spawn_daemon", lambda n, e, c, **k: spawns.append(n) or port
         )
         try:
             proxy.heal(tmp_path)

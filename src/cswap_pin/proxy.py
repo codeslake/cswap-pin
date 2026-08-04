@@ -3905,12 +3905,20 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
         return None
 
 
-def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
+def _spawn_daemon(
+    account_num: str, email: str, certdir: Path, listen_fd: int | None = None
+) -> int | None:
     """Start the proxy daemon detached; wait for its state file. None on failure.
 
     Creates the refcount FIFO up front so a session can attach a holder the
     instant the daemon comes up (no gap where the daemon sees zero holders and
     tears itself down).
+
+    ``listen_fd`` is a still-LISTENING socket the caller has stopped accepting
+    on, passed to the successor so the port is never unbound. Handing the port
+    NUMBER over instead leaves a hole nothing in this package can close: the
+    successor is a fresh interpreter (~50ms to reach ``bind()``) and a
+    listening port cannot be co-bound, with SO_REUSEADDR or SO_REUSEPORT.
     """
     import subprocess
     import sys
@@ -3962,11 +3970,32 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
     # there and a log that also carries chatter buries the one line worth
     # reading.
     log = _open_daemon_log(certdir)
+    # SCRUB, THEN SET. A daemon that was itself handed a socket still carries
+    # these variables in its own environment, and a spawn that passes no fd
+    # would hand that stale pair to the child verbatim — naming a descriptor
+    # the child does not have. The ppid guard already refuses it, but an
+    # environment that lies is one pid-reuse away from being believed, and
+    # nothing needs it to survive the process it was addressed to.
+    env = {k: v for k, v in os.environ.items()
+           if k not in (_HANDDOWN_FD_ENV, _HANDDOWN_FROM_ENV)}
+    pass_fds: tuple[int, ...] = ()
+    if listen_fd is not None:
+        # NAME THE NUMBER. `Popen(pass_fds=...)` does not renumber — measured,
+        # a parent's fd 9 arrives as the child's fd 9 and its fd 3 is EBADF —
+        # so the systemd "first fd is 3" convention cannot express this and the
+        # successor is told which descriptor to look at. The origin pid is the
+        # guard: these variables reach every descendant but the fd does not, so
+        # a grandchild without it must not adopt whatever that number became.
+        env[_HANDDOWN_FD_ENV] = str(listen_fd)
+        env[_HANDDOWN_FROM_ENV] = str(os.getpid())
+        pass_fds = (listen_fd,)
     try:
         try:
             subprocess.Popen(
                 [sys.executable, "-m", _DAEMON_MODULE, account_num, email,
                  str(certdir)],
+                env=env,
+                pass_fds=pass_fds,
                 # GIVE THE CHILD ITS OWN STDIN. Without this it inherits the
                 # parent's fd 0, and a daemon spawning its successor is not a
                 # CLI: whatever fd 0 became in a long-lived detached process is
@@ -4166,12 +4195,35 @@ def _watch_own_code(
                 # finish, so the drain happens after, while the new daemon is
                 # already accepting. A supervisor-held port makes both moot —
                 # this is what the package does when it owns the socket itself.
-                server.release_listener()
+                #
+                # AND THE SOCKET GOES WITH IT, which is what makes the handover
+                # gapless rather than merely short. Releasing the port and
+                # letting the successor rebind it still costs the successor's
+                # start-up: measured on a live box, 6 refused requests over
+                # 0.27s, and no drain fix moved it, because a listening port
+                # cannot be co-bound (SO_REUSEADDR and SO_REUSEPORT both
+                # refused) and a fresh interpreter needs ~50ms to reach
+                # `bind()`. Passing the listening socket down leaves the port
+                # bound the whole time, so arrivals queue in the backlog
+                # instead: 0 refused. `release_listener` joins the accept loop
+                # first — two processes accepting on one socket split the
+                # connections, and the one that has stopped serving drops its
+                # share.
+                handed_fd = server.release_listener(hand_down=True)
                 stopped = True
-                spawned = _spawn_daemon(account_num, email, certdir)
+                spawned = _spawn_daemon(
+                    account_num, email, certdir, listen_fd=handed_fd
+                )
                 server.await_inflight(_DRAIN_SECONDS)
                 if spawned is not None:
                     _log_lifecycle("successor is serving — leaving the wiring to it")
+                    # OUR COPY OF THE FD STAYS OPEN, deliberately. This process
+                    # returns from here into its own exit, and closing a
+                    # listening descriptor two processes hold is only ever
+                    # dangerous in the other direction: close it a moment too
+                    # early and the port is gone. Nothing here accepts on it —
+                    # `release_listener` joined the accept loop before handing
+                    # it over.
                     handed_over = True
                     return
                 _log_lifecycle("successor did not come up")
@@ -4255,6 +4307,55 @@ def _inherited_listener() -> "socket.socket | None":
     except OSError as exc:
         _log_lifecycle(f"ignoring the passed fd 3: {exc}")
         sock.detach()  # not ours — leave the fd as the supervisor left it
+        return None
+    return sock
+
+
+_HANDDOWN_FD_ENV = "CSWAP_PIN_LISTEN_FD"
+_HANDDOWN_FROM_ENV = "CSWAP_PIN_LISTEN_FROM"
+
+
+def _handed_down_listener() -> "socket.socket | None":
+    """The listening socket our PREDECESSOR passed us, or None to bind our own.
+
+    A separate path from :func:`_inherited_listener`, and it has to be. That
+    one implements the systemd convention, where the first passed fd is
+    number 3 — but `subprocess.Popen(pass_fds=...)` does NOT renumber:
+    measured, a parent's fd 9 arrives as the child's fd 9 and its fd 3 is
+    EBADF. A predecessor cannot use the systemd variables to say what it
+    passed, so it names the number instead.
+
+    ``_HANDDOWN_FROM_ENV`` is the same guard ``LISTEN_PID`` is, one level
+    over: the variables reach every descendant, and a grandchild does NOT
+    inherit the fd (Popen closes what it does not pass), so a bare number
+    would name whatever that descriptor became — a log file, a pipe, another
+    socket. Requiring it to have come from our own parent is what makes the
+    number meaningful. Anything not a listening TCP socket is refused, and
+    refusing means we bind our own port: a bad hand-down must not be able to
+    take the pin down with it.
+    """
+    origin = os.environ.get(_HANDDOWN_FROM_ENV)
+    if not origin or origin != str(os.getppid()):
+        return None
+    try:
+        fd = int(os.environ.get(_HANDDOWN_FD_ENV, ""))
+    except ValueError:
+        return None
+    if fd < 0:
+        return None
+    try:
+        sock = socket.socket(fileno=fd)
+    except OSError:
+        return None
+    try:
+        if sock.type != socket.SOCK_STREAM:
+            raise OSError("not a stream socket")
+        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+            raise OSError("not listening")
+        sock.getsockname()
+    except OSError as exc:
+        _log_lifecycle(f"ignoring the handed-down fd {fd}: {exc}")
+        sock.detach()  # not ours — leave the descriptor as we found it
         return None
     return sock
 
@@ -4545,6 +4646,9 @@ class PinProxy:
         # hop when it is not — see _note_egress.
         self._egress_direct = False
         self._egress_hop: "tuple[str, int] | None" = None
+        # The last hop fault reported, so a steadily-down hop costs one line
+        # instead of one per connection — see _note_hop_unusable.
+        self._hop_fault: "tuple[tuple[str, int], str] | None" = None
         # The credential a client must present on CONNECT is re-read per
         # connection, not cached here — ``_current_secret``. Caching it made
         # the gate arm on the next RESPAWN rather than when the secret was
@@ -4575,6 +4679,14 @@ class PinProxy:
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
         self._inherited = False
+        # The accept loop, held so a handover can JOIN it rather than merely
+        # signal it: two processes accepting on one socket split the
+        # connections between them, and the one that has stopped serving drops
+        # its share.
+        self._accept_thread: threading.Thread | None = None
+        # The descriptor handed to a successor, kept only so it can be closed
+        # if the spawn fails and we resume serving.
+        self._handed_fd: int | None = None
         self.port = 0
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
         # request (method, path, whether it matched a pinned route and was
@@ -4583,6 +4695,34 @@ class PinProxy:
         self._debug = open(debug_path, "a") if debug_path else None
 
     def start(self) -> None:
+        if self._handed_fd is not None:
+            # WE HANDED THIS DOWN AND NOBODY TOOK IT — the spawn failed, and
+            # this is the resume. The socket never stopped listening, so there
+            # is no port to reclaim and no window to lose: take the descriptor
+            # back and start accepting on it again.
+            fd, self._handed_fd = self._handed_fd, None
+            try:
+                self._srv = socket.socket(fileno=fd)
+                self.port = self._srv.getsockname()[1]
+            except OSError as exc:
+                _log_lifecycle(f"could not take back the handed-down fd: {exc}")
+                self._srv = None
+            else:
+                self._inherited = False
+                self._start_accept_loop()
+                return
+        handed = _handed_down_listener()
+        if handed is not None:
+            # OUR PREDECESSOR'S SOCKET, still listening. It stopped accepting
+            # before it passed this down, so connections that arrived during
+            # our start-up are waiting in the backlog rather than refused —
+            # which is the whole 0.27s gap, closed. The port was never
+            # unbound, so there is nothing to reclaim and nothing to race.
+            self._srv = handed
+            self._inherited = False  # ours to close when we in turn go away
+            self.port = self._srv.getsockname()[1]
+            self._start_accept_loop()
+            return
         inherited = _inherited_listener()
         if inherited is not None:
             # A SUPERVISOR OWNS THE PORT. It bound the socket before we existed
@@ -4597,7 +4737,7 @@ class PinProxy:
             self._srv = inherited
             self._inherited = True
             self.port = self._srv.getsockname()[1]
-            threading.Thread(target=self._accept_loop, daemon=True).start()
+            self._start_accept_loop()
             return
         self._inherited = False
         self._srv = socket.socket()
@@ -4637,10 +4777,23 @@ class PinProxy:
                           # ephemeral port
         self._srv.listen(64)
         self.port = self._srv.getsockname()[1]
-        threading.Thread(target=self._accept_loop, daemon=True).start()
+        self._start_accept_loop()
 
-    def release_listener(self) -> None:
-        """Stop accepting and free the port, leaving open connections alone.
+    def _start_accept_loop(self) -> None:
+        """Run the accept loop on a thread we can JOIN, not merely signal.
+
+        Kept as a handle because exactly one process may be accepting on a
+        socket at a time. The kernel hands each connection to ONE of the fd
+        holders that calls ``accept()``, so a predecessor still inside its
+        loop dequeues connections it has already stopped serving — measured
+        by a peer on a launcher that kept accepting alongside its child:
+        19 of 60 requests lost in steady state, no restart involved.
+        """
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+
+    def release_listener(self, hand_down: bool = False) -> "int | None":
+        """Stop accepting, leaving open connections alone. The fd if handed down.
 
         The half of :meth:`stop` a handover needs FIRST. ``stop(drain=N)``
         closes the listener and then waits N seconds before returning, so the
@@ -4651,8 +4804,44 @@ class PinProxy:
         Splitting it lets the successor take the port immediately while the
         requests already in flight here keep running; :meth:`await_inflight`
         collects them afterwards.
+
+        ``hand_down`` goes one step further and is what closes the gap
+        entirely. Closing the port and letting the successor rebind it is
+        instant in the kernel (a rebind after close measured 0.0000s), but the
+        successor is a fresh interpreter and takes ~50ms to reach ``bind()`` —
+        and neither ``SO_REUSEADDR`` nor ``SO_REUSEPORT`` will co-bind a port
+        that is still listening, so that window cannot be overlapped away.
+        Measured on a live box: 6 refused requests over 0.27s per handover,
+        unchanged by every drain fix. Passing the SOCKET down instead leaves
+        the port bound the whole time, so arrivals queue in the backlog:
+        0 refused.
+
+        Either way this returns only once our accept loop has ENDED. A
+        signalled-but-running loop would keep winning connections from a
+        socket it no longer serves.
         """
         self._stop = True
+        srv, self._srv = self._srv, None
+        # JOIN, do not merely set the flag. The loop polls with a 0.5s
+        # timeout, so it can be inside `accept()` right now — and an accept
+        # that succeeds after we have handed the socket down takes a
+        # connection away from the successor and drops it.
+        t = getattr(self, "_accept_thread", None)
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=5.0)
+        self._accept_thread = None
+        if srv is not None and hand_down:
+            if self._inherited:
+                # NOT OURS TO PASS ON. A supervisor holds this port across our
+                # restarts; handing its socket to a child we do not control
+                # would leave that child accepting on it after we are gone.
+                self._srv = srv
+                return None
+            fd = srv.detach()  # leave it LISTENING and open for the successor
+            os.set_inheritable(fd, True)
+            self._handed_fd = fd
+            return fd
+        self._srv = srv
         if self._srv and self._inherited:
             # NOT OURS TO CLOSE — a supervisor holds this port precisely so it
             # keeps answering across our restarts.
@@ -4669,6 +4858,7 @@ class PinProxy:
             except OSError:
                 pass
             self._srv = None
+            return None
         elif self._srv:
             # SHUTDOWN BEFORE CLOSE. A thread blocked in ``accept()`` keeps the
             # listening socket alive across a bare ``close()``: measured, the
@@ -4685,6 +4875,7 @@ class PinProxy:
             except OSError:
                 pass
             self._srv = None
+        return None
 
     def await_inflight(self, budget: float) -> None:
         """Wait up to ``budget`` for open connections to finish, then cut them.
@@ -5425,7 +5616,16 @@ class PinProxy:
             # listener is up before its proxy logic is.
             try:
                 raw = _dial_chain(chain, extra_ca=self._chain_ca())
-            except OSError:
+            except OSError as exc:
+                # NAME WHY, even though the reaction is the same. "the hop
+                # refused" and "the hop answered and was wrong" are one
+                # decision here and two DIFFERENT FAULTS to whoever runs that
+                # hop: the first says its port was down, the second says its
+                # port was up and its logic was not. Collapsing them left the
+                # log unable to tell a supervisor that kept the port alive
+                # from one that never ran — which is the whole claim such a
+                # supervisor makes.
+                self._note_hop_unusable(chain.address, f"dial failed: {exc!r}")
                 continue
             try:
                 raw.sendall(
@@ -5441,6 +5641,11 @@ class PinProxy:
             except OSError:
                 status = None
             if not _connect_ok(status):
+                self._note_hop_unusable(
+                    chain.address,
+                    "accepted but did not tunnel: "
+                    + (f"CONNECT -> {status!r}" if status else "no reply"),
+                )
                 try:
                     raw.close()
                 except OSError:
@@ -5453,6 +5658,25 @@ class PinProxy:
         sock.settimeout(None)
         self._note_egress(direct=True)
         return sock, False  # direct dial: verification stays on
+
+    def _note_hop_unusable(self, hop: "tuple[str, int]", why: str) -> None:
+        """Log WHY a hop was skipped, once per (hop, reason) transition.
+
+        The walk falls through an unusable hop silently and carries on, so the
+        only trace is which hop ended up carrying the request. That is not
+        enough to attribute a failure: a hop whose PORT is dead and a hop that
+        answers and refuses to tunnel are the same fall-through here and
+        opposite faults for whoever runs it. One of them is what a supervisor
+        holding that port exists to prevent; the other it cannot touch.
+
+        Deduplicated on the transition like :meth:`_note_egress`, so a hop
+        that is steadily down costs one line rather than one per connection.
+        """
+        state = (hop, why)
+        if state == self._hop_fault:
+            return
+        self._hop_fault = state
+        _log_lifecycle(f"hop {hop[0]}:{hop[1]} unusable — {why}")
 
     def _note_egress(self, *, direct: bool, hop: "tuple[str, int] | None" = None) -> None:
         """Log egress path changes; silence means the path is unchanged.
