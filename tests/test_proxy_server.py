@@ -1135,11 +1135,19 @@ class TestLongPollSurvives:
 
 
 class TestChainRediscovery:
-    """The daemon outlives the launch that spawned it, and CCF picks its port
-    from a family (9901 + walk range) and can restart. A chain bound once at
-    spawn therefore goes stale — and a stale chain does not degrade, it
-    BYPASSES the egress proxy, which behind a corporate proxy is a hard
-    failure. The daemon re-reads the hint every connection instead."""
+    """The daemon outlives the launch that spawned it, and a cache proxy picks
+    its port from a family and can restart. A chain bound once at spawn
+    therefore goes stale — and a stale chain does not degrade, it BYPASSES the
+    egress proxy. The daemon re-reads the hint every connection instead.
+
+    AND A DEAD HOP FALLS THROUGH TO THE HOP BEHIND IT, never to a direct dial.
+    Behind a corporate TLS-inspecting proxy a direct dial is not "no proxy",
+    it is the inspector, and its leaf carries no Authority Key Identifier —
+    so a strict verifier refuses it and OAuth against claude.ai fails with
+    nothing on screen. Only the outermost proxy reaches the real leaf, which
+    is why a hint recording ONE hop is not enough: when the recorded hop is an
+    inner cache proxy and it goes away, the correct target is the outer proxy
+    it was itself chaining to."""
 
     def test_follows_a_chain_that_appears_after_the_daemon_started(
         self, certdir, tmp_path
@@ -1294,26 +1302,6 @@ class TestChainRediscovery:
         # A DIFFERENT loopback proxy (CCF) is a legitimate chain.
         env = {"HTTPS_PROXY": "http://127.0.0.1:9901", "CSWAP_PIN_PORT": "45678"}
         assert _ambient_proxy(env) == "http://127.0.0.1:9901"
-
-
-class TestTheChainFallsThroughToTheNextHop:
-    """A dead hop must fall through to the hop BEHIND it, not to a direct dial.
-
-    On a machine behind a corporate TLS-inspecting proxy, a direct dial is not
-    "no proxy" — it is the inspector, and its leaf has no Authority Key
-    Identifier, so OAuth against claude.ai fails. Measured on this host, the
-    four egress paths give four different leaves and only the outer proxy
-    reaches the real one:
-
-        DIRECT          issuer=CN=SSL Decryption cert       aki=NO
-        via privoxy     issuer=CN=WE1,O=Google Trust …      aki=yes
-        via CCF         issuer=CN=cache-fix forward-proxy CA
-        via pin         issuer=CN=cswap pin-proxy CA
-
-    So the hint recording ONE hop is the defect: when the recorded hop is the
-    inner cache proxy and it goes away, the only correct target is the outer
-    proxy it was itself chaining to.
-    """
 
     def _dead_port(self) -> int:
         s = socket.socket()
@@ -1521,6 +1509,8 @@ class TestTheChainFallsThroughToTheNextHop:
         pp.write_upstream_hint(certdir, f"http://127.0.0.1:{dead}", next_hop=nxt)
         hops = pp._chain_hops(certdir)
         assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
+
+
 
 
 class TestAbsoluteFormPassthrough:
