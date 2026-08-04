@@ -7,10 +7,11 @@ disk. Everything else (inference at ``/v1/messages``, OAuth, telemetry, …) is
 relayed untouched, and non-anthropic hosts are blind-tunnelled.
 
 The daemon lifecycle here — fixed port across respawns, FIFO refcount, config
-fingerprint, idle teardown — follows the one in claude-code-cache-fix ("CCF"
+fingerprint, idle teardown — follows the one used by local cache proxies ("the cache proxy"
 in the comments below), whose forward-proxy mode solves the same shape of
 problem in front of Claude Code. Nothing in this module requires it: a
-comment naming CCF is citing where a decision came from, not a dependency.
+comment naming a peer implementation cites where a decision came from,
+not a dependency.
 """
 
 from __future__ import annotations
@@ -206,11 +207,15 @@ def write_upstream_hint(
     # hop behind it; falling through to a direct dial is not "no proxy" on a
     # machine whose direct route is a TLS-inspecting corporate proxy.
     #
-    # Taken from the caller rather than probed here, and NOT carried over from
-    # the previous record: only a launch can confirm the hop behind this one
-    # (see ``_probe_next_hop``), so a writer that cannot is recording nothing
-    # rather than something stale.
-    keep_next = next_hop or ""
+    # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE". ``_probe_next_hop``
+    # returns None both when the hop reports no upstream AND when the hop is not
+    # answering — and the second case is exactly when the chain is about to be
+    # needed. Writing "" there erased the outer hop at the moment the inner one
+    # died, leaving a single-hop chain that falls straight to a direct dial.
+    #
+    # Keep what a previous launch confirmed; only a launch that positively
+    # reports a different hop replaces it.
+    keep_next = next_hop or _read_upstream(certdir, "next") or ""
     if value:
         keep_proxy = value
     else:
@@ -327,7 +332,7 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     other_path = Path(other)
     # Rebuild only when an input is newer than the output — the inputs are
     # immutable per launch, so the steady state is two stats instead of
-    # rewriting the bundle on every launch (same trade CCF's ensure makes).
+    # rewriting the bundle on every launch (the same trade a sibling proxy's ensure makes).
     #
     # AND ON CONTENT, for the same reason the un-merge branch above needed it.
     # mtime answers "did an input change since we built this", which is not
@@ -619,7 +624,7 @@ def _join_pem(*parts: bytes) -> bytes:
     we do not recognise would silently narrow the bundle, which no reader can
     detect).
 
-    Raised by the CCF session, whose read-side guard was accepting the fused
+    Raised by a peer implementation, whose read-side guard was accepting the fused
     shape until e28abd0; their END matcher used ``indexOf``, so trailing
     content on the marker line passed.
 
@@ -651,7 +656,7 @@ def _write_bundle_atomically(bundle: Path, body: bytes) -> None:
     A BEGIN/END balance check does not cover this. Truncate just after an END
     marker and the file is BALANCED with a corrupt base64 payload inside; that
     shape passes the count and still costs the session all its trust.
-    (Measured by the CCF session against their read-side guard, which now
+    (Measured by a peer implementation against their read-side guard, which now
     rejects it — but a reader's guard is a backstop, and the cause is here.)
 
     ``os.replace`` is atomic on POSIX and Windows, so a reader sees either the
@@ -721,7 +726,7 @@ def _find_end(body: bytes, label: bytes, start: int, limit: int) -> int:
     files leaves CRLF, openssl loads those happily, and refusing them is the
     false reject that costs every sibling component its trust.
 
-    The sibling CCF implementation reached this from the other side — their END
+    A sibling implementation reached this from the other side — their END
     matcher used `indexOf`, so trailing content passed, fixed in e28abd0.
     """
     needle = b"-----END " + label + b"-----"
@@ -848,7 +853,7 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
     # it can carry --use-openssl-ca and friends, so the child would consult a
     # different trust store than the one under test.
     #
-    # Raised by the CCF session, whose probe had the mirror-image gap: they
+    # Raised by a peer implementation, whose probe had the mirror-image gap: they
     # cleared these two and not the proxy family.
     env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
     for leak in ("NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS"):
@@ -1100,7 +1105,7 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
 
     Where it cannot tell, it REFUSES. Refusing costs one session's sibling
     CAs; accepting costs the session entirely. See
-    cnighswonger/claude-code-cache-fix#296, which measured this same guard
+    a peer implementation, which measured this same guard
     wrong in both directions in the sibling implementation.
     """
     import base64
@@ -1227,11 +1232,10 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             #
             # This comment previously read "2 certs on one and 132 on another".
             # The 132 was right for this host; the 2 was the COMPONENT COUNT
-            # (ca-trust.d holds ccf.pem and cswap-pin.pem, one certificate
+            # (ca-trust.d holds one PEM per component, one certificate
             # each), not a bundle size — two different quantities reported as
             # one measurement. The real spread, measured on all three by the
-            # CCF session after this claim was quoted at them: host-a 132,
-            # work-mac 168, personal-mac 5. The conclusion survives and is in
+            # peer after this claim was quoted at them. The conclusion survives and is in
             # fact stronger, but it was not supported by the numbers cited.
             #
             # NOTE what this rules out and what it does not. It rules out an
@@ -1359,7 +1363,7 @@ def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
     the same host, and each new one repeats the fight — which is how a pinned
     session ended up verifying everything it SENDS while every Remote Control
     SSE reconnect failed with ``unable to verify the first certificate``
-    (measured on work-mac: 13 attempts, 0 connects, while worker/heartbeat and
+    (measured: 13 attempts, 0 connects, while worker/heartbeat and
     client/presence answered 200 in the same process).
 
     So publish instead of overwrite: one file per component under
@@ -1433,7 +1437,7 @@ def heal(backup_root: Path) -> bool:
     to a launch: ``ensure_proxy`` runs when a NEW session starts, so if the
     daemon dies while sessions are up, nothing brings it back — and if the dead
     wiring has blocked every session, no new one can start to trigger it. That
-    is a deadlock, and it is exactly what happened on work-mac: a human had to
+    is a deadlock, and it is exactly what was measured: a human had to
     re-pin by hand.
 
     So this needs no switcher: the pinned identity comes from settings.json and
@@ -1647,7 +1651,7 @@ def unwire_if_dead(certdir: Path) -> bool:
 
     The teardown path restores ``.claude.json`` itself, but it only runs when
     the daemon exits in an orderly way. A SIGKILL, an OOM kill, a crash — or a
-    daemon that never started at all, which is what happened on work-mac when
+    daemon that never started at all, which is what was measured when
     ``cryptography`` vanished from its environment — leaves the env block
     naming a port nothing listens on. Claude Code applies that block at boot,
     so every session from then on dials a dead proxy and retries forever while
@@ -1881,6 +1885,33 @@ def _mode_of(path: Path, default: int) -> int:
         return default
 
 
+def _ambient_chain(
+    env: dict[str, str] | None = None, certdir: Path | None = None
+) -> "tuple[str | None, str | None]":
+    """``(hop, next_hop)`` as this launch can see them.
+
+    When a launch prefers a recorded inner proxy over the one its own shell
+    exports, the shell's value is not noise — it is the hop the inner one
+    chains THROUGH, observed directly. Discarding it left the record
+    single-hop, and a single-hop chain falls to a direct dial the moment its
+    one hop blinks. Returning both is what lets the walk step past a dead
+    inner proxy to the outer one.
+    """
+    src = os.environ if env is None else env
+    shell_value = src.get("HTTPS_PROXY") or src.get("https_proxy")
+    hop = _ambient_proxy(env, certdir)
+    shell_parsed = parse_upstream_proxy(shell_value)
+    hop_parsed = parse_upstream_proxy(hop)
+    if (
+        shell_parsed is None
+        or hop_parsed is None
+        or shell_parsed.address == hop_parsed.address
+        or shell_parsed.port == _self_port(src)
+    ):
+        return hop, None
+    return hop, shell_value
+
+
 def _ambient_proxy(
     env: dict[str, str] | None = None, certdir: Path | None = None
 ) -> str | None:
@@ -1903,19 +1934,19 @@ def _ambient_proxy(
     if parsed.host in _LOOPBACK and parsed.port == _self_port(src):
         return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
-    # behind. A launcher (cc-wrapper) starts a per-session cache proxy and
+    # behind. A launcher may start a per-session cache proxy and
     # points HTTPS_PROXY at THAT; an ordinary shell, and every ssh shell, only
     # has the machine-wide egress proxy the launcher itself chains to. Taking
     # the shell's value then silently drops the launcher's proxy out of the
-    # chain: measured on work-mac, where `cswap pin` run over ssh recorded
-    # privoxy:8118 while CCF on :9901 (whose own upstream IS 8118) was left
-    # bypassed for every pinned session. Prefer the recorded one when it is
+    # chain: Measured: where `cswap pin` run over ssh recorded
+    # the machine-wide proxy while the per-session cache proxy (whose own
+    # upstream IS that same proxy) was left bypassed for every pinned session. Prefer the recorded one when it is
     # still serving — it is the inner link, and it reaches this one anyway.
     # Two places can name the inner proxy: what our env block displaced on a
     # previous launch, and what a previous launch recorded as the chain. Try
     # the displaced value first — it is the most direct evidence — then the
     # recorded one, which is the only source on a machine where our block has
-    # never displaced anything (measured: work-mac, where every shell exports
+    # never displaced anything (measured on a host where every shell exports
     # the machine-wide proxy, so the displaced value is empty and re-pinning
     # from any shell kept dropping the launcher's proxy out of the chain).
     for prev in (_wired_over_proxy(), _recorded_upstream(certdir)):
@@ -2293,7 +2324,7 @@ class CertBundle:
 
 
 # 100 years — the proxy's certs are ephemeral local trust; a long life avoids
-# spurious expiry mid-session and matches CCF's 10-year leaf.
+# spurious expiry mid-session and matches the 10-year leaf a sibling proxy issues.
 _CERT_DAYS = 3650
 
 
@@ -2455,7 +2486,7 @@ def _make_ca() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
         .add_extension(
             # OpenSSL 3 (Python 3.14's ssl, Node) rejects a signing CA that
             # lacks keyCertSign — "CA cert does not include key usage
-            # extension". CCF's openssl-generated CA happened to carry it;
+            # extension". an openssl-generated CA happened to carry it;
             # be explicit.
             x509.KeyUsage(
                 digital_signature=False,
@@ -2937,12 +2968,18 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     # launch is the only moment that question has a trustworthy answer, and it
     # is what lets a dead hop fall through to the next one instead of to a
     # direct dial (see ``_probe_next_hop``).
-    ambient = _ambient_proxy(certdir=certdir)
+    ambient, observed_next = _ambient_chain(certdir=certdir)
+    # Two independent sources for the hop BEHIND this one, and they fail in
+    # different conditions: the probe needs the inner hop to be answering,
+    # while the shell's own proxy is visible whether or not it is. Prefer the
+    # probe (it is what the hop reports about itself) and fall back to what
+    # this launch observed directly.
     write_upstream_hint(
         certdir,
         ambient,
         os.environ.get("NODE_EXTRA_CA_CERTS"),
-        next_hop=_probe_next_hop(ambient or _read_upstream(certdir, "proxy")),
+        next_hop=_probe_next_hop(ambient or _read_upstream(certdir, "proxy"))
+        or observed_next,
     )
     fp = daemon_fingerprint(account_num, email)
 
@@ -2969,7 +3006,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         return port, ca
 
     # Slow path: take an exclusive lock so concurrent launches elect ONE
-    # spawner (CCF's mkdir election). Re-check under the lock — another launch
+    # spawner (an mkdir election). Re-check under the lock — another launch
     # may have spawned while we waited.
     with _spawn_lock(certdir):
         port = _read_alive_port(certdir, fingerprint=fp)
@@ -3048,7 +3085,7 @@ def _spawn_lock(certdir: Path, name: str = ".spawn.lock"):
 def _kill_daemon(pid: int) -> None:
     """TERM a daemon, then escalate to KILL if it does not exit — so a daemon
     that ignores TERM (or hangs mid-teardown) never lingers as an orphan
-    holding a port. Mirrors CCF's recycle_supervisor bounded-wait-then-force.
+    holding a port. Mirrors a supervisor recycle: bounded wait, then force.
 
     THE TERM BUDGET IS DERIVED FROM THE DRAIN, NOT CHOSEN. A daemon answering
     TERM runs ``stop(drain=_DRAIN_SECONDS)``, so a fixed 2s wait here SIGKILLed
@@ -3171,7 +3208,7 @@ _LOG_MAX_BYTES = 64 * 1024
 
 def refcount_fifo_path(certdir: Path) -> Path:
     """Path of the refcount FIFO. Sessions hold a write fd on it; the daemon
-    reads it and exits when the last holder closes (CCF's FIFO refcount)."""
+    reads it and exits when the last holder closes (a FIFO refcount)."""
     return Path(certdir) / _FIFO_NAME
 
 
@@ -3459,7 +3496,7 @@ def watch_refcount(
     live_clients=None,
 ) -> None:
     """Block on ``fifo`` until every write-holder closes, then call
-    ``on_last_holder_gone``. This is exactly CCF's supervisor `cat FIFO`:
+    ``on_last_holder_gone``. This is a supervisor holding `cat FIFO`:
     a READ-ONLY open blocks until the first writer appears, and the subsequent
     read returns EOF (b"") only once all writer fds have closed. A read-only
     reader must NOT also hold a write end (that would mask EOF), which is why
@@ -3810,8 +3847,8 @@ def read_daemon_state(certdir: Path) -> dict | None:
 
 def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     """Identity of the daemon's CODE, so a redeploy of pin_proxy.py makes a
-    running daemon stale and the launcher recycles it — mirrors CCF's
-    fingerprint staleness (cachefix-ensure).
+    running daemon stale and the launcher recycles it — mirrors the fingerprint
+    staleness a sibling proxy's ensure step uses.
 
     The pinned account is deliberately NOT part of this. It is re-read per
     request (see :func:`make_pin_token_provider`), so re-pinning takes effect
@@ -4049,7 +4086,7 @@ def _watch_own_code(
     WHY THIS LIVES IN THE DAEMON. Every other entry point reacts to a LAUNCH:
     `ensure_proxy` recycles a stale daemon, but only when a new session starts.
     A machine whose sessions are all already running never launches, so an
-    upgrade never reaches the process. Measured on work-mac: a daemon served
+    upgrade never reaches the process. Measured: a daemon served
     for 22 hours on code that had been replaced 19 hours earlier, across six
     releases, dialling direct instead of chaining — every claude.ai handshake
     got the corporate MITM leaf and OAuth login was broken the whole time.
@@ -4121,7 +4158,7 @@ def _watch_own_code(
                 # listener FIRST and only then waits up to N seconds for
                 # in-flight requests, so the port sat unbound for the whole
                 # drain and every new connection was refused. Measured on
-                # host-a: 19:15:16 handing over -> 19:15:47 serving, 31 s, with
+                # a live daemon: handover at T, successor serving at T+31 s, with
                 # a peer's request dying inside it.
                 #
                 # Dropping the listener without draining lets the successor
@@ -4349,7 +4386,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             # came up while we were draining, or a supervisor holding the port
             # on our behalf. Unwiring then removes the config of a working pin,
             # and every session that dials during the gap gets
-            # ConnectionRefused. Measured on work-mac: unwire at 19:16:35, the
+            # ConnectionRefused. Measured: unwire at 19:16:35, the
             # successor serving at 19:16:36, and a live session retrying.
             #
             # The state-file arbitration above cannot see this: a successor
@@ -4365,8 +4402,8 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             # Put ``.claude.json`` back the way we found it. Without this the env
             # block keeps naming the port we just stopped serving, and Claude Code
             # applies that block at boot — so EVERY session started afterwards
-            # dials a dead proxy and retries forever, with privoxy and the cache
-            # proxy both healthy and unreachable behind it. Measured on work-mac:
+            # dials a dead proxy and retries forever, with every proxy behind it
+            # healthy and unreachable behind it. Measured:
             # "Unable to connect to API (ConnectionRefused), attempt 14/300", and
             # the only cure was a human re-pinning by hand.
             #
@@ -4619,6 +4656,18 @@ class PinProxy:
         if self._srv and self._inherited:
             # NOT OURS TO CLOSE — a supervisor holds this port precisely so it
             # keeps answering across our restarts.
+            #
+            # DETACH, do not just drop the reference. Dropping it hands the
+            # socket to CPython's finalizer, which closes the fd — measured:
+            # fd 3 gone with errno 9 and the supervisor's port refusing
+            # immediately afterwards, which is the exact outage this branch
+            # exists to prevent. ``detach`` gives up the object and leaves the
+            # descriptor open, the same way _inherited_listener refuses a bad
+            # fd without closing it.
+            try:
+                self._srv.detach()
+            except OSError:
+                pass
             self._srv = None
         elif self._srv:
             # SHUTDOWN BEFORE CLOSE. A thread blocked in ``accept()`` keeps the
@@ -4995,7 +5044,7 @@ class PinProxy:
                 k, v = h.split(":", 1)
                 parsed.append((k.strip(), v.strip()))
                 # Never forward OUR proxy credential onward. This path relays
-                # the client's headers verbatim to the chain (CCF, a corporate
+                # the client's headers verbatim to the chain (a cache proxy, a corporate
                 # proxy), which would hand them a working credential for the
                 # pinned account's proxy. It is hop-by-hop by definition
                 # (RFC 9110): it authenticates to THIS proxy and stops here.
@@ -5447,7 +5496,7 @@ class PinProxy:
         """The tunnel if it is actually carrying, None if it is already EOF.
 
         A CONNECT 200 means the proxy ACCEPTED the request, not that it reached
-        the host: privoxy answers optimistically and dials afterwards, closing
+        the host: a filtering proxy answers optimistically and dials afterwards, closing
         the socket when that dial fails. Look for a closed read end — no client
         byte has been sent yet, so a readable socket here can only mean EOF.
         Never blocks: a healthy idle tunnel has nothing to read and reports not
@@ -5493,12 +5542,12 @@ class PinProxy:
             # Try the chain first, but never let it be the only answer. Remote
             # Control RECEIVES over a WebSocket to the ingress host named in the
             # /bridge response — a host the egress proxy has no rule for, and
-            # which a filtering proxy (privoxy with per-domain forwards, a
+            # which a filtering proxy (one with per-domain forwards, a
             # corporate MITM) may refuse outright. Closing here made that
             # refusal invisible: the session kept heartbeating and posting
             # events through the MITM path at 200, the pin still read as
             # applied, and nothing sent from claude.ai ever arrived. Measured
-            # on work-mac, where the same session on a machine whose chain let
+            # where the same session on a machine whose chain let
             # the host through received normally.
             try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
@@ -5525,10 +5574,10 @@ class PinProxy:
             except OSError:
                 up = None
         if up is not None and (carrying := self._tunnel_is_open(up)) is None:
-            # A 200 is not proof the chain reached the host. privoxy answers
+            # A 200 is not proof the chain reached the host. a filtering proxy answers
             # CONNECT optimistically and only then dials; when that dial fails
             # it closes, so the tunnel is EOF the instant we look. Measured on
-            # work-mac against the RC ingress: "200 Connection established"
+            # against a remote-control ingress: "200 Connection established"
             # followed by UNEXPECTED_EOF_WHILE_READING on the first TLS byte.
             # Trusting the status alone made Remote Control silently deaf —
             # everything Claude Code SENDS still went through the MITM path at
