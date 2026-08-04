@@ -2715,6 +2715,15 @@ class TestTheDaemonWatchesItsOwnCode:
                             lambda *a, **k: next(fps))
 
         class _Srv:
+            # Mirrors the real split: the handover releases the port, spawns,
+            # and only then drains. A stub with just stop() no longer resembles
+            # the callee and would fail on the method the code actually calls.
+            def release_listener(self):
+                events.append(("stop", None))
+
+            def await_inflight(self, budget):
+                events.append(("drain", budget))
+
             def stop(self, drain=None):
                 events.append(("stop", drain))
 
@@ -2729,12 +2738,21 @@ class TestTheDaemonWatchesItsOwnCode:
             interval=0.01, _own_fingerprint="fp-old",
         )
 
-        assert ("stop", pin_proxy._DRAIN_SECONDS) in events, events
+        assert ("stop", None) in events, events
         assert ("spawn", "1") in events, events
+        assert ("drain", pin_proxy._DRAIN_SECONDS) in events, events
+        # THE DRAIN COMES AFTER THE SPAWN. Draining before it meant the port
+        # stayed unbound for the whole budget and every new connection was
+        # refused — measured at 31s on a live daemon. Releasing the listener
+        # first lets the successor bind at once; the requests still in flight
+        # here are finished afterwards, while the new daemon already accepts.
+        assert events.index(("spawn", "1")) < events.index(
+            ("drain", pin_proxy._DRAIN_SECONDS)
+        ), events
         # ORDER IS LOAD-BEARING: the port must be free before the successor
         # tries to bind it, and _spawn_daemon blocks until the successor is
         # serving. Spawning first would race two daemons for one port.
-        assert events.index(("stop", pin_proxy._DRAIN_SECONDS)) < events.index(
+        assert events.index(("stop", None)) < events.index(
             ("spawn", "1")), events
         # AND IT MUST NOT UNWIRE. The successor rebound the same port and owns
         # the wiring now; unwiring here would strip the config it just wrote
@@ -2757,6 +2775,15 @@ class TestTheDaemonWatchesItsOwnCode:
                             lambda n, e, c: events.append(("spawn", n)) or 1)
 
         class _Srv:
+            # Mirrors the real split: the handover releases the port, spawns,
+            # and only then drains. A stub with just stop() no longer resembles
+            # the callee and would fail on the method the code actually calls.
+            def release_listener(self):
+                events.append(("stop", None))
+
+            def await_inflight(self, budget):
+                events.append(("drain", budget))
+
             def stop(self, drain=None):
                 events.append(("stop", drain))
 
@@ -2799,6 +2826,15 @@ class TestTheDaemonWatchesItsOwnCode:
                             lambda srv: events.append(("resume", True)) or True)
 
         class _Srv:
+            # Mirrors the real split: the handover releases the port, spawns,
+            # and only then drains. A stub with just stop() no longer resembles
+            # the callee and would fail on the method the code actually calls.
+            def release_listener(self):
+                events.append(("stop", None))
+
+            def await_inflight(self, budget):
+                events.append(("drain", budget))
+
             def stop(self, drain=None):
                 events.append(("stop", drain))
 
@@ -2835,6 +2871,15 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "_resume_serving", lambda srv: False)
 
         class _Srv:
+            # Mirrors the real split: the handover releases the port, spawns,
+            # and only then drains. A stub with just stop() no longer resembles
+            # the callee and would fail on the method the code actually calls.
+            def release_listener(self):
+                events.append(("stop", None))
+
+            def await_inflight(self, budget):
+                events.append(("drain", budget))
+
             def stop(self, drain=None):
                 events.append(("stop", drain))
 
@@ -2978,6 +3023,15 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", _boom)
 
         class _Srv:
+            # Mirrors the real split: the handover releases the port, spawns,
+            # and only then drains. A stub with just stop() no longer resembles
+            # the callee and would fail on the method the code actually calls.
+            def release_listener(self):
+                events.append(("stop", None))
+
+            def await_inflight(self, budget):
+                events.append(("drain", budget))
+
             def stop(self, drain=None):
                 events.append(("stop", drain))
 
@@ -3029,6 +3083,13 @@ class TestTheDaemonWatchesItsOwnCode:
         stopped = []
 
         class _Srv:
+            # Same split as the real server: release, spawn, then drain.
+            def release_listener(self):
+                stopped.append(None)
+
+            def await_inflight(self, budget):
+                pass
+
             def stop(self, drain=None):
                 stopped.append(drain)
 
@@ -3124,6 +3185,13 @@ class TestTheDaemonWatchesItsOwnCode:
         handover_done = threading.Event()
 
         class _Srv:
+            # Same split as the real server: release, spawn, then drain.
+            def release_listener(self):
+                pass
+
+            def await_inflight(self, budget):
+                pass
+
             def stop(self, drain=None):
                 pass
 
