@@ -1654,6 +1654,86 @@ class TestDaemonPortStability:
         finally:
             proxy.stop()
 
+    def test_a_supervisor_held_port_survives_our_stop(self, tmp_path):
+        """When something else owns the port, losing it stops being possible.
+
+        Reclaiming the recorded port recovers from a restart; a held port
+        removes the window entirely, because the socket was never ours to
+        close. Both must work — a machine without a supervisor still relies on
+        the reclaim above.
+        """
+        import os
+        import socket
+
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        lsn = socket.socket()
+        lsn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(8)
+        port = lsn.getsockname()[1]
+        os.dup2(lsn.fileno(), 3)
+        os.environ["LISTEN_FDS"] = "1"
+        os.environ["LISTEN_PID"] = str(os.getpid())
+        try:
+            proxy = PinProxy(tmp_path, lambda: "tok")
+            proxy.start()
+            assert proxy.port == port, "did not serve the port it was handed"
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+            proxy.stop(drain=0)
+            # THE POINT: our stop must not take the port with it.
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        finally:
+            os.environ.pop("LISTEN_FDS", None)
+            os.environ.pop("LISTEN_PID", None)
+            lsn.close()
+
+    def test_a_passed_fd_that_is_not_a_listener_is_refused(self, tmp_path):
+        """A wrong fd must send us back to binding our own port, not down.
+
+        LISTEN_FDS/LISTEN_PID are inherited by every descendant, so a
+        grandchild trusting the count alone serves on whatever its fd 3
+        happens to be — a log file, a pipe — and the port goes unserved with
+        no error. Each refusal below leaves the daemon able to bind for
+        itself.
+        """
+        import os
+        import socket
+        import tempfile
+
+        from cswap_pin import proxy as pin_proxy
+
+        me = str(os.getpid())
+        # Addressed to somebody else.
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(1)
+        os.dup2(lsn.fileno(), 3)
+        os.environ["LISTEN_FDS"] = "1"
+        try:
+            os.environ["LISTEN_PID"] = str(os.getpid() + 1)
+            assert pin_proxy._inherited_listener() is None, "adopted another pid's fd"
+
+            os.environ["LISTEN_PID"] = me
+            # A regular file on fd 3.
+            f = tempfile.NamedTemporaryFile(delete=False)
+            os.dup2(f.fileno(), 3)
+            assert pin_proxy._inherited_listener() is None, "adopted a plain file"
+            f.close()
+            os.unlink(f.name)
+
+            # A socket that was never listened on.
+            s2 = socket.socket()
+            s2.bind(("127.0.0.1", 0))
+            os.dup2(s2.fileno(), 3)
+            assert pin_proxy._inherited_listener() is None, "adopted a non-listener"
+            s2.close()
+        finally:
+            os.environ.pop("LISTEN_FDS", None)
+            os.environ.pop("LISTEN_PID", None)
+            lsn.close()
+
     def test_falls_back_to_a_free_port_when_recorded_one_is_taken(self, tmp_path):
         import socket
         from cswap_pin.proxy import PinProxy, ensure_ca, write_daemon_state

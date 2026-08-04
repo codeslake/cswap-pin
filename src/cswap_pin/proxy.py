@@ -4165,6 +4165,48 @@ def _watch_own_code(
                 done.set()
 
 
+def _inherited_listener() -> "socket.socket | None":
+    """The listening socket a supervisor handed us, or None to bind our own.
+
+    The systemd socket-activation convention: ``LISTEN_FDS`` counts the fds
+    passed starting at 3, and ``LISTEN_PID`` names who they were passed TO.
+
+    LISTEN_PID is not optional. The variables are inherited by every
+    descendant, so a grandchild that trusts ``LISTEN_FDS`` alone serves on
+    whatever its own fd 3 happens to be — a log file, a pipe, another
+    process's socket — and the port goes unserved with no error anywhere.
+
+    Anything not a listening TCP socket is refused rather than adopted, and
+    refusing means we bind our own port: a supervisor that passed us the wrong
+    thing must not be able to take the pin down with it.
+    """
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return None
+    try:
+        count = int(os.environ.get("LISTEN_FDS", "0"))
+    except ValueError:
+        return None
+    if count < 1:
+        return None
+    try:
+        sock = socket.socket(fileno=3)
+    except OSError:
+        return None
+    try:
+        if sock.type != socket.SOCK_STREAM:
+            raise OSError("not a stream socket")
+        # getsockname() answers on a bound socket; accept() would block, so the
+        # listening state is proven by asking the socket itself.
+        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+            raise OSError("not listening")
+        sock.getsockname()
+    except OSError as exc:
+        _log_lifecycle(f"ignoring the passed fd 3: {exc}")
+        sock.detach()  # not ours — leave the fd as the supervisor left it
+        return None
+    return sock
+
+
 def _resume_serving(server) -> bool:
     """Put a stopped server back on its own port. True if it is listening again.
 
@@ -4441,6 +4483,9 @@ class PinProxy:
         # request still ends in RST without this.
         self._open_conns: set = set()
         self._stop = False
+        # True when a supervisor handed us the listening socket. Then the port
+        # is not ours to close — see start() and stop().
+        self._inherited = False
         self.port = 0
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
         # request (method, path, whether it matched a pinned route and was
@@ -4449,6 +4494,23 @@ class PinProxy:
         self._debug = open(debug_path, "a") if debug_path else None
 
     def start(self) -> None:
+        inherited = _inherited_listener()
+        if inherited is not None:
+            # A SUPERVISOR OWNS THE PORT. It bound the socket before we existed
+            # and will hold it after we exit, so the port answers whether this
+            # process is starting, restarting, hung, or gone — the failure mode
+            # a same-port reclaim can only recover from, never prevent.
+            #
+            # This is the systemd socket-activation convention (LISTEN_FDS /
+            # LISTEN_PID, first fd = 3), not an agreement with any particular
+            # supervisor: anything implementing it can hold our port, and we
+            # name none of them.
+            self._srv = inherited
+            self._inherited = True
+            self.port = self._srv.getsockname()[1]
+            threading.Thread(target=self._accept_loop, daemon=True).start()
+            return
+        self._inherited = False
         self._srv = socket.socket()
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Reclaim the port a previous daemon recorded, when it is free. A
@@ -4510,7 +4572,14 @@ class PinProxy:
         — completes.
         """
         self._stop = True
-        if self._srv:
+        if self._srv and self._inherited:
+            # NOT OURS TO CLOSE. The supervisor holds this port so that it keeps
+            # answering across our restarts; closing it here would hand back the
+            # exact gap the arrangement exists to remove. Setting ``_stop`` is
+            # enough — the accept loop ends on its own and the supervisor serves
+            # whatever arrives meanwhile.
+            self._srv = None
+        elif self._srv:
             # SHUTDOWN BEFORE CLOSE, and the order is the whole point. A thread
             # blocked in `accept()` keeps the listening socket alive across a
             # bare `close()`: measured, the port stayed `Address already in
@@ -4559,11 +4628,26 @@ class PinProxy:
     # -- internals ----------------------------------------------------------
 
     def _accept_loop(self) -> None:
+        # Hold the socket, not the attribute: stop() clears ``_srv`` when a
+        # supervisor owns the port (closing it there would drop the port), and
+        # reading the attribute each pass would then raise AttributeError in a
+        # daemon thread instead of ending the loop.
+        srv = self._srv
+        # A bounded wait so ``_stop`` is noticed without needing the listener
+        # closed underneath us — which is the only wake-up available when the
+        # socket is not ours to close.
+        srv.settimeout(0.5)
         while not self._stop:
             try:
-                conn, _ = self._srv.accept()
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
+            # A timeout on the LISTENER is inherited by every socket it
+            # accepts, which would then cut a quiet-but-healthy stream. The
+            # wait above is about noticing shutdown, not about the client.
+            conn.settimeout(None)
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
