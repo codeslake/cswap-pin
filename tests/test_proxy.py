@@ -3042,10 +3042,14 @@ class TestTheDaemonWatchesItsOwnCode:
         from cswap_pin import proxy as pin_proxy
 
         events = []
-        fps = iter(["fp-old", "fp-new", "fp-new"])
+        # The code on disk stays NEW for the whole run: a handover that fails
+        # leaves the reason for handing over still true, which is what makes
+        # "does it try again" an observable question.
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
-                            lambda *a, **k: next(fps))
-        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c, **k: None)
+                            lambda *a, **k: "fp-new")
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon",
+            lambda n, e, c, **k: events.append(("spawn", n)) and None)
         monkeypatch.setattr(pin_proxy, "_resume_serving",
                             lambda srv: events.append(("resume", True)) or True)
 
@@ -3053,6 +3057,9 @@ class TestTheDaemonWatchesItsOwnCode:
 
         certdir = self._certdir(tmp_path)
         done = threading.Event()
+        # Ends the run from the outside, exactly as a normal teardown does, so
+        # a watchdog that correctly keeps retrying still terminates the test.
+        threading.Timer(1.0, done.set).start()
         pin_proxy._watch_own_code(
             _Srv(), "1", "a@example.com", certdir,
             done, teardown=lambda reason: events.append(("teardown", reason)),
@@ -3063,6 +3070,22 @@ class TestTheDaemonWatchesItsOwnCode:
         assert not [e for e in events if e[0] == "teardown"], (
             "the daemon resumed serving, so nothing should have unwired", events)
         assert not done.is_set(), "a resumed daemon must keep running"
+        # AND IT MUST KEEP WATCHING. A resume that returns leaves the process
+        # alive, serving, and permanently on the stale code — which is the
+        # 22-hour outage this whole class exists to end, reached one failed
+        # spawn later instead of by having no watchdog at all. The machine
+        # this watchdog is FOR is the one whose sessions never relaunch, so
+        # nothing else will ever try again.
+        assert len([e for e in events if e[0] == "spawn"]) > 1, (
+            f"the watchdog gave up after ONE failed spawn and returned — the "
+            f"daemon now serves the stale code forever: {events}"
+        )
+        # ...but bounded, not a spin. A peer measured a respawn loop at
+        # ~3.75/sec against a child that could never start.
+        assert len([e for e in events if e[0] == "spawn"]) <= 6, (
+            f"unbounded retry: {len([e for e in events if e[0] == 'spawn'])} "
+            f"spawns"
+        )
 
     def test_a_successor_that_never_comes_up_unwires_if_it_cannot_resume(
         self, tmp_path, monkeypatch
