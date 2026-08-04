@@ -4116,9 +4116,24 @@ def _watch_own_code(
                 # Another daemon may have recycled us while we queued.
                 if daemon_fingerprint() == own:
                     continue
-                server.stop(drain=_DRAIN_SECONDS)
+                # RELEASE THE PORT, THEN DRAIN — in that order, and with the
+                # successor started in between. `stop(drain=N)` closes the
+                # listener FIRST and only then waits up to N seconds for
+                # in-flight requests, so the port sat unbound for the whole
+                # drain and every new connection was refused. Measured on
+                # lmd42: 19:15:16 handing over -> 19:15:47 serving, 31 s, with
+                # a peer's request dying inside it.
+                #
+                # Dropping the listener without draining lets the successor
+                # bind immediately; the in-flight requests are still ours to
+                # finish, so the drain happens after, while the new daemon is
+                # already accepting. A supervisor-held port makes both moot —
+                # this is what the package does when it owns the socket itself.
+                server.release_listener()
                 stopped = True
-                if _spawn_daemon(account_num, email, certdir) is not None:
+                spawned = _spawn_daemon(account_num, email, certdir)
+                server.await_inflight(_DRAIN_SECONDS)
+                if spawned is not None:
                     _log_lifecycle("successor is serving — leaving the wiring to it")
                     handed_over = True
                     return
@@ -4585,6 +4600,56 @@ class PinProxy:
         self.port = self._srv.getsockname()[1]
         threading.Thread(target=self._accept_loop, daemon=True).start()
 
+    def release_listener(self) -> None:
+        """Stop accepting and free the port, leaving open connections alone.
+
+        The half of :meth:`stop` a handover needs FIRST. ``stop(drain=N)``
+        closes the listener and then waits N seconds before returning, so the
+        successor could not bind until the drain was over and the port was
+        unbound for all of it — measured at 31 s on a live box, with a peer's
+        request refused inside the window.
+
+        Splitting it lets the successor take the port immediately while the
+        requests already in flight here keep running; :meth:`await_inflight`
+        collects them afterwards.
+        """
+        self._stop = True
+        if self._srv and self._inherited:
+            # NOT OURS TO CLOSE — a supervisor holds this port precisely so it
+            # keeps answering across our restarts.
+            self._srv = None
+        elif self._srv:
+            # SHUTDOWN BEFORE CLOSE. A thread blocked in ``accept()`` keeps the
+            # listening socket alive across a bare ``close()``: measured, the
+            # port stayed "Address already in use" while ``fileno()`` was
+            # already -1, so the successor could not reclaim the recorded port
+            # and came up on a fresh one — stranding every session whose
+            # HTTPS_PROXY was fixed at exec.
+            try:
+                self._srv.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # never listened, or already down
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+            self._srv = None
+
+    def await_inflight(self, budget: float) -> None:
+        """Wait up to ``budget`` for open connections to finish, then cut them.
+
+        A CEILING, not a wait: zero clients returns at once. Kept separate from
+        releasing the port so a handover can do this while its successor is
+        already accepting.
+        """
+        if budget > 0:
+            deadline = time.monotonic() + budget
+            while time.monotonic() < deadline:
+                if self.live_client_count() == 0:
+                    break
+                time.sleep(0.05)
+        self._close_open_connections()
+
     def stop(self, drain: float = 0.0) -> None:
         """Stop accepting, and optionally let in-flight requests FINISH.
 
@@ -4606,48 +4671,20 @@ class PinProxy:
         the budget exists so that the normal case — a few seconds of streaming
         — completes.
         """
-        self._stop = True
-        if self._srv and self._inherited:
-            # NOT OURS TO CLOSE. The supervisor holds this port so that it keeps
-            # answering across our restarts; closing it here would hand back the
-            # exact gap the arrangement exists to remove. Setting ``_stop`` is
-            # enough — the accept loop ends on its own and the supervisor serves
-            # whatever arrives meanwhile.
-            self._srv = None
-        elif self._srv:
-            # SHUTDOWN BEFORE CLOSE, and the order is the whole point. A thread
-            # blocked in `accept()` keeps the listening socket alive across a
-            # bare `close()`: measured, the port stayed `Address already in
-            # use` afterwards and `_srv.fileno()` was already -1, so the socket
-            # looked shut while the kernel still held the address.
-            #
-            # That is not a tidiness problem. The next daemon then cannot
-            # reclaim the recorded port, comes up on a fresh one, and every
-            # session whose HTTPS_PROXY was fixed at exec is left dialling a
-            # dead address — which is exactly how Remote Control goes deaf:
-            # claude.ai sends, and the CLI is listening at a port nobody
-            # serves. `shutdown()` wakes the accept and releases the address.
-            try:
-                self._srv.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass  # never listened, or already down
-            try:
-                self._srv.close()
-            except OSError:
-                pass
-        if drain > 0:
-            deadline = time.monotonic() + drain
-            while time.monotonic() < deadline:
-                if self.live_client_count() == 0:
-                    break
-                time.sleep(0.05)
-        # CLOSE THEM. Draining alone is not enough and the difference is not
-        # subtle: measured, a request that had transferred every one of its
-        # bytes STILL reached the client as ConnectionResetError, because the
-        # teardown path ends in os._exit(0) and a process exiting without
-        # closing its sockets makes the kernel answer with RST instead of FIN.
-        # The data had arrived; the client threw it away over the reset. One
-        # shutdown(SHUT_WR) per connection turns that into a clean EOF.
+        self.release_listener()
+        self.await_inflight(drain)
+
+    def _close_open_connections(self) -> None:
+        """Close every open connection, write end first.
+
+        Draining alone is not enough and the difference is not subtle:
+        measured, a request that had transferred every one of its bytes STILL
+        reached the client as ConnectionResetError, because the teardown path
+        ends in ``os._exit(0)`` and a process exiting without closing its
+        sockets makes the kernel answer with RST instead of FIN. The data had
+        arrived; the client threw it away over the reset. One
+        ``shutdown(SHUT_WR)`` per connection turns that into a clean EOF.
+        """
         with self._live_lock:
             conns, self._open_conns = list(self._open_conns), set()
         for conn in conns:
