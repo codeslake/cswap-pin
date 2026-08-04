@@ -4207,6 +4207,22 @@ def _inherited_listener() -> "socket.socket | None":
     return sock
 
 
+def _port_answers(port: int, timeout: float = 0.5) -> bool:
+    """Whether something accepts on ``port`` right now, on loopback.
+
+    A connect, not a request: the question is whether a session dialling this
+    address would be refused, and that is answered by the accept alone. Kept
+    short because it runs on a teardown path — a pin must never make an exit
+    slow — and treated as "nobody" on any error, since a port we cannot reach
+    is one a session cannot reach either.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _resume_serving(server) -> bool:
     """Put a stopped server back on its own port. True if it is listening again.
 
@@ -4311,6 +4327,25 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
                 # A successor owns the state now. Unwiring here would strip the
                 # config it just wrote and send every new session to no proxy
                 # at all, so the departing daemon leaves the wiring alone.
+                return
+            # ASK THE PORT, DO NOT INFER FROM A FILE. Our own listener is
+            # already closed by the drain above, so anything still answering
+            # the wired address is SOMEBODY ELSE serving it — a successor that
+            # came up while we were draining, or a supervisor holding the port
+            # on our behalf. Unwiring then removes the config of a working pin,
+            # and every session that dials during the gap gets
+            # ConnectionRefused. Measured on work-mac: unwire at 19:16:35, the
+            # successor serving at 19:16:36, and a live session retrying.
+            #
+            # The state-file arbitration above cannot see this: a successor
+            # publishes its record and rewires only once it is serving, so
+            # between our decision and its publication the files say we are
+            # alone while the port says otherwise.
+            live = _wired_port()
+            if live is not None and _port_answers(live):
+                _log_lifecycle(
+                    f"port {live} is still served — leaving the wiring alone"
+                )
                 return
             # Put ``.claude.json`` back the way we found it. Without this the env
             # block keeps naming the port we just stopped serving, and Claude Code
