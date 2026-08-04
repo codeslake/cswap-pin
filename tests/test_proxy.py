@@ -4499,6 +4499,13 @@ class TestTheCryptographyFloorIsLoadBearing:
 
         Simulated by removing the attribute from the class, which is what an
         older cryptography actually looks like to this code.
+
+        Both classes must lose it. Below 46 ``x509.Certificate`` is a Python
+        ABC and the object a load actually returns is the Rust class, so
+        stripping only the ABC leaves the attribute access working while the
+        guard's ``hasattr`` reports it gone — the function then returns False
+        where production would raise. From 46 the two names are one class and
+        the set collapses to a single ``delattr``.
         """
         from cswap_pin import proxy
 
@@ -4509,7 +4516,9 @@ class TestTheCryptographyFloorIsLoadBearing:
             "api.anthropic.com",
         ), "fixture is not consistent to begin with"
 
-        monkeypatch.delattr(x509.Certificate, "not_valid_after_utc", raising=False)
+        loaded = x509.load_pem_x509_certificate(ca.read_bytes())
+        for klass in {x509.Certificate, type(loaded)}:
+            monkeypatch.delattr(klass, "not_valid_after_utc", raising=False)
         with pytest.raises(AttributeError):
             proxy._certs_consistent(
                 ca, tmp_path / "ca.key", tmp_path / "leaf.pem", tmp_path / "leaf.key",
