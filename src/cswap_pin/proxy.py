@@ -4144,15 +4144,20 @@ def _watch_own_code(
                         "successor did not come up — resumed serving the old "
                         "code, still on the recorded port"
                     )
+                    # Clearing the flag is what keeps `done` unset below; a
+                    # `return` here would do the same but swallows any
+                    # in-flight exception, and Python 3.14 warns about it.
                     stopped = False
-                    return
-                # Could not get the listener back either. Now the config really
-                # does name a port nothing answers, so fall back.
-                _log_lifecycle("no successor and could not resume — unwiring")
-                try:
-                    teardown("failed handover")
-                except Exception as exc:  # noqa: BLE001
-                    _log_lifecycle(f"COULD NOT unwire after a failed handover: {exc!r}")
+                else:
+                    # Could not get the listener back either. Now the config
+                    # really does name a port nothing answers, so fall back.
+                    _log_lifecycle("no successor and could not resume — unwiring")
+                    try:
+                        teardown("failed handover")
+                    except Exception as exc:  # noqa: BLE001
+                        _log_lifecycle(
+                            f"COULD NOT unwire after a failed handover: {exc!r}"
+                        )
             if stopped:
                 # Either way this daemon is finished. `done` releases
                 # `daemon_main`'s `done.wait()`; leaving it unset is what made
