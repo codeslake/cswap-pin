@@ -2134,8 +2134,26 @@ def _wrap_upstream(ctx: ssl.SSLContext, sock, server_hostname: str):
     return ctx.wrap_socket(sock, server_hostname=server_hostname)
 
 
+# How long one HOP gets to accept and answer a CONNECT before it is treated as
+# unusable and the walk moves to the hop behind it.
+#
+# NOT the same number as the upstream dial budget, and the difference is the
+# point. A hop is on loopback and answers in well under a second (a real
+# chain: ~260ms median, ~300ms worst for a hop that dials out itself, 0ms for
+# a caching one). The upstream is across the internet and needs seconds.
+#
+# The budget matters because a hop can ACCEPT AND NEVER ANSWER — a process
+# stopped by a signal, a listener bound before its logic is ready. Nothing
+# raises, so only a deadline moves the walk on to the next hop; on the
+# upstream's 15s that costs every request 15s and reads as a hang. 2s is
+# ~7x the slowest healthy CONNECT, so a real hop is never cut.
+_HOP_CONNECT_BUDGET_S = 2.0
+
+
 def _dial_chain(
-    chain: "_Chain", timeout: float = 15, extra_ca: "Path | None" = None
+    chain: "_Chain",
+    timeout: float = _HOP_CONNECT_BUDGET_S,
+    extra_ca: "Path | None" = None,
 ) -> socket.socket:
     """Connect to the egress proxy, wrapping in TLS when the URL said https.
 
@@ -5108,12 +5126,11 @@ class PinProxy:
         """
         for chain in self._chain_candidates():
             # A HOP THAT REFUSES AND A HOP THAT WILL NOT DIAL ARE ONE EVENT.
-            # The two used to be handled apart: an OSError from the dial fell
-            # back, while a CONNECT the hop ACCEPTED and then answered non-200
-            # raised out of here uncaught — and a cache proxy that is
-            # RESTARTING is exactly that shape, listener up before its proxy
-            # logic is. Both mean "this hop is not usable", so both fall
-            # through to the hop behind it.
+            # A dial that raises OSError, a CONNECT answered non-200, and a
+            # hop that accepts and never answers all mean the same thing:
+            # this hop is not usable, so try the one behind it. A cache proxy
+            # that is RESTARTING produces the second and third shapes — its
+            # listener is up before its proxy logic is.
             try:
                 raw = _dial_chain(chain, extra_ca=self._chain_ca())
             except OSError:
