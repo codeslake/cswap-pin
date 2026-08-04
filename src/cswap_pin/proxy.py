@@ -4333,6 +4333,8 @@ class PinProxy:
         self._chain = chain_proxy
         self._rediscover_chain = rediscover_chain
         self._host = host
+        # Whether egress is currently bypassing the chain — see _note_egress.
+        self._egress_direct = False
         # The credential a client must present on CONNECT is re-read per
         # connection, not cached here — ``_current_secret``. Caching it made
         # the gate arm on the next RESPAWN rather than when the secret was
@@ -5155,10 +5157,31 @@ class PinProxy:
                     pass
                 continue
             raw.settimeout(None)
+            self._note_egress(direct=False)
             return raw, chain.host in _LOOPBACK
         sock = _dial_with_no_chain(self._upstream)
         sock.settimeout(None)
+        self._note_egress(direct=True)
         return sock, False  # direct dial: verification stays on
+
+    def _note_egress(self, *, direct: bool) -> None:
+        """Log egress path changes; silence means the chain is carrying.
+
+        A launch must never be blocked, so no hop reachable degrades to a
+        direct dial rather than failing. That downgrade is invisible from the
+        outside: requests keep succeeding and the session looks pinned, while
+        egress has left the path the user configured. On an inspecting network
+        the two are not equivalent — a direct dial there terminates at the
+        middlebox. Log the transition, not the state, so a chain that is
+        simply working costs nothing per connection.
+        """
+        if direct == self._egress_direct:
+            return
+        self._egress_direct = direct
+        _log_lifecycle(
+            "egress DIRECT — no chain hop reachable, bypassing the configured "
+            "proxy chain" if direct else "egress restored to the proxy chain"
+        )
 
     def _chain_candidates(self) -> list[_Chain]:
         """The hops to try, in order. The re-read one first (it is the most
