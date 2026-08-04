@@ -3101,6 +3101,16 @@ def _kill_daemon(pid: int) -> None:
     """
     import time
 
+    # A PID, NOT A GROUP. In ``kill(2)`` a pid of 0 addresses the CALLER'S OWN
+    # process group and a negative pid addresses the group named by its
+    # absolute value — so a derived-but-wrong 0 arriving here does not fail,
+    # it SIGTERMs this daemon and whatever spawned it. Every caller today
+    # derives its pid from ``ps`` output and cannot produce one, but that is a
+    # property of the CALLERS, and a guard that lives in each of them is one
+    # new call site away from being missed. A peer landed exactly here with
+    # SIGKILL and took down its own test runner.
+    if pid <= 0:
+        return
     try:
         os.kill(pid, 15)  # SIGTERM
     except OSError:
@@ -3866,6 +3876,23 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a process we could signal. Nothing else.
+
+    A PID MUST BE POSITIVE, and refusing the rest is the whole guard. In
+    ``kill(2)`` a pid of 0 addresses the CALLER'S OWN PROCESS GROUP and a
+    negative pid addresses the group named by its absolute value — so
+    ``os.kill(0, 0)`` is a permission check on ourselves that ALWAYS
+    succeeds, and this answered True for a process that cannot exist.
+
+    A peer hit the same primitive one signal number away: a pid parse that
+    yielded 0 turned ``kill(pid, SIGKILL)`` into ``kill(0, SIGKILL)`` and
+    SIGKILLed its own test runner. Here the kill sites are gated on
+    ``_pin_daemon_pids`` so 0 cannot reach one, which makes this a wrong
+    ANSWER rather than an outage — and a wrong answer a later caller would
+    inherit as a fact.
+    """
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -5650,7 +5677,8 @@ class PinProxy:
         while heartbeats (which answer at once) kept succeeding — so the
         session looked healthy and was silently deaf.
         """
-        for chain in self._chain_candidates():
+        candidates = self._chain_candidates()
+        for chain in candidates:
             # A HOP THAT REFUSES AND A HOP THAT WILL NOT DIAL ARE ONE EVENT.
             # A dial that raises OSError, a CONNECT answered non-200, and a
             # hop that accepts and never answers all mean the same thing:
@@ -5699,7 +5727,10 @@ class PinProxy:
             return raw, chain.host in _LOOPBACK
         sock = _dial_with_no_chain(self._upstream)
         sock.settimeout(None)
-        self._note_egress(direct=True)
+        # `candidates` is the whole difference between a host that HAS no
+        # chain and one whose chain would not answer. Empty means nothing was
+        # ever configured here, which is a normal machine, not a degraded one.
+        self._note_egress(direct=True, configured=bool(candidates))
         return sock, False  # direct dial: verification stays on
 
     def _note_hop_unusable(self, hop: "tuple[str, int]", why: str) -> None:
@@ -5721,7 +5752,13 @@ class PinProxy:
         self._hop_fault = state
         _log_lifecycle(f"hop {hop[0]}:{hop[1]} unusable — {why}")
 
-    def _note_egress(self, *, direct: bool, hop: "tuple[str, int] | None" = None) -> None:
+    def _note_egress(
+        self,
+        *,
+        direct: bool,
+        hop: "tuple[str, int] | None" = None,
+        configured: bool = True,
+    ) -> None:
         """Log egress path changes; silence means the path is unchanged.
 
         A launch must never be blocked, so no hop reachable degrades to a
@@ -5734,12 +5771,27 @@ class PinProxy:
         the first are indistinguishable in the log — an observer had to infer
         it afterwards from the TLS issuer. Record the transition only, so a
         steady chain still costs nothing per connection.
+
+        ``configured`` SEPARATES "NOTHING IS SET UP" FROM "NOTHING ANSWERED",
+        which used to be one sentence. On a host with no corporate proxy and
+        no cache proxy there is no chain to walk, so a direct dial is the only
+        thing a pin can do and it is the NORMAL path. Saying "no chain hop
+        reachable, bypassing the configured proxy chain" there is false twice
+        — nothing was unreachable, and there is no configured chain to bypass
+        — and it is the STEADY STATE on such a machine, so a reader seeing it
+        alone calls a healthy host degraded. The two need opposite responses:
+        one is "go look at your egress proxy", the other is "this is how this
+        machine is".
         """
         state = None if direct else hop
         if direct == self._egress_direct and state == self._egress_hop:
             return
         self._egress_direct, self._egress_hop = direct, state
-        if direct:
+        if direct and not configured:
+            _log_lifecycle(
+                "egress direct — no proxy chain is configured on this host"
+            )
+        elif direct:
             _log_lifecycle(
                 "egress DIRECT — no chain hop reachable, bypassing the "
                 "configured proxy chain"

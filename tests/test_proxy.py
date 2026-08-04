@@ -1800,6 +1800,62 @@ class TestDaemonPortStability:
             "which is luck, not the fix"
         )
 
+    def test_pid_zero_is_not_alive(self):
+        """0 is a legal argument to kill(2) and it does NOT mean a process.
+
+        ``os.kill(0, sig)`` addresses the CALLER'S OWN PROCESS GROUP, so
+        ``os.kill(0, 0)`` is a permission check that always succeeds and
+        ``_pid_alive(0)`` answered True — a liveness claim about a pid that
+        cannot exist. Measured: `python3 -c "import os; os.kill(0,0)"`
+        succeeds.
+
+        A peer hit the same primitive one signal number away and it was worse:
+        a pid parse that yielded 0 turned ``kill(pid, SIGKILL)`` into
+        ``kill(0, SIGKILL)``, which SIGKILLed its own test runner — every case
+        in the file reported as cancelled, including cases that never ran.
+
+        Here every KILL site is gated on membership in ``_pin_daemon_pids``
+        (parsed from ``ps``), so 0 cannot reach one, and both liveness callers
+        also require the port to answer. That is why this is a wrong ANSWER
+        rather than an outage — and why it is worth one line to stop a future
+        caller inheriting it as a fact.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        assert pin_proxy._pid_alive(0) is False, (
+            "pid 0 read as a live process — kill(0, 0) is a permission check "
+            "on our own process group, not evidence anything is running"
+        )
+        assert pin_proxy._pid_alive(-1) is False, (
+            "a negative pid names a process GROUP, never a process"
+        )
+        # THE CONTROL: a pid that really is alive must still read as alive,
+        # or the guard above is satisfied by a function that says False to
+        # everything.
+        assert pin_proxy._pid_alive(os.getpid()) is True, (
+            "our own pid did not read as alive — the check is now useless"
+        )
+
+        # AND THE FUNCTION THAT ACTUALLY SIGNALS must refuse it too. Today
+        # every caller derives its pid from `ps` output, so 0 cannot reach
+        # here — but that is a property of the CALLERS, and the caller is
+        # exactly where this class of bug keeps being fixed one site at a
+        # time. `kill(0, SIGKILL)` kills our own process group: this daemon,
+        # and on a spawn path the process that spawned it.
+        signalled = []
+        real_kill = os.kill
+        try:
+            os.kill = lambda p, s: signalled.append((p, s))
+            pin_proxy._kill_daemon(0)
+            pin_proxy._kill_daemon(-1)
+        finally:
+            os.kill = real_kill
+        assert signalled == [], (
+            f"_kill_daemon signalled {signalled} — a pid of 0 means OUR OWN "
+            f"process group and a negative pid means the group named by its "
+            f"absolute value; neither is a daemon"
+        )
+
     def test_a_spawn_without_a_handdown_does_not_pass_the_variables_on(
         self, tmp_path, monkeypatch
     ):

@@ -1450,6 +1450,78 @@ class TestChainRediscovery:
         finally:
             good.close()
 
+    def test_a_host_with_no_proxy_chain_is_not_reported_as_degraded(
+        self, certdir
+    ):
+        """"Nothing is configured" is not "nothing is reachable".
+
+        On a host with no corporate proxy — and no cache proxy either — there
+        is no chain to walk, so a direct dial is the ONLY thing a pin can do
+        and it is the NORMAL path, not a downgrade. The line said otherwise:
+        the same "no chain hop reachable, bypassing the configured proxy
+        chain" that a genuinely dead hop produces. On such a host that
+        sentence is the steady state and it is false twice over — nothing was
+        unreachable, and there is no configured chain to bypass. Anyone
+        reading it alone calls a healthy machine degraded.
+
+        The two must be distinguishable in the log, because they need
+        opposite responses: one is "go look at your egress proxy", the other
+        is "this is how this machine is".
+        """
+        import contextlib
+        import io
+
+        from cswap_pin import proxy as pin_proxy
+
+        # A reachable stand-in for the origin, so the direct dial COMPLETES
+        # and the line under test is actually emitted.
+        sink = socket.socket()
+        sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sink.bind(("127.0.0.1", 0))
+        sink.listen(4)
+        threading.Thread(
+            target=lambda: [sink.accept() for _ in iter(int, 1)], daemon=True
+        ).start()
+
+        def _egress_line(candidates):
+            relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+            relay._chain_candidates = lambda: candidates
+            relay._upstream = ("127.0.0.1", sink.getsockname()[1])
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                try:
+                    sock, _ = relay._connect_upstream()
+                    sock.close()
+                except OSError:
+                    pass
+            lines = [l for l in buf.getvalue().splitlines() if "egress" in l]
+            return lines[-1] if lines else ""
+
+        try:
+            dead = socket.socket()
+            dead.bind(("127.0.0.1", 0))
+            dead_port = dead.getsockname()[1]
+            dead.close()
+
+            unconfigured = _egress_line([])
+            degraded = _egress_line(
+                [pin_proxy._as_chain(("127.0.0.1", dead_port))]
+            )
+
+            assert unconfigured, "a direct dial said nothing at all"
+            assert degraded, "a dead hop said nothing at all"
+            assert unconfigured != degraded, (
+                f"a host with NO chain configured and a host whose chain is "
+                f"DEAD produced the same line — the first is normal and the "
+                f"second needs attention: {unconfigured!r}"
+            )
+            # And specifically: the normal case must not claim something was
+            # unreachable, or that a configured chain was bypassed.
+            assert "reachable" not in unconfigured, unconfigured
+            assert "bypass" not in unconfigured, unconfigured
+        finally:
+            sink.close()
+
     def test_the_log_separates_a_refused_hop_from_one_that_answered_wrong(
         self, certdir
     ):
