@@ -24,6 +24,40 @@ from cswap_pin.proxy import (
     parse_upstream_proxy,
 )
 
+# A REAL zero-serial root CA (GoDaddy Root Certificate Authority - G2),
+# extracted from this box's ambient `/etc/ssl/certs/ca-certificates.crt`.
+# Embedded rather than read from the ambient store so the guard tests below
+# do not depend on the host having one, or having a zero-serial cert in it.
+# `x509.load_pem_x509_certificate` on this block raises
+# `CryptographyDeprecationWarning` ("Parsed a serial number which wasn't
+# positive ... will cause an exception in a future release") under the
+# library's default filter, which every ambient `-W error` promotes to a
+# hard exception — the exact shape `_load_cert`'s guard exists to survive.
+ZERO_SERIAL_ROOT_PEM = b"""-----BEGIN CERTIFICATE-----
+MIIDxTCCAq2gAwIBAgIBADANBgkqhkiG9w0BAQsFADCBgzELMAkGA1UEBhMCVVMx
+EDAOBgNVBAgTB0FyaXpvbmExEzARBgNVBAcTClNjb3R0c2RhbGUxGjAYBgNVBAoT
+EUdvRGFkZHkuY29tLCBJbmMuMTEwLwYDVQQDEyhHbyBEYWRkeSBSb290IENlcnRp
+ZmljYXRlIEF1dGhvcml0eSAtIEcyMB4XDTA5MDkwMTAwMDAwMFoXDTM3MTIzMTIz
+NTk1OVowgYMxCzAJBgNVBAYTAlVTMRAwDgYDVQQIEwdBcml6b25hMRMwEQYDVQQH
+EwpTY290dHNkYWxlMRowGAYDVQQKExFHb0RhZGR5LmNvbSwgSW5jLjExMC8GA1UE
+AxMoR28gRGFkZHkgUm9vdCBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkgLSBHMjCCASIw
+DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAL9xYgjx+lk09xvJGKP3gElY6SKD
+E6bFIEMBO4Tx5oVJnyfq9oQbTqC023CYxzIBsQU+B07u9PpPL1kwIuerGVZr4oAH
+/PMWdYA5UXvl+TW2dE6pjYIT5LY/qQOD+qK+ihVqf94Lw7YZFAXK6sOoBJQ7Rnwy
+DfMAZiLIjWltNowRGLfTshxgtDj6AozO091GB94KPutdfMh8+7ArU6SSYmlRJQVh
+GkSBjCypQ5Yj36w6gZoOKcUcqeldHraenjAKOc7xiID7S13MMuyFYkMlNAJWJwGR
+tDtwKj9useiciAF9n9T521NtYJ2/LOdYq7hfRvzOxBsDPAnrSTFcaUaz4EcCAwEA
+AaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYE
+FDqahQcQZyi27/a9BUFuIMGU2g/eMA0GCSqGSIb3DQEBCwUAA4IBAQCZ21151fmX
+WWcDYfF+OwYxdS2hII5PZYe096acvNjpL9DbWu7PdIxztDhC2gV7+AJ1uP2lsdeu
+9tfeE8tTEH6KRtGX+rcuKxGrkLAngPnon1rpN5+r5N9ss4UXnT3ZJE95kTXWXwTr
+gIOrmgIttRD02JDHBHNA7XIloKmf7J6raBKZV8aPEjoJpL1E/QYVN8Gb5DKj7Tjo
+2GTzLH4U/ALqn83/B2gX2yKQOC16jdFU8WnjXzPKej17CuPKf1855eJ1usV2GDPO
+LPAvTK33sefOT6jEm0pUBsV/fdUID+Ic/n4XuKxe9tQWskMJDE32p2u0mYRlynqI
+4uJEvlz36hz1
+-----END CERTIFICATE-----
+"""
+
 
 @pytest.fixture(autouse=True)
 def _stdlib_ssl():
@@ -6251,38 +6285,44 @@ class TestTheUnMergeBranchReadsTheFileItReturns:
 
 
 class TestTheFilterKeepsBlocksAfterTheTearToo:
-    """`_drop_unreadable_blocks` stopped at the first damaged marker and threw
-    away everything after it.
+    """`_drop_unreadable_blocks` USED TO stop at the first damaged marker and
+    throw away everything after it.
 
     `_pem_blocks` ends its scan at the first damage — every damage arm is
     `yield ...; return` — so a plain comprehension over it never sees a block
     past the tear. `_salvage_bundle` handles that with a restart loop
     (`proxy.py:857-892`); the filter had no equivalent, while its docstring and
-    this file's own class docstring both claimed parity with it.
+    this file's own class docstring both claimed parity with it. Both are
+    routed through `_parseable_blocks` now, which resumes past damage — the
+    table below is what that resumption measures TODAY, not the pre-fix
+    numbers (four of its six rows were stale: `drop_unreadable` had drifted
+    back to describing the code this class exists to have already replaced).
 
     Measured on `/etc/ssl/certs/ca-certificates.crt`, this box's real ambient
-    store, 125 blocks, control first:
+    store, 125 blocks, CONTROL first. ``ours`` is a freshly minted cswap-pin
+    CA — never one of the ambient 125 — so `salvage` is `drop_unreadable`'s
+    count plus one (the unconditional append of `ours`) on every row:
 
         ambient store        drop_unreadable   salvage
-        CONTROL untouched          125           125
-        tear at idx 0                0           125
-        tear at idx 1                1           124
-        tear at idx 5                5           124
-        tear at idx 62              62           124
-        tear at idx 124            124           124
+        CONTROL untouched          125           126
+        tear at idx 0              124           125
+        tear at idx 1              124           125
+        tear at idx 5              124           125
+        tear at idx 62             124           125
+        tear at idx 124            124           125
 
-    One damaged block near the front of a corporate root bundle — an
-    interrupted `update-ca-certificates`, a partially synced store — and the
-    session is handed a file that LOADS CLEANLY carrying 6 roots instead of
-    125. Nothing downstream flags it: it is not torn, so `_bundle_is_usable`
-    says usable and the node oracle says True (our CA is at index 0, ahead of
-    everything lost).
+    BEFORE this fix, one damaged block near the front of a corporate root
+    bundle — an interrupted `update-ca-certificates`, a partially synced
+    store — handed the session a file that LOADED CLEANLY carrying five
+    roots instead of 125 (a tear at idx 5 kept only indices 0-4). Nothing
+    downstream flagged it: not torn, so `_bundle_is_usable` said usable and
+    the node oracle said True (our CA at index 0, ahead of everything lost).
 
     The old suite could not see this. Replacing the comprehension with the
-    restart loop — which takes the idx-5 row from 6 to 124 — killed ZERO tests,
-    because every emission test asserts `not _damaged(body)` and only the
-    healthy control asserts a block count. A filter that keeps one block and a
-    filter that keeps 124 are indistinguishable to `not _damaged`.
+    restart loop — which takes the idx-5 row from 5 to 124 — killed ZERO
+    tests, because every emission test asserts `not _damaged(body)` and only
+    the healthy control asserts a block count. A filter that keeps one block
+    and a filter that keeps 124 are indistinguishable to `not _damaged`.
     """
 
     def _store(self):
@@ -6326,3 +6366,354 @@ class TestTheFilterKeepsBlocksAfterTheTearToo:
         blocks = self._store()
 
         assert self._kept(b"".join(blocks)) == len(blocks), "a healthy store lost blocks"
+
+
+class TestLoadCertSurvivesAnAmbientErrorFilter:
+    """`_load_cert`'s `catch_warnings`/`simplefilter("ignore")` guard is the
+    fix 0.1.25 shipped for, and until this class existed the suite could not
+    detect its own removal: reverting `_load_cert` to 0.1.24's unguarded body
+    (drop the guard, keep the bare try/except) left the WHOLE SUITE green.
+
+    Detectable only under a filter that promotes the warning to an error —
+    nothing here promotes it globally (see `pyproject.toml`'s
+    `[tool.pytest.ini_options]`, which sets no `filterwarnings`), so each test
+    installs its OWN `-W error`-equivalent scope with `pytest.warns` /
+    `warnings.catch_warnings`, rather than a global config change that would
+    alter every other test's environment.
+    """
+
+    def test_a_zero_serial_cert_survives_under_an_error_filter(self):
+        """A LOADABLE certificate must not become a dropped one just because
+        the ambient filter promotes its own deprecation warning to an error.
+
+        `CryptographyDeprecationWarning` subclasses `UserWarning` ->
+        `Warning` -> `Exception`, so an unguarded `except Exception` catches
+        it as if the block were unparseable. It is not: openssl and python
+        `ssl` both accept a zero-serial root, and 0.1.25 exists to keep this
+        proxy accepting it too.
+        """
+        import warnings
+
+        from cswap_pin.proxy import _load_cert
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            cert = _load_cert(ZERO_SERIAL_ROOT_PEM)
+
+        assert cert is not None, (
+            "a loadable zero-serial certificate was dropped under an ambient "
+            "error filter — _load_cert's guard is gone or not working"
+        )
+
+    def test_unparseable_bytes_still_return_none_under_the_same_filter(self):
+        """CONTROL for the test above: the guard must not turn EVERY error
+        into a swallowed success. Garbage must still come back None."""
+        import warnings
+
+        from cswap_pin.proxy import _load_cert
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            cert = _load_cert(b"-----BEGIN CERTIFICATE-----\nnot a cert\n-----END CERTIFICATE-----\n")
+
+        assert cert is None, "garbage was accepted as a certificate"
+
+
+class TestCarriesUsesTheSameGuardAsEverySite:
+    """`_carries` raw-loads at both its `want` and its per-block sites instead
+    of going through `_load_cert` — the release note for b5fc87b says "both
+    x509 call sites use it: the filter's CERTIFICATE arm and `_carries`",
+    which is false; `_carries` still has its own bare
+    `except Exception: return False` at each load.
+
+    Exposure is real but narrow: `_make_ca` uses `x509.random_serial_number()`
+    (RFC 5280, never 0), so this cannot fire on a CA cswap-pin minted itself —
+    only on a `ca_path` a DIFFERENT MITM published into the shared trust dir.
+    A wrong `False` there costs a bundle rebuild, not lost trust. Still, it is
+    the same shared-vs-per-caller shape the ladder argues for: one guard in
+    `_load_cert` beats a guard duplicated at each raw-load site.
+    """
+
+    def test_a_zero_serial_want_is_still_found_under_an_error_filter(self, tmp_path):
+        """`want` (the CA `_carries` is asked to find) is zero-serial and
+        loadable — `_load_cert` would keep it. The raw `x509.load_pem_x509_
+        certificate` call at `_carries`'s `want` site does not, and drops it
+        under an ambient error filter: `want` becomes unreadable, so `_carries`
+        answers False for a CA that IS in the store."""
+        import warnings
+
+        from cswap_pin.proxy import _carries
+
+        ca_path = tmp_path / "want.pem"
+        ca_path.write_bytes(ZERO_SERIAL_ROOT_PEM)
+        # A single-block store containing exactly the cert we are looking for.
+        store_body = ZERO_SERIAL_ROOT_PEM
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            found = _carries(store_body, ca_path)
+
+        assert found, (
+            "_carries answered False for a zero-serial CA that IS in the "
+            "store — its raw x509 load dropped a certificate _load_cert "
+            "would have kept under the same ambient error filter"
+        )
+
+    def test_a_normal_ca_is_still_found_under_an_error_filter(self, tmp_path):
+        """CONTROL: an ordinary (non-zero-serial) CA must still be found
+        under the same filter, so the test above is not passing vacuously."""
+        import warnings
+
+        from cswap_pin.proxy import _carries, ensure_ca
+
+        ca_path = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        store_body = ca_path.read_bytes()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            found = _carries(store_body, ca_path)
+
+        assert found, "a normal CA was not found in a store that carries it"
+
+
+class TestLoadCertDoesNotRaceItself:
+    """`_load_cert`'s `warnings.catch_warnings()` snapshots and restores
+    process-global state (`warnings.filters`, `showwarning`,
+    `_showwarnmsg_impl`), reachable concurrently from the daemon's
+    `watch_refcount` thread and per-connection `_serve_client` threads.
+
+    Forced deterministically with `threading.Event` handshakes, not GIL
+    timing luck: thread B `__enter__`s first (snapshotting the ambient
+    error filter), waits for thread A to install ITS `simplefilter("ignore")`,
+    then `__exit__`s — restoring B's pre-ignore snapshot — before A's own
+    `load_pem_x509_certificate` call runs. That stomps A's active "ignore"
+    back to "error" between A's `simplefilter` and A's load, so a warning
+    that A's own guard was supposed to suppress fires as an exception inside
+    A's `try`, and A's certificate is dropped.
+    """
+
+    def test_a_concurrent_load_cannot_stomp_this_threads_ignore_filter(self):
+        import threading
+        import warnings
+
+        from cswap_pin import proxy
+
+        real_load = proxy.x509.load_pem_x509_certificate
+        # Two DISTINCT objects with identical content, so the wrapper below
+        # can tell which call site is which by identity (`is`), the way two
+        # different blocks parsed in the same scan would be distinct objects.
+        block_b = bytes(bytearray(ZERO_SERIAL_ROOT_PEM))
+        block_a = ZERO_SERIAL_ROOT_PEM
+
+        b_ready = threading.Event()
+        a_about_to_load = threading.Event()
+        b_finished = threading.Event()
+
+        def wrapped_load(data, backend=None):
+            if data is block_b:
+                b_ready.set()
+                a_about_to_load.wait(timeout=5)
+                return real_load(data)
+            if data is block_a:
+                a_about_to_load.set()
+                b_finished.wait(timeout=5)
+                return real_load(data)
+            return real_load(data)
+
+        result = {}
+
+        def thread_b():
+            result["b"] = proxy._load_cert(block_b)
+            b_finished.set()
+
+        def thread_a():
+            b_ready.wait(timeout=5)
+            result["a"] = proxy._load_cert(block_a)
+
+        proxy.x509.load_pem_x509_certificate = wrapped_load
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                tb = threading.Thread(target=thread_b)
+                ta = threading.Thread(target=thread_a)
+                tb.start()
+                ta.start()
+                tb.join(timeout=10)
+                ta.join(timeout=10)
+        finally:
+            proxy.x509.load_pem_x509_certificate = real_load
+
+        assert result.get("b") is not None, "fixture broken: B's own load should succeed"
+        assert result.get("a") is not None, (
+            "a concurrent _load_cert call stomped this thread's warning "
+            "filter between simplefilter('ignore') and the load — the "
+            "catch_warnings() guard is not safe under concurrent callers"
+        )
+
+
+class TestARefusedUnlinkDoesNotReportDisarmed:
+    """`apply_pin(email=None)` unlinks the proxy secret to disarm the gate,
+    then returns `False` unconditionally — the SAME `False` whether the
+    secret is now gone or the unlink was REFUSED (permission denied, a
+    read-only mount) and it is still sitting there, armed. A caller reading
+    `False` has no way to tell "disarmed" from "still armed, and I could not
+    tell you" — the shape every task in this release is about.
+
+    Absent (`FileNotFoundError`) and refused (any other `OSError`) are not
+    the same outcome and must not share a silent `pass`.
+    """
+
+    def test_a_refused_unlink_does_not_look_like_a_successful_disarm(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        pin_proxy.ensure_proxy_secret(certdir)
+        assert pin_proxy.read_proxy_secret(certdir) is not None
+
+        class _Sw:
+            backup_dir = tmp_path
+
+        monkeypatch.setattr(pin_proxy, "save_pin", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
+
+        real_unlink = Path.unlink
+
+        def refusing_unlink(self, *a, **k):
+            if self.name == pin_proxy._SECRET_FILE:
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(Path, "unlink", refusing_unlink)
+
+        raised = False
+        try:
+            pin_proxy.apply_pin(_Sw(), None, None)
+        except OSError:
+            raised = True
+
+        assert raised, (
+            "apply_pin swallowed a REFUSED unlink and returned normally — "
+            "the secret is still armed and nothing told the caller"
+        )
+        assert pin_proxy.read_proxy_secret(certdir) is not None, (
+            "fixture broken: the secret should still be there since the "
+            "unlink was refused"
+        )
+        # The absent-secret CONTROL is already covered by
+        # TestTheGateDisarmsWhenThePinIsCleared.test_clearing_without_a_secret_is_not_an_error.
+
+
+class TestAReleaseFailureDoesNotLookLikeSuccess:
+    """`_release_daemon_state` returns `False` both when it dropped
+    ``proxy.json`` (its own state, now gone) AND when the unlink was
+    REFUSED — same value, opposite facts. A refused delete leaves a state
+    file naming a DEAD pid, and the next daemon start (`PinProxy.start`,
+    which calls `read_daemon_state` to reclaim a port) reads that file and
+    believes a daemon it can never reach.
+    """
+
+    def test_a_refused_unlink_is_distinguishable_from_a_successful_release(
+        self, tmp_path, monkeypatch
+    ):
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        pin_proxy.write_daemon_state(certdir, 12345, os.getpid(), "fp-abc")
+        assert pin_proxy.read_daemon_state(certdir) is not None
+
+        real_unlink = Path.unlink
+
+        def refusing_unlink(self, *a, **k):
+            if self.name == pin_proxy._STATE_FILE:
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(Path, "unlink", refusing_unlink)
+
+        raised = False
+        try:
+            pin_proxy._release_daemon_state(certdir)
+        except OSError:
+            raised = True
+
+        assert raised, (
+            "_release_daemon_state swallowed a REFUSED unlink and returned "
+            "normally — the state file still names this (now-dead) daemon "
+            "and the next start will believe it"
+        )
+        assert pin_proxy.read_daemon_state(certdir) is not None, (
+            "fixture broken: the state file should still be there since "
+            "the unlink was refused"
+        )
+
+    def test_a_successful_release_still_returns_false(self, tmp_path):
+        """CONTROL: releasing our own state normally must still succeed and
+        return False (not "someone else owns it now")."""
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        pin_proxy.write_daemon_state(certdir, 12345, os.getpid(), "fp-abc")
+
+        assert pin_proxy._release_daemon_state(certdir) is False
+        assert pin_proxy.read_daemon_state(certdir) is None
+
+
+class TestASalvageWriteFailureNeverCostsOurOwnCA:
+    """`_trust_file`'s salvage-write can fail (disk full, a read-only cert
+    dir) and lands in the blanket `except Exception: pass` — measured
+    whether that collapse is still safe on every path that reaches it.
+
+    It is: `ours` is confirmed non-empty before the salvage attempt, and
+    every branch below the handler falls through to `return Path(ca_path)`
+    — the CA already on disk, already read once — so a salvage-write
+    failure costs the corporate roots (a narrowing this file already treats
+    as acceptable everywhere else — see `TestNarrowingIsDeliberatelyUnguarded`)
+    but never the session's ability to verify its OWN proxy. This is the
+    control that would go red if a future change made that stop being true.
+    """
+
+    def _cfg(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        home.mkdir()
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        return home
+
+    def test_a_totally_failed_write_still_returns_our_own_readable_ca(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin.proxy import CA_TRUST_FILE, _trust_file, ensure_ca
+
+        cfg = self._cfg(tmp_path, monkeypatch)
+        ca_path = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
+        other_ca = ensure_ca(tmp_path / "other", "other.example.com").ca_path
+
+        shared = cfg / CA_TRUST_FILE
+        # Unusable (unbalanced marker) so `_trust_file` takes the salvage arm.
+        shared.write_bytes(
+            (ca_path.read_bytes().strip() + b"\n" + other_ca.read_bytes().strip())
+            .replace(b"-----END CERTIFICATE-----", b" X\n-----END CERTIFICATE-----", 1)
+        )
+
+        import cswap_pin.proxy as pin_proxy
+
+        def always_fails(bundle, body):
+            raise OSError("simulated: every bundle write fails")
+
+        monkeypatch.setattr(pin_proxy, "_write_bundle_atomically", always_fails)
+
+        result = _trust_file(ca_path, None)
+
+        assert Path(result) == ca_path, (
+            f"a salvage-write failure returned {result}, not our own CA — "
+            "the session can no longer verify even its own proxy"
+        )
+        assert Path(result).read_bytes().strip(), "our own CA file is empty or unreadable"
