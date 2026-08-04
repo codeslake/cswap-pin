@@ -2581,6 +2581,167 @@ class TestUnwireWhenDead:
         )
 
 
+class TestTheDaemonWatchesItsOwnCode:
+    """A daemon must notice its own code was replaced and hand over.
+
+    MEASURED, work-mac, the outage this exists for: a pin daemon ran for 22
+    hours on code that had been replaced 19 hours earlier. Six releases landed
+    on disk in that window and none reached the running process. The stale
+    daemon dialled direct instead of chaining, so every claude.ai and
+    platform.claude.com handshake got the corporate MITM leaf and OAuth login
+    was broken the whole time, until a human noticed.
+
+    The recycle machinery was already complete and CORRECT. `heal` was
+    evaluated in-process against that live daemon and every gate passed —
+    fingerprint stale, port serving, slot resolvable, pid identified. It never
+    ran because NOTHING CALLED IT: its only caller is a human typing
+    `cswap pin --heal`. The periodic caller used to be a status-line hook, and
+    that hook was removed on purpose (a status line is one machine's personal
+    config, so recovery living there means every user without that hook has no
+    recovery at all). The removal was right; the replacement is this class.
+
+    So the daemon watches ITSELF. `daemon_fingerprint` is a hash of this
+    module's mtime, which means re-calling it later answers "was proxy.py
+    replaced under me" with no new machinery and no host-side hook of any kind.
+    """
+
+    def _certdir(self, tmp_path):
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(exist_ok=True)
+        return certdir
+
+    def test_a_replaced_module_makes_the_daemon_hand_over(self, monkeypatch):
+        """The positive case: fingerprint moved -> stop, spawn, done.
+
+        Driven through `_watch_own_code` directly rather than through a real
+        `daemon_main`, because the thing under test is the DECISION and its
+        ORDER, and a real daemon would add sockets, a FIFO and a spawn to the
+        failure surface without adding anything to the assertion.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        events = []
+        fps = iter(["fp-old", "fp-new", "fp-new"])
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: next(fps))
+
+        class _Srv:
+            def stop(self, drain=None):
+                events.append(("stop", drain))
+
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda n, e, c: events.append(("spawn", n)) or 41234)
+
+        done = threading.Event()
+        pin_proxy._watch_own_code(
+            _Srv(), "1", "a@example.com", Path("/nonexistent"),
+            done, teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01, _own_fingerprint="fp-old",
+        )
+
+        assert ("stop", pin_proxy._DRAIN_SECONDS) in events, events
+        assert ("spawn", "1") in events, events
+        # ORDER IS LOAD-BEARING: the port must be free before the successor
+        # tries to bind it, and _spawn_daemon blocks until the successor is
+        # serving. Spawning first would race two daemons for one port.
+        assert events.index(("stop", pin_proxy._DRAIN_SECONDS)) < events.index(
+            ("spawn", "1")), events
+        # AND IT MUST NOT UNWIRE. The successor rebound the same port and owns
+        # the wiring now; unwiring here would strip the config it just wrote
+        # and send every new session to no proxy at all.
+        assert not [e for e in events if e[0] == "teardown"], events
+        assert done.is_set()
+
+    def test_an_unchanged_module_never_hands_over(self, monkeypatch):
+        """THE CONTROL. Without it the suite cannot tell "recycles when the
+        code changed" from "recycles always", and the second would replace a
+        22-hour outage with a daemon that restarts itself forever."""
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        events = []
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: "fp-same")
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda n, e, c: events.append(("spawn", n)) or 1)
+
+        class _Srv:
+            def stop(self, drain=None):
+                events.append(("stop", drain))
+
+        done = threading.Event()
+        # Ends the loop from the outside after several intervals, exactly as a
+        # normal teardown does — so "did not recycle" is observed across many
+        # ticks rather than inferred from one.
+        threading.Timer(0.25, done.set).start()
+        pin_proxy._watch_own_code(
+            _Srv(), "1", "a@example.com", Path("/nonexistent"),
+            done, teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01, _own_fingerprint="fp-same",
+        )
+
+        assert events == [], events
+
+    def test_a_successor_that_never_comes_up_unwires(self, monkeypatch):
+        """We have already stopped serving, so the config names a port nothing
+        serves. That is the ConnectionRefused outage `_teardown` exists to
+        prevent — reached here by the recycle itself if it does not fall back."""
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        events = []
+        fps = iter(["fp-old", "fp-new", "fp-new"])
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: next(fps))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c: None)
+
+        class _Srv:
+            def stop(self, drain=None):
+                events.append(("stop", drain))
+
+        done = threading.Event()
+        pin_proxy._watch_own_code(
+            _Srv(), "1", "a@example.com", Path("/nonexistent"),
+            done, teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01, _own_fingerprint="fp-old",
+        )
+
+        assert [e for e in events if e[0] == "teardown"], events
+
+    def test_daemon_main_starts_the_watchdog(self):
+        """The watchdog must be WIRED IN, not merely defined.
+
+        Asserted on the parse tree for the same reason as
+        `test_teardown_restores_the_config` above: a comment naming the call
+        satisfies a grep and not an AST. This is the assertion that would have
+        caught the original defect — a correct mechanism with no caller.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy as pin_proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+        started = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "attr", None) == "start"
+            and any(
+                getattr(kw.value, "id", None) == "_watch_own_code"
+                for kw in getattr(getattr(n.func, "value", None), "keywords", [])
+            )
+        ]
+        assert started, (
+            "daemon_main must START a _watch_own_code thread; a self-recycle "
+            "nothing calls is exactly the 22h outage this release fixes"
+        )
+
+
 class TestHealRestoresWithoutRestart:
     """A repaired pin must come back on the SAME port, with no session restart.
 
