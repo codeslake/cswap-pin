@@ -1688,12 +1688,17 @@ class TestDaemonPortStability:
             # release that merely unreferences the socket instead of
             # detaching it (CPython's finalizer closes the fd, and the
             # supervisor's port dies with our handover).
+            # The fixture's own descriptors would keep the port bound no
+            # matter what release did, and dup2 left TWO: `lsn` and fd 3.
+            # Close both, so the only thing that can still hold the address is
+            # whatever release_listener did with the socket it adopted. A
+            # release that merely unreferences it hands the fd to CPython's
+            # finalizer, which closes it — and the port dies here.
             import gc
 
-            lsn_fd = lsn.detach()
+            lsn.close()
             gc.collect()
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
-            os.close(lsn_fd)
             return
         finally:
             os.environ.pop("LISTEN_FDS", None)
