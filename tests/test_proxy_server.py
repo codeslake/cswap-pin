@@ -1370,6 +1370,86 @@ class TestChainRediscovery:
         assert proxy.port != 36301, proxy.port
         return proxy, upstream
 
+    def test_the_log_names_the_hop_that_carried_and_stays_quiet_after(
+        self, certdir
+    ):
+        """Falling through a dead hop is silent, so a request carried by the
+        second hop and one carried by the first read identically. An observer
+        had to infer it afterwards from the TLS issuer.
+
+        The transition is logged, not the state: a steady chain costs nothing
+        per connection, and losing a hop is visible the moment it happens.
+        """
+        import contextlib
+        import io
+
+        from cswap_pin import proxy as pin_proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        good = socket.socket()
+        good.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        good.bind(("127.0.0.1", 0))
+        good.listen(4)
+        good_port = good.getsockname()[1]
+
+        def _answer():
+            while True:
+                try:
+                    conn, _ = good.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+        threading.Thread(target=_answer, daemon=True).start()
+        try:
+            relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", dead_port)),
+                pin_proxy._as_chain(("127.0.0.1", good_port)),
+            ]
+
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            first = [l for l in buf.getvalue().splitlines() if "egress" in l]
+            assert first, "the walk said nothing about which hop carried it"
+            assert str(good_port) in first[0], first
+
+            # The SAME hop again must be silent, or every connection logs.
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            assert not [
+                l for l in buf.getvalue().splitlines() if "egress" in l
+            ], "an unchanged chain logged again"
+
+            # And with no hop left, the downgrade is named.
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", dead_port))
+            ]
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                try:
+                    sock, _ = relay._connect_upstream()
+                    sock.close()
+                except OSError:
+                    pass
+            assert any(
+                "DIRECT" in l for l in buf.getvalue().splitlines()
+            ), buf.getvalue()
+        finally:
+            good.close()
+
     def test_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
         self, certdir, tmp_path, monkeypatch
     ):
