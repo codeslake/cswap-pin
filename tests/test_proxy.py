@@ -7424,3 +7424,72 @@ class TestASalvageWriteFailureNeverCostsOurOwnCA:
             "the session can no longer verify even its own proxy"
         )
         assert Path(result).read_bytes().strip(), "our own CA file is empty or unreadable"
+
+
+class TestTeardownAsksThePortBeforeUnwiring:
+    """An unwire is only correct when nobody is serving the wired address.
+
+    MEASURED, work-mac, a live session retrying:
+        19:16:35 pid=58845 unwired .claude.json — sessions fall back
+        19:16:36 pid=60863 serving on port 53749
+    One second apart. The departing daemon decided from the state files, which
+    say it is alone right up until a successor publishes — and a successor
+    publishes only once it is already serving. So the files and the port
+    disagree for exactly the length of a handover, and the config lost its pin
+    inside that window.
+
+    The port is the thing a session actually dials, so the port is what decides.
+    """
+
+    def test_a_served_port_keeps_its_wiring(self, tmp_path, monkeypatch):
+        import socket
+
+        from cswap_pin import proxy
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        try:
+            assert proxy._port_answers(srv.getsockname()[1]) is True
+        finally:
+            srv.close()
+
+    def test_an_unserved_port_does_not(self, tmp_path):
+        """The other direction, or the guard would just be 'never unwire'."""
+        import socket
+
+        from cswap_pin import proxy
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        assert proxy._port_answers(port) is False
+
+    def test_the_probe_gates_the_unwire_in_the_real_teardown(self):
+        """Both halves above are about the probe. This is about the CALLER:
+        a correct probe nothing consults changes nothing."""
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(proxy.daemon_main)))
+        teardown = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_teardown"
+        )
+        calls = sorted(
+            (n.lineno, getattr(n.func, "id", getattr(n.func, "attr", "")))
+            for n in ast.walk(teardown)
+            if isinstance(n, ast.Call)
+        )
+        probe = [ln for ln, name in calls if name == "_port_answers"]
+        unwire = [ln for ln, name in calls if name == "wire_global_config"]
+        assert probe, "_teardown no longer asks whether the port is served"
+        assert unwire, "_teardown no longer unwires at all"
+        assert probe[0] < unwire[0], (
+            "the port check must run BEFORE the unwire, or it decides nothing"
+        )
