@@ -3879,25 +3879,63 @@ def _watch_own_code(
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
     while not done.wait(interval):
+        # ONE EXIT, TAKEN ON EVERY PATH. 0.1.27 had three exits and one of them
+        # took neither: `_spawn_daemon` RAISING (fork() EAGAIN under a
+        # post-deploy herd) landed in the guard below, which logged and
+        # returned with the server already stopped, nothing unwired, and `done`
+        # never set — so the process stayed alive serving nothing while
+        # `.claude.json` named its port and `daemon_main` blocked on
+        # `done.wait()` forever. Measured: stop=yes teardown=no done=no.
+        #
+        # `handed_over` is the whole arbitration: True means a successor owns
+        # the wiring and we must NOT unwire; False after we have stopped means
+        # nobody is serving and we MUST. The `finally` applies that once,
+        # rather than each branch remembering to.
+        stopped = handed_over = False
         try:
             if daemon_fingerprint() == own:
                 continue
             _log_lifecycle("code on disk changed — handing over to a successor")
-            server.stop(drain=_DRAIN_SECONDS)
-            if _spawn_daemon(account_num, email, certdir) is not None:
-                _log_lifecycle("successor is serving — leaving the wiring to it")
-                done.set()
-                return
-            # The successor never came up and we are no longer serving.
-            _log_lifecycle("successor did not come up — unwiring so sessions fall back")
-            teardown("failed handover")
+            # SERIALIZED, like every other spawn caller (`heal`,
+            # `ensure_proxy`). Without it, a deploy replaces proxy.py and every
+            # daemon on the box goes stale in the same instant, so their timers
+            # fire together and two unserialized spawns leave one successor
+            # orphaned — invisible to the sweep, holding a port forever. Taken
+            # BEFORE the stop so a loser waits with its server still up rather
+            # than dead.
+            with _spawn_lock(certdir):
+                # Another daemon may have recycled us while we queued.
+                if daemon_fingerprint() == own:
+                    continue
+                server.stop(drain=_DRAIN_SECONDS)
+                stopped = True
+                if _spawn_daemon(account_num, email, certdir) is not None:
+                    _log_lifecycle("successor is serving — leaving the wiring to it")
+                    handed_over = True
+                    return
+                _log_lifecycle("successor did not come up")
             return
         except Exception as exc:  # noqa: BLE001 — a watchdog must never raise
-            # A raise here would kill the thread silently and put the daemon
+            # A raise here used to kill the thread silently and put the daemon
             # back in the state this whole release exists to end: correct
             # recycle machinery with nothing driving it.
             _log_lifecycle(f"code watch failed: {exc!r}")
             return
+        finally:
+            if stopped and not handed_over:
+                # We are no longer serving and no successor took over, so the
+                # config names a port nothing answers — the ConnectionRefused
+                # outage, reached by the recycle itself. Fall back instead.
+                _log_lifecycle("no successor — unwiring so sessions fall back")
+                try:
+                    teardown("failed handover")
+                except Exception as exc:  # noqa: BLE001
+                    _log_lifecycle(f"COULD NOT unwire after a failed handover: {exc!r}")
+            if stopped:
+                # Either way this daemon is finished. `done` releases
+                # `daemon_main`'s `done.wait()`; leaving it unset is what made
+                # the raise path a permanent zombie.
+                done.set()
 
 
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
