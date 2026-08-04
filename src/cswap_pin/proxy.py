@@ -3930,6 +3930,14 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
             subprocess.Popen(
                 [sys.executable, "-m", _DAEMON_MODULE, account_num, email,
                  str(certdir)],
+                # GIVE THE CHILD ITS OWN STDIN. Without this it inherits the
+                # parent's fd 0, and a daemon spawning its successor is not a
+                # CLI: whatever fd 0 became in a long-lived detached process is
+                # what the child gets. A child whose fd 0 is unusable dies in
+                # interpreter startup, before any of its own code runs, so it
+                # cannot report why — the failure is a bare init_sys_streams
+                # with no Python frame and the handover produces no successor.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=log,
                 start_new_session=True,
@@ -4124,10 +4132,23 @@ def _watch_own_code(
             return
         finally:
             if stopped and not handed_over:
-                # We are no longer serving and no successor took over, so the
-                # config names a port nothing answers — the ConnectionRefused
-                # outage, reached by the recycle itself. Fall back instead.
-                _log_lifecycle("no successor — unwiring so sessions fall back")
+                # KEEP SERVING THE OLD CODE RATHER THAN NOTHING. A recycle that
+                # cannot start a successor has no reason to end the pin: this
+                # process is intact, it merely stopped listening, and the code
+                # it runs is the code that was working a moment ago. Unwiring
+                # here left a machine unpinned until a human re-pinned it by
+                # hand — measured, hours — while the alternative costs only
+                # running one release behind until the next attempt.
+                if _resume_serving(server):
+                    _log_lifecycle(
+                        "successor did not come up — resumed serving the old "
+                        "code, still on the recorded port"
+                    )
+                    stopped = False
+                    return
+                # Could not get the listener back either. Now the config really
+                # does name a port nothing answers, so fall back.
+                _log_lifecycle("no successor and could not resume — unwiring")
                 try:
                     teardown("failed handover")
                 except Exception as exc:  # noqa: BLE001
@@ -4137,6 +4158,33 @@ def _watch_own_code(
                 # `daemon_main`'s `done.wait()`; leaving it unset is what made
                 # the raise path a permanent zombie.
                 done.set()
+
+
+def _resume_serving(server) -> bool:
+    """Put a stopped server back on its own port. True if it is listening again.
+
+    ``stop()`` closes the listener but leaves the object usable, and ``start()``
+    already reclaims the recorded port rather than taking a fresh one — so a
+    resume is a restart of the listener, not of the process. The port matters
+    more than the uptime: a running session's HTTPS_PROXY was fixed at exec, so
+    coming back anywhere else is the same outage as not coming back.
+    """
+    try:
+        server._stop = False
+        server.start()
+    except Exception as exc:  # noqa: BLE001 — the caller has a fallback
+        _log_lifecycle(f"could not resume serving: {exc!r}")
+        return False
+    want = read_daemon_state(server._certdir)
+    recorded = want.get("port") if isinstance(want, dict) else None
+    if isinstance(recorded, int) and recorded > 0 and server.port != recorded:
+        # Listening, but not where the live sessions are pointed. That is not a
+        # resume, it is a second outage wearing the same log line.
+        _log_lifecycle(
+            f"resumed on {server.port} but sessions expect {recorded}"
+        )
+        return False
+    return True
 
 
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
