@@ -1368,11 +1368,19 @@ def heal(backup_root: Path) -> bool:
     is a deadlock, and it is exactly what happened on work-mac: a human had to
     re-pin by hand.
 
-    So this is callable from anything that already runs periodically (the
-    status line does, every few seconds) and needs no switcher: the pinned
-    identity comes from settings.json and the slot from the account registry,
-    both on disk. Cheap when healthy — a state read plus one loopback connect,
-    and it returns immediately.
+    So this needs no switcher: the pinned identity comes from settings.json and
+    the slot from the account registry, both on disk. Cheap when healthy — a
+    state read plus one loopback connect, and it returns immediately.
+
+    WHO CALLS IT, stated because the previous answer here was wrong and cost 22
+    hours. This used to say "callable from anything that already runs
+    periodically (the status line does, every few seconds)". A status line is
+    ONE MACHINE'S PERSONAL CONFIG, so recovery living there means every user
+    without that hook has no recovery at all — the hook was removed on purpose,
+    and this docstring was left as the only record of a design that no longer
+    existed. The periodic caller today is :func:`_watch_own_code`, INSIDE the
+    daemon, which needs no host cooperation. `heal` remains the launch-path
+    repair and the manual one (``cswap pin --heal``); it is not on a timer.
 
     The port is REBOUND, not reallocated: the daemon reclaims the port recorded
     in proxy.json, else port.hint. That is what makes live sessions recover on
@@ -3814,6 +3822,84 @@ def _release_daemon_state(certdir: Path) -> bool:
     return False
 
 
+_CODE_WATCH_INTERVAL_S = 30.0
+
+
+def _watch_own_code(
+    server,
+    account_num: str,
+    email: str,
+    certdir: Path,
+    done,
+    teardown,
+    interval: float = _CODE_WATCH_INTERVAL_S,
+    _own_fingerprint: str | None = None,
+) -> None:
+    """Hand over to a successor when this module's code is replaced on disk.
+
+    WHY THIS LIVES IN THE DAEMON. Every other entry point reacts to a LAUNCH:
+    `ensure_proxy` recycles a stale daemon, but only when a new session starts.
+    A machine whose sessions are all already running never launches, so an
+    upgrade never reaches the process. Measured on work-mac: a daemon served
+    for 22 hours on code that had been replaced 19 hours earlier, across six
+    releases, dialling direct instead of chaining — every claude.ai handshake
+    got the corporate MITM leaf and OAuth login was broken the whole time.
+
+    `heal` already detects exactly this and recycles correctly; it was
+    evaluated against that live daemon and every one of its gates passed. It
+    never ran because its only caller is a human typing `cswap pin --heal`.
+    The periodic caller used to be a status-line hook, and removing that was
+    RIGHT: a status line is one machine's personal config, so recovery living
+    there means every user without that hook has no recovery at all. This is
+    the replacement, and it needs no host-side hook of any kind — the daemon
+    is the one process guaranteed to be running when its own code goes stale.
+
+    `daemon_fingerprint` hashes this module's mtime, so re-calling it IS the
+    detector; nothing new is needed to sense staleness.
+
+    THE ORDER IS LOAD-BEARING:
+
+      1. stop and drain — the port must be free before the successor binds it,
+         and draining is what keeps a recycle from cutting live requests.
+      2. `_spawn_daemon` — it already hands the outgoing port to the successor
+         and blocks until that successor is serving and has published its own
+         state, so live sessions (whose HTTPS_PROXY was fixed at exec) keep
+         reaching the same address.
+      3. on success, DO NOT unwire. The successor owns the wiring now; tearing
+         it down would strip the config it just wrote and send every new
+         session to no proxy at all.
+      4. on failure, unwire. We have already stopped serving, so leaving the
+         config naming this port is the ConnectionRefused outage `_teardown`
+         exists to prevent — reached by the recycle itself.
+
+    NOT gated on the daemon being idle: a busy daemon is exactly the one that
+    must upgrade, and the drain in step 1 is what protects its in-flight work.
+    """
+    own = _own_fingerprint if _own_fingerprint is not None else daemon_fingerprint()
+    # Waiting on `done` rather than sleeping, so a normal teardown ends this
+    # thread at once instead of after a full interval.
+    while not done.wait(interval):
+        try:
+            if daemon_fingerprint() == own:
+                continue
+            _log_lifecycle("code on disk changed — handing over to a successor")
+            server.stop(drain=_DRAIN_SECONDS)
+            if _spawn_daemon(account_num, email, certdir) is not None:
+                _log_lifecycle("successor is serving — leaving the wiring to it")
+                done.set()
+                return
+            # The successor never came up and we are no longer serving.
+            _log_lifecycle("successor did not come up — unwiring so sessions fall back")
+            teardown("failed handover")
+            return
+        except Exception as exc:  # noqa: BLE001 — a watchdog must never raise
+            # A raise here would kill the thread silently and put the daemon
+            # back in the state this whole release exists to end: correct
+            # recycle machinery with nothing driving it.
+            _log_lifecycle(f"code watch failed: {exc!r}")
+            return
+
+
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     """Entry point for the detached proxy process (``-m claude_swap.pin_proxy``).
 
@@ -3904,6 +3990,12 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
 
     # A recycle/cc-update TERM runs the same cleanup as an idle teardown.
     _install_signal_teardown(_teardown)
+
+    threading.Thread(
+        target=_watch_own_code,
+        args=(proxy, account_num, email, certdir, done, _teardown),
+        daemon=True,
+    ).start()
 
     threading.Thread(
         target=watch_refcount,
