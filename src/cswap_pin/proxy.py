@@ -125,8 +125,65 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     return parse_upstream_proxy(_read_upstream(certdir, "proxy"))
 
 
+def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
+    """The proxy the recorded hop is ITSELF chaining to, asked of that hop.
+
+    A local cache proxy reports its own upstream on ``/health`` while it is
+    alive, and that is the only moment the answer can be trusted — so this is
+    called at hint-writing time (a launch), never from the relay. Returns None
+    whenever the hop does not answer or does not name one: a hop that cannot be
+    confirmed NOW must not be recorded, because a stale next hop costs a dial
+    before the walk reaches the no-chain decision.
+
+    Loopback only. The next hop matters for a chain of local proxies; asking a
+    remote corporate proxy for a /health it does not serve would spend the
+    timeout on every launch.
+    """
+    import http.client
+
+    hop = parse_upstream_proxy(value)
+    if hop is None or hop.host not in _LOOPBACK or hop.tls:
+        return None
+    try:
+        conn = http.client.HTTPConnection(hop.host, hop.port, timeout=timeout)
+        try:
+            conn.request("GET", "/health")
+            body = json.loads(conn.getresponse().read())
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — an absent probe is "no next hop"
+        return None
+    if not isinstance(body, dict):
+        return None
+    nxt = body.get("https_proxy") or body.get("HTTPS_PROXY")
+    if not isinstance(nxt, str) or not nxt:
+        return None
+    parsed = parse_upstream_proxy(nxt)
+    # A hop naming ITSELF would make the walk retry the address that just
+    # failed, which is a loop rather than a fallback.
+    if parsed is None or parsed.address == hop.address:
+        return None
+    return nxt
+
+
+def _chain_hops(certdir: Path) -> list[_Chain]:
+    """Every recorded hop, outermost LAST — the order to try them in.
+
+    The relay dials the first and falls through to the next when a hop is not
+    usable. A single-hop record (nothing behind it was confirmed) yields one
+    entry, which is what every caller did before the chain was recorded.
+    """
+    hops = []
+    for value in (_read_upstream(certdir, "proxy"), _read_upstream(certdir, "next")):
+        hop = parse_upstream_proxy(value)
+        if hop is not None and hop not in hops:
+            hops.append(hop)
+    return hops
+
+
 def write_upstream_hint(
-    certdir: Path, value: str | None, ca: str | None = None
+    certdir: Path, value: str | None, ca: str | None = None,
+    next_hop: str | None = None,
 ) -> None:
     """Record the egress proxy for the daemon to chain through (see above).
 
@@ -145,6 +202,15 @@ def write_upstream_hint(
     path = Path(certdir) / _UPSTREAM_FILE
     tmp = path.with_suffix(".tmp")
     keep_ca = read_upstream_ca(certdir) if ca is None else ca
+    # THE CHAIN, NOT ONE HOP. A recorded hop that dies must fall through to the
+    # hop behind it; falling through to a direct dial is not "no proxy" on a
+    # machine whose direct route is a TLS-inspecting corporate proxy.
+    #
+    # Taken from the caller rather than probed here, and NOT carried over from
+    # the previous record: only a launch can confirm the hop behind this one
+    # (see ``_probe_next_hop``), so a writer that cannot is recording nothing
+    # rather than something stale.
+    keep_next = next_hop or ""
     if value:
         keep_proxy = value
     else:
@@ -157,7 +223,9 @@ def write_upstream_hint(
         #   https://bob:***@corp.proxy:8443 -> http://corp.proxy:8443
         keep_proxy = _read_upstream(certdir, "proxy") or ""
     try:
-        tmp.write_text(json.dumps({"proxy": keep_proxy, "ca": keep_ca or ""}))
+        tmp.write_text(json.dumps(
+            {"proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next}
+        ))
         tmp.replace(path)
     except OSError:
         pass
@@ -2091,6 +2159,22 @@ def _dial_chain(
         raise
 
 
+def _dial_with_no_chain(upstream: tuple[str, int], timeout: float = 15):
+    """What to do when NO hop is usable and none is recorded behind them.
+
+    THE ONE PLACE THIS DECISION IS MADE, deliberately. A direct dial is not
+    "no proxy" on a machine whose direct route is a TLS-inspecting corporate
+    proxy: the leaf it returns has no Authority Key Identifier, so a strict
+    verifier refuses it and OAuth against claude.ai breaks with nothing on
+    screen. Refusing instead would honour that — at the cost of the standing
+    rule that a pin must never block traffic, and on a machine with no
+    inspector the direct dial is simply correct.
+
+    Dials. Changing it to refuse is this function's body and nothing else.
+    """
+    return socket.create_connection(upstream, timeout=timeout)
+
+
 def _connect_ok(status: "str | None") -> bool:
     """Whether a CONNECT status line reports success.
 
@@ -2820,10 +2904,16 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     # This is what makes the daemon follow the environment instead of the
     # environment that happened to exist when it spawned: a wrapper that sets
     # a proxy, one that moved ports, or one that went away entirely.
+    # ...and the hop BEHIND it, asked of that hop while it is answering. A
+    # launch is the only moment that question has a trustworthy answer, and it
+    # is what lets a dead hop fall through to the next one instead of to a
+    # direct dial (see ``_probe_next_hop``).
+    ambient = _ambient_proxy(certdir=certdir)
     write_upstream_hint(
         certdir,
-        _ambient_proxy(certdir=certdir),
+        ambient,
         os.environ.get("NODE_EXTRA_CA_CERTS"),
+        next_hop=_probe_next_hop(ambient or _read_upstream(certdir, "proxy")),
     )
     fp = daemon_fingerprint(account_num, email)
 
@@ -3629,12 +3719,25 @@ def read_port_hint(certdir: Path) -> int | None:
         return None
 
 
-def write_daemon_state(certdir: Path, port: int, pid: int, fingerprint: str) -> None:
-    """Record the live daemon's identity atomically (temp-then-rename)."""
+def write_daemon_state(
+    certdir: Path, port: int, pid: int, fingerprint: str, handover: bool = False
+) -> None:
+    """Record the live daemon's identity atomically (temp-then-rename).
+
+    ``handover`` marks the record as "a successor is being spawned for this
+    daemon right now". It is the ONE arbitration point across the three paths
+    that share the daemon lifecycle — the code watchdog, the refcount idle
+    teardown and the SIGTERM handler — because all three already read this
+    file and none of them can see the others' locals. The mark says: nothing
+    is serving on this record, and whoever is departing must not unwire.
+    """
     import json
 
+    rec = {"port": port, "pid": pid, "fingerprint": fingerprint}
+    if handover:
+        rec["handover"] = True
     tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps({"port": port, "pid": pid, "fingerprint": fingerprint}))
+    tmp.write_text(json.dumps(rec))
     os.replace(tmp, Path(certdir) / _STATE_FILE)
 
 
@@ -3710,6 +3813,13 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
     st = read_daemon_state(certdir)
     if not st:
         return None
+    # A handover in flight means the recorded daemon has already stopped
+    # serving and its successor has not published yet. The pid is still alive
+    # and the port may already answer — reclaimed by that successor — so both
+    # liveness checks below would read the record as healthy and hand the
+    # spawner its own predecessor.
+    if st.get("handover"):
+        return None
     if fingerprint is not None and st.get("fingerprint") != fingerprint:
         return None
     # A daemon that has proven it cannot read the pinned credential is not a
@@ -3748,11 +3858,31 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
     prev = read_daemon_state(certdir)
     if isinstance(prev, dict) and isinstance(prev.get("port"), int):
         _write_port_hint(certdir, prev["port"])
-    for f in (certdir / _STATE_FILE, certdir / "proxy.port"):
+    # MARKED, NOT DELETED, and this is the whole arbitration. Deleting it made
+    # the successor's own liveness poll safe (it can no longer match the
+    # predecessor's entry) at the cost of blinding every OTHER reader for the
+    # ~10s the spawn takes: with no record, `_release_daemon_state` reports "not
+    # superseded" and a teardown arriving from the refcount watcher or from
+    # SIGTERM unwires a successor that comes up perfectly healthy and never
+    # rewires. The mark answers both: the record still names who is departing,
+    # and every reader that asks "is anything serving here" is told no.
+    if isinstance(prev, dict) and isinstance(prev.get("pid"), int):
         try:
-            f.unlink()
+            write_daemon_state(
+                certdir, prev.get("port") or 0, prev["pid"],
+                prev.get("fingerprint") or "", handover=True,
+            )
+        except OSError:
+            pass
+    else:
+        try:
+            (certdir / _STATE_FILE).unlink()
         except FileNotFoundError:
             pass
+    try:
+        (certdir / "proxy.port").unlink()
+    except FileNotFoundError:
+        pass
     fifo = refcount_fifo_path(certdir)
     if not fifo.exists():
         try:
@@ -3767,29 +3897,59 @@ def _spawn_daemon(account_num: str, email: str, certdir: Path) -> int | None:
     # reading.
     log = _open_daemon_log(certdir)
     try:
-        subprocess.Popen(
-            [sys.executable, "-m", _DAEMON_MODULE, account_num, email, str(certdir)],
-            stdout=subprocess.DEVNULL,
-            stderr=log,
-            start_new_session=True,
-        )
-    finally:
-        # The child holds its own dup of the fd; ours would otherwise leak on
-        # every spawn.
-        if hasattr(log, "close"):
-            log.close()
-    for _ in range(100):  # up to ~10s (first run generates RSA keys)
-        port = _read_alive_port(certdir)
-        if port is not None:
-            # New daemon is serving and recorded in proxy.json — sweep any
-            # orphan pin daemons for this certdir that aren't the keeper, so a
-            # recycle that left the old one alive never accumulates.
-            st = read_daemon_state(certdir)
-            keep = int(st["pid"]) if st else -1
-            _sweep_orphan_daemons(certdir, keep_pid=keep)
-            return port
-        time.sleep(0.1)
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", _DAEMON_MODULE, account_num, email,
+                 str(certdir)],
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+                start_new_session=True,
+            )
+        finally:
+            # The child holds its own dup of the fd; ours would otherwise leak
+            # on every spawn.
+            if hasattr(log, "close"):
+                log.close()
+        for _ in range(100):  # up to ~10s (first run generates RSA keys)
+            port = _read_alive_port(certdir)
+            if port is not None:
+                # New daemon is serving and recorded in proxy.json — sweep any
+                # orphan pin daemons for this certdir that aren't the keeper, so
+                # a recycle that left the old one alive never accumulates.
+                st = read_daemon_state(certdir)
+                keep = int(st["pid"]) if st else -1
+                _sweep_orphan_daemons(certdir, keep_pid=keep)
+                return port
+            time.sleep(0.1)
+    except BaseException:
+        # A spawn that RAISES (fork() EAGAIN under a post-deploy herd) leaves
+        # no successor, so the mark must not outlive it — see below.
+        _clear_handover_mark(certdir)
+        raise
+    # NO SUCCESSOR CAME. The mark says "one is coming", and leaving it would
+    # tell the caller's own teardown it has been superseded — so the wiring
+    # would be kept pointing at a port nobody serves, which is the outage the
+    # unwire exists to prevent.
+    _clear_handover_mark(certdir)
     return None
+
+
+def _clear_handover_mark(certdir: Path) -> None:
+    """Drop a marked record once the spawn it describes has failed.
+
+    The mark means "a successor is coming"; leaving it after nothing came would
+    make the caller's own teardown read "superseded" and keep the wiring
+    pointing at a port nobody serves. The record described a daemon that has
+    already stopped, so there is nothing left to preserve — the port to reclaim
+    lives in the hint (see ``read_port_hint``).
+    """
+    st = read_daemon_state(certdir)
+    if not (st and st.get("handover")):
+        return
+    try:
+        (Path(certdir) / _STATE_FILE).unlink()
+    except OSError:
+        pass
 
 
 def _release_daemon_state(certdir: Path) -> bool:
@@ -3802,6 +3962,16 @@ def _release_daemon_state(certdir: Path) -> bool:
     makes a LIVE daemon invisible: the next launch reads no state and spawns
     another one on top of it.
 
+    A HANDOVER IN FLIGHT COUNTS AS SUPERSEDED. `_spawn_daemon` marks the record
+    before it forks and the successor replaces it once it is serving, so for
+    the length of that spawn the record still names US and yet the wiring
+    belongs to a daemon that is about to own it. Reading only the pid there
+    unwired a healthy successor, and nothing rewires afterwards:
+    `_repair_wiring_if_ours` declines when nothing is wired at all. The mark is
+    what the three lifecycle paths — this teardown's two callers and the
+    watchdog that set it — share, because none of them can see the others'
+    locals.
+
     A REFUSED delete (permission denied, a read-only mount) is not the same
     outcome as an ABSENT file, and both used to return the same `False` a
     successful release does. A refused delete leaves the file naming OUR
@@ -3811,6 +3981,8 @@ def _release_daemon_state(certdir: Path) -> bool:
     """
     try:
         st = read_daemon_state(certdir)
+        if st and st.get("handover"):
+            return True
         if st and int(st["pid"]) != os.getpid():
             return True
     except (ValueError, KeyError, TypeError):
@@ -4934,18 +5106,19 @@ class PinProxy:
         while heartbeats (which answer at once) kept succeeding — so the
         session looked healthy and was silently deaf.
         """
-        chain = _as_chain(self._current_chain())
-        if chain:
+        for chain in self._chain_candidates():
+            # A HOP THAT REFUSES AND A HOP THAT WILL NOT DIAL ARE ONE EVENT.
+            # The two used to be handled apart: an OSError from the dial fell
+            # back, while a CONNECT the hop ACCEPTED and then answered non-200
+            # raised out of here uncaught — and a cache proxy that is
+            # RESTARTING is exactly that shape, listener up before its proxy
+            # logic is. Both mean "this hop is not usable", so both fall
+            # through to the hop behind it.
             try:
                 raw = _dial_chain(chain, extra_ca=self._chain_ca())
             except OSError:
-                # The recorded chain is gone. The hint is kept across launches
-                # that cannot see a proxy (a plain `cswap pin` shell has none),
-                # so it cannot expire on its own — fall through to a direct
-                # dial rather than failing every request until someone re-pins
-                # from a shell that happens to have the new address.
-                raw = None
-            if raw is not None:
+                continue
+            try:
                 raw.sendall(
                     f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
                     f"Host: {self._upstream[0]}:{self._upstream[1]}\r\n"
@@ -4956,14 +5129,29 @@ class PinProxy:
                     h = _read_line(raw)
                     if h in ("", None):
                         break
-                if not _connect_ok(status):
+            except OSError:
+                status = None
+            if not _connect_ok(status):
+                try:
                     raw.close()
-                    raise OSError(f"upstream CONNECT failed: {status}")
-                raw.settimeout(None)
-                return raw, chain[0] in _LOOPBACK
-        sock = socket.create_connection(self._upstream, timeout=15)
+                except OSError:
+                    pass
+                continue
+            raw.settimeout(None)
+            return raw, chain.host in _LOOPBACK
+        sock = _dial_with_no_chain(self._upstream)
         sock.settimeout(None)
         return sock, False  # direct dial: verification stays on
+
+    def _chain_candidates(self) -> list[_Chain]:
+        """The hops to try, in order. The re-read one first (it is the most
+        current), then whatever a launch recorded behind it."""
+        chain = _as_chain(self._current_chain())
+        hops = [chain] if chain else []
+        for hop in _chain_hops(self._certdir):
+            if hop not in hops:
+                hops.append(hop)
+        return hops
 
     @staticmethod
     def _tunnel_is_open(up: socket.socket):

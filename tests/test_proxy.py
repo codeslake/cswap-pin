@@ -2857,9 +2857,11 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
                             lambda n, e, c: spawned.append(n) or 41234)
 
+        stopped = []
+
         class _Srv:
             def stop(self, drain=None):
-                pass
+                stopped.append(drain)
 
         # Hold the spawn lock from another thread for the whole handover. If
         # the watchdog takes it, it cannot spawn while we hold it.
@@ -2891,6 +2893,221 @@ class TestTheDaemonWatchesItsOwnCode:
             "the watchdog spawned while another holder had the spawn lock — "
             "two daemons on one certdir can both recycle at the same tick"
         )
+        # THE PREMISE, asserted rather than assumed. "nothing spawned" also
+        # describes a run where the handover never started, so without this the
+        # assertion above is satisfied by the feature being absent entirely.
+        # Observable only after the lock is released: the stop happens INSIDE
+        # the lock, so a watchdog that is correctly blocked has not stopped yet.
+        assert spawned == ["1"], (
+            f"premise: the watchdog must reach the handover once the lock is "
+            f"free; spawned={spawned}"
+        )
+        assert stopped, (
+            "premise: the handover must stop the server before spawning; this "
+            "run never reached it"
+        )
+
+    def _successor(self, certdir, port, pid):
+        """Publish a successor's state — a live pid that is not ours, on a port
+        that answers — exactly as a real successor's `write_daemon_state` does."""
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.write_daemon_state(certdir, port, pid, pin_proxy.daemon_fingerprint())
+
+    def test_a_teardown_during_the_spawn_window_leaves_the_wiring_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """A concurrent teardown must not unwire a successor that is coming up.
+
+        `_spawn_daemon` clears the record before it forks and then polls for the
+        successor to publish, so for the length of that window there is nothing
+        on disk to match against. `_release_daemon_state` answers "not
+        superseded" throughout, and both other lifecycle paths — the refcount
+        idle teardown and the SIGTERM handler — read that answer and unwire a
+        daemon that comes up healthy and never rewires. Nothing self-heals
+        afterwards: `_repair_wiring_if_ours` declines when nothing is wired.
+
+        Driven through the REAL handover (`_watch_own_code`, which takes the
+        real `_spawn_lock` and calls the real `_spawn_daemon`) racing the REAL
+        `_teardown` closure `daemon_main` builds. A stand-in for either cannot
+        race state it does not own, which is how this window went unmeasured.
+        The after-publish control separates "this teardown is safe" from "no
+        teardown ran".
+        """
+        import threading
+
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        certdir, cfg, teardown = self._live_daemon(tmp_path, monkeypatch, paths)
+        st = pin_proxy.read_daemon_state(certdir)
+        pin_proxy.wire_global_config(st["port"], certdir / "ca.pem")
+        assert pin_proxy._wired_port() == st["port"], "premise: not wired"
+
+        succ, succ_port, published = self._late_successor(certdir, monkeypatch)
+
+        # The handover path, for real: its own fingerprint has moved, so it
+        # takes the spawn lock, stops the server and blocks in `_spawn_daemon`
+        # polling for a successor that publishes only when we let it.
+        fps = iter(["fp-new"] * 8)
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: next(fps))
+        handover_done = threading.Event()
+
+        class _Srv:
+            def stop(self, drain=None):
+                pass
+
+        threading.Thread(
+            target=lambda: (pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", certdir, threading.Event(),
+                lambda r: None, 0.01, "fp-old"), handover_done.set()),
+            daemon=True,
+        ).start()
+
+        try:
+            # IN THE WINDOW: the record is cleared and the successor has not
+            # published yet. This is the moment a refcount recheck or a SIGTERM
+            # arrives, and the wiring it would strip belongs to a daemon that is
+            # about to serve on that very port.
+            for _ in range(500):
+                if pin_proxy._read_alive_port(certdir) is None:
+                    break
+                time.sleep(0.01)
+            assert pin_proxy._read_alive_port(certdir) is None, (
+                "premise: the handover never reached the spawn window — "
+                "the predecessor's record still reads as a serving daemon"
+            )
+            teardown("refcount")
+            assert pin_proxy._wired_port() == st["port"], (
+                "a teardown inside the spawn window unwired a successor that "
+                "comes up healthy — the daemon serves and the pin is off"
+            )
+        finally:
+            published.set()
+            handover_done.wait(timeout=15)
+            succ.close()
+
+    def _late_successor(self, certdir, monkeypatch):
+        """A successor that comes up healthy but publishes only on demand — so
+        the spawn window can be held open and observed rather than raced."""
+        import socket as _socket
+        import subprocess
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        succ = _socket.socket()
+        succ.bind(("127.0.0.1", 0))
+        succ.listen(1)
+        succ_port = succ.getsockname()[1]
+        assert succ_port != 36301, succ_port
+        published = threading.Event()
+
+        def _fake_popen(*a, **k):
+            def _late():
+                published.wait(timeout=15)
+                # A live pid that is not ours, on a port that answers: exactly
+                # what a real successor's write_daemon_state records.
+                self._successor(certdir, succ_port, os.getppid())
+            threading.Thread(target=_late, daemon=True).start()
+
+            class _P:
+                pass
+            return _P()
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        # The sweep shells out to `ps` through the Popen just replaced, and it
+        # is not what this measures.
+        monkeypatch.setattr(pin_proxy, "_sweep_orphan_daemons", lambda *a, **k: None)
+        return succ, succ_port, published
+
+    def test_a_teardown_after_the_successor_publishes_still_leaves_it_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """THE CONTROL for the window test above.
+
+        Once the successor's record is on disk the departing daemon is plainly
+        superseded, and that case already worked. Without this the window test
+        cannot tell a fix from a teardown that stopped unwiring altogether.
+        """
+        import socket as _socket
+
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        certdir, cfg, teardown = self._live_daemon(tmp_path, monkeypatch, paths)
+        st = pin_proxy.read_daemon_state(certdir)
+        pin_proxy.wire_global_config(st["port"], certdir / "ca.pem")
+
+        succ = _socket.socket()
+        succ.bind(("127.0.0.1", 0))
+        succ.listen(1)
+        succ_port = succ.getsockname()[1]
+        assert succ_port != 36301, succ_port
+        try:
+            self._successor(certdir, succ_port, os.getppid())
+            teardown("refcount")
+            assert pin_proxy._wired_port() == st["port"], (
+                "unwired a published successor"
+            )
+        finally:
+            succ.close()
+
+    def test_a_teardown_with_no_successor_still_unwires(self, tmp_path, monkeypatch):
+        """...and the window guard must not disable the unwire it guards.
+
+        With no handover in flight and no successor, the config names a port
+        this daemon has just stopped serving. Leaving it is the
+        ConnectionRefused outage `_teardown` exists to prevent.
+        """
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        certdir, cfg, teardown = self._live_daemon(tmp_path, monkeypatch, paths)
+        st = pin_proxy.read_daemon_state(certdir)
+        pin_proxy.wire_global_config(st["port"], certdir / "ca.pem")
+        teardown("refcount")
+        assert pin_proxy._wired_port() is None, (
+            "a daemon that stopped serving left the config naming its port — "
+            "every later session dials an address nobody answers"
+        )
+
+    def _live_daemon(self, tmp_path, monkeypatch, paths):
+        """A REAL daemon_main up to the point it installs its signal teardown,
+        returning that teardown closure — the one both the refcount watcher and
+        the SIGTERM handler call. A stand-in closure cannot race the state it
+        does not own, which is how the window went unmeasured."""
+        from cswap_pin import proxy as pin_proxy
+
+        assert Path(pin_proxy.__file__).resolve().is_relative_to(
+            Path(__file__).resolve().parent.parent
+        ), pin_proxy.__file__
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(exist_ok=True)
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text("{}")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+
+        class _Reached(Exception):
+            pass
+
+        box = {}
+
+        def _grab(cleanup):
+            box["teardown"] = cleanup
+            raise _Reached
+
+        monkeypatch.setattr(pin_proxy, "_install_signal_teardown", _grab)
+        try:
+            pin_proxy.daemon_main("1", "a@b.c", certdir)
+        except _Reached:
+            pass
+        st = pin_proxy.read_daemon_state(certdir)
+        assert st and st["pid"] == os.getpid(), st
+        assert st["port"] != 36301, st
+        return certdir, cfg, box["teardown"]
 
 
 class TestHealRestoresWithoutRestart:

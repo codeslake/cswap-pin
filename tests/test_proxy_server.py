@@ -1296,6 +1296,233 @@ class TestChainRediscovery:
         assert _ambient_proxy(env) == "http://127.0.0.1:9901"
 
 
+class TestTheChainFallsThroughToTheNextHop:
+    """A dead hop must fall through to the hop BEHIND it, not to a direct dial.
+
+    On a machine behind a corporate TLS-inspecting proxy, a direct dial is not
+    "no proxy" — it is the inspector, and its leaf has no Authority Key
+    Identifier, so OAuth against claude.ai fails. Measured on this host, the
+    four egress paths give four different leaves and only the outer proxy
+    reaches the real one:
+
+        DIRECT          issuer=CN=SSL Decryption cert       aki=NO
+        via privoxy     issuer=CN=WE1,O=Google Trust …      aki=yes
+        via CCF         issuer=CN=cache-fix forward-proxy CA
+        via pin         issuer=CN=cswap pin-proxy CA
+
+    So the hint recording ONE hop is the defect: when the recorded hop is the
+    inner cache proxy and it goes away, the only correct target is the outer
+    proxy it was itself chaining to.
+    """
+
+    def _dead_port(self) -> int:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        assert port != 36301, port
+        return port
+
+    def _refusing_chain(self):
+        """Accepts the CONNECT and answers 502 — a restarting cache proxy,
+        whose listener is up before its proxy logic is ready."""
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        assert srv.getsockname()[1] != 36301, srv.getsockname()
+        seen = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                seen.append(1)
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    c.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return srv, srv.getsockname()[1], seen
+
+    def _proxy_over(self, certdir, tmp_path, first_url, next_url, monkeypatch):
+        """A daemon whose recorded chain is ``first_url`` with ``next_url``
+        behind it, pointed at an upstream signed by a CA it CANNOT trust.
+
+        The foreign CA is the discriminator: verification is skipped only for a
+        loopback hop, so a 200 proves the request went through a recorded hop
+        and a refusal proves it did not.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir(exist_ok=True)
+        ensure_ca(foreign, "api.anthropic.com")
+        upstream = _FakeUpstream(foreign)
+
+        write_upstream_hint(certdir, first_url, next_hop=next_url)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+            rediscover_chain=True,
+        )
+        proxy.start()
+        assert proxy.port != 36301, proxy.port
+        return proxy, upstream
+
+    def test_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """CCF is DOWN: nothing is listening on the recorded hop.
+
+        The dial raises OSError and the code dropped to
+        `socket.create_connection(self._upstream)` — a direct dial, i.e. the
+        corporate inspector on this host. No error, nothing on screen.
+        """
+        outer = _LoopbackConnectProxy(("127.0.0.1", 0))
+        dead = self._dead_port()
+        proxy = upstream = None
+        try:
+            outer._target = None  # set below, once the upstream exists
+            proxy, upstream = self._proxy_over(
+                certdir, tmp_path,
+                f"http://127.0.0.1:{dead}",
+                f"http://127.0.0.1:{outer.port}",
+                monkeypatch,
+            )
+            outer._target = ("127.0.0.1", upstream.port)
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert outer.connects == 1, (
+                "the dead hop fell through to a DIRECT dial instead of to the "
+                "hop behind it — on this host that is the corporate inspector"
+            )
+            assert status == 200, "the next hop was not usable"
+        finally:
+            if proxy:
+                proxy.stop()
+            if upstream:
+                upstream.stop()
+            outer.stop()
+
+    def test_D2_a_chain_that_refuses_the_CONNECT_uses_the_next_hop(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """CCF is RESTARTING: its listener is up, its proxy logic is not.
+
+        `_connect_ok` is false, and the `raise OSError` that follows was caught
+        by nobody — the `except OSError` wrapped only the dial. So a hop that
+        accepts and then fails did not even reach the (wrong) direct fallback:
+        it killed the request outright.
+        """
+        refusing, refusing_port, seen = self._refusing_chain()
+        outer = _LoopbackConnectProxy(("127.0.0.1", 0))
+        proxy = upstream = None
+        try:
+            outer._target = None
+            proxy, upstream = self._proxy_over(
+                certdir, tmp_path,
+                f"http://127.0.0.1:{refusing_port}",
+                f"http://127.0.0.1:{outer.port}",
+                monkeypatch,
+            )
+            outer._target = ("127.0.0.1", upstream.port)
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert seen, "premise: the refusing hop was never dialled"
+            assert outer.connects == 1, (
+                "a hop that ACCEPTED and then refused the CONNECT did not fall "
+                "through at all — the OSError it raises is caught by nobody"
+            )
+            assert status == 200, "the next hop was not usable"
+        finally:
+            if proxy:
+                proxy.stop()
+            if upstream:
+                upstream.stop()
+            outer.stop()
+            refusing.close()
+
+    def test_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
+        """Where the second hop comes from: the inner proxy reports its own
+        upstream while it is alive, and a launch records both. Probed rather
+        than inherited, because `cswap pin` runs in a plain shell that has
+        neither value in its environment."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        assert port != 36301, port
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = json.dumps(
+                        {"status": "ok", "forward_proxy": True,
+                         "https_proxy": "http://127.0.0.1:8118"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            nxt = pp._probe_next_hop(f"http://127.0.0.1:{port}")
+            assert nxt == "http://127.0.0.1:8118"
+            pp.write_upstream_hint(
+                certdir, f"http://127.0.0.1:{port}", next_hop=nxt
+            )
+            assert pp._chain_hops(certdir)[-1].address == ("127.0.0.1", 8118)
+        finally:
+            srv.close()
+
+    def test_a_cache_proxy_that_is_not_answering_records_no_next_hop(self, certdir):
+        """Never record a stale hop. A hop that cannot be confirmed right now
+        is worse than none: the walk would spend a dial on it before reaching
+        the branch that decides what to do with no chain at all."""
+        import cswap_pin.proxy as pp
+
+        dead = self._dead_port()
+        nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}")
+        assert nxt is None
+        pp.write_upstream_hint(certdir, f"http://127.0.0.1:{dead}", next_hop=nxt)
+        hops = pp._chain_hops(certdir)
+        assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
+
+
 class TestAbsoluteFormPassthrough:
     """The native auto-updater and telemetry use axios in plain-proxy mode:
     they send `GET http://host/path` (absolute-form, no CONNECT). The proxy
