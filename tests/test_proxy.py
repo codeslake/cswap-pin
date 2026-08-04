@@ -1523,6 +1523,7 @@ class TestKillDaemon:
 
     def test_escalates_to_kill(self, monkeypatch):
         import os
+        import time
         from cswap_pin import proxy as pin_proxy
         sent = []
         alive = {"pid": True}
@@ -1532,6 +1533,12 @@ class TestKillDaemon:
                 alive["pid"] = False
         monkeypatch.setattr(pin_proxy.os, "kill", fake_kill)
         monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: alive["pid"])
+        # The escalation loop is `_DRAIN_SECONDS * 10 + 20` ticks of a real
+        # 0.1s sleep, so an unpatched run of this test WAITS THE FULL CEILING —
+        # measured 32.02s, four times the rest of the suite put together. The
+        # ticks are the mechanism under test; the wall-clock is not. The
+        # sibling test at `_kill_daemon(4242)` already patches this.
+        monkeypatch.setattr(time, "sleep", lambda s: None)
         pin_proxy._kill_daemon(4321)
         assert 15 in sent and 9 in sent  # TERM first, then KILL escalation
 
@@ -2610,7 +2617,7 @@ class TestTheDaemonWatchesItsOwnCode:
         certdir.mkdir(exist_ok=True)
         return certdir
 
-    def test_a_replaced_module_makes_the_daemon_hand_over(self, monkeypatch):
+    def test_a_replaced_module_makes_the_daemon_hand_over(self, tmp_path, monkeypatch):
         """The positive case: fingerprint moved -> stop, spawn, done.
 
         Driven through `_watch_own_code` directly rather than through a real
@@ -2634,9 +2641,10 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
                             lambda n, e, c: events.append(("spawn", n)) or 41234)
 
+        certdir = self._certdir(tmp_path)
         done = threading.Event()
         pin_proxy._watch_own_code(
-            _Srv(), "1", "a@example.com", Path("/nonexistent"),
+            _Srv(), "1", "a@example.com", certdir,
             done, teardown=lambda reason: events.append(("teardown", reason)),
             interval=0.01, _own_fingerprint="fp-old",
         )
@@ -2654,7 +2662,7 @@ class TestTheDaemonWatchesItsOwnCode:
         assert not [e for e in events if e[0] == "teardown"], events
         assert done.is_set()
 
-    def test_an_unchanged_module_never_hands_over(self, monkeypatch):
+    def test_an_unchanged_module_never_hands_over(self, tmp_path, monkeypatch):
         """THE CONTROL. Without it the suite cannot tell "recycles when the
         code changed" from "recycles always", and the second would replace a
         22-hour outage with a daemon that restarts itself forever."""
@@ -2672,20 +2680,21 @@ class TestTheDaemonWatchesItsOwnCode:
             def stop(self, drain=None):
                 events.append(("stop", drain))
 
+        certdir = self._certdir(tmp_path)
         done = threading.Event()
         # Ends the loop from the outside after several intervals, exactly as a
         # normal teardown does — so "did not recycle" is observed across many
         # ticks rather than inferred from one.
         threading.Timer(0.25, done.set).start()
         pin_proxy._watch_own_code(
-            _Srv(), "1", "a@example.com", Path("/nonexistent"),
+            _Srv(), "1", "a@example.com", certdir,
             done, teardown=lambda reason: events.append(("teardown", reason)),
             interval=0.01, _own_fingerprint="fp-same",
         )
 
         assert events == [], events
 
-    def test_a_successor_that_never_comes_up_unwires(self, monkeypatch):
+    def test_a_successor_that_never_comes_up_unwires(self, tmp_path, monkeypatch):
         """We have already stopped serving, so the config names a port nothing
         serves. That is the ConnectionRefused outage `_teardown` exists to
         prevent — reached here by the recycle itself if it does not fall back."""
@@ -2703,9 +2712,10 @@ class TestTheDaemonWatchesItsOwnCode:
             def stop(self, drain=None):
                 events.append(("stop", drain))
 
+        certdir = self._certdir(tmp_path)
         done = threading.Event()
         pin_proxy._watch_own_code(
-            _Srv(), "1", "a@example.com", Path("/nonexistent"),
+            _Srv(), "1", "a@example.com", certdir,
             done, teardown=lambda reason: events.append(("teardown", reason)),
             interval=0.01, _own_fingerprint="fp-old",
         )
@@ -2739,6 +2749,147 @@ class TestTheDaemonWatchesItsOwnCode:
         assert started, (
             "daemon_main must START a _watch_own_code thread; a self-recycle "
             "nothing calls is exactly the 22h outage this release fixes"
+        )
+
+    def test_the_watchdog_is_handed_the_account_and_email_in_that_order(self):
+        """The AST test above proves the thread STARTS, not that it is handed
+        the right arguments. Swapping `account_num` and `email` in the `args=`
+        tuple survived the whole suite — a successor spawned for account
+        "user@example.com" with email "1" is a recycle that cannot work, and
+        nothing said so."""
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy as pin_proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+        call = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "attr", None) == "start"
+            and any(
+                getattr(kw.value, "id", None) == "_watch_own_code"
+                for kw in getattr(getattr(n.func, "value", None), "keywords", [])
+            )
+        )
+        args = next(
+            kw.value for kw in call.func.value.keywords if kw.arg == "args"
+        )
+        names = [getattr(e, "id", None) for e in args.elts]
+        assert names[1:4] == ["account_num", "email", "certdir"], (
+            f"_watch_own_code's args are {names} — the successor is spawned "
+            "with whatever lands in positions 2 and 3, so a swap here pins the "
+            "wrong account with no error anywhere"
+        )
+
+    def test_a_raising_spawn_does_not_leave_a_zombie(self, tmp_path, monkeypatch):
+        """C3: `_spawn_daemon` RAISING (fork() EAGAIN under a post-deploy herd
+        is the realistic trigger) hit the `except Exception` guard, which
+        logged and returned WITHOUT calling teardown and WITHOUT done.set().
+
+        Measured on 0.1.27: server STOPPED, teardown not called, done not set —
+        so the process stays alive serving nothing while `.claude.json` still
+        names its port, and `daemon_main`'s main thread blocks on `done.wait()`
+        forever. That is the ConnectionRefused outage the module exists to
+        prevent, produced by the code meant to prevent it.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        events = []
+        fps = iter(["fp-old", "fp-new", "fp-new", "fp-new"])
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: next(fps))
+
+        def _boom(n, e, c):
+            raise OSError(11, "Resource temporarily unavailable")
+
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", _boom)
+
+        class _Srv:
+            def stop(self, drain=None):
+                events.append(("stop", drain))
+
+        certdir = self._certdir(tmp_path)
+        done = threading.Event()
+        pin_proxy._watch_own_code(
+            _Srv(), "1", "a@example.com", certdir, done,
+            teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01, _own_fingerprint="fp-old",
+        )
+
+        # THE PRECONDITION, asserted rather than assumed: this test is only
+        # about the raise if the handover actually got as far as stopping.
+        assert any(e[0] == "stop" for e in events), (
+            "premise: the watchdog must have stopped the server before the "
+            "spawn; this run never reached the handover"
+        )
+        assert [e for e in events if e[0] == "teardown"], (
+            "the spawn raised, the server is stopped, and nothing unwired — "
+            "every later session dials a port nobody serves"
+        )
+        assert done.is_set(), (
+            "done was never set, so daemon_main's main thread blocks on "
+            "done.wait() forever: a live process serving nothing"
+        )
+
+    def test_the_handover_is_serialized_by_the_spawn_lock(self, tmp_path, monkeypatch):
+        """C2: every other `_spawn_daemon` caller takes `_spawn_lock` (heal,
+        ensure_proxy). The watchdog did not.
+
+        It matters most in the shape this release CREATES: a deploy replaces
+        proxy.py, so every daemon on the box goes stale in the same instant and
+        their timers fire together. Two unserialized spawns leave one successor
+        orphaned, invisible to the sweep, holding a port forever.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        spawned = []
+        fps = iter(["fp-old", "fp-new", "fp-new", "fp-new"])
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: next(fps))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda n, e, c: spawned.append(n) or 41234)
+
+        class _Srv:
+            def stop(self, drain=None):
+                pass
+
+        # Hold the spawn lock from another thread for the whole handover. If
+        # the watchdog takes it, it cannot spawn while we hold it.
+        held = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            with pin_proxy._spawn_lock(certdir):
+                held.set()
+                release.wait(timeout=5)
+
+        t = threading.Thread(target=_holder, daemon=True)
+        t.start()
+        assert held.wait(timeout=5), "premise: the holder never took the lock"
+
+        done = threading.Event()
+        w = threading.Thread(target=pin_proxy._watch_own_code, args=(
+            _Srv(), "1", "a@example.com", certdir, done, lambda r: None, 0.01,
+            "fp-old"), daemon=True)
+        w.start()
+        w.join(timeout=1.0)
+
+        blocked = not spawned
+        release.set()
+        t.join(timeout=5)
+        w.join(timeout=5)
+
+        assert blocked, (
+            "the watchdog spawned while another holder had the spawn lock — "
+            "two daemons on one certdir can both recycle at the same tick"
         )
 
 
