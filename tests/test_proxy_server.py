@@ -1616,6 +1616,131 @@ class TestChainRediscovery:
             outer.stop()
             refusing.close()
 
+    def test_D3_the_blind_tunnel_uses_the_next_hop_too(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """THE REMOTE CONTROL PATH, and it walked no chain at all.
+
+        D1 and D2 cover the MITM path (api.anthropic.com). Everything else —
+        including the WebSocket Remote Control RECEIVES on, whose host comes
+        from the /bridge response and is NOT api.anthropic.com — takes
+        `_blind_tunnel`, which read ONE hop and fell straight to a direct
+        dial. So the fall-through those two tests pin did not exist on the
+        path where a missed hop is least visible: Claude Code keeps
+        heartbeating and posting through the MITM at 200 while nothing sent
+        from claude.ai arrives.
+
+        A direct dial is not "no proxy" here. On a host whose direct route is
+        a TLS-inspecting corporate proxy it is the inspector, and on a host
+        with no direct route out it is a dead connection.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        dead = self._dead_port()
+        # The hop BEHIND the dead one. A blind tunnel is opaque by
+        # definition, so the discriminator is whether this hop is DIALLED at
+        # all — not what comes back through it.
+        inner = _LoopbackConnectProxy(("127.0.0.1", 1))
+        proxy = None
+        try:
+            write_upstream_hint(
+                certdir,
+                f"http://127.0.0.1:{dead}",
+                next_hop=f"http://127.0.0.1:{inner.port}",
+            )
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: None,
+                rediscover_chain=True,
+            )
+            proxy.start()
+            assert proxy.port != 36301, proxy.port
+
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                # A host that is NOT api.anthropic.com: the blind-tunnel path.
+                c.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                c.settimeout(10)
+                try:
+                    c.recv(256)
+                except OSError:
+                    pass
+            finally:
+                c.close()
+
+            assert inner.connects == 1, (
+                "the blind tunnel fell through a dead hop to a DIRECT dial "
+                "instead of to the hop behind it — on a host with an "
+                "inspecting egress proxy that IS the inspector, and Remote "
+                "Control receives on this path"
+            )
+        finally:
+            if proxy:
+                proxy.stop()
+            inner.stop()
+
+    def test_D4_the_plain_relay_uses_the_next_hop_too(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """The absolute-form path, the third one, with the same single hop.
+
+        `GET http://host/x` from the auto-updater and telemetry takes this
+        branch. It read one hop and, when that hop was dead, dialled the
+        ORIGIN direct — the same wrong fall-through D1 fixed for the MITM path
+        and D3 for the blind tunnel. On a host with no direct route out that
+        is not a downgrade, it is a failure.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+
+        secret = ensure_proxy_secret(certdir)
+        dead = self._dead_port()
+        inner = _LoopbackConnectProxy(("127.0.0.1", 1))
+        proxy = None
+        try:
+            write_upstream_hint(
+                certdir,
+                f"http://127.0.0.1:{dead}",
+                next_hop=f"http://127.0.0.1:{inner.port}",
+            )
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: None,
+                rediscover_chain=True,
+            )
+            proxy.start()
+            assert proxy.port != 36301, proxy.port
+
+            import base64
+
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"GET http://example.com/x HTTP/1.1\r\n"
+                    b"Host: example.com\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                )
+                c.settimeout(10)
+                try:
+                    c.recv(256)
+                except OSError:
+                    pass
+            finally:
+                c.close()
+
+            assert inner.connects == 1, (
+                "the plain relay fell through a dead hop to a DIRECT dial at "
+                "the ORIGIN instead of to the hop behind it — the auto-updater "
+                "and telemetry take this path"
+            )
+        finally:
+            if proxy:
+                proxy.stop()
+            inner.stop()
+
     def test_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
         """Where the second hop comes from: the inner proxy reports its own
         upstream while it is alive, and a launch records both. Probed rather

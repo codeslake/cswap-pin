@@ -4098,6 +4098,14 @@ def _release_daemon_state(certdir: Path) -> bool:
 
 
 _CODE_WATCH_INTERVAL_S = 30.0
+# Consecutive failed handovers before the watchdog stops trying. A ceiling on
+# NEVER-SUCCEEDING, not on total recycles: a daemon that hands over cleanly
+# and later goes stale again starts from zero. Without one, a successor that
+# can never start (a broken deploy, a missing dependency) is retried forever
+# — and a peer measured exactly that shape at ~3.75 attempts/sec on the other
+# side of this seam, with the port held the whole time so nothing refused and
+# nobody noticed.
+_HANDOVER_ATTEMPTS = 5
 
 
 def _watch_own_code(
@@ -4151,6 +4159,7 @@ def _watch_own_code(
     must upgrade, and the drain in step 1 is what protects its in-flight work.
     """
     own = _own_fingerprint if _own_fingerprint is not None else daemon_fingerprint()
+    attempts = 0
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
     while not done.wait(interval):
@@ -4227,7 +4236,31 @@ def _watch_own_code(
                     handed_over = True
                     return
                 _log_lifecycle("successor did not come up")
-            return
+            # TRY AGAIN, BOUNDED. Returning here left the thread dead with the
+            # code on disk still new, so the daemon served the stale code
+            # forever — the 22-hour outage this watchdog exists to end,
+            # reached one failed spawn later instead of by having no watchdog.
+            # The machine this is FOR is the one whose sessions never
+            # relaunch, so nothing else will ever try.
+            #
+            # And bounded rather than endless, for the failure a peer measured
+            # on the other side of this seam: an unbounded respawn against a
+            # child that can never start ran at ~3.75/sec with the port held
+            # the whole time, so callers waited out a 15s deadline instead of
+            # failing over in 0ms. A start failure is QUIETER once the port
+            # survives it, which is exactly why it needs a ceiling.
+            #
+            # The counter is on CONSECUTIVE failures, so a daemon that
+            # recycles cleanly years apart still gets its full budget each
+            # time — the ceiling is on never-succeeding, not on total tries.
+            attempts += 1
+            if attempts >= _HANDOVER_ATTEMPTS:
+                _log_lifecycle(
+                    f"{attempts} handovers failed in a row — staying on the "
+                    f"current code, still serving"
+                )
+                return
+            continue
         except Exception as exc:  # noqa: BLE001 — a watchdog must never raise
             # A raise here used to kill the thread silently and put the daemon
             # back in the state this whole release exists to end: correct
@@ -5264,33 +5297,43 @@ class PinProxy:
         # dialled the origin direct — bypassing the egress proxy on exactly the
         # traffic (auto-updater, telemetry) it was added to rescue, and hard
         # failing where there is no direct route out.
-        chain = _as_chain(self._current_chain())
-        try:
-            if chain:
+        # EVERY HOP, like the MITM path and the blind tunnel. Reading only the
+        # first one meant a dead hop fell through to a dial at the ORIGIN,
+        # skipping the hop behind it — and on a host with no direct route out
+        # that is not a downgrade, it is a failure. This is the auto-updater's
+        # and telemetry's path.
+        up = head = None
+        for chain in self._chain_candidates():
+            try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
-                # A plain proxy takes the absolute-form line as-is. Our own
-                # credential for the chain rides here, not the client's.
-                head = (
-                    f"{method} {url} HTTP/1.1\r\n"
-                    + "\r\n".join(headers)
-                    + "\r\n"
-                    + chain.connect_headers()
-                    + "\r\n"
-                )
-            else:
+            except (OSError, ssl.SSLError):
+                up = None
+                continue
+            # A plain proxy takes the absolute-form line as-is. Our own
+            # credential for the chain rides here, not the client's.
+            head = (
+                f"{method} {url} HTTP/1.1\r\n"
+                + "\r\n".join(headers)
+                + "\r\n"
+                + chain.connect_headers()
+                + "\r\n"
+            )
+            break
+        if up is None:
+            try:
                 up = socket.create_connection((host, port), timeout=15)
                 if secure:
                     # An https:// origin dialled direct needs the handshake,
                     # verified. Without it we sent cleartext HTTP at a TLS
                     # port and the request simply failed.
                     up = _verifying_ctx().wrap_socket(up, server_hostname=host)
-                path = split.path or "/"
-                if split.query:
-                    path += "?" + split.query
-                head = f"{method} {path} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
-        except (OSError, ssl.SSLError):
-            conn.close()
-            return
+            except (OSError, ssl.SSLError):
+                conn.close()
+                return
+            path = split.path or "/"
+            if split.query:
+                path += "?" + split.query
+            head = f"{method} {path} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
         try:
             # Connect budget only, same as the tunnel: _pump streams, and a
             # read timeout left on the socket tears down a response that is
@@ -5748,7 +5791,6 @@ class PinProxy:
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
-        chain = _as_chain(self._current_chain())
         # Trace the tunnel too. Remote Control receives over a WebSocket to the
         # ingress host the /bridge response names — NOT api.anthropic.com — so
         # it lands here, not in the MITM. Logging only the MITM made an absent
@@ -5762,17 +5804,21 @@ class PinProxy:
             )
             _TRACE.flush()
         up = None
-        if chain:
-            # Try the chain first, but never let it be the only answer. Remote
-            # Control RECEIVES over a WebSocket to the ingress host named in the
-            # /bridge response — a host the egress proxy has no rule for, and
-            # which a filtering proxy (one with per-domain forwards, a
-            # corporate MITM) may refuse outright. Closing here made that
-            # refusal invisible: the session kept heartbeating and posting
-            # events through the MITM path at 200, the pin still read as
-            # applied, and nothing sent from claude.ai ever arrived. Measured
-            # where the same session on a machine whose chain let
-            # the host through received normally.
+        # EVERY HOP, not just the first. This path used to read one hop and
+        # fall straight to a direct dial, so the fall-through the MITM path
+        # walks did not exist here — on the path where a missed hop is least
+        # visible. Remote Control RECEIVES over a WebSocket to the ingress
+        # host the /bridge response names, which is not api.anthropic.com and
+        # therefore lands here: with the hop missed, the session keeps
+        # heartbeating and posting through the MITM at 200 while nothing sent
+        # from claude.ai arrives.
+        #
+        # Try each hop, but never let the chain be the only answer. A
+        # filtering proxy (per-domain forwards, a corporate MITM) may refuse
+        # the ingress host outright, and closing here made that refusal
+        # invisible. Measured where the same session on a machine whose chain
+        # let the host through received normally.
+        for chain in self._chain_candidates():
             try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
                 up.sendall(
@@ -5785,18 +5831,22 @@ class PinProxy:
                     if h in ("", None):
                         break
                 if not _connect_ok(status):
-                    # Refused BY the chain (not a transport failure) — the one
-                    # case where a direct dial is both correct and necessary.
+                    # Refused BY this hop (not a transport failure). Try the
+                    # hop behind it; a direct dial is what happens only when
+                    # none of them will carry it.
                     if _TRACE is not None:
                         _TRACE.write(
                             f"[c{getattr(self._local, 'cid', 0)}] chain refused "
-                            f"{target} ({(status or '').strip()}) — dialling direct\n"
+                            f"{target} ({(status or '').strip()}) — next hop\n"
                         )
                         _TRACE.flush()
                     up.close()
                     up = None
+                    continue
             except OSError:
                 up = None
+                continue
+            break
         if up is not None and (carrying := self._tunnel_is_open(up)) is None:
             # A 200 is not proof the chain reached the host. a filtering proxy answers
             # CONNECT optimistically and only then dials; when that dial fails
