@@ -1682,8 +1682,19 @@ class TestDaemonPortStability:
             assert proxy.port == port, "did not serve the port it was handed"
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
             proxy.stop(drain=0)
-            # THE POINT: our stop must not take the port with it.
+            # THE POINT: our stop must not take the port with it. The test's
+            # own `lsn` would keep the fd alive no matter what stop() did, so
+            # drop it first and force a collection — that is what exposes a
+            # release that merely unreferences the socket instead of
+            # detaching it (CPython's finalizer closes the fd, and the
+            # supervisor's port dies with our handover).
+            import gc
+
+            lsn_fd = lsn.detach()
+            gc.collect()
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
+            os.close(lsn_fd)
+            return
         finally:
             os.environ.pop("LISTEN_FDS", None)
             os.environ.pop("LISTEN_PID", None)
