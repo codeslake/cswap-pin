@@ -4841,6 +4841,10 @@ class PinProxy:
             conn.close()
             return
         try:
+            # Connect budget only, same as the tunnel: _pump streams, and a
+            # read timeout left on the socket tears down a response that is
+            # merely quiet — an SSE gap or a slow origin — rather than dead.
+            up.settimeout(None)
             up.sendall(head.encode("latin1"))
             _pump(conn, up)
         finally:
