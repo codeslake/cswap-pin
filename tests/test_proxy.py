@@ -2694,10 +2694,18 @@ class TestTheDaemonWatchesItsOwnCode:
 
         assert events == [], events
 
-    def test_a_successor_that_never_comes_up_unwires(self, tmp_path, monkeypatch):
-        """We have already stopped serving, so the config names a port nothing
-        serves. That is the ConnectionRefused outage `_teardown` exists to
-        prevent — reached here by the recycle itself if it does not fall back."""
+    def test_a_successor_that_never_comes_up_keeps_serving_the_old_code(
+        self, tmp_path, monkeypatch
+    ):
+        """A recycle that cannot spawn has no reason to end the pin.
+
+        This process is intact and the code it runs is what was working a
+        moment ago; stopping the listener was OUR step, not a failure of it.
+        Unwiring here leaves the machine unpinned until a human re-pins it by
+        hand, which is a strictly worse outcome than running one release
+        behind. Only when the listener cannot be recovered either does the
+        config genuinely name a dead port — that case is the next test.
+        """
         import threading
 
         from cswap_pin import proxy as pin_proxy
@@ -2707,6 +2715,44 @@ class TestTheDaemonWatchesItsOwnCode:
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: next(fps))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c: None)
+        monkeypatch.setattr(pin_proxy, "_resume_serving",
+                            lambda srv: events.append(("resume", True)) or True)
+
+        class _Srv:
+            def stop(self, drain=None):
+                events.append(("stop", drain))
+
+        certdir = self._certdir(tmp_path)
+        done = threading.Event()
+        pin_proxy._watch_own_code(
+            _Srv(), "1", "a@example.com", certdir,
+            done, teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01, _own_fingerprint="fp-old",
+        )
+
+        assert ("resume", True) in events, events
+        assert not [e for e in events if e[0] == "teardown"], (
+            "the daemon resumed serving, so nothing should have unwired", events)
+        assert not done.is_set(), "a resumed daemon must keep running"
+
+    def test_a_successor_that_never_comes_up_unwires_if_it_cannot_resume(
+        self, tmp_path, monkeypatch
+    ):
+        """The other half: no successor AND the listener will not come back.
+
+        Now the config really does name a port nothing answers, which is the
+        ConnectionRefused outage `_teardown` exists to prevent.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        events = []
+        fps = iter(["fp-old", "fp-new", "fp-new"])
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: next(fps))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda n, e, c: None)
+        monkeypatch.setattr(pin_proxy, "_resume_serving", lambda srv: False)
 
         class _Srv:
             def stop(self, drain=None):
@@ -2721,6 +2767,49 @@ class TestTheDaemonWatchesItsOwnCode:
         )
 
         assert [e for e in events if e[0] == "teardown"], events
+        assert done.is_set(), "a daemon that gave up must release daemon_main"
+
+    def test_resume_refuses_a_port_the_live_sessions_are_not_using(
+        self, tmp_path
+    ):
+        """Listening again is not enough — it has to be the RECORDED port.
+
+        A session's HTTPS_PROXY is fixed at exec, so a resume that lands
+        anywhere else is a second outage wearing the same log line.
+        """
+        import json
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = self._certdir(tmp_path)
+        srv = pin_proxy.PinProxy(certdir, lambda: "tok")
+        srv.start()
+        port = srv.port
+        (certdir / "proxy.json").write_text(json.dumps({"pid": 1, "port": port}))
+        srv.stop(drain=0)
+
+        assert pin_proxy._resume_serving(srv) is True
+        assert srv.port == port
+        socket.create_connection(("127.0.0.1", port), timeout=1.0).close()
+        srv.stop(drain=0)
+
+        # And the refusal: someone else holds the recorded port.
+        srv2 = pin_proxy.PinProxy(certdir, lambda: "tok")
+        srv2.start()
+        taken = srv2.port
+        (certdir / "proxy.json").write_text(json.dumps({"pid": 1, "port": taken}))
+        srv2.stop(drain=0)
+        squat = socket.socket()
+        squat.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squat.bind(("127.0.0.1", taken))
+        squat.listen(1)
+        try:
+            assert pin_proxy._resume_serving(srv2) is False, (
+                "resuming on a different port is not a resume")
+        finally:
+            squat.close()
+            srv2.stop(drain=0)
 
     def test_daemon_main_starts_the_watchdog(self):
         """The watchdog must be WIRED IN, not merely defined.
