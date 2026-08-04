@@ -303,27 +303,32 @@ def _carries(body: bytes, ca_path: Path) -> bool:
     A DER comparison, not a subject-name one: `_make_ca` gives every cswap-pin
     CA the identical subject `CN=cswap pin-proxy CA`, so a name check would
     accept a RETIRED CA of our own — the exact case this is written to catch.
+
+    Goes through `_load_cert` at both sites (``want`` and each block), not a
+    raw `x509.load_pem_x509_certificate`. A bare load treats
+    `CryptographyDeprecationWarning` as a parse failure under any ambient
+    warnings-as-errors filter, same as the bug `_load_cert`'s guard exists to
+    fix — `_make_ca` never mints a zero-serial CA (it uses
+    `x509.random_serial_number()`, which per RFC 5280 is never 0), but
+    ``ca_path`` can name a CA a DIFFERENT MITM published into the shared trust
+    dir, and that one is not ours to constrain.
     """
-    try:
-        want = x509.load_pem_x509_certificate(ca_path.read_bytes()).public_bytes(
-            serialization.Encoding.DER
-        )
-    except Exception:  # noqa: BLE001 — no CA to look for: nothing carries it
+    want_cert = _load_cert(_read_or_empty(ca_path))
+    if want_cert is None:  # no CA to look for: nothing carries it
         return False
+    want = want_cert.public_bytes(serialization.Encoding.DER)
     for label, _head, _end, block in _pem_blocks(body):
         if label != b"CERTIFICATE":
             continue
-        try:
-            if (
-                x509.load_pem_x509_certificate(block).public_bytes(
-                    serialization.Encoding.DER
-                )
-                == want
-            ):
-                return True
-        except Exception:  # noqa: BLE001 — a block no loader reads is not a match
+        cert = _load_cert(block)
+        if cert is None:  # a block no loader reads is not a match
             continue
+        if cert.public_bytes(serialization.Encoding.DER) == want:
+            return True
     return False
+
+
+_LOAD_CERT_LOCK = threading.Lock()
 
 
 def _load_cert(block: bytes):
@@ -343,12 +348,35 @@ def _load_cert(block: bytes):
     accept every one. Counts on the other two machines: 8 and 11.
 
     Nothing promotes the warning today. The reason this is a guard rather than
-    a note is that the warning's own text is a scheduled promise — "Loading
-    this certificate will cause an exception in a future release" — and the
-    floor is `cryptography>=42.0` with no ceiling, so one `uv tool upgrade`
-    turns a silent 6-to-11 root drop permanent, absorbed by the same `except`.
+    a note is that ambient `-W error` (or an equivalent `filterwarnings`
+    entry the caller's process installs) is a real, measured case on this
+    box, and the floor is `cryptography>=42.0` with no ceiling — a future
+    minor version can add more categories the SAME way. What this guard does
+    NOT cover: the warning's own text is a scheduled promise — "Loading this
+    certificate will cause an exception in a future release" — and
+    `simplefilter("ignore")` suppresses a *warning*, not an *exception*.
+    Measured: once cryptography makes good on that promise and raises
+    directly, this guard drops the cert exactly as the unguarded `except`
+    does today, because there is no warning left for it to ignore. The
+    floor stops that upgrade from happening silently underfoot (see
+    `pyproject.toml`), but this guard will not survive it.
+
+    LOCKED, because `warnings.catch_warnings()` snapshots and restores
+    process-global state (`warnings.filters`, `showwarning`,
+    `_showwarnmsg_impl`) and this function is reachable from the daemon's
+    `watch_refcount` thread concurrently with per-connection `_serve_client`
+    threads. Measured (forced, deterministic interleave, not GIL timing
+    luck): thread B enters, waits for thread A to install its own
+    `simplefilter("ignore")`, then exits — restoring B's PRE-ignore snapshot
+    — before A's load runs, so A's own "ignore" is gone when A's warning
+    fires and A's certificate is dropped. `except Warning:` does not fix
+    this or the "no test can detect the guard's removal" gap either: it
+    would still race, and when a warning fires as an error the load
+    ABORTS — there is no certificate object for a handler to hand back.
+    Locking the whole guarded section removes the interleave rather than
+    trying to detect it after the fact.
     """
-    with warnings.catch_warnings():
+    with _LOAD_CERT_LOCK, warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
             return x509.load_pem_x509_certificate(block)
@@ -378,7 +406,7 @@ def _parseable_blocks(body: bytes) -> list[bytes]:
         tear at idx 5            5     124
         tear at idx 62          62     124
 
-    Six roots instead of 125, in a file that LOADS CLEANLY — so nothing
+    Five roots instead of 125, in a file that LOADS CLEANLY — so nothing
     downstream flags it: not torn, so the predicate says usable and the node
     oracle says True, our CA being at index 0 ahead of everything lost.
     """
@@ -451,7 +479,7 @@ def _drop_unreadable_blocks(body: bytes) -> bytes:
 
     `blocks=1` there is a TWO-block fixture losing its bad half, not a repair
     rate. On a real store the same code kept only the PREFIX before the tear —
-    6 of 125 for damage at index 5 — until both sites were routed through
+    5 of 125 for damage at index 5 — until both sites were routed through
     `_parseable_blocks`, which resumes. See that function; the count is the
     thing this table does not report and the reason the truncation shipped.
 
@@ -1201,6 +1229,20 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             )
             return salvaged
     except Exception:
+        # A SALVAGE-WRITE FAILURE (disk full, a read-only cert dir) LANDS
+        # HERE TOO, same as a missing/corrupt shared bundle — and collapses
+        # into "no shared bundle" rather than into an error the caller sees.
+        # Measured whether that is still safe on every path that reaches it:
+        # with `ours` already confirmed non-empty above, every branch below
+        # this handler falls through to `return Path(ca_path)` — our own CA,
+        # already on disk and already read once — even when door four's
+        # write ALSO fails. The session never loses the ability to verify
+        # ITS OWN proxy. What it loses is the corporate roots the shared or
+        # merged bundle would have carried, which is the same "narrowing"
+        # this file already treats as a builder-owned, not a reader-owned,
+        # decision everywhere else (see `_bundle_is_usable`'s docstring and
+        # `TestNarrowingIsDeliberatelyUnguarded`) — not a new failure mode
+        # this `except` introduces.
         pass
     # No shared bundle: merge with what THIS env trusts. Deliberately not
     # _merged_ca, which also consults the ambient process environment and a
@@ -2505,10 +2547,20 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
         # demands a credential" are both true at once — a state no user has a
         # model for. Worse, the next `cswap pin` re-arms it against sessions
         # wired in between, which is exactly the 407 storm this is fixed for.
+        #
+        # ABSENT AND REFUSED ARE NOT THE SAME OSError. FileNotFoundError means
+        # there was never anything armed — fine, `False` is correct. Any other
+        # OSError (permission denied, a read-only mount) means the secret is
+        # STILL THERE and this function is about to return the exact `False`
+        # a successful disarm would, which every caller reads as "nothing is
+        # armed". RE-RAISE rather than log: logging still returns the false
+        # `False`, and the caller's next decision — including the next `cswap
+        # pin` re-arming against sessions wired in the meantime — is made on
+        # that return value, not on a log line nobody is required to read.
         try:
             proxy_secret_path(switcher.backup_dir / "pin-proxy").unlink()
-        except OSError:
-            pass  # absent, or unwritable: nothing to disarm either way
+        except FileNotFoundError:
+            pass  # never armed, or already disarmed: nothing to do
         return False
     # Mint the proxy credential HERE, not in the daemon. This is the one path
     # that also rewrites the wiring, so the gate and the URL that satisfies it
@@ -3741,14 +3793,24 @@ def _release_daemon_state(certdir: Path) -> bool:
     can land on the record of the daemon that is now serving. Deleting that
     makes a LIVE daemon invisible: the next launch reads no state and spawns
     another one on top of it.
+
+    A REFUSED delete (permission denied, a read-only mount) is not the same
+    outcome as an ABSENT file, and both used to return the same `False` a
+    successful release does. A refused delete leaves the file naming OUR
+    (about-to-exit) pid, and the next daemon start reads it to decide which
+    port to reclaim — believing a daemon it can never reach. RE-RAISE, so
+    the caller (the departing daemon's teardown) is not told this succeeded.
     """
     try:
         st = read_daemon_state(certdir)
         if st and int(st["pid"]) != os.getpid():
             return True
+    except (ValueError, KeyError, TypeError):
+        pass  # state file is garbage, not ours to protect — fall through
+    try:
         (Path(certdir) / _STATE_FILE).unlink()
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+    except FileNotFoundError:
+        pass  # already gone: nothing to release
     return False
 
 
