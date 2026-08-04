@@ -2148,6 +2148,11 @@ def _wrap_upstream(ctx: ssl.SSLContext, sock, server_hostname: str):
 # upstream's 15s that costs every request 15s and reads as a hang. 2s is
 # ~7x the slowest healthy CONNECT, so a real hop is never cut.
 _HOP_CONNECT_BUDGET_S = 2.0
+# Reaching a hop and getting its answer are two different legs. The dial is
+# loopback or LAN; the CONNECT reply waits for the hop's OWN outbound round
+# trip to the upstream, so it carries real internet latency and needs a budget
+# sized for that, not for the dial. Sharing one number cuts healthy hops.
+_HOP_REPLY_BUDGET_S = 6.0
 
 
 def _dial_chain(
@@ -4186,35 +4191,50 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # reading a streaming reply. An idle daemon returns from here at once.
         proxy.stop(drain=_DRAIN_SECONDS)
         _log_lifecycle(f"drained, {proxy.live_client_count()} client(s) still open")
-        if _release_daemon_state(certdir):
-            # A successor owns the state now. Unwiring here would strip the
-            # config it just wrote and send every new session to no proxy at
-            # all, so the departing daemon leaves the wiring alone.
-            done.set()
-            return
-        # Put ``.claude.json`` back the way we found it. Without this the env
-        # block keeps naming the port we just stopped serving, and Claude Code
-        # applies that block at boot — so EVERY session started afterwards
-        # dials a dead proxy and retries forever, with privoxy and the cache
-        # proxy both healthy and unreachable behind it. Measured on work-mac:
-        # "Unable to connect to API (ConnectionRefused), attempt 14/300", and
-        # the only cure was a human re-pinning by hand.
-        #
-        # An optional feature must not be able to take the required path down
-        # with it. wire_global_config(None, None) restores whatever proxy the
-        # user or their launcher had before we wrote ours, which is exactly
-        # what `pin --clear` already does — the call simply never ran on the
-        # path where the daemon goes away by itself.
+        # ``done`` must be set on EVERY exit from here: ``daemon_main`` blocks
+        # on it and the signal path ends in ``os._exit(0)``, so an exception
+        # escaping before it leaves the server stopped, ``.claude.json`` naming
+        # a dead port, and the process alive forever holding both.
         try:
-            wire_global_config(None, None)
-            _log_lifecycle("unwired .claude.json — sessions fall back")
-        except Exception as exc:  # noqa: BLE001
-            # NAME THE FAILURE. If the unwire does not happen, every session
-            # started afterwards dials a port nothing serves, and that is the
-            # outage this whole path exists to prevent. Silently swallowing it
-            # is what made one such outage unattributable for hours.
-            _log_lifecycle(f"COULD NOT unwire .claude.json: {exc!r}")
-        done.set()
+            try:
+                superseded = _release_daemon_state(certdir)
+            except OSError as exc:
+                # The record could not be dropped, which is NOT evidence a
+                # successor owns it. Treat it as "no successor" so the unwire
+                # below still runs: leaving the config naming a port this
+                # daemon is about to stop serving is the outage, and a stale
+                # record is the smaller fault of the two.
+                _log_lifecycle(f"could not release daemon state: {exc!r}")
+                superseded = False
+            if superseded:
+                # A successor owns the state now. Unwiring here would strip the
+                # config it just wrote and send every new session to no proxy
+                # at all, so the departing daemon leaves the wiring alone.
+                return
+            # Put ``.claude.json`` back the way we found it. Without this the env
+            # block keeps naming the port we just stopped serving, and Claude Code
+            # applies that block at boot — so EVERY session started afterwards
+            # dials a dead proxy and retries forever, with privoxy and the cache
+            # proxy both healthy and unreachable behind it. Measured on work-mac:
+            # "Unable to connect to API (ConnectionRefused), attempt 14/300", and
+            # the only cure was a human re-pinning by hand.
+            #
+            # An optional feature must not be able to take the required path down
+            # with it. wire_global_config(None, None) restores whatever proxy the
+            # user or their launcher had before we wrote ours, which is exactly
+            # what `pin --clear` already does — the call simply never ran on the
+            # path where the daemon goes away by itself.
+            try:
+                wire_global_config(None, None)
+                _log_lifecycle("unwired .claude.json — sessions fall back")
+            except Exception as exc:  # noqa: BLE001
+                # NAME THE FAILURE. If the unwire does not happen, every session
+                # started afterwards dials a port nothing serves, and that is the
+                # outage this whole path exists to prevent. Silently swallowing it
+                # is what made one such outage unattributable for hours.
+                _log_lifecycle(f"COULD NOT unwire .claude.json: {exc!r}")
+        finally:
+            done.set()
 
     # A recycle/cc-update TERM runs the same cleanup as an idle teardown.
     _install_signal_teardown(_teardown)
@@ -5137,6 +5157,9 @@ class PinProxy:
                 raw = _dial_chain(chain, extra_ca=self._chain_ca())
             except OSError:
                 continue
+            # create_connection leaves its timeout ON the socket, so without
+            # this the dial budget would also bound the reply.
+            raw.settimeout(_HOP_REPLY_BUDGET_S)
             try:
                 raw.sendall(
                     f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
