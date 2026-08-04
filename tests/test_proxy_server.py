@@ -1450,6 +1450,97 @@ class TestChainRediscovery:
         finally:
             good.close()
 
+    def test_the_log_separates_a_refused_hop_from_one_that_answered_wrong(
+        self, certdir
+    ):
+        """Two faults, one fall-through — and they belong to different owners.
+
+        A hop whose PORT is dead and a hop that accepts and then will not
+        tunnel are the same `continue` in the walk, and the log said the same
+        nothing about both. They are opposite findings for whoever runs that
+        hop: the first says its listener was down, the second says its
+        listener was up and its logic was not. A supervisor that holds the
+        port across restarts is a claim about exactly the first, so a log that
+        cannot tell them apart cannot confirm or refute it.
+        """
+        import contextlib
+        import io
+
+        from cswap_pin import proxy as pin_proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        # Up, and answers CONNECT with a refusal — a proxy mid-restart whose
+        # listener is live before its proxy logic is.
+        rude = socket.socket()
+        rude.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        rude.bind(("127.0.0.1", 0))
+        rude.listen(4)
+        rude_port = rude.getsockname()[1]
+
+        def _refuse():
+            while True:
+                try:
+                    conn, _ = rude.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    conn.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=_refuse, daemon=True).start()
+        try:
+            relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", dead_port))
+            ]
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                try:
+                    sock, _ = relay._connect_upstream()
+                    sock.close()
+                except OSError:
+                    pass
+            refused_lines = [
+                l for l in buf.getvalue().splitlines()
+                if f"{dead_port} unusable" in l
+            ]
+            assert refused_lines, (
+                f"a hop whose port is dead was skipped silently: "
+                f"{buf.getvalue()!r}")
+            assert "dial failed" in refused_lines[0], refused_lines
+
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", rude_port))
+            ]
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                try:
+                    sock, _ = relay._connect_upstream()
+                    sock.close()
+                except OSError:
+                    pass
+            wrong_lines = [
+                l for l in buf.getvalue().splitlines()
+                if f"{rude_port} unusable" in l
+            ]
+            assert wrong_lines, (
+                f"a hop that answered and refused to tunnel was skipped "
+                f"silently: {buf.getvalue()!r}")
+            assert "dial failed" not in wrong_lines[0], (
+                "a hop that ANSWERED was reported as a dead port — the two "
+                "faults are indistinguishable again")
+            assert "502" in wrong_lines[0], wrong_lines
+        finally:
+            rude.close()
+
     def test_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
         self, certdir, tmp_path, monkeypatch
     ):
