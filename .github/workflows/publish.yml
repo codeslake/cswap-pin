@@ -16,6 +16,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Without this a hung step burns the full 6h GitHub cap and the run reads as
+    # "still going" rather than "stuck" — so nothing reports a failure at all.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -39,6 +42,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: pypi
     permissions:
       id-token: write  # mint the OIDC token PyPI verifies; nothing else needed
