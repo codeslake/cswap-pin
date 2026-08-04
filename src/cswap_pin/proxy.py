@@ -2173,6 +2173,12 @@ def _dial_chain(
     the very proxy it describes would fail.
     """
     sock = socket.create_connection(chain.address, timeout=timeout)
+    # create_connection leaves the DIAL budget on the socket, where it would
+    # then bound every read. Reaching a hop and waiting for its answer are
+    # different legs: the dial is loopback or LAN, the answer waits on the
+    # hop's own outbound round trip. Hand back a socket already carrying the
+    # budget for the leg that comes next, so no caller has to remember.
+    sock.settimeout(_HOP_REPLY_BUDGET_S)
     if not chain.tls:
         return sock
     try:
@@ -5157,9 +5163,6 @@ class PinProxy:
                 raw = _dial_chain(chain, extra_ca=self._chain_ca())
             except OSError:
                 continue
-            # create_connection leaves its timeout ON the socket, so without
-            # this the dial budget would also bound the reply.
-            raw.settimeout(_HOP_REPLY_BUDGET_S)
             try:
                 raw.sendall(
                     f"CONNECT {self._upstream[0]}:{self._upstream[1]} HTTP/1.1\r\n"
