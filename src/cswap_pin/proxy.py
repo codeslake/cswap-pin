@@ -3374,14 +3374,20 @@ def _install_signal_teardown(cleanup) -> None:
             # A TERM IS A RECYCLE, NOT A RELEASE. Somebody wants this daemon
             # replaced — a redeploy, a repin, a fingerprint change — and under
             # a holder that means "put a successor on this socket", not "give
-            # the port back". Exiting 0 here made an update cost every live
-            # session, since their HTTPS_PROXY is fixed at exec.
+            # the port back". Exiting 0 here made the holder release the port:
+            # measured, 186,206 refused connections across three SIGTERMs.
+            #
+            # THE HOLDER IS IDENTIFIED BY THE HAND-DOWN VARIABLES, not by
+            # LISTEN_PID. That was the first version and it was always false —
+            # the holder cannot know its child's pid before spawning, so it
+            # uses the predecessor protocol instead (fd by number, guarded by
+            # the parent's pid), and nothing ever set LISTEN_PID to ours.
             #
             # Only when a holder owns the socket: without one there is nothing
             # to interpret the code, and 0 is what every existing caller reads.
             os._exit(
                 _RESTART_ME_CODE
-                if os.environ.get("LISTEN_PID") == str(os.getpid())
+                if os.environ.get(_HELD_BY_ENV) == str(os.getppid())
                 else 0
             )
 
@@ -4342,6 +4348,12 @@ class PortHolder:
         env["LISTEN_FDS"] = "0"
         env[_HANDDOWN_FD_ENV] = str(fd)
         env[_HANDDOWN_FROM_ENV] = str(os.getpid())
+        # A HOLDER, not a predecessor. Both pass a listening socket down and
+        # both use the variables above, but only this one is still alive
+        # afterwards to put a successor on the socket — which is what makes a
+        # TERM here a recycle rather than a release. A predecessor handing over
+        # is itself going away, so its child must exit 0 as it always has.
+        env[_HELD_BY_ENV] = str(os.getpid())
         log = _open_daemon_log(self._certdir)
         try:
             proc = subprocess.Popen(
@@ -4414,17 +4426,40 @@ class PortHolder:
             self._spawn()
 
     def kill_daemon_for_test(self) -> None:
-        """SIGKILL the supervised daemon — the crash this class is for."""
-        if self.daemon_pid:
+        """SIGKILL the supervised daemon — the crash this class is for.
+
+        Through the Popen, never through the pid: see ``stop``.
+        """
+        proc = getattr(self, "_proc", None)
+        if proc is not None and getattr(proc, "returncode", 0) is None:
             try:
-                os.kill(self.daemon_pid, 9)
-            except OSError:
+                proc.kill()
+            except (OSError, ValueError):
                 pass
 
     def stop(self) -> None:
         self._stop = True
-        if self.daemon_pid:
-            _kill_daemon(self.daemon_pid)
+        # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
+        # is only meaningful while the Popen it came from is ours — and a pid
+        # is reused freely, so signalling it after the child is gone aims at
+        # whatever inherited the number. Measured: with `_spawn` stubbed in a
+        # test, this SIGTERM'd the pytest-xdist worker running it, and the run
+        # died with "cannot send (already closed?)" rather than a failure.
+        #
+        # `Popen.terminate` cannot make that mistake: it signals the process
+        # object, and CPython refuses once it has been reaped.
+        proc = getattr(self, "_proc", None)
+        if proc is not None and getattr(proc, "returncode", 0) is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=_DRAIN_SECONDS + 2)
+            except (OSError, ValueError):
+                pass
+            except Exception:  # noqa: BLE001 — TimeoutExpired: escalate
+                try:
+                    proc.kill()
+                except (OSError, ValueError):
+                    pass
         try:
             self._srv.close()
         except OSError:
@@ -4952,6 +4987,11 @@ def _inherited_listener() -> "socket.socket | None":
 
 _HANDDOWN_FD_ENV = "CSWAP_PIN_LISTEN_FD"
 _HANDDOWN_FROM_ENV = "CSWAP_PIN_LISTEN_FROM"
+# Set by a HOLDER only, naming itself. Distinguishes "my parent is still there
+# and will start my successor" from "my predecessor handed me its socket on the
+# way out" — the two look identical in the variables above, and they mean
+# opposite things when this daemon is TERM'd.
+_HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
 
 
 def _handed_down_listener() -> "socket.socket | None":
@@ -5397,7 +5437,15 @@ class PinProxy:
             # which is the whole 0.27s gap, closed. The port was never
             # unbound, so there is nothing to reclaim and nothing to race.
             self._srv = handed
-            self._inherited = False  # ours to close when we in turn go away
+            # OURS TO CLOSE ONLY IF NOBODY IS STILL HOLDING IT. A predecessor
+            # that handed this over is on its way out, so the socket becomes
+            # ours. A HOLDER is not: it is still there and will put a successor
+            # on this very socket, so closing it on our way out unbinds the
+            # port the holder exists to keep. Measured: 201,909 refused
+            # connections across three planned restarts.
+            self._inherited = (
+                os.environ.get(_HELD_BY_ENV) == str(os.getppid())
+            )
             self.port = self._srv.getsockname()[1]
             self._start_accept_loop()
             return

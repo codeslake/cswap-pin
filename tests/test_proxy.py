@@ -2546,6 +2546,81 @@ class TestDaemonPortStability:
         finally:
             holder.stop()
 
+    def case_a_planned_restart_under_a_holder_loses_nothing(self, tmp_path):
+        """SIGTERM is what a deploy sends, and it must cost NOTHING.
+
+        Two separate bugs made this the worst path rather than the best, and
+        both are invisible without a real daemon under a real holder:
+
+          - the daemon read `LISTEN_PID` to decide "am I held?", which the
+            holder never sets (it cannot know a child's pid before spawning),
+            so every TERM exited 0 and the holder released the port
+          - the daemon then CLOSED the holder's socket on its way out, having
+            adopted it as a predecessor's hand-down
+
+        Measured before the fix: 186,206 then 201,909 refused connections
+        across three SIGTERMs. After: 0 refused, 0 reset, 13,471 served.
+        """
+        import os
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import PortHolder, ensure_ca, read_daemon_state
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        holder.start()
+        counts = {"ok": 0, "refused": 0, "reset": 0}
+        stop = threading.Event()
+
+        def _hammer():
+            while not stop.is_set():
+                try:
+                    s = socket.create_connection(("127.0.0.1", holder.port), timeout=3)
+                    s.sendall(
+                        b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                        b"Host: api.anthropic.com:443\r\n\r\n"
+                    )
+                    if s.recv(200):
+                        counts["ok"] += 1
+                    s.close()
+                except ConnectionRefusedError:
+                    counts["refused"] += 1
+                except ConnectionResetError:
+                    counts["reset"] += 1
+                except OSError:
+                    pass
+
+        deadline = time.time() + 8
+        while time.time() < deadline and not read_daemon_state(tmp_path):
+            time.sleep(0.05)
+        threads = [threading.Thread(target=_hammer, daemon=True) for _ in range(2)]
+        for t in threads:
+            t.start()
+        try:
+            time.sleep(0.4)
+            for _ in range(2):
+                st = read_daemon_state(tmp_path)
+                if st:
+                    os.kill(int(st["pid"]), 15)  # a deploy's own signal
+                time.sleep(1.2)
+            stop.set()
+            for t in threads:
+                t.join(timeout=3)
+            assert counts["ok"] > 0, "the hammer never reached the daemon at all"
+            assert counts["refused"] == 0, (
+                f"{counts['refused']} refused across a PLANNED restart — the "
+                f"holder released the port a deploy is supposed to keep"
+            )
+            assert counts["reset"] == 0, (
+                f"{counts['reset']} in-flight requests cut by a planned "
+                f"restart; only a crash may cost one"
+            )
+        finally:
+            stop.set()
+            holder.stop()
+
     def case_an_idle_teardown_is_not_restarted(self, tmp_path):
         """A daemon that MEANT to exit must stay exited.
 
@@ -2693,14 +2768,25 @@ class TestDaemonPortStability:
 
 
 class _ExitedProc:
-    """A Popen that has already exited with ``code``."""
+    """A Popen that has already exited with ``code``.
+
+    `returncode` is set from the start, which is what a REAPED Popen looks
+    like — and the holder must read that rather than signal a pid. A stub
+    without it let `stop()` SIGTERM whatever process held the fake pid: in
+    CI that was the pytest-xdist worker running the test.
+    """
 
     def __init__(self, code: int):
         self.returncode = code
         self.pid = 0
 
-    def wait(self):
+    def wait(self, timeout=None):
         return self.returncode
+
+    def terminate(self):
+        raise AssertionError("signalled a process that had already exited")
+
+    kill = terminate
 
 
 class TestUltrareviewIsPinned:
