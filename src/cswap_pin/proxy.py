@@ -4544,18 +4544,6 @@ class PortHolder:
                 return
             self._spawn()
 
-    def kill_daemon_for_test(self) -> None:
-        """SIGKILL the supervised daemon — the crash this class is for.
-
-        Through the Popen, never through the pid: see ``stop``.
-        """
-        proc = getattr(self, "_proc", None)
-        if proc is not None and getattr(proc, "returncode", 0) is None:
-            try:
-                proc.kill()
-            except (OSError, ValueError):
-                pass
-
     def stop(self) -> None:
         self._stop = True
         # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
@@ -7588,10 +7576,6 @@ class _PumpLoop:
         except OSError:
             pass
 
-    def _queue(self, dst, data: bytes, on_close) -> None:
-        with self._lock:
-            self._pending[dst] = self._pending.get(dst, b"") + data
-
     def _flush(self, dst, on_close) -> None:
         """Send what we can, keep the rest, and watch for writability.
 
@@ -7701,7 +7685,8 @@ class _PumpLoop:
                 # buffered and flushed when the selector says `dst` is
                 # writable. A blocking `sendall` here reintroduced the exact
                 # coupling this class removed.
-                self._queue(dst, data, on_close)
+                with self._lock:
+                    self._pending[dst] = self._pending.get(dst, b"") + data
                 self._flush(dst, on_close)
 
 
@@ -7711,14 +7696,57 @@ _PUMP = _PumpLoop()
 def _pump(a: socket.socket, b: socket.socket) -> None:
     """Shuttle bytes both ways until either side closes, BLOCKING.
 
-    The shared selector does the waiting, so this thread is parked on an Event
-    rather than on a socket — but it is still a thread. Prefer
-    :func:`_pump_detached` on any path that can give its thread back; this
-    remains for callers whose own frame must outlive the tunnel.
+    OWNS ITS OWN SELECTOR, deliberately: this is what runs for a socket the
+    shared `_PumpLoop` cannot drive, so routing it back through `_PUMP.add`
+    re-enters the very call that refused it. It did, for one release —
+    `_pump` was rewritten as `add` plus an Event, which made the `can_take`
+    fallback raise the same AttributeError it existed to avoid.
+
+    A blocking selector needs only `fileno()`, which `_TLSInTLS` has; it is
+    `setblocking` it lacks. That is why every version before the shared loop
+    carried an https:// chain hop without noticing.
+
+    Costs a thread. Prefer :func:`_pump_detached` on any path that can give
+    its thread back.
+
+    Drains each side's TLS buffer before going back to `select`. One TLS
+    record can decrypt to more than a single `recv` returns, and select sees
+    the SOCKET, not the SSL buffer — so bytes already decrypted and waiting
+    are invisible to it. Measured: after a recv returning 10 bytes, 90 more
+    sat in the buffer while the selector reported not-readable.
     """
-    done = threading.Event()
-    _PUMP.add(a, b, done.set)
-    done.wait()
+
+    def _drain(src) -> bytes:
+        data = src.recv(65536)
+        pending = getattr(src, "pending", None)
+        while data and pending and pending():
+            more = src.recv(65536)
+            if not more:
+                break
+            data += more
+        return data
+
+    sel = selectors.DefaultSelector()
+    sel.register(a, selectors.EVENT_READ)
+    sel.register(b, selectors.EVENT_READ)
+    try:
+        while True:
+            for key, _ in sel.select(timeout=60):
+                src = key.fileobj
+                dst = b if src is a else a
+                data = _drain(src)
+                if not data:
+                    return
+                dst.sendall(data)
+    except (OSError, ssl.SSLError):
+        return
+    finally:
+        sel.close()
+        for s in (a, b):
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 def _pump_detached(a: socket.socket, b: socket.socket, on_close=None) -> None:
