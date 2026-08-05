@@ -99,6 +99,31 @@ execs: coming back on a different port would leave that session dialling an
 address nothing answers, and its requests would then go out *unpinned* rather
 than fail loudly.
 
+### The port outlives the daemon
+
+The socket is bound by a **holder** — a process that never serves a request.
+It binds, starts the daemon, and waits. The daemon accepts on that inherited
+descriptor, so there is no relay and no extra hop: the connection the client
+makes is the connection the daemon serves.
+
+That is what makes a crash survivable. A planned restart already keeps the
+port (the outgoing daemon hands its socket down), but a `kill -9`, an OOM
+kill or a segfault skips every cooperative step — and an unowned port is
+permanent for a live session, whose `HTTPS_PROXY` was fixed at exec.
+Measured: three `kill -9`s of the daemon while hammering the port, `refused=0`
+and a new pid on the same port each time.
+
+The holder reads the daemon's exit rather than guessing:
+
+| exit | meaning | what the holder does |
+| :-- | :-- | :-- |
+| `0` | idle teardown — it meant to go | release the port, do not respawn |
+| `75` | `SIGTERM` under a holder: a redeploy | restart at once, same socket |
+| other | killed or crashed | restart on a 0.25s → 5s ladder |
+
+`CSWAP_PIN_SELF_HEAL=off` turns the restart off, for when you are debugging
+the daemon and a respawner fighting you is worse than a dead port.
+
 ### Asking for a specific port
 
 ```bash
