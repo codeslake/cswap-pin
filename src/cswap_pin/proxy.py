@@ -7449,6 +7449,8 @@ class _PumpLoop:
     def __init__(self):
         self._sel = selectors.DefaultSelector()
         self._peer: dict = {}
+        # Bytes accepted from one side that the other has not taken yet.
+        self._pending: dict = {}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         # A self-pipe so `add` wakes the selector instead of waiting out its
@@ -7458,6 +7460,25 @@ class _PumpLoop:
         self._wake_r, self._wake_w = socket.socketpair()
         self._wake_r.setblocking(False)
         self._sel.register(self._wake_r, selectors.EVENT_READ)
+
+    @staticmethod
+    def can_take(sock) -> bool:
+        """Whether this socket can live in a non-blocking selector at all.
+
+        `_TLSInTLS` (an https:// chain hop, TLS inside TLS) implements only
+        sendall/recv/pending/settimeout/gettimeout/fileno/close — no
+        `setblocking`, and no way to drive its handshake from a readiness
+        callback. `add` used to call `setblocking(False)` on it and raise
+        AttributeError, which is not in the except tuple: the exception
+        escaped `_handle_one_request`'s `except (OSError, ssl.SSLError)` and
+        killed the connection. Behind a TLS egress proxy that is Remote
+        Control's inbound WebSocket dying on every launch, and it left two
+        stale entries in `_peer` on the way out.
+
+        Callers fall back to the blocking `_pump` for these, which costs a
+        thread and is what every version before the shared selector did.
+        """
+        return callable(getattr(sock, "setblocking", None))
 
     def add(self, a, b, on_close=None) -> None:
         """Take over a pair of sockets. Returns AT ONCE.
@@ -7483,7 +7504,52 @@ class _PumpLoop:
         except OSError:
             pass
 
+    def _queue(self, dst, data: bytes, on_close) -> None:
+        with self._lock:
+            self._pending[dst] = self._pending.get(dst, b"") + data
+
+    def _flush(self, dst, on_close) -> None:
+        """Send what we can, keep the rest, and watch for writability.
+
+        Registering EVENT_WRITE only while there is a backlog: a socket that
+        is always writable would otherwise wake the selector on every pass
+        and turn the loop into a spin.
+        """
+        with self._lock:
+            buf = self._pending.get(dst, b"")
+        while buf:
+            try:
+                sent = dst.send(buf)
+            except (BlockingIOError, ssl.SSLWantWriteError):
+                break
+            except OSError:
+                with self._lock:
+                    peer = self._peer.get(dst)
+                    self._pending.pop(dst, None)
+                    if peer is not None:
+                        self._close_pair(dst, peer[0], peer[1])
+                return
+            buf = buf[sent:]
+        with self._lock:
+            if buf:
+                self._pending[dst] = buf
+                try:
+                    self._sel.modify(
+                        dst, selectors.EVENT_READ | selectors.EVENT_WRITE
+                    )
+                except (KeyError, ValueError, OSError):
+                    pass
+            else:
+                self._pending.pop(dst, None)
+                try:
+                    self._sel.modify(dst, selectors.EVENT_READ)
+                except (KeyError, ValueError, OSError):
+                    pass
+
     def _close_pair(self, a, b, on_close) -> None:
+        # CALLER HOLDS THE LOCK. It mutates `_peer`, and the run loop now
+        # takes the lock only around the map — so each call site wraps it
+        # rather than the method taking a second, non-reentrant acquire.
         for s in (a, b):
             self._peer.pop(s, None)
             try:
@@ -7502,39 +7568,57 @@ class _PumpLoop:
 
     def _run(self) -> None:
         while True:
-            for key, _ in self._sel.select(timeout=60):
+            for key, events in self._sel.select(timeout=60):
                 src = key.fileobj
+                # A BACKLOG DRAINING is not a read. `_flush` registered this
+                # socket for writability because its peer had bytes waiting;
+                # handle that first and fall through, since a socket can be
+                # both readable and writable in the same pass.
+                if events & selectors.EVENT_WRITE:
+                    with self._lock:
+                        entry = self._peer.get(src)
+                    self._flush(src, entry[1] if entry else None)
+                    if not (events & selectors.EVENT_READ):
+                        continue
                 if src is self._wake_r:
                     try:
                         self._wake_r.recv(65536)
                     except OSError:
                         pass
                     continue
+                # THE LOCK COVERS THE MAP, NOT THE I/O. Holding it across the
+                # write re-coupled every tunnel to every other one: a single
+                # peer that stops reading blocks this one thread inside
+                # `sendall` WHILE HOLDING the lock `add` also takes, so no
+                # other tunnel moves a byte and no new tunnel can register.
+                # That is the "one bad connection stalls everything" property
+                # this class removed from the thread count, put back as a
+                # global mutex — and a peer that stops reading is exactly what
+                # the outage produced.
                 with self._lock:
                     entry = self._peer.get(src)
-                    if entry is None:
-                        continue
-                    dst, on_close = entry
-                    try:
-                        data = _drain_ready(src)
-                    except (BlockingIOError, ssl.SSLWantReadError):
-                        continue  # nothing decrypted yet — wait for more
-                    except OSError:
-                        data = b""
-                    if not data:
+                if entry is None:
+                    continue
+                dst, on_close = entry
+                try:
+                    data = _drain_ready(src)
+                except (BlockingIOError, ssl.SSLWantReadError):
+                    continue  # nothing decrypted yet — wait for more
+                except OSError:
+                    data = b""
+                if not data:
+                    with self._lock:
                         self._close_pair(src, dst, on_close)
-                        continue
-                    try:
-                        # Blocking for the WRITE only. A non-blocking sendall
-                        # can raise mid-buffer with no record of how much went
-                        # out, and a tunnel that loses bytes silently is worse
-                        # than one that waits: the peer is a local hop or an
-                        # already-connected upstream, so this drains promptly.
-                        dst.setblocking(True)
-                        dst.sendall(data)
-                        dst.setblocking(False)
-                    except OSError:
-                        self._close_pair(src, dst, on_close)
+                    continue
+                # NEVER BLOCK THIS THREAD. It carries every tunnel, so a
+                # peer that stops reading would stall all of them — releasing
+                # the lock was not enough, because the stall is the THREAD,
+                # not the mutex. `send` reports how much it took; the rest is
+                # buffered and flushed when the selector says `dst` is
+                # writable. A blocking `sendall` here reintroduced the exact
+                # coupling this class removed.
+                self._queue(dst, data, on_close)
+                self._flush(dst, on_close)
 
 
 _PUMP = _PumpLoop()
@@ -7560,7 +7644,21 @@ def _pump_detached(a: socket.socket, b: socket.socket, on_close=None) -> None:
     onward and lives for as long as the session does, so the thread that set
     it up has nothing left to do — it was only holding the connection open.
     `on_close` carries whatever teardown that frame would have run.
+
+    A socket the selector cannot drive (see `_PumpLoop.can_take`) keeps the
+    thread instead: correctness first, and it is what every version before
+    the shared selector did for every connection.
     """
+    if not (_PumpLoop.can_take(a) and _PumpLoop.can_take(b)):
+        try:
+            _pump(a, b)
+        finally:
+            if on_close is not None:
+                try:
+                    on_close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return
     _PUMP.add(a, b, on_close)
 
 

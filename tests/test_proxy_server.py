@@ -1424,6 +1424,76 @@ class TestChainRediscovery:
         )
         assert len(attempts) == 3, f"walked {len(attempts)} times, expected 3"
 
+    def case_one_stalled_peer_does_not_stop_every_other_tunnel(self, certdir):
+        """The shared pump must not re-couple what it decoupled.
+
+        Removing the thread-per-connection put every tunnel on ONE selector
+        thread. If that thread can block inside a write while holding the lock
+        that `add` also takes, a single peer that stops reading stalls every
+        other tunnel and every new one — the same "one bad connection stops
+        everything" property, moved from thread count to a global mutex.
+
+        A peer that stops reading is not hypothetical: it is a wedged hop, a
+        stalled upstream, or a client that stopped draining, which is the
+        exact condition the outage this class was written for produced.
+        """
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import _PumpLoop
+
+        pump = _PumpLoop()
+
+        def _pair():
+            a, b = socket.socketpair()
+            return a, b
+
+        # TUNNEL 1: its far end never reads, so the pump's write will block
+        # once the socket buffer fills.
+        feed_1, in_1 = _pair()
+        out_1, stuck_1 = _pair()
+        pump.add(in_1, out_1)
+        # Fill until OUR OWN send would block: by then the pump is inside its
+        # write to a peer that is not reading, which is the condition. A
+        # timeout, not sendall, or this test wedges on the same buffer.
+        feed_1.setblocking(False)
+        try:
+            for _ in range(256):
+                feed_1.send(b"x" * 65536)
+        except (BlockingIOError, OSError):
+            pass
+        time.sleep(0.3)
+
+        # TUNNEL 2: perfectly healthy, added AFTER the stall exists.
+        started = time.monotonic()
+        feed_2, in_2 = _pair()
+        out_2, sink_2 = _pair()
+        pump.add(in_2, out_2)                  # must not block on tunnel 1
+        add_took = time.monotonic() - started
+
+        feed_2.sendall(b"ping")
+        sink_2.settimeout(3)
+        try:
+            got = sink_2.recv(16)
+        except socket.timeout:
+            got = b""
+
+        for s in (feed_1, in_1, out_1, stuck_1, feed_2, in_2, out_2, sink_2):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+        assert add_took < 1.0, (
+            f"registering a new tunnel waited {add_took:.1f}s on an unrelated "
+            f"stalled one — the lock is held across the write"
+        )
+        assert got == b"ping", (
+            "a healthy tunnel carried nothing while another peer stopped "
+            "reading — one stalled connection stops them all"
+        )
+
     def case_connections_do_not_become_threads(self, tmp_path, monkeypatch):
         """CONNECTIONS MUST NOT BECOME THREADS.
 
