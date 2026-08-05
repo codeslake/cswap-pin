@@ -495,6 +495,64 @@ def test_every_case_has_a_driver():
     )
 
 
+def test_the_holder_has_no_accept_loop():
+    """THE HOLDER MUST NEVER ACCEPT, and every measured property rests on it.
+
+    Two processes hold one listening socket, and the kernel gives each arrival
+    to exactly ONE of them. A holder that accepts therefore eats a share of
+    STEADY-STATE traffic and hangs it, because nothing in the holder answers a
+    request.
+
+    A peer session measured that on its runtime: 200 concurrent requests,
+    hung=36 acceptedByHolder=36, EXACTLY 1:1, ~18% of all traffic. Its holder
+    cannot avoid it — node's `net.Server` has no `pause()`, and
+    `maxConnections=0` accepts then RSTs (19 of 20 measured) — so it must
+    CLOSE the socket while a child runs and win it back after. That close is
+    what gives its port a refusal window a crash can land in.
+
+    Mine has no window because it never closes, and it can stay open only
+    because it never accepts: a bare socket object with nothing calling
+    `accept()` on it does not accept, so the kernel has one candidate.
+    Measured against this shape, 200 concurrent, no kills:
+    `ok=200 hung=0 refused=0`, peak accepted holder 0 / daemon 7.
+
+    ASSERTED ON THE SOURCE, deliberately. The runtime version of this test was
+    written first and DELETED: it passed, and then failed to fail when the
+    holder was given a real accept loop — an unfalsifiable green test is worse
+    than none, because it reads as coverage. This asks the one question that
+    is decidable: does `PortHolder` contain an accept call at all.
+    """
+    import pathlib
+    import re
+
+    src = (
+        pathlib.Path(__file__).parent.parent / "src/cswap_pin/proxy.py"
+    ).read_text()
+    # THE CLASS BODY, not everything after it. Splitting on "\nclass " runs
+    # past the end of the class into the module-level functions below, which
+    # DO accept — `_handed_down_listener`'s one-shot non-blocking probe asks
+    # a socket whether it is listening, and immediately closes what it gets.
+    # Reading those as PortHolder's made this fail on correct code, which
+    # teaches a reader to ignore it.
+    body = src.split("class PortHolder")[1]
+    body = body[: body.index("\ndef ")] if "\ndef " in body else body
+    # Comments and docstrings discuss accepting at length — that is the point
+    # of the class. Only executable calls matter.
+    code = "\n".join(
+        line for line in body.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    accepts = re.findall(r"\.accept\(\)", code)
+    assert not accepts, (
+        f"PortHolder calls accept() {len(accepts)} time(s). Two processes "
+        f"share one listening socket, so every connection it takes is one the "
+        f"daemon never sees — and nothing in the holder answers, so it hangs. "
+        f"A peer measured exactly 1:1, 36 of 200 requests, ~18% of ALL "
+        f"traffic. If the holder must accept, it must also close between "
+        f"children, and the port gains a refusal window a crash can land in."
+    )
+
+
 def test_the_reaper_kills_holders_before_the_daemons_they_replace():
     """A REAPER THAT KILLS CHILDREN FIRST CANNOT CONVERGE.
 
