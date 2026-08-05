@@ -282,6 +282,73 @@ def _short_hop_budgets(monkeypatch):
     monkeypatch.setattr(_p, "_CHAIN_HEAL_POLL_S", 0.05, raising=False)
 
 
+def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
+    """Kill every pin process serving ``certdir``, PARENTS FIRST, and WAIT.
+
+    Two things make this less obvious than it looks, both measured here:
+
+      - PARENTS FIRST. A holder's whole job is to replace a daemon that dies,
+        so killing children first MULTIPLIES them. A handover test that TERM'd
+        only the recorded daemon pid accumulated 7 orphans across a few suite
+        runs; a peer session stalled its machine with 53.
+      - WAIT, and re-sweep. A holder answering SIGTERM drains its daemon
+        first, so the child is still alive when this returns — and a test that
+        returns before its processes are gone leaves them for the next run to
+        find. Re-sending until the set is empty also catches a daemon the
+        holder respawned in the window before it saw the signal.
+
+    Matched on the certdir being the LAST argv token, which is how the product
+    identifies its own daemons — so a test certdir can never select the live
+    pin, whose certdir is the real backup dir.
+    """
+    import os
+    import subprocess
+    import time
+
+    target = str(pathlib.Path(certdir).resolve())
+
+    def _mine():
+        try:
+            out = subprocess.run(["ps", "-eo", "pid=,command="],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return [], []
+        holders, daemons = [], []
+        for line in out.splitlines():
+            pid_s, _, cmd = line.strip().partition(" ")
+            if "cswap_pin.proxy" not in cmd:
+                continue
+            if not cmd.rstrip().endswith(" " + target):
+                continue
+            try:
+                pid = int(pid_s)
+            except ValueError:
+                continue
+            if pid == os.getpid():
+                continue
+            (holders if "--hold-port" in cmd else daemons).append(pid)
+        return holders, daemons
+
+    deadline = time.monotonic() + timeout
+    while True:
+        holders, daemons = _mine()
+        if not holders and not daemons:
+            return
+        for pid in holders + daemons:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        if time.monotonic() >= deadline:
+            for pid in holders + daemons:  # last resort, still parents first
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+            return
+        time.sleep(0.2)
+
+
 # --- one pytest test per class, N cases inside -------------------------------
 # The suite's cases are cheap (54 ms each, measured) and its per-case pytest
 # overhead is not the cost — but 332 collected items is more surface than the
