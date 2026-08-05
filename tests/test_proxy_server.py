@@ -1339,6 +1339,57 @@ class TestChainRediscovery:
             proxy.stop()
             upstream.stop()
 
+    def case_a_host_with_no_chain_pays_nothing_for_the_heal_grace(self, certdir):
+        """The grace is for a hop that is RESTARTING, not for having no hop.
+
+        `_CHAIN_HEAL_GRACE_S` waits out a cache proxy coming back under a new
+        pid (~1s, measured). A host with no chain configured has nothing to
+        wait for — `_walk_chain_once` returns None instantly on an empty
+        candidate list — and the loop still slept out 13 polls before the
+        direct dial that was always the answer.
+
+        MEASURED: 2.60s per `_connect_upstream`, which is per new MITM
+        connection AND per bridge-sweep API call, on exactly the machines
+        (no corporate proxy, no cache proxy) where direct IS the normal path.
+
+        The constant's own comment claimed the opposite — "a host with no
+        chain at all never enters this loop, because an empty candidate list
+        falls straight through" — so the code and the comment disagreed and
+        the comment was the one being believed.
+        """
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy
+
+        # THE SHIPPED GRACE, not the shrunken one conftest installs for speed.
+        # With the test value (0.3s) the stall is 0.31s and reads as noise;
+        # the defect is only visible at the value users actually run.
+        keep = (pin_proxy._CHAIN_HEAL_GRACE_S, pin_proxy._CHAIN_HEAL_POLL_S)
+        pin_proxy._CHAIN_HEAL_GRACE_S = 2.5
+        pin_proxy._CHAIN_HEAL_POLL_S = 0.2
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            rediscover_chain=True,
+        )
+        assert proxy._chain_candidates() == [], "premise: this host has no chain"
+
+        started = time.monotonic()
+        try:
+            proxy._connect_upstream()
+        except OSError:
+            pass  # nothing listens on port 1; the TIMING is what is asserted
+        finally:
+            pin_proxy._CHAIN_HEAL_GRACE_S, pin_proxy._CHAIN_HEAL_POLL_S = keep
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, (
+            f"a chainless host paid {elapsed:.2f}s of heal grace per upstream "
+            f"dial — there was never a hop to wait for"
+        )
+
     def case_a_hop_that_comes_back_is_waited_for_not_bypassed(self, certdir):
         """A hop RESTARTING is not a hop that is gone.
 
@@ -1364,6 +1415,10 @@ class TestChainRediscovery:
             return sentinel if len(attempts) >= 3 else None
 
         proxy._walk_chain_once = _walk
+        # A CANDIDATE MUST EXIST for the grace to apply at all: an empty list
+        # means "no chain on this host" and falls straight through, which is
+        # the sibling case above.
+        proxy._chain_candidates = lambda: [object()]
         assert proxy._connect_upstream() is sentinel, (
             "the relay bypassed a hop that came back inside the grace period"
         )
