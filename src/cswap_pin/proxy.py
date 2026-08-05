@@ -3335,6 +3335,11 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
         head, _, rest = line.partition(" ")
         if not rest.rstrip().endswith(" " + target):
             continue
+        # NOT THE HOLDER. Its argv is the daemon's plus one flag, so it passes
+        # both gates above — and it is the one process here whose death takes
+        # the port with it, which is the outage the holder exists to prevent.
+        if f" {_HOLDER_MODULE_ARG} " in rest:
+            continue
         try:
             pids.append(int(head))
         except ValueError:
@@ -3366,7 +3371,19 @@ def _install_signal_teardown(cleanup) -> None:
         except TypeError:
             cleanup()  # a cleanup that takes no reason (tests)
         finally:
-            os._exit(0)
+            # A TERM IS A RECYCLE, NOT A RELEASE. Somebody wants this daemon
+            # replaced — a redeploy, a repin, a fingerprint change — and under
+            # a holder that means "put a successor on this socket", not "give
+            # the port back". Exiting 0 here made an update cost every live
+            # session, since their HTTPS_PROXY is fixed at exec.
+            #
+            # Only when a holder owns the socket: without one there is nothing
+            # to interpret the code, and 0 is what every existing caller reads.
+            os._exit(
+                _RESTART_ME_CODE
+                if os.environ.get("LISTEN_PID") == str(os.getpid())
+                else 0
+            )
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -3376,6 +3393,9 @@ def _install_signal_teardown(cleanup) -> None:
 
 
 _DAEMON_MODULE = "cswap_pin.proxy"
+# Same module, same certdir, one flag apart — which is why `_pin_daemon_pids`
+# has to exclude it explicitly rather than by argv shape.
+_HOLDER_MODULE_ARG = "--hold-port"
 
 # The orphan sweep finds daemons by matching their argv, so during the split it
 # must recognise BOTH module paths. A machine mid-cutover can have a daemon
@@ -4176,6 +4196,267 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
         return None
 
 
+def wanted_port(certdir: Path) -> "int | None":
+    """The port this pin should serve on, in precedence order.
+
+    Shared by the daemon's own bind and by :class:`PortHolder`, which binds
+    the same address on the daemon's behalf. Two copies of this order is how
+    a holder comes to hold one port while the daemon reclaims another.
+
+    1. what a human configured (``--set_port``): a standing instruction
+    2. the port the last daemon recorded
+    3. the hint a respawn left (it deletes ``proxy.json`` before starting us)
+    4. what ``.claude.json`` names — the only record that survives a wiped
+       cert dir, and the number live sessions are actually dialling
+    """
+    want = configured_port(certdir)
+    if isinstance(want, int):
+        return want
+    prev = read_daemon_state(certdir)
+    if isinstance(prev, dict) and isinstance(prev.get("port"), int):
+        return prev["port"]
+    want = read_port_hint(certdir)
+    if isinstance(want, int):
+        return want
+    return _wired_port()
+
+
+_SELF_HEAL_ENV = "CSWAP_PIN_SELF_HEAL"
+# "I am going, put a successor on this socket." A daemon serving on a holder's
+# socket exits with this instead of 0 when it was TERM'd rather than idle: the
+# holder keeps the port and respawns, so a redeploy loads new code without the
+# address ever unbinding. A plain 0 still means "released — do not restart".
+_RESTART_ME_CODE = 75  # EX_TEMPFAIL, and nothing else in this file uses it
+# The ladder a daemon that keeps dying costs: one attempt every ~5s rather than
+# four a second, so a persistently broken build does not spin the box while the
+# port it holds stays answering.
+_HOLD_RESTART_BASE_S = 0.25
+_HOLD_RESTART_MAX_S = 5.0
+# How long the holder waits for the port it was told to take. The predecessor
+# is usually mid-teardown, so this is a handoff, not a contest.
+_HOLD_BIND_WAIT_S = 3.0
+
+
+class PortHolder:
+    """Owns the pin's port, and restarts the daemon under it.
+
+    THE CASE EVERY HANDOVER MISSES IS A CRASH. `release_listener(hand_down=True)`
+    keeps the port bound across a planned restart, but it is cooperative: the
+    outgoing daemon stops accepting and passes the socket on. A `kill -9`, an
+    OOM kill, or a segfault skips all of that, and the port is then unowned —
+    which for a live session is permanent, because its ``HTTPS_PROXY`` was
+    fixed at exec and is never re-read. Measured outage: sessions on a dead
+    36301 do not fail loudly, their requests leave WITHOUT the pin.
+
+    So the socket is bound by a process that does not serve requests and has
+    almost nothing to crash: it binds, spawns, waits. The daemon accepts on the
+    inherited descriptor, so there is no relay, no extra hop, and no copy —
+    the connection the client makes is the connection the daemon serves.
+
+    A RELAY WOULD ALSO WORK and is what the cache proxy does (it has no way to
+    pass a socket to its child). Here the socket-activation path already
+    exists — ``_inherited_listener`` — so holding the port costs one bind and
+    the daemon is unchanged.
+
+    ``CSWAP_PIN_SELF_HEAL=off`` disables the restart, because a respawner
+    fighting a human who is debugging the daemon is worse than a dead port.
+    """
+
+    def __init__(self, certdir: Path, account_num: str, email: str,
+                 port: int | None = None):
+        self._certdir = Path(certdir)
+        self._account = account_num
+        self._email = email
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # THE SAME PORT THE DAEMON WOULD HAVE TAKEN. The holder binds on its
+        # behalf, so it has to resolve the address the same way — otherwise a
+        # live session's HTTPS_PROXY names a port the holder does not hold.
+        if port is None:
+            want = wanted_port(self._certdir)
+            port = want if isinstance(want, int) and want > 0 else 0
+        # WAIT FOR THE PORT WE WERE ASKED FOR. The predecessor may still be
+        # letting go of it — this runs immediately after a daemon closed its
+        # listener — and falling straight to an ephemeral port would strand
+        # every session whose HTTPS_PROXY names the old one. Measured: the
+        # holder bound 35051 while 36311 was being reclaimed, one moment later.
+        deadline = time.monotonic() + _HOLD_BIND_WAIT_S
+        while port:
+            try:
+                self._srv.bind(("127.0.0.1", port))
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    # Genuinely taken by something else. Serve somewhere rather
+                    # than refuse to start, and say so — a pin on an unexpected
+                    # port is degraded, a pin that did not start is gone.
+                    _log_lifecycle(
+                        f"port {port} is still taken — holding an ephemeral "
+                        f"port instead"
+                    )
+                    port = 0
+                    break
+                time.sleep(0.05)
+        if not port:
+            self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(128)
+        self.port = self._srv.getsockname()[1]
+        self.daemon_pid: int | None = None
+        self._stop = False
+        self._failures = 0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        # The FIRST spawn happens here, not in the thread: `start()` returning
+        # has to mean a daemon exists, or a caller that immediately reads
+        # `daemon_pid` (or asks the port for a health probe) races the
+        # supervisor's first loop iteration.
+        self._spawn()
+        self._thread = threading.Thread(target=self._supervise, daemon=True)
+        self._thread.start()
+
+    def _self_heal_on(self) -> bool:
+        return os.environ.get(_SELF_HEAL_ENV, "").lower() not in ("off", "0", "no")
+
+    def _spawn(self) -> None:
+        """Start a daemon on our socket, via the socket-activation convention.
+
+        LISTEN_PID names the CHILD, which we cannot know before it exists —
+        so it is set from the child itself, in a preexec hook. The parent's own
+        pid there would make ``_inherited_listener`` refuse the fd (that guard
+        is what stops a grandchild adopting a descriptor it does not have) and
+        the daemon would bind a fresh port, which is the stranding this class
+        exists to prevent.
+        """
+        import subprocess
+        import sys
+
+        fd = self._srv.fileno()
+        # THE PREDECESSOR PROTOCOL, not the systemd one. `LISTEN_PID` has to
+        # name the CHILD, which cannot be known before it exists — and writing
+        # it from `preexec_fn` does nothing, because Popen has already captured
+        # the environment by then (measured: the child bound a fresh port every
+        # time). `_handed_down_listener` was built for exactly this: the fd is
+        # named by NUMBER and guarded by the PARENT's pid, which we do know.
+        env = {k: v for k, v in os.environ.items() if k != "LISTEN_PID"}
+        env["LISTEN_FDS"] = "0"
+        env[_HANDDOWN_FD_ENV] = str(fd)
+        env[_HANDDOWN_FROM_ENV] = str(os.getpid())
+        log = _open_daemon_log(self._certdir)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", _DAEMON_MODULE, self._account,
+                 self._email, str(self._certdir)],
+                env=env,
+                pass_fds=(fd,),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log,
+            )
+        finally:
+            if hasattr(log, "close"):
+                log.close()
+        self.daemon_pid = proc.pid
+        self._proc = proc
+
+    def _supervise(self) -> None:
+        while not self._stop:
+            code = self._proc.wait()
+            if self._stop:
+                return
+            # A CLEAN EXIT IS A DECISION, NOT A FAILURE. The pin tears itself
+            # down when the last refcount holder closes the FIFO — that is the
+            # whole idle-teardown design. Restarting it would make the port
+            # this class holds immortal too, and the daemon would respawn
+            # forever with nobody to serve.
+            #
+            # Exit status is the only thing that separates them: 0 means the
+            # daemon chose to go (teardown, SIGTERM handler), anything else
+            # means it was killed or crashed.
+            if code == 0:
+                _log_lifecycle(
+                    f"daemon {self.daemon_pid} exited cleanly — releasing port "
+                    f"{self.port}"
+                )
+                try:
+                    self._srv.close()
+                except OSError:
+                    pass
+                return
+            if code == _RESTART_ME_CODE:
+                # A REDEPLOY, not a teardown. Respawn at once and skip the
+                # backoff: this exit was asked for, so treating it as a failure
+                # would make every update wait out a ladder rung.
+                _log_lifecycle(
+                    f"daemon {self.daemon_pid} asked for a successor — "
+                    f"restarting on the held port {self.port}"
+                )
+                self._failures = 0
+                self._spawn()
+                continue
+            if not self._self_heal_on():
+                _log_lifecycle(
+                    f"daemon {self.daemon_pid} exited and {_SELF_HEAL_ENV}=off — "
+                    f"the port stays bound but nothing is serving it"
+                )
+                return
+            self._failures += 1
+            _log_lifecycle(
+                f"daemon {self.daemon_pid} exited; restarting under the held "
+                f"port {self.port}"
+            )
+            time.sleep(min(
+                _HOLD_RESTART_BASE_S * 2 ** min(self._failures, 5),
+                _HOLD_RESTART_MAX_S,
+            ))
+            if self._stop:
+                return
+            self._spawn()
+
+    def kill_daemon_for_test(self) -> None:
+        """SIGKILL the supervised daemon — the crash this class is for."""
+        if self.daemon_pid:
+            try:
+                os.kill(self.daemon_pid, 9)
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._stop = True
+        if self.daemon_pid:
+            _kill_daemon(self.daemon_pid)
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+
+
+def run_service(certdir: Path, account_num: str, email: str,
+                port: int | None = None) -> PortHolder:
+    """Hold the pin's port and keep a daemon serving on it."""
+    holder = PortHolder(certdir, account_num, email, port=port)
+    holder.start()
+    return holder
+
+
+def holder_main(account_num: str, email: str, certdir: Path,
+                port: int | None = None) -> None:
+    """Entry point for the detached holder (``-m cswap_pin.proxy --hold-port``)."""
+    holder = run_service(Path(certdir), account_num, email, port=port)
+    _log_lifecycle(f"holding port {holder.port} for account {account_num}")
+
+    def _cleanup(reason: str = "signal") -> None:
+        _log_lifecycle(f"holder stopping ({reason})")
+        holder.stop()
+
+    _install_signal_teardown(_cleanup)
+    # The supervisor thread IS the service; this process has nothing else to
+    # do. Joining it means the holder exits exactly when it stops supervising
+    # — a clean daemon exit (idle teardown) or a self-heal switched off.
+    if holder._thread is not None:
+        holder._thread.join()
+
+
 def _spawn_daemon(
     account_num: str, email: str, certdir: Path, listen_fd: int | None = None
 ) -> int | None:
@@ -4196,6 +4477,14 @@ def _spawn_daemon(
     import time
 
     certdir = Path(certdir)
+    # RESOLVED BEFORE ANYTHING IS REWRITTEN. Everything below mutates the very
+    # files `wanted_port` reads — proxy.json is marked handover, proxy.port is
+    # unlinked — so asking afterwards gives a different, wrong answer, and a
+    # holder started with it binds an address no live session is dialling.
+    # Measured: holder on 46021 while 44733 was the port being reclaimed.
+    want_port = wanted_port(certdir)
+    if not (isinstance(want_port, int) and want_port > 0):
+        want_port = 0
     # Hand the outgoing port to the new daemon before clearing the state it
     # lives in: it rebinds that port so live sessions — whose HTTPS_PROXY was
     # fixed at exec — keep reaching the proxy instead of a dead address (and
@@ -4260,11 +4549,20 @@ def _spawn_daemon(
         env[_HANDDOWN_FD_ENV] = str(listen_fd)
         env[_HANDDOWN_FROM_ENV] = str(os.getpid())
         pass_fds = (listen_fd,)
+    # A COLD START GETS A HOLDER. The handover path already keeps the port
+    # bound (it passes its own listening socket down), but a cold start has
+    # nothing owning the address — so the daemon binds it itself and a
+    # `kill -9` takes it down with it, stranding every session whose
+    # HTTPS_PROXY was fixed at exec. Under a holder the socket outlives any
+    # way the daemon can die.
+    argv = [sys.executable, "-m", _DAEMON_MODULE]
+    if listen_fd is None:
+        argv += [_HOLDER_MODULE_ARG, str(want_port if want_port else 0)]
+    argv += [account_num, email, str(certdir)]
     try:
         try:
             subprocess.Popen(
-                [sys.executable, "-m", _DAEMON_MODULE, account_num, email,
-                 str(certdir)],
+                argv,
                 env=env,
                 pass_fds=pass_fds,
                 # GIVE THE CHILD ITS OWN STDIN. Without this it inherits the
@@ -5139,28 +5437,7 @@ class PinProxy:
         # strands sessions whose HTTPS_PROXY was fixed at exec, exactly as the
         # note below describes. That is why nothing here CHANGES the port on
         # its own; it changes only when a human says so.
-        want = configured_port(self._certdir)
-        prev = read_daemon_state(self._certdir)
-        if not isinstance(want, int):
-            want = prev.get("port") if isinstance(prev, dict) else None
-        if not isinstance(want, int):
-            # A respawn deletes proxy.json before starting us, so the port to
-            # reclaim arrives via the hint the spawner left instead.
-            want = read_port_hint(self._certdir)
-        if not isinstance(want, int):
-            # BOTH state files gone — an uninstall/reinstall, a wiped cert dir,
-            # a restored backup. The sessions do not know that: their
-            # HTTPS_PROXY was fixed at exec and still names the old port, so
-            # coming up anywhere else leaves them dialling an address nobody
-            # serves. Remote Control is where that shows: claude.ai sends, and
-            # the CLI is waiting at a port with nothing behind it.
-            #
-            # `.claude.json` is the one record that survives a wiped cert dir,
-            # because it is CSWAP's file rather than the proxy's — and it holds
-            # the very number those sessions are using. Reclaiming from it is
-            # what makes "delete the package and install it again" survivable
-            # without restarting a single session.
-            want = _wired_port()
+        want = wanted_port(self._certdir)
         for candidate in ([want] if isinstance(want, int) and want > 0 else []) + [0]:
             try:
                 self._srv.bind((self._host, candidate))
@@ -7004,4 +7281,8 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
 if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
     import sys as _sys
 
-    daemon_main(_sys.argv[1], _sys.argv[2], Path(_sys.argv[3]))
+    if _sys.argv[1:2] == [_HOLDER_MODULE_ARG]:
+        holder_main(_sys.argv[3], _sys.argv[4], Path(_sys.argv[5]),
+                    port=int(_sys.argv[2]))
+    else:
+        daemon_main(_sys.argv[1], _sys.argv[2], Path(_sys.argv[3]))
