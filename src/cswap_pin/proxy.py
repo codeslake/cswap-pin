@@ -6490,8 +6490,31 @@ class PinProxy:
             )
         except Exception:
             can_pin = False
+        # WHAT EGRESS IS ACTUALLY DOING, not what it is configured to do.
+        # `chain` above reports the hop the relay WOULD use, so a daemon that
+        # can reach no hop and is dialling DIRECT reported exactly what a
+        # healthy one did. Every field was green through two measured outages,
+        # here and on the peer's side.
+        #
+        # DIRECT is not "degraded but fine" on a corporate host: the direct
+        # route IS the TLS-inspecting proxy, and it answers 403. Owner's count
+        # on host-a for one day: 61 DIRECT transitions, 148 dial-failed,
+        # 89 accepted-but-did-not-tunnel, against 238 healthy. The pin
+        # detected all four outages and wrote all four to daemon.log; nobody
+        # read it any of the four times.
+        #
+        # `null` until the first dial: "we have not dialled yet" is not the
+        # same as "we are direct", and a monitor that cannot tell them apart
+        # alarms on every daemon start.
+        if self._egress_hop is not None:
+            egress = f"{self._egress_hop[0]}:{self._egress_hop[1]}"
+        elif self._egress_direct:
+            egress = "direct"
+        else:
+            egress = None
         body = json.dumps(
-            {"pin_proxy": True, "port": self.port, "chain": chain, "can_pin": can_pin}
+            {"pin_proxy": True, "port": self.port, "chain": chain,
+             "can_pin": can_pin, "egress": egress}
         )
         try:
             conn.sendall(
@@ -7152,20 +7175,64 @@ class PinProxy:
         # matters most.
         if not nxt or nxt == _read_upstream(self._certdir, "next"):
             return
+        # A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP. `_probe_next_hop`
+        # guards a hop naming ITSELF; this is the other direction, and it is
+        # what a peer measured on this box: a cache proxy launched from a
+        # shell that already exported the chain adopted the PIN as its
+        # upstream, so the path became 9901 -> 36301 -> 9901 and never reached
+        # privoxy. A looped proxy neither answers nor exits — it appears here
+        # as "accepted but did not tunnel: no reply".
+        if self._is_me(nxt):
+            _log_lifecycle(
+                f"{recorded} names this daemon as its upstream — refusing to "
+                f"record a loop"
+            )
+            return
         write_upstream_hint(
             self._certdir, recorded, read_upstream_ca(self._certdir), next_hop=nxt,
         )
         _log_lifecycle(f"learned the hop behind {recorded}: {nxt}")
 
+    def _is_me(self, value) -> bool:
+        """Whether ``value`` names this daemon's own address.
+
+        A hop we would dial back into. Loopback only — a remote proxy on our
+        port number is a different machine and perfectly legitimate.
+
+        Takes a URL string OR an already-parsed hop, because the two callers
+        differ: `learn_next_hop` holds what `/health` reported (a string) and
+        `_chain_candidates` holds `_Chain`s. `_as_chain` accepts a tuple, not
+        a URL — splatting a string into it makes `_Chain(*"http://…")`, which
+        is a TypeError, so the string has to be parsed first.
+        """
+        hop = parse_upstream_proxy(value) if isinstance(value, str) \
+            else _as_chain(value)
+        if hop is None or not self.port:
+            return False
+        return hop.host in _LOOPBACK and hop.port == self.port
+
     def _chain_candidates(self) -> list[_Chain]:
         """The hops to try, in order. The re-read one first (it is the most
-        current), then whatever a launch recorded behind it."""
+        current), then whatever a launch recorded behind it.
+
+        A HOP NAMING US IS DROPPED HERE TOO, not only at learning time. The
+        record outlives the process that wrote it, so a chain learned during a
+        polluted window — or written by a version without the guard above,
+        which is every version already on disk today — would keep pointing at
+        this daemon after the hop itself was repaired.
+        """
         chain = _as_chain(self._current_chain())
         hops = [chain] if chain else []
         for hop in _chain_hops(self._certdir):
             if hop not in hops:
                 hops.append(hop)
-        return hops
+        kept = [h for h in hops if not self._is_me(h)]
+        if len(kept) != len(hops):
+            self._note_hop_unusable(
+                (self._certdir.name, self.port),
+                "a recorded hop names this daemon — dropped, it is a loop",
+            )
+        return kept
 
     @staticmethod
     def _tunnel_is_open(up: socket.socket):
