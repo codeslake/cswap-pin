@@ -2908,6 +2908,48 @@ class TestDaemonPortStability:
             f"so a kill -9 takes the port with it"
         )
 
+    def case_a_handover_also_lands_under_a_holder(self, tmp_path):
+        """EVERY path must end under a holder, not just the cold start.
+
+        MEASURED, twice in one day, by upgrading two live machines: an old
+        daemon noticed its code had changed, handed its listening socket to a
+        successor, and the successor ran WITHOUT a holder. The port then left
+        the holder for good, and the next thing that went wrong stranded every
+        session:
+
+          wmac  12:57  53749 -> served UNHELD on 54264
+          host-a 13:03  36301 -> 45357, and .claude.json followed it there
+
+        Documenting "upgrade carefully" was the first answer and it is not one:
+        a deploy is not a procedure someone follows, it is whatever the running
+        code does. So the handover spawns a holder too — one that ADOPTS the
+        socket it was handed instead of binding a fresh one, which is why it
+        cannot lose the race the cold-start holder can.
+        """
+        import subprocess
+
+        from cswap_pin import proxy as pin_proxy
+
+        seen = []
+        real = subprocess.Popen
+
+        def _spy(argv, **kw):
+            seen.append(list(argv))
+            raise OSError("not actually spawning")
+
+        subprocess.Popen = _spy
+        try:
+            pin_proxy._spawn_daemon("1", "a@b.c", tmp_path, listen_fd=7)
+        except OSError:
+            pass
+        finally:
+            subprocess.Popen = real
+        assert seen, "no process was spawned at all"
+        assert any(pin_proxy._HOLDER_MODULE_ARG in a for a in seen[0]), (
+            f"a handover spawned {seen[0]} — the port leaves the holder, and "
+            f"the machine is one failed bind away from stranding every session"
+        )
+
     def case_the_orphan_sweep_does_not_kill_the_holder(self, tmp_path):
         """The sweep finds daemons by argv, and the holder's argv matches.
 

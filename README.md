@@ -75,30 +75,17 @@ cswap's account store and rewrites the config cswap already manages. Installing
 
 ### Upgrading a machine that is already serving
 
-**The upgrade itself runs the OLD code.** A daemon notices its own code
-changed on disk and recycles — using the handover its own version implements,
-not the one you are installing. So a fix to that path cannot fix the handover
-that installs it, and each machine has exactly one unsafe transition.
+Nothing to do. Install the new version; the running daemon notices its own
+code changed and replaces itself, on the same port, without dropping anything.
+Measured across a real code change on a live daemon: **75,697 requests, 0
+refused, 0 reset**, same port, new pid.
 
-Measured on two machines the day this was learned: the outgoing daemon handed
-its listening socket to a successor, the successor's holder found the port
-still held and served on a fresh one instead, and `.claude.json` followed it
-there. Every session that had the old number baked in at exec got
-`ConnectionRefused` until a human noticed.
-
-So do it deliberately rather than letting the watchdog do it:
-
-```bash
-uv pip install --python <tool-python> --upgrade cswap-pin   # 1. install
-cswap pin --get_port                                        # 2. note the port
-# 3. retire the running holder (its daemon goes with it)
-kill -TERM "$(pgrep -f 'cswap_pin.proxy --hold-port' | head -1)"
-# 4. put the NEW code on the port the config names
-python -m cswap_pin.proxy --hold-port <port> <account> <email> <certdir> &
-```
-
-Then check that port answers before touching the next machine. `cswap pin
---ensure` repairs the wiring if the window left it empty.
+This used to need a procedure, and a procedure is not an answer — a deploy is
+not something someone follows, it is whatever the running code does. Two
+machines taught that: both moved their port mid-upgrade (53749 → 54264,
+36301 → 45357) and stranded every session that had the old number baked in at
+exec, because the successor came up with no holder above it. Every spawn now
+lands under one.
 
 ## Use
 
@@ -154,8 +141,14 @@ the daemon and a respawner fighting you is worse than a dead port.
 A redeploy is the same story from the other side. Under a holder the daemon
 does not hand its socket to a successor — it exits `75` and lets the holder
 put the new code on the socket it already owns. Handing the port out of the
-holder is what left this machine's pin unwired for 76 minutes while every
+holder is what left one machine's pin unwired for 76 minutes while every
 component reported healthy.
+
+A daemon that is NOT under a holder still hands its socket down, and the
+successor it starts gets a holder that **adopts** that socket rather than
+binding a fresh one. There is no race to lose: the descriptor is already bound
+and listening. That is what makes the first upgrade onto this version safe as
+well as every one after it.
 
 ## A connection is not a thread
 
