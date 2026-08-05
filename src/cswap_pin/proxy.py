@@ -3211,6 +3211,9 @@ _DAEMON_MODULE = "cswap_pin.proxy"
 _DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 
 _STATE_FILE = "proxy.json"
+# How long `_spawn_daemon` waits for a successor to publish. 10s because a
+# FIRST run generates an RSA key pair before it can serve.
+_SPAWN_WAIT_S = 10.0
 # The pin's OWN settings, in the pin's OWN directory. `CSWAP_PIN_PORT` used to
 # live in `~/.claude.json`'s env block, and it is the one entry there that
 # Claude Code never reads — HTTPS_PROXY, https_proxy, ALL_PROXY and
@@ -4111,7 +4114,11 @@ def _spawn_daemon(
             # on every spawn.
             if hasattr(log, "close"):
                 log.close()
-        for _ in range(100):  # up to ~10s (first run generates RSA keys)
+        # NAMED so a test can shorten it. It was inlined, and a test that
+        # stubs Popen (no child ever appears) then paid the full 10s — 10% of
+        # the whole suite in one case that is only asserting what the spawn
+        # PASSES, not that it works.
+        for _ in range(int(_SPAWN_WAIT_S * 10)):
             port = _read_alive_port(certdir)
             if port is not None:
                 # New daemon is serving and recorded in proxy.json — sweep any
@@ -5025,6 +5032,20 @@ class PinProxy:
         # connection away from the successor and drops it.
         t = getattr(self, "_accept_thread", None)
         if t is not None and t is not threading.current_thread():
+            # WAKE IT, do not wait out its poll. The loop uses a 0.5s accept
+            # timeout to notice `_stop`, so a bare join paid up to that on
+            # EVERY stop — measured at 502 ms, and the test suite alone stops
+            # ~50 servers, which was 25 s of pure waiting. One loopback
+            # connect makes accept() return at once; the loop sees `_stop` and
+            # ends. Harmless if it races the socket closing, hence the guard.
+            if srv is not None:
+                try:
+                    with socket.create_connection(
+                        srv.getsockname(), timeout=0.2
+                    ):
+                        pass
+                except OSError:
+                    pass
             t.join(timeout=5.0)
         self._accept_thread = None
         if srv is not None and hand_down:
