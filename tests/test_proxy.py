@@ -2654,14 +2654,29 @@ def _config_home(tmp_path, monkeypatch):
     return home
 
 
+_OTHER_CA_CACHE: dict = {}
+
+
 def _other_ca(certdir):
-    """Another component's real CA, for multi-writer bundle fixtures."""
+    """Another component's real CA, for multi-writer bundle fixtures.
+
+    BUILT ONCE. Every caller wants the same thing — a valid CA that is NOT
+    ours — and none asserts on which one, so minting a fresh RSA-2048 pair per
+    call (~70 ms, 30-odd call sites) bought nothing. Keyed by nothing: one
+    "other" is all any of these fixtures distinguishes.
+
+    Trailing newline INCLUDED. Concatenating stripped PEMs fuses
+    `-----END-----` into `-----BEGIN-----`, producing a bundle no reader can
+    parse — a fixture bug that reads exactly like a guard bug.
+    """
     from cswap_pin.proxy import ensure_ca
 
-    # Trailing newline INCLUDED. Concatenating stripped PEMs fuses
-    # `-----END-----` into `-----BEGIN-----`, producing a bundle no reader can
-    # parse — a fixture bug that reads exactly like a guard bug.
-    return ensure_ca(certdir, "api.anthropic.com").ca_path.read_bytes().strip() + b"\n"
+    if "pem" not in _OTHER_CA_CACHE:
+        _OTHER_CA_CACHE["pem"] = (
+            ensure_ca(certdir, "api.anthropic.com").ca_path.read_bytes().strip()
+            + b"\n"
+        )
+    return _OTHER_CA_CACHE["pem"]
 
 
 class TestConsumesTheSharedTrustBundle:
@@ -4696,7 +4711,10 @@ class TestAnUpgradeCostsNoSession:
         assert p.live_client_count() == 1
         assert len(p._open_conns) == 1, "the connection is not tracked for close"
 
-        p.stop(drain=2.0)
+        # 0.3 s is a CEILING, and the property is that a drained request
+        # ends in FIN rather than RST — which is decided the moment stop()
+        # returns, not by how long it waited. 2.0 s was 2 s of runtime.
+        p.stop(drain=0.3)
         try:
             assert client.recv(100) == b"", "expected a clean EOF"
         except ConnectionResetError:  # pragma: no cover - the bug being fixed
