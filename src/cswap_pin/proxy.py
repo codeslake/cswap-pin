@@ -4293,15 +4293,22 @@ class PortHolder:
                 break
             except OSError:
                 if time.monotonic() >= deadline:
-                    # Genuinely taken by something else. Serve somewhere rather
-                    # than refuse to start, and say so — a pin on an unexpected
-                    # port is degraded, a pin that did not start is gone.
-                    _log_lifecycle(
-                        f"port {port} is still taken — holding an ephemeral "
-                        f"port instead"
+                    # REFUSE, do not serve somewhere else. A holder exists to
+                    # keep ONE address answering; on any other port it is a
+                    # healthy-looking daemon that no session can reach, while
+                    # `.claude.json` still names the number they were given.
+                    # Measured on the personal Mac, doing exactly this: 29,999
+                    # refused connections with the pin reporting success.
+                    #
+                    # An ephemeral fallback IS right at a cold start (port 0
+                    # below) — there nothing is wired yet and any port will do.
+                    # It is wrong once we have been told which port to take,
+                    # because that instruction came from the live sessions.
+                    self._srv.close()
+                    raise OSError(
+                        f"port {port} is taken — refusing to hold a different "
+                        f"one, which the sessions wired to {port} cannot reach"
                     )
-                    port = 0
-                    break
                 time.sleep(0.05)
         if not port:
             self._srv.bind(("127.0.0.1", 0))
@@ -4477,7 +4484,17 @@ def run_service(certdir: Path, account_num: str, email: str,
 def holder_main(account_num: str, email: str, certdir: Path,
                 port: int | None = None) -> None:
     """Entry point for the detached holder (``-m cswap_pin.proxy --hold-port``)."""
-    holder = run_service(Path(certdir), account_num, email, port=port)
+    try:
+        holder = run_service(Path(certdir), account_num, email, port=port)
+    except OSError as exc:
+        # SOMEBODY ELSE IS ALREADY ON OUR PORT, which is usually a healthy pin
+        # — a concurrent launch won the election, or the predecessor has not
+        # finished draining. Serve as a plain daemon instead of dying: it will
+        # reclaim the port when it frees, and one unheld daemon is what every
+        # release before this one shipped.
+        _log_lifecycle(f"holder could not take the port ({exc}) — serving unheld")
+        daemon_main(account_num, email, Path(certdir))
+        return
     _log_lifecycle(f"holding port {holder.port} for account {account_num}")
 
     def _cleanup(reason: str = "signal") -> None:

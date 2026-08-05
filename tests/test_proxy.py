@@ -2621,6 +2621,44 @@ class TestDaemonPortStability:
             stop.set()
             holder.stop()
 
+    def case_a_holder_that_cannot_take_the_wired_port_refuses_to_start(
+        self, tmp_path
+    ):
+        """Serving the WRONG port is worse than not serving.
+
+        Falling through to an ephemeral port looks like resilience and is the
+        opposite: `.claude.json` still names the old number, so every live
+        session dials an address nobody answers while a healthy-looking daemon
+        serves somewhere else. Measured on the personal Mac, doing exactly
+        this: 29,999 refused connections and a pin that reported success.
+
+        An ephemeral fallback is right when NOTHING is wired yet — the cold
+        start, where any port will do. It is wrong when we were told which
+        port to take, because that instruction came from the sessions.
+        """
+        import socket
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        squatter = socket.socket()
+        squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen(1)
+        taken = squatter.getsockname()[1]
+        try:
+            try:
+                PortHolder(tmp_path, "1", "a@b.c", port=taken)
+            except OSError:
+                return  # refused, which is the whole point
+            raise AssertionError(
+                f"the holder started on some other port while {taken} was "
+                f"taken — every session wired to {taken} is now stranded "
+                f"behind a pin that looks healthy"
+            )
+        finally:
+            squatter.close()
+
     def case_an_idle_teardown_is_not_restarted(self, tmp_path):
         """A daemon that MEANT to exit must stay exited.
 
