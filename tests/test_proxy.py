@@ -3066,26 +3066,51 @@ class TestDaemonPortStability:
         ensure_ca(tmp_path, "api.anthropic.com")
         holder = PortHolder(tmp_path, "1", "a@b.c")
         holder.start()
-        counts = {"ok": 0, "refused": 0, "reset": 0}
+        counts = {"ok": 0, "refused": 0, "reset": 0, "no_reply": 0}
         stop = threading.Event()
 
         def _hammer():
+            """A REQUEST, not a connect — and a timeout is a FAILURE.
+
+            `except OSError: pass` swallowed `socket.timeout`, so a restart
+            that left requests hanging was counted as neither ok nor refused
+            and the assertions below passed on it. That is the same shape as
+            the 30s held-exit drain: the port stays BOUND while nobody is
+            behind it, so refused is structurally 0 and only an unanswered
+            request can see the gap. A peer hit the identical bug from the
+            other side — a bounded call whose timeout landed in a broad catch
+            and read as a PASS.
+            """
             while not stop.is_set():
                 try:
                     s = socket.create_connection(("127.0.0.1", holder.port), timeout=3)
+                except ConnectionRefusedError:
+                    counts["refused"] += 1
+                    continue
+                except OSError:
+                    counts["no_reply"] += 1
+                    continue
+                try:
+                    s.settimeout(3)
                     s.sendall(
                         b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
                         b"Host: api.anthropic.com:443\r\n\r\n"
                     )
                     if s.recv(200):
                         counts["ok"] += 1
-                    s.close()
-                except ConnectionRefusedError:
-                    counts["refused"] += 1
+                    else:
+                        counts["no_reply"] += 1
+                except socket.timeout:
+                    counts["no_reply"] += 1
                 except ConnectionResetError:
                     counts["reset"] += 1
                 except OSError:
-                    pass
+                    counts["no_reply"] += 1
+                finally:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
 
         deadline = time.time() + 8
         while time.time() < deadline and not read_daemon_state(tmp_path):
@@ -3111,6 +3136,14 @@ class TestDaemonPortStability:
             assert counts["reset"] == 0, (
                 f"{counts['reset']} in-flight requests cut by a planned "
                 f"restart; only a crash may cost one"
+            )
+            # AND NOTHING WENT UNANSWERED. This is the axis `refused` cannot
+            # see: the holder's socket stays bound through the restart, so a
+            # window with nobody serving produces timeouts, not refusals.
+            assert counts["no_reply"] == 0, (
+                f"{counts['no_reply']} requests connected and were never "
+                f"answered across a planned restart — the port was bound the "
+                f"whole time and nobody was behind it"
             )
         finally:
             stop.set()
