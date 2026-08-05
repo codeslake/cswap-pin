@@ -140,8 +140,19 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
 
 
 @pytest.fixture
-def certdir(tmp_path):
-    ensure_ca(tmp_path, "api.anthropic.com")
+def certdir(tmp_path, _session_ca):
+    """A cert dir with a CA already in it.
+
+    COPIED from one session-wide CA rather than generated. `ensure_ca` mints
+    two RSA-2048 keys (~70 ms) and this fixture runs for most of the file, so
+    generating per test was the single largest cost in the suite. Nothing
+    here asserts on a key's VALUE — the tests need a CA that signs its leaf,
+    which a copy is.
+    """
+    import shutil
+
+    for f in ("ca.pem", "ca.key", "leaf.pem", "leaf.key"):
+        shutil.copy2(_session_ca / f, tmp_path / f)
     return tmp_path
 
 
