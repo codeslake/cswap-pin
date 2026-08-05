@@ -833,6 +833,89 @@ class TestWireGlobalConfig:
         )
         return path
 
+    def case_a_receipt_that_cannot_be_written_leaves_the_config_unwired(
+        self, tmp_path, monkeypatch
+    ):
+        """A WIRING NOTHING CAN REMOVE IS WORSE THAN NO WIRING.
+
+        The write pops the config-key copies of the receipt (they are where it
+        USED to live, and a stale copy would outrank the sidecar) and then
+        writes the sidecar. `_write_ledger` is best-effort and swallows every
+        error, so if the sidecar write fails the config is left carrying our
+        proxy vars with the receipt in NEITHER location.
+
+        Nothing can then remove them: `_wire_mark_of` reads the sidecar, falls
+        through to the config keys, finds neither, and every "is it wired"
+        caller answers no — while `HTTPS_PROXY` in `.claude.json` sends every
+        new session to a port that may be long gone. `--clear` is a no-op on
+        it. Only a hand edit fixes it, which is exactly what `clear_wiring`
+        exists to make unnecessary.
+
+        `_write_ledger`'s docstring claims the failure "degrades to the
+        pre-existing behaviour — `--clear` still finds the wiring through the
+        config keys an older pin left". That is false FOR THIS PATH: the same
+        function popped those keys three lines earlier.
+
+        So the config write is the one that must be conditional. If the
+        receipt cannot be written, leave the file alone: unwired is a working
+        session, and wired-with-no-receipt is an outage nobody can clear.
+
+        THE CONTROL is the same call with a writable sidecar, which must wire
+        — otherwise "does not wire" would pass for a function that never
+        wires at all.
+        """
+        import json as _json
+
+        from cswap_pin import proxy as pin_proxy
+
+        def _attempt(ledger_fails, name):
+            # A DISTINCT CONFIG PATH PER ATTEMPT. The sidecar is keyed by a
+            # hash of the config path (`_ledger_path`), so reusing one path
+            # lets the CONTROL's sidecar answer for the failing attempt — and
+            # the case passes while the defect is fully present. Measured:
+            # that is exactly how the first version of this test went green
+            # against code a direct probe showed to be broken.
+            from pathlib import Path
+            path = Path(tmp_path) / f"{name}.claude.json"
+            path.write_text("{}", encoding="utf-8")
+            monkeypatch.setattr(
+                "claude_swap.paths.get_global_config_path", lambda: path
+            )
+            real = pin_proxy._write_ledger
+            if ledger_fails:
+                def _boom(*a, **k):
+                    raise OSError("sidecar store is unwritable")
+                pin_proxy._write_ledger = _boom
+            try:
+                ok = pin_proxy.wire_global_config(41234, certdir / "ca.pem")
+            finally:
+                pin_proxy._write_ledger = real
+            raw = _json.loads(path.read_text(encoding="utf-8"))
+            env = raw.get("env") or {}
+            # THE RECEIPT AS EVERY READER SEES IT: sidecar first, config keys
+            # as the fallback. `_read_ledger` is that lookup, so asking it is
+            # asking exactly what `--clear` and `_wiring_present` will find.
+            mark = pin_proxy._read_ledger(path, raw).get(pin_proxy._WIRE_MARK)
+            return ok, "HTTPS_PROXY" in env, mark
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(exist_ok=True)
+        ensure_ca(certdir, "api.anthropic.com")
+
+        # CONTROL: a writable sidecar must produce a real wiring.
+        ok, wired, mark = _attempt(ledger_fails=False, name="control")
+        assert ok and wired and mark, (
+            f"CONTROL FAILED: a normal wire did not happen "
+            f"(ok={ok} wired={wired} mark={mark!r})"
+        )
+
+        ok, wired, mark = _attempt(ledger_fails=True, name="broken")
+        assert not (wired and mark is None), (
+            "the config carries our proxy vars with the receipt in NEITHER "
+            "location — nothing can remove them and `--clear` is a no-op, so "
+            "every new session dials a port that may be gone"
+        )
+
     def case_the_config_is_never_published_wider_than_it_was(
         self, tmp_path, monkeypatch
     ):
@@ -2889,6 +2972,7 @@ class TestDaemonPortStability:
             else:
                 os.environ[pin_proxy._HELD_BY_ENV] = prev
 
+
     def case_the_port_answers_across_a_SIGKILL_of_the_daemon(self, tmp_path):
         """A CRASH is the case a handover cannot cover.
 
@@ -3031,9 +3115,26 @@ class TestDaemonPortStability:
         An ephemeral fallback is right when NOTHING is wired yet — the cold
         start, where any port will do. It is wrong when we were told which
         port to take, because that instruction came from the sessions.
+
+        BOTH HALVES, because refusing the bind was not enough on its own:
+        `holder_main` caught that OSError and fell back to `daemon_main`, on
+        the premise that a plain daemon "will reclaim the port when it frees".
+        A daemon cannot move its port — the address is fixed at bind — so the
+        fallback served on an EPHEMERAL port nothing is wired to. Measured
+        during an orphan recovery, isolated port 49927:
+
+            11:57:13 holder could not take the port (49927 is taken —
+                     refusing to hold a different one) — serving unheld
+            11:57:13 serving on port 37001
+
+        The bind fails for two opposite reasons and NEITHER wants a second
+        daemon: a healthy pin already on the port makes this process
+        redundant, and a port held by something not serving is not helped by
+        another port.
         """
         import socket
 
+        from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PortHolder, ensure_ca
 
         ensure_ca(tmp_path, "api.anthropic.com")
@@ -3042,17 +3143,50 @@ class TestDaemonPortStability:
         squatter.bind(("127.0.0.1", 0))
         squatter.listen(1)
         taken = squatter.getsockname()[1]
+        # The real budget is for a predecessor draining; this squatter never
+        # leaves, so waiting it out is 3s of nothing.
+        real_wait = pin_proxy._HOLD_BIND_WAIT_S
+        pin_proxy._HOLD_BIND_WAIT_S = 0.2
+        served = []
+        real_daemon = pin_proxy.daemon_main
+        pin_proxy.daemon_main = lambda *a, **k: served.append(a)
         try:
             try:
                 PortHolder(tmp_path, "1", "a@b.c", port=taken)
+                raise AssertionError(
+                    f"the holder started on some other port while {taken} was "
+                    f"taken — every session wired to {taken} is now stranded "
+                    f"behind a pin that looks healthy"
+                )
             except OSError:
-                return  # refused, which is the whole point
-            raise AssertionError(
-                f"the holder started on some other port while {taken} was "
-                f"taken — every session wired to {taken} is now stranded "
-                f"behind a pin that looks healthy"
+                pass  # refused the bind, which is the first half
+
+            # AND THE ENTRY POINT MUST NOT SERVE ANYWAY. `holder_main` catches
+            # that OSError itself, so the refusal above proves nothing about
+            # what the process does next.
+            #
+            # ITS SIGNAL HANDLERS ARE NEUTERED FIRST. `holder_main` installs
+            # SIGTERM/SIGINT teardowns via `_install_signal_teardown`, and
+            # called in-process that arms them ON THE PYTEST WORKER. Measured:
+            # the worker died with `received keyboard-interrupt`, 3 runs of 3,
+            # once this class ran in parallel with another that spawns holders
+            # — the same shape that once SIGTERM'd an xdist worker through a
+            # bare pid. The subject here is the daemon_main fallback, not the
+            # handlers, so stubbing them changes nothing this asserts.
+            real_signals = pin_proxy._install_signal_teardown
+            pin_proxy._install_signal_teardown = lambda *a, **k: None
+            try:
+                pin_proxy.holder_main("1", "a@b.c", tmp_path, port=taken)
+            finally:
+                pin_proxy._install_signal_teardown = real_signals
+            assert not served, (
+                "a holder that could not take the wired port served as a "
+                "plain daemon on another one — nothing is wired there and no "
+                "session can reach it (measured: 49927 taken -> 37001)"
             )
         finally:
+            pin_proxy._HOLD_BIND_WAIT_S = real_wait
+            pin_proxy.daemon_main = real_daemon
             squatter.close()
 
     def case_a_held_daemon_exits_instead_of_handing_the_port_away(
@@ -3319,107 +3453,68 @@ class TestDaemonPortStability:
             f"the report does not name how many attempts failed: {said[0]!r}"
         )
 
-    def case_a_refused_hold_defers_to_the_pin_that_has_the_port(self, tmp_path):
-        """A HOLDER THAT CANNOT TAKE THE PORT MUST NOT SERVE ON ANOTHER ONE.
+    def case_a_mark_that_cannot_be_cleared_is_not_reported_as_cleared(
+        self, tmp_path
+    ):
+        """A FAILED UNLINK MUST NOT READ AS A CLEARED MARK.
 
-        `holder_main` falls back to `daemon_main` when the bind fails, on the
-        premise that it "will reclaim the port when it frees". A daemon cannot
-        move its port — its address is fixed once it binds, and every session's
-        HTTPS_PROXY was fixed at exec — so the fallback does not reclaim
-        anything. It serves on an EPHEMERAL port that nothing is wired to.
+        The handover mark means "a successor is coming". When no successor
+        comes, `_clear_handover_mark` drops the record — because leaving it
+        tells the departing daemon's own teardown it was SUPERSEDED, and the
+        teardown then keeps `.claude.json` pointing at a port nobody serves.
+        That is the outage the unwire exists to prevent, reached through the
+        code that prevents it.
 
-        MEASURED, isolated port 49927, during an orphan recovery:
+        The unlink swallowed every OSError and returned None either way, so a
+        record that could not be removed — a read-only store, a lost mount, an
+        immutable file — was indistinguishable from one that was. The caller
+        went on to a teardown that read "superseded" and left the wiring.
 
-            11:57:13 holder could not take the port (49927 is taken —
-                     refusing to hold a different one) — serving unheld
-            11:57:13 serving on port 37001
+        Reporting the outcome does not make the unlink succeed; it lets the
+        caller stop believing a cleanup that did not happen, and it puts the
+        reason in the one log a later reader has.
 
-        Two daemons then existed: the one holding the wired port and a second
-        answering nothing, which the sweep does not reap (it has its own valid
-        state) and no session can reach.
-
-        The bind fails for exactly two reasons and they are opposite:
-
-          - somebody healthy already serves the wired port. Then this process
-            is redundant and the right move is to EXIT. That is the common
-            case — a concurrent launch won the election.
-          - the port is held by something that is not serving. Then a second
-            daemon on a different port does not help either.
-
-        So a refused hold exits rather than serving somewhere nobody dials.
-        `_spawn_daemon`'s caller already treats "no successor" correctly, and
-        the incumbent is by definition still up.
-
-        THE CONTROL: a bind that SUCCEEDS must still serve, or "exits when
-        refused" would pass for a holder that never serves at all.
+        THE CONTROL is the same call on a removable record, which must report
+        success — otherwise "reports failure" would pass for a function that
+        always reports failure.
         """
-        import socket
-        import threading
+        import os as _os
+        import stat as _stat
 
         from cswap_pin import proxy as pin_proxy
-        from cswap_pin.proxy import ensure_ca
 
-        ensure_ca(tmp_path, "api.anthropic.com")
-        served = []
-        real_daemon = pin_proxy.daemon_main
-        pin_proxy.daemon_main = lambda *a, **k: served.append(a)
-        # Occupy the port the holder will be told to take, and ANSWER on it —
-        # this is the healthy-incumbent case, which is the common one.
-        squatter = socket.socket()
-        squatter.bind(("127.0.0.1", 0))
-        squatter.listen(4)
-        taken = squatter.getsockname()[1]
-
-        def _run_holder(port):
-            """`holder_main` to completion. Returns what it handed daemon_main."""
-            served.clear()
-            t = threading.Thread(
-                target=pin_proxy.holder_main,
-                args=("1", "a@b.c", tmp_path),
-                kwargs={"port": port},
-                daemon=True,
+        def _clear(make_unremovable):
+            d = tmp_path / ("stuck" if make_unremovable else "ok")
+            d.mkdir(exist_ok=True)
+            pin_proxy.write_daemon_state(d, 41234, _os.getpid(), "fp")
+            st = pin_proxy.read_daemon_state(d)
+            raw = json.loads((d / pin_proxy._STATE_FILE).read_text())
+            raw["handover"] = True
+            (d / pin_proxy._STATE_FILE).write_text(json.dumps(raw))
+            assert pin_proxy.read_daemon_state(d).get("handover"), (
+                "premise: the record is marked as a handover"
             )
-            t.start()
-            t.join(timeout=15)
-            return list(served)
-
-        # A short wait: the real 3s budget is for a predecessor draining, and
-        # this squatter never leaves.
-        real_wait = pin_proxy._HOLD_BIND_WAIT_S
-        real_spawn = pin_proxy.PortHolder._spawn
-        pin_proxy._HOLD_BIND_WAIT_S = 0.2
-        # The CONTROL's holder must not actually spawn a child process — the
-        # question is whether it got far enough to hold, not whether a real
-        # daemon comes up. `_thread.join()` then returns once the supervisor
-        # sees the stub exit.
-        pin_proxy.PortHolder._spawn = lambda self: setattr(
-            self, "_proc", _ExitedProc(0)
-        )
-        try:
-            assert _run_holder(taken) == [], (
-                "a holder that could not take the wired port served as a plain "
-                "daemon on another one — nothing is wired there and no session "
-                "can reach it (measured: 49927 taken -> served on 37001)"
-            )
-            # CONTROL: a FREE port must still be held, or the assertion above
-            # would pass for a holder that never serves under any condition.
-            free = socket.socket()
-            free.bind(("127.0.0.1", 0))
-            open_port = free.getsockname()[1]
-            free.close()
-            held = pin_proxy.PortHolder(tmp_path, "1", "a@b.c", port=open_port)
+            if make_unremovable:
+                # A DIRECTORY WITH NO WRITE BIT: unlink needs write on the
+                # PARENT, not on the file, so this blocks removal without
+                # touching the record itself.
+                _os.chmod(d, _stat.S_IRUSR | _stat.S_IXUSR)
             try:
-                assert held.port == open_port, (
-                    f"CONTROL FAILED: a free port was not held "
-                    f"({held.port} != {open_port}) — the case above proves nothing"
-                )
+                return pin_proxy._clear_handover_mark(d)
             finally:
-                held.stop()
-        finally:
-            pin_proxy._HOLD_BIND_WAIT_S = real_wait
-            pin_proxy.PortHolder._spawn = real_spawn
-            pin_proxy.daemon_main = real_daemon
-            squatter.close()
+                if make_unremovable:
+                    _os.chmod(d, 0o700)
+
+        # CONTROL: a removable record must report success.
+        assert _clear(make_unremovable=False) is True, (
+            "CONTROL FAILED: clearing a removable mark did not report success, "
+            "so the failure below says nothing"
+        )
+        assert _clear(make_unremovable=True) is False, (
+            "a mark that could not be removed reported the same as one that "
+            "was — the caller's teardown then reads 'superseded' and leaves "
+            "the wiring pointing at a port nobody serves"
+        )
 
     def case_a_deploy_restarts_the_daemon_without_releasing_the_port(
         self, tmp_path

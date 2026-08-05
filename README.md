@@ -274,7 +274,7 @@ For a serial repro of a failure, add `-n 0`: xdist gives no live output and
 truncates tracebacks it cannot attribute to a worker.
 
 One pytest test runs many `case_*` methods (`run_cases` in `conftest.py`), so
-113 collected tests carry 352 cases. A failure names both: `Class::case_name`.
+113 collected tests carry 350 cases. A failure names both: `Class::case_name`.
 
 ## Why a separate package
 
