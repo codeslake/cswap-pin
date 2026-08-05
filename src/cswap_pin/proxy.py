@@ -244,6 +244,83 @@ def read_upstream_ca(certdir: Path) -> str | None:
 _WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
 _WIRE_MARK = "_cswapPinWiredKeys"
 
+# -- where the receipt lives -------------------------------------------------
+#
+# The `env` block stays in `.claude.json` — Claude Code reads it there at boot,
+# so that file IS the interface and nothing about it can move. The RECEIPT
+# (which keys are ours, and what they displaced) is bookkeeping only cswap
+# reads, and it belongs with cswap's other state: `.claude.json` is the user's
+# file, and `_cswapPinWiredKeys` / `_cswapPinWiredKeysSaved` are two opaque
+# keys a human editing it can only trip over.
+#
+# READ BOTH, WRITE NEW — no cutover. An OLDER cswap-pin, or an older
+# claude-swap, still reads and writes the config key; both keep working
+# because every reader here consults the sidecar first and falls back to the
+# config. The config keys are REMOVED on the next write by a new pin, so a
+# box converges by being used rather than by a migration step.
+
+
+def _ledger_path(config_path: Path) -> Path:
+    """The sidecar receipt for ``config_path``, under the account store.
+
+    KEYED BY CONFIG PATH, because there are two configs: `~/.claude.json` and
+    the `CLAUDE_CONFIG_DIR` copy a session terminal uses. One sidecar for both
+    would let the second wiring's receipt overwrite the first's, and unwiring
+    would restore the wrong displaced values into the wrong file — strictly
+    worse than the config key it replaces, which at least travelled WITH its
+    own config.
+    """
+    import hashlib
+
+    from cswap_pin._host import require
+
+    root = Path(require("paths").get_backup_root())
+    key = hashlib.sha256(str(config_path).encode("utf-8")).hexdigest()[:16]
+    return root / "pin-wiring" / f"{key}.json"
+
+
+def _read_ledger(config_path: Path, raw: dict) -> dict:
+    """The receipt for ``config_path``: sidecar first, config as fallback.
+
+    A sidecar that EXISTS and says "not wired" is an answer, not a miss — an
+    unwire writes exactly that. Falling through to the config there would
+    resurrect a receipt the unwire deliberately emptied.
+    """
+    try:
+        side = json.loads(_ledger_path(config_path).read_text(encoding="utf-8"))
+        if isinstance(side, dict) and _WIRE_MARK in side:
+            return side
+    except Exception:  # noqa: BLE001 — absent/unreadable: fall back
+        pass
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_ledger(config_path: Path, ledger: dict) -> None:
+    """Record the receipt beside cswap's other state. Never raises.
+
+    Best-effort ON PURPOSE. The config write is what strands a session when it
+    fails; this one only costs a receipt, and a missing receipt degrades to
+    the pre-existing behaviour — the next wire re-derives it, and `--clear`
+    still finds the wiring through the config keys an older pin left.
+    """
+    tmp = None
+    try:
+        path = _ledger_path(config_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(ledger, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 — see the docstring
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
 
 def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     """Our CA plus whatever the session already trusted, in one file.
@@ -1782,20 +1859,24 @@ def _wire_global_config_locked(
     env = raw.get("env")
     env = dict(env) if isinstance(env, dict) else {}
     before = dict(env)
-    ours = raw.get(_WIRE_MARK)
+    # THE RECEIPT, from wherever the last writer put it. See `_ledger_path`:
+    # it moved out of `.claude.json` into the account store, and BOTH are read
+    # because an older cswap-pin still writes the config key.
+    prev = _read_ledger(path, raw)
+    ours = prev.get(_WIRE_MARK)
     ours = list(ours) if isinstance(ours, list) else []
 
     # Drop what we wrote last time, restoring anything we displaced.
-    saved = raw.get(f"{_WIRE_MARK}Saved")
+    saved = prev.get(f"{_WIRE_MARK}Saved")
     saved = dict(saved) if isinstance(saved, dict) else {}
     for key in ours:
         env.pop(key, None)
     for key, value in saved.items():
         env[key] = value
 
+    ledger = {_WIRE_MARK: [], f"{_WIRE_MARK}Saved": {}}
     if port is None or ca_path is None:
-        raw.pop(_WIRE_MARK, None)
-        raw.pop(f"{_WIRE_MARK}Saved", None)
+        pass  # `ledger` above already records "not wired"
     else:
         # The CA lives in the cert dir, so its parent IS the cert dir — which
         # is where the proxy credential lives too. Deriving it here keeps the
@@ -1830,14 +1911,17 @@ def _wire_global_config_locked(
             "CSWAP_PIN_PORT": str(port),
         }
         # Remember what we are about to displace, so unwiring is lossless.
-        raw[f"{_WIRE_MARK}Saved"] = {
-            k: env[k] for k in wanted if k in env
-        }
+        displaced = {k: env[k] for k in wanted if k in env}
         env.update(wanted)
-        raw[_WIRE_MARK] = list(wanted)
+        ledger = {_WIRE_MARK: list(wanted), f"{_WIRE_MARK}Saved": displaced}
 
     if env == before and _WIRE_MARK not in raw and not ours:
         return False
+    # THE CONFIG KEYS GO, whichever location we read from. They are where the
+    # receipt USED to live; leaving them behind means an older claude-swap
+    # keeps reading a stale copy of a receipt this write just replaced.
+    raw.pop(_WIRE_MARK, None)
+    raw.pop(f"{_WIRE_MARK}Saved", None)
     if env:
         raw["env"] = env
     else:
@@ -1870,6 +1954,11 @@ def _wire_global_config_locked(
         os.replace(tmp, path)
     except OSError:
         return False
+    # AFTER the config write, never before. This records what the config now
+    # holds; writing it first and then failing the config write would claim a
+    # wiring that is not there — and on an unwire, would drop the receipt for
+    # proxy vars still in the file, leaving them unremovable except by hand.
+    _write_ledger(path, ledger)
     return True
 
 
@@ -2014,10 +2103,15 @@ def _wired_over_proxy() -> str | None:
     get_global_config_path = require("paths").get_global_config_path
 
     try:
-        raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
+        path = get_global_config_path()
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    saved = raw.get(f"{_WIRE_MARK}Saved") if isinstance(raw, dict) else None
+    # THROUGH `_read_ledger`, not `raw` directly. The receipt moved to the
+    # account store; reading the config key alone would see nothing on any box
+    # a new pin has already written, and this function's silence is what makes
+    # a pinned session bypass the launcher's own proxy.
+    saved = _read_ledger(path, raw).get(f"{_WIRE_MARK}Saved")
     if isinstance(saved, dict):
         value = saved.get("HTTPS_PROXY") or saved.get("https_proxy")
         if value:

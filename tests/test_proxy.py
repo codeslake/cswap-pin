@@ -899,6 +899,67 @@ class TestWireGlobalConfig:
         assert env["FOO"] == "bar"                            # never touched
         assert "NODE_EXTRA_CA_CERTS" not in env               # ours, removed
 
+    def case_unwire_restores_what_an_OLDER_pin_recorded_in_the_config(
+        self, tmp_path, monkeypatch
+    ):
+        """The same restore, from the receipt's PREVIOUS home.
+
+        The receipt (`_cswapPinWiredKeys` + `…Saved`) moved out of
+        `.claude.json` into the account store. There is no cutover — an older
+        cswap-pin on the same box still writes the config keys — so the reader
+        takes both, and this is the pairing that upgrade actually produces:
+        wired by the old writer, unwired by the new one.
+
+        Losing it is silent and expensive: the corporate proxy the pin
+        displaced is simply never put back, and the user is left worse off than
+        before they pinned.
+        """
+        from cswap_pin.proxy import wire_global_config
+
+        path = self._config(tmp_path, monkeypatch, {})
+        # Exactly what a pre-move cswap-pin left behind.
+        path.write_text(json.dumps({
+            "env": {
+                "HTTPS_PROXY": "http://127.0.0.1:41000",
+                "CSWAP_PIN_PORT": "41000",
+            },
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            "_cswapPinWiredKeysSaved": {"HTTPS_PROXY": "http://corp:8080"},
+        }))
+
+        assert wire_global_config(None, None) is True
+        env = json.loads(path.read_text()).get("env") or {}
+        assert env.get("HTTPS_PROXY") == "http://corp:8080", (
+            "the proxy the OLD pin displaced was not restored — the new reader "
+            "did not fall back to the receipt's previous home"
+        )
+        assert "CSWAP_PIN_PORT" not in env
+
+    def case_a_cleared_receipt_is_an_answer_not_a_miss(self, tmp_path, monkeypatch):
+        """An unwire is REMEMBERED, so a leftover config key cannot undo it.
+
+        The fallback above has a sharp edge: if "the new location says not
+        wired" read as absence, the reader would fall through to the config —
+        and a stale key there (an older pin's, a restored backup) would make
+        the very next read believe the wiring is back, over a config whose
+        proxy vars are already gone.
+        """
+        from pathlib import Path
+
+        from cswap_pin import proxy
+
+        path = self._config(tmp_path, monkeypatch, {})
+        proxy.wire_global_config(47000, Path("/tmp/ca.pem"))
+        proxy.wire_global_config(None, None)
+
+        raw = json.loads(path.read_text())
+        raw["_cswapPinWiredKeys"] = ["HTTPS_PROXY", "CSWAP_PIN_PORT"]
+        path.write_text(json.dumps(raw))
+
+        assert proxy._read_ledger(path, json.loads(path.read_text())).get(
+            "_cswapPinWiredKeys"
+        ) == [], "a cleared receipt fell through to a stale config key"
+
     def case_unwire_leaves_no_env_block_when_it_was_ours_alone(
         self, tmp_path, monkeypatch
     ):
@@ -4605,7 +4666,12 @@ class TestHealReWiresAServingDaemon:
         try:
             assert proxy.heal(tmp_path) is True
             raw = json.loads(cfg.read_text())
-            assert raw.get("_cswapPinWiredKeys"), "the wiring was not restored"
+            # THE RECEIPT IS THE SIDECAR NOW, read through the same helper the
+            # product uses — asserting on the config key would test where the
+            # receipt USED to live, and would pass for a write that never
+            # recorded one at all.
+            ledger = proxy._read_ledger(cfg, raw)
+            assert ledger.get("_cswapPinWiredKeys"), "the wiring was not restored"
             assert (raw.get("env") or {}).get("CSWAP_PIN_PORT") == str(port), (
                 "re-wired to the wrong port — live sessions would not reattach"
             )
