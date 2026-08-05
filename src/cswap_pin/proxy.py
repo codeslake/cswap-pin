@@ -2279,28 +2279,6 @@ _HOP_CONNECT_BUDGET_S = 2.0
 # sized for that, not for the dial. Sharing one number cuts healthy hops.
 _HOP_REPLY_BUDGET_S = 6.0
 
-# A CEILING ON CONCURRENT CLIENTS, because the budgets above are per-dial and
-# a wedged hop makes every one of them run to the end.
-#
-# MEASURED OUTAGE, host-a, 2026-08-05: the cache hop died, and the pin served
-# 27,491 threads and 44,121 file descriptors inside 40 minutes. Load average
-# on a 48-core box reached 16,483 and the machine had to be rescued by hand.
-#
-# The threads were NOT leaked — measured here, 200 held connections produce
-# 202 threads and fall back to 2 the moment the clients close. What was
-# missing is a limit: one thread per connection, no cap, while every thread
-# sat out 2s+6s against a hop that accepts and never answers. A client that
-# retries forever (Claude Code does: "attempt N/300") then opens connections
-# faster than they can drain, and the box goes down before the pin ever
-# reaches its own DIRECT fallback.
-#
-# 256 is ~10x the busiest real daemon measured (26 threads for 16 live
-# sessions on host-a, 12 on a Mac), so a healthy host never meets it, and it
-# bounds the damage at something a machine survives. Refusing the excess is
-# the point: a refused connection is a client that retries in a second, while
-# an accepted one it cannot serve is a thread held for the full budget.
-_MAX_CLIENT_THREADS = 256
-
 # HOW LONG TO WAIT OUT A HOP THAT IS RESTARTING, before falling through to a
 # direct dial. Sized from the cache proxy's measured self-heal: ~1s to come
 # back under a new pid, refusing (not hanging) throughout. A little over twice
@@ -5438,8 +5416,6 @@ class PinProxy:
         # a burst; without this each would start its own listing.
         self._bridge_sweeping = False
         self._sweep_lock = threading.Lock()
-        # Whether we are currently refusing clients — see `_note_overloaded`.
-        self._overloaded = False
         # The connections themselves, not just a count. `stop()` has to CLOSE
         # them before the process exits — see the note there on why a drained
         # request still ends in RST without this.
@@ -5754,19 +5730,6 @@ class PinProxy:
             # accepts, which would then cut a quiet-but-healthy stream. The
             # wait above is about noticing shutdown, not about the client.
             conn.settimeout(None)
-            # REFUSE RATHER THAN ACCUMULATE. See `_MAX_CLIENT_THREADS`: past
-            # the ceiling, taking one more connection costs a thread held for
-            # the whole hop budget, and the client that opened it is retrying
-            # anyway. Closing it immediately is the cheaper answer for both
-            # sides — and it is what keeps a dead upstream from taking the
-            # machine with it.
-            if self.live_client_count() >= _MAX_CLIENT_THREADS:
-                self._note_overloaded()
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                continue
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
@@ -5818,55 +5781,32 @@ class PinProxy:
         with self._live_lock:
             self._live_clients += 1
             self._open_conns.add(conn)
-        try:
-            self._handle_client(conn)
-        finally:
+
+        def _release():
             with self._live_lock:
                 self._live_clients -= 1
                 self._open_conns.discard(conn)
-                # Back under the ceiling: re-arm the notice, so the NEXT
-                # episode is reported too rather than being swallowed by the
-                # first one's flag.
-                if self._overloaded and self._live_clients < _MAX_CLIENT_THREADS:
-                    self._overloaded = False
+
+        # HANDED OVER, NOT FINISHED. A handler that turns the connection into
+        # an opaque tunnel gives its thread back and passes this teardown to
+        # the pump, which runs it at EOF — so the connection stays counted for
+        # its whole life without a thread sitting on it. Measured before this:
+        # 300 connections cost 304 threads, exactly 1:1, which is how a dead
+        # upstream reached 27,491.
+        self._local.release = _release
+        detached = False
+        try:
+            detached = bool(self._handle_client(conn))
+        finally:
+            if not detached:
+                _release()
+            self._local.release = None
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
         count the daemon keeps itself, not an inference about the OS."""
         with self._live_lock:
             return self._live_clients
-
-    def _note_overloaded(self) -> None:
-        """Say once per episode that connections are being refused.
-
-        SILENCE HERE WOULD REPEAT THE OUTAGE'S OWN LESSON. Nobody noticed the
-        host-a failure until sessions showed "attempt N/300"; the components
-        themselves said nothing. A cap that engages quietly is the same shape
-        — the box survives, and the reason it is refusing is nowhere.
-
-        Once per episode, not per refusal: at the ceiling this runs on every
-        accept, and a line per refused connection is its own flood.
-        """
-        if self._overloaded:
-            return
-        self._overloaded = True
-        _log_lifecycle(
-            f"refusing new clients — {_MAX_CLIENT_THREADS} already connected. "
-            f"An upstream that accepts and never answers holds every one of "
-            f"them for the hop budget; check the chain."
-        )
-
-    # -- superseded remote-control bridges ---------------------------------
-    #
-    # claude.ai addresses a session by TITLE. When a session opens a bridge
-    # while an OLDER bridge of the same name is still `connected`, the sidebar
-    # picks between them and a dead one silently swallows the message.
-    # Measured on the owner's account: 293 connected bridges for 16 live
-    # processes, `CCF` appearing 7 times and `cswap` 4.
-    #
-    # ON THE DAEMON because the pin is why one account holds every machine's
-    # bridges in the first place, and because it already sees the event: the
-    # RC lifecycle call is a route it swaps the bearer on.
 
     def _bridge_api(self, method: str, path: str, token: str, timeout: float = 30.0):
         """One call to the sessions API, over the daemon's own egress.
@@ -6084,10 +6024,8 @@ class PinProxy:
                 # "the network broke" and not as "the pin did something".
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
-                    self._blind_tunnel(target, conn)
-                    return
-                self._mitm(conn)
-                return
+                    return self._blind_tunnel(target, conn)
+                return self._mitm(conn)
             if len(parts) >= 2 and parts[1].startswith("/health"):
                 # Local health probe (origin-form GET /health to our own port).
                 # Lets a statusline/cc-update probe tell the pin proxy apart
@@ -6337,19 +6275,28 @@ class PinProxy:
             except OSError:
                 pass
 
-    def _mitm(self, conn: socket.socket) -> None:
+    def _mitm(self, conn: socket.socket) -> bool:
+        """Serve requests on this connection. True when it was HANDED OVER.
+
+        A 101 turns the connection into an opaque stream that the shared pump
+        owns from then on — so this frame must NOT close it, and its caller
+        must not run the per-connection teardown that the pump will run at EOF.
+        """
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
+        self._local.detached = False
         try:
             while True:
                 if not self._handle_one_request(tls):
                     break
         finally:
-            self._drop_upstream()
-            try:
-                tls.close()
-            except OSError:
-                pass
+            if not getattr(self._local, "detached", False):
+                self._drop_upstream()
+                try:
+                    tls.close()
+                except OSError:
+                    pass
+        return bool(getattr(self._local, "detached", False))
 
     def _handle_one_request(self, tls: ssl.SSLSocket) -> bool:
         request_line = _read_line(tls)
@@ -6536,7 +6483,16 @@ class PinProxy:
                 # directions until either side closes. Nothing further on this
                 # connection is HTTP, so the request loop must end.
                 if _relay_upgrade(up, client):
-                    _pump(up, client)
+                    # 101 = OPAQUE FROM HERE. Nothing further on this
+                    # connection is HTTP, so the thread that carried the
+                    # handshake has no work left: hand both sockets to the
+                    # shared selector and give it back. This is the Remote
+                    # Control WebSocket, which stays open for the whole
+                    # session — the single longest-lived thing the pin holds.
+                    self._local.up = None  # the pump owns it now
+                    _pump_detached(up, client, getattr(self._local, "release", None))
+                    self._local.detached = True
+                    return False
                 self._drop_upstream()
                 return False
             return _relay_response(
@@ -6943,7 +6899,11 @@ class PinProxy:
         # read timeout left on it would tear down an idle-but-healthy stream.
         up.settimeout(None)
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        _pump(conn, up)
+        # DETACHED: nothing after the 200 is ours to parse, so the thread that
+        # built the tunnel has no work left. It hands the pair to the shared
+        # selector along with its own teardown and returns.
+        _pump_detached(conn, up, getattr(self._local, "release", None))
+        return True
 
 
 _TRACE = (
@@ -7333,47 +7293,175 @@ def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> b
             return True
 
 
-def _pump(a: socket.socket, b: socket.socket) -> None:
-    """Shuttle bytes both ways until either side closes.
+def _drain_ready(src) -> bytes:
+    """Everything readable right now, TLS buffer included.
 
-    Drains each side's TLS buffer before going back to ``select``. One TLS
-    record can decrypt to more than a single ``recv`` returns, and select sees
-    the SOCKET, not the SSL buffer — so bytes already decrypted and waiting
-    are invisible to it. Measured: after a recv returning 10 bytes, 90 more
-    sat in the buffer while the selector reported not-readable. A long poll or
-    SSE stream through such a tunnel stalls on data that has already arrived.
+    One TLS record can decrypt to more than a single ``recv`` returns, and a
+    selector sees the SOCKET, not the SSL buffer — so bytes already decrypted
+    and waiting are invisible to it. Measured: after a recv returning 10
+    bytes, 90 more sat in the buffer while the selector reported not-readable.
+    A long poll or SSE stream through such a tunnel stalls on data that has
+    already arrived.
+    """
+    data = src.recv(65536)
+    pending = getattr(src, "pending", None)
+    while data and pending and pending():
+        more = src.recv(65536)
+        if not more:
+            break
+        data += more
+    return data
+
+
+class _PumpLoop:
+    """ONE selector thread for EVERY tunnel, instead of one thread each.
+
+    THE MEASURED PROBLEM. A connection spends almost its whole life here —
+    a CONNECT tunnel is opaque from the 200 onward, and a WebSocket upgrade
+    turns the MITM into the same thing — and it used to hold an OS thread for
+    that entire time. Counted from outside the process, hop wedged:
+
+        idle          4 threads
+         50 conns ->  54 threads
+        150 conns -> 154 threads
+        300 conns -> 304 threads
+
+    Exactly 1:1, which is how a dead upstream produced 27,491 threads and
+    44,121 FDs in 40 minutes and took a 48-core box to load 16,483: the
+    retry count IS the thread count. A ceiling was tried and removed — it
+    turns the 257th retry into a refused connection and leaves the coupling.
+
+    The multiplexing was always here; `_pump` already ran a selector over its
+    two sockets. It just ran one per connection. Registering every pair with
+    ONE selector is the same code with the thread removed, which is what an
+    event loop would give and what the peer proxy in this chain measured on
+    its own side: 84 connections, 11 threads, flat.
+
+    NOT asyncio, deliberately. This module speaks blocking sockets in 53
+    places — TLS MITM, CONNECT tunnels, the chain walk, fd hand-down — and
+    every one of them carries a measurement that would have to be re-proved
+    against a coroutine rewrite. The property the outage needs is "a
+    connection is not a thread", and that is this class.
     """
 
-    def _drain(src) -> bytes:
-        data = src.recv(65536)
-        pending = getattr(src, "pending", None)
-        while data and pending and pending():
-            more = src.recv(65536)
-            if not more:
-                break
-            data += more
-        return data
+    def __init__(self):
+        self._sel = selectors.DefaultSelector()
+        self._peer: dict = {}
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        # A self-pipe so `add` wakes the selector instead of waiting out its
+        # timeout: a tunnel registered a moment after `select()` blocked would
+        # otherwise sit idle for the whole poll, which is a stall the client
+        # sees as a hang.
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._sel.register(self._wake_r, selectors.EVENT_READ)
 
-    sel = selectors.DefaultSelector()
-    sel.register(a, selectors.EVENT_READ)
-    sel.register(b, selectors.EVENT_READ)
-    try:
-        while True:
-            for key, _ in sel.select(timeout=60):
-                src = key.fileobj
-                dst = b if src is a else a
-                data = _drain(src)
-                if not data:
+    def add(self, a, b, on_close=None) -> None:
+        """Take over a pair of sockets. Returns AT ONCE.
+
+        `on_close` runs when the tunnel ends — it is where the caller's own
+        teardown goes, because the caller no longer has a thread to run it on.
+        """
+        with self._lock:
+            self._peer[a] = (b, on_close)
+            self._peer[b] = (a, on_close)
+            for s in (a, b):
+                try:
+                    s.setblocking(False)
+                    self._sel.register(s, selectors.EVENT_READ)
+                except (OSError, ValueError, KeyError):
+                    self._close_pair(a, b, on_close)
                     return
-                dst.sendall(data)
-    except OSError:
-        return
-    finally:
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+        try:
+            self._wake_w.send(b"\0")
+        except OSError:
+            pass
+
+    def _close_pair(self, a, b, on_close) -> None:
         for s in (a, b):
+            self._peer.pop(s, None)
+            try:
+                self._sel.unregister(s)
+            except (KeyError, ValueError):
+                pass
             try:
                 s.close()
             except OSError:
                 pass
+        if on_close is not None:
+            try:
+                on_close()
+            except Exception:  # noqa: BLE001 — never take the loop down
+                pass
+
+    def _run(self) -> None:
+        while True:
+            for key, _ in self._sel.select(timeout=60):
+                src = key.fileobj
+                if src is self._wake_r:
+                    try:
+                        self._wake_r.recv(65536)
+                    except OSError:
+                        pass
+                    continue
+                with self._lock:
+                    entry = self._peer.get(src)
+                    if entry is None:
+                        continue
+                    dst, on_close = entry
+                    try:
+                        data = _drain_ready(src)
+                    except (BlockingIOError, ssl.SSLWantReadError):
+                        continue  # nothing decrypted yet — wait for more
+                    except OSError:
+                        data = b""
+                    if not data:
+                        self._close_pair(src, dst, on_close)
+                        continue
+                    try:
+                        # Blocking for the WRITE only. A non-blocking sendall
+                        # can raise mid-buffer with no record of how much went
+                        # out, and a tunnel that loses bytes silently is worse
+                        # than one that waits: the peer is a local hop or an
+                        # already-connected upstream, so this drains promptly.
+                        dst.setblocking(True)
+                        dst.sendall(data)
+                        dst.setblocking(False)
+                    except OSError:
+                        self._close_pair(src, dst, on_close)
+
+
+_PUMP = _PumpLoop()
+
+
+def _pump(a: socket.socket, b: socket.socket) -> None:
+    """Shuttle bytes both ways until either side closes, BLOCKING.
+
+    The shared selector does the waiting, so this thread is parked on an Event
+    rather than on a socket — but it is still a thread. Prefer
+    :func:`_pump_detached` on any path that can give its thread back; this
+    remains for callers whose own frame must outlive the tunnel.
+    """
+    done = threading.Event()
+    _PUMP.add(a, b, done.set)
+    done.wait()
+
+
+def _pump_detached(a: socket.socket, b: socket.socket, on_close=None) -> None:
+    """Hand a tunnel to the shared selector and RETURN.
+
+    This is where the thread is given back. A tunnel is opaque from the 200
+    onward and lives for as long as the session does, so the thread that set
+    it up has nothing left to do — it was only holding the connection open.
+    `on_close` carries whatever teardown that frame would have run.
+    """
+    _PUMP.add(a, b, on_close)
+
+
 
 if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
     import sys as _sys
