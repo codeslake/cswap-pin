@@ -431,3 +431,49 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             f"{len(failures)} of {len(work)} cases failed:\n\n" + "\n".join(failures)
         )
 
+
+
+def test_every_case_has_a_driver():
+    """A `case_*` method with no `test_all` NEVER RUNS, and nothing says so.
+
+    MEASURED: 82 cases across 57 classes had been silently dead — including
+    TestKillDaemon, TestOrphanSweep, TestDaemonSignalTeardown and
+    TestEnsureProxyLifecycle, i.e. the paths that strand sessions. The suite
+    reported `60 passed` the whole time, and a test written for a REAL defect
+    (the mtime fingerprint) passed while the defect was still there, because
+    its class had no driver either.
+
+    That is worse than having no test: a green run is read as evidence. This
+    guard is the one thing that cannot itself go quiet, because it is a plain
+    pytest function with no driver of its own.
+    """
+    import pathlib
+    import re
+
+    dead = []
+    for path in sorted(pathlib.Path(__file__).parent.glob("test_*.py")):
+        cls = None
+        has_driver = False
+        cases = []
+        for line in path.read_text().splitlines():
+            if line.startswith("class "):
+                if cls and cases and not has_driver:
+                    dead.append((path.name, cls, len(cases)))
+                cls = line.split(":")[0].split("(")[0].replace("class ", "").strip()
+                has_driver = False
+                cases = []
+            elif re.match(r"    def test_all\b", line):
+                has_driver = True
+            elif re.match(r"    def case_", line):
+                cases.append(line.strip())
+        if cls and cases and not has_driver:
+            dead.append((path.name, cls, len(cases)))
+
+    assert not dead, (
+        f"{sum(n for _, _, n in dead)} case(s) in {len(dead)} class(es) never "
+        f"run — they have `case_*` methods and no `test_all` driver:\n"
+        + "\n".join(f"  {f}::{c} ({n} cases)" for f, c, n in dead)
+        + "\n\nAdd to each class:\n"
+        "    def test_all(self, request, tmp_path_factory):\n"
+        "        run_cases(self, request, tmp_path_factory)"
+    )
