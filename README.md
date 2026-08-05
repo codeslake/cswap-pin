@@ -124,6 +124,31 @@ The holder reads the daemon's exit rather than guessing:
 `CSWAP_PIN_SELF_HEAL=off` turns the restart off, for when you are debugging
 the daemon and a respawner fighting you is worse than a dead port.
 
+A redeploy is the same story from the other side. Under a holder the daemon
+does not hand its socket to a successor — it exits `75` and lets the holder
+put the new code on the socket it already owns. Handing the port out of the
+holder is what left this machine's pin unwired for 76 minutes while every
+component reported healthy.
+
+## A connection is not a thread
+
+An upstream that accepts and never answers used to cost one OS thread per
+connection, and a client that retries forever opens them faster than they
+drain. Measured on a 48-core box: **27,491 threads / 44,121 FDs in 40
+minutes**, load 16,483, rescued by hand.
+
+Connections are multiplexed on one selector instead. Measured with
+`tools/thread_probe.py`, idle CONNECT tunnels against a local upstream:
+
+| open tunnels | before | after |
+| --: | --: | --: |
+| 50 | 55 threads | 5 |
+| 150 | 155 threads | 5 |
+| 300 | 305 threads | 5 |
+
+A ceiling was tried first and removed: it turns the 257th retry into a
+refused connection and leaves the coupling in place.
+
 ### Asking for a specific port
 
 ```bash
