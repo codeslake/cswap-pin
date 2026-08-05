@@ -3619,6 +3619,29 @@ def _log_lifecycle(what: str) -> None:
 # is the same outcome as before this existed.
 _DRAIN_SECONDS = 30.0
 
+# THE SAME DRAIN, PAID AT A DIFFERENT MOMENT. Under a holder the daemon exits
+# so the HOLDER can spawn the successor — and the holder cannot start anything
+# until this process is gone, so every second of drain here is a second with
+# the port bound and nobody behind it. The unheld path has the opposite shape:
+# it drains AFTER `_spawn_daemon` returned, with the successor already
+# accepting, so a 30s ceiling there costs nothing.
+#
+# Measured on lmd42, upgrading 0.1.44 -> 0.1.46 under load:
+#   16:24:08 code on disk changed — exiting for the holder to replace
+#   16:24:38 pid=2664753 serving on port 36301
+# Thirty seconds, exactly `_DRAIN_SECONDS`. Nothing was REFUSED — the holder's
+# socket queues arrivals, which is what this design is for — but 30 requests
+# timed out at 3s waiting for a reply nobody was there to write.
+#
+# The ceiling is always paid in full on a real machine: a CONNECT tunnel is
+# counted for its whole life (deliberately — that is what stops an idle
+# watcher cutting a live session), and Remote Control's WebSocket lives as
+# long as the session does, so the count is never zero.
+#
+# Still a drain, not zero: a response mid-stream must not be cut, which is the
+# 34-connections-reset outage `stop(drain=…)` exists to prevent.
+_HELD_DRAIN_SECONDS = 2.0
+
 _FIRST_HOLDER_TIMEOUT = 300.0
 
 # How long to wait before re-asking whether a daemon whose last FIFO holder
@@ -4967,11 +4990,12 @@ def _watch_own_code(
                 _log_lifecycle(
                     "code on disk changed — exiting for the holder to replace"
                 )
-                # DRAIN FIRST, exactly as the handover path does. The holder
-                # cannot start the successor until we release the socket, but
-                # in-flight requests are still ours to finish.
+                # DRAIN FIRST, but on a SHORT budget — see
+                # `_HELD_DRAIN_SECONDS`. The holder cannot start the successor
+                # until we are gone, so unlike the handover path below this
+                # drain is time with nobody serving.
                 server.release_listener()
-                server.await_inflight(_DRAIN_SECONDS)
+                server.await_inflight(_HELD_DRAIN_SECONDS)
                 os._exit(_RESTART_ME_CODE)
             # NAME THE REASON THAT APPLIES. Both paths hand over, but saying
             # "code on disk changed" about an orphaning is a false line in the
@@ -5422,7 +5446,15 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # ends in os._exit(0), so anything still being served when this returns
         # is cut mid-response — measured as ConnectionResetError at a client
         # reading a streaming reply. An idle daemon returns from here at once.
-        proxy.stop(drain=_DRAIN_SECONDS)
+        #
+        # SHORT WHEN A HOLDER IS WAITING TO RESPAWN, for the same reason the
+        # code watchdog's held exit is (see `_HELD_DRAIN_SECONDS`): a TERM
+        # under a holder is a RECYCLE, and the holder cannot put the successor
+        # on the socket until we are gone. Draining the full ceiling there is
+        # time with the port bound and nobody behind it.
+        proxy.stop(
+            drain=_HELD_DRAIN_SECONDS if held_by_a_holder() else _DRAIN_SECONDS
+        )
         _log_lifecycle(f"drained, {proxy.live_client_count()} client(s) still open")
         # ``done`` must be set on EVERY exit from here: ``daemon_main`` blocks
         # on it and the signal path ends in ``os._exit(0)``, so an exception

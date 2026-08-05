@@ -3099,6 +3099,84 @@ class TestDaemonPortStability:
             "minutes of unwired pin on lmd42)"
         )
 
+    def case_a_held_exit_does_not_drain_before_letting_the_holder_respawn(
+        self, tmp_path
+    ):
+        """UNDER A HOLDER, THE DRAIN HAPPENS WHILE NOBODY IS SERVING.
+
+        The sibling case above stubs `await_inflight` away, so it cannot see
+        what budget the exit path passes. The budget is the whole problem.
+
+        The two handover paths look alike and are NOT. The unheld one drains
+        AFTER `_spawn_daemon` has returned, so the successor is already
+        accepting and a 30s ceiling costs nothing. The held one exits so the
+        HOLDER can spawn — and the holder cannot start anything until this
+        process is gone, so every second of drain is a second with the port
+        bound and nobody behind it.
+
+        MEASURED on lmd42, upgrading 0.1.44 -> 0.1.46 under load:
+
+            16:24:08 code on disk changed — exiting for the holder to replace
+            16:24:38 pid=2664753 serving on port 36301
+
+        Thirty seconds, which is exactly `_DRAIN_SECONDS`. Nothing was
+        refused (the holder's socket queues arrivals, which is the property
+        this design is for) but 30 connections timed out at 3s waiting for a
+        reply that had nobody to write it.
+
+        A CONNECT tunnel is counted for its whole life, deliberately — that
+        is what stops an idle watcher cutting a live session. So on any real
+        machine the count is never zero (Remote Control's WebSocket alone
+        lives as long as the session) and the ceiling is always paid in full.
+
+        The budget here must be short enough that the gap is not felt.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        budgets = []
+        exits = []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                return 7 if hand_down else None
+
+            def await_inflight(self, budget):
+                budgets.append(budget)
+
+        real_exit = os._exit
+        os._exit = lambda code: exits.append(code) or (_ for _ in ()).throw(
+            SystemExit(code)
+        )
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                lambda *a: None, interval=0.01,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+        finally:
+            os._exit = real_exit
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+
+        assert exits == [pin_proxy._RESTART_ME_CODE], (
+            "premise: this is the held-exit path"
+        )
+        assert budgets, "the exit path did not drain at all"
+        assert budgets[0] <= pin_proxy._HELD_DRAIN_SECONDS, (
+            f"a held exit drained for {budgets[0]}s before the holder could "
+            f"respawn — the port is bound and nobody is behind it for all of it"
+        )
+        # AND IT IS STILL A DRAIN. Zero would cut a response mid-stream, which
+        # is the 34-connections-reset outage `stop(drain=…)` exists to prevent.
+        assert budgets[0] > 0, (
+            "a held exit stopped draining entirely — in-flight requests are "
+            "still ours to finish, holder or no holder"
+        )
+
     def case_an_idle_teardown_is_not_restarted(self, tmp_path):
         """A daemon that MEANT to exit must stay exited.
 
