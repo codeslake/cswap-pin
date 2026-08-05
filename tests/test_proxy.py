@@ -3004,7 +3004,22 @@ class TestDaemonPortStability:
             # SIGKILL through the Popen, never through the pid: `daemon_pid`
             # is only ours while the Popen it came from is, and signalling a
             # bare number once killed a pytest-xdist worker (see `stop`).
-            holder._proc.kill()
+            #
+            # AND ONLY WHILE IT IS STILL RUNNING. `Popen.kill()` on a REAPED
+            # child signals its pid anyway — CPython only refuses after
+            # `returncode` is set, and nothing here guarantees that ordering
+            # against the holder's own supervisor thread, which reaps
+            # concurrently. A pid the kernel has already recycled then belongs
+            # to somebody else. Measured: the worker running this case took a
+            # SIGINT and xdist reported `received keyboard-interrupt`, 3 runs
+            # of 3, traced to this line. `kill_daemon_for_test` carried this
+            # guard and a ponytail cut dropped it with the method.
+            proc = holder._proc
+            assert proc.returncode is None, (
+                "premise: the daemon is still running, so there is a crash to "
+                "cause"
+            )
+            proc.kill()
 
             # THE POINT: no window. Not "it comes back in a second" — the
             # socket was never the daemon's to take down with it, so a
