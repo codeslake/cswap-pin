@@ -4351,6 +4351,26 @@ _RESTART_ME_CODE = 75  # EX_TEMPFAIL, and nothing else in this file uses it
 # port it holds stays answering.
 _HOLD_RESTART_BASE_S = 0.25
 _HOLD_RESTART_MAX_S = 5.0
+
+# Consecutive failed respawns before the holder says the successor cannot
+# start. NOT a ceiling — it keeps retrying, because a machine that recovers on
+# attempt 20 should. It is the line between "it crashed, the next one will be
+# fine" and "nothing this holder starts will ever run", which look identical
+# on the ladder and need opposite responses.
+#
+# MEASURED here, caused by running the README's own install command against an
+# editable install: it replaced the checkout with the PyPI release and took
+# `cswap_pin` out of the tool env with it. The daemon already running kept
+# serving — its code is in memory — while every successor died before reaching
+# any of its own code:
+#
+#   .../claude-swap/bin/python: Error while finding module specification for
+#   'cswap_pin.proxy' (ModuleNotFoundError: No module named 'cswap_pin')
+#
+# repeated in `daemon.log` with nothing saying the port was one death away
+# from being unrecoverable. The pin fails open by design, so this is exactly
+# the class of failure that stays invisible until it is an outage.
+_HOLD_RESTART_REPORT_AT = 5
 # How long the holder waits for the port it was told to take. The predecessor
 # is usually mid-teardown, so this is a handoff, not a contest.
 _HOLD_BIND_WAIT_S = 3.0
@@ -4466,6 +4486,15 @@ class PortHolder:
     def _self_heal_on(self) -> bool:
         return os.environ.get(_SELF_HEAL_ENV, "").lower() not in ("off", "0", "no")
 
+    @staticmethod
+    def _backoff(failures: int) -> float:
+        """How long to wait before the next respawn. A method so a test can
+        take the ladder out: reaching the report threshold through the real
+        one costs 0.5+1+2+4+5 = 12.5s, which is a timing test nobody wanted."""
+        return min(
+            _HOLD_RESTART_BASE_S * 2 ** min(failures, 5), _HOLD_RESTART_MAX_S,
+        )
+
     def _spawn(self) -> None:
         """Start a daemon on our socket, via the socket-activation convention.
 
@@ -4559,10 +4588,18 @@ class PortHolder:
                 f"daemon {self.daemon_pid} exited; restarting under the held "
                 f"port {self.port}"
             )
-            time.sleep(min(
-                _HOLD_RESTART_BASE_S * 2 ** min(self._failures, 5),
-                _HOLD_RESTART_MAX_S,
-            ))
+            # SAY IT ONCE when the successor is not merely crashing but cannot
+            # start at all — see `_HOLD_RESTART_REPORT_AT`. Exactly at the
+            # threshold, so a machine that keeps failing does not turn the log
+            # into one warning per rung forever.
+            if self._failures == _HOLD_RESTART_REPORT_AT:
+                _log_lifecycle(
+                    f"the successor cannot start — {self._failures} spawns in "
+                    f"a row died immediately. Still retrying, but the port is "
+                    f"one holder death away from being unrecoverable. The "
+                    f"daemon's own stderr is above in this file."
+                )
+            time.sleep(self._backoff(self._failures))
             if self._stop:
                 return
             self._spawn()
