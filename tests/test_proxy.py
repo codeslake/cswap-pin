@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import re
 import time
 from pathlib import Path
@@ -2667,6 +2668,158 @@ class TestDaemonPortStability:
         finally:
             proxy.stop()
             squatter.close()
+
+    def case_recycling_a_held_daemon_keeps_the_port_and_one_holder(
+        self, tmp_path
+    ):
+        """A recycle under a holder must replace the CODE, not the port.
+
+        `ensure_proxy`/`heal` recycle a stale daemon by SIGTERMing it and
+        spawning. Under a holder that is two mistakes at once, measured:
+
+          the TERM makes the daemon exit 75, so the holder replaces it
+          IMMEDIATELY — with the same stale code, and the recycle achieved
+          nothing
+
+          `_spawn_daemon` then starts a SECOND holder for a port the first
+          one still holds; it cannot bind, falls back, and the wiring is
+          rewritten to a different port (measured: 44411 -> 41569) while the
+          live sessions still name the old one
+
+        End state before the fix: 3 processes, two of them holders, and a
+        config naming an address no session was given. Under a holder the
+        recycle belongs to the holder — the code watchdog already replaces a
+        daemon whose file changed, on the socket the holder owns.
+        """
+        import os
+        import subprocess
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.ensure_ca(tmp_path, "api.anthropic.com")
+        # TRACK EVERY CHILD AT BIRTH. This case starts real holders, and
+        # reaping by certdir afterwards races the spawn — the holder can
+        # appear after the reap and then lives forever.
+        started = []
+        real_popen = subprocess.Popen
+
+        def _tracked(*a, **k):
+            proc = real_popen(*a, **k)
+            started.append(proc)
+            return proc
+
+        subprocess.Popen = _tracked
+        try:
+            port = pin_proxy._spawn_daemon("1", "a@example.com", tmp_path)
+        finally:
+            subprocess.Popen = real_popen
+        if not port:
+            log = tmp_path / "daemon.log"
+            raise AssertionError(
+                "the daemon did not come up; log tail:\n"
+                + (log.read_text()[-600:] if log.exists() else "(no log)")
+            )
+        time.sleep(1.5)
+        first = int(pin_proxy.read_daemon_state(tmp_path)["pid"])
+        try:
+            pin_proxy._write_port_hint(tmp_path, port)
+            # THE REAL FLOW: recycle, and spawn ONLY if the holder is not
+            # already putting a successor up. That branch is the fix — calling
+            # `_spawn_daemon` unconditionally is what started a second holder.
+            # THE PREMISE: a holder must actually be up, or this measures
+            # nothing. `_spawn_daemon` returns as soon as the state file
+            # appears, which can precede the holder being visible in `ps`.
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                # /proc, NOT ps. Inside pytest the `ps` output arrived with
+                # the command line truncated mid-argument ("--hold-port 0 1
+                # a@"), so a certdir match could never succeed — the same
+                # class of trap as `pgrep -f` reading argv while the value is
+                # in the environment.
+                found = False
+                for entry in pathlib.Path("/proc").glob("[0-9]*"):
+                    try:
+                        cl = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+                    except OSError:
+                        continue
+                    line = cl.decode(errors="replace")
+                    if "--hold-port" in line and str(tmp_path) in line:
+                        found = True
+                        break
+                if found:
+                    break
+                time.sleep(0.2)
+            else:
+                log = tmp_path / "daemon.log"
+                out = subprocess.run(
+                    ["ps", "-eo", "pid=,command="], capture_output=True, text=True
+                ).stdout
+                raise AssertionError(
+                    f"no holder came up (spawn returned {port}).\n"
+                    f"log: {log.read_text()[-400:] if log.exists() else '(none)'}\n"
+                    f"want certdir={tmp_path!s}\n"
+                    f"holder argvs: "
+                    + " || ".join(
+                        l.strip().partition(" ")[2]
+                        for l in out.splitlines()
+                        if "--hold-port" in l and "cswap_pin" in l
+                    )[-500:]
+                )
+
+            handled = pin_proxy._recycle_daemon(tmp_path, first)
+            if handled:
+                again = None
+                for _ in range(60):
+                    time.sleep(0.25)
+                    again = pin_proxy._read_alive_port(tmp_path)
+                    if again is not None:
+                        break
+            else:
+                again = pin_proxy._spawn_daemon("1", "a@example.com", tmp_path)
+            time.sleep(1.0)
+            assert handled, (
+                "a daemon under a holder was not recognised as held — the "
+                "caller spawns a second holder for a port the first still has"
+            )
+
+            # /proc, for the same reason the premise check uses it: `ps`
+            # truncated the command line here and every certdir match failed.
+            mine = []
+            for entry in pathlib.Path("/proc").glob("[0-9]*"):
+                try:
+                    argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+                except OSError:
+                    continue
+                cmd = argv.decode(errors="replace")
+                if " -m cswap_pin.proxy" in cmd and str(tmp_path) in cmd:
+                    mine.append(f"{entry.name} {cmd}")
+            holders = [line for line in mine if "--hold-port" in line]
+
+            assert again == port, (
+                f"the recycle moved the port {port} -> {again}; every session "
+                f"wired to {port} is stranded"
+            )
+            assert len(holders) == 1, (
+                f"{len(holders)} holders for one certdir — the second cannot "
+                f"bind and its daemon lands unheld"
+            )
+        finally:
+            # PARENTS FIRST: `started` holds the holders, and each takes its
+            # own daemon down with it. Killing daemons first would only make
+            # the holders replace them.
+            for proc in started:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:  # noqa: BLE001 — gone, or too slow
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+            from conftest import _reap_pin_processes
+
+            _reap_pin_processes(tmp_path)
 
     def case_an_idle_teardown_under_a_holder_still_unwires(self, tmp_path):
         """A holder's bare socket is not "somebody else is serving".

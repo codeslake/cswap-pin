@@ -3190,7 +3190,17 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # already wired to the old one.
             if isinstance(stale.get("port"), int):
                 _write_port_hint(certdir, stale["port"])
-            _kill_daemon(int(stale["pid"]))
+            if _recycle_daemon(certdir, int(stale["pid"])):
+                # THE HOLDER OWNS THE REPLACEMENT. Spawning here would start a
+                # second holder for a port the first still holds; it cannot
+                # bind, falls back, and the wiring moves to an address no live
+                # session was given (measured: 44411 -> 41569).
+                for _ in range(int(_SPAWN_WAIT_S * 10)):
+                    port = _read_alive_port(certdir)
+                    if port is not None:
+                        wire_global_config(port, ca)
+                        return port, ca
+                    time.sleep(0.1)
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
             # The spawn failed. Anything still wired in .claude.json may name a
@@ -3284,6 +3294,80 @@ def _kill_daemon(pid: int) -> None:
         if not _pid_alive(pid):
             return
         time.sleep(0.1)
+
+
+def _recycle_daemon(certdir: Path, pid: int) -> bool:
+    """Replace a stale daemon. True when a successor is already on the way.
+
+    UNDER A HOLDER THIS IS NOT OURS TO DO, and doing it anyway was two
+    mistakes at once (both measured):
+
+      the TERM makes the daemon exit `_RESTART_ME_CODE`, so the holder
+      replaces it AT ONCE — with the same stale code the recycle was meant to
+      retire, and at zero backoff
+
+      the caller then spawns, which starts a SECOND holder for a port the
+      first one still holds. It cannot bind, falls back, and the wiring is
+      rewritten to a different port: 44411 -> 41569, with every live session
+      still naming 44411.
+
+    So under a holder we TERM and report "handled": the holder puts a
+    successor on the socket it owns, and the code watchdog inside that
+    successor retires it again if the file on disk has moved on. Without a
+    holder this is the old behaviour, unchanged — kill, and let the caller
+    spawn.
+    """
+    held = _holder_owns(certdir)
+    _kill_daemon(pid)
+    return held
+
+
+def _holder_owns(certdir: Path) -> bool:
+    """Is a holder holding the port for ``certdir``?
+
+    /proc FIRST, `ps` only as the fallback. `ps -eo command=` TRUNCATES a long
+    command line — measured inside the test runner, where a holder's argv
+    arrived as "--hold-port 0 1 a@" with the certdir cut off entirely, so the
+    match could never succeed and the caller silently took the double-holder
+    path. `/proc/<pid>/cmdline` is the argv the kernel actually holds, with no
+    width to run out of. It does not exist on macOS, which is why `ps` stays
+    as the fallback rather than the primary.
+
+    Cannot tell -> False, which means "recycle the old way". Guessing True
+    would skip a recycle that was asked for.
+    """
+    targets = {str(Path(certdir)), str(Path(certdir).resolve())}
+
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.glob("[0-9]*"):
+            try:
+                argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+            except OSError:
+                continue
+            cmd = argv.decode("utf-8", "replace").rstrip()
+            if _HOLDER_MODULE_ARG not in cmd:
+                continue
+            if any(cmd.endswith(" " + t) for t in targets):
+                return True
+        return False
+
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,command="], capture_output=True, text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in out.splitlines():
+        cmd = line.strip().partition(" ")[2].rstrip()
+        if _HOLDER_MODULE_ARG not in cmd:
+            continue
+        if any(cmd.endswith(" " + t) for t in targets):
+            return True
+    return False
 
 
 def _pin_daemon_pids(certdir: Path) -> list[int]:
