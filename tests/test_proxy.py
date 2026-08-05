@@ -1174,7 +1174,7 @@ class TestRefcount:
         # No holder is ever opened.
         threading.Thread(
             target=watch_refcount, args=(fifo, fired.set),
-            kwargs={"first_holder_timeout": 0.5}, daemon=True,
+            kwargs={"first_holder_timeout": 0.15}, daemon=True,
         ).start()
         assert fired.wait(timeout=5), "daemon never torn down — it would linger forever"
 
@@ -1194,10 +1194,10 @@ class TestRefcount:
         fired = threading.Event()
         threading.Thread(
             target=watch_refcount, args=(fifo, fired.set),
-            kwargs={"first_holder_timeout": 0.5}, daemon=True,
+            kwargs={"first_holder_timeout": 0.15}, daemon=True,
         ).start()
         # Well past the first-holder timeout: a silent holder must NOT trip it.
-        assert not fired.wait(timeout=0.4), "tore down while a holder was still attached"
+        assert not fired.wait(timeout=0.15), "tore down while a holder was still attached"
         os.close(holder)
         assert fired.wait(timeout=3), "did not tear down after the holder closed"
 
@@ -1234,9 +1234,9 @@ class TestRefcount:
         fired = threading.Event()
         threading.Thread(
             target=watch_refcount, args=(fifo, fired.set),
-            kwargs={"first_holder_timeout": 0.3}, daemon=True,
+            kwargs={"first_holder_timeout": 0.1}, daemon=True,
         ).start()
-        assert not fired.wait(timeout=0.4), (
+        assert not fired.wait(timeout=0.15), (
             "tore down a daemon the global config still routes sessions to"
         )
 
@@ -1265,7 +1265,7 @@ class TestRefcount:
         fired = threading.Event()
         threading.Thread(
             target=watch_refcount, args=(fifo, fired.set),
-            kwargs={"first_holder_timeout": 0.3}, daemon=True,
+            kwargs={"first_holder_timeout": 0.1}, daemon=True,
         ).start()
         assert fired.wait(timeout=5), "orphan lingered — reaper disabled by a foreign pin"
 
@@ -1312,7 +1312,7 @@ class TestRefcount:
         # that second phase, not the first-holder timeout.
         time.sleep(0.4)
         os.close(holder)  # ...and leaves, while the wiring still names us
-        assert not fired.wait(timeout=0.4), (
+        assert not fired.wait(timeout=0.15), (
             "tore down a daemon the global config still routes sessions "
             "to — they get ConnectionRefused and cannot be redirected"
         )
@@ -2393,74 +2393,62 @@ class TestAmbientProxyPrefersTheLauncherProxy:
     where a `cswap pin` run over ssh recorded privoxy:8118 while CCF on :9901
     stayed bypassed for every pinned session afterwards."""
 
-    def _serving_port(self):
-        import socket as s
-        srv = s.socket()
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(1)
-        return srv, srv.getsockname()[1]
+    def test_which_proxy_the_chain_records(self, tmp_path, monkeypatch):
+        """Five inputs, one function. The CASES are the value here.
 
-    def _wire(self, tmp_path, monkeypatch, saved_proxy):
+        `_ambient_proxy` chooses between what a previous launch DISPLACED (the
+        launcher's own inner proxy) and what this shell exports (the
+        machine-wide one). Getting it wrong drops a whole hop out of the
+        chain, silently.
+        """
+        import socket as _s
+
+        from cswap_pin.proxy import _ambient_proxy
+
         cfg = tmp_path / ".claude.json"
-        cfg.write_text(json.dumps({"_cswapPinWiredKeysSaved": {"HTTPS_PROXY": saved_proxy}}))
-        monkeypatch.setattr("claude_swap.paths.get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(
+            "claude_swap.paths.get_global_config_path", lambda: cfg
+        )
 
-    def test_recorded_launcher_proxy_wins_over_the_shell_one(
-        self, tmp_path, monkeypatch
-    ):
-        from cswap_pin.proxy import _ambient_proxy
+        live = _s.socket()
+        live.bind(("127.0.0.1", 0))
+        live.listen(1)
+        live_url = "http://127.0.0.1:%d" % live.getsockname()[1]
+        dead = _s.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_url = "http://127.0.0.1:%d" % dead.getsockname()[1]
+        dead.close()
 
-        srv, ccf_port = self._serving_port()
+        shell = "http://127.0.0.1:8118"
         try:
-            self._wire(tmp_path, monkeypatch, f"http://127.0.0.1:{ccf_port}")
-            # The ssh shell only knows the machine-wide egress proxy.
-            got = _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"})
-            assert got == f"http://127.0.0.1:{ccf_port}", (
-                "the launcher's proxy was dropped from the chain"
-            )
+            for saved, env, want, why in (
+                # A LIVE loopback record is the inner link and wins: an ssh
+                # shell knows only the machine-wide proxy, so taking it would
+                # drop the launcher's proxy out of the chain entirely.
+                (live_url, {"HTTPS_PROXY": shell}, live_url,
+                 "a live launcher proxy must win over the shell's"),
+                # ...but a STALE one must never strand the chain.
+                (dead_url, {"HTTPS_PROXY": shell}, shell,
+                 "a dead record must fall back to the shell"),
+                (shell, {"HTTPS_PROXY": shell}, shell,
+                 "the same proxy in both places is unchanged"),
+                # Only a LOCAL launcher proxy is worth restoring; a corporate
+                # one recorded earlier must not override the live shell.
+                ("http://proxy.corp.example:3128", {"HTTPS_PROXY": shell}, shell,
+                 "a non-loopback record is not preferred"),
+                # A shell that ran pin-env exports OUR port; recording it would
+                # make the daemon dial itself.
+                (shell,
+                 {"HTTPS_PROXY": "http://127.0.0.1:44444",
+                  "CSWAP_PIN_PORT": "44444"},
+                 shell, "our own port is never recorded"),
+            ):
+                cfg.write_text(
+                    json.dumps({"_cswapPinWiredKeysSaved": {"HTTPS_PROXY": saved}})
+                )
+                assert _ambient_proxy(env) == want, why
         finally:
-            srv.close()
-
-    def test_shell_value_wins_when_the_recorded_one_is_dead(
-        self, tmp_path, monkeypatch
-    ):
-        """A stale record must never strand the chain on a port nothing serves."""
-        from cswap_pin.proxy import _ambient_proxy
-
-        srv, dead_port = self._serving_port()
-        srv.close()  # nothing listens there now
-        self._wire(tmp_path, monkeypatch, f"http://127.0.0.1:{dead_port}")
-        got = _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"})
-        assert got == "http://127.0.0.1:8118"
-
-    def test_same_proxy_in_both_places_is_unchanged(self, tmp_path, monkeypatch):
-        from cswap_pin.proxy import _ambient_proxy
-
-        self._wire(tmp_path, monkeypatch, "http://127.0.0.1:8118")
-        assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}) == (
-            "http://127.0.0.1:8118"
-        )
-
-    def test_a_non_loopback_record_is_not_preferred(self, tmp_path, monkeypatch):
-        """Only a LOCAL launcher proxy is the inner link worth restoring; a
-        corporate proxy recorded earlier must not override the live shell."""
-        from cswap_pin.proxy import _ambient_proxy
-
-        self._wire(tmp_path, monkeypatch, "http://proxy.corp.example:3128")
-        assert _ambient_proxy({"HTTPS_PROXY": "http://127.0.0.1:8118"}) == (
-            "http://127.0.0.1:8118"
-        )
-
-    def test_our_own_port_is_never_recorded(self, tmp_path, monkeypatch):
-        """Unchanged behaviour: a shell that ran pin-env exports OUR port."""
-        from cswap_pin.proxy import _ambient_proxy
-
-        self._wire(tmp_path, monkeypatch, "http://127.0.0.1:8118")
-        got = _ambient_proxy(
-            {"HTTPS_PROXY": "http://127.0.0.1:44444", "CSWAP_PIN_PORT": "44444"}
-        )
-        assert got == "http://127.0.0.1:8118", "would have made the daemon loop to itself"
-
+            live.close()
 
 class TestCaIsPublishedToTheTrustDir:
     """NODE_EXTRA_CA_CERTS names ONE file, so every MITM that writes it as an
