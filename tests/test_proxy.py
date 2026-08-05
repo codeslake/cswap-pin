@@ -5687,7 +5687,7 @@ class TestArmingReportsWhoItCutsOff:
             if n_idle is None:
                 pytest.skip("no /proc/net/tcp on this platform")
             assert n_idle == 0, "counted a client before anyone connected"
-            c = socket.create_connection(("127.0.0.1", port))
+            c = socket.create_connection(("127.0.0.1", port), timeout=5)
             conn, _ = srv.accept()
             try:
                 assert pin_proxy.clients_that_arming_would_cut_off(port) >= 1, (
@@ -5767,7 +5767,7 @@ class TestClearingThePinDoesNotStrandLiveSessions:
             assert pin_proxy._is_claimed(certdir) is False, (
                 "an idle unwired daemon should still time out"
             )
-            c = socket.create_connection(("127.0.0.1", port))
+            c = socket.create_connection(("127.0.0.1", port), timeout=5)
             conn, _ = srv.accept()
             try:
                 assert pin_proxy._is_claimed(certdir) is True, (
@@ -6412,7 +6412,7 @@ class TestAnUpgradeCostsNoSession:
         certdir = tmp_path / "cd"
         certdir.mkdir()
         p = self._proxy(certdir)
-        client = socket.create_connection(("127.0.0.1", p.port))
+        client = socket.create_connection(("127.0.0.1", p.port), timeout=5)
         client.settimeout(5)
         time.sleep(0.2)
         assert p.live_client_count() == 1

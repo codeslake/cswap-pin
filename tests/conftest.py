@@ -477,3 +477,74 @@ def test_every_case_has_a_driver():
         "    def test_all(self, request, tmp_path_factory):\n"
         "        run_cases(self, request, tmp_path_factory)"
     )
+
+
+def test_no_blocking_socket_call_is_unbounded():
+    """A SOCKET CALL WITH NO TIMEOUT CAN HANG THE WHOLE SUITE.
+
+    pytest has no default per-test timeout, so one `recv` on a peer that
+    accepts and never answers does not fail the case — it stops the run, and
+    the job idles to whatever outer cap exists with nothing reported. A peer
+    session measured exactly that on its own runner: one job past 43 minutes
+    while its siblings finished in 39 seconds, and NO check anywhere said
+    "failed".
+
+    A global timeout is the wrong fix and is deliberately not used here: a
+    value large enough for a slow machine cannot catch a hang, and one small
+    enough to catch it turns a slow machine red. This reads source instead —
+    it cannot make a slow runner fail, only an unbounded call.
+
+    WHY A GUARD RATHER THAN CARE. The same peer swept its suite BY HAND three
+    times and missed the same shape three times; my own sweep of this suite
+    was by hand too. Judgement does not scale to a file that keeps growing.
+
+    Scoped to `connect`/`recv`/`accept` on a bare socket — the calls that
+    block forever by default. `create_connection` is covered because its
+    timeout argument is what a caller forgets.
+    """
+    import pathlib
+    import re
+
+    # `recv` on a socket whose timeout was set earlier is fine, so this looks
+    # for the two shapes that CANNOT have one: a connection built with no
+    # timeout=, and a bare `socket.socket()` used without `settimeout`.
+    unbounded = []
+    for path in sorted(pathlib.Path(__file__).parent.glob("test_*.py")):
+        lines = path.read_text().splitlines()
+        for n, line in enumerate(lines, 1):
+            if "# noqa: unbounded" in line:
+                continue  # deliberate, and it has to say so
+            if "socket.create_connection(" not in line:
+                continue
+            # PROSE IS NOT A CALL. A guard that flags the sentence describing
+            # it reads as a finding and trains the reader to ignore it — a
+            # peer's first version of this same guard did exactly that.
+            if re.match(r"\s*[#*]|\s*`|\s*\"\"\"", line) or "`" in line:
+                continue
+            # THE ARGUMENTS MAY WRAP: `create_connection(\n  addr,\n
+            # timeout=5)` is bounded and looks unbounded on line 1 alone. So
+            # read to the paren that CLOSES the call — the first `)` is the
+            # address tuple's, and stopping there flagged every bounded call
+            # in the suite while looking correct.
+            call = "\n".join(lines[n - 1:n + 4])
+            call = call[call.index("create_connection("):]
+            depth, end = 0, len(call)
+            for i, ch in enumerate(call):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if "timeout" in call[:end]:
+                continue
+            unbounded.append(f"{path.name}:{n}: {line.strip()}")
+
+    assert not unbounded, (
+        "socket call(s) with no timeout — one of these can hang the entire "
+        "run with nothing reported, because pytest has no default per-test "
+        "deadline:\n" + "\n".join(f"  {u}" for u in unbounded)
+        + "\n\nPass timeout=, or mark the line `# noqa: unbounded` if the "
+        "block is the point of the test."
+    )
