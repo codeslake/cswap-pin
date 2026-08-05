@@ -4915,8 +4915,33 @@ def _watch_own_code(
         # rather than each branch remembering to.
         stopped = handed_over = False
         try:
-            if daemon_fingerprint() == own:
+            # ORPHANED IS ALSO A REASON TO RECYCLE, not just stale code.
+            #
+            # A holder that dies without taking its daemon down leaves the port
+            # bound — the daemon already holds the socket — but with NOTHING
+            # above it. Measured, isolated port 60759, SIGHUP to the holder:
+            #
+            #     before:       holder 1855196, daemon 1855252
+            #     after SIGHUP: daemon 1855252 ppid 1, port answers: True
+            #     HOLDERS REMAINING: 0   PORT ALIVE: True
+            #
+            # Nothing looks wrong from outside, which is what makes it worth
+            # a check: the invariant that makes a crash survivable — every
+            # spawn lands under a holder — is gone, so the NEXT death takes
+            # the port down for good, and a live session's HTTPS_PROXY was
+            # fixed at exec.
+            #
+            # `_orphaned` rather than `not held_by_a_holder()`: a daemon that
+            # was never held (a bare `daemon_main`, a test) has no holder to
+            # lose and must not recycle itself forever.
+            orphaned = _orphaned_from_its_holder()
+            if daemon_fingerprint() == own and not orphaned:
                 continue
+            if orphaned:
+                _log_lifecycle(
+                    "the holder above this daemon is gone — handing over so "
+                    "the successor lands under one"
+                )
             # UNDER A HOLDER THERE IS NOTHING TO HAND OVER. The holder already
             # owns this socket and will put the successor on it, so the whole
             # release-spawn-drain dance below is not merely unnecessary — it
@@ -4938,7 +4963,14 @@ def _watch_own_code(
                 server.release_listener()
                 server.await_inflight(_DRAIN_SECONDS)
                 os._exit(_RESTART_ME_CODE)
-            _log_lifecycle("code on disk changed — handing over to a successor")
+            # NAME THE REASON THAT APPLIES. Both paths hand over, but saying
+            # "code on disk changed" about an orphaning is a false line in the
+            # one log a later reader has — measured, an orphan recovery logged
+            # a code change that never happened.
+            if not orphaned:
+                _log_lifecycle(
+                    "code on disk changed — handing over to a successor"
+                )
             # SERIALIZED, like every other spawn caller (`heal`,
             # `ensure_proxy`). Without it, a deploy replaces proxy.py and every
             # daemon on the box goes stale in the same instant, so their timers
@@ -4948,7 +4980,7 @@ def _watch_own_code(
             # than dead.
             with _spawn_lock(certdir):
                 # Another daemon may have recycled us while we queued.
-                if daemon_fingerprint() == own:
+                if daemon_fingerprint() == own and not orphaned:
                     continue
                 # RELEASE THE PORT, THEN DRAIN — in that order, and with the
                 # successor started in between. `stop(drain=N)` closes the
@@ -5183,6 +5215,24 @@ def held_by_a_holder(ppid: int | None = None, env=None) -> bool:
     env = os.environ if env is None else env
     ppid = os.getppid() if ppid is None else ppid
     return env.get(_HELD_BY_ENV) == str(ppid)
+
+
+def _orphaned_from_its_holder(env=None) -> bool:
+    """Did this daemon HAVE a holder and LOSE it?
+
+    Not the same question as `not held_by_a_holder()`, and the difference is
+    the whole guard: a daemon that was never held (a bare `daemon_main`, a
+    test harness) also answers "no holder", and recycling that one hands over
+    forever. Only a daemon whose environment NAMES a holder can be orphaned
+    from it.
+
+    The marker outlives the holder — it is our own environment, set at spawn —
+    while `getppid()` moves to init the moment the holder dies. So the two
+    disagreeing IS the orphaning, and no signal handler or liveness probe is
+    needed to see it.
+    """
+    env = os.environ if env is None else env
+    return bool(env.get(_HELD_BY_ENV)) and not held_by_a_holder(env=env)
 
 
 def _handed_down_listener() -> "socket.socket | None":
@@ -5761,10 +5811,24 @@ class PinProxy:
             t.join(timeout=5.0)
         self._accept_thread = None
         if srv is not None and hand_down:
-            if self._inherited:
+            if self._inherited and not _orphaned_from_its_holder():
                 # NOT OURS TO PASS ON. A supervisor holds this port across our
                 # restarts; handing its socket to a child we do not control
                 # would leave that child accepting on it after we are gone.
+                #
+                # UNLESS THE HOLDER IS GONE, which `_inherited` cannot know:
+                # it is decided once, in `start()`, and the holder can die
+                # afterwards. Refusing then answers about a holder that no
+                # longer exists — and the successor's own holder finds the
+                # port occupied by us. Measured, isolated port 49927:
+                #
+                #   11:57:10 the holder above this daemon is gone — handing over
+                #   11:57:13 holder could not take the port (49927 is taken)
+                #            — serving unheld
+                #   11:57:13 serving on port 37001
+                #
+                # The recycle fired correctly and still stranded every session
+                # whose HTTPS_PROXY was fixed at exec.
                 self._srv = srv
                 return None
             fd = srv.detach()  # leave it LISTENING and open for the successor
@@ -5772,9 +5836,14 @@ class PinProxy:
             self._handed_fd = fd
             return fd
         self._srv = srv
-        if self._srv and self._inherited:
+        if self._srv and self._inherited and not _orphaned_from_its_holder():
             # NOT OURS TO CLOSE — a supervisor holds this port precisely so it
             # keeps answering across our restarts.
+            #
+            # And the same "unless it is gone" as the hand-down above: an
+            # orphan detaching here leaves the port BOUND with nobody
+            # accepting, which is worse than refused — the handshake completes
+            # and the client waits.
             #
             # DETACH, do not just drop the reference. Dropping it hands the
             # socket to CPython's finalizer, which closes the fd — measured:
