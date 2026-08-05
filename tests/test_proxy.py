@@ -206,30 +206,29 @@ class TestPinCodeResolvesItsNames:
 
 
 class TestIsPinnedRoute:
-    def test_code_sessions_is_pinned(self):
-        # Remote Control creates/uses claude.ai code sessions here.
-        assert is_pinned_route("/v1/code/sessions") is True
+    def test_which_routes_carry_the_pinned_bearer(self):
+        """The whole routing table, in one place.
 
-    def test_messages_is_not_pinned(self):
-        # Inference must follow the swapped (disk) account, never the pin.
-        assert is_pinned_route("/v1/messages") is False
-
-    def test_frame_deploy_is_pinned(self):
-        # Artifact publishes ("frames") are owned by the creating bearer too.
-        assert is_pinned_route("/api/frame/deploy/init") is True
-
-    def test_session_unarchive_is_pinned(self):
-        # RC reconnect unarchives the session at /v1/sessions/{id}/unarchive
-        # (NOT /v1/code/sessions) before re-bridging. Measured: if this route
-        # keeps the disk bearer while the bridge is swapped, the session's
-        # ownership splits — unarchive lands it on the disk account, and the
-        # reconnect resolves there, so the pinned account never sees it.
-        assert is_pinned_route("/v1/sessions/cse_01ABC/unarchive") is True
-
-    def test_bare_sessions_list_not_pinned(self):
-        # A plain /v1/sessions or /v1/messages must not be swept in.
-        assert is_pinned_route("/v1/messages") is False
-
+        It was five methods asserting one function; the ROUTES are the value,
+        so a new one is a line rather than a method.
+        """
+        for path, pinned, why in (
+            ("/v1/code/sessions", True,
+             "Remote Control creates and uses claude.ai code sessions here"),
+            ("/api/frame/deploy/init", True,
+             "artifact publishes are owned by the creating bearer too"),
+            # RC reconnect unarchives at /v1/sessions/{id}/unarchive — NOT
+            # /v1/code/sessions — before re-bridging. Keeping the disk bearer
+            # here SPLITS the session's ownership: unarchive lands it on the
+            # disk account, the reconnect resolves there, and the pinned
+            # account never sees it.
+            ("/v1/sessions/cse_01ABC/unarchive", True, "RC reconnect unarchive"),
+            ("/v1/messages", False,
+             "inference must follow the swapped disk account, never the pin"),
+            ("/v1/sessions", False,
+             "a plain list must not be swept in by the unarchive rule"),
+        ):
+            assert is_pinned_route(path) is pinned, f"{path}: {why}"
 
 class TestParseUpstreamProxy:
     """One function, nine inputs. It was nine test methods; the CASES are the
@@ -1038,20 +1037,25 @@ class TestDaemonState:
     account, or redeployed code) and recycle it. Mirrors CCF's fingerprint
     staleness check (cachefix-ensure is_fresh/recycle)."""
 
-    def test_roundtrip(self, tmp_path):
-        from cswap_pin.proxy import write_daemon_state, read_daemon_state
+    def test_the_record_roundtrips_and_survives_damage(self, tmp_path):
+        """Write, read, and the two ways a read finds nothing.
+
+        Three methods for one file's read path; the CASES are the value.
+        """
+        from cswap_pin.proxy import read_daemon_state, write_daemon_state
+
+        assert read_daemon_state(tmp_path) is None, "absent must read as None"
+
         write_daemon_state(tmp_path, port=51000, pid=1234, fingerprint="fp-abc")
-        st = read_daemon_state(tmp_path)
-        assert st == {"port": 51000, "pid": 1234, "fingerprint": "fp-abc"}
+        assert read_daemon_state(tmp_path) == {
+            "port": 51000, "pid": 1234, "fingerprint": "fp-abc",
+        }
 
-    def test_missing_is_none(self, tmp_path):
-        from cswap_pin.proxy import read_daemon_state
-        assert read_daemon_state(tmp_path) is None
-
-    def test_corrupt_is_none(self, tmp_path):
-        from cswap_pin.proxy import read_daemon_state
         (tmp_path / "proxy.json").write_text("{not json")
-        assert read_daemon_state(tmp_path) is None
+        assert read_daemon_state(tmp_path) is None, (
+            "a corrupt record must read as absent, not raise — a launcher "
+            "polls this and a traceback there takes the launch with it"
+        )
 
     def test_fingerprint_encodes_the_code_only(self, tmp_path):
         # Identifies the CODE, so a redeploy makes a running daemon stale. The
@@ -1063,7 +1067,6 @@ class TestDaemonState:
             "2", "b@co.com"
         )
         assert daemon_fingerprint() == daemon_fingerprint("1", "a@co.com")
-
 
 class TestEnsureProxyLifecycle:
     """ensure_proxy under the CCF-style lifecycle: reuse a fresh live daemon,
@@ -6634,29 +6637,6 @@ class TestTheArmorCheckIsNotAcceptingEmptiness:
         ours = ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
         return ours.read_bytes().strip() + b"\n"
 
-    def test_a_torn_CRL_with_CRLF_endings_is_refused(self, tmp_path):
-        from cswap_pin.proxy import _bundle_is_usable
-
-        raw = self._blocks(tmp_path)
-        a = _other_ca(tmp_path / "corp-a")
-        torn = b"-----BEGIN X509 CRL-----\r\n!!!not base64!!!\r\n-----END X509 CRL-----\r\n"
-        assert _bundle_is_usable(a + torn + raw, raw.strip()) is False, (
-            "a torn CRL with CRLF endings was approved — the armor slice found "
-            "no separator, returned empty, and empty base64 decodes fine"
-        )
-
-    def test_a_torn_key_block_with_a_trailing_space_is_refused(self, tmp_path):
-        """Same hole through the other tolerance `_find_end` grants."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        raw = self._blocks(tmp_path)
-        a = _other_ca(tmp_path / "corp-a")
-        torn = b"-----BEGIN PUBLIC KEY----- \n!!!not base64!!!\n-----END PUBLIC KEY-----\n"
-        assert _bundle_is_usable(a + torn + raw, raw.strip()) is False, (
-            "a torn key block whose BEGIN line carries a trailing space was "
-            "approved — the armor check never saw its body"
-        )
-
     def test_a_HEALTHY_CRLF_key_block_is_still_accepted(self, tmp_path):
         """The false-REJECT direction: real corporate bundles carry CRLs and
         key blocks, and refusing them costs every sibling component."""
@@ -6667,7 +6647,6 @@ class TestTheArmorCheckIsNotAcceptingEmptiness:
         assert _bundle_is_usable(good + raw, raw.strip()) is True, (
             "a healthy CRLF key block was refused"
         )
-
 
 class TestAnEmptyArmorIsNotIntactArmor:
     """`TestTheArmorCheckIsNotAcceptingEmptiness` fixed the SLICE and left the
@@ -6732,6 +6711,12 @@ class TestAnEmptyArmorIsNotIntactArmor:
             ("stray characters", B + b"B+0=cA/-\n" + E),
             ("CRLF, whitespace line", b"-----BEGIN X509 CRL-----\r\nQUFBQQ==\r\n   \r\n"
                                       b"-----END X509 CRL-----\r\n"),
+            # CRLF and a trailing space are the shapes a real corporate bundle
+            # arrives in, and both were separate test methods.
+            ("torn CRL, CRLF endings",
+             b"-----BEGIN X509 CRL-----\r\nQUJD!!!\r\n-----END X509 CRL-----\r\n"),
+            ("torn key block, trailing space",
+             b"-----BEGIN PRIVATE KEY----- \nQUJD!!!\n-----END PRIVATE KEY-----\n"),
         ):
             assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
                 f"{name}: a balanced but undecodable block was accepted — "

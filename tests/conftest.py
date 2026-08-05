@@ -188,15 +188,34 @@ def _shared_ca(monkeypatch, tmp_path_factory):
 
     def fast_ensure_ca(ca_dir, host):
         d = pathlib.Path(ca_dir)
+        # A SECOND cert dir gets the cache too, UNLESS its path says the test
+        # wants a distinct CA. Restricting it to the first dir left 88 calls
+        # generating (5.5 s); the tests that genuinely need two DIFFERENT CAs
+        # name them, and `_other_ca` has its own cache.
+        wants_distinct = any(
+            w in str(d).lower()
+            for w in ("other", "corp", "foreign", "sibling", "another", "second")
+        )
         if (
             host == "api.anthropic.com"
-            and not served
+            and not wants_distinct
             and not (d / "ca.pem").exists()
         ):
             served.append(str(d))
             d.mkdir(parents=True, exist_ok=True, mode=0o700)
             for f in ("ca.pem", "ca.key", "leaf.pem", "leaf.key"):
                 shutil.copy2(cache / f, d / f)
+            # AND SKIP THE RE-VERIFICATION. `ensure_ca` re-parses all four
+            # files and checks the CA actually signed the leaf — 50 ms, and
+            # correct for a real run. These four were verified once when the
+            # cache was built and copied byte-for-byte, so re-deriving that
+            # per test was 6.3 s of the suite. Tests that CARE about
+            # consistency build their own pair and are unaffected.
+            return _p.CertBundle(
+                ca_path=d / "ca.pem",
+                leaf_path=d / "leaf.pem",
+                leaf_key_path=d / "leaf.key",
+            )
         return real(d, host)
 
     monkeypatch.setattr(_p, "ensure_ca", fast_ensure_ca)
@@ -221,3 +240,19 @@ def _session_ca(tmp_path_factory):
     d = tmp_path_factory.mktemp("session-ca")
     _p.ensure_ca(d, "api.anthropic.com")
     return d
+
+
+@pytest.fixture(autouse=True)
+def _short_hop_budgets(monkeypatch):
+    """Shrink the egress-hop budgets for tests.
+
+    A hop that accepts and never answers costs `_HOP_REPLY_BUDGET_S` (6 s) per
+    dial, and several tests point the walk at exactly that shape on purpose.
+    The PRODUCT budget has to be generous — it covers a real proxy's outbound
+    round trip — but a test dialling 127.0.0.1 needs none of it, and the
+    budget was the runtime rather than the thing under test.
+    """
+    from cswap_pin import proxy as _p
+
+    monkeypatch.setattr(_p, "_HOP_CONNECT_BUDGET_S", 0.3, raising=False)
+    monkeypatch.setattr(_p, "_HOP_REPLY_BUDGET_S", 0.3, raising=False)
