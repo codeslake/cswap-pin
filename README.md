@@ -284,6 +284,20 @@ xdist refuses the flag rather than ignoring it, so the suite will not start.
 For a serial repro of a failure, add `-n 0`: xdist gives no live output and
 truncates tracebacks it cannot attribute to a worker.
 
+**Do not split a heavy test class to parallelise it.** It looks like free
+speed — splitting the 24-case port class halved its 12.7s — and it crashes a
+worker instead, 3 runs of 3, reported as `received keyboard-interrupt`. The
+cause is in xdist's own shutdown, not in this suite: `execnet`'s
+`_terminate_execution` gives a worker's execution pool **5 seconds** to drain
+and then runs `os.kill(os.getpid(), 2)  # send ourselves a SIGINT`
+(`gateway_base.py:1245`, measured with `sigwaitinfo` — `si_pid` is the worker
+itself and `si_code` is `SI_USER`). Two spawn-heavy classes on one worker
+exceed that budget, so the worker interrupts itself mid-run and the class
+never reports at all — it does not even appear in `--durations`.
+
+The 5s is hardcoded, so nothing here can raise it. Both halves pass in
+isolation (7.60s and 5.74s); together on one worker they do not.
+
 One pytest test runs many `case_*` methods (`run_cases` in `conftest.py`), so
 113 collected tests carry 350 cases. A failure names both: `Class::case_name`.
 
