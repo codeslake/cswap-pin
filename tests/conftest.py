@@ -121,8 +121,16 @@ def _redirect_everything_to(tmp_path, monkeypatch):
     # logging "configured port 36301 is not available". The suite was reading
     # a value from outside its own fixture, exactly like the config paths
     # above; it just had no consumer yet.
+    # AND THE OFF SWITCH, for the opposite reason: it does not break tests, it
+    # makes them PASS VACUOUSLY. `CSWAP_PIN_SELF_HEAL=off` disables the
+    # holder's respawn and the code watchdog, so a developer who exported it
+    # while debugging turns every test of those paths green without running
+    # them. A peer session hit exactly this from the other side — its fixture
+    # forced the switch off, and once the switch genuinely worked, three
+    # watcher cases turned out never to have exercised the enabled path: "they
+    # passed because the bug existed".
     for name in ("CSWAP_PIN_PORT", "CSWAP_PIN_WIRED", "CSWAP_PIN_FIFO",
-                 "CSWAP_PIN_REFCOUNT_FD"):
+                 "CSWAP_PIN_REFCOUNT_FD", "CSWAP_PIN_SELF_HEAL"):
         monkeypatch.delenv(name, raising=False)
 
     store = tmp_path / "data-home"
