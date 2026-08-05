@@ -1817,11 +1817,13 @@ class TestChainRediscovery:
                     b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
                     b"Host: rc-ingress.example.com:443\r\n\r\n"
                 )
-                c.settimeout(10)
-                try:
-                    c.recv(256)
-                except OSError:
-                    pass
+                # WAIT FOR THE HOP, NOT FOR A RESPONSE. The inner hop points at
+                # port 1, so nothing ever answers and a recv here simply burns
+                # its own timeout — 3.2 s of it. What the test asserts is that
+                # the hop was DIALLED, so wait for exactly that.
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and inner.connects == 0:
+                    time.sleep(0.01)
             finally:
                 c.close()
 
