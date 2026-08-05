@@ -1631,6 +1631,102 @@ class TestWorkerJwtRoutesAreNotSwapped:
             assert is_pinned_route(path), f"{path} must be pinned"
 
 
+class TestThePortIsConfigurable:
+    """The pin's own settings live in the pin's own directory.
+
+    ``CSWAP_PIN_PORT`` sat in ``~/.claude.json``'s env block, and it is the
+    one entry there that Claude Code does not read: HTTPS_PROXY, https_proxy,
+    ALL_PROXY and NODE_EXTRA_CA_CERTS are consumed by CC at boot, that number
+    is consumed only by US. Settings for an optional feature do not belong in
+    another program's exclusive file, and a user who wants a fixed port had
+    nowhere to say so.
+
+    THREE SOURCES, IN THIS ORDER, and the order is the feature:
+
+      1. the ENVIRONMENT (``CSWAP_PIN_PORT``). A user who exports it in their
+         rc has said what they want for THIS shell, and nothing on disk may
+         overrule a value the user typed.
+      2. the SETTINGS FILE (``settings.json`` in the cert dir), written by
+         ``cswap pin --set_port``. Persistent, machine-wide, ours.
+      3. nothing — an ephemeral port, which is what every machine does today.
+    """
+
+    def _certdir(self, tmp_path):
+        d = tmp_path / "pin-proxy"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_the_environment_outranks_the_file(self, tmp_path, monkeypatch):
+        """A value the user typed beats a value we persisted.
+
+        Both directions asserted: the file alone is used when the env is
+        silent, and IGNORED when it is not. Testing only the first would pass
+        against an implementation that never reads the env at all.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = self._certdir(tmp_path)
+        pin_proxy.write_pin_settings(certdir, port=41111)
+
+        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
+        assert pin_proxy.configured_port(certdir) == 41111, "the file was not read"
+
+        monkeypatch.setenv("CSWAP_PIN_PORT", "42222")
+        assert pin_proxy.configured_port(certdir) == 42222, (
+            "an rc export was overruled by a file — the user's own shell must "
+            "win over anything we persisted"
+        )
+
+    def test_nothing_configured_means_nothing_claimed(self, tmp_path, monkeypatch):
+        """No env, no file: None, so the daemon takes an ephemeral port.
+
+        The absence has to be distinguishable from a configured 0 — port 0
+        means "let the kernel choose" to bind(), so returning it as a
+        CONFIGURED value would silently mean the opposite of what a user who
+        typed it meant.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = self._certdir(tmp_path)
+        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
+        assert pin_proxy.configured_port(certdir) is None
+
+        for junk in ("", "not-a-port", "0", "70000", "-1"):
+            monkeypatch.setenv("CSWAP_PIN_PORT", junk)
+            assert pin_proxy.configured_port(certdir) is None, (
+                f"{junk!r} was accepted as a port; a value outside 1-65535 is "
+                f"not a port at all and bind() would either fail or, for 0, "
+                f"do the opposite of what was asked"
+            )
+
+    def test_the_settings_file_survives_a_rewrite(self, tmp_path, monkeypatch):
+        """Writing the port must not destroy anything else in the file.
+
+        It is a settings file, not a port file — the next setting to land
+        there would otherwise be erased by the next `--set_port`.
+        """
+        import json as _json
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = self._certdir(tmp_path)
+        path = certdir / "settings.json"
+        path.write_text(_json.dumps({"somethingElse": "keep me"}))
+
+        pin_proxy.write_pin_settings(certdir, port=43333)
+        raw = _json.loads(path.read_text())
+        assert raw.get("somethingElse") == "keep me", (
+            f"--set_port clobbered the rest of the settings file: {raw}"
+        )
+        assert raw.get("port") == 43333
+
+        # ...and clearing it removes only the port.
+        pin_proxy.write_pin_settings(certdir, port=None)
+        raw = _json.loads(path.read_text())
+        assert "port" not in raw, raw
+        assert raw.get("somethingElse") == "keep me", raw
+
+
 class TestDaemonPortStability:
     """A live session's HTTPS_PROXY is fixed at exec time. If a recycled
     daemon comes back on a NEW port, every already-running session keeps
