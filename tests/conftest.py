@@ -29,6 +29,7 @@ throws it away.
 
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -144,3 +145,79 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
                 lambda store=store: store / "claude-swap",
                 raising=False,
             )
+
+
+# --- one CA for the whole session -------------------------------------------
+# `ensure_ca` generates an RSA key pair, which costs ~90 ms. Measured: 158 of
+# the suite's tests call it, so the suite spent ~14 s — 18% of its runtime —
+# re-deriving a key whose VALUE no test asserts on. The tests that care about
+# CA CONTENT (the consistency checks, the trust-bundle merge) build their own
+# and are unaffected; everything else just needs A valid CA to exist.
+#
+# So: build one, and have `ensure_ca` copy it when the target has none. The
+# copy is what keeps the function's contract intact — callers still get four
+# files in their own directory, and the idempotent-reuse path is untouched.
+@pytest.fixture(autouse=True)
+def _shared_ca(monkeypatch, tmp_path_factory):
+    """Serve one pre-built CA to the FIRST cert dir each test asks for.
+
+    `ensure_ca` mints two RSA-2048 keys — ~70 ms — and the suite calls it in
+    most of its tests. Nothing asserts on a key's VALUE; what matters is that
+    a CA signs its leaf, which a copy satisfies.
+
+    THE FIRST DIR ONLY, per test. A test that builds a SECOND cert dir is
+    almost always constructing a DIFFERENT CA on purpose ("a leaf signed by
+    another CA of the same name", "a bundle without ours"), and handing those
+    the same files makes the assertion vacuous. Measured: serving every dir
+    broke three such tests.
+
+    Only for the default host, too: a test naming another host needs a leaf
+    with that SAN.
+    """
+    import shutil
+
+    from cswap_pin import proxy as _p
+
+    cache = tmp_path_factory.getbasetemp() / "_ca-cache"
+    real = _p.ensure_ca
+    if not (cache / "ca.pem").exists():
+        cache.mkdir(parents=True, exist_ok=True)
+        real(cache, "api.anthropic.com")
+
+    served: list = []
+
+    def fast_ensure_ca(ca_dir, host):
+        d = pathlib.Path(ca_dir)
+        if (
+            host == "api.anthropic.com"
+            and not served
+            and not (d / "ca.pem").exists()
+        ):
+            served.append(str(d))
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for f in ("ca.pem", "ca.key", "leaf.pem", "leaf.key"):
+                shutil.copy2(cache / f, d / f)
+        return real(d, host)
+
+    monkeypatch.setattr(_p, "ensure_ca", fast_ensure_ca)
+    # AND EVERY MODULE THAT IMPORTED THE NAME. `from cswap_pin.proxy import
+    # ensure_ca` binds it into that module's namespace, so patching only the
+    # source leaves those call sites on the real one.
+    for mod in list(sys.modules.values()):
+        if mod is None or mod is _p:
+            continue
+        if getattr(mod, "__name__", "").startswith(("test_", "tests.")):
+            if getattr(mod, "ensure_ca", None) is real:
+                monkeypatch.setattr(mod, "ensure_ca", fast_ensure_ca, raising=False)
+
+
+@pytest.fixture(scope="session")
+def _session_ca(tmp_path_factory):
+    """ONE CA for the whole run, built once and copied by everything that
+    only needs *a* valid CA. Two RSA-2048 keys cost ~70 ms and the suite asked
+    for one in most of its tests."""
+    from cswap_pin import proxy as _p
+
+    d = tmp_path_factory.mktemp("session-ca")
+    _p.ensure_ca(d, "api.anthropic.com")
+    return d

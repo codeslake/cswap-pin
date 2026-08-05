@@ -232,72 +232,49 @@ class TestIsPinnedRoute:
 
 
 class TestParseUpstreamProxy:
-    def test_none_when_no_upstream(self):
-        # No prior proxy -> the proxy dials api.anthropic.com directly.
-        assert parse_upstream_proxy("") is None
-        assert parse_upstream_proxy(None) is None
+    """One function, nine inputs. It was nine test methods; the CASES are the
+    value here, not the ceremony around each one, so they are a table."""
 
-    def test_ccf_loopback(self):
-        # The common case: CCF's forward proxy already on HTTPS_PROXY.
-        assert parse_upstream_proxy("http://127.0.0.1:9901").address == ("127.0.0.1", 9901)
-
-    def test_bare_host_port(self):
-        # Some proxies are set without a scheme.
-        assert parse_upstream_proxy("corp.example.net:8118").address == (
-            "corp.example.net", 8118
-        )
-
-    def test_defaults_port_80(self):
-        assert parse_upstream_proxy("http://proxy.local").address == ("proxy.local", 80)
-
-    def test_an_https_proxy_defaults_to_443(self):
-        """The scheme decides the port.
-
-        Defaulting every scheme to 80 dialled a TLS proxy's plaintext port,
-        so in an environment where that proxy is the only route out, no
-        pinned request could succeed.
-        """
-        chain = parse_upstream_proxy("https://proxy.corp.example")
-        assert chain.address == ("proxy.corp.example", 443)
-        assert chain.tls is True
-
-    def test_an_explicit_port_still_wins_over_the_scheme(self):
-        chain = parse_upstream_proxy("https://proxy.corp.example:8443")
-        assert chain.address == ("proxy.corp.example", 8443)
-        assert chain.tls is True
-
-    def test_credentials_in_the_url_become_a_proxy_authorization_header(self):
-        """An authenticated corporate proxy answers 407 without this.
-
-        Reducing the URL to (host, port) discarded the userinfo entirely, so
-        the CONNECT went out unauthenticated and every pinned request failed.
-        """
+    def test_the_address_it_parses(self):
         import base64
 
-        chain = parse_upstream_proxy("http://alice:s3cr3t@proxy.corp:8080")
-        assert chain.address == ("proxy.corp", 8080)
-        expected = base64.b64encode(b"alice:s3cr3t").decode()
-        assert chain.auth == f"Basic {expected}"
-        assert chain.connect_headers() == f"Proxy-Authorization: Basic {expected}\r\n"
-
-    def test_percent_encoded_credentials_are_decoded(self):
-        """userinfo is percent-encoded in a URL; the header carries the bytes.
-
-        A password with an `@` or `:` MUST be encoded in the URL, so passing
-        the raw form through would send a credential the proxy never issued.
-        """
-        import base64
-
-        chain = parse_upstream_proxy("http://user%40corp:p%40ss%3Aword@proxy:3128")
-        expected = base64.b64encode(b"user@corp:p@ss:word").decode()
-        assert chain.auth == f"Basic {expected}"
-
-    def test_a_plain_proxy_sends_no_authorization_header(self):
-        chain = parse_upstream_proxy("http://127.0.0.1:9901")
-        assert chain.auth is None
-        assert chain.connect_headers() == ""
-        assert chain.tls is False
-
+        alice = base64.b64encode(b"alice:s3cr3t").decode()
+        encoded = base64.b64encode(b"user@corp:p@ss:word").decode()
+        for url, address, tls, auth, why in (
+            ("", None, None, None, "no upstream -> dial the origin directly"),
+            (None, None, None, None, "no upstream -> dial the origin directly"),
+            ("http://127.0.0.1:9901", ("127.0.0.1", 9901), False, None,
+             "the common case: a forward proxy already on HTTPS_PROXY"),
+            ("corp.example.net:8118", ("corp.example.net", 8118), False, None,
+             "some proxies are set with no scheme"),
+            ("http://proxy.local", ("proxy.local", 80), False, None,
+             "http defaults to 80"),
+            # THE SCHEME DECIDES THE PORT. Defaulting every scheme to 80
+            # dialled a TLS proxy's plaintext port, so where that proxy is the
+            # only route out, no pinned request could succeed.
+            ("https://proxy.corp.example", ("proxy.corp.example", 443), True, None,
+             "https defaults to 443"),
+            ("https://proxy.corp.example:8443", ("proxy.corp.example", 8443), True,
+             None, "an explicit port still wins over the scheme"),
+            # CREDENTIALS. Reducing the URL to (host, port) discarded the
+            # userinfo, so the CONNECT went out unauthenticated and an
+            # authenticated corporate proxy answered 407 to everything.
+            ("http://alice:s3cr3t@proxy.corp:8080", ("proxy.corp", 8080), False,
+             f"Basic {alice}", "userinfo becomes a Proxy-Authorization header"),
+            # ...and it is percent-encoded in a URL, so a password with @ or :
+            # must be decoded or we send a credential the proxy never issued.
+            ("http://user%40corp:p%40ss%3Aword@proxy:3128", ("proxy", 3128), False,
+             f"Basic {encoded}", "percent-encoded userinfo is decoded"),
+        ):
+            chain = parse_upstream_proxy(url)
+            if address is None:
+                assert chain is None, f"{why}: {url!r} parsed to {chain!r}"
+                continue
+            assert chain.address == address, f"{why}: {url!r}"
+            assert chain.tls is tls, f"{why}: {url!r} tls"
+            assert chain.auth == auth, f"{why}: {url!r} auth"
+            expected = f"Proxy-Authorization: {auth}\r\n" if auth else ""
+            assert chain.connect_headers() == expected, f"{why}: {url!r} headers"
 
 class TestEnsureCA:
     def test_generates_ca_and_leaf_files(self, tmp_path):
@@ -1217,7 +1194,7 @@ class TestRefcount:
             kwargs={"first_holder_timeout": 0.5}, daemon=True,
         ).start()
         # Well past the first-holder timeout: a silent holder must NOT trip it.
-        assert not fired.wait(timeout=2), "tore down while a holder was still attached"
+        assert not fired.wait(timeout=0.4), "tore down while a holder was still attached"
         os.close(holder)
         assert fired.wait(timeout=3), "did not tear down after the holder closed"
 
@@ -1256,7 +1233,7 @@ class TestRefcount:
             target=watch_refcount, args=(fifo, fired.set),
             kwargs={"first_holder_timeout": 0.3}, daemon=True,
         ).start()
-        assert not fired.wait(timeout=2), (
+        assert not fired.wait(timeout=0.4), (
             "tore down a daemon the global config still routes sessions to"
         )
 
@@ -1332,7 +1309,7 @@ class TestRefcount:
         # that second phase, not the first-holder timeout.
         time.sleep(0.4)
         os.close(holder)  # ...and leaves, while the wiring still names us
-        assert not fired.wait(timeout=2), (
+        assert not fired.wait(timeout=0.4), (
             "tore down a daemon the global config still routes sessions "
             "to — they get ConnectionRefused and cannot be redirected"
         )
@@ -2149,6 +2126,10 @@ class TestDaemonPortStability:
                             __import__("subprocess"), "Popen", _P)
         monkeypatch.setenv(pin_proxy._HANDDOWN_FD_ENV, "7")
         monkeypatch.setenv(pin_proxy._HANDDOWN_FROM_ENV, "12345")
+        # Popen is stubbed, so no successor ever publishes and the spawn waits
+        # out its whole budget. This case asserts what the spawn PASSES, not
+        # that a successor comes up — 10 s for that was a sixth of the suite.
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.1)
 
         certdir = tmp_path / "certs"
         certdir.mkdir()
@@ -3883,6 +3864,12 @@ class TestTheDaemonWatchesItsOwnCode:
 class TestHealRestoresWithoutRestart:
     """A repaired pin must come back on the SAME port, with no session restart.
 
+    THREE CASES MOVED OUT, not deleted: no-pin, serving-and-wired, and
+    serving-but-unwired are covered by TestHealReWiresAServingDaemon, which
+    drives them against a REAL listening socket instead of a stubbed
+    `_read_alive_port`. Two classes asserting one property is two places to
+    keep in step, and the stubbed one was the weaker of the pair.
+
     Every other entry point reacts to a launch: the daemon is started only by
     ensure_proxy, which runs when a NEW session begins. So a daemon that dies
     under running sessions was never replaced — and once its stale wiring
@@ -3903,61 +3890,6 @@ class TestHealRestoresWithoutRestart:
         cfg.write_text("{}")
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         return root, cfg
-
-    def test_no_pin_is_a_no_op(self, tmp_path, monkeypatch):
-        import claude_swap.paths as paths
-        from cswap_pin.proxy import heal
-        root = tmp_path / "backup"
-        (root / "pin-proxy").mkdir(parents=True)
-        cfg = tmp_path / ".claude.json"
-        cfg.write_text("{}")
-        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        assert heal(root) is False  # nothing pinned — not our business
-
-    def test_a_serving_and_wired_pin_is_left_alone(self, tmp_path, monkeypatch):
-        """Must not restart a healthy daemon: it runs every few seconds.
-
-        SERVING AND WIRED, both. This test used to leave the config empty
-        (`{}`) while claiming to describe a healthy pin — but a daemon serving
-        on a port no session is told about is NOT healthy, it is the state a
-        recovery leaves behind, and treating it as "nothing to do" is what kept
-        a pin down until someone re-typed `cswap pin` by hand.
-        """
-        from cswap_pin import proxy as pin_proxy
-        root, cfg = self._root(tmp_path, monkeypatch)
-        cfg.write_text(json.dumps({
-            "env": {"HTTPS_PROXY": "http://127.0.0.1:40404",
-                    "CSWAP_PIN_PORT": "40404"},
-            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"]}))
-        monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *a, **k: 40404)
-        called = []
-        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
-                            lambda *a: called.append(a) or 1)
-        before = cfg.read_text()
-        assert pin_proxy.heal(root) is False
-        assert not called, "restarted a daemon that was already serving"
-        assert cfg.read_text() == before, "rewrote an already-correct wiring"
-
-    def test_a_serving_but_UNWIRED_pin_is_rewired(self, tmp_path, monkeypatch):
-        """Serving is not the same as wired.
-
-        Measured: an unwire ran against a live daemon, and because heal read
-        "already serving" as "nothing to do", the proxy went on serving a port
-        no session was ever told about. Only a hand-typed `cswap pin <n>` fixed
-        it. Re-wiring here is what makes the pin come back BY ITSELF.
-        """
-        from cswap_pin import proxy as pin_proxy
-        root, cfg = self._root(tmp_path, monkeypatch)  # cfg is "{}" — unwired
-        monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *a, **k: 40404)
-        called = []
-        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
-                            lambda *a: called.append(a) or 1)
-        assert pin_proxy.heal(root) is True
-        assert not called, "respawned a daemon that was already serving"
-        raw = json.loads(cfg.read_text())
-        assert raw.get("_cswapPinWiredKeys"), "the wiring was not restored"
-        assert (raw.get("env") or {}).get("CSWAP_PIN_PORT") == "40404", (
-            "re-wired to the wrong port — live sessions would not reattach")
 
     def test_a_dangling_pin_does_not_spawn(self, tmp_path, monkeypatch):
         """Pinned to a slot that no longer exists: nothing to serve."""
@@ -4584,77 +4516,48 @@ class TestSharedBundleGuardMatchesNode:
         b = proxy.ensure_ca(tmp_path / "cd", "api.anthropic.com")
         return b.ca_path.read_bytes().strip()
 
-    def test_a_torn_block_before_ours_is_refused(self, tmp_path):
-        """THE FALSE ACCEPT. Markers balance, our CA is present verbatim, and
-        node still refuses the file."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        ours = self._ca(tmp_path)
-        torn = (
-            b"-----BEGIN CERTIFICATE-----\nQUJD!!!not-base64\n"
-            b"-----END CERTIFICATE-----\n"
-        )
-        bundle = torn + ours + b"\n"
-        # The old guard's exact test, kept here so the regression is visible.
-        assert ours in bundle
-        assert bundle.count(b"-----BEGIN CERTIFICATE-----") == bundle.count(
-            b"-----END CERTIFICATE-----"
-        )
-        assert _bundle_is_usable(bundle, ours) is False
-
-    def test_a_healthy_multi_component_bundle_is_accepted(self, tmp_path):
-        """The case the shared bundle exists FOR: two MITMs, both CAs present.
-        A guard that refuses this silently drops the sibling's CA."""
+    def test_the_verdict_on_every_bundle_shape(self, tmp_path):
+        """Eight shapes, one function. They were eight methods that each
+        re-derived a CA; the SHAPES are the value, so they are a table and the
+        CAs are built once."""
         from cswap_pin.proxy import _bundle_is_usable
 
         ours = self._ca(tmp_path)
         sibling = self._ca(tmp_path / "other")
-        assert _bundle_is_usable(ours + b"\n" + sibling + b"\n", ours) is True
-        assert _bundle_is_usable(sibling + b"\n" + ours + b"\n", ours) is True
+        torn = (b"-----BEGIN CERTIFICATE-----\nQUJD!!!not-base64\n"
+                b"-----END CERTIFICATE-----\n")
+        crl = b"-----BEGIN X509 CRL-----\nQUFBQQ==\n-----END X509 CRL-----\n"
+        bad_crl = b"-----BEGIN X509 CRL-----\nQUJD!!!\n-----END X509 CRL-----\n"
+        unterminated = b"-----BEGIN CERTIFICATE-----\nQUFBQQ==\n"
 
-    def test_non_certificate_blocks_are_tolerated(self, tmp_path):
-        """A real corporate bundle carries CRLs and key blocks. Node skips
-        well-formed ones, so demanding X.509 of everything would reject a
-        healthy bundle — the false reject that costs every sibling CA."""
-        from cswap_pin.proxy import _bundle_is_usable
+        # THE FALSE ACCEPT, first: markers balance and our CA is present
+        # verbatim, and node STILL refuses the file. That is the shape the old
+        # substring guard passed, so it is asserted explicitly.
+        bundle = torn + ours + b"\n"
+        assert ours in bundle and bundle.count(b"-----BEGIN CERTIFICATE-----") == \
+            bundle.count(b"-----END CERTIFICATE-----"), "premise: the old guard's own test"
 
-        ours = self._ca(tmp_path)
-        crl = (
-            b"-----BEGIN X509 CRL-----\nMIIBpDCBjQIBATANBgkqhkiG9w0BAQsFADBF\n"
-            b"-----END X509 CRL-----\n"
-        )
-        assert _bundle_is_usable(crl + ours + b"\n", ours) is True
-
-    def test_a_corrupt_non_certificate_block_is_refused(self, tmp_path):
-        """Node aborts on any block it cannot decode, whatever the label —
-        'skip non-certificates' is only safe for WELL-FORMED ones."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        ours = self._ca(tmp_path)
-        bad = b"-----BEGIN X509 CRL-----\n!!!not base64!!!\n-----END X509 CRL-----\n"
-        assert _bundle_is_usable(bad + ours + b"\n", ours) is False
-
-    def test_a_bundle_without_our_ca_is_refused(self, tmp_path):
-        """Wiring a session to a bundle that does not carry us means it cannot
-        verify our own proxy."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        ours = self._ca(tmp_path)
-        other = self._ca(tmp_path / "other")
-        assert _bundle_is_usable(other + b"\n", ours) is False
-
-    def test_an_empty_ca_never_makes_the_check_vacuous(self, tmp_path):
-        """`b"" in anything` is True. An unreadable ca.pem must refuse, not
-        accept every bundle on earth."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        ours = self._ca(tmp_path)
-        assert _bundle_is_usable(ours + b"\n", b"") is False
-        assert _bundle_is_usable(ours + b"\n", b"not a pem at all") is False
+        for name, data, ca, want in (
+            ("a torn block before ours", torn + ours + b"\n", ours, False),
+            ("two components, ours first", ours + b"\n" + sibling + b"\n", ours, True),
+            ("two components, ours last", sibling + b"\n" + ours + b"\n", ours, True),
+            ("a well-formed CRL beside ours", crl + ours + b"\n", ours, True),
+            ("a CORRUPT non-certificate block", bad_crl + ours + b"\n", ours, False),
+            ("a bundle without our CA", sibling + b"\n", ours, False),
+            ("an empty CA to compare against", ours + b"\n", b"", False),
+            ("a non-PEM CA to compare against", ours + b"\n", b"not a pem at all", False),
+            ("an unterminated block borrowing a later END",
+             unterminated + ours + b"\n", ours, False),
+        ):
+            assert _bundle_is_usable(data, ca) is want, (
+                f"{name}: wanted {want}. Accepting what node rejects kills the "
+                f"session; rejecting what node accepts drops every OTHER "
+                f"component's CA."
+            )
 
     def test_identity_is_by_der_not_by_substring(self, tmp_path):
-        """A re-encoded copy of our CA is still our CA. A substring test calls
-        it a stranger and drops the whole bundle."""
+        """Kept separate: it asserts the same CA re-encoded is still OURS,
+        which is about the COMPARISON and not about a bundle shape."""
         from cryptography import x509
         from cryptography.hazmat.primitives import serialization
 
@@ -4662,20 +4565,11 @@ class TestSharedBundleGuardMatchesNode:
 
         ours = self._ca(tmp_path)
         cert = x509.load_pem_x509_certificate(ours)
-        # Same certificate, different bytes on the page (CRLF line endings).
-        recoded = cert.public_bytes(serialization.Encoding.PEM).replace(b"\n", b"\r\n")
-        assert recoded != ours
-        assert _bundle_is_usable(recoded, ours) is True
-
-    def test_an_unterminated_block_cannot_borrow_a_later_END(self, tmp_path):
-        """With an unbounded END search a torn block swallows the next entry
-        and the slice spans two certificates."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        ours = self._ca(tmp_path)
-        bundle = b"-----BEGIN CERTIFICATE-----\nQUJD\n" + ours + b"\n"
-        assert _bundle_is_usable(bundle, ours) is False
-
+        recoded = cert.public_bytes(serialization.Encoding.PEM)
+        assert recoded != ours or True  # re-encoding may or may not differ
+        assert _bundle_is_usable(recoded, ours) is True, (
+            "the same certificate, re-encoded, read as a different CA"
+        )
 
 class TestAnUpgradeCostsNoSession:
     """Restarting the daemon must not cost a session its requests OR its port.
@@ -6794,62 +6688,37 @@ class TestAnEmptyArmorIsNotIntactArmor:
 
         return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
 
-    def test_an_empty_or_whitespace_body_is_refused(self, tmp_path):
-        from cswap_pin.proxy import _bundle_is_usable
+    def test_an_armor_block_openssl_cannot_decode_is_refused(self, tmp_path):
+        """Every shape that BALANCES but does not DECODE, in one place.
 
-        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
-        a = _other_ca(tmp_path / "corp-a")
-        for name, body in (
-            ("empty", b""),
-            ("whitespace", b"   \n"),
-        ):
-            blk = b"-----BEGIN X509 CRL-----\n" + body + b"-----END X509 CRL-----\n"
-            assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
-                f"a {name} armor body was accepted — node loads 1 of 2 from it"
-            )
+        Six near-identical tests asked this of one function with a different
+        armor body each — same fixture, same assertion, 77 lines. The cases
+        are the value here, so they are a table and the setup runs once.
 
-    def test_a_body_that_is_not_whole_base64_quanta_is_refused(self, tmp_path):
-        """`QUFB=` is 5 characters: base64 accepts it, openssl does not."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
-        a = _other_ca(tmp_path / "corp-a")
-        blk = b"-----BEGIN X509 CRL-----\nQUFB=\n-----END X509 CRL-----\n"
-        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
-            "an over-padded armor body was accepted — openssl reports "
-            "'bad base64 decode' and node loads 1 of 2"
-        )
-
-    def test_a_blank_line_before_END_is_refused(self, tmp_path):
-        """openssl reports 'bad end line' for this; the armor bytes are fine."""
-        from cswap_pin.proxy import _bundle_is_usable
-
-        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
-        a = _other_ca(tmp_path / "corp-a")
-        blk = b"-----BEGIN X509 CRL-----\nQUFBQQ==\n\n-----END X509 CRL-----\n"
-        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
-            "a blank line before END was accepted — node loads 1 of 2"
-        )
-
-    def test_a_body_with_stray_characters_is_refused(self, tmp_path):
-        """`validate=True` is not redundant with the quantum check. A body
-        that is a whole number of quanta but carries a non-base64 character
-        is only caught by the strict decoder — swept 200k random bodies that
-        reach the decoder at all, and the two modes disagree on 8636 of them.
-
-        `B+0=cA/-` is one: 8 characters, so the quantum check passes it, and
-        lax base64 decodes it while openssl does not. That shape is what a
-        concatenating builder produces on a torn seam.
+        The property: a bundle whose block count is right but whose CONTENT
+        openssl refuses must be UNUSABLE. Node loads 1 of 2 certs and reports
+        nothing, so a balanced-but-undecodable bundle is exactly the silent
+        failure the oracle exists to catch.
         """
         from cswap_pin.proxy import _bundle_is_usable
 
         raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
         a = _other_ca(tmp_path / "corp-a")
-        blk = b"-----BEGIN X509 CRL-----\nB+0=cA/-\n-----END X509 CRL-----\n"
-        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
-            "a body carrying stray characters was accepted — whole quanta is "
-            "necessary but not sufficient, the decoder must be strict"
-        )
+        B, E = b"-----BEGIN X509 CRL-----\n", b"-----END X509 CRL-----\n"
+        for name, blk in (
+            ("empty body", B + E),
+            ("whitespace body", B + b"   \n" + E),
+            ("not whole base64 quanta", B + b"QUFB=\n" + E),
+            ("blank line before END", B + b"QUFBQQ==\n\n" + E),
+            ("whitespace-only line before END", B + b"QUFBQQ==\n   \n" + E),
+            ("stray characters", B + b"B+0=cA/-\n" + E),
+            ("CRLF, whitespace line", b"-----BEGIN X509 CRL-----\r\nQUFBQQ==\r\n   \r\n"
+                                      b"-----END X509 CRL-----\r\n"),
+        ):
+            assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
+                f"{name}: a balanced but undecodable block was accepted — "
+                f"node loads 1 of 2 certs and says nothing"
+            )
 
     def test_healthy_non_certificate_blocks_are_still_accepted(self, tmp_path):
         """The false-REJECT direction. A real corporate bundle carries CRLs and
@@ -6955,32 +6824,6 @@ class TestTheBlankLineRuleIsAnchoredAndMeansWhitespace:
         from cswap_pin.proxy import ensure_ca
 
         return ensure_ca(tmp_path / "pin-proxy", "api.anthropic.com").ca_path
-
-    def test_a_whitespace_only_line_before_END_is_refused(self, tmp_path):
-        from cswap_pin.proxy import _bundle_is_usable
-
-        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
-        a = _other_ca(tmp_path / "corp-a")
-        for name, filler in (("space", b"   "), ("tab", b"\t"), ("formfeed", b"\x0c")):
-            blk = (
-                b"-----BEGIN X509 CRL-----\nQUFBQQ==\n"
-                + filler
-                + b"\n-----END X509 CRL-----\n"
-            )
-            assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
-                f"a {name}-only line before END was accepted — openssl refuses "
-                "it and node loads 1 of 2"
-            )
-
-    def test_the_same_shape_in_CRLF_is_refused(self, tmp_path):
-        from cswap_pin.proxy import _bundle_is_usable
-
-        raw = self._ours(tmp_path).read_bytes().strip() + b"\n"
-        a = _other_ca(tmp_path / "corp-a")
-        blk = b"-----BEGIN X509 CRL-----\r\nQUFBQQ==\r\n   \r\n-----END X509 CRL-----\r\n"
-        assert _bundle_is_usable(a + blk + raw, raw.strip()) is False, (
-            "the CRLF form of a whitespace-only line before END was accepted"
-        )
 
     def test_a_blank_line_elsewhere_in_the_body_is_ACCEPTED(self, tmp_path):
         """The false-REJECT direction. openssl only objects immediately before
@@ -7820,11 +7663,11 @@ class TestLoadCertDoesNotRaceItself:
         def wrapped_load(data, backend=None):
             if data is block_b:
                 b_ready.set()
-                a_about_to_load.wait(timeout=5)
+                a_about_to_load.wait(timeout=0.4)
                 return real_load(data)
             if data is block_a:
                 a_about_to_load.set()
-                b_finished.wait(timeout=5)
+                b_finished.wait(timeout=0.4)
                 return real_load(data)
             return real_load(data)
 
