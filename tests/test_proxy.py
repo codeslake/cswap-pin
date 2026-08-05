@@ -2496,6 +2496,212 @@ class TestDaemonPortStability:
             proxy.stop()
             squatter.close()
 
+    def case_the_port_answers_across_a_SIGKILL_of_the_daemon(self, tmp_path):
+        """A CRASH is the case a handover cannot cover.
+
+        Every mechanism above is cooperative: the outgoing daemon stops
+        accepting and passes its socket on. A `kill -9`, an OOM kill, or a
+        segfault skips all of it, and the port then has NO owner — which for a
+        live session is permanent, because its HTTPS_PROXY was fixed at exec
+        and is never re-read.
+
+        `run_service` is the answer: the port is bound by a supervisor that
+        outlives the daemon, so the descriptor stays listening no matter how
+        the daemon dies and arrivals queue in the backlog until the successor
+        accepts them.
+        """
+        import socket
+        import time
+
+        from cswap_pin.proxy import ensure_ca, run_service
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = run_service(tmp_path, account_num="1", email="a@b.c")
+        try:
+            port = holder.port
+            assert port, "the holder did not bind a port"
+            socket.create_connection(("127.0.0.1", port), timeout=2).close()
+
+            first = holder.daemon_pid
+            assert first, "no daemon was started under the holder"
+            holder.kill_daemon_for_test()
+
+            # THE POINT: no window. Not "it comes back in a second" — the
+            # socket was never the daemon's to take down with it, so a
+            # connection landing mid-crash waits in the backlog.
+            refused = 0
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                except ConnectionRefusedError:
+                    refused += 1
+                if holder.daemon_pid not in (None, first):
+                    break
+                time.sleep(0.02)
+            assert refused == 0, f"{refused} connections refused while the daemon was dead"
+            assert holder.daemon_pid not in (None, first), (
+                "the holder did not restart the daemon it supervises"
+            )
+        finally:
+            holder.stop()
+
+    def case_an_idle_teardown_is_not_restarted(self, tmp_path):
+        """A daemon that MEANT to exit must stay exited.
+
+        The pin tears itself down when the last refcount holder closes the
+        FIFO — that is the design, not a failure. A supervisor that cannot
+        tell the two apart turns idle teardown into an infinite respawn, and
+        the port it holds then never goes away either.
+
+        Exit status is the whole distinction: a clean 0 is a decision, a
+        signal or a non-zero is a crash.
+        """
+        import time
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        spawns = []
+
+        def _fake_spawn():
+            spawns.append(1)
+            holder._proc = _ExitedProc(0 if len(spawns) == 1 else -9)
+            holder.daemon_pid = 1000 + len(spawns)
+
+        holder._spawn = _fake_spawn
+        holder.start()
+        try:
+            # Longer than the first backoff rung (0.5s), so a restart that is
+            # merely SLOW still fails this rather than passing on timing.
+            time.sleep(1.2)
+            assert len(spawns) == 1, (
+                f"a clean exit was restarted {len(spawns) - 1} time(s) — an "
+                f"idle teardown becomes an infinite respawn"
+            )
+        finally:
+            holder.stop()
+
+
+    def case_a_deploy_restarts_the_daemon_without_releasing_the_port(
+        self, tmp_path
+    ):
+        """An UPDATE must not cost the port either.
+
+        A recycle sends SIGTERM, and the daemon's handler exits 0 — which the
+        holder correctly reads as "it meant to go" and releases the port. That
+        is right for an idle teardown and wrong for a redeploy: the whole point
+        of a redeploy is that a daemon running NEW code should be serving the
+        SAME address a moment later.
+
+        So a TERM'd daemon that is serving on a socket it does not own asks to
+        be restarted instead. The holder respawns it — a fresh interpreter, so
+        the new code loads — and the socket never unbinds.
+        """
+        import time
+
+        from cswap_pin.proxy import _RESTART_ME_CODE, PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        spawns = []
+
+        def _fake_spawn():
+            spawns.append(1)
+            holder._proc = _ExitedProc(_RESTART_ME_CODE if len(spawns) == 1 else 0)
+            holder.daemon_pid = 2000 + len(spawns)
+
+        holder._spawn = _fake_spawn
+        holder.start()
+        try:
+            deadline = time.time() + 3
+            while time.time() < deadline and len(spawns) < 2:
+                time.sleep(0.02)
+            assert len(spawns) == 2, (
+                "the daemon asked to be restarted and the holder released the "
+                "port instead — a redeploy costs every live session"
+            )
+        finally:
+            holder.stop()
+
+
+    def case_a_cold_start_puts_a_holder_on_the_port(self, tmp_path):
+        """The holder has to be REACHED, not merely implemented.
+
+        A cold start is the only moment nothing owns the address yet, so it is
+        the only moment a holder can be put under it. Without this the class
+        exists and every daemon still binds its own port — and dies with it.
+        """
+        import subprocess
+
+        from cswap_pin import proxy as pin_proxy
+
+        seen = []
+        real = subprocess.Popen
+
+        def _spy(argv, **kw):
+            seen.append(list(argv))
+            raise OSError("not actually spawning")
+
+        subprocess.Popen = _spy
+        try:
+            pin_proxy._spawn_daemon("1", "a@b.c", tmp_path)
+        except OSError:
+            pass
+        finally:
+            subprocess.Popen = real
+        assert seen, "no process was spawned at all"
+        assert any(pin_proxy._HOLDER_MODULE_ARG in a for a in seen[0]), (
+            f"a cold start spawned {seen[0]} — the daemon binds its own port, "
+            f"so a kill -9 takes the port with it"
+        )
+
+    def case_the_orphan_sweep_does_not_kill_the_holder(self, tmp_path):
+        """The sweep finds daemons by argv, and the holder's argv matches.
+
+        `_pin_daemon_pids` selects on "module name present AND certdir is the
+        last token" — which the holder's own command line satisfies exactly.
+        A sweep would then SIGTERM the process holding the port, taking down
+        every session wired to it to clean up an orphan that was not one.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = str(tmp_path.resolve())
+        holder_line = (
+            f"999 /usr/bin/python -m cswap_pin.proxy "
+            f"{pin_proxy._HOLDER_MODULE_ARG} 36301 1 a@b.c {certdir}"
+        )
+        daemon_line = f"998 /usr/bin/python -m cswap_pin.proxy 1 a@b.c {certdir}"
+
+        class _Ran:
+            stdout = holder_line + "\n" + daemon_line + "\n"
+
+        import subprocess
+
+        real = subprocess.run
+        subprocess.run = lambda *a, **k: _Ran()
+        try:
+            pids = pin_proxy._pin_daemon_pids(tmp_path)
+        finally:
+            subprocess.run = real
+        assert 998 in pids, "the sweep stopped seeing real daemons"
+        assert 999 not in pids, (
+            "the sweep selected the PORT HOLDER — killing it takes the port "
+            "down with it, which is the outage the holder exists to prevent"
+        )
+
+
+class _ExitedProc:
+    """A Popen that has already exited with ``code``."""
+
+    def __init__(self, code: int):
+        self.returncode = code
+        self.pid = 0
+
+    def wait(self):
+        return self.returncode
+
 
 class TestUltrareviewIsPinned:
     """Ultrareview is a claude.ai-side capability authenticated by the OAuth
