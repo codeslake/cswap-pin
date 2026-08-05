@@ -299,8 +299,6 @@ class _StreamingUpstream:
 
 
 class TestStreamingRelay:
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_first_event_arrives_before_upstream_finishes(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -718,8 +716,6 @@ class TestChunkedRequestBodiesReachUpstream:
     artifact upload silently lost its payload.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_chunked_body_is_decoded_and_reframed(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -785,8 +781,6 @@ class TestTheChainsCredentialIsSent:
     proxy is the only route out, ALL pinned traffic fails.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _recording_chain(self):
         """A CONNECT proxy that records the request head and then refuses.
@@ -898,8 +892,6 @@ class _LoopbackConnectProxy:
 
 
 class TestLoopbackChainTrust:
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
         from cswap_pin.proxy import PinProxy
@@ -1159,8 +1151,6 @@ class TestLongPollSurvives:
     killed that poll — heartbeats (answered at once) kept returning 200, so
     the session looked healthy while no inbound message ever arrived."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_upstream_socket_has_no_read_deadline(self, certdir):
         import socket as _socket
@@ -2025,8 +2015,6 @@ class TestAbsoluteFormPassthrough:
     must relay these through the chain, not drop them (dropping = the
     'Auto-update failed' banner). No MITM/swap — just forward."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_absolute_form_get_is_relayed(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -2079,8 +2067,6 @@ class TestHealthEndpoint:
     own port) so a statusline/cc-update probe can tell it apart from CCF and
     read the chain it forwards to (mirrors CCF's /health with https_proxy)."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_health_reports_pin_and_chain(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -2195,8 +2181,6 @@ class TestKeepAlive:
     after the first is what made /remote-control fail with 'Transport closed:
     server rejected connection' while every individual route swapped fine."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_multiple_requests_over_one_connection(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -2307,8 +2291,6 @@ class TestWebSocketUpgrade:
     hop-by-hop made the server answer 403 — the whole reason /remote-control
     never connected through the pin proxy."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_upgrade_headers_reach_upstream_and_tunnel_opens(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -2367,8 +2349,6 @@ class TestBlindTunnelIsTraced:
     the channel it *receives* on left no line. Diagnosing that cost a live
     debugging session; the tunnel must announce itself."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_tunnel_to_a_foreign_host_writes_a_trace_line(self, certdir, tmp_path):
         import cswap_pin.proxy as pp
@@ -2440,8 +2420,6 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
     ever arrived. Measured on work-mac against a machine whose chain did let
     the host through, where the same session received normally."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _refusing_chain(self):
         """A proxy that answers every CONNECT with 403."""
@@ -2548,8 +2526,6 @@ class TestOptimisticConnectIsDetected:
     made RC silently deaf: everything Claude Code SENDS kept going through the
     MITM path at 200 while the receive channel was a dead socket."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _optimistic_chain(self):
         """Answers 200 to every CONNECT, then closes without connecting."""
@@ -2654,8 +2630,6 @@ class TestTheTrustFileActuallyVerifies:
     TLS OK, issuer "cswap pin-proxy CA"; with no extra CA,
     UNABLE_TO_VERIFY_LEAF_SIGNATURE. This is that, in-process."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _handshake(self, proxy_port: int, cafile) -> str:
         """CONNECT through the proxy and complete TLS, trusting only cafile."""
@@ -2724,8 +2698,6 @@ class TestTheKillGateIdentifiesItsTarget:
     shell whose command line quotes them, a wrapper, a grep.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _pids(self, monkeypatch, lines, certdir):
         import subprocess as _sp
@@ -3621,3 +3593,36 @@ class TestAMisroutedSwapCannotKillASession:
         finally:
             proxy.stop()
             upstream.stop()
+
+
+class TestEverySmallCaseHolder:
+    """Every small case-holder in this file, as ONE pytest test.
+
+    Each holder is run SEPARATELY (its own instance, its own helpers)
+    rather than merged by inheritance: three of these classes define a
+    `_ca` / `_cfg` / `_ours` helper with different meanings, and a
+    shared MRO would have handed every case just one of them.
+    A failure still names the class its case came from.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(
+            [
+                TestStreamingRelay(),
+                TestChunkedRequestBodiesReachUpstream(),
+                TestTheChainsCredentialIsSent(),
+                TestLoopbackChainTrust(),
+                TestLongPollSurvives(),
+                TestAbsoluteFormPassthrough(),
+                TestHealthEndpoint(),
+                TestKeepAlive(),
+                TestWebSocketUpgrade(),
+                TestBlindTunnelIsTraced(),
+                TestBlindTunnelFallsBackWhenChainRefuses(),
+                TestOptimisticConnectIsDetected(),
+                TestTheTrustFileActuallyVerifies(),
+                TestTheKillGateIdentifiesItsTarget(),
+                ],
+            request,
+            tmp_path_factory,
+        )

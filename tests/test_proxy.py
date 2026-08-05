@@ -78,8 +78,6 @@ class TestLiveRemoteControlSessions:
     fixed its owner at creation), so `cswap pin` names the ones affected
     instead of telling everyone to restart something."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _sessions_dir(self, tmp_path, monkeypatch):
         from pathlib import Path
@@ -117,8 +115,6 @@ class TestRepinIsLive:
     address, so the daemon must be able to serve a different account
     underneath it as soon as `cswap pin` writes one."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     class _Sw:
         def __init__(self, backup_dir):
@@ -214,8 +210,6 @@ class TestPinCodeResolvesItsNames:
 
 
 class TestIsPinnedRoute:
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_which_routes_carry_the_pinned_bearer(self):
         """The whole routing table, in one place.
@@ -245,8 +239,6 @@ class TestParseUpstreamProxy:
     """One function, nine inputs. It was nine test methods; the CASES are the
     value here, not the ceremony around each one, so they are a table."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_the_address_it_parses(self):
         import base64
@@ -384,8 +376,6 @@ class TestResolvePinToken:
     refreshing (via an injected callback) only when the stored one is near
     expiry. The proxy calls this before swapping the bearer."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _creds(self, token, expires_at, refresh="rt-1"):
         import json
@@ -1075,8 +1065,6 @@ class TestDaemonState:
     account, or redeployed code) and recycle it. Mirrors CCF's fingerprint
     staleness check (cachefix-ensure is_fresh/recycle)."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_the_record_roundtrips_and_survives_damage(self, tmp_path):
         """Write, read, and the two ways a read finds nothing.
@@ -1113,8 +1101,6 @@ class TestEnsureProxyLifecycle:
     """ensure_proxy under the CCF-style lifecycle: reuse a fresh live daemon,
     recycle a stale-fingerprint one, and never double-spawn under a race."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     class _Sw:
         def __init__(self, backup_dir):
@@ -1559,8 +1545,6 @@ class TestKillDaemon:
     """_kill_daemon must escalate TERM → KILL so a daemon that ignores TERM
     (or is mid-teardown) never lingers as an orphan holding a port."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_escalates_to_kill(self, monkeypatch):
         import os
@@ -1589,8 +1573,6 @@ class TestDaemonSignalTeardown:
     TERMs it cleans up its state file and port instead of relying on default
     kill semantics."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_sigterm_handler_is_installed(self, monkeypatch, tmp_path):
         # daemon_main should register a SIGTERM handler. We assert the wiring
@@ -1609,8 +1591,6 @@ class TestOrphanSweep:
     spawn, sweep every pin_proxy daemon for THIS backup dir except the one we
     keep, so orphans never accumulate."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_sweeps_other_pin_daemons_for_this_certdir(self, monkeypatch, tmp_path):
         from cswap_pin import proxy as pin_proxy
@@ -1637,8 +1617,6 @@ class TestWorkerJwtRoutesAreNotSwapped:
     Once that JWT exists it must travel untouched.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_worker_routes_keep_their_own_token(self):
         from cswap_pin.proxy import is_pinned_route
@@ -2358,8 +2336,6 @@ class TestUltrareviewIsPinned:
     bearer (binary: `/v1/ultrareview/preflight` with auth:"teleport-org"),
     so it belongs to the pinned cloud account like RC and artifacts."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_ultrareview_routes_are_pinned(self):
         from cswap_pin.proxy import is_pinned_route
@@ -2385,8 +2361,6 @@ class TestPinTokenRefreshIsSerialized:
     again.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_concurrent_expired_requests_refresh_once(self, tmp_path):
         import json
@@ -2467,8 +2441,6 @@ class TestAmbientProxyPrefersTheLauncherProxy:
     where a `cswap pin` run over ssh recorded privoxy:8118 while CCF on :9901
     stayed bypassed for every pinned session afterwards."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_which_proxy_the_chain_records(self, tmp_path, monkeypatch):
         """Five inputs, one function. The CASES are the value here.
@@ -3038,8 +3010,6 @@ class TestNarrowingIsDeliberatelyUnguarded:
     that adds a cert-count floor fails here instead of breaking the host with
     one component."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _cfg(self, tmp_path, monkeypatch):
         home = tmp_path / "cfg"
@@ -4044,8 +4014,6 @@ class TestTheGateDisarmsWhenThePinIsCleared:
     way to learn why.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_clear_removes_the_secret(self, tmp_path, monkeypatch):
         from cswap_pin import proxy as pin_proxy
@@ -4086,8 +4054,6 @@ class TestArmingReportsWhoItCutsOff:
     is how a session killed itself and reported success in the same breath.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_the_count_is_sockets_not_environments(self, monkeypatch, tmp_path):
         """A previous counter read /proc/*/environ and returned a DISJOINT set:
@@ -4288,8 +4254,6 @@ class TestABlindDaemonIsNotReusedForever:
     fact and the reuse check honours it.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_marked_daemon_is_not_reused(self, tmp_path):
         import json
@@ -4639,8 +4603,6 @@ class TestSharedBundleGuardMatchesNode:
     See cnighswonger/claude-code-cache-fix#296, which found this same guard
     wrong in both directions in the sibling implementation.
     """
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
 
     @staticmethod
@@ -5041,8 +5003,6 @@ class TestTheKillBudgetOutlastsTheDrain:
     recycle the package itself performs.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_draining_daemon_is_not_killed_before_it_finishes(self, monkeypatch):
         """Behaviour, not source: a process that exits just under the drain
@@ -5725,8 +5685,6 @@ class TestTheOracleWorksOnRUNTIMESWEDoNotDevelopOn:
     answerable on every node back to v12, and it is the question that actually
     matters — a session's failure mode is a handshake, not a census.
     """
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
 
     @staticmethod
@@ -6036,8 +5994,6 @@ class TestTheOracleTestsRunWhereTheyClaimTo:
     silently skipping the whole suite again on the runtime it is for.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_the_probe_answers_on_the_oldest_node_on_this_box(self, tmp_path):
         """Not "a node exists" — "the node we would actually consult answers".
@@ -6113,8 +6069,6 @@ class TestTheOracleIsAVetoNeverAnApproval:
     Nothing pins that position — the builder is not ours.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _ca(self, tmp_path):
         from cswap_pin.proxy import ensure_ca
@@ -6197,8 +6151,6 @@ class TestTheSalvageArmLogsWhatItDid:
     refusal/salvage arm must name the shared path and how many blocks were
     kept vs. found."""
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_salvage_names_the_shared_path_and_the_block_count(
         self, tmp_path, monkeypatch
@@ -6246,8 +6198,6 @@ class TestTheOwnershipGuardCannotBeFakedByName:
     string matches.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_leaf_signed_by_a_DIFFERENT_ca_of_the_same_name_is_rejected(
         self, tmp_path
@@ -6322,8 +6272,6 @@ class TestTheMissingLeafArmStaysUnknown:
     exactly this fixture — so this test is the one that has to catch it.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_missing_leaf_plus_healthy_bundle_wires_the_LIVE_shared_file(
         self, tmp_path, monkeypatch
@@ -6503,8 +6451,6 @@ class TestTheProbeAsksAboutTHISBundle:
     the proxy family and not these two.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_disabled_tls_check_does_not_manufacture_a_verdict(
         self, tmp_path, monkeypatch
@@ -6801,8 +6747,6 @@ class TestTheArmorCheckIsNotAcceptingEmptiness:
     keeps one root.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _blocks(self, tmp_path):
         from cswap_pin.proxy import ensure_ca
@@ -6853,8 +6797,6 @@ class TestAnEmptyArmorIsNotIntactArmor:
     before END, which is exactly what the three conditions below encode.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _ours(self, tmp_path):
         from cswap_pin.proxy import ensure_ca
@@ -6937,8 +6879,6 @@ class TestSalvageRefusesTheSameArmorThePredicateDoes:
     test), which is why it is worth a test rather than a comment.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_salvage_drops_a_block_whose_armor_openssl_refuses(self, tmp_path):
         from cswap_pin.proxy import _salvage_bundle, ensure_ca
@@ -7002,8 +6942,6 @@ class TestTheBlankLineRuleIsAnchoredAndMeansWhitespace:
     assumed. One rule, one meaning.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _ours(self, tmp_path):
         from cswap_pin.proxy import ensure_ca
@@ -7051,8 +6989,6 @@ class TestATruncatedBundleIsRefusedNotAccepted:
     written to hunt, one function away.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_bundle_whose_last_block_is_unterminated_is_refused(self, tmp_path):
         from cswap_pin.proxy import _bundle_is_usable, ensure_ca
@@ -7117,8 +7053,6 @@ class TestTheLastLineRuleAppliesToCertificatesToo:
     pass through, rather than in one arm of one of them.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _ours(self, tmp_path):
         from cswap_pin.proxy import ensure_ca
@@ -7185,8 +7119,6 @@ class TestTheEmptyCAGuardIsOnBothSidesOfTheSeam:
     of the guard is one line.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_salvage_is_not_reached_with_an_empty_ca(self, tmp_path, monkeypatch):
         import cswap_pin.proxy as proxy
@@ -7281,8 +7213,6 @@ class TestTheEmptyCAGuardCoversTheOTHERMergeToo:
     guard, it is a coincidence.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_an_empty_ca_does_not_produce_a_merge_without_us(self, tmp_path):
         from cswap_pin.proxy import _merged_ca
@@ -7563,8 +7493,6 @@ class TestTheUnMergeBranchReadsTheFileItReturns:
     sweep moved its guards PAST rather than through.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _live_and_bundle(self, tmp_path, bundle_content):
         from cswap_pin.proxy import ensure_ca
@@ -7682,8 +7610,6 @@ class TestTheFilterKeepsBlocksAfterTheTearToo:
     and a filter that keeps 124 are indistinguishable to `not _damaged`.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _store(self):
         import pathlib
@@ -7742,8 +7668,6 @@ class TestLoadCertSurvivesAnAmbientErrorFilter:
     alter every other test's environment.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_zero_serial_cert_survives_under_an_error_filter(self):
         """A LOADABLE certificate must not become a dropped one just because
@@ -7797,8 +7721,6 @@ class TestCarriesUsesTheSameGuardAsEverySite:
     `_load_cert` beats a guard duplicated at each raw-load site.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_zero_serial_want_is_still_found_under_an_error_filter(self, tmp_path):
         """`want` (the CA `_carries` is asked to find) is zero-serial and
@@ -7858,8 +7780,6 @@ class TestLoadCertDoesNotRaceItself:
     A's `try`, and A's certificate is dropped.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_concurrent_load_cannot_stomp_this_threads_ignore_filter(self):
         import threading
@@ -7932,8 +7852,6 @@ class TestARefusedUnlinkDoesNotReportDisarmed:
     the same outcome and must not share a silent `pass`.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_refused_unlink_does_not_look_like_a_successful_disarm(
         self, tmp_path, monkeypatch
@@ -7987,8 +7905,6 @@ class TestAReleaseFailureDoesNotLookLikeSuccess:
     believes a daemon it can never reach.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def case_a_refused_unlink_is_distinguishable_from_a_successful_release(
         self, tmp_path, monkeypatch
@@ -8056,8 +7972,6 @@ class TestASalvageWriteFailureNeverCostsOurOwnCA:
     control that would go red if a future change made that stop being true.
     """
 
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
 
     def _cfg(self, tmp_path, monkeypatch):
         home = tmp_path / "cfg"
@@ -8166,4 +8080,66 @@ class TestTeardownAsksThePortBeforeUnwiring:
         assert unwire, "_teardown no longer unwires at all"
         assert probe[0] < unwire[0], (
             "the port check must run BEFORE the unwire, or it decides nothing"
+        )
+
+
+class TestEverySmallCaseHolder:
+    """Every small case-holder in this file, as ONE pytest test.
+
+    Each holder is run SEPARATELY (its own instance, its own helpers)
+    rather than merged by inheritance: three of these classes define a
+    `_ca` / `_cfg` / `_ours` helper with different meanings, and a
+    shared MRO would have handed every case just one of them.
+    A failure still names the class its case came from.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(
+            [
+                TestLiveRemoteControlSessions(),
+                TestRepinIsLive(),
+                TestIsPinnedRoute(),
+                TestParseUpstreamProxy(),
+                TestResolvePinToken(),
+                TestDaemonState(),
+                TestEnsureProxyLifecycle(),
+                TestKillDaemon(),
+                TestDaemonSignalTeardown(),
+                TestOrphanSweep(),
+                TestWorkerJwtRoutesAreNotSwapped(),
+                TestUltrareviewIsPinned(),
+                TestPinTokenRefreshIsSerialized(),
+                TestAmbientProxyPrefersTheLauncherProxy(),
+                TestNarrowingIsDeliberatelyUnguarded(),
+                TestTheGateDisarmsWhenThePinIsCleared(),
+                TestArmingReportsWhoItCutsOff(),
+                TestABlindDaemonIsNotReusedForever(),
+                TestSharedBundleGuardMatchesNode(),
+                TestTheKillBudgetOutlastsTheDrain(),
+                TestTheOracleWorksOnRUNTIMESWEDoNotDevelopOn(),
+                TestTheOracleTestsRunWhereTheyClaimTo(),
+                TestTheOracleIsAVetoNeverAnApproval(),
+                TestTheSalvageArmLogsWhatItDid(),
+                TestTheOwnershipGuardCannotBeFakedByName(),
+                TestTheMissingLeafArmStaysUnknown(),
+                TestTheProbeAsksAboutTHISBundle(),
+                TestTheArmorCheckIsNotAcceptingEmptiness(),
+                TestAnEmptyArmorIsNotIntactArmor(),
+                TestSalvageRefusesTheSameArmorThePredicateDoes(),
+                TestTheBlankLineRuleIsAnchoredAndMeansWhitespace(),
+                TestATruncatedBundleIsRefusedNotAccepted(),
+                TestTheLastLineRuleAppliesToCertificatesToo(),
+                TestTheEmptyCAGuardIsOnBothSidesOfTheSeam(),
+                TestTheEmptyCAGuardCoversTheOTHERMergeToo(),
+                TestTheUnMergeBranchReadsTheFileItReturns(),
+                TestTheFilterKeepsBlocksAfterTheTearToo(),
+                TestLoadCertSurvivesAnAmbientErrorFilter(),
+                TestCarriesUsesTheSameGuardAsEverySite(),
+                TestLoadCertDoesNotRaceItself(),
+                TestARefusedUnlinkDoesNotReportDisarmed(),
+                TestAReleaseFailureDoesNotLookLikeSuccess(),
+                TestASalvageWriteFailureNeverCostsOurOwnCA(),
+                ],
+            request,
+            tmp_path_factory,
         )
