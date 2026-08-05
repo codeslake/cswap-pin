@@ -111,6 +111,32 @@ proxy; it only misinforms the session.
   the exact surface it borrows)
 - `cryptography` (installed automatically) for the MITM CA
 
+## Running the tests
+
+```bash
+uv sync --group dev                 # pytest, pytest-xdist, and the host
+S="$(mktemp -d)" && HOME="$S" XDG_DATA_HOME="$S/.local/share" \
+  uv run python -m pytest tests -q
+```
+
+**Redirect `HOME` and `XDG_DATA_HOME`.** The suite drives real cert dirs,
+daemon state and config wiring; a run against your own `HOME` will rewrite
+`~/.claude.json`, publish a test CA into `~/.claude/ca-trust.d/`, and touch
+the account store. `tests/conftest.py` redirects all of it per test, but the
+env vars are the belt to that suspenders — they are what the child processes
+the suite spawns obey.
+
+**`pytest-xdist` is required, not optional.** `addopts = "-n 4"` in
+`pyproject.toml` runs the suite on 4 workers (12.2s → ~5.0s, measured; more
+workers do not help — the floor is the single longest test). A pytest without
+xdist refuses the flag rather than ignoring it, so the suite will not start.
+
+For a serial repro of a failure, add `-n 0`: xdist gives no live output and
+truncates tracebacks it cannot attribute to a worker.
+
+One pytest test runs many `case_*` methods (`run_cases` in `conftest.py`), so
+60 collected tests carry 321 cases. A failure names both: `Class::case_name`.
+
 ## Why a separate package
 
 Upstream did not want a MITM proxy shipped inside claude-swap itself and asked

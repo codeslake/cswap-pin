@@ -34,6 +34,17 @@ classifiers = [
 # and get a pin that breaks every request, silently.
 dependencies = ["cryptography>=42.0"]
 
+[dependency-groups]
+# The suite runs on 4 xdist workers by default (see `addopts` below), so
+# pytest-xdist is REQUIRED, not optional: without it pytest refuses the `-n`
+# in addopts and the suite does not run at all. Measured on a venv with plain
+# pytest: "error: unrecognized arguments: -n".
+#
+# claude-swap is here and NOT in `dependencies` for the reason the comment
+# above it gives: it is a peer. The TESTS import the host, the package does
+# not.
+dev = ["pytest", "pytest-xdist", "claude-swap"]
+
 [project.urls]
 Homepage = "https://github.com/codeslake/cswap-pin"
 Repository = "https://github.com/codeslake/cswap-pin"
@@ -49,6 +60,19 @@ packages = ["src/cswap_pin"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# PARALLEL BY DEFAULT. 12.2s -> ~5.0s on 4 workers, measured; 8 and 12 workers
+# were no faster, because the floor is the single longest test (the real
+# spawned-successor handover, 3.1s) and no number of workers splits that.
+#
+# SAFE TO SPLIT, checked rather than assumed. Every listener in this suite
+# binds port 0, so two workers cannot collide on a port; the orphan sweep is
+# scoped to a certdir and every case has its own tmp_path; and the conftest
+# redirects HOME, CLAUDE_CONFIG_DIR and XDG_DATA_HOME per case, so a worker
+# cannot see another's config, store or daemon state.
+#
+# Override with `-p no:xdist` or `-n 0` when a failure needs a serial repro —
+# xdist gives no live output and truncates tracebacks it cannot attribute.
+addopts = "-n 4"
 markers = [
     # Needs a claude-swap whose seam is not released yet. The publish gate
     # installs the RELEASED host — that is the world a `pip install
