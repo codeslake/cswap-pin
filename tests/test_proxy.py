@@ -3214,6 +3214,80 @@ class TestDaemonPortStability:
         finally:
             holder.stop()
 
+    def case_a_successor_that_can_never_start_is_named_as_such(self, tmp_path):
+        """A BROKEN ENV AND A TRANSIENT CRASH MUST NOT READ THE SAME.
+
+        The holder retries a dead child on a 0.25s -> 5s ladder, forever,
+        logging the same line each time. That is right for a crash — the next
+        attempt usually works — and it is silence for a child that can NEVER
+        start, which is the state a bad deploy leaves behind.
+
+        MEASURED here, on wmac, caused by running the README's own install
+        command against an editable install: it replaced the checkout with the
+        PyPI release and took `cswap_pin` out of the tool env with it. The
+        daemon already running kept serving (its code is in memory), while
+        every successor died before reaching any of its own code:
+
+            .../claude-swap/bin/python: Error while finding module
+            specification for 'cswap_pin.proxy' (ModuleNotFoundError)
+
+        repeated in `daemon.log` with nothing saying the port was one death
+        away from being unrecoverable. The pin fails open by design, so this
+        is exactly the class of failure that stays invisible until it is an
+        outage.
+
+        So after `_HOLD_RESTART_REPORT_AT` consecutive failures the holder says
+        so ONCE, naming the count. Not a new mechanism and not a ceiling: it
+        keeps retrying, because a machine that recovers on attempt 20 should.
+
+        THE CONTROL is the same holder below the threshold, which must stay
+        quiet — a warning on every transient crash is the same silence by
+        another route.
+        """
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        at = pin_proxy._HOLD_RESTART_REPORT_AT
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        spawns = []
+        lines = []
+
+        def _fake_spawn():
+            spawns.append(1)
+            holder._proc = _ExitedProc(1)      # dies instantly, every time
+            holder.daemon_pid = 3000 + len(spawns)
+
+        holder._spawn = _fake_spawn
+        # NO LADDER: this is not a timing test, and the real one would take
+        # 0.5+1+2+4+5 = 12.5s to reach the threshold.
+        holder._backoff = lambda failures: 0.0
+        real_log = pin_proxy._log_lifecycle
+        pin_proxy._log_lifecycle = lambda msg, *a, **k: lines.append(msg)
+        holder.start()
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and len(spawns) <= at + 2:
+                time.sleep(0.02)
+        finally:
+            holder.stop()
+            pin_proxy._log_lifecycle = real_log
+
+        said = [l for l in lines if "cannot start" in l]
+        assert len(spawns) > at, (
+            f"only {len(spawns)} spawns happened — the threshold ({at}) was "
+            f"never reached, so this case proves nothing"
+        )
+        assert len(said) == 1, (
+            f"the holder said 'cannot start' {len(said)} time(s) across "
+            f"{len(spawns)} failed spawns — a broken env is either invisible "
+            f"or it is noise on every rung forever"
+        )
+        assert str(at) in said[0], (
+            f"the report does not name how many attempts failed: {said[0]!r}"
+        )
 
     def case_a_deploy_restarts_the_daemon_without_releasing_the_port(
         self, tmp_path
