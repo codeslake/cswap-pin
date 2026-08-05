@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from collections.abc import Callable
 
@@ -2791,6 +2791,38 @@ def live_remote_control_sessions() -> list[str]:
     return names
 
 
+def _live_bridge_ids() -> set[str]:
+    """Bridge ids whose owning process is still alive on THIS machine.
+
+    A record alone is not liveness: Claude Code leaves the file behind when a
+    session dies, so the registry accumulates. Measured here: 562 records, 293
+    of them still ``connected`` server-side, 16 with a process.
+
+    Both spellings, because the API renames the id it hands back:
+    ``session_…`` locally, ``cse_…`` in the listing.
+    """
+    get_claude_config_home = require("paths").get_claude_config_home
+
+    live: set[str] = set()
+    try:
+        entries = list((get_claude_config_home() / "sessions").glob("*.json"))
+    except OSError:
+        return live
+    for path in entries:
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        bridge, pid = rec.get("bridgeSessionId"), rec.get("pid")
+        if not bridge or not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        live.add(str(bridge))
+        live.add(str(bridge).replace("session_", "cse_"))
+    return live
+
+
 def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
     """Set (or clear, with ``email=None``) the pin AND bring the world in line.
 
@@ -4987,6 +5019,10 @@ class PinProxy:
         # machines that cannot answer (see ``_serve_client``).
         self._live_clients = 0
         self._live_lock = threading.Lock()
+        # One bridge sweep at a time. A session opening fires several calls in
+        # a burst; without this each would start its own listing.
+        self._bridge_sweeping = False
+        self._sweep_lock = threading.Lock()
         # The connections themselves, not just a count. `stop()` has to CLOSE
         # them before the process exits — see the note there on why a drained
         # request still ends in RST without this.
@@ -5296,6 +5332,41 @@ class PinProxy:
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
 
+    def _sweep_bridges_after_connect(self, token: str) -> None:
+        """Sweep superseded bridges, right after this session opened one.
+
+        THE EVENT, NOT A TIMER. A duplicate is created at exactly one moment:
+        a session opens an RC bridge while an older bridge of the same name is
+        still `connected`. That is when the sidebar becomes a coin flip, and
+        it is the only moment worth spending an API listing on. A periodic
+        sweep would wake a quiet daemon for hours to find nothing, and would
+        still leave the window between ticks — the one time it matters.
+
+        The pin sees this event for free: every RC lifecycle call is a route
+        it already swaps the bearer on, so `/v1/code/sessions` succeeding IS
+        the notification. Nothing polls and nothing extra is dialled.
+
+        In a thread, and never awaited: the client's response must not wait on
+        a listing, and a hanging API call must not hold a request open.
+        `_bridge_sweeping` keeps a burst of session calls from starting N
+        sweeps beside each other.
+        """
+        with self._sweep_lock:
+            if self._bridge_sweeping:
+                return
+            self._bridge_sweeping = True
+
+        def _run():
+            try:
+                self.sweep_superseded_bridges(token)
+            except Exception:  # noqa: BLE001 — never take the daemon down
+                pass
+            finally:
+                with self._sweep_lock:
+                    self._bridge_sweeping = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _serve_client(self, conn: socket.socket) -> None:
         """``_handle_client`` with the connection counted for its lifetime.
 
@@ -5320,6 +5391,164 @@ class PinProxy:
         count the daemon keeps itself, not an inference about the OS."""
         with self._live_lock:
             return self._live_clients
+
+    # -- superseded remote-control bridges ---------------------------------
+    #
+    # claude.ai addresses a session by TITLE. When a session opens a bridge
+    # while an OLDER bridge of the same name is still `connected`, the sidebar
+    # picks between them and a dead one silently swallows the message.
+    # Measured on the owner's account: 293 connected bridges for 16 live
+    # processes, `CCF` appearing 7 times and `cswap` 4.
+    #
+    # ON THE DAEMON because the pin is why one account holds every machine's
+    # bridges in the first place, and because it already sees the event: the
+    # RC lifecycle call is a route it swaps the bearer on.
+
+    def _bridge_api(self, method: str, path: str, token: str, timeout: float = 30.0):
+        """One call to the sessions API, over the daemon's own egress.
+
+        NOT THROUGH OUR OWN PORT. `/v1/code/sessions` is a PINNED ROUTE, so a
+        call routed through this daemon re-enters the swap path and is
+        indistinguishable from a session's own request — it overwrote the
+        bearer a real retry was using, caught by
+        `case_a_403_on_a_swapped_route_is_retried_unswapped`.
+
+        NOR A PLAIN DIRECT DIAL. Measured on this host: a fresh
+        `create_default_context()` to api.anthropic.com fails
+        CERTIFICATE_VERIFY_FAILED, because the direct route is a TLS-inspecting
+        corporate proxy. `_connect_upstream` + `_upstream_ctx` are the pair
+        that already solves both — the chain walk and the trust that matches
+        whichever hop answered — so this reuses them rather than becoming a
+        third egress path with its own copy of the same decisions.
+
+        None means "could not ask", NEVER "nothing there": a sweep that read a
+        failed call as an empty listing would close every bridge on the
+        account.
+        """
+        raw = None
+        try:
+            raw, via_loopback = self._connect_upstream()
+            up = _wrap_upstream(self._upstream_ctx(via_loopback), raw, UPSTREAM_HOST)
+            up.settimeout(timeout)
+            req = (
+                f"{method} {path} HTTP/1.1\r\n"
+                f"Host: {UPSTREAM_HOST}\r\n"
+                f"Authorization: Bearer {token}\r\n"
+                "anthropic-beta: oauth-2025-04-20\r\n"
+                "anthropic-version: 2023-06-01\r\n"
+                "Accept: application/json\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            up.sendall(req.encode("latin1"))
+            status_line = _read_line(up) or ""
+            headers = []
+            while True:
+                h = _read_line(up)
+                if h in ("", None):
+                    break
+                if ":" in h:
+                    k, v = h.split(":", 1)
+                    headers.append((k.strip(), v.strip()))
+            body = _read_body(up, headers)
+            try:
+                code = int(status_line.split(" ")[1])
+            except (IndexError, ValueError):
+                return None
+            if code >= 400:
+                return None
+            return json.loads(body) if body else {}
+        except Exception:  # noqa: BLE001 — could not ask
+            return None
+        finally:
+            if raw is not None:
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+
+    def _list_bridges(self, token: str):
+        """Every session on the pinned account, paginated. None when it failed.
+
+        PAGINATION IS NOT OPTIONAL: the first page is 100 of ~560 here, and a
+        sweep that saw only page one would treat every later bridge as absent.
+        """
+        out, cursor = [], None
+        for _ in range(40):
+            path = "/v1/code/sessions?limit=100"
+            if cursor:
+                path += "&cursor=" + quote(cursor)
+            page = self._bridge_api("GET", path, token)
+            if page is None:
+                return None if not out else out
+            out.extend(page.get("data") or [])
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return out
+
+    def sweep_superseded_bridges(self, token: str) -> int:
+        """Close bridges that a NEWER bridge of the same name has replaced.
+
+        THREE CONDITIONS, ALL REQUIRED. Each alone closes something in use;
+        the measurement that ruled each one out is named with it.
+
+        1. ``connection_status == "connected"``. Only a connected bridge
+           competes for a message; a disconnected one costs nothing and
+           closing it would only destroy history.
+
+        2. ``status == "archived"``. A session that merely ENDED stays
+           ``active`` — 186 of them here — so ``active`` cannot mean "gone".
+
+        3. A NEWER BRIDGE SHARES ITS TITLE. This is what makes it safe.
+           ``archived`` alone is also what the user gets by archiving a
+           conversation they mean to return to: of 269 archived-and-connected
+           bridges here, 202 are the newest thing carrying their title, and
+           closing those would delete exactly what someone put away on
+           purpose. The other 67 are the shape this exists for.
+
+        "NO PROCESS ON THIS MACHINE" IS DELIBERATELY NOT A CONDITION. The pin
+        exists so ONE account holds every machine's bridges, so this host sees
+        the other machines' sessions and cannot check their pids. It would
+        have been destructive: ``pmac-inbound-demo`` and ``pinverify-pmac``
+        have no process here and were both LIVE on via-personal-mac when this
+        was measured. Local liveness is used only as a NEGATIVE guard — never
+        close something running here — never as evidence anything is dead.
+
+        Nor is a title shared between two LIVE bridges a reason to close
+        either: two windows both named ``cswap`` that each opened RC are two
+        sessions in use, and that is for the human to fix with `/rename`.
+        """
+        sessions = self._list_bridges(token)
+        if sessions is None:
+            return 0  # could not ask — certainly not "delete everything"
+
+        live = _live_bridge_ids()
+        newest: dict[str, str] = {}
+        for item in sessions:
+            title = (item.get("title") or "").strip()
+            if title:
+                stamp = item.get("last_event_at") or ""
+                if stamp > newest.get(title, ""):
+                    newest[title] = stamp
+
+        closed = 0
+        for item in sessions:
+            sid, title = item.get("id"), (item.get("title") or "").strip()
+            if not sid or not title or sid in live:
+                continue
+            if item.get("connection_status") != "connected":
+                continue
+            if item.get("status") != "archived":
+                continue
+            if (item.get("last_event_at") or "") >= newest[title]:
+                continue  # the newest of its name — someone put this away
+            if self._bridge_api(
+                "DELETE", f"/v1/code/sessions/{sid}", token
+            ) is not None:
+                closed += 1
+        if closed:
+            _log_lifecycle(f"closed {closed} superseded remote-control bridges")
+        return closed
 
     def _handle_client(self, conn: socket.socket) -> None:
         # A per-CONNECTION id, not a thread id: threads are pooled and reused,
@@ -5685,6 +5914,17 @@ class PinProxy:
                     for k, v in headers
                 ]
                 swapped = True
+                # A SESSION WAS JUST OPENED — the one moment a duplicate can
+                # appear. `POST /v1/code/sessions` is how a bridge is created,
+                # so an older bridge of the same name becoming ambiguous
+                # happens here and nowhere else. Sweeping on THIS instead of a
+                # timer means a quiet daemon never wakes to find nothing, and
+                # the fix lands when it is needed rather than up to an hour
+                # later. Fired on the request rather than the response: the
+                # sweep re-lists from the server anyway, so a create that
+                # fails simply finds nothing new to supersede.
+                if method == "POST" and path == "/v1/code/sessions":
+                    self._sweep_bridges_after_connect(token)
             else:
                 # Fail-open: the request still goes, on the disk bearer. That is
                 # deliberate — a pin that cannot resolve must never block work —
