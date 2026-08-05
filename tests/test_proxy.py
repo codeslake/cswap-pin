@@ -3024,6 +3024,13 @@ class TestDaemonPortStability:
             # THE POINT: no window. Not "it comes back in a second" — the
             # socket was never the daemon's to take down with it, so a
             # connection landing mid-crash waits in the backlog.
+            #
+            # PROBED AS FAST AS THE LOOP ALLOWS, with no sleep between tries.
+            # A structural window here is NARROW — a peer measured 1 refusal
+            # in 40 requests on a supervisor that closes and rebinds, and its
+            # own local repro missed it 8 runs out of 8. A probe that pauses
+            # 20 ms between attempts is looking away for most of the window it
+            # is meant to catch.
             refused = 0
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -3033,7 +3040,6 @@ class TestDaemonPortStability:
                     refused += 1
                 if holder.daemon_pid not in (None, first):
                     break
-                time.sleep(0.02)
             assert refused == 0, f"{refused} connections refused while the daemon was dead"
             assert holder.daemon_pid not in (None, first), (
                 "the holder did not restart the daemon it supervises"

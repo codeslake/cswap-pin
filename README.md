@@ -145,8 +145,17 @@ That is what makes a crash survivable. A planned restart already keeps the
 port (the outgoing daemon hands its socket down), but a `kill -9`, an OOM
 kill or a segfault skips every cooperative step — and an unowned port is
 permanent for a live session, whose `HTTPS_PROXY` was fixed at exec.
-Measured: three `kill -9`s of the daemon while hammering the port, `refused=0`
-and a new pid on the same port each time.
+Measured: **twelve `kill -9`s** of the daemon while four clients hammered the
+port — **6,388 requests, 0 refused**, same port throughout, a new pid each
+time. The 41 resets in that run are the killed daemon's own in-flight
+requests, which a crash must cost; a *planned* restart costs none.
+
+The reason it is zero rather than small is that the holder never releases the
+socket between children. It binds once and keeps it; each daemon accepts on
+the inherited descriptor. So there is no re-acquire to lose, and a connection
+arriving mid-crash waits in the kernel's backlog instead of being refused. A
+supervisor that closes and rebinds has a window there by construction, however
+narrow — a peer measured 1 refusal in 40 requests on that shape.
 
 The holder reads the daemon's exit rather than guessing:
 
