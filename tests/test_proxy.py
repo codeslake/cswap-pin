@@ -3738,12 +3738,58 @@ class TestTheDaemonWatchesItsOwnCode:
         t.start()
         assert held.wait(timeout=5), "premise: the holder never took the lock"
 
+        # WAIT FOR THE WATCHDOG TO BE BLOCKED, do not wait out a fixed
+        # deadline. `w.join(timeout=1.0)` spent the whole second every run (the
+        # watchdog is blocked, so the join can only ever time out) and proved
+        # less than this does — a run where the watchdog never reached the lock
+        # also "spawned nothing", and the join could not tell the two apart.
+        #
+        # THE WAIT MUST END ON *BLOCKED IN* THE LOCK, NOT ON *CALLING* IT.
+        # Mutation-checked: pointing the watchdog at a different lock file
+        # (`name=".MUTANT.lock"` — serialization gone) still called
+        # `_spawn_lock`, so a spy that fired on ENTRY passed the mutant. Firing
+        # only once the call has failed to return within a grace period is what
+        # distinguishes "queued behind the holder" from "took some other lock
+        # and walked straight through".
+        entered = threading.Event()
+        blocked_in_lock = threading.Event()
+        real_lock = pin_proxy._spawn_lock
+
+        def _watched_lock(*a, **k):
+            entered.set()
+            cm = real_lock(*a, **k)
+            got_it = threading.Event()
+
+            class _Probe:
+                def __enter__(self):
+                    r = cm.__enter__()
+                    got_it.set()
+                    return r
+
+                def __exit__(self, *exc):
+                    return cm.__exit__(*exc)
+
+            def _watch():
+                # not acquired within the grace period => genuinely queued
+                if not got_it.wait(timeout=0.2):
+                    blocked_in_lock.set()
+
+            threading.Thread(target=_watch, daemon=True).start()
+            return _Probe()
+
+        monkeypatch.setattr(pin_proxy, "_spawn_lock", _watched_lock)
+
         done = threading.Event()
         w = threading.Thread(target=pin_proxy._watch_own_code, args=(
             _Srv(), "1", "a@example.com", certdir, done, lambda r: None, 0.01,
             "fp-old"), daemon=True)
         w.start()
-        w.join(timeout=1.0)
+        assert entered.wait(timeout=5), "the watchdog never reached the spawn lock"
+        assert blocked_in_lock.wait(timeout=5), (
+            "the watchdog called _spawn_lock but was NOT queued behind the "
+            "holder — it is taking some other lock, so two daemons on one "
+            "certdir can still recycle at the same tick"
+        )
 
         blocked = not spawned
         release.set()
