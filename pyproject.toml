@@ -49,3 +49,12 @@ packages = ["src/cswap_pin"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    # Needs a claude-swap whose seam is not released yet. The publish gate
+    # installs the RELEASED host — that is the world a `pip install
+    # cswap-pin` user is in — so a test of an unreleased seam would fail
+    # there for a reason that is not a defect. Deselected by marker rather
+    # than skipped inside the test, so the exclusion is a visible `-m`
+    # expression in the workflow instead of a silent skip nobody reads.
+    "needs_host_seam: requires an unreleased claude_swap seam",
+]

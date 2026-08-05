@@ -1688,6 +1688,77 @@ class TestChainRediscovery:
             outer.stop()
             refusing.close()
 
+    def test_a_plain_user_with_only_HTTPS_PROXY_still_chains_through_it(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """NO cc-wrapper, NO launcher, NO upstream.json. Just a corp proxy.
+
+        The composition every other test assumes is the one a plain
+        `pip install` user never gets: something else wrote the chain record
+        first. Here nothing has, and the only evidence a corp proxy exists is
+        `HTTPS_PROXY` in the shell that runs `cswap pin`.
+
+        If the pin ignored that, a user behind a corporate proxy would get
+        pin -> DIRECT: a dead session where the firewall is closed, and a
+        silent skip of inspection where it is open. Neither is acceptable for
+        an optional feature, and neither is visible from outside.
+
+        THE HOP MUST SEE THE TRAFFIC, not merely appear in a candidate list.
+        A peer measured its own version of this with a fake proxy that
+        ANSWERED the CONNECT instead of relaying it: the leg died before
+        anything was logged and the fixture reported a bypass that was not
+        happening. `_LoopbackConnectProxy` relays, and the assertion is on
+        what it SAW.
+        """
+        from cswap_pin.proxy import PinProxy, _ambient_chain, write_upstream_hint
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir(exist_ok=True)
+        ensure_ca(foreign, "api.anthropic.com")
+        upstream = _FakeUpstream(foreign)
+        corp = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+
+        proxy = None
+        try:
+            # THE PLAIN SHELL, and nothing else. No upstream.json exists yet.
+            assert not (certdir / "upstream.json").exists(), (
+                "fixture invalid: something already recorded a chain, which is "
+                "the very thing a plain user does not have"
+            )
+            env = {"HTTPS_PROXY": f"http://127.0.0.1:{corp.port}"}
+            hop, next_hop = _ambient_chain(env=env, certdir=certdir)
+            assert hop is not None, (
+                "the pin saw a corp proxy in the shell and recorded nothing — "
+                "every pinned request would bypass it"
+            )
+            # Exactly what `ensure_proxy` does with that answer.
+            write_upstream_hint(certdir, hop, None, next_hop=next_hop)
+
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: None,
+                upstream=("127.0.0.1", upstream.port),
+                rediscover_chain=True,
+            )
+            proxy.start()
+            assert proxy.port != 36301, proxy.port
+
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert corp.connects == 1, (
+                "a REAL request through the pin never reached the corp proxy "
+                "the user's shell named — on a host behind a firewall that is "
+                "a dead session, and where it is open it silently skips "
+                "inspection"
+            )
+            assert status == 200, "the request did not complete through it"
+        finally:
+            if proxy:
+                proxy.stop()
+            upstream.stop()
+            corp.stop()
+
     def test_D3_the_blind_tunnel_uses_the_next_hop_too(
         self, certdir, tmp_path, monkeypatch
     ):
@@ -2242,12 +2313,24 @@ class TestBlindTunnelIsTraced:
                     f"CONNECT ingress.example.com:{peer_port} HTTP/1.1\r\n"
                     f"Host: ingress.example.com:{peer_port}\r\n\r\n".encode()
                 )
-                resp = b""
-                while b"\r\n\r\n" not in resp:
-                    chunk = raw.recv(4096)
-                    if not chunk:
+                # WAIT FOR THE TRACE, NOT FOR A RESPONSE. `ingress.example.com`
+                # does not resolve, so no response is ever coming and the old
+                # `recv` loop simply raced the DNS resolver: it blocked until
+                # its own 10s socket timeout while the resolver retried.
+                # Measured, this test alone: 1 failure in 12 runs, the failing
+                # one always ~10.3s against pass-times of 0.8-5.9s. The flake
+                # was pre-existing and only became visible when a publish gate
+                # started running the suite.
+                #
+                # The property under test is that the tunnel ANNOUNCES itself,
+                # and that line is written before any dial — so waiting for it
+                # tests the thing and waits on nothing else.
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pp._TRACE.flush()
+                    if "CONNECT ingress.example.com" in log.read_text():
                         break
-                    resp += chunk
+                    time.sleep(0.02)
                 raw.close()
             finally:
                 proxy.stop()
