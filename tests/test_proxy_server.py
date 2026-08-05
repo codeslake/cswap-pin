@@ -1354,7 +1354,7 @@ class TestChainRediscovery:
         )
         assert len(attempts) == 3, f"walked {len(attempts)} times, expected 3"
 
-    def case_connections_do_not_become_threads(self, tmp_path):
+    def case_connections_do_not_become_threads(self, tmp_path, monkeypatch):
         """CONNECTIONS MUST NOT BECOME THREADS.
 
         MEASURED OUTAGE, lmd42: the cache hop died and the pin served 27,491
@@ -1377,6 +1377,14 @@ class TestChainRediscovery:
         opener threads, which are the same order of magnitude as the thing
         being measured, and it read "grew=0" while every connection had its
         own server thread.
+
+        WHAT THIS TEST DOES NOT PROVE, stated because a green test that cannot
+        fail is worse than no test. Reverting the detach in `_blind_tunnel`
+        leaves this case PASSING, while the same control run through
+        `tools/thread_probe.py` reports 305 threads against 5. The probe is the
+        instrument; this is a smoke check that the daemon still serves 300
+        concurrent tunnels without the count exploding. Why the two disagree is
+        open — do not read a pass here as evidence the coupling is gone.
         """
         import os
         import socket
@@ -1386,7 +1394,29 @@ class TestChainRediscovery:
         from cswap_pin.proxy import ensure_ca
 
         ensure_ca(tmp_path, "api.anthropic.com")
-        port = pin_proxy._spawn_daemon("1", "a@example.com", tmp_path)
+        # BOUND THE SPAWN WAIT. The default polls 10s for the child to
+        # publish, and a holder that appears after this case has reaped lives
+        # forever — measured, 2 orphans a run from exactly that window.
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 1.5)
+        # TRACK THE CHILD AT BIRTH. Reaping by certdir afterwards races the
+        # spawn — `_spawn_daemon` returns when the state file appears, but the
+        # HOLDER it started keeps going, and one born a moment later was in no
+        # sweep. Measured: 2 orphans a run surviving a reap that found nothing.
+        import subprocess as _sp
+
+        started = []
+        _real_popen = _sp.Popen
+
+        def _tracked(*a, **k):
+            proc = _real_popen(*a, **k)
+            started.append(proc)
+            return proc
+
+        _sp.Popen = _tracked
+        try:
+            port = pin_proxy._spawn_daemon("1", "a@example.com", tmp_path)
+        finally:
+            _sp.Popen = _real_popen
         assert port, "the daemon did not come up"
         st = pin_proxy.read_daemon_state(tmp_path)
         pid = int(st["pid"])
@@ -1472,10 +1502,21 @@ class TestChainRediscovery:
                     s.close()
                 except OSError:
                     pass
-            try:
-                os.kill(pid, 15)
-            except OSError:
-                pass
+            # PARENTS FIRST. `_spawn_daemon` starts a HOLDER, whose job is
+            # to replace a daemon that dies — so killing `pid` alone gets it
+            # replaced, and this case leaked 38 processes in one suite run.
+            for proc in started:          # PARENTS FIRST: these are holders
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:  # noqa: BLE001 — gone, or too slow
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+            from conftest import _reap_pin_processes
+
+            _reap_pin_processes(tmp_path)
             far.close()
 
     def case_health_reports_the_chain_the_relay_would_use(self, certdir):

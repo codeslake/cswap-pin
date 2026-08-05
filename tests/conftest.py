@@ -430,3 +430,4 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
         raise AssertionError(
             f"{len(failures)} of {len(work)} cases failed:\n\n" + "\n".join(failures)
         )
+
