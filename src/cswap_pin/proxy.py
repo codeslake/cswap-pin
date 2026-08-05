@@ -2188,7 +2188,7 @@ _HOP_REPLY_BUDGET_S = 6.0
 
 def _dial_chain(
     chain: "_Chain",
-    timeout: float = _HOP_CONNECT_BUDGET_S,
+    timeout: float | None = None,
     extra_ca: "Path | None" = None,
 ) -> socket.socket:
     """Connect to the egress proxy, wrapping in TLS when the URL said https.
@@ -2203,6 +2203,11 @@ def _dial_chain(
     only in the hint would otherwise never be consulted, and verification of
     the very proxy it describes would fail.
     """
+    # READ THE BUDGET AT CALL TIME. As a default argument it was frozen at
+    # import, so nothing could adjust it afterwards — not a future caller, and
+    # not a test pointing the walk at a hop that never answers.
+    if timeout is None:
+        timeout = _HOP_CONNECT_BUDGET_S
     sock = socket.create_connection(chain.address, timeout=timeout)
     # create_connection leaves the DIAL budget on the socket, where it would
     # then bound every read. Reaching a hop and waiting for its answer are
