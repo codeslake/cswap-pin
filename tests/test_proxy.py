@@ -4937,6 +4937,61 @@ class TestTheDaemonWatchesItsOwnCode:
                 except OSError:
                     pass
 
+    def case_self_heal_off_stops_the_code_watch_too(self, tmp_path, monkeypatch):
+        """`CSWAP_PIN_SELF_HEAL=off` MUST STOP EVERY AUTOMATIC REPLACEMENT.
+
+        The switch is documented on `PortHolder` as "a respawner fighting a
+        human who is debugging the daemon is worse than a dead port", and the
+        holder honours it. The code watchdog — added later — never consulted
+        it, so with the switch OFF a debugging session still had its daemon
+        taken away the moment anything touched the file on disk. That is the
+        one thing the switch exists to prevent, reached by the other path.
+
+        `heal` and `ensure_proxy` are DELIBERATELY not covered: those are a
+        human or a launch asking for a repair, and a switch meaning "do not
+        act on your own" should not refuse a direct instruction.
+
+        THE CONTROL is the same watcher with the switch unset, which must
+        still hand over — otherwise "off stops it" would pass for a watchdog
+        that never acts at all.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        def _handed_over(switch):
+            events = []
+            monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                                lambda *a, **k: "fp-new")
+            monkeypatch.setattr(
+                pin_proxy, "_spawn_daemon",
+                lambda n, e, c, **k: events.append(("spawn", n)) or 41234,
+            )
+            if switch is None:
+                monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+            else:
+                monkeypatch.setenv(pin_proxy._SELF_HEAL_ENV, switch)
+            done = threading.Event()
+            threading.Timer(0.25, done.set).start()
+            pin_proxy._watch_own_code(
+                _recording_server(events)(), "1", "a@b.c",
+                self._certdir(tmp_path), done,
+                teardown=lambda reason: events.append(("teardown", reason)),
+                interval=0.01, _own_fingerprint="fp-old",
+            )
+            return [e for e in events if e[0] == "spawn"]
+
+        # CONTROL: with the switch unset the watcher must act.
+        assert _handed_over(None), (
+            "CONTROL FAILED: the watchdog did not hand over on changed code, "
+            "so the refusal below says nothing"
+        )
+        assert not _handed_over("off"), (
+            f"the code watch replaced the daemon while "
+            f"{pin_proxy._SELF_HEAL_ENV}=off — the switch exists so a human "
+            f"debugging the daemon is not fought by a respawner"
+        )
+
     def case_an_unchanged_module_never_hands_over(self, tmp_path, monkeypatch):
         """THE CONTROL. Without it the suite cannot tell "recycles when the
         code changed" from "recycles always", and the second would replace a
