@@ -2392,8 +2392,21 @@ def _certs_consistent(
             return False
         ca = x509.load_pem_x509_certificate(ca_pem.read_bytes())
         leaf = x509.load_pem_x509_certificate(leaf_pem.read_bytes())
-        serialization.load_pem_private_key(ca_key.read_bytes(), password=None)
-        lkey = serialization.load_pem_private_key(leaf_key.read_bytes(), password=None)
+        # `unsafe_skip_rsa_key_validation` skips OpenSSL's RSA_check_key, which
+        # costs 27ms per key — 55ms of every single launch, measured, spent
+        # re-proving the primality of a key THIS code generated and wrote 0600
+        # into its own dir. The check defends against an ATTACKER-supplied key
+        # (fault attacks on a key you did not make); it is not a corruption
+        # check. PEM framing, DER structure, and the algorithm are still parsed
+        # and still raise on a truncated or foreign file, which is the only
+        # failure this function is asking about. Landed in cryptography 39.0,
+        # well under the 42.0 floor above.
+        serialization.load_pem_private_key(
+            ca_key.read_bytes(), password=None, unsafe_skip_rsa_key_validation=True
+        )
+        lkey = serialization.load_pem_private_key(
+            leaf_key.read_bytes(), password=None, unsafe_skip_rsa_key_validation=True
+        )
         if lkey.public_key().public_numbers() != leaf.public_key().public_numbers():
             return False
         # Renew a month early: a cert that expires mid-session takes the
