@@ -73,6 +73,17 @@ The pin is an optional extra of claude-swap, not a standalone tool: it reads
 cswap's account store and rewrites the config cswap already manages. Installing
 `cswap-pin` on its own does nothing useful.
 
+**On a machine running claude-swap from a checkout, keep it editable.** The
+command above installs the PyPI release and replaces whatever was there, extras
+included — so running it against an editable install both downgrades the host
+and drops `cswap_pin` from the tool env. The daemon already running survives
+(its code is in memory) but every successor it spawns dies with
+`ModuleNotFoundError`, which is invisible until something tries to restart it:
+
+```bash
+uv tool install --force --editable '.[pin]'     # from the checkout
+```
+
 ### Upgrading a machine that is already serving
 
 Nothing to do. Install the new version; the running daemon notices its own
