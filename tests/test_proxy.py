@@ -3289,6 +3289,108 @@ class TestDaemonPortStability:
             f"the report does not name how many attempts failed: {said[0]!r}"
         )
 
+    def case_a_refused_hold_defers_to_the_pin_that_has_the_port(self, tmp_path):
+        """A HOLDER THAT CANNOT TAKE THE PORT MUST NOT SERVE ON ANOTHER ONE.
+
+        `holder_main` falls back to `daemon_main` when the bind fails, on the
+        premise that it "will reclaim the port when it frees". A daemon cannot
+        move its port — its address is fixed once it binds, and every session's
+        HTTPS_PROXY was fixed at exec — so the fallback does not reclaim
+        anything. It serves on an EPHEMERAL port that nothing is wired to.
+
+        MEASURED, isolated port 49927, during an orphan recovery:
+
+            11:57:13 holder could not take the port (49927 is taken —
+                     refusing to hold a different one) — serving unheld
+            11:57:13 serving on port 37001
+
+        Two daemons then existed: the one holding the wired port and a second
+        answering nothing, which the sweep does not reap (it has its own valid
+        state) and no session can reach.
+
+        The bind fails for exactly two reasons and they are opposite:
+
+          - somebody healthy already serves the wired port. Then this process
+            is redundant and the right move is to EXIT. That is the common
+            case — a concurrent launch won the election.
+          - the port is held by something that is not serving. Then a second
+            daemon on a different port does not help either.
+
+        So a refused hold exits rather than serving somewhere nobody dials.
+        `_spawn_daemon`'s caller already treats "no successor" correctly, and
+        the incumbent is by definition still up.
+
+        THE CONTROL: a bind that SUCCEEDS must still serve, or "exits when
+        refused" would pass for a holder that never serves at all.
+        """
+        import socket
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        served = []
+        real_daemon = pin_proxy.daemon_main
+        pin_proxy.daemon_main = lambda *a, **k: served.append(a)
+        # Occupy the port the holder will be told to take, and ANSWER on it —
+        # this is the healthy-incumbent case, which is the common one.
+        squatter = socket.socket()
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen(4)
+        taken = squatter.getsockname()[1]
+
+        def _run_holder(port):
+            """`holder_main` to completion. Returns what it handed daemon_main."""
+            served.clear()
+            t = threading.Thread(
+                target=pin_proxy.holder_main,
+                args=("1", "a@b.c", tmp_path),
+                kwargs={"port": port},
+                daemon=True,
+            )
+            t.start()
+            t.join(timeout=15)
+            return list(served)
+
+        # A short wait: the real 3s budget is for a predecessor draining, and
+        # this squatter never leaves.
+        real_wait = pin_proxy._HOLD_BIND_WAIT_S
+        real_spawn = pin_proxy.PortHolder._spawn
+        pin_proxy._HOLD_BIND_WAIT_S = 0.2
+        # The CONTROL's holder must not actually spawn a child process — the
+        # question is whether it got far enough to hold, not whether a real
+        # daemon comes up. `_thread.join()` then returns once the supervisor
+        # sees the stub exit.
+        pin_proxy.PortHolder._spawn = lambda self: setattr(
+            self, "_proc", _ExitedProc(0)
+        )
+        try:
+            assert _run_holder(taken) == [], (
+                "a holder that could not take the wired port served as a plain "
+                "daemon on another one — nothing is wired there and no session "
+                "can reach it (measured: 49927 taken -> served on 37001)"
+            )
+            # CONTROL: a FREE port must still be held, or the assertion above
+            # would pass for a holder that never serves under any condition.
+            free = socket.socket()
+            free.bind(("127.0.0.1", 0))
+            open_port = free.getsockname()[1]
+            free.close()
+            held = pin_proxy.PortHolder(tmp_path, "1", "a@b.c", port=open_port)
+            try:
+                assert held.port == open_port, (
+                    f"CONTROL FAILED: a free port was not held "
+                    f"({held.port} != {open_port}) — the case above proves nothing"
+                )
+            finally:
+                held.stop()
+        finally:
+            pin_proxy._HOLD_BIND_WAIT_S = real_wait
+            pin_proxy.PortHolder._spawn = real_spawn
+            pin_proxy.daemon_main = real_daemon
+            squatter.close()
+
     def case_a_deploy_restarts_the_daemon_without_releasing_the_port(
         self, tmp_path
     ):
