@@ -1928,7 +1928,9 @@ class TestDaemonPortStability:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def case_a_real_spawned_successor_drops_no_connection(self, tmp_path):
+    def case_a_real_spawned_successor_drops_no_connection(
+        self, tmp_path, monkeypatch
+    ):
         """THE WHOLE PROPERTY, end to end, with a REAL successor process.
 
         The in-process test above proves the socket is handed over and the
@@ -1954,9 +1956,24 @@ class TestDaemonPortStability:
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PinProxy, ensure_ca
 
+        # BOUND THE SPAWN WAIT. `_spawn_daemon` polls for up to 10s, and a
+        # successor that publishes late is born AFTER this case has finished
+        # reaping — measured, processes 11s younger than a reap that reported
+        # nothing left. The successor here comes up in well under a second when
+        # it comes up at all, so the remaining 9s only buys orphans.
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 1.0)
+
+        arms = []
+        children = []
+
         def _handover(hand_down: bool) -> tuple[int, int]:
             """(refused, served) across one real handover. Returns counts."""
             certdir = tmp_path / ("hd" if hand_down else "ctl")
+            # RECORDED FOR THE REAP. `tmp_path` here is the CASE's directory,
+            # handed down by `run_cases`, so a caller outside this closure
+            # cannot reconstruct the path — and reaping the wrong one silently
+            # reaps nothing.
+            arms.append(certdir)
             certdir.mkdir()
             ensure_ca(certdir, "api.anthropic.com")
             old = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
@@ -1990,39 +2007,86 @@ class TestDaemonPortStability:
             spawned = None
             try:
                 fd = old.release_listener(hand_down=hand_down)
-                spawned = pin_proxy._spawn_daemon(
-                    "1", "a@example.com", certdir, listen_fd=fd
-                )
+                # RECORD EVERY CHILD THIS SPAWN CREATES. Reaping by certdir
+                # after the fact races the spawn itself: `_spawn_daemon`
+                # returns as soon as the state file appears, but the HOLDER it
+                # started keeps working, and a successor born a moment later
+                # was never in any sweep. Measured: orphans 11s younger than a
+                # reap that reported nothing left. Wrapping Popen catches them
+                # at birth, which cannot race anything.
+                import subprocess as _sp
+
+                _real_popen = _sp.Popen
+
+                def _tracked(*a, **k):
+                    proc = _real_popen(*a, **k)
+                    children.append(proc)
+                    return proc
+
+                _sp.Popen = _tracked
+                try:
+                    spawned = pin_proxy._spawn_daemon(
+                        "1", "a@example.com", certdir, listen_fd=fd
+                    )
+                finally:
+                    _sp.Popen = _real_popen
                 old.await_inflight(0)
                 time.sleep(0.3)
             finally:
                 stop.set()
                 h.join(timeout=5)
-                st = pin_proxy.read_daemon_state(certdir)
-                if st and int(st.get("pid") or 0) != os.getpid():
-                    try:
-                        os.kill(int(st["pid"]), 15)
-                    except OSError:
-                        pass
+                # PARENTS FIRST, and the holder is a parent. Killing the
+                # daemon alone made this test MULTIPLY processes: the holder's
+                # whole job is to replace a daemon that dies, so each kill
+                # bought a fresh one. Measured: 7 orphaned pin processes
+                # accumulating on the dev box across a few suite runs, and a
+                # peer session stalled its machine with 53 of them.
+                from conftest import _reap_pin_processes
+
+                _reap_pin_processes(certdir)
             assert spawned == port, (
                 f"the successor came up on {spawned}, not {port} — this run "
                 f"measures a port change, not a handover"
             )
             return len(refused) - base, len(served)
 
-        control_refused, _ = _handover(hand_down=False)
-        assert control_refused > 0, (
-            "THE CONTROL DID NOT FAIL. Handing the port NUMBER over leaves a "
-            "hole the successor's start-up cannot avoid, so a run with zero "
-            "refusals here means the hammer is not measuring the window — and "
-            "the pass below would prove nothing"
-        )
+        # REAP BOTH ARMS, WHATEVER HAPPENS. This case starts REAL detached
+        # processes — a holder and its daemon per arm — and an assertion
+        # between the two calls used to skip the second arm's cleanup
+        # entirely. Measured: 3 orphans per suite run from this case alone,
+        # accumulating to 16 on the dev box.
+        from conftest import _reap_pin_processes
 
-        refused, served = _handover(hand_down=True)
-        assert refused == 0, (
-            f"{refused} of {refused + served} connections were refused across "
-            f"a real handover (the control refused {control_refused})"
-        )
+        try:
+            control_refused, _ = _handover(hand_down=False)
+            assert control_refused > 0, (
+                "THE CONTROL DID NOT FAIL. Handing the port NUMBER over leaves "
+                "a hole the successor's start-up cannot avoid, so a run with "
+                "zero refusals here means the hammer is not measuring the "
+                "window — and the pass below would prove nothing"
+            )
+
+            refused, served = _handover(hand_down=True)
+            assert refused == 0, (
+                f"{refused} of {refused + served} connections were refused "
+                f"across a real handover (control refused {control_refused})"
+            )
+        finally:
+            # PARENTS FIRST — a holder replaces a daemon that dies, so killing
+            # children first MULTIPLIES them (a peer session stalled its
+            # machine with 53 orphans this way). `children` holds the holders
+            # this case started; each takes its own daemon down with it.
+            for proc in children:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:  # noqa: BLE001 — already gone, or too slow
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+            for arm in arms:
+                _reap_pin_processes(arm)
 
     def case_daemon_reclaims_the_recorded_port(self, tmp_path):
         import socket
