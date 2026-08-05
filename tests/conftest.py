@@ -36,6 +36,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
+    _redirect_everything_to(tmp_path, monkeypatch)
+
+
+def _redirect_everything_to(tmp_path, monkeypatch):
     """Point every config-path lookup at this test's own tmp_path."""
     cfg = tmp_path / "conftest-claude.json"
     if not cfg.exists():
@@ -256,3 +260,79 @@ def _short_hop_budgets(monkeypatch):
 
     monkeypatch.setattr(_p, "_HOP_CONNECT_BUDGET_S", 0.3, raising=False)
     monkeypatch.setattr(_p, "_HOP_REPLY_BUDGET_S", 0.3, raising=False)
+
+
+# --- one pytest test per class, N cases inside -------------------------------
+# The suite's cases are cheap (54 ms each, measured) and its per-case pytest
+# overhead is not the cost — but 332 collected items is more surface than the
+# behaviour warrants, and each one re-pays the autouse fixtures. `run_cases`
+# runs every `case_*` method of a class inside ONE pytest test, giving each its
+# own tmp_path and its own monkeypatch so a case cannot leak into the next.
+#
+# WHAT THIS MUST NOT LOSE, and does not:
+#  - INDEPENDENCE. Each case gets a fresh MonkeyPatch (undone in a finally) and
+#    a fresh tmp_path subdir, so state a case installs dies with it. That is
+#    the property pytest's own per-test teardown was providing.
+#  - EVERY FAILURE, not the first. A raising case is recorded and the run
+#    continues; the driver fails at the end naming ALL of them. Stopping at the
+#    first would hide the rest behind one fix — strictly worse than what the
+#    separate tests reported.
+#  - THE FAILING CASE'S NAME AND TRACEBACK. Both are in the message, so a
+#    failure still points at one method in one file.
+def run_cases(instance, request, tmp_path_factory, extra=None):
+    """Run every `case_*` method of `instance`, isolated, reporting all failures.
+
+    A case takes the fixtures it names in its signature, resolved from `extra`
+    plus the per-case `tmp_path` / `monkeypatch` this builds. Anything else it
+    asks for is fetched from pytest itself via `request.getfixturevalue`.
+    """
+    import traceback
+
+    from _pytest.monkeypatch import MonkeyPatch
+
+    names = sorted(
+        n for n in dir(type(instance)) if n.startswith("case_") and callable(
+            getattr(instance, n)
+        )
+    )
+    module_factories = getattr(
+        sys.modules[type(instance).__module__], "case_fixtures", {}
+    )
+    failures = []
+    for i, name in enumerate(names):
+        method = getattr(instance, name)
+        wants = [
+            a
+            for a in method.__code__.co_varnames[: method.__code__.co_argcount]
+            if a != "self"
+        ]
+        mp = MonkeyPatch()
+        # A per-case dir, not the shared one: two cases writing `pin-proxy/`
+        # under one tmp_path would see each other's files.
+        case_tmp = tmp_path_factory.mktemp(f"c{i}")
+        try:
+            # The autouse guards ran once for the DRIVER's tmp_path. Re-point
+            # them at this case's dir, or a case's config writes land in the
+            # dir a sibling case is asserting about.
+            _redirect_everything_to(case_tmp, mp)
+            pool = {"tmp_path": case_tmp, "monkeypatch": mp}
+            # A FIXTURE A CASE CAN WRITE INTO IS BUILT PER CASE, not once for
+            # the driver. Measured: sharing one `certdir` across a class let a
+            # case's `upstream.json` be read by the next one, which then
+            # asserted about a chain it had never recorded. A test module names
+            # those in `case_fixtures`; everything else still comes from pytest,
+            # where a read-only or session-scoped value is correct to share.
+            for fname, factory in {**module_factories, **(extra or {})}.items():
+                pool[fname] = factory(case_tmp) if callable(factory) else factory
+            args = [
+                pool[a] if a in pool else request.getfixturevalue(a) for a in wants
+            ]
+            method(*args)
+        except Exception:  # noqa: BLE001 — collect, do not stop the run
+            failures.append(f"--- {name} ---\n{traceback.format_exc()}")
+        finally:
+            mp.undo()
+    if failures:
+        raise AssertionError(
+            f"{len(failures)} of {len(names)} cases failed:\n\n" + "\n".join(failures)
+        )

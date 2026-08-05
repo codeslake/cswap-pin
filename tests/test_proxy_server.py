@@ -10,8 +10,10 @@ from __future__ import annotations
 import contextlib
 import http.client
 import json
+import pathlib
 import socket
 import ssl
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -19,6 +21,8 @@ from pathlib import Path
 import pytest
 
 from cswap_pin.proxy import ensure_ca
+
+from conftest import run_cases
 
 
 @pytest.fixture(autouse=True)
@@ -139,25 +143,51 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
     return resp.status
 
 
-@pytest.fixture
-def certdir(tmp_path, _session_ca):
+_CA_CACHE: list = []
+
+
+def _make_certdir(tmp_path):
     """A cert dir with a CA already in it.
 
     COPIED from one session-wide CA rather than generated. `ensure_ca` mints
-    two RSA-2048 keys (~70 ms) and this fixture runs for most of the file, so
-    generating per test was the single largest cost in the suite. Nothing
+    two RSA-2048 keys (~70 ms) and this runs for most of the file, so
+    generating per case was the single largest cost in the suite. Nothing
     here asserts on a key's VALUE — the tests need a CA that signs its leaf,
     which a copy is.
     """
     import shutil
 
+    from cswap_pin.proxy import ensure_ca
+
+    if not _CA_CACHE:
+        src = pathlib.Path(tempfile.mkdtemp(prefix="cswap-test-ca-"))
+        ensure_ca(src, "api.anthropic.com")
+        _CA_CACHE.append(src)
     for f in ("ca.pem", "ca.key", "leaf.pem", "leaf.key"):
-        shutil.copy2(_session_ca / f, tmp_path / f)
+        shutil.copy2(_CA_CACHE[0] / f, tmp_path / f)
     return tmp_path
 
 
+# Built PER CASE by `run_cases`, because the cases WRITE into it (`upstream.json`,
+# `proxy.json`) and a shared one let a case read what the previous one recorded.
+case_fixtures = {"certdir": _make_certdir}
+
+
+def _mkdir(p):
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+@pytest.fixture
+def certdir(tmp_path):
+    return _make_certdir(tmp_path)
+
+
 class TestPinProxyServer:
-    def test_pinned_route_gets_swapped_bearer(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_pinned_route_gets_swapped_bearer(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         upstream = _FakeUpstream(certdir)
@@ -178,7 +208,7 @@ class TestPinProxyServer:
             proxy.stop()
             upstream.stop()
 
-    def test_inference_route_keeps_original_bearer(self, certdir):
+    def case_inference_route_keeps_original_bearer(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         upstream = _FakeUpstream(certdir)
@@ -200,7 +230,7 @@ class TestPinProxyServer:
             proxy.stop()
             upstream.stop()
 
-    def test_upstream_signed_by_foreign_ca_via_node_extra(self, certdir, tmp_path, monkeypatch):
+    def case_upstream_signed_by_foreign_ca_via_node_extra(self, certdir, tmp_path, monkeypatch):
         # Chained through CCF, the "upstream" presents CCF's cert, not the
         # real one. The proxy must trust whatever NODE_EXTRA_CA_CERTS names.
         from cswap_pin.proxy import PinProxy
@@ -269,7 +299,10 @@ class _StreamingUpstream:
 
 
 class TestStreamingRelay:
-    def test_first_event_arrives_before_upstream_finishes(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_first_event_arrives_before_upstream_finishes(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         upstream = _StreamingUpstream(certdir)
@@ -414,6 +447,9 @@ class TestResponseFramingIsParseable:
     agree with a hand-rolled writer and still be wrong.
     """
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def _connect(self, proxy_port, ca_path):
         ctx = ssl.create_default_context(cafile=str(ca_path))
         conn = http.client.HTTPSConnection(
@@ -467,7 +503,7 @@ class TestResponseFramingIsParseable:
         proxy.start()
         return proxy
 
-    def test_a_chunked_response_stays_framed_as_chunked(self, certdir):
+    def case_a_chunked_response_stays_framed_as_chunked(self, certdir):
         upstream = _FramingUpstream(
             certdir,
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
@@ -486,7 +522,7 @@ class TestResponseFramingIsParseable:
             proxy.stop()
             upstream.stop()
 
-    def test_204_completes_without_waiting_for_a_close(self, certdir):
+    def case_204_completes_without_waiting_for_a_close(self, certdir):
         upstream = _FramingUpstream(
             certdir, b"HTTP/1.1 204 No Content\r\nDate: now\r\n\r\n"
         )
@@ -501,7 +537,7 @@ class TestResponseFramingIsParseable:
             proxy.stop()
             upstream.stop()
 
-    def test_304_completes_without_waiting_for_a_close(self, certdir):
+    def case_304_completes_without_waiting_for_a_close(self, certdir):
         upstream = _FramingUpstream(
             certdir, b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n"
         )
@@ -514,7 +550,7 @@ class TestResponseFramingIsParseable:
             proxy.stop()
             upstream.stop()
 
-    def test_connection_close_is_relayed_not_swallowed(self, certdir):
+    def case_connection_close_is_relayed_not_swallowed(self, certdir):
         """`Connection` is hop-by-hop, so the filter drops it — but `close`
         was read into the keep-alive verdict and never re-declared. The proxy
         was about to close while the client still believed the connection
@@ -545,7 +581,7 @@ class TestResponseFramingIsParseable:
             proxy.stop()
             upstream.stop()
 
-    def test_a_keep_alive_response_is_not_marked_close(self, certdir):
+    def case_a_keep_alive_response_is_not_marked_close(self, certdir):
         """...and the re-declaration must not fire on a healthy response, or
         every connection becomes single-use."""
         upstream = _FramingUpstream(
@@ -606,7 +642,7 @@ class TestResponseFramingIsParseable:
             except OSError:
                 pass
 
-    def test_an_interim_1xx_is_not_delivered_as_the_final_response(self, certdir):
+    def case_an_interim_1xx_is_not_delivered_as_the_final_response(self, certdir):
         """A 1xx is INTERIM: the real response follows on the same connection.
 
         Treating it as complete delivered the 103 as the answer and left the
@@ -635,7 +671,7 @@ class TestResponseFramingIsParseable:
             proxy.stop()
             upstream.stop()
 
-    def test_205_reset_content_carries_no_body(self, certdir):
+    def case_205_reset_content_carries_no_body(self, certdir):
         """RFC 9110 §15.3.6 — same class as 204, and it was missing.
 
         Raw client: http.client's bodyless set is {204, 304}, so it would
@@ -655,7 +691,7 @@ class TestResponseFramingIsParseable:
             proxy.stop()
             upstream.stop()
 
-    def test_a_head_response_does_not_wait_for_its_absent_body(self, certdir):
+    def case_a_head_response_does_not_wait_for_its_absent_body(self, certdir):
         """HEAD mirrors GET's headers — Content-Length included — with no
         body. Only the request method says so."""
         upstream = _FramingUpstream(
@@ -682,7 +718,10 @@ class TestChunkedRequestBodiesReachUpstream:
     artifact upload silently lost its payload.
     """
 
-    def test_a_chunked_body_is_decoded_and_reframed(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_chunked_body_is_decoded_and_reframed(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         upstream = _FakeUpstream(certdir)
@@ -746,6 +785,9 @@ class TestTheChainsCredentialIsSent:
     proxy is the only route out, ALL pinned traffic fails.
     """
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def _recording_chain(self):
         """A CONNECT proxy that records the request head and then refuses.
 
@@ -779,7 +821,7 @@ class TestTheChainsCredentialIsSent:
         threading.Thread(target=loop, daemon=True).start()
         return srv, srv.getsockname()[1], seen
 
-    def test_connect_carries_proxy_authorization(self, certdir):
+    def case_connect_carries_proxy_authorization(self, certdir):
         import base64
 
         from cswap_pin.proxy import PinProxy, write_upstream_hint
@@ -856,7 +898,10 @@ class _LoopbackConnectProxy:
 
 
 class TestLoopbackChainTrust:
-    def test_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
         from cswap_pin.proxy import PinProxy
 
         # Fake upstream signed by a FOREIGN CA the pin proxy has no way to trust.
@@ -883,7 +928,7 @@ class TestLoopbackChainTrust:
             chain.stop()
             upstream.stop()
 
-    def test_a_dead_loopback_chain_does_not_disarm_verification(
+    def case_a_dead_loopback_chain_does_not_disarm_verification(
         self, certdir, tmp_path
     ):
         """Skipping verification is a property of the HOP, not of the hint.
@@ -951,7 +996,10 @@ class TestPortReclamationAcrossRespawn:
     than failing loudly. proxy.json is deleted before the respawn (a stale
     record must never read as live), so the port travels via a hint."""
 
-    def test_rebinds_the_port_carried_across_the_state_deletion(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_rebinds_the_port_carried_across_the_state_deletion(self, certdir):
         """The real daemon is a separate process, so its listening socket is
         gone by the time the successor binds. Model that by taking a free
         port, recording it the way _spawn_daemon does, and checking the
@@ -977,7 +1025,7 @@ class TestPortReclamationAcrossRespawn:
         finally:
             proxy.stop()
 
-    def test_recycling_a_stale_daemon_carries_its_port(self, tmp_path, monkeypatch):
+    def case_recycling_a_stale_daemon_carries_its_port(self, tmp_path, monkeypatch):
         """The stale-recycle path kills the old daemon first, and the daemon
         unlinks its own state on TERM — so the port must be saved BEFORE the
         kill or there is nothing left to reclaim from. Measured live: a
@@ -1007,7 +1055,7 @@ class TestPortReclamationAcrossRespawn:
         assert killed == [4242], "the stale daemon was not recycled"
         assert pin_proxy.read_port_hint(certdir) == 51000
 
-    def test_a_reused_pid_is_not_killed(self, tmp_path, monkeypatch):
+    def case_a_reused_pid_is_not_killed(self, tmp_path, monkeypatch):
         """Alive is not "still ours".
 
         An unclean exit leaves proxy.json behind, and the OS reuses pids
@@ -1043,7 +1091,7 @@ class TestPortReclamationAcrossRespawn:
             "SIGTERM/SIGKILL sent to a process that is not our daemon"
         )
 
-    def test_a_superseded_daemon_leaves_the_successors_state_alone(
+    def case_a_superseded_daemon_leaves_the_successors_state_alone(
         self, tmp_path
     ):
         """The other half of the same root: cleanup must check ownership too.
@@ -1072,7 +1120,7 @@ class TestPortReclamationAcrossRespawn:
             "the departing daemon deleted the serving successor's state"
         )
 
-    def test_a_daemon_still_owning_its_state_clears_it(self, tmp_path):
+    def case_a_daemon_still_owning_its_state_clears_it(self, tmp_path):
         """The normal teardown must still leave nothing behind — a stale
         record reads as live and the next launch reuses a dead port."""
         import os as _os
@@ -1085,7 +1133,7 @@ class TestPortReclamationAcrossRespawn:
         assert pin_proxy._release_daemon_state(certdir) is False
         assert pin_proxy.read_daemon_state(certdir) is None
 
-    def test_spawn_carries_the_port_forward(self, tmp_path, monkeypatch):
+    def case_spawn_carries_the_port_forward(self, tmp_path, monkeypatch):
         """_spawn_daemon must record the outgoing port BEFORE deleting the
         state file it lives in — the regression that let a recycle land on a
         fresh port while .claude.json still named the old one."""
@@ -1111,7 +1159,10 @@ class TestLongPollSurvives:
     killed that poll — heartbeats (answered at once) kept returning 200, so
     the session looked healthy while no inbound message ever arrived."""
 
-    def test_upstream_socket_has_no_read_deadline(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_upstream_socket_has_no_read_deadline(self, certdir):
         import socket as _socket
         import threading as _threading
         from cswap_pin.proxy import PinProxy
@@ -1160,7 +1211,10 @@ class TestChainRediscovery:
     inner cache proxy and it goes away, the correct target is the outer proxy
     it was itself chaining to."""
 
-    def test_follows_a_chain_that_appears_after_the_daemon_started(
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_follows_a_chain_that_appears_after_the_daemon_started(
         self, certdir, tmp_path
     ):
         from cswap_pin.proxy import PinProxy, write_upstream_hint
@@ -1196,7 +1250,7 @@ class TestChainRediscovery:
             chain.stop()
             upstream.stop()
 
-    def test_a_launch_that_sees_no_proxy_keeps_the_recorded_one(self, certdir):
+    def case_a_launch_that_sees_no_proxy_keeps_the_recorded_one(self, certdir):
         """`cswap pin` normally runs in an ordinary shell, while the launcher
         sets HTTPS_PROXY only in the env it execs Claude Code with. Treating
         "I can't see one" as "there is none" blanked a live upstream —
@@ -1216,7 +1270,7 @@ class TestChainRediscovery:
         write_upstream_hint(certdir, "http://127.0.0.1:9902")
         assert read_upstream_hint(certdir).address == ("127.0.0.1", 9902)
 
-    def test_the_kept_hint_keeps_its_CREDENTIAL_and_scheme(self, certdir):
+    def case_the_kept_hint_keeps_its_CREDENTIAL_and_scheme(self, certdir):
         """Keeping the address is not keeping the chain.
 
         The keep-previous branch rebuilt the URL from the parsed pair, which
@@ -1239,7 +1293,7 @@ class TestChainRediscovery:
             f"the re-stamp laundered the chain: {first} -> {kept}"
         )
 
-    def test_the_recorded_upstream_is_returned_raw(self, certdir):
+    def case_the_recorded_upstream_is_returned_raw(self, certdir):
         """_recorded_upstream feeds back INTO the hint, so reconstructing the
         URL there launders the credential on the other side of the same round
         trip."""
@@ -1249,7 +1303,7 @@ class TestChainRediscovery:
         write_upstream_hint(certdir, url)
         assert _recorded_upstream(certdir) == url
 
-    def test_falls_back_to_direct_when_the_recorded_chain_is_gone(
+    def case_falls_back_to_direct_when_the_recorded_chain_is_gone(
         self, certdir, tmp_path
     ):
         """The hint cannot expire on its own (see above), so a chain that dies
@@ -1280,7 +1334,7 @@ class TestChainRediscovery:
             proxy.stop()
             upstream.stop()
 
-    def test_health_reports_the_chain_the_relay_would_use(self, certdir):
+    def case_health_reports_the_chain_the_relay_would_use(self, certdir):
         """A probe that says "no chain" while every request goes through one
         sends the next diagnosis the wrong way. Measured after a cc-update
         recycle: /health said chain=null with CCF live and recorded on disk."""
@@ -1303,7 +1357,7 @@ class TestChainRediscovery:
         finally:
             proxy.stop()
 
-    def test_ignores_a_hint_pointing_at_our_own_port(self, tmp_path):
+    def case_ignores_a_hint_pointing_at_our_own_port(self, tmp_path):
         """A shell that eval'd pin-env exports the pin proxy as HTTPS_PROXY.
         Recording that would make the daemon CONNECT to itself."""
         from cswap_pin.proxy import _ambient_proxy
@@ -1381,7 +1435,7 @@ class TestChainRediscovery:
         assert proxy.port != 36301, proxy.port
         return proxy, upstream
 
-    def test_the_log_names_the_hop_that_carried_and_stays_quiet_after(
+    def case_the_log_names_the_hop_that_carried_and_stays_quiet_after(
         self, certdir
     ):
         """Falling through a dead hop is silent, so a request carried by the
@@ -1461,7 +1515,7 @@ class TestChainRediscovery:
         finally:
             good.close()
 
-    def test_a_host_with_no_proxy_chain_is_not_reported_as_degraded(
+    def case_a_host_with_no_proxy_chain_is_not_reported_as_degraded(
         self, certdir
     ):
         """"Nothing is configured" is not "nothing is reachable".
@@ -1533,7 +1587,7 @@ class TestChainRediscovery:
         finally:
             sink.close()
 
-    def test_the_log_separates_a_refused_hop_from_one_that_answered_wrong(
+    def case_the_log_separates_a_refused_hop_from_one_that_answered_wrong(
         self, certdir
     ):
         """Two faults, one fall-through — and they belong to different owners.
@@ -1624,7 +1678,7 @@ class TestChainRediscovery:
         finally:
             rude.close()
 
-    def test_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
+    def case_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
         self, certdir, tmp_path, monkeypatch
     ):
         """CCF is DOWN: nothing is listening on the recorded hop.
@@ -1660,7 +1714,7 @@ class TestChainRediscovery:
                 upstream.stop()
             outer.stop()
 
-    def test_D2_a_chain_that_refuses_the_CONNECT_uses_the_next_hop(
+    def case_D2_a_chain_that_refuses_the_CONNECT_uses_the_next_hop(
         self, certdir, tmp_path, monkeypatch
     ):
         """CCF is RESTARTING: its listener is up, its proxy logic is not.
@@ -1699,7 +1753,7 @@ class TestChainRediscovery:
             outer.stop()
             refusing.close()
 
-    def test_a_plain_user_with_only_HTTPS_PROXY_still_chains_through_it(
+    def case_a_plain_user_with_only_HTTPS_PROXY_still_chains_through_it(
         self, certdir, tmp_path, monkeypatch
     ):
         """NO cc-wrapper, NO launcher, NO upstream.json. Just a corp proxy.
@@ -1770,7 +1824,7 @@ class TestChainRediscovery:
             upstream.stop()
             corp.stop()
 
-    def test_D3_the_blind_tunnel_uses_the_next_hop_too(
+    def case_D3_the_blind_tunnel_uses_the_next_hop_too(
         self, certdir, tmp_path, monkeypatch
     ):
         """THE REMOTE CONTROL PATH, and it walked no chain at all.
@@ -1838,7 +1892,7 @@ class TestChainRediscovery:
                 proxy.stop()
             inner.stop()
 
-    def test_D4_the_plain_relay_uses_the_next_hop_too(
+    def case_D4_the_plain_relay_uses_the_next_hop_too(
         self, certdir, tmp_path, monkeypatch
     ):
         """The absolute-form path, the third one, with the same single hop.
@@ -1897,7 +1951,7 @@ class TestChainRediscovery:
                 proxy.stop()
             inner.stop()
 
-    def test_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
+    def case_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
         """Where the second hop comes from: the inner proxy reports its own
         upstream while it is alive, and a launch records both. Probed rather
         than inherited, because `cswap pin` runs in a plain shell that has
@@ -1949,7 +2003,7 @@ class TestChainRediscovery:
         finally:
             srv.close()
 
-    def test_a_cache_proxy_that_is_not_answering_records_no_next_hop(self, certdir):
+    def case_a_cache_proxy_that_is_not_answering_records_no_next_hop(self, certdir):
         """Never record a stale hop. A hop that cannot be confirmed right now
         is worse than none: the walk would spend a dial on it before reaching
         the branch that decides what to do with no chain at all."""
@@ -1971,7 +2025,10 @@ class TestAbsoluteFormPassthrough:
     must relay these through the chain, not drop them (dropping = the
     'Auto-update failed' banner). No MITM/swap — just forward."""
 
-    def test_absolute_form_get_is_relayed(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_absolute_form_get_is_relayed(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         # A plain HTTP origin the "updater" fetches (absolute-form target).
@@ -2022,7 +2079,10 @@ class TestHealthEndpoint:
     own port) so a statusline/cc-update probe can tell it apart from CCF and
     read the chain it forwards to (mirrors CCF's /health with https_proxy)."""
 
-    def test_health_reports_pin_and_chain(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_health_reports_pin_and_chain(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         proxy = PinProxy(
@@ -2135,7 +2195,10 @@ class TestKeepAlive:
     after the first is what made /remote-control fail with 'Transport closed:
     server rejected connection' while every individual route swapped fine."""
 
-    def test_multiple_requests_over_one_connection(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_multiple_requests_over_one_connection(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         up = _KeepAliveUpstream(certdir)
@@ -2244,7 +2307,10 @@ class TestWebSocketUpgrade:
     hop-by-hop made the server answer 403 — the whole reason /remote-control
     never connected through the pin proxy."""
 
-    def test_upgrade_headers_reach_upstream_and_tunnel_opens(self, certdir):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_upgrade_headers_reach_upstream_and_tunnel_opens(self, certdir):
         from cswap_pin.proxy import PinProxy
 
         up = _WebSocketUpstream(certdir)
@@ -2301,7 +2367,10 @@ class TestBlindTunnelIsTraced:
     the channel it *receives* on left no line. Diagnosing that cost a live
     debugging session; the tunnel must announce itself."""
 
-    def test_tunnel_to_a_foreign_host_writes_a_trace_line(self, certdir, tmp_path):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_tunnel_to_a_foreign_host_writes_a_trace_line(self, certdir, tmp_path):
         import cswap_pin.proxy as pp
 
         # A plain TCP peer standing in for the ingress host.
@@ -2371,6 +2440,9 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
     ever arrived. Measured on work-mac against a machine whose chain did let
     the host through, where the same session received normally."""
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def _refusing_chain(self):
         """A proxy that answers every CONNECT with 403."""
         srv = socket.socket()
@@ -2397,7 +2469,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
         threading.Thread(target=serve, daemon=True).start()
         return srv
 
-    def test_direct_dial_when_the_chain_refuses_the_ingress_host(
+    def case_direct_dial_when_the_chain_refuses_the_ingress_host(
         self, certdir, tmp_path
     ):
         import cswap_pin.proxy as pp
@@ -2476,6 +2548,9 @@ class TestOptimisticConnectIsDetected:
     made RC silently deaf: everything Claude Code SENDS kept going through the
     MITM path at 200 while the receive channel was a dead socket."""
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def _optimistic_chain(self):
         """Answers 200 to every CONNECT, then closes without connecting."""
         srv = socket.socket()
@@ -2504,7 +2579,7 @@ class TestOptimisticConnectIsDetected:
         threading.Thread(target=serve, daemon=True).start()
         return srv
 
-    def test_falls_back_when_the_200_tunnel_is_already_eof(self, certdir, tmp_path):
+    def case_falls_back_when_the_200_tunnel_is_already_eof(self, certdir, tmp_path):
         import cswap_pin.proxy as pp
 
         chain = self._optimistic_chain()
@@ -2579,6 +2654,9 @@ class TestTheTrustFileActuallyVerifies:
     TLS OK, issuer "cswap pin-proxy CA"; with no extra CA,
     UNABLE_TO_VERIFY_LEAF_SIGNATURE. This is that, in-process."""
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def _handshake(self, proxy_port: int, cafile) -> str:
         """CONNECT through the proxy and complete TLS, trusting only cafile."""
         raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
@@ -2605,7 +2683,7 @@ class TestTheTrustFileActuallyVerifies:
             raw.close()
             return f"FAIL:{e.reason}"
 
-    def test_the_named_trust_file_verifies_the_proxy(self, certdir, tmp_path, monkeypatch):
+    def case_the_named_trust_file_verifies_the_proxy(self, certdir, tmp_path, monkeypatch):
         import cswap_pin.proxy as pp
 
         home = tmp_path / "cfg"
@@ -2646,6 +2724,9 @@ class TestTheKillGateIdentifiesItsTarget:
     shell whose command line quotes them, a wrapper, a grep.
     """
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def _pids(self, monkeypatch, lines, certdir):
         import subprocess as _sp
 
@@ -2657,7 +2738,7 @@ class TestTheKillGateIdentifiesItsTarget:
         monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
         return pp._pin_daemon_pids(certdir)
 
-    def test_the_certdir_must_be_the_last_argv_token(self, tmp_path, monkeypatch):
+    def case_the_certdir_must_be_the_last_argv_token(self, tmp_path, monkeypatch):
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir()
         t = str(certdir.resolve())
@@ -2675,7 +2756,7 @@ class TestTheKillGateIdentifiesItsTarget:
             f"daemon: {pids}"
         )
 
-    def test_a_different_certdir_is_never_matched(self, tmp_path, monkeypatch):
+    def case_a_different_certdir_is_never_matched(self, tmp_path, monkeypatch):
         mine = tmp_path / "pin-proxy"; mine.mkdir()
         other = tmp_path / "other-proxy"; other.mkdir()
         pids = self._pids(
@@ -2694,6 +2775,9 @@ class TestFailOpenIsNotSilent:
     server fixes at /bridge and never transfers. Measured: a daemon that could
     not reach its credential store served 13 of 13 pinned routes unswapped, and
     19 sessions had to be rebuilt by hand. Fail open, but say so."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
 
     def _proxy(self, certdir, provider):
         from cswap_pin.proxy import PinProxy
@@ -2735,7 +2819,7 @@ class TestFailOpenIsNotSilent:
             pass  # relay to the dead upstream fails; the swap already happened
         return None
 
-    def test_a_deferred_refresh_does_not_condemn_the_daemon(self, tmp_path):
+    def case_a_deferred_refresh_does_not_condemn_the_daemon(self, tmp_path):
         """"Busy right now" is not "cannot pin".
 
         The gate answers ``consume-busy`` when another process holds the
@@ -2774,7 +2858,7 @@ class TestFailOpenIsNotSilent:
             "unpinnable and is never reused again"
         )
 
-    def test_a_real_unreadable_credential_IS_still_a_failure(self, tmp_path):
+    def case_a_real_unreadable_credential_IS_still_a_failure(self, tmp_path):
         """...and the deferral must not swallow the case the warning exists
         for. An unreadable store still has to condemn."""
         from cswap_pin import proxy as pp
@@ -2793,7 +2877,7 @@ class TestFailOpenIsNotSilent:
             "an unreadable credential must still warn"
         )
 
-    def test_warns_when_the_token_cannot_be_minted(self, certdir, monkeypatch):
+    def case_warns_when_the_token_cannot_be_minted(self, certdir, monkeypatch):
         import io
         import sys as _sys
 
@@ -2804,7 +2888,7 @@ class TestFailOpenIsNotSilent:
         assert "UNPINNED" in err
         assert "cswap pin" in err, "the message must name the fix"
 
-    def test_the_spawned_daemon_has_somewhere_to_warn(self, certdir, monkeypatch):
+    def case_the_spawned_daemon_has_somewhere_to_warn(self, certdir, monkeypatch):
         """The warning above is written to the daemon's stderr, and the daemon
         is spawned detached — so whether it reaches anyone is decided by
         spawn_daemon, not by the writer. Measured on all three machines: the
@@ -2839,7 +2923,7 @@ class TestFailOpenIsNotSilent:
             f"expected the daemon's stderr on {log}, got {seen['stderr']!r}"
         )
 
-    def test_the_warning_lands_in_that_log(self, certdir):
+    def case_the_warning_lands_in_that_log(self, certdir):
         """End to end through the real file object spawn_daemon opens: write
         the warning to it and read it back off disk. The two tests above pass a
         StringIO and so cannot see a destination that does not exist."""
@@ -2857,7 +2941,7 @@ class TestFailOpenIsNotSilent:
         assert "UNPINNED" in body
         assert "cswap pin" in body
 
-    def test_warns_only_once_per_daemon(self, certdir, monkeypatch):
+    def case_warns_only_once_per_daemon(self, certdir, monkeypatch):
         """A pinned session makes these calls continuously; a line each would
         bury the signal it exists to be."""
         import io
@@ -2870,7 +2954,7 @@ class TestFailOpenIsNotSilent:
             p._warn_unpinnable()
         assert buf.getvalue().count("UNPINNED") == 1
 
-    def test_health_reports_whether_the_pin_can_apply(self, certdir):
+    def case_health_reports_whether_the_pin_can_apply(self, certdir):
         """A daemon being up is not the same as the pin working. The sweep
         needs the second fact, and only the daemon can answer it."""
         import json as _json, socket as _s
@@ -2897,7 +2981,7 @@ class TestFailOpenIsNotSilent:
             finally:
                 p.stop()
 
-    def test_a_noop_pin_does_not_warn(self, certdir, monkeypatch):
+    def case_a_noop_pin_does_not_warn(self, certdir, monkeypatch):
         """Nothing-to-swap must not fire the keychain warning.
 
         When the pinned account IS the active one the provider correctly
@@ -2925,7 +3009,7 @@ class TestFailOpenIsNotSilent:
         assert self._drive_pinned_request(p) is None
         assert "UNPINNED" not in buf.getvalue(), "warned when nothing was wrong"
 
-    def test_an_unreadable_store_still_warns(self, certdir, monkeypatch):
+    def case_an_unreadable_store_still_warns(self, certdir, monkeypatch):
         """The quieting must not swallow the case the warning exists for."""
         import io
         import sys as _sys
@@ -2937,7 +3021,7 @@ class TestFailOpenIsNotSilent:
         assert self._drive_pinned_request(p) is None
         assert "UNPINNED" in buf.getvalue(), "went silent on a real fail-open"
 
-    def test_a_noop_pin_reports_can_pin_on_health(self, certdir):
+    def case_a_noop_pin_reports_can_pin_on_health(self, certdir):
         """/health must not call a pin broken on the machine where it is a no-op.
 
         can_pin is what a fleet sweep reads. Reporting false where there is
@@ -2975,7 +3059,7 @@ class TestFailOpenIsNotSilent:
         finally:
             p.stop()
 
-    def test_a_raising_provider_reports_cannot_pin(self, certdir):
+    def case_a_raising_provider_reports_cannot_pin(self, certdir):
         """Health must never take the daemon down, whatever the store does."""
         import json as _json, socket as _s
 
@@ -3014,6 +3098,9 @@ class TestProxyRequiresACredential:
     cannot be read; the proxy was handing out its effect to anyone who asked.
     """
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def _proxy(self, certdir, provider=lambda: "PINNED-TOKEN"):
         from cswap_pin.proxy import PinProxy
         return PinProxy(certdir=certdir, pin_token_provider=provider,
@@ -3037,7 +3124,7 @@ class TestProxyRequiresACredential:
         c.close()
         return data.decode("latin1", "replace").split("\r\n")[0]
 
-    def test_an_unauthenticated_connect_is_served_but_never_pinned(self, certdir):
+    def case_an_unauthenticated_connect_is_served_but_never_pinned(self, certdir):
         """The property is "no credential, no bearer" — NOT "no credential, no
         service".
 
@@ -3067,7 +3154,7 @@ class TestProxyRequiresACredential:
             [("Proxy-Authorization", "Basic " + __import__("base64")
               .b64encode(f"cswap:{secret}".encode()).decode())], secret) is True
 
-    def test_a_wrong_credential_is_served_but_never_pinned(self, certdir):
+    def case_a_wrong_credential_is_served_but_never_pinned(self, certdir):
         from cswap_pin.proxy import ensure_proxy_secret, _proxy_authorized
         secret = ensure_proxy_secret(certdir)
         p = self._proxy(certdir)
@@ -3081,7 +3168,7 @@ class TestProxyRequiresACredential:
         assert _proxy_authorized(
             [("Proxy-Authorization", f"Basic {wrong}")], secret) is False
 
-    def test_the_real_credential_is_accepted(self, certdir):
+    def case_the_real_credential_is_accepted(self, certdir):
         """The credential must not lock out the sessions it is meant to serve.
 
         Getting past the gate means the CONNECT proceeds to the MITM, whose
@@ -3097,7 +3184,7 @@ class TestProxyRequiresACredential:
         finally:
             p.stop()
 
-    def test_a_blind_tunnel_is_not_gated(self, certdir):
+    def case_a_blind_tunnel_is_not_gated(self, certdir):
         """It used to be, on "otherwise we are an open forward proxy". That
         assumes the port is reachable; it binds 127.0.0.1 only, so the
         population it could refuse is the same-user processes that can read
@@ -3122,7 +3209,7 @@ class TestProxyRequiresACredential:
         finally:
             p.stop()
 
-    def test_absolute_form_also_needs_the_credential(self, certdir):
+    def case_absolute_form_also_needs_the_credential(self, certdir):
         """The plain-proxy path must not be a way around the CONNECT gate."""
         import socket as _s
         from cswap_pin.proxy import ensure_proxy_secret
@@ -3142,7 +3229,7 @@ class TestProxyRequiresACredential:
         finally:
             p.stop()
 
-    def test_health_stays_open(self, certdir):
+    def case_health_stays_open(self, certdir):
         """The statusline and cc-update probe /health with no credential.
 
         Gating it would make a working pin read as a dead one on every
@@ -3173,7 +3260,7 @@ class TestProxyRequiresACredential:
         finally:
             p.stop()
 
-    def test_a_daemon_without_a_secret_still_serves(self, certdir):
+    def case_a_daemon_without_a_secret_still_serves(self, certdir):
         """A pin that starts refusing traffic after an upgrade is worse than
         the exposure it closes. No secret on disk => no auth required."""
         p = self._proxy(certdir)  # nothing minted
@@ -3183,7 +3270,7 @@ class TestProxyRequiresACredential:
         finally:
             p.stop()
 
-    def test_the_secret_is_not_world_readable(self, certdir):
+    def case_the_secret_is_not_world_readable(self, certdir):
         import stat
         from cswap_pin.proxy import ensure_proxy_secret, proxy_secret_path
         ensure_proxy_secret(certdir)
@@ -3192,13 +3279,13 @@ class TestProxyRequiresACredential:
             "the credential is readable by other users — it protects nothing"
         )
 
-    def test_the_secret_is_stable_across_respawns(self, certdir):
+    def case_the_secret_is_stable_across_respawns(self, certdir):
         """A new secret each spawn would strand every live session: their
         HTTPS_PROXY is fixed at exec time and would carry the old one."""
         from cswap_pin.proxy import ensure_proxy_secret
         assert ensure_proxy_secret(certdir) == ensure_proxy_secret(certdir)
 
-    def test_the_wiring_hands_clients_the_credential(self, certdir):
+    def case_the_wiring_hands_clients_the_credential(self, certdir):
         """Measured: the real Claude Code client sends Proxy-Authorization on
         CONNECT only when HTTPS_PROXY carries user:pass. If the wiring does
         not embed it, enforcing auth cuts off every session."""
@@ -3208,7 +3295,7 @@ class TestProxyRequiresACredential:
         assert secret in env["HTTPS_PROXY"]
         assert "@127.0.0.1:9955" in env["HTTPS_PROXY"]
 
-    def test_the_credential_is_not_forwarded_upstream(self, certdir):
+    def case_the_credential_is_not_forwarded_upstream(self, certdir):
         """It authenticates to THIS proxy and stops here (hop-by-hop).
 
         The absolute-form path relays client headers verbatim to the chain, so
@@ -3269,7 +3356,7 @@ class TestProxyRequiresACredential:
         )
         assert base64.b64encode(f"cswap:{secret}".encode()).decode() not in seen[0]
 
-    def test_a_secret_written_under_a_running_daemon_takes_effect(self, certdir):
+    def case_a_secret_written_under_a_running_daemon_takes_effect(self, certdir):
         """The gate must arm when the secret is WRITTEN, not on a later respawn.
 
         Measured by the cswap owner on linux, which is why this test exists:
@@ -3302,7 +3389,7 @@ class TestProxyRequiresACredential:
         finally:
             p.stop()
 
-    def test_a_respawn_does_not_arm_the_gate(self, certdir, monkeypatch):
+    def case_a_respawn_does_not_arm_the_gate(self, certdir, monkeypatch):
         """The upgrade must not cut off sessions wired before it.
 
         A live session's HTTPS_PROXY is fixed at exec time, so one started
@@ -3329,7 +3416,7 @@ class TestProxyRequiresACredential:
             "a respawn minted the credential — every live session would 407"
         )
 
-    def test_apply_pin_mints_the_credential(self, certdir, monkeypatch):
+    def case_apply_pin_mints_the_credential(self, certdir, monkeypatch):
         """...and the path that rewrites the wiring DOES arm it."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import apply_pin, proxy_secret_path
@@ -3365,7 +3452,10 @@ class TestTogglingThePinMidSessionActuallyWorks:
     — for a session that never carried a credential, across the toggle.
     """
 
-    def test_rc_swaps_and_inference_does_not_for_an_uncredentialed_session(
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_rc_swaps_and_inference_does_not_for_an_uncredentialed_session(
         self, certdir
     ):
         from cswap_pin.proxy import PinProxy, ensure_proxy_secret
@@ -3402,7 +3492,7 @@ class TestTogglingThePinMidSessionActuallyWorks:
             proxy.stop()
             upstream.stop()
 
-    def test_clearing_returns_rc_to_the_active_account(self, certdir):
+    def case_clearing_returns_rc_to_the_active_account(self, certdir):
         from cswap_pin.proxy import PinProxy, ensure_proxy_secret, proxy_secret_path
 
         upstream = _FakeUpstream(certdir)
@@ -3434,7 +3524,7 @@ class TestTogglingThePinMidSessionActuallyWorks:
             proxy.stop()
             upstream.stop()
 
-    def test_no_407_in_either_direction(self, certdir):
+    def case_no_407_in_either_direction(self, certdir):
         """The 407 itself, asserted directly: a raw CONNECT with no credential
         must succeed before AND after arming."""
         import base64
@@ -3489,17 +3579,16 @@ class TestAMisroutedSwapCannotKillASession:
     this route" into "this request went out unpinned", which is the failure
     the module is already built to tolerate.
     """
+    def test_all(self, request, tmp_path_factory):
+        run_cases(
+            self,
+            request,
+            tmp_path_factory,
+            # this class wants the CA one level down, in `pin-proxy/`
+            extra={"certdir": lambda t: _make_certdir(_mkdir(t / "pin-proxy"))},
+        )
 
-    @pytest.fixture
-    def certdir(self, tmp_path):
-        from cswap_pin.proxy import ensure_ca
-
-        d = tmp_path / "pin-proxy"
-        d.mkdir(parents=True)
-        ensure_ca(d, "api.anthropic.com")
-        return d
-
-    def test_a_403_on_a_swapped_route_is_retried_unswapped(self, certdir):
+    def case_a_403_on_a_swapped_route_is_retried_unswapped(self, certdir):
         """The upstream refuses the pinned bearer; the client must still get a
         real answer, carrying its OWN bearer."""
         from cswap_pin.proxy import PinProxy

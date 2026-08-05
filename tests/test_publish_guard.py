@@ -46,6 +46,8 @@ def test_a_child_cannot_publish_into_the_real_config_home(tmp_path, capsys):
 import os
 import pathlib
 
+from conftest import run_cases
+
 
 class TestTheGuardCoversTheACCOUNTSTORE:
     """The autouse guard redirected the CONFIG but not the ACCOUNT STORE.
@@ -69,7 +71,10 @@ class TestTheGuardCoversTheACCOUNTSTORE:
     path itself.
     """
 
-    def test_the_backup_root_is_not_the_real_one(self, tmp_path):
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_the_backup_root_is_not_the_real_one(self, tmp_path):
         """The store a test would write to must be under tmp, never $HOME."""
         from claude_swap.paths import get_backup_root
 
@@ -81,7 +86,7 @@ class TestTheGuardCoversTheACCOUNTSTORE:
             "credentials and roster"
         )
 
-    def test_the_env_the_children_inherit_does_not_name_the_real_store(self):
+    def case_the_env_the_children_inherit_does_not_name_the_real_store(self):
         """A monkeypatched attribute does not cross a process boundary; the
         daemons and probes this suite spawns obey XDG_DATA_HOME."""
         xdg = os.environ.get("XDG_DATA_HOME")
@@ -90,7 +95,7 @@ class TestTheGuardCoversTheACCOUNTSTORE:
             f"XDG_DATA_HOME points inside the real home ({xdg})"
         )
 
-    def test_path_home_is_redirected(self):
+    def case_path_home_is_redirected(self):
         """`get_backup_root`'s fallback computes the path from Path.home()."""
         assert pathlib.Path.home() != pathlib.Path(os.path.expanduser("~")), (
             "Path.home() returns the REAL home, so any code computing the "
