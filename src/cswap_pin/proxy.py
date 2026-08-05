@@ -2279,6 +2279,39 @@ _HOP_CONNECT_BUDGET_S = 2.0
 # sized for that, not for the dial. Sharing one number cuts healthy hops.
 _HOP_REPLY_BUDGET_S = 6.0
 
+# A CEILING ON CONCURRENT CLIENTS, because the budgets above are per-dial and
+# a wedged hop makes every one of them run to the end.
+#
+# MEASURED OUTAGE, lmd42, 2026-08-05: the cache hop died, and the pin served
+# 27,491 threads and 44,121 file descriptors inside 40 minutes. Load average
+# on a 48-core box reached 16,483 and the machine had to be rescued by hand.
+#
+# The threads were NOT leaked — measured here, 200 held connections produce
+# 202 threads and fall back to 2 the moment the clients close. What was
+# missing is a limit: one thread per connection, no cap, while every thread
+# sat out 2s+6s against a hop that accepts and never answers. A client that
+# retries forever (Claude Code does: "attempt N/300") then opens connections
+# faster than they can drain, and the box goes down before the pin ever
+# reaches its own DIRECT fallback.
+#
+# 256 is ~10x the busiest real daemon measured (26 threads for 16 live
+# sessions on lmd42, 12 on a Mac), so a healthy host never meets it, and it
+# bounds the damage at something a machine survives. Refusing the excess is
+# the point: a refused connection is a client that retries in a second, while
+# an accepted one it cannot serve is a thread held for the full budget.
+_MAX_CLIENT_THREADS = 256
+
+# HOW LONG TO WAIT OUT A HOP THAT IS RESTARTING, before falling through to a
+# direct dial. Sized from the cache proxy's measured self-heal: ~1s to come
+# back under a new pid, refusing (not hanging) throughout. A little over twice
+# that leaves room for a slower box without turning a genuinely absent hop
+# into a stall — a host with no chain at all never enters this loop, because
+# an empty candidate list falls straight through.
+_CHAIN_HEAL_GRACE_S = 2.5
+# Refused dials are ~free, so poll often enough that the second the hop comes
+# back is the second we use it.
+_CHAIN_HEAL_POLL_S = 0.2
+
 
 def _dial_chain(
     chain: "_Chain",
@@ -5016,6 +5049,8 @@ class PinProxy:
         # a burst; without this each would start its own listing.
         self._bridge_sweeping = False
         self._sweep_lock = threading.Lock()
+        # Whether we are currently refusing clients — see `_note_overloaded`.
+        self._overloaded = False
         # The connections themselves, not just a count. `stop()` has to CLOSE
         # them before the process exits — see the note there on why a drained
         # request still ends in RST without this.
@@ -5345,6 +5380,19 @@ class PinProxy:
             # accepts, which would then cut a quiet-but-healthy stream. The
             # wait above is about noticing shutdown, not about the client.
             conn.settimeout(None)
+            # REFUSE RATHER THAN ACCUMULATE. See `_MAX_CLIENT_THREADS`: past
+            # the ceiling, taking one more connection costs a thread held for
+            # the whole hop budget, and the client that opened it is retrying
+            # anyway. Closing it immediately is the cheaper answer for both
+            # sides — and it is what keeps a dead upstream from taking the
+            # machine with it.
+            if self.live_client_count() >= _MAX_CLIENT_THREADS:
+                self._note_overloaded()
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
@@ -5402,12 +5450,37 @@ class PinProxy:
             with self._live_lock:
                 self._live_clients -= 1
                 self._open_conns.discard(conn)
+                # Back under the ceiling: re-arm the notice, so the NEXT
+                # episode is reported too rather than being swallowed by the
+                # first one's flag.
+                if self._overloaded and self._live_clients < _MAX_CLIENT_THREADS:
+                    self._overloaded = False
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
         count the daemon keeps itself, not an inference about the OS."""
         with self._live_lock:
             return self._live_clients
+
+    def _note_overloaded(self) -> None:
+        """Say once per episode that connections are being refused.
+
+        SILENCE HERE WOULD REPEAT THE OUTAGE'S OWN LESSON. Nobody noticed the
+        lmd42 failure until sessions showed "attempt N/300"; the components
+        themselves said nothing. A cap that engages quietly is the same shape
+        — the box survives, and the reason it is refusing is nowhere.
+
+        Once per episode, not per refusal: at the ceiling this runs on every
+        accept, and a line per refused connection is its own flood.
+        """
+        if self._overloaded:
+            return
+        self._overloaded = True
+        _log_lifecycle(
+            f"refusing new clients — {_MAX_CLIENT_THREADS} already connected. "
+            f"An upstream that accepts and never answers holds every one of "
+            f"them for the hop budget; check the chain."
+        )
 
     # -- superseded remote-control bridges ---------------------------------
     #
@@ -6204,6 +6277,48 @@ class PinProxy:
         while heartbeats (which answer at once) kept succeeding — so the
         session looked healthy and was silently deaf.
         """
+        # A HOP THAT IS RESTARTING IS NOT A HOP THAT IS GONE. Measured by the
+        # cache proxy's own maintainer on the deployed build, hammering the
+        # port continuously across a `kill -9` of its holder:
+        #
+        #     refused=32   accepted-then-silent=0   served=159
+        #
+        # It comes back in ~1s under a new pid, and it REFUSES for that whole
+        # second rather than accepting and going quiet — the successor binds
+        # only when it is ready to relay. A refused dial costs this walk
+        # nothing, so waiting out that second is nearly free.
+        #
+        # WHY WAIT AT ALL, when there is already a DIRECT fallback: on the
+        # machine this outage happened to, DIRECT is the corporate
+        # TLS-inspecting proxy. Falling through to it saves one second and
+        # sends the request through an inspector for as long as the hop is
+        # away. Holding briefly keeps the chain the user configured.
+        #
+        # BOUNDED, and small. The window measured is ~1s; this allows a little
+        # over twice that and then falls through exactly as before. It is not
+        # a retry ladder — the hop's own restart is already bounded (its
+        # maintainer killed the holder three times in a row: process count
+        # unchanged, one replacement per death, no accumulation), so a ladder
+        # here would only add a busy loop neither side intended.
+        deadline = time.monotonic() + _CHAIN_HEAL_GRACE_S
+        while True:
+            sock = self._walk_chain_once()
+            if sock is not None:
+                return sock
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_CHAIN_HEAL_POLL_S)
+        # Every hop is still unusable after the grace period: fall through to
+        # the unchained dial, which is what this method has always ended in.
+        candidates = self._chain_candidates()
+        sock = _dial_with_no_chain(self._upstream)
+        sock.settimeout(None)
+        self._note_egress(direct=True, configured=bool(candidates))
+        return sock, False
+
+    def _walk_chain_once(self) -> "tuple[socket.socket, bool] | None":
+        """One pass over the chain. The socket and its loopback flag, or None
+        when no hop was usable this time round."""
         candidates = self._chain_candidates()
         for chain in candidates:
             # A HOP THAT REFUSES AND A HOP THAT WILL NOT DIAL ARE ONE EVENT.
@@ -6252,13 +6367,12 @@ class PinProxy:
             raw.settimeout(None)
             self._note_egress(direct=False, hop=chain.address)
             return raw, chain.host in _LOOPBACK
-        sock = _dial_with_no_chain(self._upstream)
-        sock.settimeout(None)
-        # `candidates` is the whole difference between a host that HAS no
-        # chain and one whose chain would not answer. Empty means nothing was
-        # ever configured here, which is a normal machine, not a degraded one.
-        self._note_egress(direct=True, configured=bool(candidates))
-        return sock, False  # direct dial: verification stays on
+        # NO HOP ANSWERED THIS PASS. The caller decides whether that is final:
+        # a hop mid-restart refuses for ~1s and then serves again, so the
+        # direct dial belongs after a grace period, not here. `candidates`
+        # being empty (no chain configured at all) is still the caller's
+        # distinction to make — see `_note_egress(configured=...)`.
+        return None
 
     def _note_hop_unusable(self, hop: "tuple[str, int]", why: str) -> None:
         """Log WHY a hop was skipped, once per (hop, reason) transition.

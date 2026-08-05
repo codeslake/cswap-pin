@@ -273,6 +273,13 @@ def _short_hop_budgets(monkeypatch):
 
     monkeypatch.setattr(_p, "_HOP_CONNECT_BUDGET_S", 0.3, raising=False)
     monkeypatch.setattr(_p, "_HOP_REPLY_BUDGET_S", 0.3, raising=False)
+    # AND THE HEAL GRACE. The production value waits out a hop that is
+    # restarting (~1s, measured); a test whose hop is deliberately dead pays it
+    # in full for nothing. Measured: the suite went 5s -> 96s the moment the
+    # grace landed. Shrunk rather than zeroed, so the retry LOOP still runs —
+    # a zero would skip the behaviour instead of shortening it.
+    monkeypatch.setattr(_p, "_CHAIN_HEAL_GRACE_S", 0.3, raising=False)
+    monkeypatch.setattr(_p, "_CHAIN_HEAL_POLL_S", 0.05, raising=False)
 
 
 # --- one pytest test per class, N cases inside -------------------------------
