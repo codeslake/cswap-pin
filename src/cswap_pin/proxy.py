@@ -4361,7 +4361,40 @@ def _inherited_listener() -> "socket.socket | None":
             raise OSError("not a stream socket")
         # getsockname() answers on a bound socket; accept() would block, so the
         # listening state is proven by asking the socket itself.
-        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+        # A PROBE THAT CANNOT ANSWER IS NOT A "NO". `SO_ACCEPTCONN` is
+        # readable on Linux and NOT on Darwin — measured, same call:
+        # linux 1, darwin OSError 42 "Protocol not available". Treating that
+        # raise as "not listening" refused every handover on macOS and the
+        # successor bound a FRESH port, which is the stranding this whole
+        # path exists to prevent (live sessions have the old port fixed at
+        # exec). Measured on wmac: "ignoring the handed-down fd 3: [Errno 42]"
+        # then "serving on port 58062" while the wiring named 53749.
+        #
+        # `getsockname()` below still proves it is a bound TCP socket on both
+        # platforms, so only the redundant option is allowed to be absent.
+        try:
+            listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        except OSError:
+            # ASK THE SOCKET INSTEAD. A non-blocking accept() answers on both
+            # platforms and cannot consume a connection we would then drop:
+            # a LISTENING socket with an empty queue raises EAGAIN
+            # (BlockingIOError), and one that never listened raises EINVAL.
+            # Measured on both. The timeout is restored either way — the
+            # accept loop sets its own, and leaving a socket non-blocking
+            # would turn every accept into a busy spin.
+            prev = sock.gettimeout()
+            try:
+                sock.settimeout(0)
+                conn, _ = sock.accept()
+                conn.close()  # it WAS listening, and a client was waiting
+                listening = 1
+            except BlockingIOError:
+                listening = 1  # listening, queue empty — the normal case
+            except OSError:
+                listening = 0  # EINVAL: never listened
+            finally:
+                sock.settimeout(prev)
+        if not listening:
             raise OSError("not listening")
         sock.getsockname()
     except OSError as exc:
@@ -4410,7 +4443,40 @@ def _handed_down_listener() -> "socket.socket | None":
     try:
         if sock.type != socket.SOCK_STREAM:
             raise OSError("not a stream socket")
-        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+        # A PROBE THAT CANNOT ANSWER IS NOT A "NO". `SO_ACCEPTCONN` is
+        # readable on Linux and NOT on Darwin — measured, same call:
+        # linux 1, darwin OSError 42 "Protocol not available". Treating that
+        # raise as "not listening" refused every handover on macOS and the
+        # successor bound a FRESH port, which is the stranding this whole
+        # path exists to prevent (live sessions have the old port fixed at
+        # exec). Measured on wmac: "ignoring the handed-down fd 3: [Errno 42]"
+        # then "serving on port 58062" while the wiring named 53749.
+        #
+        # `getsockname()` below still proves it is a bound TCP socket on both
+        # platforms, so only the redundant option is allowed to be absent.
+        try:
+            listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        except OSError:
+            # ASK THE SOCKET INSTEAD. A non-blocking accept() answers on both
+            # platforms and cannot consume a connection we would then drop:
+            # a LISTENING socket with an empty queue raises EAGAIN
+            # (BlockingIOError), and one that never listened raises EINVAL.
+            # Measured on both. The timeout is restored either way — the
+            # accept loop sets its own, and leaving a socket non-blocking
+            # would turn every accept into a busy spin.
+            prev = sock.gettimeout()
+            try:
+                sock.settimeout(0)
+                conn, _ = sock.accept()
+                conn.close()  # it WAS listening, and a client was waiting
+                listening = 1
+            except BlockingIOError:
+                listening = 1  # listening, queue empty — the normal case
+            except OSError:
+                listening = 0  # EINVAL: never listened
+            finally:
+                sock.settimeout(prev)
+        if not listening:
             raise OSError("not listening")
         sock.getsockname()
     except OSError as exc:

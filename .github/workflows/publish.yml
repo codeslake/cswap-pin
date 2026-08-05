@@ -22,6 +22,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      # NOTHING RAN THE TESTS BEFORE AN UPLOAD. This job was checkout, build,
+      # import-smoke, upload — and the smoke proves the package IMPORTS
+      # without claude-swap, which says nothing about whether it still works.
+      # Three releases went out on the strength of a developer's local run,
+      # with no machine anywhere checking. A version cannot be un-uploaded, so
+      # the one gate that matters has to be the one before the upload.
+      #
+      # In the BUILD job deliberately: `publish` needs `build`, so a failure
+      # here means the publish job never starts and the tag produces no
+      # release at all.
+      - name: The suite must pass before anything is uploaded
+        run: |
+          # HOME and XDG_DATA_HOME redirected: the suite drives real cert
+          # dirs and daemon state, and a runner's real HOME is the one place
+          # a test must never write.
+          #
+          # `--with claude-swap` because the suite imports the HOST. cswap-pin
+          # is a peer, not a dependency (see pyproject), so nothing installs
+          # it for us — and without it collection dies with HostMissing, which
+          # is precisely why no CI had ever run these tests.
+          #
+          # THE RELEASED HOST, deliberately. Testing against a developer's
+          # checkout would gate on a seam users cannot install yet; testing
+          # against the release gates on what a `pip install cswap-pin` world
+          # actually looks like. The cost is that tests of an UNRELEASED seam
+          # fail here — those are marked `needs_host_seam` and deselected, not
+          # silently skipped, so the exclusion is visible in the log.
+          S="$(mktemp -d)"
+          HOME="$S" XDG_DATA_HOME="$S/.local/share" \
+            uv run --with pytest --with cryptography --with claude-swap \
+            python -m pytest tests/ -q -p no:randomly \
+            -m "not needs_host_seam"
       - run: uv build
       # The wheel is what users install; a build that produces an importable
       # package but a broken one still uploads cleanly. Import it from the
