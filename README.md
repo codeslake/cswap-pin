@@ -150,6 +150,37 @@ binding a fresh one. There is no race to lose: the descriptor is already bound
 and listening. That is what makes the first upgrade onto this version safe as
 well as every one after it.
 
+### A daemon that outlives its holder gets a new one
+
+A holder can die without taking its daemon with it, and nothing looks wrong
+afterwards: the daemon already holds the socket, so the port keeps answering.
+What is gone is the property above — every spawn lands under a holder — so the
+*next* death takes the port down for good.
+
+The daemon notices by asking a question it was already able to answer. Its
+`CSWAP_PIN_HELD_BY` names the holder that started it, and an orphan is
+reparented to init, so the marker and `getppid()` disagree the moment the
+holder dies. Nothing signal-specific: a `SIGHUP`, a `SIGQUIT`, a segfault and a
+targeted kill all land the same way. It then hands over exactly as a code
+change would, and the successor's holder adopts the socket.
+
+Measured, under load across the whole orphaning: **110,188 requests, 0 refused,
+0 reset**, same port, one holder afterwards.
+
+## Falling through a dead hop
+
+The pin dials through whatever egress proxy the machine already has, and that
+proxy usually has one behind it. When a hop dies the request has to reach the
+hop *behind* it — falling through to a direct dial is not "no proxy" on a
+machine whose direct route is a TLS-inspecting corporate proxy, it is a `403`.
+
+So the pin asks each hop what it chains through, **while that hop is still
+answering** — the only moment the answer can be trusted, and the only moment it
+is free. Measured on one machine: the record named a single hop for a day while
+that hop's own `/health` had been naming the next one the entire time, because
+the question was only ever asked at launch. When the inner hop died, a chain
+that could have stepped one hop out went direct instead.
+
 ## A connection is not a thread
 
 An upstream that accepts and never answers used to cost one OS thread per
@@ -222,7 +253,7 @@ For a serial repro of a failure, add `-n 0`: xdist gives no live output and
 truncates tracebacks it cannot attribute to a worker.
 
 One pytest test runs many `case_*` methods (`run_cases` in `conftest.py`), so
-60 collected tests carry 321 cases. A failure names both: `Class::case_name`.
+113 collected tests carry 347 cases. A failure names both: `Class::case_name`.
 
 ## Why a separate package
 
