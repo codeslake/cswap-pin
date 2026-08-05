@@ -4915,6 +4915,16 @@ def _watch_own_code(
         # rather than each branch remembering to.
         stopped = handed_over = False
         try:
+            # LEARN THE HOP BEHIND OURS WHILE IT IS STILL ANSWERING. This is
+            # the only timer the daemon has, and the question is only
+            # answerable before the hop dies — see `learn_next_hop`. Cheap
+            # (loopback, 1s budget, writes only on a change) and never fatal:
+            # the `except` below is a watchdog's, so a probe that raises must
+            # not take the code watch down with it.
+            try:
+                server.learn_next_hop()
+            except (AttributeError, OSError):
+                pass  # a stand-in server in tests, or a hop that went away
             # ORPHANED IS ALSO A REASON TO RECYCLE, not just stale code.
             #
             # A holder that dies without taking its daemon down leaves the port
@@ -7013,6 +7023,50 @@ class PinProxy:
         else:
             where = f"{hop[0]}:{hop[1]}" if hop else "the proxy chain"
             _log_lifecycle(f"egress via {where}")
+
+    def learn_next_hop(self) -> None:
+        """Ask the recorded hop what IT chains through, and record the answer.
+
+        THE RECORD HAS TO BE ABLE TO GROW AFTER THE LAUNCH THAT MADE IT.
+        `_probe_next_hop` runs at hint-writing time and nowhere else, and
+        `cswap pin --ensure` — what an rc hook calls before every `claude` —
+        routes to `heal`, which never re-stamps the hint. So the only chance
+        to learn the outer hop was a launch that happened while the inner one
+        was answering. Miss it once and the chain is single-hop for good.
+
+        MEASURED here, and it was the steady state, not a transient:
+
+            upstream.json  {"proxy": "http://127.0.0.1:9901", "ca": ...}
+            written 2026-08-04 01:32, no "next" key a day later
+            live probe of 9901 -> http://127.0.0.1:8118
+
+        When 9901 died the walk had one hop and fell to DIRECT — and DIRECT on
+        this host is the corporate TLS inspector, which answers 403 "Access
+        restricted by network policy". The answer was one HTTP request away
+        the whole time.
+
+        ASKED WHILE THE HOP IS HEALTHY, which is both the only moment the
+        answer can be trusted and the only moment it is free: a dead hop
+        cannot say what is behind it, and that is exactly when it is needed.
+
+        Never raises and never blocks a request: `_probe_next_hop` is loopback
+        only with a 1s budget, and this runs on the daemon's own timer, not on
+        a connection.
+        """
+        recorded = _read_upstream(self._certdir, "proxy")
+        if not recorded:
+            return
+        nxt = _probe_next_hop(recorded)
+        # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
+        # rule `write_upstream_hint` states. Writing "" on a hop that is down
+        # would erase a next hop learned while it was up, at the moment it
+        # matters most.
+        if not nxt or nxt == _read_upstream(self._certdir, "next"):
+            return
+        write_upstream_hint(
+            self._certdir, recorded, read_upstream_ca(self._certdir), next_hop=nxt,
+        )
+        _log_lifecycle(f"learned the hop behind {recorded}: {nxt}")
 
     def _chain_candidates(self) -> list[_Chain]:
         """The hops to try, in order. The re-read one first (it is the most
