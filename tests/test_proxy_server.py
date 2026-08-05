@@ -1339,6 +1339,162 @@ class TestChainRediscovery:
             proxy.stop()
             upstream.stop()
 
+    def case_a_dead_hop_is_asked_of_the_hop_behind_it_at_dial_time(
+        self, certdir, tmp_path
+    ):
+        """THE NEXT HOP MUST BE LEARNABLE WHEN THE INNER ONE IS ALREADY DEAD.
+
+        `_probe_next_hop` asks a hop what it chains through — but only at
+        LAUNCH, because that is the moment the answer is trustworthy. So a
+        launch that happens while the inner hop is down records nothing, and
+        the chain stays single-hop with no way to grow one.
+
+        MEASURED on this box, and it is the steady state, not a transient:
+
+            upstream.json: {"proxy": "http://127.0.0.1:9901", ... }   no "next"
+            written 2026-08-04 01:32, still single-hop a day later
+            live probe of 9901 RIGHT NOW answers http://127.0.0.1:8118
+
+        The answer was available the whole time; nothing asked again. When
+        9901 died the walk had one hop, so it fell to DIRECT — and DIRECT on
+        this host is the corporate TLS inspector, which 403s. That is the
+        outage the user hit ("Access restricted by network policy").
+
+        A dead hop's OWN fallback is the one thing a dial-time probe cannot
+        get from the dead hop, so it comes from the recorded chain — and the
+        record has to be able to grow AFTER a launch. This asks that: with a
+        dead inner hop and a live outer one, the request must reach the outer
+        one rather than falling through to a direct dial.
+
+        THE CONTROL is the same setup with the outer hop unreachable too:
+        that one must still fall to direct, or "reaches the outer hop" would
+        pass equally for code that never walks at all.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        upstream = _FakeUpstream(certdir)
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        def _reaches(next_hop):
+            """Was the OUTER hop dialled? A fresh one per attempt, because
+            `_LoopbackConnectProxy` accepts exactly once."""
+            outer = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+            hop = f"http://127.0.0.1:{outer.port}" if next_hop else None
+            write_upstream_hint(
+                certdir, f"http://127.0.0.1:{dead_port}", next_hop=hop,
+            )
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: None,
+                upstream=("127.0.0.1", upstream.port),
+                rediscover_chain=True,
+            )
+            proxy.start()
+            try:
+                _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+                )
+            except Exception:  # noqa: BLE001 — reaching it is the assertion
+                pass
+            finally:
+                proxy.stop()
+                outer.stop()
+            return outer.connects > 0
+
+        try:
+            # CONTROL: no outer hop recorded, so nothing to walk to.
+            assert not _reaches(None), (
+                "CONTROL FAILED: the outer hop was reached with no chain "
+                "recording it — this case cannot distinguish anything"
+            )
+            assert _reaches(True), (
+                "a dead inner hop fell through to a DIRECT dial with a live "
+                "outer hop recorded — direct here is the corporate inspector"
+            )
+        finally:
+            upstream.stop()
+
+    def case_a_live_hop_is_asked_what_is_behind_it_while_it_still_answers(
+        self, certdir
+    ):
+        """THE RECORD MUST BE ABLE TO GROW AFTER THE LAUNCH THAT MADE IT.
+
+        The case above proves the walk USES a recorded next hop. This is why
+        one is so often missing. `_probe_next_hop` runs at hint-writing time
+        (a launch) and nowhere else, and `--ensure` — the thing an rc hook
+        calls before every `claude` — routes to `heal`, which never re-stamps
+        the hint. So the only chance to learn the outer hop is a launch that
+        happens while the inner hop is answering. Miss it once and the chain
+        is single-hop for good.
+
+        MEASURED on this box, and it is the steady state:
+
+            upstream.json  {"proxy": "http://127.0.0.1:9901", "ca": ...}
+            written 2026-08-04 01:32, no "next" key a day later
+            live probe of 9901 right now -> http://127.0.0.1:8118
+
+        When 9901 died, the walk had one hop and fell to DIRECT, which on this
+        host is the corporate TLS inspector: 403 "Access restricted by network
+        policy". The answer was one HTTP request away the entire time.
+
+        So the daemon asks while the hop is HEALTHY — that is the only moment
+        the answer is trustworthy, and it is also the moment it is free. The
+        assertion is on the RECORD, not on a dial, because what is being fixed
+        is the record being empty when the hop later dies.
+
+        THE CONTROL is a hop that reports no upstream: nothing must be written
+        then, or "learned it" would pass equally for code that records noise.
+        """
+        import http.server
+        import threading
+
+        from cswap_pin.proxy import PinProxy, _read_upstream, write_upstream_hint
+
+        class _Health(http.server.BaseHTTPRequestHandler):
+            answer: dict = {}
+
+            def do_GET(self):
+                body = json.dumps(self.answer).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        def _learned(answer):
+            _Health.answer = answer
+            srv = http.server.HTTPServer(("127.0.0.1", 0), _Health)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            hop = f"http://127.0.0.1:{srv.server_address[1]}"
+            write_upstream_hint(certdir, hop, next_hop="")
+            try:
+                proxy = PinProxy(
+                    certdir=certdir,
+                    pin_token_provider=lambda: None,
+                    upstream=("127.0.0.1", 1),
+                    rediscover_chain=True,
+                )
+                proxy.learn_next_hop()
+                return _read_upstream(certdir, "next")
+            finally:
+                srv.shutdown()
+
+        # CONTROL: a hop that names no upstream must leave the record alone.
+        assert not _learned({"status": "ok"}), (
+            "CONTROL FAILED: a hop reporting no upstream still got recorded"
+        )
+        assert _learned({"https_proxy": "http://127.0.0.1:8118"}) == (
+            "http://127.0.0.1:8118"
+        ), (
+            "a healthy hop was never asked what is behind it, so the chain "
+            "stays single-hop and falls to DIRECT when that hop dies"
+        )
+
     def case_a_host_with_no_chain_pays_nothing_for_the_heal_grace(self, certdir):
         """The grace is for a hop that is RESTARTING, not for having no hop.
 
