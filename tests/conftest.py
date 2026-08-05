@@ -129,8 +129,16 @@ def _redirect_everything_to(tmp_path, monkeypatch):
     # forced the switch off, and once the switch genuinely worked, three
     # watcher cases turned out never to have exercised the enabled path: "they
     # passed because the bug existed".
+    # The list is not hand-maintained: `test_the_developers_environment_
+    # cannot_change_what_the_suite_measures` reads proxy.py for every name it
+    # takes from the environment and fails if one is missing here. It found
+    # the last four — including the two hand-down variables, where a stale
+    # value from a developer's shell would make a test adopt a descriptor
+    # that is not the one under test.
     for name in ("CSWAP_PIN_PORT", "CSWAP_PIN_WIRED", "CSWAP_PIN_FIFO",
-                 "CSWAP_PIN_REFCOUNT_FD", "CSWAP_PIN_SELF_HEAL"):
+                 "CSWAP_PIN_REFCOUNT_FD", "CSWAP_PIN_SELF_HEAL",
+                 "CSWAP_PIN_DEBUG", "CSWAP_PIN_SHAPE",
+                 "CSWAP_PIN_LISTEN_FD", "CSWAP_PIN_LISTEN_FROM"):
         monkeypatch.delenv(name, raising=False)
 
     store = tmp_path / "data-home"
@@ -484,6 +492,96 @@ def test_every_case_has_a_driver():
         + "\n\nAdd to each class:\n"
         "    def test_all(self, request, tmp_path_factory):\n"
         "        run_cases(self, request, tmp_path_factory)"
+    )
+
+
+def test_the_developers_environment_cannot_change_what_the_suite_measures(
+    tmp_path, monkeypatch
+):
+    """EVERY VARIABLE THE PIN READS MUST BE SCRUBBED BEFORE A CASE RUNS.
+
+    The suite runs inside a pinned session, which inherits the pin's own env
+    at boot, and a developer debugging the daemon exports more of it by hand.
+    Both directions have bitten:
+
+      - `CSWAP_PIN_PORT` made four unrelated cases fail, each trying to bind
+        the developer's real 36301. Loud, so it was fixed the day it appeared.
+      - `CSWAP_PIN_SELF_HEAL=off` disables the holder's respawn and the code
+        watchdog, so it turned every test of those paths GREEN without running
+        them. Silent, so nothing surfaced it. A peer session hit the same
+        class from the loud side and said it plainly: "they passed because the
+        bug existed".
+
+    So this asserts the scrub COVERS what the module reads, rather than
+    trusting a list somebody remembers to extend. It reads the source for
+    `CSWAP_PIN_*` names and checks each one is either scrubbed or is a name
+    the pin WRITES rather than reads.
+
+    AND THAT THE SCRUB RUNS FIRST. A peer put its equivalent scrub AFTER the
+    fixture set its own values and deleted what the fixture had just set —
+    "the edit applied cleanly and looked right". Here the scrub is at the top
+    of `_redirect_everything_to`, and this pins that: a fixture-set value must
+    survive into the case.
+    """
+    import os
+    import pathlib
+    import re
+
+    src = pathlib.Path(__file__).read_text()
+    scrubbed = set(re.findall(r'"(CSWAP_PIN_\w+)"', src.split("store =")[0]))
+
+    proxy_src = (
+        pathlib.Path(__file__).parent.parent / "src/cswap_pin/proxy.py"
+    ).read_text()
+    # What the module READS from the environment — a name it only WRITES (into
+    # a child's env, or into `.claude.json`) cannot pollute a case.
+    #
+    # Two shapes, because the module uses both: the literal, and a module
+    # constant holding it. Resolving the constants first makes the second
+    # shape the same question as the first.
+    consts = dict(re.findall(r'^(\w+_ENV) = "(CSWAP_PIN_\w+)"', proxy_src, re.M))
+    read = set(re.findall(r'environ\.get\(\s*"(CSWAP_PIN_\w+)"', proxy_src))
+    for const, value in consts.items():
+        if re.search(rf"environ\.get\(\s*{const}\b", proxy_src):
+            read.add(value)
+
+    missing = sorted(read - scrubbed)
+    assert not missing, (
+        f"the pin reads {missing} from the environment and the conftest does "
+        f"not scrub it — a developer who exports it changes what this suite "
+        f"measures, silently if the value makes a path a no-op"
+    )
+
+    # AND THE ORDER: THE SCRUB MUST RUN BEFORE THE FIXTURE SETS ANYTHING.
+    #
+    # A peer put its equivalent scrub AFTER its fixture's own assignments and
+    # deleted what the fixture had just set — "the edit applied cleanly and
+    # looked right", caught only by reading the surrounding lines.
+    #
+    # ASSERTED ON THE SOURCE, not by setting a variable here and reading it
+    # back. That was the first version and it was worthless: it runs inside
+    # THIS test, where the fixture's own assignments are not in play, so it
+    # passed with the scrub moved to the end of the fixture — verified by
+    # mutation, which is the only reason it is not still here.
+    # THE RULE IS NARROWER THAN "SCRUB FIRST": what must not happen is the
+    # scrub deleting a name the fixture ITSELF sets. Unrelated writes may come
+    # before it — `CLAUDE_CONFIG_DIR` does, and correctly, because the scrub
+    # never touches that name.
+    #
+    # Two earlier versions of this check were wrong ON CORRECT CODE, which is
+    # how a guard teaches people to ignore it: one compared against
+    # `setattr` (not an env write at all), the next against the first `setenv`
+    # of any name. Both found by running it, not by reading it.
+    body = src.split("def _redirect_everything_to")[1].split("\ndef ")[0]
+    scrub_at = body.index("delenv(name, raising=False)")
+    clobbered = [
+        n for n in scrubbed
+        if f'setenv("{n}"' in body and body.index(f'setenv("{n}"') < scrub_at
+    ]
+    assert not clobbered, (
+        f"the scrub deletes {clobbered}, which this fixture sets ABOVE it — "
+        f"scrub the BASE, then apply, or the fixture's own value is thrown "
+        f"away before any case sees it"
     )
 
 

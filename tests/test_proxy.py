@@ -4694,6 +4694,17 @@ def _recording_server(events):
     fails on the method the code actually calls, and six copies means six
     places to miss. ``release_listener`` returns the fd it would hand down —
     None here, which is what a server with nothing to pass returns too.
+
+    WHAT THE CASES ASSERT ON, and this is deliberate rather than incidental:
+    these recorded CALLS are the watchdog's own account of what it did. A pid
+    change is a side effect several other paths produce — a holder rebinding,
+    an orphan recovery, a sweep — so a case that judges "did the watchdog hand
+    over?" by watching a pid measures the state, not the actor. A peer session
+    shipped exactly that, went red on two CI runners while passing 5/5
+    locally, and traced it to the test rather than the code.
+
+    So: assert on what is recorded here. If a later refactor makes a case
+    watch a pid instead, it has stopped testing the watchdog.
     """
 
     class _Srv:
