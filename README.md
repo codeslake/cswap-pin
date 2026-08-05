@@ -99,9 +99,30 @@ execs: coming back on a different port would leave that session dialling an
 address nothing answers, and its requests would then go out *unpinned* rather
 than fail loudly.
 
-`CSWAP_PIN_PORT` in a session's environment is an **output** — the daemon
-telling that session where it landed. Setting it yourself does not move the
-proxy; it only misinforms the session.
+### Asking for a specific port
+
+```bash
+cswap pin --get_port          # what it is serving right now (for scripts)
+cswap pin --set_port 41234    # serve there from the next daemon start
+cswap pin --set_port 0        # back to dynamic: the kernel picks
+export CSWAP_PIN_PORT=41234   # same, for this shell only; 0 also means dynamic
+```
+
+A port you set outranks the reclaim above — it is a standing instruction,
+where the reclaim is only about keeping live sessions attached. It takes
+effect on the next daemon start, not immediately: moving the port under a
+running session would strand it, since its `HTTPS_PROXY` was fixed at exec.
+
+If the port you asked for is taken, the pin serves on another one rather than
+refusing to start, and says so in `pin-proxy/daemon.log`.
+
+**`CSWAP_PIN_PORT` inside a pinned session is not yours.** Claude Code applies
+`.claude.json`'s env block at boot, and the pin writes that variable there as
+its own marker — so every process in such a session inherits it, including a
+`cswap` you run from a Bash tool. It is written beside `CSWAP_PIN_WIRED`,
+which is how the pin tells its own value from one you exported. Your rc export
+still works exactly as written; you just cannot read the variable back and
+conclude a human set it.
 
 ## Requirements
 
