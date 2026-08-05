@@ -242,11 +242,6 @@ def read_upstream_ca(certdir: Path) -> str | None:
 
 
 _WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
-
-# Written beside CSWAP_PIN_PORT in the same env block, purely so a process can
-# tell OUR value from the user's own export of the same name. See
-# `configured_port`.
-_WIRED_MARKER_ENV = "CSWAP_PIN_WIRED"
 _WIRE_MARK = "_cswapPinWiredKeys"
 
 # -- where the receipt lives -------------------------------------------------
@@ -1914,11 +1909,6 @@ def _wire_global_config_locked(
             # ambient one. Without the marker it records THAT as the upstream
             # and the daemon starts CONNECTing to itself.
             "CSWAP_PIN_PORT": str(port),
-            # Says the number above is OURS, not a user's rc export. Without
-            # it `configured_port` reads our own marker back as a standing
-            # instruction and a daemon spawned inside a pinned session tries
-            # to bind the live daemon's port.
-            _WIRED_MARKER_ENV: "1",
         }
         # Remember what we are about to displace, so unwiring is lossless.
         displaced = {k: env[k] for k in wanted if k in env}
@@ -3383,67 +3373,22 @@ _LOG_MAX_BYTES = 64 * 1024
 def configured_port(certdir: Path) -> int | None:
     """The port the user asked us to serve on, or None for an ephemeral one.
 
-    THREE SOURCES, AND THE ORDER IS THE POINT:
+    ONE SOURCE: ``settings.json``, written by ``cswap pin --set_port``.
 
-      1. ``CSWAP_PIN_PORT`` in the ENVIRONMENT. A user who exports it in their
-         rc has said what they want for this shell, and nothing on disk may
-         overrule a value they typed.
-      2. ``settings.json`` in the cert dir, written by ``cswap pin
-         --set_port``. Persistent, machine-wide, and ours.
-      3. Nothing. The daemon takes an ephemeral port, which is what every
-         machine does today.
+    NOT ``CSWAP_PIN_PORT``: `wire_global_config` writes that name into
+    `.claude.json` as the self-loop marker and Claude Code applies the block
+    at boot, so inside a pinned session it is already the LIVE daemon's port.
+    Reading it as config made the pin fight itself for a port it was on.
 
-    RANGE-CHECKED HERE, at the read. A value outside 1-65535 is not a port,
-    and 0 is worse than invalid: ``bind()`` reads it as "choose one for me",
-    so honouring a configured 0 would do the OPPOSITE of what the user meant
-    while looking like it worked.
+    0 is not a port to bind: `bind()` reads it as "choose one for me", so
+    `--set_port 0` CLEARS the setting, which is how a dynamic port is asked
+    for.
     """
-    # THE ENVIRONMENT ANSWERS OR IT DOES NOT — it never falls through to the
-    # file. `CSWAP_PIN_PORT=0` is a user saying "let the kernel choose", the
-    # same thing `--set_port 0` means, and the same word has to mean the same
-    # thing in both places. Falling through made it mean "ignore my 0 and use
-    # whatever I saved months ago", so a rc export could not force a dynamic
-    # port on a machine that had ever been given a fixed one.
-    #
-    # Anything else unparseable in the env IS a fall-through: a typo is not an
-    # instruction, and the saved setting is the better answer than nothing.
-    env = _env_port()
-    if env is not None:
-        try:
-            port = int(env)
-        except (TypeError, ValueError):
-            port = None
-        if port == 0:
-            return None  # explicit: ephemeral, and the file does not override
-        if port is not None and 0 < port <= 65535:
-            return port
     try:
         port = int(_settings_port(certdir))
     except (TypeError, ValueError):
         return None
     return port if 0 < port <= 65535 else None
-
-
-def _env_port() -> object:
-    """``CSWAP_PIN_PORT`` from the environment — ONLY when a user set it.
-
-    THE NAME HAS TWO AUTHORS. We write it into `.claude.json`'s env block
-    ourselves as the self-loop marker (see `wire_global_config`), and Claude
-    Code applies that block at boot, so every process inside a pinned session
-    inherits it — including a daemon spawned from a Bash tool there. Read back
-    naively it says "the user asked for the port the LIVE daemon is already
-    on": measured, such a daemon tried to bind 36301, failed, and logged
-    "configured port 36301 is not available" on every start, taking four
-    unrelated tests red with it.
-
-    `CSWAP_PIN_WIRED` is written beside it in the same block and nowhere else,
-    so its presence identifies our own value. A user's rc export has no such
-    companion, and `--set_port` writes the settings file instead — which is
-    unambiguous either way.
-    """
-    if os.environ.get(_WIRED_MARKER_ENV):
-        return None
-    return os.environ.get("CSWAP_PIN_PORT")
 
 
 def _settings_port(certdir: Path) -> object:

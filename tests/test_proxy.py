@@ -1744,23 +1744,9 @@ class TestWorkerJwtRoutesAreNotSwapped:
 
 
 class TestThePortIsConfigurable:
-    """The pin's own settings live in the pin's own directory.
-
-    ``CSWAP_PIN_PORT`` sat in ``~/.claude.json``'s env block, and it is the
-    one entry there that Claude Code does not read: HTTPS_PROXY, https_proxy,
-    ALL_PROXY and NODE_EXTRA_CA_CERTS are consumed by CC at boot, that number
-    is consumed only by US. Settings for an optional feature do not belong in
-    another program's exclusive file, and a user who wants a fixed port had
-    nowhere to say so.
-
-    THREE SOURCES, IN THIS ORDER, and the order is the feature:
-
-      1. the ENVIRONMENT (``CSWAP_PIN_PORT``). A user who exports it in their
-         rc has said what they want for THIS shell, and nothing on disk may
-         overrule a value the user typed.
-      2. the SETTINGS FILE (``settings.json`` in the cert dir), written by
-         ``cswap pin --set_port``. Persistent, machine-wide, ours.
-      3. nothing — an ephemeral port, which is what every machine does today.
+    """One source: ``settings.json``, written by ``cswap pin --set_port``.
+    Absent means the kernel chooses. The env is not a source — that name is
+    the pin's own self-loop marker.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -1771,109 +1757,49 @@ class TestThePortIsConfigurable:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def case_the_environment_outranks_the_file(self, tmp_path, monkeypatch):
-        """A value the user typed beats a value we persisted.
-
-        Both directions asserted: the file alone is used when the env is
-        silent, and IGNORED when it is not. Testing only the first would pass
-        against an implementation that never reads the env at all.
-        """
-        from cswap_pin import proxy as pin_proxy
-
-        certdir = self._certdir(tmp_path)
-        pin_proxy.write_pin_settings(certdir, port=41111)
-
-        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
-        assert pin_proxy.configured_port(certdir) == 41111, "the file was not read"
-
-        monkeypatch.setenv("CSWAP_PIN_PORT", "42222")
-        assert pin_proxy.configured_port(certdir) == 42222, (
-            "an rc export was overruled by a file — the user's own shell must "
-            "win over anything we persisted"
-        )
 
     def case_nothing_configured_means_nothing_claimed(self, tmp_path, monkeypatch):
-        """No env, no file: None, so the daemon takes an ephemeral port.
+        """No file: None, so the daemon takes an ephemeral port.
 
         The absence has to be distinguishable from a configured 0 — port 0
         means "let the kernel choose" to bind(), so returning it as a
         CONFIGURED value would silently mean the opposite of what a user who
-        typed it meant.
+        typed it meant. `--set_port 0` therefore CLEARS, and clearing is how
+        you ask for a dynamic port.
         """
+        import json as _json
+
         from cswap_pin import proxy as pin_proxy
 
         certdir = self._certdir(tmp_path)
-        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
         assert pin_proxy.configured_port(certdir) is None
 
-        for junk in ("", "not-a-port", "0", "70000", "-1"):
-            monkeypatch.setenv("CSWAP_PIN_PORT", junk)
+        for junk in ("", "not-a-port", 0, 70000, -1, None, [41234]):
+            (certdir / "settings.json").write_text(_json.dumps({"port": junk}))
             assert pin_proxy.configured_port(certdir) is None, (
                 f"{junk!r} was accepted as a port; a value outside 1-65535 is "
                 f"not a port at all and bind() would either fail or, for 0, "
                 f"do the opposite of what was asked"
             )
 
-        # AND 0 IN THE ENV MEANS THE SAME AS `--set_port 0`: ephemeral, full
-        # stop. It used to fall through to the file, so the same word meant
-        # "let the kernel choose" from the CLI and "ignore my 0, use whatever I
-        # saved months ago" from an rc export — and a user could not force a
-        # dynamic port on a machine that had ever been given a fixed one.
-        pin_proxy.write_pin_settings(certdir, port=41234)
-        monkeypatch.setenv("CSWAP_PIN_PORT", "0")
-        assert pin_proxy.configured_port(certdir) is None, (
-            "an explicit 0 fell through to the saved port — `export "
-            "CSWAP_PIN_PORT=0` must mean ephemeral, exactly as `--set_port 0` "
-            "does"
-        )
-        # A TYPO IS NOT AN INSTRUCTION, though: it still falls through, because
-        # the saved setting is a better answer than nothing.
-        monkeypatch.setenv("CSWAP_PIN_PORT", "not-a-port")
-        assert pin_proxy.configured_port(certdir) == 41234
-        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
-        assert pin_proxy.configured_port(certdir) == 41234
-
-    def case_our_own_self_loop_marker_is_not_a_user_setting(
-        self, tmp_path, monkeypatch
-    ):
-        """`CSWAP_PIN_PORT` in the env is OURS unless a user put it there.
-
-        We write it into `.claude.json`'s env block as the self-loop marker,
-        and Claude Code applies that block at boot — so every process inside a
-        pinned session inherits it, including a daemon spawned from a Bash
-        tool there. Read back naively it says "the user asked for the port the
-        LIVE daemon is already on", and the new daemon then fights the running
-        one for its port.
-
-        NOT HYPOTHETICAL — this is what wiring the setting first exposed: four
-        unrelated tests went red, each trying to bind the developer's real
-        36301 and logging "configured port 36301 is not available". The suite
-        had been inheriting that value all along with nothing reading it.
-
-        `CSWAP_PIN_WIRED` is written beside it and nowhere else, so it
-        identifies our own value. A user's rc export has no companion.
-        """
+    def case_the_environment_is_not_a_source(self, tmp_path, monkeypatch):
+        """The env is never read as config: inside a pinned session that name
+        is already the live daemon's port (our own self-loop marker)."""
         from cswap_pin import proxy as pin_proxy
 
         certdir = self._certdir(tmp_path)
 
-        # A user's own export: honoured.
         monkeypatch.setenv("CSWAP_PIN_PORT", "44444")
-        monkeypatch.delenv("CSWAP_PIN_WIRED", raising=False)
-        assert pin_proxy.configured_port(certdir) == 44444
-
-        # The same number, but wearing OUR marker: not a setting at all.
-        monkeypatch.setenv("CSWAP_PIN_WIRED", "1")
         assert pin_proxy.configured_port(certdir) is None, (
-            "the pin read its own self-loop marker back as a user setting — a "
-            "daemon started inside a pinned session would try to bind the "
-            "live daemon's port"
+            "an env value answered — a new daemon would try to bind the live "
+            "daemon's port"
         )
 
-        # ...and the settings file still answers, because that one is
-        # unambiguous however the session was launched.
-        pin_proxy.write_pin_settings(certdir, port=45555)
-        assert pin_proxy.configured_port(certdir) == 45555
+        pin_proxy.write_pin_settings(certdir, port=41234)
+        assert pin_proxy.configured_port(certdir) == 41234, (
+            "the env overruled the file"
+        )
+
 
     def case_the_daemon_actually_binds_the_configured_port(
         self, tmp_path, monkeypatch
