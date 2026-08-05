@@ -3387,7 +3387,7 @@ def _install_signal_teardown(cleanup) -> None:
             # to interpret the code, and 0 is what every existing caller reads.
             os._exit(
                 _RESTART_ME_CODE
-                if os.environ.get(_HELD_BY_ENV) == str(os.getppid())
+                if held_by_a_holder()
                 else 0
             )
 
@@ -4804,6 +4804,27 @@ def _watch_own_code(
         try:
             if daemon_fingerprint() == own:
                 continue
+            # UNDER A HOLDER THERE IS NOTHING TO HAND OVER. The holder already
+            # owns this socket and will put the successor on it, so the whole
+            # release-spawn-drain dance below is not merely unnecessary — it
+            # takes the port OUT of the holder, and the successor is then one
+            # failed bind away from stranding every session.
+            #
+            # Measured on lmd42, 76 minutes of broken pin reported as healthy:
+            #   10:13:07 handing over to a successor
+            #   10:13:15 successor holder: could not take 36301 — serving
+            #            UNHELD on 33349
+            #   10:18:15 33349: idle teardown — unwired .claude.json
+            if held_by_a_holder():
+                _log_lifecycle(
+                    "code on disk changed — exiting for the holder to replace"
+                )
+                # DRAIN FIRST, exactly as the handover path does. The holder
+                # cannot start the successor until we release the socket, but
+                # in-flight requests are still ours to finish.
+                server.release_listener()
+                server.await_inflight(_DRAIN_SECONDS)
+                os._exit(_RESTART_ME_CODE)
             _log_lifecycle("code on disk changed — handing over to a successor")
             # SERIALIZED, like every other spawn caller (`heal`,
             # `ensure_proxy`). Without it, a deploy replaces proxy.py and every
@@ -5009,6 +5030,19 @@ _HANDDOWN_FROM_ENV = "CSWAP_PIN_LISTEN_FROM"
 # way out" — the two look identical in the variables above, and they mean
 # opposite things when this daemon is TERM'd.
 _HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
+
+
+def held_by_a_holder(ppid: int | None = None, env=None) -> bool:
+    """Whether a holder owns this daemon's socket and will outlive it.
+
+    The distinction the whole restart story turns on. A PREDECESSOR that hands
+    its socket down is leaving, so its successor owns the port and must hand it
+    on in turn. A HOLDER is still there and will put the next daemon on the
+    same socket — so this daemon has nothing to hand over and should simply go.
+    """
+    env = os.environ if env is None else env
+    ppid = os.getppid() if ppid is None else ppid
+    return env.get(_HELD_BY_ENV) == str(ppid)
 
 
 def _handed_down_listener() -> "socket.socket | None":
@@ -5460,9 +5494,7 @@ class PinProxy:
             # on this very socket, so closing it on our way out unbinds the
             # port the holder exists to keep. Measured: 201,909 refused
             # connections across three planned restarts.
-            self._inherited = (
-                os.environ.get(_HELD_BY_ENV) == str(os.getppid())
-            )
+            self._inherited = held_by_a_holder()
             self.port = self._srv.getsockname()[1]
             self._start_accept_loop()
             return
