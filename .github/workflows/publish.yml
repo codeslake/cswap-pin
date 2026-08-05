@@ -65,9 +65,13 @@ jobs:
       # package but a broken one still uploads cleanly. Import it from the
       # built artifact, not from the checkout, so this tests what ships.
       - name: The built wheel must import without claude-swap
+        # `uv venv` + `uv pip`, not stdlib venv + pip. Same empty environment,
+        # same wheel, same assertion — but `python3 -m venv` bootstraps pip by
+        # copying it in (1.70s measured, against 0.01s for `uv venv`), and the
+        # whole step was 5.2s of a 29s job for one import.
         run: |
-          python3 -m venv /tmp/check
-          /tmp/check/bin/pip install dist/*.whl
+          uv venv /tmp/check
+          VIRTUAL_ENV=/tmp/check uv pip install dist/*.whl
           /tmp/check/bin/python -c '
           import cswap_pin
           assert cswap_pin.host_available() is False, "host_available lied with no host installed"

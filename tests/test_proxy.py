@@ -3130,7 +3130,20 @@ class TestDaemonPortStability:
                 st = read_daemon_state(tmp_path)
                 if st:
                     os.kill(int(st["pid"]), 15)  # a deploy's own signal
-                time.sleep(1.2)
+                # WAIT FOR THE SUCCESSOR, don't sleep a fixed 1.2s hoping it
+                # arrived. The successor is what the next kill needs to find,
+                # and it usually lands well inside the old budget — the wait
+                # was 2.4s of the class's runtime for an event that announces
+                # itself. The deadline is longer than the old sleep, so a
+                # genuinely slow respawn is still caught rather than raced
+                # past, and the hammer keeps counting throughout either way.
+                gone = int(st["pid"]) if st else None
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    now = read_daemon_state(tmp_path)
+                    if now and int(now["pid"]) != gone:
+                        break
+                    time.sleep(0.02)
             stop.set()
             for t in threads:
                 t.join(timeout=3)
