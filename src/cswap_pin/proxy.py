@@ -4116,11 +4116,31 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     """
     import hashlib
 
+    # THE CONTENT, NOT ITS mtime. mtime is a proxy for "is this the same code"
+    # and it is wrong in BOTH directions, measured:
+    #
+    #   new content + PRESERVED mtime  -> MISSED. `rsync -a`, `cp -p`, `tar -p`
+    #       and a restored backup all preserve it, so a real deploy through any
+    #       of those left the old daemon serving — the stale daemon this
+    #       fingerprint exists to end.
+    #   same content + touched mtime   -> SPURIOUS. A no-op reinstall recycled
+    #       a healthy daemon and cost a handover for nothing.
+    #
+    # A peer proxy in the same chain hit the mirror of this by comparing PATHS:
+    # it caught a relocated install and missed `git pull` in place, which is the
+    # commonest deploy there is. Both are the same mistake — answering a
+    # cheaper question than the one that matters.
+    #
+    # Reading the file costs one stat + one read per check (the watchdog polls
+    # on an interval, not per request), against a mistake that costs an outage.
     try:
-        code_mtime = os.stat(__file__).st_mtime_ns
+        code = Path(__file__).read_bytes()
     except OSError:
-        code_mtime = 0
-    return hashlib.sha256(str(code_mtime).encode()).hexdigest()[:16]
+        # UNREADABLE IS NOT UNCHANGED. Return something stable-but-distinct so
+        # a daemon does not read "no fingerprint" as "same as mine" and serve
+        # stale code forever; the next successful read re-establishes it.
+        code = b""
+    return hashlib.sha256(code).hexdigest()[:16]
 
 
 def _pid_alive(pid: int) -> bool:
