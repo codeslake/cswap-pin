@@ -5055,6 +5055,22 @@ def _watch_own_code(
                 server.learn_next_hop()
             except (AttributeError, OSError):
                 pass  # a stand-in server in tests, or a hop that went away
+            # THE OFF SWITCH STOPS EVERY AUTOMATIC REPLACEMENT, not just the
+            # holder's. `CSWAP_PIN_SELF_HEAL=off` is documented on PortHolder
+            # as "a respawner fighting a human who is debugging the daemon is
+            # worse than a dead port", and the holder honours it — but this
+            # watchdog was added later and never asked, so with the switch OFF
+            # a debugging session still lost its daemon the moment anything
+            # touched the file. That is the one thing the switch exists to
+            # prevent, reached through the other path.
+            #
+            # LEARNING THE NEXT HOP STAYS ON, deliberately: it records what a
+            # hop reports and replaces nothing, so it cannot fight anybody.
+            # `heal` and `ensure_proxy` stay on too — those are a human or a
+            # launch ASKING for a repair, and a switch meaning "do not act on
+            # your own" must not refuse a direct instruction.
+            if os.environ.get(_SELF_HEAL_ENV, "").lower() in ("off", "0", "no"):
+                continue
             # ORPHANED IS ALSO A REASON TO RECYCLE, not just stale code.
             #
             # A holder that dies without taking its daemon down leaves the port

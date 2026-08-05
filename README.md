@@ -156,8 +156,10 @@ The holder reads the daemon's exit rather than guessing:
 | `75` | `SIGTERM` under a holder: a redeploy | restart at once, same socket |
 | other | killed or crashed | restart on a 0.25s → 5s ladder |
 
-`CSWAP_PIN_SELF_HEAL=off` turns the restart off, for when you are debugging
-the daemon and a respawner fighting you is worse than a dead port.
+`CSWAP_PIN_SELF_HEAL=off` turns every automatic replacement off — the holder's
+restart above and the self-upgrade below — for when you are debugging the
+daemon and a respawner fighting you is worse than a dead port. `cswap pin
+--heal` and a launch still repair, because those are you asking.
 
 A redeploy is the same story from the other side. Under a holder the daemon
 does not hand its socket to a successor — it exits `75` and lets the holder
