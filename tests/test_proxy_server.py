@@ -300,6 +300,9 @@ class _StreamingUpstream:
 
 class TestStreamingRelay:
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_first_event_arrives_before_upstream_finishes(self, certdir):
         from cswap_pin.proxy import PinProxy
 
@@ -717,6 +720,9 @@ class TestChunkedRequestBodiesReachUpstream:
     """
 
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_a_chunked_body_is_decoded_and_reframed(self, certdir):
         from cswap_pin.proxy import PinProxy
 
@@ -815,6 +821,9 @@ class TestTheChainsCredentialIsSent:
         threading.Thread(target=loop, daemon=True).start()
         return srv, srv.getsockname()[1], seen
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_connect_carries_proxy_authorization(self, certdir):
         import base64
 
@@ -892,6 +901,9 @@ class _LoopbackConnectProxy:
 
 
 class TestLoopbackChainTrust:
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
 
     def case_relays_through_untrusted_loopback_mitm(self, certdir, tmp_path):
         from cswap_pin.proxy import PinProxy
@@ -1151,6 +1163,9 @@ class TestLongPollSurvives:
     killed that poll — heartbeats (answered at once) kept returning 200, so
     the session looked healthy while no inbound message ever arrived."""
 
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
 
     def case_upstream_socket_has_no_read_deadline(self, certdir):
         import socket as _socket
@@ -2211,6 +2226,9 @@ class TestAbsoluteFormPassthrough:
     'Auto-update failed' banner). No MITM/swap — just forward."""
 
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_absolute_form_get_is_relayed(self, certdir):
         from cswap_pin.proxy import PinProxy
 
@@ -2262,6 +2280,9 @@ class TestHealthEndpoint:
     own port) so a statusline/cc-update probe can tell it apart from CCF and
     read the chain it forwards to (mirrors CCF's /health with https_proxy)."""
 
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
 
     def case_health_reports_pin_and_chain(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -2377,6 +2398,9 @@ class TestKeepAlive:
     server rejected connection' while every individual route swapped fine."""
 
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_multiple_requests_over_one_connection(self, certdir):
         from cswap_pin.proxy import PinProxy
 
@@ -2487,6 +2511,9 @@ class TestWebSocketUpgrade:
     never connected through the pin proxy."""
 
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_upgrade_headers_reach_upstream_and_tunnel_opens(self, certdir):
         from cswap_pin.proxy import PinProxy
 
@@ -2544,6 +2571,9 @@ class TestBlindTunnelIsTraced:
     the channel it *receives* on left no line. Diagnosing that cost a live
     debugging session; the tunnel must announce itself."""
 
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
 
     def case_tunnel_to_a_foreign_host_writes_a_trace_line(self, certdir, tmp_path):
         import cswap_pin.proxy as pp
@@ -2641,6 +2671,9 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
 
         threading.Thread(target=serve, daemon=True).start()
         return srv
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
 
     def case_direct_dial_when_the_chain_refuses_the_ingress_host(
         self, certdir, tmp_path
@@ -2750,6 +2783,9 @@ class TestOptimisticConnectIsDetected:
         threading.Thread(target=serve, daemon=True).start()
         return srv
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_falls_back_when_the_200_tunnel_is_already_eof(self, certdir, tmp_path):
         import cswap_pin.proxy as pp
 
@@ -2852,6 +2888,9 @@ class TestTheTrustFileActuallyVerifies:
             raw.close()
             return f"FAIL:{e.reason}"
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_the_named_trust_file_verifies_the_proxy(self, certdir, tmp_path, monkeypatch):
         import cswap_pin.proxy as pp
 
@@ -2904,6 +2943,9 @@ class TestTheKillGateIdentifiesItsTarget:
 
         monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
         return pp._pin_daemon_pids(certdir)
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
 
     def case_the_certdir_must_be_the_last_argv_token(self, tmp_path, monkeypatch):
         certdir = tmp_path / "pin-proxy"
