@@ -1149,6 +1149,32 @@ class TestEnsureProxyLifecycle:
         assert killed == [os.getpid()]  # stale daemon was recycled
 
 
+def _watch_blocking_phase(monkeypatch):
+    """An Event that fires when `watch_refcount` enters its blocking read.
+
+    Two of these cases must let the watcher get PAST the first-holder phase
+    before closing the holder, and both did it by sleeping 400 ms. That is a
+    guess, and a 2000x-too-large one: the transition is `os.set_blocking(fd,
+    True)` and it happens 0.19 ms after the thread starts when the holder is
+    already attached. Watching for the call is both faster and stricter — a
+    watcher that never gets there now fails the test instead of being
+    silently outrun by the sleep.
+    """
+    import os
+    import threading
+
+    reached = threading.Event()
+    real = os.set_blocking
+
+    def spy(fd, flag):
+        if flag:
+            reached.set()
+        return real(fd, flag)
+
+    monkeypatch.setattr(os, "set_blocking", spy)
+    return reached
+
+
 class TestRefcount:
     """FIFO refcount (CCF model): the daemon lives while >=1 session holds a
     write fd on the refcount FIFO, and self-terminates when the last one closes
@@ -1336,14 +1362,18 @@ class TestRefcount:
         monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
 
         holder = os.open(fifo, os.O_RDWR)  # a wrapper-launched session attaches
+        # WAIT FOR THE WATCHER, do not guess how long it takes. It switches to
+        # the blocking (real-EOF) read once a writer has attached, and this
+        # test is about that second phase, not the first-holder timeout. The
+        # switch IS `os.set_blocking(fd, True)`, so watch for it: measured at
+        # 0.19 ms with the holder already attached, where a fixed sleep here
+        # waited 400 ms for it.
+        reached = _watch_blocking_phase(monkeypatch)
         fired = threading.Event()
         threading.Thread(
             target=watch_refcount, args=(fifo, fired.set), daemon=True
         ).start()
-        # Let the watcher SEE the holder: it only switches to the blocking
-        # (real-EOF) read once a writer has attached, and this test is about
-        # that second phase, not the first-holder timeout.
-        time.sleep(0.4)
+        assert reached.wait(timeout=5.0), "watcher never reached the blocking read"
         os.close(holder)  # ...and leaves, while the wiring still names us
         assert not fired.wait(timeout=0.15), (
             "tore down a daemon the global config still routes sessions "
@@ -1377,11 +1407,12 @@ class TestRefcount:
         monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
 
         holder = os.open(fifo, os.O_RDWR)
+        reached = _watch_blocking_phase(monkeypatch)  # as above
         fired = threading.Event()
         threading.Thread(
             target=watch_refcount, args=(fifo, fired.set), daemon=True
         ).start()
-        time.sleep(0.4)  # as above: reach the blocking phase before closing
+        assert reached.wait(timeout=5.0), "watcher never reached the blocking read"
         os.close(holder)
         assert fired.wait(timeout=5), (
             "an unreferenced daemon lingered — the reaper stopped working"
