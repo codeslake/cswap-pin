@@ -295,13 +295,20 @@ def _read_ledger(config_path: Path, raw: dict) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def _write_ledger(config_path: Path, ledger: dict) -> None:
-    """Record the receipt beside cswap's other state. Never raises.
+def _write_ledger(config_path: Path, ledger: dict) -> bool:
+    """Record the receipt beside cswap's other state. True when it landed.
 
-    Best-effort ON PURPOSE. The config write is what strands a session when it
-    fails; this one only costs a receipt, and a missing receipt degrades to
-    the pre-existing behaviour — the next wire re-derives it, and `--clear`
-    still finds the wiring through the config keys an older pin left.
+    NEVER RAISES, but the answer is now load-bearing rather than advisory. It
+    used to be best-effort on the reasoning that a lost receipt "degrades to
+    the pre-existing behaviour — `--clear` still finds the wiring through the
+    config keys an older pin left". That is false where it matters: the caller
+    POPS those keys in the same write, so a failure here leaves the proxy vars
+    in `.claude.json` with the receipt in NEITHER location, and nothing can
+    remove them.
+
+    So the caller writes this FIRST and abandons the config write when it
+    fails. A receipt with no wiring is a no-op; a wiring with no receipt is an
+    outage that needs a hand edit.
     """
     tmp = None
     try:
@@ -314,12 +321,14 @@ def _write_ledger(config_path: Path, ledger: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        return True
     except Exception:  # noqa: BLE001 — see the docstring
         if tmp is not None:
             try:
                 tmp.unlink()
             except OSError:
                 pass
+        return False
 
 
 def _merged_ca(ca_path: Path, existing: str | None) -> Path:
@@ -1917,6 +1926,32 @@ def _wire_global_config_locked(
 
     if env == before and _WIRE_MARK not in raw and not ours:
         return False
+    # THE RECEIPT FIRST, AND IT MUST SUCCEED — see `_write_ledger`. This used
+    # to run after the config write, best-effort, on the reasoning that a lost
+    # receipt "degrades to the pre-existing behaviour: --clear still finds the
+    # wiring through the config keys an older pin left". That is false for
+    # this path, because the same function pops those keys three lines below.
+    #
+    # Measured, with the sidecar store made unwritable:
+    #   wire returned:            False
+    #   HTTPS_PROXY in config:    True
+    #   config keys mark:         None
+    #   _read_ledger mark:        None
+    #
+    # A wiring in NEITHER location is one nothing can remove: `--clear` reads
+    # the sidecar, falls through to the config keys, finds neither, and
+    # answers "not wired" — while `.claude.json` keeps sending every new
+    # session to a port that may be long gone. Only a hand edit fixes it,
+    # which is what `clear_wiring` exists to make unnecessary.
+    #
+    # So the CONFIG write is the one that becomes conditional. Unwired is a
+    # working session; wired-with-no-receipt is an outage nobody can clear.
+    if not _write_ledger(path, ledger):
+        _log_lifecycle(
+            "could not record the wiring receipt — leaving .claude.json "
+            "untouched rather than wiring it unremovably"
+        )
+        return False
     # THE CONFIG KEYS GO, whichever location we read from. They are where the
     # receipt USED to live; leaving them behind means an older claude-swap
     # keeps reading a stale copy of a receipt this write just replaced.
@@ -1953,12 +1988,11 @@ def _wire_global_config_locked(
             os.close(fd)
         os.replace(tmp, path)
     except OSError:
+        # THE RECEIPT NOW OVERSTATES, and that is the safe direction. It says
+        # keys are ours that the config does not carry, so `--clear` removes
+        # nothing and reports nothing — a no-op, not an outage. The opposite
+        # order fails the other way, which is why the write above is first.
         return False
-    # AFTER the config write, never before. This records what the config now
-    # holds; writing it first and then failing the config write would claim a
-    # wiring that is not there — and on an unwire, would drop the receipt for
-    # proxy vars still in the file, leaving them unremovable except by hand.
-    _write_ledger(path, ledger)
     return True
 
 
@@ -4855,7 +4889,7 @@ def _spawn_daemon(
     return None
 
 
-def _clear_handover_mark(certdir: Path) -> None:
+def _clear_handover_mark(certdir: Path) -> bool:
     """Drop a marked record once the spawn it describes has failed.
 
     The mark means "a successor is coming"; leaving it after nothing came would
@@ -4863,14 +4897,30 @@ def _clear_handover_mark(certdir: Path) -> None:
     pointing at a port nobody serves. The record described a daemon that has
     already stopped, so there is nothing left to preserve — the port to reclaim
     lives in the hint (see ``read_port_hint``).
+
+    RETURNS WHETHER THE MARK IS GONE. The unlink swallowed every OSError and
+    returned nothing either way, so a record that could NOT be removed — a
+    read-only store, a lost mount, an immutable file — was indistinguishable
+    from one that was, and the caller went on to a teardown that read
+    "superseded" and left the wiring in place. Saying so does not make the
+    unlink succeed; it stops the caller believing a cleanup that did not
+    happen, and puts the reason in the one log a later reader has.
+
+    True when there is no mark to clear: the postcondition this reports is
+    "no stale mark remains", not "a file was deleted".
     """
     st = read_daemon_state(certdir)
     if not (st and st.get("handover")):
-        return
+        return True
     try:
         (Path(certdir) / _STATE_FILE).unlink()
-    except OSError:
-        pass
+        return True
+    except OSError as exc:
+        _log_lifecycle(
+            f"could not clear the handover mark ({exc}) — a teardown will "
+            f"read this as superseded and leave the wiring in place"
+        )
+        return False
 
 
 def _release_daemon_state(certdir: Path) -> bool:
