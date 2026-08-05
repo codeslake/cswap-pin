@@ -49,9 +49,15 @@ jobs:
           # actually looks like. The cost is that tests of an UNRELEASED seam
           # fail here — those are marked `needs_host_seam` and deselected, not
           # silently skipped, so the exclusion is visible in the log.
+          #
+          # `--with pytest-xdist` is NOT optional: pyproject's addopts carries
+          # `-n 4`, and a pytest without xdist refuses the flag outright
+          # ("error: unrecognized arguments: -n") rather than ignoring it, so
+          # the suite would not run at all. Measured on a clean venv.
           S="$(mktemp -d)"
           HOME="$S" XDG_DATA_HOME="$S/.local/share" \
-            uv run --with pytest --with cryptography --with claude-swap \
+            uv run --with pytest --with pytest-xdist --with cryptography \
+            --with claude-swap \
             python -m pytest tests/ -q -p no:randomly \
             -m "not needs_host_seam"
       - run: uv build
