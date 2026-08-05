@@ -495,6 +495,54 @@ def test_every_case_has_a_driver():
     )
 
 
+def test_the_reaper_kills_holders_before_the_daemons_they_replace():
+    """A REAPER THAT KILLS CHILDREN FIRST CANNOT CONVERGE.
+
+    A holder's whole job is to replace a daemon that dies, so killing the
+    daemon first hands the holder its cue: the sweep races a supervisor that
+    is actively undoing it. `_reap_pin_processes` therefore kills PARENTS
+    first, and this pins that ordering against a later edit that looks
+    harmless.
+
+    MEASURED HERE, before that ordering existed: a handover test that TERM'd
+    only the recorded daemon pid accumulated 7 orphans across a few suite
+    runs. A peer session hit the same wall from further along and its numbers
+    are the clearer ones — four reaping strategies in a row failed, and the
+    last two failed EVEN WITH A 20-SECOND WATCH, because the survivors it
+    found were 37 s and 17 s old: born DURING the sweep, and again AFTER it.
+    Its conclusion is the same rule: "killing the listener loses to a holder
+    that just starts another".
+
+    That leak cost it a CI hang, because a leftover on the runner held the
+    job's stdout pipe — the job stopped updating rather than failing.
+
+    THE OTHER HALF is that the sweep matches on the CERTDIR in argv rather
+    than on process ancestry. A holder's replacement is spawned DETACHED, so
+    its ppid is 1 and `pgrep -P` cannot see it at all; the peer's reaper was
+    blind to exactly the process it needed to kill.
+    """
+    import pathlib
+    import re
+
+    src = pathlib.Path(__file__).read_text()
+    body = src.split("def _reap_pin_processes")[1].split("\ndef ")[0]
+
+    kills = re.findall(r"for pid in ([\w +]+):", body)
+    assert kills, "the reaper no longer loops over a list of pids"
+    for order in kills:
+        parts = [p.strip() for p in order.split("+")]
+        assert parts[0].startswith("holder"), (
+            f"the reaper kills `{order.strip()}` — daemons before holders, and "
+            f"a holder left alive replaces every daemon the sweep kills, so it "
+            f"cannot converge"
+        )
+    # AND NOT BY ANCESTRY: a holder's replacement is detached (ppid 1).
+    assert "pgrep -P" not in body and "ppid" not in body, (
+        "the reaper is selecting by process ancestry — a detached replacement "
+        "has ppid 1 and is invisible to it"
+    )
+
+
 def test_the_developers_environment_cannot_change_what_the_suite_measures(
     tmp_path, monkeypatch
 ):
