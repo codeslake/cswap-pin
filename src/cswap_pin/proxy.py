@@ -4251,6 +4251,28 @@ class PortHolder:
         self._certdir = Path(certdir)
         self._account = account_num
         self._email = email
+
+        # ADOPT A HANDED-DOWN SOCKET RATHER THAN BINDING. A predecessor that is
+        # recycling passes its still-LISTENING socket down, and it has not let
+        # go of the port — so a holder that tried to bind would lose the race
+        # and fall back to an ephemeral one, taking the port out of the holder
+        # exactly when an upgrade is in flight. Measured on two live machines:
+        # 53749 -> 54264 and 36301 -> 45357, both stranding every session.
+        #
+        # Adopting has no race to lose: the descriptor is already bound and
+        # already listening, and the predecessor stopped accepting on it before
+        # passing it over.
+        adopted = _handed_down_listener()
+        if adopted is not None:
+            self._srv = adopted
+            self.port = self._srv.getsockname()[1]
+            self.daemon_pid = None
+            self._stop = False
+            self._failures = 0
+            self._thread = None
+            self._proc = None
+            return
+
         self._srv = socket.socket()
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # THE SAME PORT THE DAEMON WOULD HAVE TAKEN. The holder binds on its
@@ -4579,16 +4601,29 @@ def _spawn_daemon(
         env[_HANDDOWN_FD_ENV] = str(listen_fd)
         env[_HANDDOWN_FROM_ENV] = str(os.getpid())
         pass_fds = (listen_fd,)
-    # A COLD START GETS A HOLDER. The handover path already keeps the port
-    # bound (it passes its own listening socket down), but a cold start has
-    # nothing owning the address — so the daemon binds it itself and a
-    # `kill -9` takes it down with it, stranding every session whose
-    # HTTPS_PROXY was fixed at exec. Under a holder the socket outlives any
-    # way the daemon can die.
-    argv = [sys.executable, "-m", _DAEMON_MODULE]
-    if listen_fd is None:
-        argv += [_HOLDER_MODULE_ARG, str(want_port if want_port else 0)]
-    argv += [account_num, email, str(certdir)]
+    # EVERY SPAWN LANDS UNDER A HOLDER, cold start and handover alike.
+    #
+    # The cold start needs one because nothing owns the address yet: the
+    # daemon would bind it itself and a `kill -9` would take the port down
+    # with it, stranding every session whose HTTPS_PROXY was fixed at exec.
+    #
+    # THE HANDOVER NEEDS ONE FOR A DIFFERENT REASON, learned by doing it twice
+    # in one day on live machines. An old daemon notices its code changed and
+    # hands its listening socket to a successor — using the handover ITS OWN
+    # VERSION implements. If that successor runs unheld, the port has left the
+    # holder for good:
+    #
+    #     wmac  12:57  53749 -> served UNHELD on 54264
+    #     lmd42 13:03  36301 -> 45357, and .claude.json followed it there
+    #
+    # A README saying "upgrade carefully" was the first answer and it is not
+    # one: a deploy is not a procedure someone follows, it is whatever the
+    # running code does. The holder here ADOPTS the socket it was handed
+    # rather than binding a fresh one, so it cannot lose the race that made
+    # the cold-start holder fall back — there is nothing to race for.
+    argv = [sys.executable, "-m", _DAEMON_MODULE, _HOLDER_MODULE_ARG,
+            str(want_port if want_port else 0), account_num, email,
+            str(certdir)]
     try:
         try:
             subprocess.Popen(
