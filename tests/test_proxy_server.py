@@ -1324,6 +1324,36 @@ class TestChainRediscovery:
             proxy.stop()
             upstream.stop()
 
+    def case_a_hop_that_comes_back_is_waited_for_not_bypassed(self, certdir):
+        """A hop RESTARTING is not a hop that is gone.
+
+        Measured on the cache proxy's deployed build, hammered across a
+        `kill -9` of its holder: refused=32, accepted-then-silent=0, served=159
+        — it returns in ~1s under a new pid and REFUSES throughout. A refused
+        dial costs the walk nothing, so waiting is nearly free, while the
+        direct fallback on host-a is the corporate TLS inspector.
+        """
+        from cswap_pin.proxy import PinProxy
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            rediscover_chain=True,
+        )
+        sentinel = object()
+        attempts = []
+
+        def _walk():
+            attempts.append(1)
+            return sentinel if len(attempts) >= 3 else None
+
+        proxy._walk_chain_once = _walk
+        assert proxy._connect_upstream() is sentinel, (
+            "the relay bypassed a hop that came back inside the grace period"
+        )
+        assert len(attempts) == 3, f"walked {len(attempts)} times, expected 3"
+
     def case_health_reports_the_chain_the_relay_would_use(self, certdir):
         """A probe that says "no chain" while every request goes through one
         sends the next diagnosis the wrong way. Measured after a cc-update
