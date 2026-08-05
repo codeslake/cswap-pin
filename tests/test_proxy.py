@@ -4367,6 +4367,149 @@ class TestTheDaemonWatchesItsOwnCode:
         assert not [e for e in events if e[0] == "teardown"], events
         assert done.is_set()
 
+    def case_a_daemon_that_outlives_its_holder_gets_a_new_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A DAEMON WITH NO HOLDER ABOVE IT MUST NOT KEEP SERVING THAT WAY.
+
+        MEASURED (isolated port 60759, the live 36301 untouched), SIGHUP to
+        the holder:
+
+            before:       holder 1855196, daemon 1855252 (ppid 1855196)
+            after SIGHUP: daemon 1855252, ppid 1 — answers: True
+            HOLDERS REMAINING: 0   PORT ALIVE: True
+
+        The port survives because the daemon already holds the socket, so
+        nothing looks wrong from outside. But the invariant that makes a
+        crash survivable — every spawn lands under a holder — is gone, and
+        the NEXT death takes the port down permanently. A live session's
+        HTTPS_PROXY is fixed at exec, so that is ConnectionRefused forever.
+
+        This is not only SIGHUP. Any way the holder leaves without taking the
+        daemon with it lands here (SIGQUIT, SIGABRT, a segfault, a targeted
+        kill). The detector is not signal-shaped either: `held_by_a_holder`
+        compares `CSWAP_PIN_HELD_BY` against `getppid()`, and an orphaned
+        daemon is reparented to init, so the comparison ALREADY goes false on
+        every one of those paths. The daemon simply never asked.
+
+        Recovery is the handover it already implements: hand the socket down,
+        and the successor's holder ADOPTS it rather than binding. Same path,
+        same 0-refused property, one new question.
+
+        THE CODE IS UNCHANGED HERE, deliberately — a fingerprint that never
+        moves is what proves the orphan is what triggered this and not the
+        code watch. `case_an_unchanged_module_never_hands_over` is the other
+        half: unchanged code AND no holder record must do nothing.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        events = []
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: "fp-same")
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda n, e, c, **k: events.append(("spawn", n)) or 1)
+        # HELD BY A PID THAT IS NOT OUR PARENT — which is exactly what the
+        # environment of an orphaned daemon says, because the variable names
+        # the holder that started it and `getppid()` has moved to init.
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getpid() + 1_000_000))
+        assert not pin_proxy.held_by_a_holder(), (
+            "the fixture failed to look orphaned — this case proves nothing"
+        )
+
+        _Srv = _recording_server(events)
+
+        certdir = self._certdir(tmp_path)
+        done = threading.Event()
+        threading.Timer(0.25, done.set).start()
+        pin_proxy._watch_own_code(
+            _Srv(), "1", "a@example.com", certdir,
+            done, teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01, _own_fingerprint="fp-same",
+        )
+
+        assert ("spawn", "1") in events, (
+            f"the daemon kept serving with no holder above it: {events}"
+        )
+        assert events.index(("stop", None)) < events.index(("spawn", "1")), events
+        # The successor owns the wiring, exactly as in the code-change path.
+        assert not [e for e in events if e[0] == "teardown"], events
+
+    def case_an_orphan_hands_the_socket_down_instead_of_keeping_it(self):
+        """AN ORPHANED DAEMON'S SOCKET IS ITS OWN TO PASS ON.
+
+        `release_listener(hand_down=True)` refuses to hand down an INHERITED
+        socket, and rightly: a holder that is still there will put the next
+        daemon on that very socket, so passing it to a child we do not control
+        leaves two owners. But `_inherited` is decided once, in `start()`, and
+        the holder can die afterwards — at which point the refusal is answering
+        about a holder that no longer exists.
+
+        MEASURED end to end, isolated port 49927, holder SIGHUPped:
+
+            11:57:10 the holder above this daemon is gone — handing over
+            11:57:13 holder could not take the port (49927 is taken —
+                     refusing to hold a different one) — serving unheld
+            11:57:13 serving on port 37001
+
+        The recycle fired correctly and still produced the outage it exists to
+        prevent: the successor's holder found the port occupied — by the
+        orphan, which had kept the socket — so it served UNHELD on a fresh
+        number while the wiring named the old one. Every session whose
+        HTTPS_PROXY was fixed at exec is stranded.
+
+        THE CONTROL is the same call with a live holder, which must still
+        refuse. Without it, "hands it down" would pass just as well for code
+        that always hands down and re-breaks the 201,909-refused case.
+        """
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        def _hand_down_under(holder_pid):
+            """What `release_listener(hand_down=True)` returns for a daemon
+            whose recorded holder is `holder_pid`. The env is set PER CALL:
+            it is one global variable, so building both servers up front let
+            the second overwrite the first and the control answered about the
+            wrong one."""
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(8)
+            proxy = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+            proxy._srv = srv
+            proxy._stop = False
+            proxy._accept_thread = None
+            proxy._handed_fd = None
+            proxy._inherited = True          # what start() recorded
+            os.environ[pin_proxy._HELD_BY_ENV] = str(holder_pid)
+            try:
+                return proxy.release_listener(hand_down=True), srv
+            finally:
+                os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+
+        # THE CONTROL: the holder is our own parent, so it is alive.
+        kept, kept_srv = _hand_down_under(os.getppid())
+        # ...and here the recorded holder is a pid we are not a child of,
+        # which is exactly what an orphaned daemon's environment says.
+        fd, orphan_srv = _hand_down_under(os.getpid() + 1_000_000)
+        try:
+            assert kept is None, (
+                "CONTROL FAILED: a socket a LIVE holder owns was handed down — "
+                "two processes would accept on it"
+            )
+            assert fd is not None, (
+                "an orphan kept the socket instead of handing it down, so the "
+                "successor's holder finds the port taken and serves unheld"
+            )
+            os.close(fd)
+        finally:
+            for srv in (kept_srv, orphan_srv):
+                try:
+                    srv.close()
+                except OSError:
+                    pass
+
     def case_an_unchanged_module_never_hands_over(self, tmp_path, monkeypatch):
         """THE CONTROL. Without it the suite cannot tell "recycles when the
         code changed" from "recycles always", and the second would replace a
