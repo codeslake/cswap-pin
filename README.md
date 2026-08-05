@@ -73,6 +73,33 @@ The pin is an optional extra of claude-swap, not a standalone tool: it reads
 cswap's account store and rewrites the config cswap already manages. Installing
 `cswap-pin` on its own does nothing useful.
 
+### Upgrading a machine that is already serving
+
+**The upgrade itself runs the OLD code.** A daemon notices its own code
+changed on disk and recycles — using the handover its own version implements,
+not the one you are installing. So a fix to that path cannot fix the handover
+that installs it, and each machine has exactly one unsafe transition.
+
+Measured on two machines the day this was learned: the outgoing daemon handed
+its listening socket to a successor, the successor's holder found the port
+still held and served on a fresh one instead, and `.claude.json` followed it
+there. Every session that had the old number baked in at exec got
+`ConnectionRefused` until a human noticed.
+
+So do it deliberately rather than letting the watchdog do it:
+
+```bash
+uv pip install --python <tool-python> --upgrade cswap-pin   # 1. install
+cswap pin --get_port                                        # 2. note the port
+# 3. retire the running holder (its daemon goes with it)
+kill -TERM "$(pgrep -f 'cswap_pin.proxy --hold-port' | head -1)"
+# 4. put the NEW code on the port the config names
+python -m cswap_pin.proxy --hold-port <port> <account> <email> <certdir> &
+```
+
+Then check that port answers before touching the next machine. `cswap pin
+--ensure` repairs the wiring if the window left it empty.
+
 ## Use
 
 ```bash
