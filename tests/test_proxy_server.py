@@ -1495,6 +1495,116 @@ class TestChainRediscovery:
             "stays single-hop and falls to DIRECT when that hop dies"
         )
 
+    def case_a_hop_naming_the_pin_itself_is_never_recorded_or_dialled(
+        self, certdir
+    ):
+        """A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP.
+
+        `learn_next_hop` records whatever the hop's `/health` reports, and
+        `_probe_next_hop` guards a hop naming ITSELF — not a hop naming the
+        PIN. That is the shape the CCF session measured on this box and fixed
+        on its own side (commit dba90bd): a `cache-fix-proxy run-service`
+        launched from a shell that already exported the chain adopted the
+        pin's own port as its upstream, so the path became
+
+            9901 -> 36301 -> 9901 -> …
+
+        and never reached privoxy. A looped proxy neither answers nor exits —
+        it shows up here as `accepted but did not tunnel: no reply`, and on
+        CCF's side as a 100s test hang.
+
+        MEASURED against this code before the guard, isolated ports:
+
+            hop reported:   http://127.0.0.1:36301
+            pin's own port: 36301
+            recorded next:  http://127.0.0.1:36301
+            LOOP RECORDED: the pin would dial itself
+
+        CCF fixing its side is not enough: the record outlives the process
+        that wrote it, so a chain learned during the polluted window would
+        keep pointing here after CCF was repaired. And a hop can be polluted
+        by anything, not only by CCF.
+
+        BOTH ENDS, because they fail at different times: refusing to RECORD
+        stops it being written, and refusing to DIAL covers a record written
+        by an older version — including the ones already on disk today.
+
+        THE CONTROL is a hop naming a different port, which must still be
+        recorded, or "refuses a loop" would pass for code that learns nothing.
+        """
+        import http.server
+        import threading
+
+        from cswap_pin.proxy import PinProxy, _read_upstream, write_upstream_hint
+
+        class _Health(http.server.BaseHTTPRequestHandler):
+            answer: dict = {}
+
+            def do_GET(self):
+                body = json.dumps(self.answer).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        def _learned(next_port, my_port):
+            _Health.answer = {"https_proxy": f"http://127.0.0.1:{next_port}"}
+            srv = http.server.HTTPServer(("127.0.0.1", 0), _Health)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            write_upstream_hint(
+                certdir, f"http://127.0.0.1:{srv.server_address[1]}", next_hop="",
+            )
+            try:
+                proxy = PinProxy(
+                    certdir=certdir,
+                    pin_token_provider=lambda: None,
+                    upstream=("127.0.0.1", 1),
+                    rediscover_chain=True,
+                )
+                proxy.port = my_port
+                proxy.learn_next_hop()
+                return _read_upstream(certdir, "next")
+            finally:
+                srv.shutdown()
+
+        # CONTROL: a real outer hop is still learned.
+        assert _learned(8118, 36301) == "http://127.0.0.1:8118", (
+            "CONTROL FAILED: a genuine next hop was not recorded, so the "
+            "refusal below says nothing"
+        )
+        # ASSERT ON WHAT IS NOT WRITTEN, not on an empty read: refusing writes
+        # NOTHING, so a re-read returns whatever the control just recorded.
+        # An `assert not _learned(...)` here reads the control's own answer
+        # and fails for the wrong reason.
+        assert _learned(36301, 36301) != "http://127.0.0.1:36301", (
+            "the pin recorded ITSELF as its own next hop — every request "
+            "would dial back into this daemon (9901 -> 36301 -> 9901)"
+        )
+
+        # AND THE WALK REFUSES ONE ALREADY ON DISK, written by an older
+        # version or by a launch during the polluted window.
+        write_upstream_hint(
+            certdir, "http://127.0.0.1:9901", next_hop="http://127.0.0.1:36301",
+        )
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            rediscover_chain=True,
+        )
+        proxy.port = 36301
+        dialled = [c.address for c in proxy._chain_candidates()]
+        assert ("127.0.0.1", 36301) not in dialled, (
+            f"the walk would dial the pin's own port: {dialled}"
+        )
+        assert ("127.0.0.1", 9901) in dialled, (
+            f"CONTROL FAILED: dropping the loop also dropped the real hop: "
+            f"{dialled}"
+        )
+
     def case_a_host_with_no_chain_pays_nothing_for_the_heal_grace(self, certdir):
         """The grace is for a hop that is RESTARTING, not for having no hop.
 
@@ -2644,6 +2754,94 @@ class TestHealthEndpoint:
 
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
+
+    def case_health_says_when_the_chain_is_being_bypassed(self, certdir):
+        """/health MUST NOT BE GREEN WHILE EGRESS HAS LEFT THE CHAIN.
+
+        `chain` reports the hop the relay WOULD use — the configured one —
+        so a daemon that cannot reach any hop and is dialling DIRECT reports
+        exactly what a healthy one does. Every field was green through two
+        measured outages, on both this component and the peer's.
+
+        DIRECT is not a degraded-but-fine state on a corporate host: the
+        direct route IS the TLS-inspecting proxy, so it answers 403 "Access
+        restricted by network policy". Owner's count on lmd42 for one day:
+
+            egress DIRECT                61
+            dial failed                 148
+            accepted but did not tunnel  89
+            egress via (healthy)        238
+
+        61 is not an exception. The pin detected all four outages and wrote
+        all four to daemon.log; nobody read it any of the four times, and a
+        human repaired the chain by hand each time. The detection was already
+        finished — only the wiring was missing.
+
+        THE THREE ARE NOT ONE, and the alarm must keep them apart (owner's
+        point, and the peer agrees): `dial failed` is a port that is not
+        there, `accepted but did not tunnel` is a proxy that is up and looped,
+        and DIRECT is the chain given up on. Collapsing them turns a measured
+        2s window during a peer restart into an incident.
+
+        THE CONTROL is the same daemon with a reachable hop, which must report
+        `egress` as the hop — otherwise "says DIRECT" would pass for a field
+        that says DIRECT always.
+        """
+        import json as _json
+
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        def _health(chain_target):
+            write_upstream_hint(certdir, chain_target)
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: None,
+                upstream=("127.0.0.1", 1),
+                rediscover_chain=True,
+            )
+            proxy.start()
+            try:
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                raw.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                raw.settimeout(5)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                body = resp.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in resp else b""
+                try:
+                    body += raw.recv(4096)
+                except OSError:
+                    pass
+                raw.close()
+                return _json.loads(body.decode() or "{}")
+            finally:
+                proxy.stop()
+
+        # A hop that is NOT there: the relay has never dialled, so the field
+        # must be honest about not knowing rather than claiming a chain.
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+        data = _health(f"http://127.0.0.1:{dead_port}")
+        assert "egress" in data, (
+            "/health reports the CONFIGURED chain and nothing about whether "
+            "egress is actually using it — the field a monitor needs"
+        )
+
+        # CONTROL: a reachable hop must report itself, not DIRECT.
+        hop = _LoopbackConnectProxy(("127.0.0.1", 1))
+        try:
+            live = _health(f"http://127.0.0.1:{hop.port}")
+            assert live.get("egress") != "direct", (
+                f"CONTROL FAILED: a reachable hop was reported as DIRECT "
+                f"({live.get('egress')!r}) — the field says direct always"
+            )
+        finally:
+            hop.stop()
 
     def case_health_reports_pin_and_chain(self, certdir):
         from cswap_pin.proxy import PinProxy
