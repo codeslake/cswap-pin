@@ -1814,6 +1814,154 @@ class TestThePortIsConfigurable:
                 f"do the opposite of what was asked"
             )
 
+        # AND 0 IN THE ENV MEANS THE SAME AS `--set_port 0`: ephemeral, full
+        # stop. It used to fall through to the file, so the same word meant
+        # "let the kernel choose" from the CLI and "ignore my 0, use whatever I
+        # saved months ago" from an rc export — and a user could not force a
+        # dynamic port on a machine that had ever been given a fixed one.
+        pin_proxy.write_pin_settings(certdir, port=41234)
+        monkeypatch.setenv("CSWAP_PIN_PORT", "0")
+        assert pin_proxy.configured_port(certdir) is None, (
+            "an explicit 0 fell through to the saved port — `export "
+            "CSWAP_PIN_PORT=0` must mean ephemeral, exactly as `--set_port 0` "
+            "does"
+        )
+        # A TYPO IS NOT AN INSTRUCTION, though: it still falls through, because
+        # the saved setting is a better answer than nothing.
+        monkeypatch.setenv("CSWAP_PIN_PORT", "not-a-port")
+        assert pin_proxy.configured_port(certdir) == 41234
+        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
+        assert pin_proxy.configured_port(certdir) == 41234
+
+    def case_our_own_self_loop_marker_is_not_a_user_setting(
+        self, tmp_path, monkeypatch
+    ):
+        """`CSWAP_PIN_PORT` in the env is OURS unless a user put it there.
+
+        We write it into `.claude.json`'s env block as the self-loop marker,
+        and Claude Code applies that block at boot — so every process inside a
+        pinned session inherits it, including a daemon spawned from a Bash
+        tool there. Read back naively it says "the user asked for the port the
+        LIVE daemon is already on", and the new daemon then fights the running
+        one for its port.
+
+        NOT HYPOTHETICAL — this is what wiring the setting first exposed: four
+        unrelated tests went red, each trying to bind the developer's real
+        36301 and logging "configured port 36301 is not available". The suite
+        had been inheriting that value all along with nothing reading it.
+
+        `CSWAP_PIN_WIRED` is written beside it and nowhere else, so it
+        identifies our own value. A user's rc export has no companion.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = self._certdir(tmp_path)
+
+        # A user's own export: honoured.
+        monkeypatch.setenv("CSWAP_PIN_PORT", "44444")
+        monkeypatch.delenv("CSWAP_PIN_WIRED", raising=False)
+        assert pin_proxy.configured_port(certdir) == 44444
+
+        # The same number, but wearing OUR marker: not a setting at all.
+        monkeypatch.setenv("CSWAP_PIN_WIRED", "1")
+        assert pin_proxy.configured_port(certdir) is None, (
+            "the pin read its own self-loop marker back as a user setting — a "
+            "daemon started inside a pinned session would try to bind the "
+            "live daemon's port"
+        )
+
+        # ...and the settings file still answers, because that one is
+        # unambiguous however the session was launched.
+        pin_proxy.write_pin_settings(certdir, port=45555)
+        assert pin_proxy.configured_port(certdir) == 45555
+
+    def case_the_daemon_actually_binds_the_configured_port(
+        self, tmp_path, monkeypatch
+    ):
+        """The setting has to REACH bind(), ahead of the reclaim order.
+
+        Without this the whole feature is a file nobody reads: `--set_port`
+        persisted a number and the daemon went on choosing an ephemeral one.
+
+        AHEAD OF THE RECORDED PORT, asserted here by recording a DIFFERENT
+        one. The reclaim exists to keep live sessions attached across a
+        respawn, so it wins by default — but a port the user set is a standing
+        instruction, and honouring it only when no record happened to survive
+        would make `--set_port` a no-op on exactly the machines that have been
+        running.
+        """
+        import socket as _socket
+
+        from cswap_pin.proxy import PinProxy, write_daemon_state, write_pin_settings
+
+        certdir = self._certdir(tmp_path)
+        ensure_ca(certdir, "api.anthropic.com")
+
+        s = _socket.socket()
+        s.bind(("127.0.0.1", 0))
+        wanted = s.getsockname()[1]
+        s.close()  # free again; we only needed a port nothing else holds
+
+        # A recorded port that is NOT the configured one: the setting must win.
+        recorded = _socket.socket()
+        recorded.bind(("127.0.0.1", 0))
+        other = recorded.getsockname()[1]
+        recorded.close()
+        write_daemon_state(certdir, other, os.getpid(), "fp")
+        write_pin_settings(certdir, port=wanted)
+        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        proxy.start()
+        try:
+            assert proxy.port == wanted, (
+                f"served on {proxy.port}, not the configured {wanted} — "
+                f"`cswap pin --set_port` writes a file nothing binds"
+            )
+        finally:
+            proxy.stop(drain=0)
+
+    def case_an_unavailable_configured_port_serves_anyway_and_says_so(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A port we cannot have must not stop the pin — but must be reported.
+
+        Failing to start would be worse than the wrong port: the standing rule
+        is that a pin never blocks work. The danger is the silent version of
+        that, where the only symptom is a number not matching what was set and
+        nothing anywhere says why.
+        """
+        import socket as _socket
+
+        from cswap_pin.proxy import PinProxy, write_pin_settings
+
+        certdir = self._certdir(tmp_path)
+        ensure_ca(certdir, "api.anthropic.com")
+
+        blocker = _socket.socket()
+        blocker.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        taken = blocker.getsockname()[1]
+
+        write_pin_settings(certdir, port=taken)
+        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        proxy.start()
+        try:
+            assert proxy.port and proxy.port != taken, (
+                "the daemon did not come up at all because one port was busy"
+            )
+            err = capsys.readouterr().err
+            assert str(taken) in err and str(proxy.port) in err, (
+                "the configured port was silently ignored — the log must name "
+                f"both numbers; got: {err!r}"
+            )
+        finally:
+            proxy.stop(drain=0)
+            blocker.close()
+
     def case_the_settings_file_survives_a_rewrite(self, tmp_path, monkeypatch):
         """Writing the port must not destroy anything else in the file.
 

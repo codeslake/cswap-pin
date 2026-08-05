@@ -112,6 +112,19 @@ def _redirect_everything_to(tmp_path, monkeypatch):
     # this suite spawns, which do not inherit a patched module object), and
     # `Path.home()` (its fallback when XDG is unset, and anything that
     # computes the path itself).
+    # AND THE PIN'S OWN ENV, which a pinned developer's session inherits at
+    # BOOT. Claude Code applies `.claude.json`'s env block into process.env,
+    # so every test run from inside a pinned session started with
+    # `CSWAP_PIN_PORT` naming the LIVE daemon's port. Nothing read it until
+    # the daemon started honouring a configured port — and then four unrelated
+    # tests went red, each trying to bind the developer's real 36301 and
+    # logging "configured port 36301 is not available". The suite was reading
+    # a value from outside its own fixture, exactly like the config paths
+    # above; it just had no consumer yet.
+    for name in ("CSWAP_PIN_PORT", "CSWAP_PIN_WIRED", "CSWAP_PIN_FIFO",
+                 "CSWAP_PIN_REFCOUNT_FD"):
+        monkeypatch.delenv(name, raising=False)
+
     store = tmp_path / "data-home"
     store.mkdir(exist_ok=True)
     monkeypatch.setenv("XDG_DATA_HOME", str(store))

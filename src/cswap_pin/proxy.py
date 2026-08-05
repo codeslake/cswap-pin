@@ -242,6 +242,11 @@ def read_upstream_ca(certdir: Path) -> str | None:
 
 
 _WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
+
+# Written beside CSWAP_PIN_PORT in the same env block, purely so a process can
+# tell OUR value from the user's own export of the same name. See
+# `configured_port`.
+_WIRED_MARKER_ENV = "CSWAP_PIN_WIRED"
 _WIRE_MARK = "_cswapPinWiredKeys"
 
 # -- where the receipt lives -------------------------------------------------
@@ -1909,6 +1914,11 @@ def _wire_global_config_locked(
             # ambient one. Without the marker it records THAT as the upstream
             # and the daemon starts CONNECTing to itself.
             "CSWAP_PIN_PORT": str(port),
+            # Says the number above is OURS, not a user's rc export. Without
+            # it `configured_port` reads our own marker back as a standing
+            # instruction and a daemon spawned inside a pinned session tries
+            # to bind the live daemon's port.
+            _WIRED_MARKER_ENV: "1",
         }
         # Remember what we are about to displace, so unwiring is lossless.
         displaced = {k: env[k] for k in wanted if k in env}
@@ -3388,14 +3398,52 @@ def configured_port(certdir: Path) -> int | None:
     so honouring a configured 0 would do the OPPOSITE of what the user meant
     while looking like it worked.
     """
-    for value in (os.environ.get("CSWAP_PIN_PORT"), _settings_port(certdir)):
+    # THE ENVIRONMENT ANSWERS OR IT DOES NOT — it never falls through to the
+    # file. `CSWAP_PIN_PORT=0` is a user saying "let the kernel choose", the
+    # same thing `--set_port 0` means, and the same word has to mean the same
+    # thing in both places. Falling through made it mean "ignore my 0 and use
+    # whatever I saved months ago", so a rc export could not force a dynamic
+    # port on a machine that had ever been given a fixed one.
+    #
+    # Anything else unparseable in the env IS a fall-through: a typo is not an
+    # instruction, and the saved setting is the better answer than nothing.
+    env = _env_port()
+    if env is not None:
         try:
-            port = int(value)
+            port = int(env)
         except (TypeError, ValueError):
-            continue
-        if 0 < port <= 65535:
+            port = None
+        if port == 0:
+            return None  # explicit: ephemeral, and the file does not override
+        if port is not None and 0 < port <= 65535:
             return port
-    return None
+    try:
+        port = int(_settings_port(certdir))
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port <= 65535 else None
+
+
+def _env_port() -> object:
+    """``CSWAP_PIN_PORT`` from the environment — ONLY when a user set it.
+
+    THE NAME HAS TWO AUTHORS. We write it into `.claude.json`'s env block
+    ourselves as the self-loop marker (see `wire_global_config`), and Claude
+    Code applies that block at boot, so every process inside a pinned session
+    inherits it — including a daemon spawned from a Bash tool there. Read back
+    naively it says "the user asked for the port the LIVE daemon is already
+    on": measured, such a daemon tried to bind 36301, failed, and logged
+    "configured port 36301 is not available" on every start, taking four
+    unrelated tests red with it.
+
+    `CSWAP_PIN_WIRED` is written beside it in the same block and nowhere else,
+    so its presence identifies our own value. A user's rc export has no such
+    companion, and `--set_port` writes the settings file instead — which is
+    unambiguous either way.
+    """
+    if os.environ.get(_WIRED_MARKER_ENV):
+        return None
+    return os.environ.get("CSWAP_PIN_PORT")
 
 
 def _settings_port(certdir: Path) -> object:
@@ -5100,8 +5148,21 @@ class PinProxy:
         # requests then leave WITHOUT the pin instead of failing loudly
         # (measured: an RC session created that way was owned by the active
         # account while the pin still looked healthy).
+        # WHAT THE USER ASKED FOR WINS, ahead of every reclaim below. The
+        # reclaim order exists to keep LIVE sessions attached across a
+        # respawn; a configured port is a standing instruction about where
+        # this pin serves, and honouring it only when no record happened to
+        # survive would make `--set_port` do nothing on the machines that
+        # matter — the ones that have been running.
+        #
+        # The cost is real and belongs to whoever sets it: moving the port
+        # strands sessions whose HTTPS_PROXY was fixed at exec, exactly as the
+        # note below describes. That is why nothing here CHANGES the port on
+        # its own; it changes only when a human says so.
+        want = configured_port(self._certdir)
         prev = read_daemon_state(self._certdir)
-        want = prev.get("port") if isinstance(prev, dict) else None
+        if not isinstance(want, int):
+            want = prev.get("port") if isinstance(prev, dict) else None
         if not isinstance(want, int):
             # A respawn deletes proxy.json before starting us, so the port to
             # reclaim arrives via the hint the spawner left instead.
@@ -5129,6 +5190,17 @@ class PinProxy:
                           # ephemeral port
         self._srv.listen(64)
         self.port = self._srv.getsockname()[1]
+        # SAY SO WHEN A CONFIGURED PORT WAS NOT HONOURED. The fall-through
+        # above is right — a pin must serve rather than refuse — but silence
+        # turns "the port I set is not being used" into a mystery whose only
+        # symptom is a number that does not match. Everything the reader needs
+        # is the two numbers and the reason.
+        asked = configured_port(self._certdir)
+        if isinstance(asked, int) and asked != self.port:
+            _log_lifecycle(
+                f"configured port {asked} is not available — serving on "
+                f"{self.port} instead"
+            )
         self._start_accept_loop()
 
     def _start_accept_loop(self) -> None:
