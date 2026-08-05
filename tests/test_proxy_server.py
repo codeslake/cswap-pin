@@ -1354,6 +1354,130 @@ class TestChainRediscovery:
         )
         assert len(attempts) == 3, f"walked {len(attempts)} times, expected 3"
 
+    def case_connections_do_not_become_threads(self, tmp_path):
+        """CONNECTIONS MUST NOT BECOME THREADS.
+
+        MEASURED OUTAGE, lmd42: the cache hop died and the pin served 27,491
+        threads / 44,121 FDs in 40 minutes; load on a 48-core box reached
+        16,483 and it was rescued by hand. The mechanism, measured here on the
+        daemon before this changed, hop wedged and counted from OUTSIDE the
+        process:
+
+            idle          4 threads
+             50 conns ->  54 threads
+            150 conns -> 154 threads
+            300 conns -> 304 threads
+
+        Exactly 1:1, so the retry count IS the thread count. A ceiling was
+        tried and removed: it turns the 257th retry into a refused connection
+        while the coupling stays.
+
+        COUNTED FROM ANOTHER PROCESS, deliberately. Every in-process count is
+        wrong here — `threading.active_count()` also counts this test's own
+        opener threads, which are the same order of magnitude as the thing
+        being measured, and it read "grew=0" while every connection had its
+        own server thread.
+        """
+        import os
+        import socket
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        port = pin_proxy._spawn_daemon("1", "a@example.com", tmp_path)
+        assert port, "the daemon did not come up"
+        st = pin_proxy.read_daemon_state(tmp_path)
+        pid = int(st["pid"])
+
+        def _threads():
+            try:
+                with open(f"/proc/{pid}/status") as fh:
+                    for line in fh:
+                        if line.startswith("Threads:"):
+                            return int(line.split()[1])
+            except OSError:
+                pass
+            return -1
+
+        if _threads() < 0:
+            return  # not Linux: /proc is the only portable answer here
+
+        # THE FAR END OF THE TUNNEL, local and idle. The outage's connections
+        # were OPEN TUNNELS, not half-finished handshakes: pointing them at
+        # `api.anthropic.com` instead measures `wrap_socket` waiting for a TLS
+        # ClientHello this test never sends, which is a different thread and a
+        # different bug.
+        far = socket.socket()
+        far.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        far.bind(("127.0.0.1", 0))
+        far.listen(512)
+        far_port = far.getsockname()[1]
+
+        def _accept_forever():
+            while True:
+                try:
+                    far.accept()
+                except OSError:
+                    return
+
+        threading.Thread(target=_accept_forever, daemon=True).start()
+
+        held, lock = [], threading.Lock()
+
+        def _hold():
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=5)
+                s.sendall(
+                    f"CONNECT 127.0.0.1:{far_port} HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{far_port}\r\n\r\n".encode()
+                )
+                if b"200" not in s.recv(200):
+                    return
+                with lock:
+                    held.append(s)
+                s.recv(65536)   # park on an OPEN tunnel
+            except OSError:
+                pass
+
+        idle = _threads()
+        try:
+            deadline = time.time() + 20
+            while time.time() < deadline and len(held) < 300:
+                want = 300 - len(held)
+                for t in [threading.Thread(target=_hold, daemon=True)
+                          for _ in range(want)]:
+                    t.start()
+                for _ in range(40):
+                    if len(held) >= 300:
+                        break
+                    time.sleep(0.05)
+            # SETTLE FIRST. A connection mid-setup still has its thread —
+            # it is handed to the shared pump only once the tunnel is open —
+            # so counting the instant the last one lands measures the ramp,
+            # not the steady state this is about. Measured: 26 threads while
+            # connecting, 5 a moment later, for the same 300 tunnels.
+            time.sleep(1)
+            live, grew = len(held), _threads() - idle
+            assert live >= 250, f"only {live} connections landed; not loaded"
+            assert grew < 20, (
+                f"{live} connections cost {grew} threads (idle was {idle}) — "
+                f"connections still become threads, which is what took the box "
+                f"down"
+            )
+        finally:
+            for s in held:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+            far.close()
+
     def case_health_reports_the_chain_the_relay_would_use(self, certdir):
         """A probe that says "no chain" while every request goes through one
         sends the next diagnosis the wrong way. Measured after a cc-update
