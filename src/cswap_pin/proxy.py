@@ -3211,9 +3211,80 @@ _DAEMON_MODULE = "cswap_pin.proxy"
 _DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 
 _STATE_FILE = "proxy.json"
+# The pin's OWN settings, in the pin's OWN directory. `CSWAP_PIN_PORT` used to
+# live in `~/.claude.json`'s env block, and it is the one entry there that
+# Claude Code never reads — HTTPS_PROXY, https_proxy, ALL_PROXY and
+# NODE_EXTRA_CA_CERTS are consumed by CC at boot; that number is consumed only
+# by us. Settings for an optional feature do not belong in another program's
+# exclusive file, and a user who wanted a fixed port had nowhere to say so.
+_SETTINGS_FILE = "settings.json"
 _FIFO_NAME = "refcount.fifo"
 _LOG_NAME = "daemon.log"
 _LOG_MAX_BYTES = 64 * 1024
+
+
+def configured_port(certdir: Path) -> int | None:
+    """The port the user asked us to serve on, or None for an ephemeral one.
+
+    THREE SOURCES, AND THE ORDER IS THE POINT:
+
+      1. ``CSWAP_PIN_PORT`` in the ENVIRONMENT. A user who exports it in their
+         rc has said what they want for this shell, and nothing on disk may
+         overrule a value they typed.
+      2. ``settings.json`` in the cert dir, written by ``cswap pin
+         --set_port``. Persistent, machine-wide, and ours.
+      3. Nothing. The daemon takes an ephemeral port, which is what every
+         machine does today.
+
+    RANGE-CHECKED HERE, at the read. A value outside 1-65535 is not a port,
+    and 0 is worse than invalid: ``bind()`` reads it as "choose one for me",
+    so honouring a configured 0 would do the OPPOSITE of what the user meant
+    while looking like it worked.
+    """
+    for value in (os.environ.get("CSWAP_PIN_PORT"), _settings_port(certdir)):
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < port <= 65535:
+            return port
+    return None
+
+
+def _settings_port(certdir: Path) -> object:
+    """The persisted port, raw. Unreadable or absent is no opinion."""
+    try:
+        raw = json.loads(
+            (Path(certdir) / _SETTINGS_FILE).read_text(encoding="utf-8")
+        )
+    except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
+        return None
+    return raw.get("port") if isinstance(raw, dict) else None
+
+
+def write_pin_settings(certdir: Path, *, port: int | None) -> None:
+    """Persist the requested port, or drop it when ``port`` is None.
+
+    READ-MODIFY-WRITE, not a truncate. This is a SETTINGS file: the next
+    setting to land here would otherwise be erased by the next `--set_port`,
+    which is the kind of loss nobody notices until the setting they set has
+    quietly gone.
+    """
+    path = Path(certdir) / _SETTINGS_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception:  # noqa: BLE001 — absent or garbage: start clean
+        raw = {}
+    if port is None:
+        raw.pop("port", None)
+    else:
+        raw["port"] = int(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def refcount_fifo_path(certdir: Path) -> Path:
