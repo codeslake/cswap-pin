@@ -211,6 +211,34 @@ class TestRepinIsLive:
                 "an unchanged file read as a redeploy — a no-op install "
                 "recycles a healthy daemon and costs a handover for nothing"
             )
+            # AND THE CHEAPER PROXIES MUST FAIL HERE. A peer proxy in the
+            # same chain encodes this as an explicit mutation and it is
+            # stronger than asserting the right answer alone: it pins WHICH
+            # wrong implementations this test rejects.
+            import hashlib
+
+            def _by_mtime():
+                return hashlib.sha256(
+                    str(src.stat().st_mtime_ns).encode()
+                ).hexdigest()[:16]
+
+            src.write_bytes(original + b"\n# redeployed\n")
+            os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns))
+            assert _by_mtime() == hashlib.sha256(
+                str(st.st_mtime_ns).encode()
+            ).hexdigest()[:16], (
+                "the mtime mutation did not reproduce — this test would pass "
+                "against an implementation it is supposed to reject"
+            )
+            src.write_bytes(original)
+            os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns))
+            # size alone: a one-character edit keeps the length
+            same_len = bytearray(original)
+            same_len[-1] = ord("#") if same_len[-1] != ord("#") else ord(" ")
+            src.write_bytes(bytes(same_len))
+            assert daemon_fingerprint() != before, (
+                "a same-LENGTH edit read as unchanged — size is not content"
+            )
         finally:
             src.write_bytes(original)
             os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -2639,6 +2667,44 @@ class TestDaemonPortStability:
         finally:
             proxy.stop()
             squatter.close()
+
+    def case_an_idle_teardown_under_a_holder_still_unwires(self, tmp_path):
+        """A holder's bare socket is not "somebody else is serving".
+
+        The teardown asks the PORT rather than a file, because a successor
+        that came up while we drained is real and unwiring past it would strip
+        a working pin. But under a holder the socket we just released is still
+        bound and listening — `release_listener` DETACHES rather than closes
+        when the port is not ours — and a listen-only socket completes a TCP
+        handshake (verified). So `_port_answers` said "served", the unwire was
+        skipped, the daemon exited 0, and the holder then released the port on
+        that clean exit: `.claude.json` left naming an address nothing listens
+        on, which is the ConnectionRefused-forever outage the unwire exists to
+        prevent.
+
+        The question the guard means to ask is "is somebody ELSE serving",
+        and a socket held on our own behalf is not somebody else.
+        """
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+
+        # The predicate, driven directly: under a holder, our own held socket
+        # must not read as a successor.
+        prev = os.environ.get(pin_proxy._HELD_BY_ENV)
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        try:
+            assert pin_proxy.held_by_a_holder(), "premise: we are under a holder"
+            assert not pin_proxy._successor_is_serving(), (
+                "a holder's own listening socket read as a successor — the "
+                "teardown skips the unwire and every later session dials a "
+                "port nothing answers"
+            )
+        finally:
+            if prev is None:
+                os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            else:
+                os.environ[pin_proxy._HELD_BY_ENV] = prev
 
     def case_the_port_answers_across_a_SIGKILL_of_the_daemon(self, tmp_path):
         """A CRASH is the case a handover cannot cover.
@@ -8977,7 +9043,15 @@ class TestTeardownAsksThePortBeforeUnwiring:
             for n in ast.walk(teardown)
             if isinstance(n, ast.Call)
         )
-        probe = [ln for ln, name in calls if name == "_port_answers"]
+        # EITHER SPELLING. The question moved into `_successor_is_serving`
+        # when the probe learned to ignore our own holder's socket — a
+        # listen-only socket completes a handshake, so `_port_answers` alone
+        # answered "served" about the port we had just stopped serving. What
+        # this case is about is the ORDER, which is unchanged.
+        probe = [
+            ln for ln, name in calls
+            if name in ("_port_answers", "_successor_is_serving")
+        ]
         unwire = [ln for ln, name in calls if name == "wire_global_config"]
         assert probe, "_teardown no longer asks whether the port is served"
         assert unwire, "_teardown no longer unwires at all"

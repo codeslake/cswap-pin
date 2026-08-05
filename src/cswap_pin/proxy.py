@@ -4131,6 +4131,14 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     # commonest deploy there is. Both are the same mistake — answering a
     # cheaper question than the one that matters.
     #
+    # NO TORN READ TO GUARD AGAINST, because this hashes the file it is
+    # ALREADY IMPORTING rather than a hash someone else publishes. An installer
+    # replaces it by rename — measured: `pip install --force-reinstall` changes
+    # the inode, so a reader either sees the whole old file or the whole new
+    # one. A design that writes a hash to a SIDE FILE does need temp+rename
+    # there, since a reader catching a partial write compares against a
+    # truncated hash and retires a healthy process.
+    #
     # Reading the file costs one stat + one read per check (the watchdog polls
     # on an interval, not per request), against a mistake that costs an outage.
     try:
@@ -5065,6 +5073,33 @@ _HANDDOWN_FROM_ENV = "CSWAP_PIN_LISTEN_FROM"
 _HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
 
 
+def _successor_is_serving() -> bool:
+    """Is SOMEBODY ELSE serving the wired port?
+
+    The teardown asks the port rather than a file, because a successor that
+    came up while we drained is real and unwiring past it would strip a
+    working pin — measured: unwire at 19:16:35, successor serving at 19:16:36,
+    a live session retrying in between.
+
+    BUT A HOLDER'S SOCKET IS NOT SOMEBODY ELSE. Under a holder,
+    `release_listener` DETACHES rather than closes (the port is not ours to
+    take down), so the socket we just stopped serving is still bound and
+    listening — and a listen-only socket completes a TCP handshake. The probe
+    therefore answered "served" about our own corpse: the unwire was skipped,
+    the daemon exited 0, the holder released the port on that clean exit, and
+    `.claude.json` was left naming an address nothing listens on. That is the
+    ConnectionRefused-forever outage this whole guard exists to prevent,
+    reached through the guard itself.
+
+    So a port that answers counts only when it is NOT the one our own holder
+    is holding for us.
+    """
+    live = _wired_port()
+    if live is None or not _port_answers(live):
+        return False
+    return not held_by_a_holder()
+
+
 def held_by_a_holder(ppid: int | None = None, env=None) -> bool:
     """Whether a holder owns this daemon's socket and will outlive it.
 
@@ -5290,10 +5325,10 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             # publishes its record and rewires only once it is serving, so
             # between our decision and its publication the files say we are
             # alone while the port says otherwise.
-            live = _wired_port()
-            if live is not None and _port_answers(live):
+            if _successor_is_serving():
                 _log_lifecycle(
-                    f"port {live} is still served — leaving the wiring alone"
+                    f"port {_wired_port()} is still served — leaving the "
+                    f"wiring alone"
                 )
                 return
             # Put ``.claude.json`` back the way we found it. Without this the env
@@ -6685,17 +6720,29 @@ class PinProxy:
         # maintainer killed the holder three times in a row: process count
         # unchanged, one replacement per death, no accumulation), so a ladder
         # here would only add a busy loop neither side intended.
-        deadline = time.monotonic() + _CHAIN_HEAL_GRACE_S
-        while True:
-            sock = self._walk_chain_once()
-            if sock is not None:
-                return sock
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(_CHAIN_HEAL_POLL_S)
-        # Every hop is still unusable after the grace period: fall through to
-        # the unchained dial, which is what this method has always ended in.
+        # NOTHING TO WAIT FOR IF THERE IS NO HOP. The grace exists for a hop
+        # that is RESTARTING; an empty candidate list means this host has no
+        # chain at all, and `_walk_chain_once` returns None instantly forever.
+        # Entering the loop anyway cost 2.60s on EVERY upstream dial —
+        # measured, so every new MITM connection and every bridge-sweep call —
+        # on exactly the machines where the direct dial is the normal path.
+        #
+        # The constant's comment already claimed this ("a host with no chain
+        # at all never enters this loop"); the code did not implement it, and
+        # the comment was the half being believed.
         candidates = self._chain_candidates()
+        if candidates:
+            deadline = time.monotonic() + _CHAIN_HEAL_GRACE_S
+            while True:
+                sock = self._walk_chain_once()
+                if sock is not None:
+                    return sock
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_CHAIN_HEAL_POLL_S)
+        # Every hop is still unusable after the grace period (or there was
+        # never a hop): fall through to the unchained dial, which is what this
+        # method has always ended in.
         sock = _dial_with_no_chain(self._upstream)
         sock.settimeout(None)
         self._note_egress(direct=True, configured=bool(candidates))
