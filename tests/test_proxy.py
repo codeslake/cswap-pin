@@ -2659,6 +2659,80 @@ class TestDaemonPortStability:
         finally:
             squatter.close()
 
+    def case_a_held_daemon_exits_instead_of_handing_the_port_away(
+        self, tmp_path
+    ):
+        """A code-change handover under a holder must stay under it.
+
+        MEASURED ON THIS MACHINE, 76 minutes of broken pin reported healthy:
+
+          10:13:07  daemon: code on disk changed — handing over
+          10:13:15  successor holder: could not take 36301 — serving UNHELD
+                    on 33349
+          10:18:15  33349: idle teardown — UNWIRED .claude.json
+
+        The daemon handed its listening socket straight to a successor, so the
+        successor had no holder above it: the port stopped being crash-proof,
+        and the one thing that could still strand sessions did.
+
+        Under a holder there is nothing to hand over. The holder already owns
+        the socket, so the daemon exits and lets it spawn the successor there.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        assert pin_proxy.held_by_a_holder(ppid=1, env={}) is False
+        assert pin_proxy.held_by_a_holder(
+            ppid=4242, env={pin_proxy._HELD_BY_ENV: "4242"}
+        ) is True, "a daemon cannot tell it is under a holder"
+        # A predecessor's hand-down is NOT a holder: it is leaving.
+        assert pin_proxy.held_by_a_holder(
+            ppid=4242, env={pin_proxy._HANDDOWN_FROM_ENV: "4242"}
+        ) is False
+
+        # AND THE WATCHDOG MUST ACT ON IT. The predicate being right is not
+        # the fix — the fix is that the code-change path takes the exit branch
+        # instead of the hand-over branch. Drive it with a stub server and a
+        # fingerprint that never matches, and assert it never spawns.
+        import threading
+
+        spawned = []
+        exited = []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                return 7 if hand_down else None
+
+            def await_inflight(self, budget):
+                pass
+
+        real_spawn = pin_proxy._spawn_daemon
+        real_exit = os._exit
+        pin_proxy._spawn_daemon = lambda *a, **k: spawned.append(a) or 1234
+        os._exit = lambda code: exited.append(code) or (_ for _ in ()).throw(
+            SystemExit(code)
+        )
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                lambda *a: None, interval=0.01,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+        finally:
+            pin_proxy._spawn_daemon = real_spawn
+            os._exit = real_exit
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+        assert exited == [pin_proxy._RESTART_ME_CODE], (
+            f"a held daemon did not exit for its holder (exits={exited})"
+        )
+        assert not spawned, (
+            "a held daemon handed its socket to a successor — the port leaves "
+            "the holder and a stranding is one failed bind away (measured: 76 "
+            "minutes of unwired pin on host-a)"
+        )
+
     def case_an_idle_teardown_is_not_restarted(self, tmp_path):
         """A daemon that MEANT to exit must stay exited.
 
