@@ -4649,11 +4649,31 @@ def holder_main(account_num: str, email: str, certdir: Path,
     except OSError as exc:
         # SOMEBODY ELSE IS ALREADY ON OUR PORT, which is usually a healthy pin
         # — a concurrent launch won the election, or the predecessor has not
-        # finished draining. Serve as a plain daemon instead of dying: it will
-        # reclaim the port when it frees, and one unheld daemon is what every
-        # release before this one shipped.
-        _log_lifecycle(f"holder could not take the port ({exc}) — serving unheld")
-        daemon_main(account_num, email, Path(certdir))
+        # finished draining after our bind budget.
+        #
+        # THIS USED TO SERVE AS A PLAIN DAEMON, on the premise that it would
+        # "reclaim the port when it frees". A daemon cannot move its port: the
+        # address is fixed at bind, and every session's HTTPS_PROXY was fixed
+        # at exec. So the fallback reclaimed nothing and served on an EPHEMERAL
+        # port nothing is wired to. Measured during an orphan recovery:
+        #
+        #   11:57:13 holder could not take the port (49927 is taken —
+        #            refusing to hold a different one) — serving unheld
+        #   11:57:13 serving on port 37001
+        #
+        # Two daemons then exist: the one on the wired port, and a second the
+        # sweep will not reap (its own state record is valid) that no session
+        # can reach.
+        #
+        # The bind fails for two opposite reasons and NEITHER wants a second
+        # daemon: if a healthy pin holds the port we are redundant, and if the
+        # port is held by something not serving, another port does not help.
+        # So exit. Every caller already handles "no successor came up", and the
+        # incumbent is by definition still there.
+        _log_lifecycle(
+            f"holder could not take the port ({exc}) — exiting rather than "
+            f"serving on an address nothing is wired to"
+        )
         return
     _log_lifecycle(f"holding port {holder.port} for account {account_num}")
 
