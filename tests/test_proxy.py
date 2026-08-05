@@ -2887,7 +2887,10 @@ class TestDaemonPortStability:
 
             first = holder.daemon_pid
             assert first, "no daemon was started under the holder"
-            holder.kill_daemon_for_test()
+            # SIGKILL through the Popen, never through the pid: `daemon_pid`
+            # is only ours while the Popen it came from is, and signalling a
+            # bare number once killed a pytest-xdist worker (see `stop`).
+            holder._proc.kill()
 
             # THE POINT: no window. Not "it comes back in a second" — the
             # socket was never the daemon's to take down with it, so a

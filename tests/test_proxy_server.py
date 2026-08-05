@@ -1424,6 +1424,86 @@ class TestChainRediscovery:
         )
         assert len(attempts) == 3, f"walked {len(attempts)} times, expected 3"
 
+    def case_a_socket_the_selector_cannot_drive_still_carries_bytes(self):
+        """The fallback for an undrivable socket must not be the selector.
+
+        `_pump_detached` asks `_PumpLoop.can_take` and falls back to `_pump`
+        for a socket the selector cannot drive — an `https://` chain hop
+        (`_TLSInTLS`), which has no `setblocking`. But `_pump` was rewritten
+        to be `_PUMP.add` plus an Event, so the fallback re-entered the very
+        call that cannot take it and raised the same AttributeError. Measured
+        on the shipped code:
+
+            can_take: False
+            fallback RAISED: AttributeError ... has no attribute 'setblocking'
+
+        AttributeError is not in `_handle_one_request`'s except tuple, so it
+        escapes and kills the connection: behind a TLS egress proxy that is
+        Remote Control's inbound WebSocket dying on every launch — the exact
+        failure `can_take` was added to prevent.
+
+        THE CONTROL is the same shuttle over a plain socketpair, which the
+        selector CAN take. Without it a fallback that silently carried
+        nothing would read as a pass.
+        """
+        import socket
+        import threading
+
+        from cswap_pin.proxy import _PumpLoop, _pump_detached
+
+        class _NoSetblocking:
+            """`_TLSInTLS`'s surface: no `setblocking`, hence undrivable."""
+
+            def __init__(self, sock):
+                self._sock = sock
+
+            def sendall(self, data):
+                return self._sock.sendall(data)
+
+            def recv(self, n=65536):
+                return self._sock.recv(n)
+
+            def fileno(self):
+                return self._sock.fileno()
+
+            def close(self):
+                return self._sock.close()
+
+        def _carries(wrap):
+            """Bytes both ways through one tunnel. Returns what arrived."""
+            feed, a = socket.socketpair()
+            b, sink = socket.socketpair()
+            closed = threading.Event()
+            threading.Thread(
+                target=_pump_detached, args=(wrap(a), wrap(b), closed.set),
+                daemon=True,
+            ).start()
+            try:
+                feed.sendall(b"ping")
+                sink.settimeout(3)
+                try:
+                    return sink.recv(16)
+                except (socket.timeout, OSError):
+                    return b""
+            finally:
+                for s in (feed, a, b, sink):
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+        assert _PumpLoop.can_take(_NoSetblocking(socket.socket())) is False, (
+            "the shim is drivable after all — this case proves nothing"
+        )
+        assert _carries(lambda s: s) == b"ping", (
+            "CONTROL FAILED: a plain socketpair carried nothing, so the "
+            "undrivable result below says nothing about the fallback"
+        )
+        assert _carries(_NoSetblocking) == b"ping", (
+            "a socket the selector cannot drive carried nothing — the "
+            "fallback routed back into the selector that had just refused it"
+        )
+
     def case_one_stalled_peer_does_not_stop_every_other_tunnel(self, certdir):
         """The shared pump must not re-couple what it decoupled.
 
