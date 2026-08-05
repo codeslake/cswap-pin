@@ -40,10 +40,19 @@ dependencies = ["cryptography>=42.0"]
 # in addopts and the suite does not run at all. Measured on a venv with plain
 # pytest: "error: unrecognized arguments: -n".
 #
-# claude-swap is here and NOT in `dependencies` for the reason the comment
-# above it gives: it is a peer. The TESTS import the host, the package does
-# not.
-dev = ["pytest", "pytest-xdist", "claude-swap"]
+# claude-swap is DELIBERATELY ABSENT, though the tests import it. Listing it
+# here made `uv run` unresolvable and took the publish workflow down with it:
+#
+#   Because the requested Python version (>=3.10) does not satisfy
+#   Python>=3.12 and all versions of claude-swap depend on Python>=3.12 ...
+#   your project's requirements are unsatisfiable.
+#
+# This package supports 3.10+; the host requires 3.12+. A dev group is
+# resolved against the FULL `requires-python` range, so naming the host here
+# would force this package's floor up to the host's — for a peer it does not
+# even depend on. The workflow installs it with `--with claude-swap`
+# instead, which resolves against the interpreter actually running.
+dev = ["pytest", "pytest-xdist"]
 
 [project.urls]
 Homepage = "https://github.com/codeslake/cswap-pin"
