@@ -88,8 +88,18 @@ uv tool install --force --editable '.[pin]'     # from the checkout
 
 Nothing to do. Install the new version; the running daemon notices its own
 code changed and replaces itself, on the same port, without dropping anything.
-Measured across a real code change on a live daemon: **75,697 requests, 0
-refused, 0 reset**, same port, new pid.
+Measured across a real code change on a live daemon: **68,168 requests, 0
+refused, 0 reset, 0 unanswered**, same port, new pid.
+
+**`refused=0` on its own is not that claim**, and it is worth saying because
+this package spent several releases believing it was. The port is held by a
+process that outlives the daemon, so during a handover it stays bound and
+every arrival queues in the backlog: a probe that only counts
+`ConnectionRefusedError` is structurally incapable of failing, however long
+nobody is behind the socket. One machine drained for 30 seconds that way —
+`refused=0` the whole time, and 30 requests died on a 3s timeout with no
+reply. The numbers above count a request that connects and is never answered
+as a failure, which is what it is to a session.
 
 This used to need a procedure, and a procedure is not an answer — a deploy is
 not something someone follows, it is whatever the running code does. Two
@@ -264,7 +274,7 @@ For a serial repro of a failure, add `-n 0`: xdist gives no live output and
 truncates tracebacks it cannot attribute to a worker.
 
 One pytest test runs many `case_*` methods (`run_cases` in `conftest.py`), so
-113 collected tests carry 347 cases. A failure names both: `Class::case_name`.
+113 collected tests carry 352 cases. A failure names both: `Class::case_name`.
 
 ## Why a separate package
 

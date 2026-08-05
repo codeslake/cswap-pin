@@ -2097,14 +2097,44 @@ class TestDaemonPortStability:
             stop = threading.Event()
 
             def hammer():
+                """A REQUEST, not a connect. A bare `create_connection().close()`
+                cannot see the failure that matters here.
+
+                While a departing daemon drains, the port stays BOUND — the
+                holder's socket queues arrivals — so a connect always succeeds
+                and `refused` is structurally 0 no matter how long nobody is
+                behind it. Measured on lmd42 during a 30s held-exit drain:
+                refused=0, and 30 requests died on a 3s timeout with no reply.
+                A refused-only hammer calls that window healthy.
+
+                So this sends a CONNECT and requires an answer. Something that
+                accepts and never replies counts as a failure, which is what it
+                is to a session.
+                """
                 while not stop.is_set():
                     try:
-                        socket.create_connection(
-                            ("127.0.0.1", port), timeout=2
-                        ).close()
-                        served.append(1)
+                        s = socket.create_connection(("127.0.0.1", port), timeout=2)
                     except OSError as exc:
                         refused.append(repr(exc))
+                        time.sleep(0.002)
+                        continue
+                    try:
+                        s.settimeout(2)
+                        s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                                  b"Host: api.anthropic.com:443\r\n\r\n")
+                        if s.recv(64):
+                            served.append(1)
+                        else:
+                            refused.append("no reply (EOF)")
+                    except socket.timeout:
+                        refused.append("no reply (timeout)")
+                    except OSError as exc:
+                        refused.append(repr(exc))
+                    finally:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
                     time.sleep(0.002)
 
             h = threading.Thread(target=hammer, daemon=True)
