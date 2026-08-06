@@ -5736,9 +5736,15 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     #     SIGTERM -> the process     : exited after 0.10s
     #
     # In the suite this was an intermittent "no successor within 3.0s" — the
-    # holder never saw an exit because there was none. In production it is
-    # quieter and worse: `cc-update` TERMs the daemon to recycle it, nothing
-    # happens, and the old code serves on while everything reports success.
+    # holder never saw an exit because there was none. In production the TERM
+    # comes from `_kill_daemon` (a recycle, or the orphan sweep), and that one
+    # ESCALATES: 32s later — `_DRAIN_SECONDS` plus the 2s of slack — it sends
+    # SIGKILL. So the dropped signal does not leave the old daemon serving; it
+    # converts an orderly handover into a force-kill, with `stop(drain=…)`
+    # never entered and every in-flight request cut. That is precisely the
+    # guarantee `_kill_daemon` says this release makes, failing silently, and
+    # the escalation is what hides it: the daemon does die, on time, so the
+    # recycle reports success.
     #
     # 0.5 s rather than a wakeup fd: the cost is one loop iteration twice a
     # second in a process that is otherwise idle, against a selector and a
