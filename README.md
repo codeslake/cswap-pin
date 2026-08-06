@@ -220,6 +220,49 @@ change would, and the successor's holder adopts the socket.
 Measured, under load across the whole orphaning: **110,188 requests, 0 refused,
 0 reset**, same port, one holder afterwards.
 
+### When the holder and its daemon die together
+
+The two rows above both leave *something* alive that can put the port back. The
+row neither covers is both going at once — `cswap` fully off, an OOM kill that
+takes the process group, a machine being torn down. The descriptor is closed by
+the kernel with the last process holding it, and a session's `HTTPS_PROXY` was
+fixed at exec, so it has no way to learn the address moved. Measured with both
+gone: **198 of 199 ConnectionRefused**, permanently.
+
+So a third process holds the same descriptor and does nothing with it. It is
+spawned detached (its own session, so a `ctrl-C` or a group-delivered `TERM`
+aimed at the holder misses it) and it **never accepts** — CPython only accepts
+when you call `accept()`, so a listening socket can be held in silence. That is
+what makes this a dormant holder rather than a relay: it forwards no bytes, so
+none of the byte-shuffling failures a relay has to get right exist here.
+
+`CSWAP_PIN_STANDBY_FROM` carries the pid it was born under. It acts only when
+**both** are true:
+
+- `getppid()` no longer reads that pid — *not* `== 1`, which never happens on a
+  subreaper host (`systemd --user`); a standby that never arms while still
+  holding the descriptor makes the address accept-and-hang, strictly worse than
+  refusing.
+- two consecutive probes to the port get **no byte back** within 2s. Any byte
+  counts and the status is ignored — a live daemon answers `407` and a peer's
+  carrying relay answers `503`, and both mean "somebody is behind this socket".
+
+Either condition alone is wrong: while the holder lives it is already respawning
+its own daemon, and a silent port during an ordinary daemon crash is a gap the
+holder closes by itself (measured: 407 of 408 requests served across a daemon
+`SIGKILL`, max time-to-first-byte 6.3ms).
+
+When it does act it does not serve traffic — it puts a holder back on the
+descriptor it was already holding, and requests that arrived meanwhile are
+waiting in the backlog of a socket that never stopped listening.
+
+**Only `SIGHUP` releases it.** `SIGTERM` and `SIGINT` are ignored outright:
+`TERM` is what a supervisor, a `systemctl stop` or a stray `pkill` sends, and
+that is exactly when the sessions still need the address. A peer on this design
+measured their graceful path as *more destructive than `kill -9`* for want of
+that distinction. `PortHolder.stop()` — a deliberate release — sends the
+`SIGHUP` itself, so releasing the port really releases it.
+
 ## Falling through a dead hop
 
 The pin dials through whatever egress proxy the machine already has, and that
