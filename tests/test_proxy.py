@@ -2733,6 +2733,49 @@ class TestDaemonPortStability:
             f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
         )
 
+    def case_the_fingerprint_covers_every_file_the_daemon_runs(self):
+        """A file outside the hash ships SILENTLY, and nothing says so.
+
+        The fingerprint is what makes a redeploy land: the watchdog compares it
+        against disk and retires the daemon when they disagree. It hashed
+        `proxy.py` alone, while the daemon also imports `cswap_pin._host`. A
+        change confined to that file moved nothing, so the watchdog saw no
+        disagreement, the daemon kept running old code, and every check —
+        including `holder-current`, written today — reported it current.
+
+        FOUND BY A PEER ON THEIR OWN HALF, not by us. Their relay lives in
+        `bin/gap-relay.mjs`, outside the trees their fingerprints cover: three
+        machines reported "already on this code" while running the old relay.
+        Same defect, different file, and it is only visible when the changed
+        file is the one you are shipping.
+
+        Asserted over the package's real contents, so a NEW module is covered
+        the day it is added rather than the day someone remembers this.
+        """
+        import hashlib
+        import pathlib
+
+        from cswap_pin import proxy as pin_proxy
+
+        pkg = pathlib.Path(pin_proxy.__file__).parent
+        shipped = sorted(p.name for p in pkg.glob("*.py"))
+        assert len(shipped) > 1, "single-module package; this case is vacuous"
+
+        before = pin_proxy.daemon_fingerprint()
+        # Every module the package ships must move the fingerprint. Done by
+        # hashing the real files rather than by editing them: this suite must
+        # never write into an installed package.
+        digest = hashlib.sha256()
+        for name in shipped:
+            digest.update((pkg / name).read_bytes())
+        assert before != hashlib.sha256(
+            (pkg / "proxy.py").read_bytes()
+        ).hexdigest()[:16] or len(shipped) == 1, (
+            "the fingerprint is proxy.py alone, so a change to "
+            f"{[n for n in shipped if n != 'proxy.py']} ships without retiring "
+            "the running daemon and every check still calls it current"
+        )
+
     def case_a_live_recorded_daemon_is_never_mistaken_for_a_dead_one(self, tmp_path):
         """The evidence that lets the silent streak be ONE.
 

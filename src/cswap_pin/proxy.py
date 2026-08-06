@@ -4273,7 +4273,23 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     # Reading the file costs one stat + one read per check (the watchdog polls
     # on an interval, not per request), against a mistake that costs an outage.
     try:
-        code = Path(__file__).read_bytes()
+        # EVERY MODULE THE PACKAGE SHIPS, not just this one. The daemon
+        # imports `cswap_pin._host`, so a change confined to that file moved
+        # nothing here: the watchdog saw no disagreement, the daemon kept
+        # running old code, and every check reported it current — including
+        # the holder-current one written the same day.
+        #
+        # A peer hit the identical defect from the other side: their relay
+        # lives outside the trees their fingerprints hash, and three machines
+        # reported "already on this code" while running the old relay. It is
+        # only ever visible when the changed file is the one being shipped,
+        # which is exactly when it matters.
+        #
+        # Sorted, so the digest does not depend on directory order.
+        here = Path(__file__).parent
+        code = b"".join(
+            p.read_bytes() for p in sorted(here.glob("*.py"))
+        )
     except OSError:
         # UNREADABLE IS NOT UNCHANGED. Return something stable-but-distinct so
         # a daemon does not read "no fingerprint" as "same as mine" and serve
