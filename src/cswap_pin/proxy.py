@@ -6238,9 +6238,10 @@ class PinProxy:
             # Microseconds when idle, wider under load, which is why it showed
             # up as an intermittent "2 in-flight requests cut by a planned
             # restart" — about 1 run in 6 on a loaded box and never on an idle
-            # one. Registering before the handoff closes the window entirely:
+            # one. Counting before the handoff closes the window entirely:
             # accepted IS connected, whatever the scheduler does next.
-            self._register_client(conn)
+            with self._live_lock:
+                self._open_conns.add(conn)
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
@@ -6280,13 +6281,6 @@ class PinProxy:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _register_client(self, conn: socket.socket) -> None:
-        """Count ``conn`` as connected. Idempotent, because two callers reach
-        it: the accept loop (so a connection is drainable from the instant it
-        exists) and `_serve_client` (for a socket handed to it directly)."""
-        with self._live_lock:
-            self._open_conns.add(conn)
-
     def _serve_client(self, conn: socket.socket) -> None:
         """``_handle_client`` with the connection counted for its lifetime.
 
@@ -6296,12 +6290,8 @@ class PinProxy:
         was then read as "nobody is connected" and let the idle watcher stop
         a daemon mid-conversation.
         """
-        # ALREADY REGISTERED by `_accept_loop` — see the comment there. Called
-        # again here for the paths that hand us a socket directly (tests, and
-        # anything that serves a connection it accepted itself); the register
-        # is idempotent so the common path double-registering is not a leak.
-        self._register_client(conn)
-
+        # ALREADY COUNTED by `_accept_loop`, before this thread existed — see
+        # the comment there. This method only has to give it back.
         def _release():
             with self._live_lock:
                 self._open_conns.discard(conn)
