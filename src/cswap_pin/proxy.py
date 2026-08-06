@@ -6148,11 +6148,28 @@ class PinProxy:
 
         Draining alone is not enough and the difference is not subtle:
         measured, a request that had transferred every one of its bytes STILL
-        reached the client as ConnectionResetError, because the teardown path
-        ends in ``os._exit(0)`` and a process exiting without closing its
-        sockets makes the kernel answer with RST instead of FIN. The data had
-        arrived; the client threw it away over the reset. One
-        ``shutdown(SHUT_WR)`` per connection turns that into a clean EOF.
+        reached the client as ConnectionResetError. The data had arrived; the
+        client threw it away over the reset. One ``shutdown(SHUT_WR)`` per
+        connection turns that into a clean EOF.
+
+        THE PRECONDITION IS UNREAD DATA, not merely exiting with the socket
+        open — an earlier version of this docstring said the latter and it is
+        wrong. Closing a socket that still has unreceived bytes in its receive
+        queue MUST send RST (RFC 1122); closing an idle one sends FIN. Measured
+        here, 2x2 with a control:
+
+            unread data   teardown              client sees
+            no            bare os._exit()       clean EOF (FIN)
+            no            shutdown(SHUT_WR)     clean EOF (FIN)
+            YES           bare os._exit()       ECONNRESET (RST)
+            YES           shutdown(SHUT_WR)     clean EOF (FIN)
+
+        A proxy meets that precondition constantly: the client keeps sending
+        while we tear down, those bytes land in our receive queue, and we exit
+        without reading them. The distinction matters to anyone reading this
+        to decide whether their own component has the same bug — a peer
+        component tested the wrong premise (an IDLE socket), correctly saw FIN
+        either way, and concluded it was immune.
         """
         with self._live_lock:
             conns, self._open_conns = list(self._open_conns), set()
