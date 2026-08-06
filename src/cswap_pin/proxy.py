@@ -5655,8 +5655,18 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         rediscover_chain=True,
     )
     proxy.start()
+    # `_OWN_FINGERPRINT`, NOT a fresh read. This record is an IDENTITY — it is
+    # what `runtime_health`, a deploy check or a human answers "is the running
+    # daemon on this code" from. `daemon_fingerprint()` samples the DISK, so
+    # recording it here would publish what is on disk at start rather than what
+    # this process loaded, and the two differ in exactly the window where the
+    # question matters: a deploy landing during daemon start would make the
+    # record claim the new code while we serve the old.
+    #
+    # Same function, opposite requirement, one line apart in intent — the
+    # watchdog's disk side must be fresh, an identity must not move.
     write_daemon_state(
-        certdir, proxy.port, os.getpid(), daemon_fingerprint(account_num, email)
+        certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT
     )
     # A start line means the log is never empty for a daemon that ran, so
     # "no teardown line" becomes evidence of a CRASH rather than of nothing.
