@@ -4286,9 +4286,18 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
         # which is exactly when it matters.
         #
         # Sorted, so the digest does not depend on directory order.
+        # RECURSIVE, AND THE NAME IS PART OF THE DIGEST. A peer asked the
+        # sharper version of this question after we both fixed the shallow
+        # case: does it NAME the files or WALK them? A list is the defect —
+        # they added their relay one day and left its own import uncovered the
+        # next — and a non-recursive glob is a list in disguise the moment a
+        # subpackage appears. Hashing the name too makes a rename visible,
+        # which pure bytes would miss.
         here = Path(__file__).parent
         code = b"".join(
-            p.read_bytes() for p in sorted(here.glob("*.py"))
+            f.relative_to(here).as_posix().encode() + b"\0" + f.read_bytes()
+            for f in sorted(here.rglob("*.py"),
+                            key=lambda f: f.relative_to(here).as_posix())
         )
     except OSError:
         # UNREADABLE IS NOT UNCHANGED. Return something stable-but-distinct so
