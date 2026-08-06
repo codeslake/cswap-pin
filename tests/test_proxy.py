@@ -3636,6 +3636,99 @@ class TestDaemonPortStability:
             holder.stop()
 
 
+    def case_the_port_queues_a_dial_that_beats_the_first_daemon(self, tmp_path):
+        """A cold-start arrival must WAIT, not be refused.
+
+        A session is handed HTTPS_PROXY at exec and cannot retry a different
+        hop, so one ECONNREFUSED during cold start strands that session for its
+        whole life. The holder calls ``listen()`` at construction and never
+        calls ``accept()``, so the kernel queues; the daemon inherits the SAME
+        listening fd and drains what accumulated. The queue belongs to the
+        SOCKET, not to a process, which is why nothing has to hand it over.
+
+        Measured: connected at t+0.159s with ``proxy.json`` not yet written,
+        and that same socket was answered "HTTP/1.1 200 Connection
+        Established" once the daemon came up.
+
+        A peer component that binds without listening has no backlog and
+        refuses in this window — the property is easy to lose by accident,
+        and nothing else in this suite pins it.
+        """
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        from cswap_pin.proxy import ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        # CONTROL: that port must refuse right now, or "queued" and "nobody
+        # is there" are the same observation.
+        control = socket.socket()
+        control.settimeout(2)
+        try:
+            control.connect(("127.0.0.1", port))
+            raise AssertionError(
+                f"port {port} answered before anything bound it — the case "
+                f"cannot tell queueing from a live server"
+            )
+        except ConnectionRefusedError:
+            pass
+        finally:
+            control.close()
+
+        log = open(tmp_path / "h.log", "wb")
+        holder = subprocess.Popen(
+            [sys.executable, "-m", "cswap_pin.proxy", "--hold-port", str(port),
+             "1", "a@b.c", str(tmp_path)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+        )
+        state = tmp_path / "proxy.json"
+        try:
+            sock, before_daemon = None, None
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                s = socket.socket()
+                s.settimeout(0.3)
+                try:
+                    s.connect(("127.0.0.1", port))
+                    sock, before_daemon = s, not state.exists()
+                    break
+                except OSError:
+                    s.close()
+                    time.sleep(0.005)
+            assert sock is not None, "the port never accepted a connection"
+            try:
+                assert before_daemon, (
+                    "the dial only landed after the daemon had published — "
+                    "this case measures the window BEFORE it, and did not "
+                    "reach it"
+                )
+                sock.settimeout(25)
+                sock.sendall(
+                    b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                    b"Host: api.anthropic.com:443\r\n\r\n"
+                )
+                reply = sock.recv(120)
+                assert b"200" in reply, (
+                    f"a connection queued before the daemon existed was not "
+                    f"served once it arrived: {reply[:60]!r}"
+                )
+            finally:
+                sock.close()
+        finally:
+            from conftest import _reap_pin_processes
+
+            if holder.poll() is None:
+                holder.terminate()
+            _reap_pin_processes(tmp_path)
+
     def case_a_cold_start_puts_a_holder_on_the_port(self, tmp_path):
         """The holder has to be REACHED, not merely implemented.
 
