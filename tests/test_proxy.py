@@ -3137,13 +3137,24 @@ class TestDaemonPortStability:
                 # itself. The deadline is longer than the old sleep, so a
                 # genuinely slow respawn is still caught rather than raced
                 # past, and the hammer keeps counting throughout either way.
-                gone = int(st["pid"]) if st else None
+                assert st, (
+                    "no daemon state to kill — the fixture stopped exercising "
+                    "the planned-restart path before it began"
+                )
+                gone = int(st["pid"])
                 deadline = time.time() + 3.0
                 while time.time() < deadline:
                     now = read_daemon_state(tmp_path)
                     if now and int(now["pid"]) != gone:
                         break
                     time.sleep(0.02)
+                else:
+                    raise AssertionError(
+                        f"no successor to {gone} within 3.0s — a respawn this "
+                        f"slow is the failure the wait exists to catch, and "
+                        f"falling through silently would kill an already-dead "
+                        f"pid on the next iteration instead of reporting it"
+                    )
             stop.set()
             for t in threads:
                 t.join(timeout=3)
