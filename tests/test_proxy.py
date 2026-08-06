@@ -3035,23 +3035,36 @@ class TestDaemonPortStability:
         both mean the same thing here: somebody is behind this socket. Parsing
         would have made those two disagree.
         """
-        from cswap_pin.proxy import _STANDBY_SILENT_STREAK, _standby_tick
+        from cswap_pin.proxy import (
+            _STANDBY_ANSWERED_POLL_S,
+            _STANDBY_POLL_S,
+            _STANDBY_SILENT_STREAK,
+            _standby_tick,
+        )
 
         assert _STANDBY_SILENT_STREAK >= 2, (
             "one silent probe is a slow answer, not a death"
         )
         born = 4242
+        dials = []
 
         def run(ppids, answers):
             """Feed a sequence of (ppid, answered) ticks; return when it armed."""
             silent = 0
+            del dials[:]
             for i, (ppid, ans) in enumerate(zip(ppids, answers)):
-                silent, arm = _standby_tick(
-                    born, silent, lambda a=ans: a, getppid=lambda p=ppid: p
+                def _probe(a=ans):
+                    dials.append(a)
+                    return a
+                silent, arm, wait = _standby_tick(
+                    born, silent, _probe, getppid=lambda p=ppid: p
                 )
+                waits.append(wait)
                 if arm:
                     return i
             return None
+
+        waits = []
 
         n = _STANDBY_SILENT_STREAK
         assert run([born] * 8, [False] * 8) is None, (
@@ -3081,6 +3094,30 @@ class TestDaemonPortStability:
             "reading the birth parent again must CLEAR the streak, not pause "
             "it — a latched counter arms on the next single silence, long "
             "after the holder came back"
+        )
+
+        # COST, not just correctness — each state wants a different rate.
+        run([born] * 3, [False] * 3)
+        assert not dials, (
+            "the standby dialled its port while its holder was alive. The "
+            "parent test must short-circuit BEFORE the probe: this is the "
+            "normal state and it should open no socket at all"
+        )
+        assert waits[-1] == _STANDBY_POLL_S
+
+        run([99] * 3, [True] * 3)
+        assert waits[-1] == _STANDBY_ANSWERED_POLL_S > _STANDBY_POLL_S, (
+            "orphaned-but-answering is polled at the tight interval. Nothing "
+            "converges in that state — a daemon outliving its holder keeps "
+            "answering while our parent stays dead forever — so this is a "
+            "connection every poll, for the life of the process, that can "
+            "never change the outcome"
+        )
+
+        run([99], [False])
+        assert waits[-1] == _STANDBY_POLL_S, (
+            "silence is the one state that IS converging toward arming, so "
+            "backing off there would just slow recovery"
         )
 
     def case_the_predecessor_stops_accepting_before_it_hands_the_socket_over(
