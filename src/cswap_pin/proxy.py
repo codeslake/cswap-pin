@@ -4740,8 +4740,8 @@ class PortHolder:
                 return
             self._failures += 1
             _log_lifecycle(
-                f"daemon {self.daemon_pid} exited; restarting under the held "
-                f"port {self.port}"
+                f"daemon {self.daemon_pid} exited (code {code}); restarting "
+                f"under the held port {self.port}"
             )
             # SAY IT ONCE when the successor is not merely crashing but cannot
             # start at all — see `_HOLD_RESTART_REPORT_AT`. Exactly at the
@@ -5605,7 +5605,93 @@ def _watch_own_code(
                 done.set()
 
 
-def _inherited_listener() -> "socket.socket | None":
+# CONNECTIONS THE ADOPT PROBE HAD TO ACCEPT TO PROVE THE SOCKET WAS LISTENING.
+# Darwin cannot answer `SO_ACCEPTCONN`, so the only portable proof is an
+# accept() — and an accept that returns is a real client, mid-request. Closing
+# it loses that request, so it is parked here and the serving loop takes it
+# before it asks the kernel for another. Emptied by whoever serves it; a
+# process that adopts and never serves closes these itself.
+_ADOPTED_BACKLOG: "list[socket.socket]" = []
+
+
+def _connect_probe(sock: "socket.socket") -> int:
+    """Is ``sock`` listening? Answered without consuming anybody's connection.
+
+    For the callers that ADOPT BUT DO NOT SERVE — a holder, a standby. They
+    need the same proof `_accept_probe` gives, and must not pay its price: an
+    accept that returns hands back a live client, and a process with no serving
+    loop holds it until the client times out. Measured: the standby swallowed a
+    queued request and sat on it for the client's full 60s, which is worse than
+    the drop it replaced.
+
+    Dialling our own address separates the two states on every platform: a
+    LISTENING socket completes the handshake from the backlog, a bound-but-
+    never-listened one answers ECONNREFUSED. Skipping the probe entirely was
+    tried first and is wrong — `case_a_listening_socket_is_adopted_where_
+    SO_ACCEPTCONN_cannot_be_read` exists because adopting a non-listening
+    descriptor is a real failure, and it caught this immediately.
+
+    Costs one connection queued on our own backlog, which we close at once. The
+    daemon that later drains it sees a client that hung up, which every proxy
+    already handles. A TIMEOUT counts as listening: only a listening socket can
+    make a connect hang, by having a full queue.
+    """
+    try:
+        addr = sock.getsockname()
+    except OSError:
+        return 0
+    try:
+        with socket.create_connection(addr[:2], timeout=1.0):
+            return 1
+    except ConnectionRefusedError:
+        return 0
+    except (TimeoutError, socket.timeout):
+        return 1
+    except OSError:
+        # Anything else is not evidence of "never listened"; refusing here
+        # would strand the sessions this handover exists to keep.
+        return 1
+
+
+def _accept_probe(sock: "socket.socket") -> int:
+    """Is ``sock`` listening? Answered by asking it, because Darwin will not say.
+
+    `SO_ACCEPTCONN` is readable on Linux and raises `OSError 42` on Darwin —
+    measured, same call. Treating that raise as "not listening" refused every
+    handover on macOS and the successor bound a FRESH port, which is the
+    stranding this whole path exists to prevent.
+
+    A non-blocking accept() answers on both platforms: a LISTENING socket with
+    an empty queue raises EAGAIN (BlockingIOError), one that never listened
+    raises EINVAL. The timeout is restored either way — leaving a socket
+    non-blocking would turn every later accept into a busy spin.
+
+    ONLY FOR A CALLER THAT WILL SERVE. When the queue is NOT empty this returns
+    a live client, and the old code closed it: a request that had completed its
+    handshake, and usually sent its bytes, got an RST or a bare EOF. Measured
+    on via-work-mac across a handover. It is parked in `_ADOPTED_BACKLOG` now
+    and the serving loop takes it first — which is only a fix if the caller has
+    a serving loop, hence `will_serve`.
+    """
+    prev = sock.gettimeout()
+    try:
+        sock.settimeout(0)
+        conn, _ = sock.accept()
+        _ADOPTED_BACKLOG.append(conn)
+        _log_lifecycle(
+            f"pid={os.getpid()} adopt probe accepted a waiting client — "
+            f"parked to serve, not dropped"
+        )
+        return 1
+    except BlockingIOError:
+        return 1  # listening, queue empty — the normal case
+    except OSError:
+        return 0  # EINVAL: never listened
+    finally:
+        sock.settimeout(prev)
+
+
+def _inherited_listener(will_serve: bool = False) -> "socket.socket | None":
     """The listening socket a supervisor handed us, or None to bind our own.
 
     The systemd socket-activation convention: ``LISTEN_FDS`` counts the fds
@@ -5651,25 +5737,12 @@ def _inherited_listener() -> "socket.socket | None":
         try:
             listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
         except OSError:
-            # ASK THE SOCKET INSTEAD. A non-blocking accept() answers on both
-            # platforms and cannot consume a connection we would then drop:
-            # a LISTENING socket with an empty queue raises EAGAIN
-            # (BlockingIOError), and one that never listened raises EINVAL.
-            # Measured on both. The timeout is restored either way — the
-            # accept loop sets its own, and leaving a socket non-blocking
-            # would turn every accept into a busy spin.
-            prev = sock.gettimeout()
-            try:
-                sock.settimeout(0)
-                conn, _ = sock.accept()
-                conn.close()  # it WAS listening, and a client was waiting
-                listening = 1
-            except BlockingIOError:
-                listening = 1  # listening, queue empty — the normal case
-            except OSError:
-                listening = 0  # EINVAL: never listened
-            finally:
-                sock.settimeout(prev)
+            # A CALLER THAT WILL NOT SERVE MUST NOT ACCEPT: an accept that
+            # returns hands back a live client, and a holder or standby has no
+            # loop to serve it. Both still need the proof, so they dial the
+            # address instead of consuming from its queue.
+            listening = (_accept_probe(sock) if will_serve
+                         else _connect_probe(sock))
         if not listening:
             raise OSError("not listening")
         sock.getsockname()
@@ -5803,7 +5876,7 @@ def _orphaned_from_its_holder(env=None) -> bool:
     return bool(env.get(_HELD_BY_ENV)) and not held_by_a_holder(env=env)
 
 
-def _handed_down_listener() -> "socket.socket | None":
+def _handed_down_listener(will_serve: bool = False) -> "socket.socket | None":
     """The listening socket our PREDECESSOR passed us, or None to bind our own.
 
     A separate path from :func:`_inherited_listener`, and it has to be. That
@@ -5852,25 +5925,12 @@ def _handed_down_listener() -> "socket.socket | None":
         try:
             listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
         except OSError:
-            # ASK THE SOCKET INSTEAD. A non-blocking accept() answers on both
-            # platforms and cannot consume a connection we would then drop:
-            # a LISTENING socket with an empty queue raises EAGAIN
-            # (BlockingIOError), and one that never listened raises EINVAL.
-            # Measured on both. The timeout is restored either way — the
-            # accept loop sets its own, and leaving a socket non-blocking
-            # would turn every accept into a busy spin.
-            prev = sock.gettimeout()
-            try:
-                sock.settimeout(0)
-                conn, _ = sock.accept()
-                conn.close()  # it WAS listening, and a client was waiting
-                listening = 1
-            except BlockingIOError:
-                listening = 1  # listening, queue empty — the normal case
-            except OSError:
-                listening = 0  # EINVAL: never listened
-            finally:
-                sock.settimeout(prev)
+            # A CALLER THAT WILL NOT SERVE MUST NOT ACCEPT: an accept that
+            # returns hands back a live client, and a holder or standby has no
+            # loop to serve it. Both still need the proof, so they dial the
+            # address instead of consuming from its queue.
+            listening = (_accept_probe(sock) if will_serve
+                         else _connect_probe(sock))
         if not listening:
             raise OSError("not listening")
         sock.getsockname()
@@ -6284,7 +6344,10 @@ class PinProxy:
                 self._inherited = False
                 self._start_accept_loop()
                 return
-        handed = _handed_down_listener()
+        # THE ONLY CALLERS THAT SERVE. `_start_accept_loop` is right below,
+        # so a client the probe has to accept is served rather than parked
+        # forever. The holder and the standby adopt too and never serve.
+        handed = _handed_down_listener(will_serve=True)
         if handed is not None:
             # OUR PREDECESSOR'S SOCKET, still listening. It stopped accepting
             # before it passed this down, so connections that arrived during
@@ -6302,7 +6365,7 @@ class PinProxy:
             self.port = self._srv.getsockname()[1]
             self._start_accept_loop()
             return
-        inherited = _inherited_listener()
+        inherited = _inherited_listener(will_serve=True)
         if inherited is not None:
             # A SUPERVISOR OWNS THE PORT. It bound the socket before we existed
             # and will hold it after we exit, so the port answers whether this
@@ -6584,12 +6647,22 @@ class PinProxy:
         # socket is not ours to close.
         srv.settimeout(0.5)
         while not self._stop:
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                return
+            # THE ADOPT PROBE'S CASUALTY, SERVED FIRST. It is older than
+            # anything the kernel still has queued, and it has been waiting
+            # since before this process existed. See `_ADOPTED_BACKLOG`.
+            if _ADOPTED_BACKLOG:
+                conn = _ADOPTED_BACKLOG.pop(0)
+                _log_lifecycle(
+                    f"pid={os.getpid()} serving the client the adopt probe "
+                    f"had to accept"
+                )
+            else:
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
             # A timeout on the LISTENER is inherited by every socket it
             # accepts, which would then cut a quiet-but-healthy stream. The
             # wait above is about noticing shutdown, not about the client.

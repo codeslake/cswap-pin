@@ -2789,6 +2789,100 @@ class TestDaemonPortStability:
             "is worse than the refusal it was meant to replace"
         )
 
+    def case_adopting_a_socket_does_not_drop_the_client_already_queued_on_it(
+        self, monkeypatch
+    ):
+        """The macOS handover probe ACCEPTED a waiting client and closed it.
+
+        `SO_ACCEPTCONN` is readable on Linux and raises `OSError 42` on Darwin,
+        so the adopt path falls back to a non-blocking `accept()` to prove the
+        socket is listening. When the queue is empty that is free. When a
+        client IS waiting it returned a live connection and did `conn.close()`
+        — dropping a request that had already completed its handshake. The
+        comment above it claimed the probe "cannot consume a connection we
+        would then drop"; it consumed and dropped exactly one, every handover,
+        on the two machines out of three that are Macs.
+
+        Invisible until the standby made queueing normal: every connection that
+        arrives during a gap sits in the backlog, so the first one is always
+        sacrificed. Measured on via-work-mac — a queued request that sent data
+        got ConnectionResetError, and one that stayed silent got EOF.
+
+        Forced here rather than skipped on Linux: the Darwin-only branch is the
+        one with the bug, so the test makes `getsockopt` fail the way Darwin
+        fails and runs the same code everywhere.
+        """
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        import contextlib
+
+        real_getsockopt = socket.socket.getsockopt
+
+        def _darwin(self, level, opt, *a):
+            if opt == socket.SO_ACCEPTCONN:
+                raise OSError(42, "Protocol not available")
+            return real_getsockopt(self, level, opt, *a)
+
+        monkeypatch.setattr(socket.socket, "getsockopt", _darwin)
+        monkeypatch.setenv(pin_proxy._HANDDOWN_FROM_ENV, str(os.getppid()))
+        trash = []
+
+        def adopt(**kw):
+            """A listening socket with ONE client waiting, adopted once.
+
+            Fresh every call: `socket.socket(fileno=fd)` TAKES OWNERSHIP, so a
+            second adopt of the same fd finds it closed as soon as the first
+            wrapper is collected.
+            """
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(128)
+            client = socket.create_connection(srv.getsockname(), timeout=2)
+            client.sendall(b"CONNECT example.invalid:443 HTTP/1.1\r\n\r\n")
+            trash.extend((srv, client))
+            monkeypatch.setenv(pin_proxy._HANDDOWN_FD_ENV, str(srv.fileno()))
+            pin_proxy._ADOPTED_BACKLOG.clear()
+            got = pin_proxy._handed_down_listener(**kw)
+            trash.append(got)
+            return got, list(pin_proxy._ADOPTED_BACKLOG)
+
+        try:
+            # A CALLER THAT WILL NOT SERVE MUST NOT TOUCH THE QUEUE. A holder
+            # and a standby both adopt and have no accept loop, so a client
+            # they consume is held until it times out — worse than the drop.
+            quiet_sock, quiet_kept = adopt()
+            assert quiet_sock is not None, (
+                "the handdown was refused for a socket that IS listening"
+            )
+            assert not quiet_kept, (
+                "a non-serving adopter consumed the queued client; nothing in "
+                "that process will ever serve it, so the request hangs until "
+                "the client gives up"
+            )
+
+            # The serving adopter must take it rather than drop it.
+            adopted, kept = adopt(will_serve=True)
+            assert adopted is not None, "the handdown was refused outright"
+            assert kept, (
+                "the probe consumed the queued client and dropped it — that "
+                "request is gone, and on a Mac this happens on every handover "
+                "that has anyone waiting"
+            )
+            # And it is the SAME connection, still carrying its request.
+            kept[0].settimeout(2)
+            assert kept[0].recv(7) == b"CONNECT", (
+                "the kept connection is not the client's, or its request was "
+                "consumed"
+            )
+        finally:
+            for c in list(pin_proxy._ADOPTED_BACKLOG) + trash:
+                with contextlib.suppress(OSError, AttributeError):
+                    c.close()
+            pin_proxy._ADOPTED_BACKLOG.clear()
+
     def case_the_standby_probe_can_tell_a_held_socket_from_a_served_one(self):
         """The probe must separate "somebody replied" from "somebody is bound".
 
