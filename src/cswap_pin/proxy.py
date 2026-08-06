@@ -4989,6 +4989,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     checked first and short-circuits, so the steady state is one integer
     comparison every 250ms and no connections at all.
     """
+    import fcntl
     import signal
 
     srv = _handed_down_listener()
@@ -5041,11 +5042,54 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
             pass
         return
 
+    # EXACTLY ONE STANDBY MAY ARM, and a lock is the only thing that can say so.
+    # Standbys accumulate legitimately: every holder that is KILLED rather than
+    # released leaves its own behind, by design — that is the row this covers.
+    # They all then watch the same port, so a single silent window arms ALL of
+    # them and each becomes a holder.
+    #
+    # MEASURED ON LMD42, not reasoned about: three armed within a minute of each
+    # other and produced four acceptors on 36301, which is precisely the
+    # property the whole design exists to keep. The silent window that set them
+    # off was an ordinary daemon handover.
+    #
+    # Non-blocking: a loser has nothing to wait for. The winner is putting a
+    # daemon back on the very socket the loser is holding, so the loser's job is
+    # finished either way.
+    lock_path = Path(certdir) / _STANDBY_ARM_LOCK
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _log_lifecycle(
+            f"another standby is already arming port {port} — exiting rather "
+            f"than adding a second acceptor to the socket it is about to serve"
+        )
+        try:
+            srv.close()
+        except OSError:
+            pass
+        return
     _log_lifecycle(
         f"holder {born_of} is gone and port {port} answered nothing "
         f"{_STANDBY_SILENT_STREAK}x — putting a daemon back on the descriptor "
         f"this process has held all along"
     )
+    # GIVE THE SIGNALS BACK BEFORE BECOMING A HOLDER. The SIG_IGN above is
+    # right for a standby — TERM is when the sessions most need the address —
+    # and WRONG the moment this process starts serving, because a handler
+    # installed once outlives the reason for it. An armed standby kept
+    # ignoring TERM and INT, so it could not be stopped by any ordinary means:
+    # `cswap` could not retire it, a supervisor could not stop it, and only
+    # SIGKILL reached it.
+    #
+    # MEASURED ON LMD42, and it is why that box needed a manual cleanup: three
+    # armed standbys had each become a holder on port 36301 — four acceptors on
+    # one socket, the single property this whole design exists to keep — and
+    # SIGTERM to all three did nothing at all.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
     # BECOME THE HOLDER on the socket we are already holding. Everything below
     # this line is the ordinary supervisor: respawn, backoff, self-heal — and
     # it places a standby of its own, so the lineage stays covered.
@@ -5832,6 +5876,9 @@ _HOLDER_SHA_ENV = "CSWAP_PIN_HOLDER_SHA"
 # the descriptor forever without ever arming.
 _STANDBY_FROM_ENV = "CSWAP_PIN_STANDBY_FROM"
 _STANDBY_MODULE_ARG = "--standby"
+# ONE ARMING STANDBY PER CERTDIR. Held for the life of the winner, so every
+# later standby that reaches the same decision finds it taken and stands down.
+_STANDBY_ARM_LOCK = ".standby-arm.lock"
 # CONSECUTIVE silent probes before the standby acts. One is not evidence: the
 # port is briefly silent during an ordinary handover, and a daemon under load
 # can miss a 2s window. Two costs ~4s of queueing on a socket that never
