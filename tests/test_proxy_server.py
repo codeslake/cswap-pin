@@ -146,6 +146,39 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
 _CA_CACHE: list = []
 
 
+def _drop_ca_cache():
+    """Remove the session's cached CA dir when the process ends.
+
+    IT NEVER CLEANED UP AND NOBODY COULD SEE IT. `mkdtemp` below is reached once
+    per PROCESS, and xdist gives every worker its own — so a run leaks one dir
+    per worker, and a loop of runs leaks a pile. Counted on lmd42 before this
+    landed: 1,619 dirs under /tmp/cswap-test-ca-*, 32 MB, all from a single
+    hour of repeated whole-suite runs while chasing a flake.
+
+    Nothing FAILS from it, which is the whole reason it survived: the number is
+    invisible until somebody goes looking, and no test asserts on /tmp.
+
+    `atexit` rather than a fixture, because the cache is deliberately
+    process-scoped — a session fixture would tie it to a pytest session and the
+    cache outlives collection order by design. `ignore_errors` because a
+    cleanup that raises during interpreter shutdown turns a tidy-up into a
+    failure nobody can act on.
+    """
+    import atexit
+    import shutil
+
+    def _sweep():
+        for d in _CA_CACHE:
+            shutil.rmtree(d, ignore_errors=True)
+        _CA_CACHE.clear()
+
+    atexit.register(_sweep)
+    return _sweep
+
+
+_SWEEP_CA_CACHE = _drop_ca_cache()
+
+
 def _make_certdir(tmp_path):
     """A cert dir with a CA already in it.
 
