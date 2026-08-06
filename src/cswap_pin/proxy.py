@@ -4654,6 +4654,30 @@ class PortHolder:
             self._spawn()
 
     def stop(self) -> None:
+        """Let go of the port: the DAEMON dies first, then the socket closes.
+
+        THAT ORDER IS THE INVARIANT, not a detail of how this happens to be
+        written. A daemon whose holder disappears is ORPHANED, and an orphaned
+        daemon's watchdog correctly puts a NEW holder back — that is the row we
+        deliberately cover. Close the socket first, or drop the holder without
+        stopping its child, and a deliberate release becomes indistinguishable
+        from a holder that died: the daemon sees `CSWAP_PIN_HELD_BY` disagree
+        with `getppid()`, concludes it was orphaned, and resurrects the thing
+        that was just asked to go away.
+
+        A peer shipped exactly that and measured it: nine holders released, all
+        nine back on the same ports within 23 seconds, and the ports could
+        therefore never be retired at all. Their fix was a lineage-wide
+        `releasing` flag the self-heal consults. Ours needs no flag BECAUSE of
+        the order — by the time anything could observe a missing holder, the
+        observer is already dead.
+
+        The cost of buying it this way is that it does not survive a new call
+        site. A flag is checked wherever it is read; an ordering holds only
+        where it is written. ANY future path that drops a holder without first
+        stopping its daemon re-opens that resurrection silently, and there is
+        no guard here that would catch it.
+        """
         self._stop = True
         # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
         # is only meaningful while the Popen it came from is ours — and a pid
