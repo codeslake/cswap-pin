@@ -4627,9 +4627,32 @@ class PortHolder:
                 self._spawn()
                 continue
             if not self._self_heal_on():
+                # SAY WHAT HAPPENS, which is not what this used to claim. The
+                # old line promised "the port stays bound but nothing is
+                # serving it". Measured, isolated port, SELF_HEAL=off, daemon
+                # SIGKILLed:
+                #
+                #   before kill: holder alive=True   port listening=True
+                #   after  kill: holder alive=False  port listening=False
+                #   probe during the window: 394 of 395 ConnectionRefused
+                #
+                # Returning here ends the supervisor, the holder process exits,
+                # and the kernel closes the descriptor with it — so the address
+                # GOES. A human who set this switch to debug a daemon read
+                # "stays bound" and would expect their live sessions to hang
+                # rather than be refused; they are refused, immediately, all of
+                # them.
+                #
+                # The switch is still doing what it was built for — its own
+                # rationale is that a respawner fighting a human is "worse than
+                # a dead port", which accepts this cost out loud. Only the line
+                # describing it was wrong, and a wrong line in the one place a
+                # debugging session looks is worse than no line.
                 _log_lifecycle(
                     f"daemon {self.daemon_pid} exited and {_SELF_HEAL_ENV}=off — "
-                    f"the port stays bound but nothing is serving it"
+                    f"NOT respawning, and this holder is exiting with it, so "
+                    f"port {self.port} stops answering. Every session wired to "
+                    f"it gets ConnectionRefused until a pin is started again."
                 )
                 return
             self._failures += 1
