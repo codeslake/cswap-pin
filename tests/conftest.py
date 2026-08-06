@@ -303,6 +303,9 @@ def _short_hop_budgets(monkeypatch):
     monkeypatch.setattr(_p, "_CHAIN_HEAL_POLL_S", 0.05, raising=False)
 
 
+_STANDBY_ARG = "--standby"
+
+
 def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
     """Kill every pin process serving ``certdir``, PARENTS FIRST, and WAIT.
 
@@ -334,7 +337,7 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
                                  capture_output=True, text=True, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
             return [], []
-        holders, daemons = [], []
+        standbys, holders, daemons = [], [], []
         for line in out.splitlines():
             pid_s, _, cmd = line.strip().partition(" ")
             if "cswap_pin.proxy" not in cmd:
@@ -347,21 +350,41 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
                 continue
             if pid == os.getpid():
                 continue
-            (holders if "--hold-port" in cmd else daemons).append(pid)
-        return holders, daemons
+            if _STANDBY_ARG in cmd:
+                standbys.append(pid)
+            elif "--hold-port" in cmd:
+                holders.append(pid)
+            else:
+                daemons.append(pid)
+        return standbys, holders, daemons
 
     deadline = time.monotonic() + timeout
     while True:
-        holders, daemons = _mine()
-        if not holders and not daemons:
+        standbys, holders, daemons = _mine()
+        if not standbys and not holders and not daemons:
             return
+        # RELEASE THE STANDBY FIRST, and by SIGHUP. It is the same rule as
+        # "parents first", one layer out: the standby is the last thing that
+        # can put the port back, so killing what it watches before telling it
+        # to let go makes it ARM and rebuild the lineage this sweep just
+        # removed. And it must be SIGHUP — the standby ignores SIGTERM on
+        # purpose, because TERM is what a supervisor sends and that is when a
+        # live session needs the address most. Reaching it with 15 would take
+        # the full timeout and a SIGKILL, after a resurrection or two.
+        for pid in standbys:
+            try:
+                os.kill(pid, 1)
+            except OSError:
+                pass
         for pid in holders + daemons:
             try:
                 os.kill(pid, 15)
             except OSError:
                 pass
         if time.monotonic() >= deadline:
-            for pid in holders + daemons:  # last resort, still parents first
+            # Last resort, still parents first, standby ahead of them: a
+            # SIGKILLed holder cannot release anything on its way out.
+            for pid in standbys + holders + daemons:
                 try:
                     os.kill(pid, 9)
                 except OSError:

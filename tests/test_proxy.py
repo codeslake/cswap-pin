@@ -2714,6 +2714,281 @@ class TestDaemonPortStability:
             f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
         )
 
+    def case_the_standby_outlives_the_holder_that_placed_it(
+        self, tmp_path, monkeypatch
+    ):
+        """ROW THREE: when the holder AND its daemon both die, the address dies.
+
+        The holder keeps the port across a daemon crash — measured, 407 of 408
+        requests served with a max time-to-first-byte of 6.3ms across a SIGKILL.
+        What it cannot cover is its own death: the descriptor is closed by the
+        kernel when the holder exits, and a session's HTTPS_PROXY was fixed at
+        exec, so `cswap` fully off strands every wired session permanently.
+        Measured: 198 of 199 ConnectionRefused. wmac carries 4 sessions on 53749
+        in exactly that position.
+
+        So a THIRD process holds the same descriptor and does nothing with it.
+        It must survive the holder, which means two things a normal child does
+        not get: its own session (so a signal delivered to the holder's process
+        group misses it) and no PDEATHSIG (whose whole purpose is to die with
+        the parent — correct for a daemon, fatal here).
+
+        Asserted on what `_spawn_standby` PASSES, not on a live child, for the
+        same reason the holder-sha case is: the contract is what we hand over.
+        """
+        import subprocess
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        seen = {}
+
+        class _P:
+            pid = 9191
+
+            def __init__(self, *a, **kw):
+                seen["argv"] = a[0] if a else kw.get("args")
+                seen.update(kw)
+
+            def wait(self, timeout=None):
+                return 0
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        monkeypatch.setattr(subprocess, "Popen", _P)
+        # BEFORE the close below: a closed socket reports fileno() == -1, and
+        # comparing that would fail a correct implementation.
+        listening_fd = holder._srv.fileno()
+        try:
+            holder._spawn_standby()
+        finally:
+            try:
+                holder._srv.close()
+            except OSError:
+                pass
+
+        # Bound to locals, never asserted against `seen` directly: a failing
+        # assert reprs its operands, and that dict holds the whole environment.
+        detached = seen.get("start_new_session")
+        handed = tuple(seen.get("pass_fds") or ())
+        born_of = (seen.get("env") or {}).get(pin_proxy._STANDBY_FROM_ENV)
+        assert detached is True, (
+            "the standby shares the holder's process group, so a ctrl-C or a "
+            "group-delivered TERM aimed at the holder takes the standby with "
+            "it — and row three is exactly when it must still be there"
+        )
+        assert listening_fd in handed, (
+            "the standby did not get the LISTENING descriptor, so it holds "
+            f"nothing and the address still dies with the holder: {handed}"
+        )
+        assert born_of == str(os.getpid()), (
+            "the standby must know the pid it was BORN under. Arming on "
+            "ppid==1 instead is wrong on any subreaper host (systemd --user "
+            "never reparents to 1): the standby would never arm, while still "
+            "holding the descriptor — so the address ACCEPTS and HANGS, which "
+            "is worse than the refusal it was meant to replace"
+        )
+
+    def case_the_standby_probe_can_tell_a_held_socket_from_a_served_one(self):
+        """The probe must separate "somebody replied" from "somebody is bound".
+
+        THIS IS THE CASE THAT WAS MISSING AND IT COST A REAL BUG. The arm
+        predicate takes `answered` as a parameter, so every unit test around it
+        passed while the actual probe was wrong: a second `def _port_answers`
+        silently overwrote the new one with the pre-existing connect-only
+        check, which returns True on any connect — and the standby is itself
+        holding the listening descriptor, so the connect ALWAYS succeeds. The
+        standby therefore read "somebody is serving" forever and only armed
+        after 34s, by a path nobody designed. Measured end to end; invisible to
+        every test until then.
+
+        BOTH CONTROLS, because either alone is passable by a broken probe. A
+        probe stuck on True passes the served control; a probe stuck on False
+        passes the silent one.
+        """
+        import socket
+        import threading
+
+        from cswap_pin.proxy import _port_returns_bytes
+
+        # CONTROL-SILENT: bound and LISTENING, never accepted. This is the
+        # standby's own steady state, and the state a descriptor scan cannot
+        # distinguish from a healthy one.
+        held = socket.socket()
+        held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        held.bind(("127.0.0.1", 0))
+        held.listen(128)
+        try:
+            assert _port_returns_bytes(held.getsockname()[1], timeout=1.0) is False, (
+                "the probe called a socket that NOBODY accepts on 'answered'. "
+                "The standby holds exactly such a socket, so this reading makes "
+                "it believe a daemon is serving for as long as it holds the port"
+            )
+        finally:
+            held.close()
+
+        # CONTROL-SERVED: something accepts and writes one byte back. Anything
+        # at all counts — a 407 and a 503 are both answers.
+        served = socket.socket()
+        served.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        served.bind(("127.0.0.1", 0))
+        served.listen(8)
+
+        def _answer_once():
+            try:
+                conn, _ = served.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(256)
+                    conn.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=_answer_once, daemon=True)
+        t.start()
+        try:
+            assert _port_returns_bytes(served.getsockname()[1], timeout=3.0) is True, (
+                "the probe missed a real answer, so the standby would arm on a "
+                "port that is being served and put a SECOND daemon on it"
+            )
+        finally:
+            served.close()
+            t.join(timeout=2)
+
+    def case_a_deliberate_release_takes_the_standby_with_it(
+        self, tmp_path, monkeypatch
+    ):
+        """`stop()` IS the human saying go away. The standby must hear it.
+
+        This is the same trap `stop()`'s own docstring records, one layer out.
+        A holder that releases the port while something else is still willing
+        to put a daemon back has not released anything: a peer shipped exactly
+        that and measured nine holders released and all nine back on the same
+        ports within 23 seconds, which made the ports unretirable. Our daemon
+        avoids it by ORDERING; the standby cannot, because it is detached and
+        by design outlives us.
+
+        So the release is explicit and it is SIGHUP, not SIGTERM. SIGTERM is
+        what ordinary tooling sends — `systemctl stop`, a supervisor, a stray
+        `pkill` — and a peer measured the graceful path as MORE destructive
+        than `kill -9` for exactly that reason: their standby ended on TERM, so
+        a clean shutdown stranded every session while a SIGKILL carried them.
+        Death must keep the address; only a request to let go releases it.
+        """
+        import signal
+        import subprocess
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        sent = []
+
+        class _P:
+            pid = 5150
+            returncode = None
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                sent.append(("daemon", signal.SIGTERM))
+
+            def send_signal(self, sig):
+                sent.append(("standby", sig))
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        monkeypatch.setattr(subprocess, "Popen", _P)
+        holder._spawn()
+        holder._spawn_standby()
+        holder.stop()
+
+        to_standby = [s for who, s in sent if who == "standby"]
+        assert signal.SIGHUP in to_standby, (
+            "a deliberate release left the standby holding the descriptor: it "
+            "will arm as soon as we exit and put the daemon straight back, so "
+            f"the port can never be retired. signals sent: {to_standby}"
+        )
+        assert signal.SIGTERM not in to_standby, (
+            "TERM is what a supervisor or a stray pkill sends, so the standby "
+            "must not treat it as a release — it is the signal that most often "
+            "means 'this host is going down', which is when the address is "
+            "needed most"
+        )
+
+    def case_the_standby_arms_on_silence_and_only_after_it_is_orphaned(self):
+        """BOTH conditions, and neither alone. The table IS the contract.
+
+        `ppid` alone is not enough: the holder can die while its daemon serves
+        on, and that daemon's own watchdog puts a fresh holder back — a standby
+        arming there would spawn a SECOND daemon onto a socket already being
+        accepted on, which is the one property this whole design exists to keep
+        (exactly one acceptor). Silence alone is not enough either: the port is
+        silent during every ordinary daemon crash, and the LIVE holder is
+        already respawning — measured, 407 of 408 requests served across one.
+        Arming there would race it.
+
+        Silence must also be CONSECUTIVE. A single miss is a slow answer, a
+        dropped packet, or a daemon mid-handover; treating it as death makes
+        the standby fire during a healthy recycle.
+
+        `answered` is deliberately "any byte at all", not a parsed response.
+        A carrying peer relay answers 503 and a live proxy answers 200, and
+        both mean the same thing here: somebody is behind this socket. Parsing
+        would have made those two disagree.
+        """
+        from cswap_pin.proxy import _STANDBY_SILENT_STREAK, _standby_tick
+
+        assert _STANDBY_SILENT_STREAK >= 2, (
+            "one silent probe is a slow answer, not a death"
+        )
+        born = 4242
+
+        def run(ppids, answers):
+            """Feed a sequence of (ppid, answered) ticks; return when it armed."""
+            silent = 0
+            for i, (ppid, ans) in enumerate(zip(ppids, answers)):
+                silent, arm = _standby_tick(
+                    born, silent, lambda a=ans: a, getppid=lambda p=ppid: p
+                )
+                if arm:
+                    return i
+            return None
+
+        n = _STANDBY_SILENT_STREAK
+        assert run([born] * 8, [False] * 8) is None, (
+            "armed while still parented by the holder that placed it — the "
+            "holder is alive and respawning its own daemon, so this would put "
+            "a second daemon on a socket that already has an acceptor"
+        )
+        assert run([99] * 8, [True] * 8) is None, (
+            "armed while something was still answering on the port"
+        )
+        assert run([99] * 8, [False] * 8) == n - 1, (
+            f"orphaned and silent {n} times in a row must arm"
+        )
+        # One answer in the middle resets the streak: n-1 silences, an answer,
+        # then n more. Arming before the last is arming on a non-consecutive run.
+        mixed = [False] * (n - 1) + [True] + [False] * n
+        assert run([99] * len(mixed), mixed) == len(mixed) - 1, (
+            "a single answer must RESET the streak, not merely pause it"
+        )
+        # And reading the birth parent again resets it too. Built to actually
+        # exercise that: with a streak of 2, my first attempt at this case put
+        # the reparent AFTER two silences, so it had already armed and the
+        # reset was never reached — the case passed for the wrong reason until
+        # the assertion was strict enough to catch it. Silence, holder, silence
+        # is the shortest sequence that can only survive if the reset happens.
+        assert run([99, born, 99], [False, False, False]) is None, (
+            "reading the birth parent again must CLEAR the streak, not pause "
+            "it — a latched counter arms on the next single silence, long "
+            "after the holder came back"
+        )
+
     def case_the_predecessor_stops_accepting_before_it_hands_the_socket_over(
         self, tmp_path
     ):
