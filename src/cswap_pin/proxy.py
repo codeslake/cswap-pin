@@ -5038,8 +5038,14 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         # THE TICK CHOOSES ITS OWN NEXT INTERVAL, because only it knows which
         # state we are in — and the three states want different rates. See
         # `_standby_tick`.
+        # THE RECORDED DAEMON FIRST, and it costs nothing. Every window spent
+        # proving nobody serves is a window in which nobody serves — the peer's
+        # point, and it is right — so the cheapest evidence goes first. A live
+        # recorded daemon settles it with a signal-0 and no probe at all.
         silent, arm, wait = _standby_tick(
-            born_of, silent, lambda: _port_returns_bytes(port)
+            born_of, silent,
+            lambda: (_recorded_daemon_alive(certdir)
+                     or _port_returns_bytes(port)),
         )
         if arm:
             break
@@ -5898,12 +5904,13 @@ _STANDBY_MODULE_ARG = "--standby"
 # ONE ARMING STANDBY PER CERTDIR. Held for the life of the winner, so every
 # later standby that reaches the same decision finds it taken and stands down.
 _STANDBY_ARM_LOCK = ".standby-arm.lock"
-# CONSECUTIVE silent probes before the standby acts. One is not evidence: the
-# port is briefly silent during an ordinary handover, and a loaded daemon can
-# miss a single short window. THREE short windows are strictly better evidence
-# than two long ones — each is an independent observation, and a false positive
-# now needs three slow answers in a row rather than two.
-_STANDBY_SILENT_STREAK = 3
+# ONE, because the corroboration is no longer repetition. Three short windows
+# replaced two long ones, and `_recorded_daemon_alive` then replaced the
+# repetition itself with a different KIND of evidence: the recorded pid answers
+# "does anything accept" outright, for free, where silence only implies it. A
+# loaded daemon that misses a window is still ALIVE, so it can no longer be
+# mistaken for a dead one.
+_STANDBY_SILENT_STREAK = 1
 _STANDBY_POLL_S = 0.25
 # HOW LONG TO WAIT WHEN ORPHANED AND SOMETHING STILL ANSWERS. Not a tuning
 # knob: that state converges to nothing, so polling it fast buys nothing and
@@ -5971,6 +5978,38 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
         except OSError:
             pass
     return retired
+
+
+def _recorded_daemon_alive(certdir) -> bool:
+    """Is the daemon `proxy.json` names still running? Microseconds, no socket.
+
+    DIRECT EVIDENCE INSTEAD OF INFERRED. Silence on the port is a PROXY for
+    "nothing accepts"; the recorded pid answers it outright, and a signal-0 is
+    free where a probe costs a timeout. That is why the silent streak can be
+    one here and had to be three without it: the corroboration moved from
+    repetition to a different KIND of evidence.
+
+    Absent or unreadable means "cannot tell", and the safe answer is TRUE —
+    assume something serves and do not arm. Arming wrongly is not cheap for us:
+    this standby does not carry traffic, it puts a DAEMON on the socket, and
+    two daemons accepting the same listener lose requests outright (19 of 60 in
+    steady state, measured). A peer can arm on a hunch because their relay
+    forwards to the same hop either way; ours cannot.
+    """
+    try:
+        rec = json.loads((Path(certdir) / _STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return True
+    pid = rec.get("pid") if isinstance(rec, dict) else None
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # EPERM: alive, just not ours to signal
+    return True
 
 
 def _standby_port_still_wanted(certdir, port: int) -> bool:

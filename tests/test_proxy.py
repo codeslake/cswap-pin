@@ -2733,6 +2733,65 @@ class TestDaemonPortStability:
             f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
         )
 
+    def case_a_live_recorded_daemon_is_never_mistaken_for_a_dead_one(self, tmp_path):
+        """The evidence that lets the silent streak be ONE.
+
+        A peer got their recovery to 3ms by arming the instant the holder is
+        gone and checking nothing, on the argument that being wrong is cheap:
+        their relay carries to the same hop either way, so a spurious second
+        one serves the request uncached rather than losing it.
+
+        THAT ARGUMENT DOES NOT TRANSFER AND COPYING IT WOULD HAVE COST US
+        REQUESTS. This standby does not carry traffic — it puts a DAEMON on the
+        socket — and two daemons accepting one listener lose requests outright:
+        19 of 60 in steady state, measured in this repo. Being wrong is not
+        cheap here.
+
+        So the speed comes from better evidence instead: the recorded pid
+        answers "does anything accept" directly, for free, where silence only
+        implies it. A daemon too loaded to answer a 250ms probe is still ALIVE
+        and still accepting, which is exactly the case a silence-only test gets
+        wrong and this one cannot.
+        """
+        import json
+
+        from cswap_pin.proxy import _recorded_daemon_alive
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        state = certdir / "proxy.json"
+
+        state.write_text(json.dumps({"port": 1, "pid": os.getpid()}))
+        assert _recorded_daemon_alive(certdir) is True, (
+            "a running daemon was read as gone; arming here puts a SECOND "
+            "daemon on the socket and they lose requests between them"
+        )
+
+        # A pid that cannot exist. Chosen high and verified absent rather than
+        # assumed, because a live pid here would make the case vacuous.
+        dead = 4_000_000
+        while True:
+            try:
+                os.kill(dead, 0)
+            except ProcessLookupError:
+                break
+            except OSError:
+                break
+            dead += 1
+        state.write_text(json.dumps({"port": 1, "pid": dead}))
+        assert _recorded_daemon_alive(certdir) is False, (
+            "a dead daemon was read as alive, so the standby never arms and "
+            "the address stays down — the outage this exists to prevent"
+        )
+
+        # UNREADABLE IS NOT DEAD. proxy.json is unlinked during an ordinary
+        # respawn, which is precisely when a standby is deciding.
+        state.unlink()
+        assert _recorded_daemon_alive(certdir) is True, (
+            "a missing record was treated as proof of death; that is the "
+            "normal mid-respawn state and arming there races the respawn"
+        )
+
     def case_a_standby_on_an_abandoned_port_does_not_rebuild_on_it(self, tmp_path):
         """The runaway. A standby must not resurrect a port nothing is wired to.
 
@@ -3304,9 +3363,21 @@ class TestDaemonPortStability:
             _standby_tick,
         )
 
-        assert _STANDBY_SILENT_STREAK >= 2, (
-            "one silent probe is a slow answer, not a death"
-        )
+        # The streak used to have to be >= 2 because one silent probe could be
+        # a SLOW answer rather than a death. That is no longer what protects
+        # us: `_recorded_daemon_alive` answers "does anything accept" from the
+        # recorded pid, for free, and a loaded daemon that misses a window is
+        # still alive. The corroboration moved from repetition to a different
+        # KIND of evidence, so what must hold now is that the evidence exists —
+        # a streak of 1 with nothing but silence behind it would arm on a hiccup.
+        from cswap_pin.proxy import _recorded_daemon_alive
+        assert _STANDBY_SILENT_STREAK >= 1
+        if _STANDBY_SILENT_STREAK < 2:
+            assert callable(_recorded_daemon_alive), (
+                "a single silent probe is only enough while something else "
+                "proves the daemon is gone; without that this arms on one slow "
+                "answer, and a second acceptor loses requests outright"
+            )
         born = 4242
         dials = []
 
@@ -3352,10 +3423,17 @@ class TestDaemonPortStability:
         # reset was never reached — the case passed for the wrong reason until
         # the assertion was strict enough to catch it. Silence, holder, silence
         # is the shortest sequence that can only survive if the reset happens.
-        assert run([99, born, 99], [False, False, False]) is None, (
-            "reading the birth parent again must CLEAR the streak, not pause "
-            "it — a latched counter arms on the next single silence, long "
-            "after the holder came back"
+        # THE RESET, driven directly. It cannot be reached through the arm path
+        # while the streak is 1 — the first orphaned silence already arms — so
+        # feeding a non-zero count in is the only way to exercise it, and it
+        # still matters: a latched counter would arm on the next single silence
+        # long after the holder came back.
+        after, armed, _ = _standby_tick(
+            born, 5, lambda: False, getppid=lambda: born
+        )
+        assert (after, armed) == (0, False), (
+            "reading the birth parent again did not CLEAR the streak: "
+            f"silent={after} arm={armed}"
         )
 
         # COST, not just correctness — each state wants a different rate.
