@@ -5720,7 +5720,31 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         kwargs={"live_clients": proxy.live_client_count},
         daemon=True,
     ).start()
-    done.wait()  # lives until the last refcount holder closes (or a signal)
+    # BOUNDED, so a signal callback actually RUNS. CPython executes a signal
+    # callback on the MAIN thread only, and only when that thread next runs
+    # bytecode. The kernel delivers to whichever thread has not blocked the
+    # signal — its C handler there clears the pending bit and sets a flag, but
+    # a main thread parked in an UNTIMED wait is never woken by a signal that
+    # went elsewhere, so the flag sits set and this daemon keeps serving.
+    #
+    # Measured on a daemon that had just ignored a TERM. Every reading says
+    # "healthy process that dropped the signal":
+    #
+    #     SigCgt 0x…4000 (SIGTERM caught)   SigPnd 0   ShdPnd 0
+    #     threads: _accept_loop in accept(), main here
+    #     SIGTERM -> a worker thread : still alive after 8s
+    #     SIGTERM -> the process     : exited after 0.10s
+    #
+    # In the suite this was an intermittent "no successor within 3.0s" — the
+    # holder never saw an exit because there was none. In production it is
+    # quieter and worse: `cc-update` TERMs the daemon to recycle it, nothing
+    # happens, and the old code serves on while everything reports success.
+    #
+    # 0.5 s rather than a wakeup fd: the cost is one loop iteration twice a
+    # second in a process that is otherwise idle, against a selector and a
+    # second teardown path to keep in step with this one.
+    while not done.wait(0.5):
+        pass
 
 
 def wire_env(

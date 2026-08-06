@@ -3058,6 +3058,99 @@ class TestDaemonPortStability:
         finally:
             holder.stop()
 
+    def case_a_term_is_never_dropped_by_a_parked_main_thread(self, tmp_path):
+        """One SIGTERM must be enough, whichever thread the kernel picks.
+
+        CPython runs a signal callback on the MAIN thread only, and only when
+        that thread next executes bytecode. The kernel may deliver the signal
+        to any thread that has not blocked it — the C handler there clears the
+        pending bit and sets a flag, but a main thread parked in an untimed
+        `Event.wait()` is not woken by a signal delivered elsewhere. The flag
+        sits set and the daemon keeps serving.
+
+        Measured on the stuck daemon, and every reading says "healthy process
+        that ignored a TERM":
+
+            SigCgt 0x...4000  (SIGTERM caught)   SigPnd 0   ShdPnd 0
+            threads: _accept_loop in accept(), main in daemon_main's wait
+            a SECOND SIGTERM killed it in 0.10s
+
+        In the suite it surfaced as an intermittent "no successor within 3.0s"
+        — the holder never sees an exit because there was none. In production
+        it is worse and quieter: `cc-update` TERMs the daemon to recycle it,
+        nothing happens, and the old code keeps serving while everything
+        reports success.
+
+        ADDRESSED TO A THREAD, not raced for. Hammering the daemon and hoping
+        the kernel picks a non-main thread reproduces it about one run in ten
+        — a test that passes nine times out of ten is not a test. `tgkill`
+        delivers to a chosen thread, so the case asserts the property rather
+        than sampling for it. Measured against the parked wait:
+
+            SIGTERM -> non-main thread : STILL ALIVE after 8s
+            SIGTERM -> the process     : exited after 0.10s
+        """
+        import ctypes
+        import os
+        import signal
+        import sys
+        import time
+
+        from cswap_pin.proxy import PortHolder, ensure_ca, read_daemon_state
+
+        if sys.platform != "linux":
+            pytest.skip("tgkill and /proc/<pid>/task are Linux-only")
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # x86_64 and aarch64 agree on 234 for tgkill; skip rather than guess.
+        if os.uname().machine not in ("x86_64", "aarch64"):
+            pytest.skip(f"tgkill number unknown for {os.uname().machine}")
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        holder.start()
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline and not read_daemon_state(tmp_path):
+                time.sleep(0.05)
+            st = read_daemon_state(tmp_path)
+            assert st, "no daemon came up — the case measures nothing"
+            pid = int(st["pid"])
+
+            # Let the daemon finish starting its worker threads; the main
+            # thread's tid equals the pid, so anything else is a worker.
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                tids = [int(t) for t in os.listdir(f"/proc/{pid}/task")]
+                if len(tids) > 1:
+                    break
+                time.sleep(0.05)
+            non_main = [t for t in tids if t != pid]
+            assert non_main, "the daemon had no worker threads to deliver to"
+
+            if libc.syscall(234, pid, non_main[0], int(signal.SIGTERM)) != 0:
+                raise AssertionError(
+                    f"tgkill failed: {os.strerror(ctypes.get_errno())}"
+                )
+
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(
+                    f"daemon {pid} ignored a SIGTERM delivered to a worker "
+                    f"thread — the callback runs on the MAIN thread, and a "
+                    f"main thread parked in an untimed wait never wakes to "
+                    f"run it. A recycle then silently leaves the old code "
+                    f"serving"
+                )
+        finally:
+            holder.stop()
+
     def case_a_connection_is_counted_before_its_thread_runs(self, tmp_path):
         """An ACCEPTED connection must be drainable, not just a served one.
 
