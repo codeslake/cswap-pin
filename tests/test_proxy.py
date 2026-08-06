@@ -5117,6 +5117,8 @@ class TestTheDaemonWatchesItsOwnCode:
         """
         import threading
 
+        from cswap_pin import proxy as pin_proxy
+
         events = []
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
                             lambda *a, **k: "disk-moved-while-we-were-starting")
@@ -5124,12 +5126,24 @@ class TestTheDaemonWatchesItsOwnCode:
                             lambda n, e, c, **k: events.append(("spawn", n)) or 41234)
 
         done = threading.Event()
-        pin_proxy._watch_own_code(
-            _recording_server(events)(), "1", "a@example.com",
-            self._certdir(tmp_path), done,
-            teardown=lambda reason: events.append(("teardown", reason)),
-            interval=0.01,
-        )
+        # A DEADLINE, so the RED half is a FAILURE rather than a HANG. Without
+        # the fix nothing ever hands over, so `done` is never set and
+        # `_watch_own_code` loops until the runner is killed — which reports as
+        # a timeout with no message and reads like infrastructure. Measured:
+        # the mutant ran past 120s. With the fix the spawn lands on the first
+        # tick and this timer never fires.
+        deadline = threading.Timer(2.0, done.set)
+        deadline.daemon = True
+        deadline.start()
+        try:
+            pin_proxy._watch_own_code(
+                _recording_server(events)(), "1", "a@example.com",
+                self._certdir(tmp_path), done,
+                teardown=lambda reason: events.append(("teardown", reason)),
+                interval=0.01,
+            )
+        finally:
+            deadline.cancel()
 
         assert ("spawn", "1") in events, (
             "the daemon did not hand over: its baseline came from the disk it "
@@ -6280,7 +6294,22 @@ class TestABlindDaemonIsNotReusedForever:
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
-        srv.listen(1)
+        # BACKLOG BIGGER THAN THE NUMBER OF PROBES, because nothing here ever
+        # calls accept(). `_read_alive_port` connects once per call and this
+        # case calls it twice, so every completed connection stays parked in
+        # the accept queue — and how many fit there is NOT the same on both
+        # platforms. Measured, same script, listen(1) and never accepting:
+        #
+        #   Linux 6.8.0    connect #1 OK   #2 OK        #3 TimeoutError
+        #   Darwin 24.6.0  connect #1 OK   #2 Timeout   #3 TimeoutError
+        #
+        # So Linux holds two and Darwin holds one, and the second probe below
+        # timed out there. `TimeoutError` is an `OSError`, which
+        # `_read_alive_port` catches and turns into None — so the assertion
+        # failed as `None == 51504` and read like a logic bug in the function
+        # under test rather than like scaffolding running out of room. This
+        # was the first failure the macOS CI job ever reported.
+        srv.listen(8)
         port = srv.getsockname()[1]
         state = certdir / "proxy.json"
         state.write_text(
