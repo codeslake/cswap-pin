@@ -3436,6 +3436,20 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
         # the port with it, which is the outage the holder exists to prevent.
         if f" {_HOLDER_MODULE_ARG} " in rest:
             continue
+        # NOR THE STANDBY, for the same reason and with the same stakes. Its
+        # argv is the daemon's plus one flag too, so it passes both gates
+        # above — and it is the process whose death removes the port's last
+        # cover. It ignores SIGTERM by design, so being selected here does not
+        # merely stop it, it takes the SIGKILL escalation: no handler, no log,
+        # and nothing places a replacement.
+        #
+        # Measured on host-b, found in production rather than here: the
+        # standby was `<defunct>` within four minutes of every deploy, and the
+        # holder ran on believing it was covered. A zombie stays in the process
+        # table until reaped, so `ps`, `kill -0` and every check that asks the
+        # table instead of the STATE reported a standby that did not exist.
+        if f" {_STANDBY_MODULE_ARG} " in rest:
+            continue
         try:
             pids.append(int(head))
         except ValueError:
@@ -4674,11 +4688,39 @@ class PortHolder:
                 log.close()
         self._standby = proc
 
+    def _reap_standby(self) -> None:
+        """Notice a dead standby, say so, and stop it being a zombie.
+
+        SAYING SO IS THE POINT. Losing the standby is not an outage — the
+        holder still keeps the port across a daemon crash — so this is a
+        warning, not a restart. But a holder that has lost it is back to the
+        pre-standby behaviour with nothing announcing the change, and the
+        machine reports a cover it does not have.
+        """
+        proc = getattr(self, "_standby", None)
+        if proc is None or proc.poll() is None:
+            return
+        _log_lifecycle(
+            f"standby for port {self.port} is gone (exit {proc.returncode}) — "
+            f"this holder's death now takes the address with it, as it did "
+            f"before the standby existed. A re-pin places a new one."
+        )
+        self._standby = None
+
     def _supervise(self) -> None:
         while not self._stop:
             code = self._proc.wait()
             if self._stop:
                 return
+            # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
+            # this loop already wakes on every daemon exit, so it costs a
+            # `poll()` and no timer. Reaping is the load-bearing half: an
+            # unreaped child stays `<defunct>` in the process table forever,
+            # and `ps`, `kill -0` and every check that asks the TABLE rather
+            # than the STATE then report a standby that is not there. Measured
+            # on host-b — a zombie standby read as alive to three
+            # separate checks, including one written that same day.
+            self._reap_standby()
             # A CLEAN EXIT IS A DECISION, NOT A FAILURE. The pin tears itself
             # down when the last refcount holder closes the FIFO — that is the
             # whole idle-teardown design. Restarting it would make the port
