@@ -1,0 +1,59 @@
+name: CI
+
+# THE GATE THAT COVERS THE PATH PEOPLE PUSH ON. Until this existed the repo had
+# exactly one workflow, publish.yml, and its only trigger was `push: tags`. So
+# nothing broken could SHIP — the release job runs the suite and publish needs
+# build — but `main` could sit red between releases with nobody looking, and
+# every untagged commit was unverified by construction. Measured on 2026-08-06:
+# ba01b99 changed src/cswap_pin/proxy.py and had never been through the suite,
+# because it carried no tag.
+#
+# NOT FOLDED INTO publish.yml VIA workflow_call. The release gate must not
+# depend on another workflow resolving: a `workflow_call` that fails to load
+# takes the release with it, and the failure mode is "no release, no error
+# anyone reads". The eight lines below are duplicated from publish.yml
+# deliberately, and that file names this one in return.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    # BOTH PLATFORMS, and macOS is the point rather than the bonus. The pin has
+    # Darwin-only branches that Linux never executes — `_holder_owns` falls back
+    # to `ps` because macs have no /proc, `_arm_parent_death_signal` returns
+    # early off Linux, and the SO_ACCEPTCONN probe answers on Linux and raises
+    # errno 42 on Darwin. Those were established by hand-measurement on a work
+    # Mac; no suite run had ever executed on the platform they describe.
+    #
+    # Two cases guard `sys.platform != "linux"` and SKIP here, so the macOS run
+    # is slightly smaller, not larger. That is expected and is not a reason to
+    # drop the job: the value is exercising the paths a mac actually takes.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A hung step otherwise burns the full 6h GitHub cap and reads as "still
+    # going" rather than "stuck", so nothing reports a failure at all.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Suite
+        run: |
+          # Kept in step with publish.yml's copy — see the header. HOME and
+          # XDG_DATA_HOME redirected because the suite drives real cert dirs and
+          # daemon state, and a runner's real HOME is the one place a test must
+          # never write. `--with claude-swap` because the suite imports the HOST
+          # and cswap-pin is a peer, not a dependency. `--with pytest-xdist` is
+          # not optional: pyproject's addopts carries `-n 4`, and a pytest
+          # without xdist refuses the flag outright rather than ignoring it.
+          S="$(mktemp -d)"
+          HOME="$S" XDG_DATA_HOME="$S/.local/share" \
+            uv run --with pytest --with pytest-xdist --with cryptography \
+            --with claude-swap \
+            python -m pytest tests/ -q -p no:randomly \
+            -m "not needs_host_seam"
