@@ -4675,9 +4675,72 @@ def run_service(certdir: Path, account_num: str, email: str,
     return holder
 
 
+def _arm_parent_death_signal() -> bool:
+    """Ask the kernel to TERM us when our parent dies. Linux only; never raises.
+
+    A HOLDER IS DELIBERATELY HARD TO KILL — its whole job is to put the daemon
+    back, so it survives the daemon dying and keeps the port bound across the
+    gap. That same property makes it an immortal orphan when the process that
+    STARTED it dies without cleaning up: a SIGKILL runs no ``finally``, so
+    nothing tells the holder to go. It reparents to init and keeps the port,
+    the memory and the pipes forever, and nothing collects it afterwards
+    because the only name it answers to is a pid that no longer exists.
+
+    Measured here before this existed: launcher SIGKILLed, holder and daemon
+    still alive at t+2s, t+5s, t+12s and t+20s, holder at ppid=1. A peer
+    component on the same design accumulated 151 such processes over hours,
+    9.17 GiB resident.
+
+    ``PR_SET_PDEATHSIG`` is the primitive for exactly this — the kernel
+    signals us however the parent dies, with no polling and no cooperation
+    from the parent. A ppid==1 poll is the portable alternative and is worse
+    on both counts: it costs a timer forever and it cannot fire during the
+    window before the poll comes round.
+
+    NOT A REPLACEMENT FOR THE REAPER. This is Linux-only (macOS has no
+    equivalent, and two of the three machines this runs on are Macs), so
+    ``tests/conftest.py``'s ``_reap_pin_processes`` stays the portable floor.
+
+    THE SIGNAL IS TERM, NOT KILL, because the holder must still run its own
+    teardown: it drains its daemon and releases the port. A KILL here would
+    trade an orphaned holder for an orphaned daemon.
+
+    Returns whether it was armed, so a caller can log the difference rather
+    than assume. Never raises: a holder that cannot arm this is still a
+    working holder, and refusing to start would be a worse failure than the
+    leak it prevents.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        import ctypes
+        import signal
+
+        # 1 == PR_SET_PDEATHSIG. Hardcoded rather than read from a header
+        # because ctypes gives us no access to one; the value is ABI-stable
+        # (include/uapi/linux/prctl.h) and has never changed.
+        return ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            1, int(signal.SIGTERM), 0, 0, 0
+        ) == 0
+    except Exception:  # noqa: BLE001 — no libc, no prctl, wrong ABI: not fatal
+        return False
+
+
 def holder_main(account_num: str, email: str, certdir: Path,
                 port: int | None = None) -> None:
     """Entry point for the detached holder (``-m cswap_pin.proxy --hold-port``)."""
+    # BEFORE THE PORT IS TAKEN. Arming after `run_service` would leave the
+    # window where the holder already owns the port unprotected, which is the
+    # one window where an orphan actually costs something.
+    #
+    # A RACE THE KERNEL CANNOT CLOSE FOR US: if the parent died between our
+    # fork and this call, the signal was already delivered to a process that
+    # had not armed it, so it never arrives. Check explicitly rather than
+    # trust the arming alone.
+    _arm_parent_death_signal()
+    if os.getppid() == 1:
+        _log_lifecycle("launcher already gone before the holder armed — exiting")
+        return
     try:
         holder = run_service(Path(certdir), account_num, email, port=port)
     except OSError as exc:
