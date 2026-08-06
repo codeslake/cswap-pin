@@ -2762,19 +2762,51 @@ class TestDaemonPortStability:
         assert len(shipped) > 1, "single-module package; this case is vacuous"
 
         before = pin_proxy.daemon_fingerprint()
-        # Every module the package ships must move the fingerprint. Done by
-        # hashing the real files rather than by editing them: this suite must
-        # never write into an installed package.
-        digest = hashlib.sha256()
-        for name in shipped:
-            digest.update((pkg / name).read_bytes())
         assert before != hashlib.sha256(
             (pkg / "proxy.py").read_bytes()
-        ).hexdigest()[:16] or len(shipped) == 1, (
+        ).hexdigest()[:16], (
             "the fingerprint is proxy.py alone, so a change to "
             f"{[n for n in shipped if n != 'proxy.py']} ships without retiring "
             "the running daemon and every check still calls it current"
         )
+
+        # IT MUST WALK, NOT NAME. A peer fixed the shallow case, added their
+        # relay to the list, and left that relay's OWN import uncovered the
+        # next day — the list is the defect. A non-recursive glob is a list in
+        # disguise the moment a subpackage exists, so this stages one.
+        #
+        # On a COPY. The suite must never write into an installed package.
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        work = pathlib.Path(tempfile.mkdtemp())
+        try:
+            shutil.copytree(pkg, work / "cswap_pin")
+
+            def fingerprint_of(root):
+                out = subprocess.run(
+                    [sys.executable, "-c",
+                     "import cswap_pin.proxy as p; print(p.daemon_fingerprint())"],
+                    env={"PYTHONPATH": str(root), "PATH": "/usr/bin:/bin",
+                         "HOME": str(root)},
+                    capture_output=True, text=True, timeout=60)
+                return out.stdout.strip()
+
+            base = fingerprint_of(work)
+            assert base, "could not read a fingerprint from the copy"
+
+            nested = work / "cswap_pin" / "sub"
+            nested.mkdir()
+            (nested / "__init__.py").write_bytes(b"# a module in a subpackage\n")
+            assert fingerprint_of(work) != base, (
+                "a module in a SUBPACKAGE moved nothing — the walk is only one "
+                "level deep, so the next import to land there ships silently, "
+                "which is the exact defect one level up"
+            )
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     def case_a_live_recorded_daemon_is_never_mistaken_for_a_dead_one(self, tmp_path):
         """The evidence that lets the silent streak be ONE.
