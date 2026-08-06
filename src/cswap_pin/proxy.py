@@ -4650,7 +4650,7 @@ def run_service(certdir: Path, account_num: str, email: str,
     return holder
 
 
-def _arm_parent_death_signal() -> bool:
+def _arm_parent_death_signal() -> None:
     """Ask the kernel to TERM us when our parent dies. Linux only; never raises.
 
     A HOLDER IS DELIBERATELY HARD TO KILL — its whole job is to put the daemon
@@ -4680,13 +4680,13 @@ def _arm_parent_death_signal() -> bool:
     teardown: it drains its daemon and releases the port. A KILL here would
     trade an orphaned holder for an orphaned daemon.
 
-    Returns whether it was armed, so a caller can log the difference rather
-    than assume. Never raises: a holder that cannot arm this is still a
-    working holder, and refusing to start would be a worse failure than the
-    leak it prevents.
+    NEVER RAISES AND ANSWERS NOTHING. A holder that cannot arm this is still a
+    working holder, so there is no caller for whom the outcome changes
+    anything: the `getppid()` check below covers the race this cannot, and the
+    reaper covers the platforms it does not reach.
     """
     if sys.platform != "linux":
-        return False
+        return
     try:
         import ctypes
         import signal
@@ -4694,11 +4694,11 @@ def _arm_parent_death_signal() -> bool:
         # 1 == PR_SET_PDEATHSIG. Hardcoded rather than read from a header
         # because ctypes gives us no access to one; the value is ABI-stable
         # (include/uapi/linux/prctl.h) and has never changed.
-        return ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
             1, int(signal.SIGTERM), 0, 0, 0
-        ) == 0
+        )
     except Exception:  # noqa: BLE001 — no libc, no prctl, wrong ABI: not fatal
-        return False
+        pass
 
 
 def holder_main(account_num: str, email: str, certdir: Path,
