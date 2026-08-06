@@ -9910,6 +9910,7 @@ class TestEverySmallCaseHolder:
                 TestPinTokenRefreshIsSerialized(),
                 TestAmbientProxyPrefersTheLauncherProxy(),
                 TestNarrowingIsDeliberatelyUnguarded(),
+                TestAHolderDoesNotOutliveItsLauncher(),
                 TestTheGateDisarmsWhenThePinIsCleared(),
                 TestArmingReportsWhoItCutsOff(),
                 TestABlindDaemonIsNotReusedForever(),
@@ -9942,3 +9943,142 @@ class TestEverySmallCaseHolder:
             request,
             tmp_path_factory,
         )
+
+
+class TestAHolderDoesNotOutliveItsLauncher:
+    """A holder whose launcher is SIGKILLed must not become an immortal orphan.
+
+    A holder is deliberately hard to kill: its whole job is to put the daemon
+    back, so it survives the daemon dying and keeps the port bound across the
+    gap. That same property makes it dangerous when the process that STARTED
+    it dies without cleaning up — a SIGKILL runs no `finally`, so nothing tells
+    the holder to go, it reparents to init, and it keeps port, memory and pipes
+    forever. Nothing collects it afterwards, because the only name it answers
+    to (its parent's pid) belongs to a process that no longer exists.
+
+    Measured on this shape before the fix: launcher SIGKILLed, holder and its
+    daemon still alive at t+2s, t+5s, t+12s and t+20s, holder reparented to
+    ppid=1. A peer component running the same design accumulated 151 such
+    processes over hours, 9.17 GiB resident.
+
+    `PR_SET_PDEATHSIG` is the primitive for exactly this: the kernel signals
+    the child when its parent dies, however the parent dies, with no polling
+    and no cooperation from the parent. Linux only — the reaper in conftest
+    remains the portable floor, and macOS has no equivalent.
+    """
+
+    def case_the_holder_arms_a_parent_death_signal(self, tmp_path):
+        """Source-level, because the runtime effect needs a real fork.
+
+        The runtime case below proves the behaviour; this pins the MECHANISM
+        so a future edit cannot quietly drop the syscall while some other
+        cleanup keeps the runtime test green.
+        """
+        import inspect
+
+        from cswap_pin import proxy as pin_proxy
+
+        src = inspect.getsource(pin_proxy)
+        assert "PR_SET_PDEATHSIG" in src or "prctl" in src, (
+            "the holder arms no parent-death signal, so a SIGKILLed launcher "
+            "leaves it running forever (measured: alive at t+20s, ppid=1)"
+        )
+
+    def case_a_sigkilled_launcher_takes_the_holder_with_it(self, tmp_path):
+        """The behaviour itself, driven end to end.
+
+        A launcher process starts the holder exactly as production does, then
+        is SIGKILLed — no `finally`, no atexit, nothing cooperative. The holder
+        and its daemon must be gone shortly afterwards.
+
+        THE LAUNCHER OUTLIVES THE HOLDER'S STARTUP ON PURPOSE. Killing it
+        immediately proves nothing about the parent-death signal: the holder's
+        own `getppid() == 1` guard catches that case and exits before it ever
+        arms, so the process disappears either way. Measured — with the
+        arming deleted the case still passed, and the log said
+        "launcher already gone before the holder armed". The kill has to land
+        AFTER the holder is serving, which is the state the guard cannot see
+        and only the kernel signal covers.
+        """
+        import os
+        import pathlib
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        from cswap_pin.proxy import ensure_ca
+
+        if sys.platform != "linux":
+            pytest.skip("PR_SET_PDEATHSIG is Linux-only")
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        launcher_src = (
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-m', 'cswap_pin.proxy',\n"
+            "                  '--hold-port', '0', '1', 'a@example.com',\n"
+            f"                  {str(tmp_path)!r}],\n"
+            "                 stdin=subprocess.DEVNULL,\n"
+            f"                 stdout=open({str(tmp_path / 'h.log')!r}, 'wb'),\n"
+            "                 stderr=subprocess.STDOUT)\n"
+            "time.sleep(600)\n"
+        )
+        launcher = subprocess.Popen(
+            [sys.executable, "-c", launcher_src], stdin=subprocess.DEVNULL
+        )
+
+        def mine():
+            out = []
+            for entry in pathlib.Path("/proc").glob("[0-9]*"):
+                try:
+                    cmd = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+                except OSError:
+                    continue
+                text = cmd.decode(errors="replace")
+                if str(tmp_path) in text and "cswap_pin.proxy" in text:
+                    out.append(int(entry.name))
+            return out
+
+        try:
+            deadline = time.time() + 25
+            while time.time() < deadline and not mine():
+                time.sleep(0.1)
+            assert mine(), "the holder never came up — the case measures nothing"
+
+            # WAIT FOR THE DAEMON, not merely the holder. Until the daemon
+            # exists the holder is still inside startup, where its own ppid
+            # guard would do the work and the signal would go unmeasured.
+            state = tmp_path / "proxy.json"
+            settled = time.time() + 25
+            while time.time() < settled and not state.exists():
+                time.sleep(0.1)
+            assert state.exists(), (
+                "no daemon came up, so the holder never left startup — the "
+                "ppid guard would carry this case instead of the signal"
+            )
+            time.sleep(0.5)
+
+            os.kill(launcher.pid, signal.SIGKILL)
+            launcher.wait(timeout=10)
+
+            # GENEROUS, because the point is "eventually gone", not "gone in
+            # under N ms": the holder drains its daemon before leaving. The
+            # pre-fix measurement was still alive at t+20s, so anything inside
+            # this window is a real change rather than a slower leak.
+            gone_by = time.time() + 25
+            while time.time() < gone_by and mine():
+                time.sleep(0.2)
+            survivors = mine()
+            assert not survivors, (
+                f"{len(survivors)} pin process(es) outlived a SIGKILLed "
+                f"launcher: {survivors} — reparented to init and holding the "
+                f"port forever"
+            )
+        finally:
+            for pid in mine():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            if launcher.poll() is None:
+                launcher.kill()
