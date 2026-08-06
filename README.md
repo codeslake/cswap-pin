@@ -170,6 +170,27 @@ restart above and the self-upgrade below — for when you are debugging the
 daemon and a respawner fighting you is worse than a dead port. `cswap pin
 --heal` and a launch still repair, because those are you asking.
 
+`CSWAP_PIN_EXIT_WITH_PARENT=1` makes the holder die when the process that
+started it dies. **Do not set this.** A holder is meant to outlive its
+launcher — `cswap pin` spawns it and exits, a shell backgrounds it and the
+shell exits — so with this on, a normal launch loses the port within a couple
+of seconds and every session wired to it is stranded. It exists for a test
+runner: a `SIGKILL`ed pytest otherwise leaves holders behind (151 of them,
+9.17 GiB, measured), and the suite sets it for the one case that asserts that
+cleanup.
+
+Two opt-in traces, both off unless you name a file:
+
+```bash
+CSWAP_PIN_DEBUG=/tmp/pin.log     # one line per request
+CSWAP_PIN_SHAPE=/tmp/shape.log   # the message-array shape of each request body
+```
+
+`CSWAP_PIN_LISTEN_FD` and `CSWAP_PIN_LISTEN_FROM` also appear in a daemon's
+environment. They are how a process hands its listening socket to the next
+one, written by the parent at spawn — not settings, and setting them by hand
+makes a daemon adopt a descriptor that is not the one it was given.
+
 A redeploy is the same story from the other side. Under a holder the daemon
 does not hand its socket to a successor — it exits `75` and lets the holder
 put the new code on the socket it already owns. Handing the port out of the
