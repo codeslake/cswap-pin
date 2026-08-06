@@ -26,6 +26,7 @@ import warnings
 import re
 import selectors
 import select
+import signal
 import socket
 import stat
 import sys
@@ -4687,6 +4688,15 @@ class PortHolder:
             if hasattr(log, "close"):
                 log.close()
         self._standby = proc
+        # ONE IN, ONE OUT — see `_retire_stale_standbys`. AFTER ours exists, so
+        # the socket is never left without one; the strays cannot arm meanwhile
+        # because the port is answering (the daemon above started first).
+        gone = _retire_stale_standbys(self._certdir, keep_pid=proc.pid)
+        if gone:
+            _log_lifecycle(
+                f"retired {gone} standby(s) left behind on port {self.port} by "
+                f"holders that were killed rather than released"
+            )
 
     def _reap_standby(self) -> None:
         """Notice a dead standby, say so, and stop it being a zombie.
@@ -4989,7 +4999,6 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     checked first and short-circuits, so the steady state is one integer
     comparison every 250ms and no connections at all.
     """
-    import fcntl
     import signal
 
     srv = _handed_down_listener()
@@ -5056,11 +5065,8 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     # Non-blocking: a loser has nothing to wait for. The winner is putting a
     # daemon back on the very socket the loser is holding, so the loser's job is
     # finished either way.
-    lock_path = Path(certdir) / _STANDBY_ARM_LOCK
-    try:
-        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    lock_fd = _claim_arm(certdir)
+    if lock_fd is None:
         _log_lifecycle(
             f"another standby is already arming port {port} — exiting rather "
             f"than adding a second acceptor to the socket it is about to serve"
@@ -5890,6 +5896,92 @@ _STANDBY_POLL_S = 0.25
 # costs a connection every quarter second for as long as the process lives.
 _STANDBY_ANSWERED_POLL_S = 2.0
 _STANDBY_PROBE_TIMEOUT_S = 2.0
+
+
+def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
+    """SIGHUP every standby for this certdir except the one we just placed.
+
+    ONE IN, ONE OUT. The arm lock stops two standbys arming at the same
+    instant; it does NOT remove the loser, and the loser still holds the
+    descriptor, still watches the port, and is precisely what arms on the next
+    silent window. So the lock defers a pile-up rather than preventing one.
+
+    They accumulate for a reason that is not a bug: a holder KILLED rather
+    than released leaves its standby behind deliberately — that is the row
+    this whole design covers. Every such death adds one. Measured on host-a:
+    three had piled up, one ordinary daemon handover armed them all, and the
+    port ended with four acceptors.
+
+    SIGHUP, because that is the standby's release signal and the only one it
+    honours — it ignores TERM and INT on purpose, so anything else would reach
+    it as a SIGKILL escalation with no handler and no log.
+    """
+    import subprocess
+
+    target = str(Path(certdir).resolve())
+    retired = 0
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not any(m in line for m in _DAEMON_MODULE_NAMES):
+            continue
+        head, _, rest = line.partition(" ")
+        # Same two gates the daemon sweep uses: the certdir must be the LAST
+        # argv token, not merely present, or a shell that quotes both matches.
+        if not rest.rstrip().endswith(" " + target):
+            continue
+        if f" {_STANDBY_MODULE_ARG} " not in rest:
+            continue
+        try:
+            pid = int(head)
+        except ValueError:
+            continue
+        if pid == keep_pid or pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGHUP)
+            retired += 1
+        except OSError:
+            pass
+    return retired
+
+
+def _claim_arm(certdir) -> "int | None":
+    """Win the right to arm, or None if another standby already has it.
+
+    THE ONLY THING THAT CAN SAY "ONLY ONE". Standbys accumulate legitimately —
+    every holder KILLED rather than released leaves its own behind, which is
+    the row this whole design covers — and they all watch the same port, so one
+    silent window arms ALL of them at once. Measured on host-a: three armed
+    within a minute, each became a holder, four acceptors on 36301.
+
+    NON-BLOCKING, because a loser has nothing to wait for: the winner is
+    putting a daemon back on the very socket the loser holds, so the loser's
+    job is finished either way.
+
+    THE FD IS RETURNED AND NEVER CLOSED. An flock lives on the open file
+    description, so closing it releases the claim — and the winner must hold it
+    for as long as it is the holder, not merely while it decides.
+    """
+    import fcntl
+
+    try:
+        fd = os.open(str(Path(certdir) / _STANDBY_ARM_LOCK),
+                     os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def _standby_tick(born_of: int, silent: int, answered, getppid=os.getppid):
