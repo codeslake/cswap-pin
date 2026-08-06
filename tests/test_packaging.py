@@ -172,3 +172,48 @@ def test_the_runtime_version_is_not_a_hand_maintained_constant():
         )
         return
     raise AssertionError("__version__ is not assigned at module level in __init__.py")
+
+
+def test_every_environment_variable_the_pin_reads_is_named_in_the_readme():
+    """A knob nobody documented is a knob nobody can turn — or turn OFF.
+
+    `CSWAP_PIN_EXIT_WITH_PARENT` was added without a README line, and it is
+    the one that most needed one: set by accident, a holder loses its port
+    within seconds of every launch. Two trace switches had been undocumented
+    for longer, and the two hand-down variables appear in a daemon's
+    environment where a reader will meet them and has no way to learn they
+    are not settings.
+
+    BEING NAMED IS THE WHOLE ASSERTION. What the README says about a variable
+    is prose no test can judge; that it says anything at all is decidable, and
+    it is the part that was missing.
+
+    NOT IN conftest.py, which is where I wrote it first. `pytest tests/`
+    collects `test_*.py` and does NOT collect `conftest.py` — measured, 0
+    tests gathered from it — so the guard would have run nowhere. The two
+    checks already living there have the same problem; that is theirs to fix,
+    but it is why this one is here.
+
+    Reads only: a name the module WRITES into a child's environment is not
+    something anybody sets at it. Two shapes, because the module uses both —
+    the literal, and a module constant holding it.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "src" / "cswap_pin" / "proxy.py").read_text(encoding="utf-8")
+
+    consts = dict(re.findall(r'^(\w+_ENV) = "(CSWAP_PIN_\w+)"', src, re.M))
+    read = set(re.findall(r'environ\.get\(\s*"(CSWAP_PIN_\w+)"', src))
+    for const, value in consts.items():
+        if re.search(rf"environ\.get\(\s*{const}\b", src):
+            read.add(value)
+    assert read, "found no environment reads at all — the pattern has drifted"
+
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    missing = sorted(name for name in read if name not in readme)
+    assert not missing, (
+        f"the pin reads {missing} from the environment and the README never "
+        f"names it — including, for an internal one, to say it is not a setting"
+    )
