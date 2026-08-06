@@ -1949,6 +1949,20 @@ class TestThePortIsConfigurable:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    @staticmethod
+    def _set_port(certdir, port):
+        """Write the setting the way the HOST writes it.
+
+        Deliberately raw JSON rather than a writer of ours. This package only
+        READS this file — `cswap pin --set_port` is what writes it, one repo
+        over — and a helper here would let a schema change pass by updating
+        both ends at once. What we assert is that we can still parse what
+        something else produced.
+        """
+        import json as _json
+
+        (certdir / "settings.json").write_text(_json.dumps({"port": port}))
+
 
     def case_nothing_configured_means_nothing_claimed(self, tmp_path, monkeypatch):
         """No file: None, so the daemon takes an ephemeral port.
@@ -1987,7 +2001,7 @@ class TestThePortIsConfigurable:
             "daemon's port"
         )
 
-        pin_proxy.write_pin_settings(certdir, port=41234)
+        self._set_port(certdir, 41234)
         assert pin_proxy.configured_port(certdir) == 41234, (
             "the env overruled the file"
         )
@@ -2010,7 +2024,7 @@ class TestThePortIsConfigurable:
         """
         import socket as _socket
 
-        from cswap_pin.proxy import PinProxy, write_daemon_state, write_pin_settings
+        from cswap_pin.proxy import PinProxy, write_daemon_state
 
         certdir = self._certdir(tmp_path)
         ensure_ca(certdir, "api.anthropic.com")
@@ -2026,7 +2040,7 @@ class TestThePortIsConfigurable:
         other = recorded.getsockname()[1]
         recorded.close()
         write_daemon_state(certdir, other, os.getpid(), "fp")
-        write_pin_settings(certdir, port=wanted)
+        self._set_port(certdir, wanted)
         monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
 
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
@@ -2051,7 +2065,7 @@ class TestThePortIsConfigurable:
         """
         import socket as _socket
 
-        from cswap_pin.proxy import PinProxy, write_pin_settings
+        from cswap_pin.proxy import PinProxy
 
         certdir = self._certdir(tmp_path)
         ensure_ca(certdir, "api.anthropic.com")
@@ -2062,7 +2076,7 @@ class TestThePortIsConfigurable:
         blocker.listen(1)
         taken = blocker.getsockname()[1]
 
-        write_pin_settings(certdir, port=taken)
+        self._set_port(certdir, taken)
         monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
 
         proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
@@ -2080,32 +2094,29 @@ class TestThePortIsConfigurable:
             proxy.stop(drain=0)
             blocker.close()
 
-    def case_the_settings_file_survives_a_rewrite(self, tmp_path, monkeypatch):
-        """Writing the port must not destroy anything else in the file.
+    def case_a_setting_beside_the_port_is_still_read(self, tmp_path, monkeypatch):
+        """A file carrying MORE than the port still answers for the port.
 
-        It is a settings file, not a port file — the next setting to land
-        there would otherwise be erased by the next `--set_port`.
+        The read-modify-write that keeps those neighbours alive belongs to the
+        writer, which is `cswap pin --set_port` in the host repo — asserted
+        there by `test_set_port_keeps_the_rest_of_the_settings_file`. It used
+        to be asserted HERE, against a `write_pin_settings` in this module
+        that nothing called: the property was proven on a writer that never
+        ran while the one that does had no test at all.
+
+        What is ours is the other half — parsing a file we did not write, and
+        not caring what else is in it.
         """
         import json as _json
 
         from cswap_pin import proxy as pin_proxy
 
         certdir = self._certdir(tmp_path)
-        path = certdir / "settings.json"
-        path.write_text(_json.dumps({"somethingElse": "keep me"}))
-
-        pin_proxy.write_pin_settings(certdir, port=43333)
-        raw = _json.loads(path.read_text())
-        assert raw.get("somethingElse") == "keep me", (
-            f"--set_port clobbered the rest of the settings file: {raw}"
+        monkeypatch.delenv("CSWAP_PIN_PORT", raising=False)
+        (certdir / "settings.json").write_text(
+            _json.dumps({"somethingElse": "keep me", "port": 43333})
         )
-        assert raw.get("port") == 43333
-
-        # ...and clearing it removes only the port.
-        pin_proxy.write_pin_settings(certdir, port=None)
-        raw = _json.loads(path.read_text())
-        assert "port" not in raw, raw
-        assert raw.get("somethingElse") == "keep me", raw
+        assert pin_proxy.configured_port(certdir) == 43333
 
 
 class TestDaemonPortStability:

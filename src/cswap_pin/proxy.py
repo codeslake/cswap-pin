@@ -3557,31 +3557,6 @@ def _settings_port(certdir: Path) -> object:
     return raw.get("port") if isinstance(raw, dict) else None
 
 
-def write_pin_settings(certdir: Path, *, port: int | None) -> None:
-    """Persist the requested port, or drop it when ``port`` is None.
-
-    READ-MODIFY-WRITE, not a truncate. This is a SETTINGS file: the next
-    setting to land here would otherwise be erased by the next `--set_port`,
-    which is the kind of loss nobody notices until the setting they set has
-    quietly gone.
-    """
-    path = Path(certdir) / _SETTINGS_FILE
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raw = {}
-    except Exception:  # noqa: BLE001 — absent or garbage: start clean
-        raw = {}
-    if port is None:
-        raw.pop("port", None)
-    else:
-        raw["port"] = int(port)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def refcount_fifo_path(certdir: Path) -> Path:
     """Path of the refcount FIFO. Sessions hold a write fd on it; the daemon
     reads it and exits when the last holder closes (a FIFO refcount)."""
