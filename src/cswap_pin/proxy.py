@@ -5899,16 +5899,24 @@ _STANDBY_MODULE_ARG = "--standby"
 # later standby that reaches the same decision finds it taken and stands down.
 _STANDBY_ARM_LOCK = ".standby-arm.lock"
 # CONSECUTIVE silent probes before the standby acts. One is not evidence: the
-# port is briefly silent during an ordinary handover, and a daemon under load
-# can miss a 2s window. Two costs ~4s of queueing on a socket that never
-# stopped listening, which is the whole reason the requests are not lost.
-_STANDBY_SILENT_STREAK = 2
+# port is briefly silent during an ordinary handover, and a loaded daemon can
+# miss a single short window. THREE short windows are strictly better evidence
+# than two long ones — each is an independent observation, and a false positive
+# now needs three slow answers in a row rather than two.
+_STANDBY_SILENT_STREAK = 3
 _STANDBY_POLL_S = 0.25
 # HOW LONG TO WAIT WHEN ORPHANED AND SOMETHING STILL ANSWERS. Not a tuning
 # knob: that state converges to nothing, so polling it fast buys nothing and
 # costs a connection every quarter second for as long as the process lives.
 _STANDBY_ANSWERED_POLL_S = 2.0
-_STANDBY_PROBE_TIMEOUT_S = 2.0
+# 250ms, NOT SECONDS. The wait is the DECISION, not the work: a live proxy
+# answers this probe in about a millisecond, so a two-second timeout was slack
+# for a stalled event loop rather than a measurement — and two of them ran
+# serially, which is where 4,610ms of the recovery went. Three short windows
+# give MORE independent observations than two long ones and cost a fifth of the
+# time. A peer measured the identical change on their own component: first
+# request after the kill 3,899ms -> 694ms, steady state unchanged.
+_STANDBY_PROBE_TIMEOUT_S = 0.25
 
 
 def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
