@@ -2687,9 +2687,28 @@ class TestDaemonPortStability:
             def wait(self, timeout=None):
                 return 0
 
+            # `_retire_stale_standbys` shells out via subprocess.run, which
+            # uses Popen as a context manager — so a stub that only fakes the
+            # constructor breaks it.
+            def poll(self):
+                return None  # still running
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def communicate(self, *a, **k):
+                return ("", "")
+
         ensure_ca(tmp_path, "api.anthropic.com")
         holder = PortHolder(tmp_path, "1", "a@b.c")
         monkeypatch.setattr(subprocess, "Popen", _P)
+        # Not what this case is about, and it would shell out through the
+        # stubbed Popen. Covered by its own case.
+        monkeypatch.setattr(pin_proxy, "_retire_stale_standbys",
+                            lambda *a, **k: 0)
         # MAKE THE DISK DISAGREE WITH WHAT WE LOADED, or this case cannot fail.
         # With the file unchanged, `daemon_fingerprint()` and
         # `_OWN_FINGERPRINT` are the same string — so publishing the wrong one
@@ -2713,6 +2732,114 @@ class TestDaemonPortStability:
             f"{pin_proxy._HOLDER_SHA_ENV}={env.get(pin_proxy._HOLDER_SHA_ENV)!r} "
             f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
         )
+
+    def case_placing_a_standby_retires_the_ones_left_behind(self, tmp_path):
+        """ONE IN, ONE OUT. The lock alone only DEFERS the pile-up.
+
+        A peer made the point better than my own fix did: an arm lock stops
+        two from arming at once, but it does not remove the loser — and the
+        loser is still holding the descriptor, still watching the port, and is
+        exactly what arms on the next silent window. Their design does not
+        accumulate for this reason and not because of any spawn guard: when a
+        successor takes the port it re-asks and SIGHUPs whoever still holds
+        the descriptor, walking the stale ones off before it serves.
+
+        Every holder that is KILLED rather than released leaves its standby
+        behind — that is the row this covers, so they genuinely accumulate.
+        Measured on lmd42 before any of this: three had piled up, one silent
+        window armed them all, and 36301 ended with four acceptors.
+
+        So placing a standby retires the strays for the same certdir, by
+        SIGHUP, which is the standby's own release signal.
+        """
+        import signal
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        target = str(certdir.resolve())
+        base = f"/usr/bin/python3 -m {pin_proxy._DAEMON_MODULE}"
+        listing = "\n".join([
+            f"5101 {base} {pin_proxy._STANDBY_MODULE_ARG} 1 a@b.c {target}",
+            f"5102 {base} {pin_proxy._STANDBY_MODULE_ARG} 1 a@b.c {target}",
+            f"5103 {base} 1 a@b.c {target}",                       # a daemon
+            f"5104 {base} {pin_proxy._HOLDER_MODULE_ARG} 0 1 a@b.c {target}",
+            f"5105 {base} {pin_proxy._STANDBY_MODULE_ARG} 1 a@b.c /other/dir",
+        ])
+
+        class _Ran:
+            stdout = listing
+
+        sent = []
+        import subprocess
+        real_run, real_kill = subprocess.run, os.kill
+        try:
+            subprocess.run = lambda *a, **k: _Ran()
+            os.kill = lambda pid, sig: sent.append((pid, sig))
+            pin_proxy._retire_stale_standbys(certdir, keep_pid=5102)
+        finally:
+            subprocess.run, os.kill = real_run, real_kill
+
+        assert (5101, signal.SIGHUP) in sent, (
+            "a standby left behind by a dead holder was not retired; it still "
+            "holds the descriptor and is what arms on the next silent window"
+        )
+        assert not any(p == 5102 for p, _ in sent), "retired the one we just placed"
+        assert not any(p in (5103, 5104) for p, _ in sent), (
+            "retired a daemon or a holder — only standbys are released this way"
+        )
+        assert not any(p == 5105 for p, _ in sent), (
+            "reached a standby for a DIFFERENT certdir"
+        )
+        assert all(s == signal.SIGHUP for _, s in sent), (
+            "used something other than SIGHUP; the standby ignores TERM and "
+            "INT on purpose, so anything else escalates to SIGKILL"
+        )
+
+    def case_only_one_standby_can_win_the_right_to_arm(self, tmp_path):
+        """The exclusion I shipped and then admitted was unproven.
+
+        The live run that produced it showed exactly one standby arming, but
+        the LOCK never fired there — the loser stood down on its own because
+        the winner restored the port before it finished its own silence
+        streak. So the outcome was right for a reason that does not hold in a
+        tighter race, and saying "one armed" would have been evidence of
+        nothing. This exercises the claim directly.
+
+        In-process is a real test of it: an flock lives on the open file
+        DESCRIPTION, so two separate `open()` calls conflict with each other
+        even inside one process. That is also why the winner must keep its fd
+        — closing it releases the claim, and the winner needs it for as long
+        as it is the holder, not merely while it decides.
+
+        What it prevents, measured on lmd42 before it existed: three standbys
+        armed within a minute of one silent window, each became a holder, and
+        36301 had FOUR acceptors — the single property this design exists to
+        keep.
+        """
+        import os as _os
+
+        from cswap_pin.proxy import _claim_arm
+
+        first = _claim_arm(tmp_path)
+        try:
+            assert first is not None, "the first standby could not claim the arm"
+            assert _claim_arm(tmp_path) is None, (
+                "a SECOND standby won the right to arm while the first still "
+                "held it — both will put a holder on the same socket, which is "
+                "the four-acceptor state measured on lmd42"
+            )
+        finally:
+            _os.close(first)
+        # And the claim is released with the winner, so the next standby to
+        # inherit this port can take it rather than finding it locked forever.
+        again = _claim_arm(tmp_path)
+        assert again is not None, (
+            "the claim outlived its holder: every future standby now stands "
+            "down and the port loses its cover permanently"
+        )
+        _os.close(again)
 
     def case_the_daemon_sweep_does_not_select_the_standby(self, tmp_path):
         """`_pin_daemon_pids` picks what gets SIGTERM-then-SIGKILLed.
@@ -2804,9 +2931,28 @@ class TestDaemonPortStability:
             def wait(self, timeout=None):
                 return 0
 
+            # `_retire_stale_standbys` shells out via subprocess.run, which
+            # uses Popen as a context manager — so a stub that only fakes the
+            # constructor breaks it.
+            def poll(self):
+                return None  # still running
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def communicate(self, *a, **k):
+                return ("", "")
+
         ensure_ca(tmp_path, "api.anthropic.com")
         holder = PortHolder(tmp_path, "1", "a@b.c")
         monkeypatch.setattr(subprocess, "Popen", _P)
+        # Not what this case is about, and it would shell out through the
+        # stubbed Popen. Covered by its own case.
+        monkeypatch.setattr(pin_proxy, "_retire_stale_standbys",
+                            lambda *a, **k: 0)
         # BEFORE the close below: a closed socket reports fileno() == -1, and
         # comparing that would fail a correct implementation.
         listening_fd = holder._srv.fileno()
@@ -3025,6 +3171,7 @@ class TestDaemonPortStability:
         import signal
         import subprocess
 
+        from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PortHolder, ensure_ca
 
         sent = []
@@ -3039,6 +3186,21 @@ class TestDaemonPortStability:
             def wait(self, timeout=None):
                 return 0
 
+            # `_retire_stale_standbys` shells out via subprocess.run, which
+            # uses Popen as a context manager — so a stub that only fakes the
+            # constructor breaks it.
+            def poll(self):
+                return None  # still running
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def communicate(self, *a, **k):
+                return ("", "")
+
             def terminate(self):
                 sent.append(("daemon", signal.SIGTERM))
 
@@ -3048,6 +3210,10 @@ class TestDaemonPortStability:
         ensure_ca(tmp_path, "api.anthropic.com")
         holder = PortHolder(tmp_path, "1", "a@b.c")
         monkeypatch.setattr(subprocess, "Popen", _P)
+        # Not what this case is about, and it would shell out through the
+        # stubbed Popen. Covered by its own case.
+        monkeypatch.setattr(pin_proxy, "_retire_stale_standbys",
+                            lambda *a, **k: 0)
         holder._spawn()
         holder._spawn_standby()
         holder.stop()
