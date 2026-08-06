@@ -6109,8 +6109,10 @@ def _standby_tick(born_of: int, silent: int, answered, getppid=os.getppid):
     answers means a daemon outlived its holder, and that daemon's own watchdog
     puts a fresh holder back; arming would race it.
 
-    Only "orphaned AND nothing answers, twice running" is the case no other
-    part of this system covers.
+    Only "orphaned AND nothing answers" is the case no other part of this
+    system covers. `_STANDBY_SILENT_STREAK` windows of it, and the streak is 1
+    — the recorded-pid check inside `answered` is direct evidence, so a second
+    window would only add latency to a question already settled.
     """
     if getppid() == born_of:
         # THE PARENT TEST COMES FIRST AND SHORT-CIRCUITS, so the normal state
