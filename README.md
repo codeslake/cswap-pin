@@ -243,7 +243,11 @@ none of the byte-shuffling failures a relay has to get right exist here.
   subreaper host (`systemd --user`); a standby that never arms while still
   holding the descriptor makes the address accept-and-hang, strictly worse than
   refusing.
-- two consecutive probes to the port get **no byte back** within 2s. Any byte
+- the daemon `proxy.json` names is gone — `kill(pid, 0)`, microseconds and no
+  socket — **and** one 250ms probe to the port gets **no byte back**. The
+  recorded pid is asked first because it is the cheapest and most direct
+  evidence there is: silence is only a *proxy* for "nothing accepts", and a
+  loaded daemon can stay silent longer than any window worth waiting. Any byte
   counts and the status is ignored — a live daemon answers `407` and a peer's
   carrying relay answers `503`, and both mean "somebody is behind this socket".
 
@@ -255,6 +259,21 @@ holder closes by itself (measured: 407 of 408 requests served across a daemon
 When it does act it does not serve traffic — it puts a holder back on the
 descriptor it was already holding, and requests that arrived meanwhile are
 waiting in the backlog of a socket that never stopped listening.
+
+**What it cannot preserve is the connections the dead daemon had already
+accepted.** Those bytes are in a process that no longer exists and no successor
+can produce them. Measured with a peer's instrument — sampling a real session's
+ESTABLISHED connections every 200ms across the kill — the session's connections
+drop to zero and are re-made about 851ms later. What survives is the *address*,
+which is the part a session cannot relearn, and that is the whole point:
+`HTTPS_PROXY` was fixed at exec, so a client that retries finds a listener
+instead of the 198-of-199 ConnectionRefused above.
+
+So **"zero requests lost" is a claim about a retrying client, not about
+connection continuity**, and elapsed time cannot tell the two apart — a reset
+that is re-made in under a second looks identical to no reset at all. The
+upgrade path above is the stronger one: there the socket is handed on, so
+connections are never reset in the first place.
 
 **Only `SIGHUP` releases it.** `SIGTERM` and `SIGINT` are ignored outright:
 `TERM` is what a supervisor, a `systemctl stop` or a stray `pkill` sends, and
