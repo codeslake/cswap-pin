@@ -5026,8 +5026,11 @@ class TestTheDaemonWatchesItsOwnCode:
     recovery at all). The removal was right; the replacement is this class.
 
     So the daemon watches ITSELF. `daemon_fingerprint` is a hash of this
-    module's mtime, which means re-calling it later answers "was proxy.py
-    replaced under me" with no new machinery and no host-side hook of any kind.
+    module's CONTENT — not its mtime, which is wrong in both directions and
+    says so in that function — which means re-calling it later answers "was
+    proxy.py replaced under me" with no new machinery and no host-side hook of
+    any kind. The baseline it is compared against is `_OWN_FINGERPRINT`, taken
+    at import; only the disk side may be re-read.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -5089,6 +5092,50 @@ class TestTheDaemonWatchesItsOwnCode:
         # and send every new session to no proxy at all.
         assert not [e for e in events if e[0] == "teardown"], events
         assert done.is_set()
+
+    def case_the_baseline_is_the_code_we_LOADED_not_the_disk_we_find(
+        self, tmp_path, monkeypatch
+    ):
+        """The one case that does NOT pass `_own_fingerprint`, deliberately.
+
+        Every other case in this class supplies the baseline, which is what let
+        the default go wrong unseen: `own` was taken by CALLING
+        `daemon_fingerprint()` from inside this thread, and the thread starts
+        near the end of `daemon_main` — after the proxy serves, after the signal
+        teardown. A deploy landing in that window is captured AS the baseline,
+        so every later tick compares the new hash against itself, is true
+        forever, and the daemon never learns it is stale. Silently: an eager
+        baseline costs one needless handover and self-corrects, this costs
+        nothing visible, which reads exactly like health.
+
+        Simulating the window is what the patch below IS. `daemon_fingerprint`
+        answers "what is on disk NOW"; making it answer something else while
+        the module constant keeps the bytes we imported is precisely the state
+        a mid-start deploy produces. A baseline read from disk here matches the
+        patch and does nothing; a baseline captured at import differs and hands
+        over.
+        """
+        import threading
+
+        events = []
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: "disk-moved-while-we-were-starting")
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda n, e, c, **k: events.append(("spawn", n)) or 41234)
+
+        done = threading.Event()
+        pin_proxy._watch_own_code(
+            _recording_server(events)(), "1", "a@example.com",
+            self._certdir(tmp_path), done,
+            teardown=lambda reason: events.append(("teardown", reason)),
+            interval=0.01,
+        )
+
+        assert ("spawn", "1") in events, (
+            "the daemon did not hand over: its baseline came from the disk it "
+            f"was comparing against, so nothing could ever differ — {events}"
+        )
+        assert pin_proxy._OWN_FINGERPRINT != "disk-moved-while-we-were-starting"
 
     def case_a_daemon_that_outlives_its_holder_gets_a_new_one(
         self, tmp_path, monkeypatch

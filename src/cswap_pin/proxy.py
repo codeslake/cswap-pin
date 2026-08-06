@@ -4267,6 +4267,30 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     return hashlib.sha256(code).hexdigest()[:16]
 
 
+# THE BYTES THIS PROCESS LOADED, captured at IMPORT and never re-read.
+#
+# `daemon_fingerprint()` re-reads the file every call, which is right for one
+# side of the watchdog's comparison and wrong for the other. The question there
+# is "does disk still match what I loaded", so the DISK side must be fresh and
+# the OWN side must not move. `_watch_own_code` took its baseline by calling
+# `daemon_fingerprint()` from inside the watchdog THREAD — started near the end
+# of `daemon_main`, after the proxy is serving and the signal teardown is
+# installed. Replace the file anywhere in that window and the baseline captures
+# the NEW bytes while the process runs the OLD ones, so every later tick
+# compares new against new, is true forever, and the daemon never learns it is
+# stale.
+#
+# That is the exact outage this watchdog exists to end — a daemon served for 22
+# hours on code replaced 19 hours earlier — reached through the detector rather
+# than by having no detector. And it fails SILENTLY: an over-eager baseline
+# costs one needless handover and corrects itself, this one costs nothing
+# visible at all, which is indistinguishable from health.
+#
+# Module level, so it is evaluated while the interpreter is executing this very
+# file. Nothing between import and the watchdog can move it.
+_OWN_FINGERPRINT = daemon_fingerprint()
+
+
 def _pid_alive(pid: int) -> bool:
     """Whether ``pid`` names a process we could signal. Nothing else.
 
@@ -5086,7 +5110,10 @@ def _watch_own_code(
     NOT gated on the daemon being idle: a busy daemon is exactly the one that
     must upgrade, and the drain in step 1 is what protects its in-flight work.
     """
-    own = _own_fingerprint if _own_fingerprint is not None else daemon_fingerprint()
+    # `_OWN_FINGERPRINT`, NOT a fresh read — see its definition. Taking the
+    # baseline here would sample the disk at THREAD-START, which is late enough
+    # for a deploy to land in between and blind this watchdog permanently.
+    own = _own_fingerprint if _own_fingerprint is not None else _OWN_FINGERPRINT
     attempts = 0
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
