@@ -32,6 +32,10 @@ jobs:
       # In the BUILD job deliberately: `publish` needs `build`, so a failure
       # here means the publish job never starts and the tag produces no
       # release at all.
+      # ci.yml runs this same command on every push and on both platforms. It
+      # is duplicated rather than shared because a `workflow_call` that fails to
+      # load would take the release with it, and "no release, no error anyone
+      # reads" is a worse failure than two copies of eight lines.
       - name: The suite must pass before anything is uploaded
         run: |
           # HOME and XDG_DATA_HOME redirected: the suite drives real cert
