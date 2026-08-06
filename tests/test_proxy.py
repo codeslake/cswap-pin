@@ -2714,6 +2714,57 @@ class TestDaemonPortStability:
             f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
         )
 
+    def case_the_daemon_sweep_does_not_select_the_standby(self, tmp_path):
+        """`_pin_daemon_pids` picks what gets SIGTERM-then-SIGKILLed.
+
+        IT ALREADY EXCLUDES THE HOLDER, for the reason that applies twice: the
+        holder's argv is the daemon's plus one flag, and its death takes the
+        port with it. The standby is the same shape and the same stakes, and
+        adding a third process kind without updating the one place that
+        enumerates them is how it got missed.
+
+        MEASURED IN PRODUCTION, which is where it was found rather than here.
+        On via-work-mac the standby was gone within four minutes of every
+        deploy, leaving `<defunct>` — killed by this sweep and never replaced.
+        It ignores SIGTERM on purpose, so it went out on the SIGKILL
+        escalation: no handler ran, no line was logged, and the holder went on
+        believing it was protected. `ps` still listed the zombie, so every
+        liveness check that asks the process TABLE rather than the STATE read
+        it as alive, including mine.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        target = str(certdir.resolve())
+        base = f"/usr/bin/python3 -m {pin_proxy._DAEMON_MODULE}"
+        rows = {
+            "daemon": f"4242 {base} 1 a@b.c {target}",
+            "holder": f"4243 {base} {pin_proxy._HOLDER_MODULE_ARG} 0 1 a@b.c {target}",
+            "standby": f"4244 {base} {pin_proxy._STANDBY_MODULE_ARG} 1 a@b.c {target}",
+        }
+
+        class _Ran:
+            stdout = "\n".join(rows.values())
+
+        import subprocess
+        real = subprocess.run
+        try:
+            subprocess.run = lambda *a, **k: _Ran()
+            picked = pin_proxy._pin_daemon_pids(certdir)
+        finally:
+            subprocess.run = real
+
+        assert 4242 in picked, "the sweep stopped finding the actual daemon"
+        assert 4243 not in picked, "the holder must stay excluded"
+        assert 4244 not in picked, (
+            "the sweep selected the STANDBY. It ignores SIGTERM by design, so "
+            "it dies on the SIGKILL escalation with no handler and no log, and "
+            "nothing replaces it — the port loses its last cover while every "
+            "check still reports a standby, because the zombie stays in the "
+            "process table until the holder reaps it"
+        )
+
     def case_the_standby_outlives_the_holder_that_placed_it(
         self, tmp_path, monkeypatch
     ):
