@@ -71,7 +71,11 @@ jobs:
         # whole step was 5.2s of a 29s job for one import.
         run: |
           uv venv /tmp/check
-          VIRTUAL_ENV=/tmp/check uv pip install dist/*.whl
+          # `--python`, not VIRTUAL_ENV=. This step runs in a repo the earlier
+          # `uv run` may have materialised a .venv for, and `uv pip` resolves
+          # its target by discovery when the env var merely hints at one.
+          # Naming the interpreter is immune to that ordering.
+          uv pip install --python /tmp/check/bin/python dist/*.whl
           /tmp/check/bin/python -c '
           import cswap_pin
           assert cswap_pin.host_available() is False, "host_available lied with no host installed"
