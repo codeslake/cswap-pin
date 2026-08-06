@@ -4978,11 +4978,15 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         f"standby holding port {port} for holder {born_of} — accepting nothing"
     )
     silent = 0
+    wait = _STANDBY_POLL_S
     while not released:
-        time.sleep(_STANDBY_POLL_S)
+        time.sleep(wait)
         if released:
             break
-        silent, arm = _standby_tick(
+        # THE TICK CHOOSES ITS OWN NEXT INTERVAL, because only it knows which
+        # state we are in — and the three states want different rates. See
+        # `_standby_tick`.
+        silent, arm, wait = _standby_tick(
             born_of, silent, lambda: _port_returns_bytes(port)
         )
         if arm:
@@ -5792,11 +5796,15 @@ _STANDBY_MODULE_ARG = "--standby"
 # stopped listening, which is the whole reason the requests are not lost.
 _STANDBY_SILENT_STREAK = 2
 _STANDBY_POLL_S = 0.25
+# HOW LONG TO WAIT WHEN ORPHANED AND SOMETHING STILL ANSWERS. Not a tuning
+# knob: that state converges to nothing, so polling it fast buys nothing and
+# costs a connection every quarter second for as long as the process lives.
+_STANDBY_ANSWERED_POLL_S = 2.0
 _STANDBY_PROBE_TIMEOUT_S = 2.0
 
 
 def _standby_tick(born_of: int, silent: int, answered, getppid=os.getppid):
-    """One poll of the standby's arm predicate. Returns ``(silent, arm)``.
+    """One poll of the standby's arm predicate. ``(silent, arm, sleep_for)``.
 
     Split out of the loop because this is the part that can be WRONG in ways a
     timing test hides. The loop around it is a sleep.
@@ -5813,9 +5821,22 @@ def _standby_tick(born_of: int, silent: int, answered, getppid=os.getppid):
     part of this system covers.
     """
     if getppid() == born_of:
-        return 0, False
-    silent = 0 if answered() else silent + 1
-    return silent, silent >= _STANDBY_SILENT_STREAK
+        # THE PARENT TEST COMES FIRST AND SHORT-CIRCUITS, so the normal state
+        # opens no socket at all — one integer comparison per poll, forever.
+        return 0, False, _STANDBY_POLL_S
+    if answered():
+        # ORPHANED BUT SOMETHING IS SERVING. A real and possibly long-lived
+        # state: a daemon that outlived its holder keeps answering, and its own
+        # watchdog puts a fresh holder back — but OUR parent stays dead, so
+        # this branch never stops being taken. At the tight poll that is a dial
+        # every ~250ms forever, because an answered probe returns in about a
+        # millisecond. Nothing is converging here, so there is nothing to poll
+        # quickly for. A peer measured the same state and backed off to 2s;
+        # this matches them.
+        return 0, False, _STANDBY_ANSWERED_POLL_S
+    silent += 1
+    # Silence IS converging — each one is a step toward arming — so stay tight.
+    return silent, silent >= _STANDBY_SILENT_STREAK, _STANDBY_POLL_S
 
 
 def _successor_is_serving() -> bool:
