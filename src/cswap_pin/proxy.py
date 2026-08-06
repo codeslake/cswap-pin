@@ -4350,6 +4350,22 @@ def wanted_port(certdir: Path) -> "int | None":
 
 
 _SELF_HEAL_ENV = "CSWAP_PIN_SELF_HEAL"
+
+# OPT-IN, because a holder is MEANT to outlive the thing that started it.
+# Armed unconditionally it took the pin down on a normal launch: `cswap pin`
+# and a shell launcher both spawn the holder and exit, so the parent is gone
+# seconds later and PR_SET_PDEATHSIG fires. Measured on a production-shaped
+# launch — parent exits, then:
+#
+#     t+2s  DEAD (ConnectionRefusedError)   t+5s  DEAD   t+15s  DEAD
+#     holder log: "launcher already gone before the holder armed — exiting"
+#
+# The leak it was written for is a TEST-RUNNER problem (a SIGKILLed pytest
+# leaving holders behind: 151 processes, 9.17 GiB measured), so the fixture
+# asks for it and production never does. A peer component shipped the same
+# default and took its port down twice under a live session before reverting
+# to exactly this shape.
+_EXIT_WITH_PARENT_ENV = "CSWAP_PIN_EXIT_WITH_PARENT"
 # "I am going, put a successor on this socket." A daemon serving on a holder's
 # socket exits with this instead of 0 when it was TERM'd rather than idle: the
 # holder keeps the port and respawns, so a redeploy loads new code without the
@@ -4704,18 +4720,24 @@ def _arm_parent_death_signal() -> None:
 def holder_main(account_num: str, email: str, certdir: Path,
                 port: int | None = None) -> None:
     """Entry point for the detached holder (``-m cswap_pin.proxy --hold-port``)."""
-    # BEFORE THE PORT IS TAKEN. Arming after `run_service` would leave the
-    # window where the holder already owns the port unprotected, which is the
-    # one window where an orphan actually costs something.
+    # ONLY WHEN ASKED — see `_EXIT_WITH_PARENT_ENV`. Outliving the process that
+    # started it is the holder's whole job, so tying its life to that process
+    # is a test harness's need, never production's.
+    #
+    # BEFORE THE PORT IS TAKEN, when it is asked for. Arming after
+    # `run_service` would leave the window where the holder already owns the
+    # port unprotected, which is the one window where an orphan actually costs
+    # something.
     #
     # A RACE THE KERNEL CANNOT CLOSE FOR US: if the parent died between our
     # fork and this call, the signal was already delivered to a process that
     # had not armed it, so it never arrives. Check explicitly rather than
     # trust the arming alone.
-    _arm_parent_death_signal()
-    if os.getppid() == 1:
-        _log_lifecycle("launcher already gone before the holder armed — exiting")
-        return
+    if os.environ.get(_EXIT_WITH_PARENT_ENV) == "1":
+        _arm_parent_death_signal()
+        if os.getppid() == 1:
+            _log_lifecycle("launcher already gone before the holder armed — exiting")
+            return
     try:
         holder = run_service(Path(certdir), account_num, email, port=port)
     except OSError as exc:
@@ -5822,10 +5844,10 @@ class PinProxy:
         # its own thread, so a thread-local keeps one upstream per client.
         self._local = threading.local()
         self._conn_seq = itertools.count(1)
-        # Clients connected right now. The daemon's own count, because the
-        # /proc-based probe is Linux-only and its None reads as "idle" on the
-        # machines that cannot answer (see ``_serve_client``).
-        self._live_clients = 0
+        # Clients connected right now, in `_open_conns` — the daemon's own
+        # record, because the /proc-based probe is Linux-only and its None
+        # reads as "idle" on the machines that cannot answer (see
+        # ``_serve_client``). No separate counter: see `live_client_count`.
         self._live_lock = threading.Lock()
         # One bridge sweep at a time. A session opening fires several calls in
         # a burst; without this each would start its own listing.
@@ -6181,6 +6203,20 @@ class PinProxy:
             # accepts, which would then cut a quiet-but-healthy stream. The
             # wait above is about noticing shutdown, not about the client.
             conn.settimeout(None)
+            # COUNTED HERE, NOT IN THE THREAD. `_serve_client` used to do the
+            # registration itself, which left the connection invisible for as
+            # long as the thread took to start: `live_client_count()` read 0,
+            # so `await_inflight` returned believing there was nothing to wait
+            # for, and `_close_open_connections` had nothing to shut down. The
+            # exit then closed the fd with the client's request unread — which
+            # the kernel MUST answer with RST (see `_close_open_connections`).
+            #
+            # Microseconds when idle, wider under load, which is why it showed
+            # up as an intermittent "2 in-flight requests cut by a planned
+            # restart" — about 1 run in 6 on a loaded box and never on an idle
+            # one. Registering before the handoff closes the window entirely:
+            # accepted IS connected, whatever the scheduler does next.
+            self._register_client(conn)
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
@@ -6220,6 +6256,13 @@ class PinProxy:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _register_client(self, conn: socket.socket) -> None:
+        """Count ``conn`` as connected. Idempotent, because two callers reach
+        it: the accept loop (so a connection is drainable from the instant it
+        exists) and `_serve_client` (for a socket handed to it directly)."""
+        with self._live_lock:
+            self._open_conns.add(conn)
+
     def _serve_client(self, conn: socket.socket) -> None:
         """``_handle_client`` with the connection counted for its lifetime.
 
@@ -6229,13 +6272,14 @@ class PinProxy:
         was then read as "nobody is connected" and let the idle watcher stop
         a daemon mid-conversation.
         """
-        with self._live_lock:
-            self._live_clients += 1
-            self._open_conns.add(conn)
+        # ALREADY REGISTERED by `_accept_loop` — see the comment there. Called
+        # again here for the paths that hand us a socket directly (tests, and
+        # anything that serves a connection it accepted itself); the register
+        # is idempotent so the common path double-registering is not a leak.
+        self._register_client(conn)
 
         def _release():
             with self._live_lock:
-                self._live_clients -= 1
                 self._open_conns.discard(conn)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
@@ -6255,9 +6299,17 @@ class PinProxy:
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
-        count the daemon keeps itself, not an inference about the OS."""
+        count the daemon keeps itself, not an inference about the OS.
+
+        DERIVED from the open set rather than a counter beside it. They were
+        two names for one fact, incremented and decremented together — and
+        `_close_open_connections` empties the set without touching a counter,
+        so the pair could disagree exactly when a drain had just cut
+        everything. One of them had to be the answer; the set is the one that
+        also says WHICH connections.
+        """
         with self._live_lock:
-            return self._live_clients
+            return len(self._open_conns)
 
     def _bridge_api(self, method: str, path: str, token: str, timeout: float = 30.0):
         """One call to the sessions API, over the daemon's own egress.

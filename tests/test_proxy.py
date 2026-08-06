@@ -3058,6 +3058,68 @@ class TestDaemonPortStability:
         finally:
             holder.stop()
 
+    def case_a_connection_is_counted_before_its_thread_runs(self, tmp_path):
+        """An ACCEPTED connection must be drainable, not just a served one.
+
+        `_accept_loop` accepts and hands the socket to a thread, but the
+        registration into `_open_conns`/`_live_clients` happens INSIDE that
+        thread (`_serve_client`). Between the two, the connection exists and
+        the daemon does not know it: `live_client_count()` reads 0, so
+        `await_inflight` returns at once believing there is nothing to wait
+        for, and `_close_open_connections` has nothing to shut down. The fd is
+        then closed by `os._exit` with the client's CONNECT bytes unread —
+        which the kernel MUST answer with RST (see
+        `_close_open_connections`).
+
+        The window is normally microseconds and widens with load, which is
+        exactly the shape of the intermittent `2 in-flight requests cut by a
+        planned restart` this class reported: ~1 run in 6 on a loaded box,
+        never on an idle one.
+
+        Reproduced deterministically by making the thread start slow rather
+        than by loading the machine: a connection accepted but not yet in the
+        thread must still be counted.
+        """
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
+        proxy.start()
+        try:
+            # WIDEN THE WINDOW, do not race it. Delaying the thread's body is
+            # the same window a loaded scheduler produces, made observable.
+            real = proxy._serve_client
+            started = threading.Event()
+
+            def _slow(conn):
+                started.set()
+                time.sleep(0.5)
+                return real(conn)
+
+            proxy._serve_client = _slow
+
+            s = socket.create_connection(("127.0.0.1", proxy.port), timeout=3)
+            try:
+                s.sendall(
+                    b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                    b"Host: api.anthropic.com:443\r\n\r\n"
+                )
+                assert started.wait(3), "the accept loop never took the socket"
+                # ACCEPTED, and the daemon is not yet in _serve_client.
+                assert proxy.live_client_count() > 0, (
+                    "an accepted connection was invisible to the drain — "
+                    "await_inflight would return believing nobody is "
+                    "connected, and the exit cuts it with its request unread"
+                )
+            finally:
+                s.close()
+        finally:
+            proxy.stop(drain=0)
+
     def case_a_planned_restart_under_a_holder_loses_nothing(self, tmp_path):
         """SIGTERM is what a deploy sends, and it must cost NOTHING.
 
@@ -10088,12 +10150,95 @@ class TestAHolderDoesNotOutliveItsLauncher:
             "leaves it running forever (measured: alive at t+20s, ppid=1)"
         )
 
-    def case_a_sigkilled_launcher_takes_the_holder_with_it(self, tmp_path):
-        """The behaviour itself, driven end to end.
+    def case_a_holder_outlives_the_launcher_that_backgrounded_it(self, tmp_path):
+        """THE DEFAULT, and the case below is the exception to it.
 
-        A launcher process starts the holder exactly as production does, then
-        is SIGKILLed — no `finally`, no atexit, nothing cooperative. The holder
-        and its daemon must be gone shortly afterwards.
+        A holder is started and left running: `cswap pin` spawns it and exits,
+        a shell launcher backgrounds it and the shell exits. Seconds later the
+        parent is gone. That is not a leak, it is the design — the holder's
+        whole job is to keep the port answering across everything above it.
+
+        Measured with the parent-death signal armed unconditionally, on a
+        production-shaped launch:
+
+            t+2s  DEAD (ConnectionRefusedError)   t+5s  DEAD   t+15s  DEAD
+            holder log: "launcher already gone before the holder armed"
+
+        A live session's HTTPS_PROXY is fixed at exec, so that is every
+        pinned session stranded for the life of the machine. A peer component
+        shipped the same default and took its port down twice under a live
+        session before reverting to the opt-in shape this asserts.
+        """
+        import pathlib
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        from cswap_pin.proxy import ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        log = tmp_path / "h.log"
+        launcher_src = (
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-m', 'cswap_pin.proxy',\n"
+            f"                  '--hold-port', {str(port)!r}, '1', 'a@example.com',\n"
+            f"                  {str(tmp_path)!r}],\n"
+            "                 stdin=subprocess.DEVNULL,\n"
+            f"                 stdout=open({str(log)!r}, 'wb'),\n"
+            "                 stderr=subprocess.STDOUT, start_new_session=True)\n"
+        )
+        # EXITS IMMEDIATELY, which is the whole point of the case.
+        subprocess.run([sys.executable, "-c", launcher_src], check=True)
+
+        try:
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                raise AssertionError(
+                    f"the holder never served {port} after its launcher "
+                    f"exited — log: {log.read_text()[-400:] if log.exists() else '(none)'}"
+                )
+            # AND STAYS. The signal fires on the parent's exit, so a holder
+            # that dies to it dies within a second or two of the launch.
+            for _ in range(6):
+                time.sleep(0.5)
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                except OSError as exc:
+                    raise AssertionError(
+                        f"the holder released {port} after its launcher exited "
+                        f"({type(exc).__name__}) — every session wired to it is "
+                        f"stranded. log: "
+                        f"{log.read_text()[-400:] if log.exists() else '(none)'}"
+                    ) from exc
+        finally:
+            from conftest import _reap_pin_processes
+
+            _reap_pin_processes(tmp_path)
+
+    def case_a_sigkilled_launcher_takes_the_holder_with_it(self, tmp_path):
+        """The behaviour itself, driven end to end — and only when ASKED for.
+
+        A launcher process starts the holder, then is SIGKILLed — no
+        `finally`, no atexit, nothing cooperative. The holder and its daemon
+        must be gone shortly afterwards.
+
+        THE FIXTURE ASKS FOR IT, with `CSWAP_PIN_EXIT_WITH_PARENT=1`. This is
+        a test-runner problem — a SIGKILLed pytest left 151 holders and
+        9.17 GiB behind — and the case above pins why it cannot be the
+        default: production spawns the holder and exits, so an unconditional
+        arming takes the port down on every normal launch.
 
         THE LAUNCHER OUTLIVES THE HOLDER'S STARTUP ON PURPOSE. Killing it
         immediately proves nothing about the parent-death signal: the holder's
@@ -10127,8 +10272,12 @@ class TestAHolderDoesNotOutliveItsLauncher:
             "                 stderr=subprocess.STDOUT)\n"
             "time.sleep(600)\n"
         )
+        # ASKED FOR, not assumed. The holder inherits this and arms; without
+        # it a normal launch would take the port down (see the case above).
         launcher = subprocess.Popen(
-            [sys.executable, "-c", launcher_src], stdin=subprocess.DEVNULL
+            [sys.executable, "-c", launcher_src],
+            stdin=subprocess.DEVNULL,
+            env=dict(os.environ, CSWAP_PIN_EXIT_WITH_PARENT="1"),
         )
 
         def mine():
