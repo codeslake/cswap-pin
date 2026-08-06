@@ -2654,6 +2654,66 @@ class TestDaemonPortStability:
         assert pin_proxy._HANDDOWN_FROM_ENV not in env, env
         assert not seen.get("pass_fds"), seen.get("pass_fds")
 
+    def case_the_holder_tells_its_child_which_code_the_HOLDER_runs(
+        self, tmp_path, monkeypatch
+    ):
+        """The layer above the daemon has to be observable, and it was not.
+
+        A daemon's fingerprint answers "is the DAEMON current" and nothing
+        more: the holder execs a fresh interpreter per spawn, so a holder on
+        months-old code starts a perfectly current child. Measured on the fleet
+        — all three holders were twelve releases behind their daemons, and the
+        only way to see it was comparing `ps` start times against tag dates,
+        which is inference and which I got wrong once first.
+
+        Asserted on what `_spawn` PUTS IN THE ENV rather than by reading a live
+        child's environ, because reading it is platform-split (/proc on Linux,
+        `ps -E` on macOS) and that belongs to whoever checks, not to the
+        contract. The contract is: the holder publishes the bytes IT loaded.
+        """
+        import subprocess
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        seen = {}
+
+        class _P:
+            pid = 4242
+
+            def __init__(self, *a, **kw):
+                seen.update(kw)
+
+            def wait(self, timeout=None):
+                return 0
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        monkeypatch.setattr(subprocess, "Popen", _P)
+        # MAKE THE DISK DISAGREE WITH WHAT WE LOADED, or this case cannot fail.
+        # With the file unchanged, `daemon_fingerprint()` and
+        # `_OWN_FINGERPRINT` are the same string — so publishing the wrong one
+        # passes, and the mutation proving that is what put this patch here.
+        # Patching the disk side simulates a deploy landing between import and
+        # spawn, which is the only moment the two differ and the only moment
+        # the distinction is worth anything.
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint",
+                            lambda *a, **k: "disk-moved-after-we-started")
+        try:
+            holder._spawn()
+        finally:
+            try:
+                holder._srv.close()
+            except OSError:
+                pass
+
+        env = seen.get("env") or {}
+        assert env.get(pin_proxy._HOLDER_SHA_ENV) == pin_proxy._OWN_FINGERPRINT, (
+            "the child cannot tell what code its holder is running: "
+            f"{pin_proxy._HOLDER_SHA_ENV}={env.get(pin_proxy._HOLDER_SHA_ENV)!r} "
+            f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
+        )
+
     def case_the_predecessor_stops_accepting_before_it_hands_the_socket_over(
         self, tmp_path
     ):

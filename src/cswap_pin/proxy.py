@@ -4574,6 +4574,10 @@ class PortHolder:
         # TERM here a recycle rather than a release. A predecessor handing over
         # is itself going away, so its child must exit 0 as it always has.
         env[_HELD_BY_ENV] = str(os.getpid())
+        # WHAT THIS HOLDER IS RUNNING — see `_HOLDER_SHA_ENV`. The child never
+        # reads it; a checker does, to answer the one question the daemon's own
+        # fingerprint cannot.
+        env[_HOLDER_SHA_ENV] = _OWN_FINGERPRINT
         log = _open_daemon_log(self._certdir)
         try:
             proc = subprocess.Popen(
@@ -5466,6 +5470,25 @@ _HANDDOWN_FROM_ENV = "CSWAP_PIN_LISTEN_FROM"
 # way out" — the two look identical in the variables above, and they mean
 # opposite things when this daemon is TERM'd.
 _HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
+# The bytes the HOLDER loaded, published into its child's environment.
+#
+# A DAEMON'S FRESHNESS SAYS NOTHING ABOUT THE HOLDER ABOVE IT. The holder execs
+# a fresh interpreter for every spawn, so a holder running months-old code
+# starts a perfectly current daemon — proxy.json's fingerprint reports the
+# child and there is no observable for the layer above. Measured 2026-08-06:
+# all three of our holders were twelve releases behind their daemons, and the
+# only way to find out was comparing `ps` start times against tag dates, which
+# is inference and which I got wrong once before getting it right.
+#
+# The CHILD'S environment rather than a file or a /health field, because it
+# needs no new writer, no new path, and no cooperation from the daemon — and
+# because it is readable on both platforms: /proc/<pid>/environ on Linux,
+# `ps -E -p <pid>` on macOS (measured, both, against a control).
+#
+# `_OWN_FINGERPRINT`, so it is what the holder IMPORTED. A fresh
+# `daemon_fingerprint()` here would publish the disk at spawn time, which is
+# exactly the lie this is meant to expose.
+_HOLDER_SHA_ENV = "CSWAP_PIN_HOLDER_SHA"
 
 
 def _successor_is_serving() -> bool:
