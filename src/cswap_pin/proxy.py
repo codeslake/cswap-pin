@@ -4451,10 +4451,11 @@ class PortHolder:
     """
 
     def __init__(self, certdir: Path, account_num: str, email: str,
-                 port: int | None = None):
+                 port: int | None = None, sock: socket.socket | None = None):
         self._certdir = Path(certdir)
         self._account = account_num
         self._email = email
+        self._standby = None
 
         # ADOPT A HANDED-DOWN SOCKET RATHER THAN BINDING. A predecessor that is
         # recycling passes its still-LISTENING socket down, and it has not let
@@ -4466,7 +4467,11 @@ class PortHolder:
         # Adopting has no race to lose: the descriptor is already bound and
         # already listening, and the predecessor stopped accepting on it before
         # passing it over.
-        adopted = _handed_down_listener()
+        # AN ALREADY-ADOPTED SOCKET, for the standby. It consumed the handdown
+        # env to hold the descriptor, so asking `_handed_down_listener` a second
+        # time would find nothing and this holder would bind a fresh port —
+        # stranding the very sessions the standby stayed alive to keep.
+        adopted = sock if sock is not None else _handed_down_listener()
         if adopted is not None:
             self._srv = adopted
             self.port = self._srv.getsockname()[1]
@@ -4529,6 +4534,9 @@ class PortHolder:
         # `daemon_pid` (or asks the port for a health probe) races the
         # supervisor's first loop iteration.
         self._spawn()
+        # AFTER the daemon, so a machine that cannot start one at all does not
+        # also leave a standby behind waiting for a holder that never worked.
+        self._spawn_standby()
         self._thread = threading.Thread(target=self._supervise, daemon=True)
         self._thread.start()
 
@@ -4594,6 +4602,77 @@ class PortHolder:
                 log.close()
         self.daemon_pid = proc.pid
         self._proc = proc
+
+    def _spawn_standby(self) -> None:
+        """Place a third process on this descriptor that does nothing with it.
+
+        THE HOLDER CANNOT COVER ITS OWN DEATH. It keeps the port across a daemon
+        crash — measured across a SIGKILL, 407 of 408 requests served, max time
+        to first byte 6.3ms — because the descriptor lives in a process that is
+        not the one serving. Apply that argument once more and it says the
+        descriptor must also live somewhere that is not the holder: when the
+        holder exits, the kernel closes its copy, and a session whose
+        ``HTTPS_PROXY`` was fixed at exec has no way to learn the address is
+        gone. Measured with both gone: 198 of 199 ConnectionRefused.
+
+        DETACHED, because the point is to outlive the parent. ``start_new_session``
+        gives it its own process group, so a ctrl-C or a group-delivered TERM
+        aimed at the holder does not reach it. It must also never arm
+        PDEATHSIG — that primitive exists to make a child die with its parent,
+        which is right for a daemon and exactly backwards here.
+
+        NOT A RELAY. A peer needed one because node installs an accept callback
+        at ``listen()`` and cannot hold a listening socket without accepting on
+        it; that forced a second acceptor, byte forwarding, and a self-exclusion
+        bug that took descriptors from 22 to 29,814 on one connect. CPython only
+        accepts when you CALL ``accept()``, so this process can hold the socket
+        and stay silent — and when it finally acts, it does not serve traffic at
+        all, it puts a real daemon back on the descriptor it was already
+        holding. Requests that arrive in between queue in the backlog of a
+        socket that never stopped listening.
+        """
+        import subprocess
+        import sys
+
+        fd = self._srv.fileno()
+        env = {k: v for k, v in os.environ.items() if k != "LISTEN_PID"}
+        env["LISTEN_FDS"] = "0"
+        env[_HANDDOWN_FD_ENV] = str(fd)
+        env[_HANDDOWN_FROM_ENV] = str(os.getpid())
+        # NEVER INHERIT THE DIE-WITH-PARENT REQUEST. `_EXIT_WITH_PARENT_ENV`
+        # asks a child to arm PDEATHSIG, which is a test harness's way of not
+        # leaking holders. Passed through to a standby it is precisely
+        # backwards: the standby exists to outlive this process, and arming it
+        # would make the standby die in the one event it was placed for.
+        env.pop(_EXIT_WITH_PARENT_ENV, None)
+        # THE PID IT WAS BORN UNDER, not a sentinel to compare against. Arming
+        # on ``getppid() == 1`` is wrong wherever a subreaper collects orphans
+        # (systemd --user is one): the standby never reads 1, so it never arms
+        # — while still holding the descriptor. The address then ACCEPTS and
+        # HANGS, which is strictly worse than the refusal it replaced, because
+        # a refused client fails at once and a queued one waits out its own
+        # timeout. A peer measured that state at 15,010ms and then failure.
+        env[_STANDBY_FROM_ENV] = str(os.getpid())
+        log = _open_daemon_log(self._certdir)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", _DAEMON_MODULE, _STANDBY_MODULE_ARG,
+                 self._account, self._email, str(self._certdir)],
+                env=env,
+                pass_fds=(fd,),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                # A FILE, never a pipe. A detached child that never exits holds
+                # the write end for as long as it lives, so a parent waiting on
+                # a pipe's EOF waits forever — a peer measured a 30s hang in
+                # exactly this shape, on the parent's own `close`.
+                stderr=log,
+                start_new_session=True,
+            )
+        finally:
+            if hasattr(log, "close"):
+                log.close()
+        self._standby = proc
 
     def _supervise(self) -> None:
         while not self._stop:
@@ -4705,7 +4784,29 @@ class PortHolder:
         stopping its daemon re-opens that resurrection silently, and there is
         no guard here that would catch it.
         """
+        import signal
+
         self._stop = True
+        # RELEASE THE STANDBY FIRST, and by SIGHUP. It is detached and outlives
+        # us on purpose, so the ordering trick that saves us from the daemon's
+        # resurrection (see below) cannot reach it — by the time we are gone it
+        # is still there, still holding the descriptor, and will arm the moment
+        # `getppid()` moves. That is a release that releases nothing: a peer on
+        # this design measured nine holders released and all nine back on the
+        # same ports within 23 seconds.
+        #
+        # SIGHUP, never SIGTERM. TERM is what a supervisor, a `systemctl stop`
+        # or a stray `pkill` sends, and the same peer measured their graceful
+        # path as MORE destructive than `kill -9` because their standby ended
+        # on it: a clean shutdown stranded every session while a SIGKILL
+        # carried them. Death must keep the address. Only being asked releases
+        # it.
+        standby = getattr(self, "_standby", None)
+        if standby is not None and getattr(standby, "returncode", 0) is None:
+            try:
+                standby.send_signal(signal.SIGHUP)
+            except (OSError, ValueError):
+                pass
         # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
         # is only meaningful while the Popen it came from is ours — and a pid
         # is reused freely, so signalling it after the child is gone aims at
@@ -4790,6 +4891,122 @@ def _arm_parent_death_signal() -> None:
         )
     except Exception:  # noqa: BLE001 — no libc, no prctl, wrong ABI: not fatal
         pass
+
+
+def _port_returns_bytes(port: int, timeout: float | None = None) -> bool:
+    """Did ANYTHING write a byte back? Not "is it healthy", not "what is it".
+
+    NOT `_port_answers`, WHICH ALREADY EXISTS AND ASKS A DIFFERENT QUESTION.
+    That one returns True on a successful CONNECT, which is the right test for
+    "would a session be refused" on the teardown path it serves. It is the
+    wrong test here, and catastrophically so: this process is itself holding
+    the listening descriptor, so a connect always succeeds and the answer is
+    always True. Shipped that way by accident — a second def of the same name,
+    silently overwritten by the later one — and the standby then armed only
+    after 34s by a path nobody designed. The unit tests could not see it
+    because `_standby_tick` takes `answered` as a parameter and was never
+    handed the real probe. Only the end-to-end run found it.
+
+    The two questions are one word apart in English and opposite in effect, so
+    they get names that cannot be mistaken for each other.
+
+    ANY BYTE COUNTS AND THE STATUS IS IGNORED. A live daemon answers 407 to an
+    unauthenticated request and a carrying peer relay answers 503 on purpose;
+    both mean "somebody is behind this socket", which is the only question
+    here. Parsing would make those two disagree and would need a credential.
+
+    REFUSED AND ACCEPTED-THEN-SILENT BOTH READ FALSE, but only the second is
+    subtle: this process is holding the LISTENING descriptor, so a connect to
+    our own port completes from the backlog even with nobody accepting. That is
+    exactly the state a descriptor scan cannot see — holder, daemon and standby
+    all read as LISTEN — and it is why the probe asks for an ANSWER instead of
+    asking the kernel who is bound.
+    """
+    # Resolved here, not as a default: this function is defined above the
+    # constants block, and a default argument is evaluated at def time.
+    timeout = _STANDBY_PROBE_TIMEOUT_S if timeout is None else timeout
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+            s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n"
+                      b"Connection: close\r\n\r\n")
+            s.settimeout(timeout)
+            return bool(s.recv(1))
+    except OSError:
+        return False
+
+
+def standby_main(account_num: str, email: str, certdir: Path) -> None:
+    """Entry point for the detached standby (``-m cswap_pin.proxy --standby``).
+
+    Holds the listening descriptor and does nothing with it until the holder
+    AND its daemon are both gone, then puts a holder back on that same socket.
+    It never serves a request itself — see `PortHolder._spawn_standby` for why
+    that is available to us and was not to the peer that needed a relay.
+
+    COSTS NOTHING WHILE THE HOLDER IS ALIVE. The ppid half of the predicate is
+    checked first and short-circuits, so the steady state is one integer
+    comparison every 250ms and no connections at all.
+    """
+    import signal
+
+    srv = _handed_down_listener()
+    if srv is None:
+        # Nothing was handed to us. Refusing beats holding a descriptor we
+        # cannot prove is the one the sessions are wired to.
+        _log_lifecycle("standby got no listening descriptor — exiting")
+        return
+    born_of = int(os.environ.get(_STANDBY_FROM_ENV) or 0)
+    port = srv.getsockname()[1]
+
+    # THE SIGNAL TABLE IS THE CONTRACT — see `PortHolder.stop`. Only being ASKED
+    # releases the address; every other way of dying keeps it.
+    released = False
+
+    def _release(*_a):
+        nonlocal released
+        released = True
+
+    signal.signal(signal.SIGHUP, _release)
+    # IGNORE, do not merely lack a handler. A supervisor stopping the machine,
+    # or a stray `pkill -f cswap_pin`, sends TERM — and TERM is precisely when
+    # the sessions still need the address. A peer measured their graceful path
+    # as more destructive than `kill -9` for want of these two lines.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    _log_lifecycle(
+        f"standby holding port {port} for holder {born_of} — accepting nothing"
+    )
+    silent = 0
+    while not released:
+        time.sleep(_STANDBY_POLL_S)
+        if released:
+            break
+        silent, arm = _standby_tick(
+            born_of, silent, lambda: _port_returns_bytes(port)
+        )
+        if arm:
+            break
+    if released:
+        _log_lifecycle(f"standby released port {port} on request")
+        try:
+            srv.close()
+        except OSError:
+            pass
+        return
+
+    _log_lifecycle(
+        f"holder {born_of} is gone and port {port} answered nothing "
+        f"{_STANDBY_SILENT_STREAK}x — putting a daemon back on the descriptor "
+        f"this process has held all along"
+    )
+    # BECOME THE HOLDER on the socket we are already holding. Everything below
+    # this line is the ordinary supervisor: respawn, backoff, self-heal — and
+    # it places a standby of its own, so the lineage stays covered.
+    holder = PortHolder(certdir, account_num, email, sock=srv)
+    holder.start()
+    if holder._thread is not None:
+        holder._thread.join()
 
 
 def holder_main(account_num: str, email: str, certdir: Path,
@@ -5489,6 +5706,43 @@ _HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
 # `daemon_fingerprint()` here would publish the disk at spawn time, which is
 # exactly the lie this is meant to expose.
 _HOLDER_SHA_ENV = "CSWAP_PIN_HOLDER_SHA"
+
+# WHICH PID THE STANDBY WAS BORN UNDER — see `PortHolder._spawn_standby`. The
+# standby compares `getppid()` against this, never against 1: a subreaper host
+# reparents orphans to itself, so 1 is never reached and the standby would hold
+# the descriptor forever without ever arming.
+_STANDBY_FROM_ENV = "CSWAP_PIN_STANDBY_FROM"
+_STANDBY_MODULE_ARG = "--standby"
+# CONSECUTIVE silent probes before the standby acts. One is not evidence: the
+# port is briefly silent during an ordinary handover, and a daemon under load
+# can miss a 2s window. Two costs ~4s of queueing on a socket that never
+# stopped listening, which is the whole reason the requests are not lost.
+_STANDBY_SILENT_STREAK = 2
+_STANDBY_POLL_S = 0.25
+_STANDBY_PROBE_TIMEOUT_S = 2.0
+
+
+def _standby_tick(born_of: int, silent: int, answered, getppid=os.getppid):
+    """One poll of the standby's arm predicate. Returns ``(silent, arm)``.
+
+    Split out of the loop because this is the part that can be WRONG in ways a
+    timing test hides. The loop around it is a sleep.
+
+    BOTH CONDITIONS, AND THE COUNTER RESETS ON EITHER. Still parented by the
+    holder that placed us means the holder is alive and already respawning its
+    own daemon — measured across a daemon SIGKILL, 407 of 408 requests served,
+    so there is nothing here to fix and arming would put a SECOND daemon on a
+    socket that already has an acceptor. Being orphaned while something still
+    answers means a daemon outlived its holder, and that daemon's own watchdog
+    puts a fresh holder back; arming would race it.
+
+    Only "orphaned AND nothing answers, twice running" is the case no other
+    part of this system covers.
+    """
+    if getppid() == born_of:
+        return 0, False
+    silent = 0 if answered() else silent + 1
+    return silent, silent >= _STANDBY_SILENT_STREAK
 
 
 def _successor_is_serving() -> bool:
@@ -8360,5 +8614,7 @@ if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
     if _sys.argv[1:2] == [_HOLDER_MODULE_ARG]:
         holder_main(_sys.argv[3], _sys.argv[4], Path(_sys.argv[5]),
                     port=int(_sys.argv[2]))
+    elif _sys.argv[1:2] == [_STANDBY_MODULE_ARG]:
+        standby_main(_sys.argv[2], _sys.argv[3], Path(_sys.argv[4]))
     else:
         daemon_main(_sys.argv[1], _sys.argv[2], Path(_sys.argv[3]))
