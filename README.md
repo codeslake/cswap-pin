@@ -229,6 +229,21 @@ the kernel with the last process holding it, and a session's `HTTPS_PROXY` was
 fixed at exec, so it has no way to learn the address moved. Measured with both
 gone: **198 of 199 ConnectionRefused**, permanently.
 
+**On Linux, killing the holder alone is already this row.** The daemon is
+spawned to exit with its parent (`PR_SET_PDEATHSIG`, and see
+`CSWAP_PIN_EXIT_WITH_PARENT`), so the kernel takes it down with the holder and
+the descriptor closes with them both. macOS has no equivalent primitive, so
+there the daemon outlives its holder still holding the socket and its own
+watchdog puts a fresh holder back. Same command, same lineage shape, measured
+the same day: **147 probes / 0 unanswered on a Mac, 232 of 241 refused on
+Linux**. Anything reasoning about "the holder dies but the daemon survives" is
+reasoning about Darwin.
+
+The signal matters as much as the target, and in the same direction:
+`SIGTERM` leaves the holder able to run its teardown — drain the daemon, hand
+the socket down — while `SIGKILL` denies it exactly that. The handler *is* the
+handover.
+
 So a third process holds the same descriptor and does nothing with it. It is
 spawned detached (its own session, so a `ctrl-C` or a group-delivered `TERM`
 aimed at the holder misses it) and it **never accepts** — CPython only accepts
