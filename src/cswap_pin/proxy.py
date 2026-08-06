@@ -5065,6 +5065,19 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     # Non-blocking: a loser has nothing to wait for. The winner is putting a
     # daemon back on the very socket the loser is holding, so the loser's job is
     # finished either way.
+    # THE PIN MUST STILL NAME THIS PORT. See `_standby_port_still_wanted`:
+    # a standby left on a superseded socket hears silence forever, and
+    # reviving it builds a lineage nothing can reach.
+    if not _standby_port_still_wanted(certdir, port):
+        _log_lifecycle(
+            f"port {port} is no longer the pin's — letting it go rather than "
+            f"rebuilding a lineage nothing is wired to"
+        )
+        try:
+            srv.close()
+        except OSError:
+            pass
+        return
     lock_fd = _claim_arm(certdir)
     if lock_fd is None:
         _log_lifecycle(
@@ -5950,6 +5963,32 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
         except OSError:
             pass
     return retired
+
+
+def _standby_port_still_wanted(certdir, port: int) -> bool:
+    """Does the pin still name OUR port? Only then is it worth reviving.
+
+    STOPS A RUNAWAY, measured on host-a. Every deploy hands the daemon to a new
+    lineage and leaves the previous lineage's standby holding a socket nobody
+    serves and nobody dials. Silence is what it waits for, so it armed, rebuilt
+    a whole holder+daemon+standby on that dead socket, and THAT standby was
+    orphaned in turn: 23 processes, 21 of them unreachable, while the real pin
+    sat correctly on 36301 throughout.
+
+    A MISSING RECORD IS NOT ABANDONMENT. `_spawn_daemon` unlinks proxy.json
+    before a respawn, so it is legitimately absent for a moment — and that is
+    exactly the moment a standby is deciding. Absent means "cannot tell", and
+    the safe answer there is to cover, because failing to revive the real port
+    is the outage this exists to prevent.
+    """
+    try:
+        rec = json.loads((Path(certdir) / _STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return True
+    recorded = rec.get("port") if isinstance(rec, dict) else None
+    if not isinstance(recorded, int) or recorded <= 0:
+        return True
+    return recorded == port
 
 
 def _claim_arm(certdir) -> "int | None":

@@ -2733,6 +2733,51 @@ class TestDaemonPortStability:
             f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
         )
 
+    def case_a_standby_on_an_abandoned_port_does_not_rebuild_on_it(self, tmp_path):
+        """The runaway. A standby must not resurrect a port nothing is wired to.
+
+        MEASURED ON LMD42 AND IT COMPOUNDS. Every deploy hands the daemon over
+        to a new lineage, and the previous lineage's standby is left holding a
+        socket that nobody serves and nobody dials. Silence is exactly what it
+        is waiting for, so it arms, rebuilds a full holder+daemon+standby on
+        that dead socket — and that new standby is orphaned in turn. 23
+        processes on one box, 21 of them on sockets no session could reach,
+        while the real pin sat correctly on 36301 the whole time.
+
+        The port a standby holds is only worth reviving while the pin still
+        NAMES it. `proxy.json` is that record, and the recorded port moving
+        away from ours is the difference between "the daemon died" (revive)
+        and "the pin moved on" (let go).
+        """
+        import json
+
+        from cswap_pin.proxy import _standby_port_still_wanted
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        state = certdir / "proxy.json"
+
+        state.write_text(json.dumps({"port": 36301, "pid": 999}))
+        assert _standby_port_still_wanted(certdir, 36301) is True, (
+            "refused to revive the port the pin actually names — that is the "
+            "row this whole design exists to cover"
+        )
+        assert _standby_port_still_wanted(certdir, 45678) is False, (
+            "revived a port the pin no longer names. Nothing is wired to it, "
+            "so this rebuilds a full lineage that serves nobody — and its own "
+            "standby is orphaned in turn, which is the runaway"
+        )
+
+        # NO RECORD IS NOT "ABANDONED". A daemon unlinks proxy.json before a
+        # respawn, so the file is legitimately absent for a moment — and that
+        # moment is exactly when a standby is deciding.
+        state.unlink()
+        assert _standby_port_still_wanted(certdir, 36301) is True, (
+            "treated a missing record as abandonment; proxy.json is unlinked "
+            "during an ordinary respawn, which is precisely when a standby is "
+            "watching, so this would refuse to cover the real case"
+        )
+
     def case_placing_a_standby_retires_the_ones_left_behind(self, tmp_path):
         """ONE IN, ONE OUT. The lock alone only DEFERS the pile-up.
 
