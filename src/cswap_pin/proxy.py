@@ -3630,6 +3630,22 @@ def _open_daemon_log(certdir: Path):
         return subprocess.DEVNULL
 
 
+def _iso_utc(ts: "float | None") -> "str | None":
+    """An epoch seconds value as UTC ISO-8601, or None passed through.
+
+    Wall-clock, deliberately: this timestamp is read against daemon.log lines
+    and a human's account of when something broke, both of which are wall
+    clock. A monotonic reading would be uncomparable to either.
+    """
+    if ts is None:
+        return None
+    return (
+        _dt.datetime.fromtimestamp(ts, _dt.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def _log_lifecycle(what: str) -> None:
     """Record one daemon lifecycle event, with a timestamp, to stderr.
 
@@ -6610,6 +6626,11 @@ class PinProxy:
         # hop when it is not — see _note_egress.
         self._egress_direct = False
         self._egress_hop: "tuple[str, int] | None" = None
+        # STICKY, unlike the two above. They are the state right now, so a
+        # chain that breaks and recovers reads green to every probe that
+        # arrives after it — and every probe arrives after it, because nobody
+        # is watching at the instant it breaks. See `direct_last`.
+        self._egress_direct_last: "float | None" = None
         # The last hop fault reported, so a steadily-down hop costs one line
         # instead of one per connection — see _note_hop_unusable.
         self._hop_fault: "tuple[tuple[str, int], str] | None" = None
@@ -7424,6 +7445,33 @@ class PinProxy:
         except OSError:
             pass
 
+    @property
+    def direct_last(self) -> "float | None":
+        """When this daemon last fell back to a DIRECT dial, or None.
+
+        The one field in /health that survives the recovery. `egress` answers
+        "what is egress doing", which is the wrong tense: the chain flaps back
+        within seconds and every later probe reads green, so a real outage is
+        invisible to everyone who was not watching at the instant it happened.
+
+        Measured on host-b 2026-08-06 — 9901 stopped tunnelling at
+        22:35:44Z, 8118 followed, the daemon went DIRECT at 22:36:46Z and was
+        back on 9901 at 22:36:47Z. One second of green-again, and the whole
+        incident was unreadable from that point on. This is the fifth outage
+        this daemon detected and wrote to daemon.log, and the fifth nobody
+        read.
+
+        NOTE THE Z. daemon.log is UTC while claude-swap.log is local, and a
+        session hunting an artifact failure read one against the other, landed
+        on this outage four hours off, and published it as the cause. It was
+        not. Timestamps out of this daemon are UTC — compare like with like.
+
+        A timestamp rather than a flag: the only question a reader has is
+        whether the fallback explains what they are looking at, and "it
+        happened" cannot be told from an hour ago or a week ago.
+        """
+        return self._egress_direct_last
+
     def _serve_health(self, conn: socket.socket) -> None:
         import json
 
@@ -7474,9 +7522,12 @@ class PinProxy:
             egress = "direct"
         else:
             egress = None
+        # `egress` is instantaneous; `direct_last` is the same fault in a tense
+        # a later probe can still read. See :attr:`direct_last`.
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
-             "can_pin": can_pin, "egress": egress}
+             "can_pin": can_pin, "egress": egress,
+             "direct_last": _iso_utc(self._egress_direct_last)}
         )
         try:
             conn.sendall(
@@ -8090,6 +8141,10 @@ class PinProxy:
                 "egress direct — no proxy chain is configured on this host"
             )
         elif direct:
+            # Stamped HERE and not in the branch above: a host with no chain
+            # configured is not falling back from anything, and stamping its
+            # steady state would leave it reporting a permanent fault.
+            self._egress_direct_last = time.time()
             _log_lifecycle(
                 "egress DIRECT — no chain hop reachable, bypassing the "
                 "configured proxy chain"
