@@ -1,0 +1,89 @@
+name: Tag on version bump
+
+# A VERSION BUMP THAT NOBODY TAGS PUBLISHES NOTHING, and it fails silently:
+# pyproject said 0.1.64 while PyPI served 0.1.55, every machine kept working
+# because deploys installed a locally built wheel, and the gap stayed invisible
+# until someone ran `pip install cswap-pin` and got code from nine releases
+# ago. Measured 2026-08-06: v0.1.55 was the newest tag with main at 0.1.64 —
+# nine bumps, zero tags. publish.yml fires on `v*` and had simply never been
+# handed a trigger.
+#
+# GATED ON CI, NOT ON THE PUSH. Tagging every push to main would tag a commit
+# whose suite has not run, and publish.yml's own gate runs the suite on ubuntu
+# ONLY — so a macOS-only regression would ship. `workflow_run` fires after CI
+# finishes and carries its conclusion, so this waits for the answer rather than
+# racing it.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag:
+    # Only a GREEN CI on main earns a tag. A failed or cancelled run leaves the
+    # version untagged, which is the correct outcome: the bump stays visible in
+    # pyproject and nothing reaches PyPI.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # THE COMMIT CI ACTUALLY TESTED, not whatever main points at now.
+          # `workflow_run` can land after main has moved, and tagging the newer
+          # commit would attach a green tag to code no suite ever saw.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Read the version and decide whether it is new
+        id: v
+        run: |
+          set -euo pipefail
+          ver=$(python3 -c '
+          import re, pathlib
+          src = pathlib.Path("pyproject.toml").read_text()
+          m = re.search(r"^version\s*=\s*\"([^\"]+)\"", src, re.M)
+          print(m.group(1) if m else "")
+          ')
+          test -n "$ver" || { echo "no version in pyproject.toml"; exit 1; }
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$ver" >/dev/null; then
+            echo "v$ver already tagged — nothing to do"
+            echo "new=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag it
+        if: steps.v.outputs.new == '1'
+        run: |
+          set -euo pipefail
+          sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          git tag "v${{ steps.v.outputs.ver }}" "$sha"
+          git push origin "v${{ steps.v.outputs.ver }}"
+          echo "tagged v${{ steps.v.outputs.ver }} at $sha"
+
+      # A TAG PUSHED WITH GITHUB_TOKEN DOES NOT START ANOTHER WORKFLOW. That is
+      # GitHub's loop guard, not a bug here, and it means publish.yml's
+      # `on: push: tags` will NOT see this tag. publish.yml also accepts
+      # workflow_dispatch, so ask for it explicitly. The same guard can suppress
+      # this call too — if it does, the tag still exists and the release is one
+      # `gh workflow run publish.yml --ref v<ver>` away, which is a much smaller
+      # thing to forget than the tag itself. Never fail the job over it: a
+      # missing dispatch must not lose the tag that was already pushed.
+      - name: Ask publish.yml to run for the new tag
+        if: steps.v.outputs.new == '1'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run publish.yml --ref "v${{ steps.v.outputs.ver }}" \
+            || echo "dispatch suppressed — run publish.yml by hand for v${{ steps.v.outputs.ver }}"
