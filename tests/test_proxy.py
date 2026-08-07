@@ -404,10 +404,33 @@ class TestHolderCrashIsNotYetSurvivable:
                 except OSError:
                     never += 1
             worst = max(waits) * 1000 if waits else -1
-            assert refused == 0 and never == 0, (
-                f"across a SIGKILL of the holder: {len(waits)} served, "
-                f"{refused} REFUSED, {never} never completed, worst served "
-                f"wait {worst:.0f}ms."
+            counts = (
+                f"{len(waits)} served, {refused} refused, {never} never "
+                f"completed, worst served wait {worst:.0f}ms"
+            )
+
+            # TWO ROWS, NOT ONE BUCKET. `refused == 0 and never == 0` was a
+            # single assertion over two different failures, and it cost a
+            # false report: a control that counted this case's XFAIL read
+            # three dropped arrivals as "the address was lost in ~83% of
+            # fresh processes". They are not degrees of the same thing and a
+            # signal that cannot tell them apart cannot answer the question
+            # it is being asked.
+            #
+            # SEVERE FIRST, so a run that does both names the worse one. The
+            # address being gone ends a live session outright — its
+            # HTTPS_PROXY was fixed at exec and is never re-read. Arrivals
+            # dropped while the address is still held cost those connections
+            # and nothing else.
+            assert refused == 0, (
+                f"THE ADDRESS WAS LOST across a SIGKILL of the holder: "
+                f"{counts}. A live session cannot re-read its HTTPS_PROXY, so "
+                f"a refusal is permanent for it."
+            )
+            assert never == 0, (
+                f"ARRIVALS WERE DROPPED across a SIGKILL of the holder (the "
+                f"address held): {counts}. Nobody accepted them during the "
+                f"takeover."
             )
         finally:
             # KILLING THE HOLDER IS NOT CLEANUP. Its standby is detached and
