@@ -271,9 +271,9 @@ class TestRepinIsLive:
 
 @pytest.mark.xfail(
     strict=False,
-    reason="measured open defect: a holder SIGKILL costs 3 arrivals that "
-           "never complete (deterministic, 6/6 fresh processes); a second "
-           "kill in the same process has also cost the address for 30s+",
+    reason="measured open defect: a holder SIGKILL drops arrivals nobody "
+           "accepts during the takeover — 3 every time when run alone on "
+           "Linux, sometimes none under a loaded suite; address never lost",
 )
 class TestHolderCrashIsNotYetSurvivable:
     """A crash of the process HOLDING the socket, which nothing tested.
@@ -290,37 +290,48 @@ class TestHolderCrashIsNotYetSurvivable:
           0      900       0      0       -           -          -
           1      128     678     94     1.30s      30.26s      never
 
-    THOSE TWO TRIALS RAN IN ONE PROCESS, and that turns out to be the
-    whole difference. Trial 1 followed a kill that trial 0 had already
-    performed. Re-measured as SIX FRESH SINGLE-TRIAL PROCESSES, with
-    `--runxfail` so the numbers surface instead of being swallowed by the
-    xfail:
+    THE COLLAPSE WAS THE HARNESS, and it is closed. Both trials ran in
+    one process, and trial 0 never retired what it left behind: a
+    holder's standby is detached and ignores SIGTERM by design, so
+    killing the holder leaves the standby at ppid=1 holding the port.
+    Re-run with `_reap_pin_processes` between trials:
 
-        run 1..6   128 served, 0 REFUSED, 3 never completed
+        4 runs x 2 trials   128 served, 0 refused, 3 never completed
 
-    Identical every run. A first kill in a clean process NEVER loses the
-    address; what it loses is three arrivals that miss a 2s connect
-    timeout. The 678-refusal collapse has only ever appeared as a SECOND
-    trial, which is the shape of leftover state from the first — a peer
-    component hit the same class four times in one day and named it
-    before this run confirmed it here.
+    Eight trials, identical, and the 678-refusal collapse does not
+    reproduce at all. Six fresh single-trial processes agree, measured
+    with `--runxfail` so the numbers surface rather than being swallowed
+    by the xfail:
 
-    NOT ESTABLISHED: the coupling. Each trial had its own certdir and its
-    own `bind(0)` port, so a leftover sitting on trial 0's port cannot be
-    on trial 1's. Do not write a mechanism into this docstring until one
-    is measured.
+        run 1..6            128 served, 0 REFUSED, 3 never completed
+
+    So THE ADDRESS IS NEVER LOST. What a holder crash costs is three
+    arrivals that nobody accepts during the takeover, deterministically —
+    smaller and sharper than every version of this I reported before it
+    was measured.
+
+    A peer component predicted this coupling from four leaked lineages of
+    its own in one day, and I refuted it once before measuring it. It was
+    right.
 
     LISTENERS, sampled with lsof: n=3 before the kill (holder + two),
     n=2 after, and in every clean run those two keep serving. No failing
     run was ever caught with lsof attached — the instrumented probe is
     slower, and every instrumented run was a first trial.
 
-    XFAIL, NOT DELETED, and NOT strict. The 3 never-completed arrivals
-    are deterministic, so a strict assertion on them would be honest —
-    but the same case also covers the second-trial collapse, whose
-    magnitude is unmeasured. Non-strict keeps CI truthful either way
-    while the instrument stays in the tree; make it strict the day the
-    standby accepts across the takeover.
+    XFAIL, NOT DELETED, and NOT strict — for two measured reasons.
+
+    The 3 dropped arrivals are deterministic when this case runs ALONE:
+    14 trials out of 14 on host-a. Under the full suite at `-n 4` they are
+    not. Four parallel runs gave three xfail and ONE XPASS — the drops
+    vanished entirely. Whatever the takeover is racing, a loaded box
+    sometimes wins it, so strict would redden CI on the lucky run.
+
+    And every one of those readings is from Linux. NOBODY HAS MEASURED
+    THIS ON DARWIN, and two of the three machines this ships to are Macs.
+
+    Take a macOS reading and a loaded-box reading before making it
+    strict. Either one alone is not enough.
 
     FOUR WRONG READINGS OF MINE, recorded so the next reader does not
     repeat them. Every one came from an instrument, not from the system.
@@ -336,9 +347,12 @@ class TestHolderCrashIsNotYetSurvivable:
          budget rose BY CONSTRUCTION. The 2s row said `never=3` and
          contradicted it.
       4. "the address is lost in ~83% of fresh processes" — that control
-         counted XFAIL, and this case xfails on `refused == 0 AND
-         never == 0`. Three slow connects scored identically to losing
-         the address. `--runxfail` shows 0 refused in 6 of 6.
+         counted XFAIL while the case asserted `refused == 0 AND
+         never == 0`, so three dropped arrivals scored identically to
+         losing the address. `--runxfail` shows 0 refused in 6 of 6, and
+         the assertion is now two rows so the message says which.
+      5. "the address is lost non-deterministically" — that was the
+         harness leaking a standby between trials, not the design.
 
     The pattern in all four: a number that looked clean, from a probe
     nobody had pointed at a control.
