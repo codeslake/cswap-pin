@@ -3597,6 +3597,21 @@ class TestDaemonPortStability:
         lsn = socket.socket()
         lsn.bind(("127.0.0.1", 0))
         lsn.listen(1)
+        # `dup2(x, 3)` SILENTLY CLOSES whatever fd 3 already is — POSIX, no
+        # error, no signal — so save it and put it back. Without this the case
+        # leaves fd 3 pointing at a bound NON-LISTENER for the rest of the
+        # pytest process: `s2.close()` closes s2's own descriptor, never the
+        # dup sitting at 3. Anything later that reads fd 3 by convention
+        # (`_inherited_listener`, with LISTEN_FDS set) then sees that corpse.
+        #
+        # `os.close(3)` appears nowhere else in this file, and a sibling case
+        # already learned the same thing the hard way — see
+        # `case_a_supervisor_held_port_survives_our_stop`: "dup2 left TWO:
+        # `lsn` and fd 3. Close both".
+        try:
+            _saved_fd3 = os.dup(3)
+        except OSError:
+            _saved_fd3 = None            # nothing there, nothing to put back
         os.dup2(lsn.fileno(), 3)
         os.environ["LISTEN_FDS"] = "1"
         try:
@@ -3621,6 +3636,14 @@ class TestDaemonPortStability:
             os.environ.pop("LISTEN_FDS", None)
             os.environ.pop("LISTEN_PID", None)
             lsn.close()
+            if _saved_fd3 is not None:
+                os.dup2(_saved_fd3, 3)
+                os.close(_saved_fd3)
+            else:
+                try:
+                    os.close(3)          # dup2's leftover, owned by nobody
+                except OSError:
+                    pass
 
         # The hand-down variables, same guard. A grandchild inherits them but
         # NOT the fd (Popen closes what it does not pass), so without the

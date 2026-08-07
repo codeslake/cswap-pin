@@ -327,7 +327,18 @@ def signal_if_still_ours(pid: int, certdir, sig: int) -> bool:
     import os
     import subprocess as _sp
 
-    target = str(pathlib.Path(certdir).resolve())
+    # BOTH SPELLINGS OF THE SAME DIRECTORY. On macOS `mkdtemp()` returns
+    # /var/folders/... while `resolve()` returns /private/var/folders/... —
+    # same directory, different string, because /var is a symlink. A child is
+    # spawned with the argv form and this compared the resolved form, so the
+    # `endswith` gate was NEVER true and the sweep reaped nothing on macOS
+    # whatever ps returned. Linux has no /private prefix; the two are equal
+    # there and the bug is invisible.
+    #
+    # Measured on wmac: mkdtemp /var/folders/l5/.../T/tmpuuwqddva
+    #                   resolve /private/var/folders/l5/.../T/tmpuuwqddva
+    _cd = pathlib.Path(certdir)
+    targets = {str(_cd), str(_cd.resolve())}
     try:
         # `-ww`, NOT bare `-o command=`. ps honours COLUMNS and pytest sets it
         # to 80, so the certdir this predicate matches on was CUT OFF mid-path
@@ -339,7 +350,8 @@ def signal_if_still_ours(pid: int, certdir, sig: int) -> bool:
                       capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, _sp.SubprocessError):
         return False
-    if "cswap_pin.proxy" not in cmd or not cmd.rstrip().endswith(" " + target):
+    if ("cswap_pin.proxy" not in cmd
+            or not any(cmd.rstrip().endswith(" " + t) for t in targets)):
         return False
     try:
         os.kill(pid, sig)
@@ -371,7 +383,18 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
     import subprocess
     import time
 
-    target = str(pathlib.Path(certdir).resolve())
+    # BOTH SPELLINGS OF THE SAME DIRECTORY. On macOS `mkdtemp()` returns
+    # /var/folders/... while `resolve()` returns /private/var/folders/... —
+    # same directory, different string, because /var is a symlink. A child is
+    # spawned with the argv form and this compared the resolved form, so the
+    # `endswith` gate was NEVER true and the sweep reaped nothing on macOS
+    # whatever ps returned. Linux has no /private prefix; the two are equal
+    # there and the bug is invisible.
+    #
+    # Measured on wmac: mkdtemp /var/folders/l5/.../T/tmpuuwqddva
+    #                   resolve /private/var/folders/l5/.../T/tmpuuwqddva
+    _cd = pathlib.Path(certdir)
+    targets = {str(_cd), str(_cd.resolve())}
 
     def _mine():
         try:
@@ -393,7 +416,7 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
             pid_s, _, cmd = line.strip().partition(" ")
             if "cswap_pin.proxy" not in cmd:
                 continue
-            if not cmd.rstrip().endswith(" " + target):
+            if not any(cmd.rstrip().endswith(" " + t) for t in targets):
                 continue
             try:
                 pid = int(pid_s)
