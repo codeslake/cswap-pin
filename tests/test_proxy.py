@@ -3589,61 +3589,64 @@ class TestDaemonPortStability:
         import os
         import socket
         import tempfile
+        import subprocess
+        import sys
 
         from cswap_pin import proxy as pin_proxy
 
         me = str(os.getpid())
-        # Addressed to somebody else.
-        lsn = socket.socket()
-        lsn.bind(("127.0.0.1", 0))
-        lsn.listen(1)
-        # `dup2(x, 3)` SILENTLY CLOSES whatever fd 3 already is — POSIX, no
-        # error, no signal — so save it and put it back. Without this the case
-        # leaves fd 3 pointing at a bound NON-LISTENER for the rest of the
-        # pytest process: `s2.close()` closes s2's own descriptor, never the
-        # dup sitting at 3. Anything later that reads fd 3 by convention
-        # (`_inherited_listener`, with LISTEN_FDS set) then sees that corpse.
+        # IN A CHILD, NEVER IN THE WORKER. `_inherited_listener` reads fd 3
+        # by the systemd/launchd convention, so exercising it in-process means
+        # `dup2(x, 3)` — which SILENTLY CLOSES whatever fd 3 already is.
         #
-        # `os.close(3)` appears nowhere else in this file, and a sibling case
-        # already learned the same thing the hard way — see
-        # `case_a_supervisor_held_port_survives_our_stop`: "dup2 left TWO:
-        # `lsn` and fd 3. Close both".
-        try:
-            _saved_fd3 = os.dup(3)
-        except OSError:
-            _saved_fd3 = None            # nothing there, nothing to put back
-        os.dup2(lsn.fileno(), 3)
-        os.environ["LISTEN_FDS"] = "1"
-        try:
-            os.environ["LISTEN_PID"] = str(os.getpid() + 1)
-            assert pin_proxy._inherited_listener() is None, "adopted another pid's fd"
+        # In a pytest-xdist worker fd 3 is execnet's channel to the controller
+        # (measured on wmac: fd 3 is a FIFO, and 0/1 are the inherited tty).
+        # Its receiver thread reads that descriptor CONCURRENTLY, so swapping
+        # fd 3 out breaks the channel mid-read — and saving and restoring it
+        # does not help, because the damage happens inside the window, not at
+        # the end. execnet then runs `_terminate_execution` from the receiver
+        # thread, waits 5s for the pool, and SIGINTs itself. xdist reports that
+        # as `node down: keyboard-interrupt` against whatever case happened to
+        # be running: macOS red, ubuntu green, and no statement in the case
+        # looking wrong when read alone.
+        #
+        # A child gets its own fd 3, which is what the convention describes
+        # anyway — a supervisor passes the listener to a process it started.
+        def _refuses(setup: str, listen_pid: str) -> bool:
+            """Does `_inherited_listener()` refuse what `setup` puts on fd 3?"""
+            prog = (
+                "import os, socket, sys, tempfile\n"
+                "srcdir = sys.argv[1]\n"
+                "sys.path.insert(0, srcdir)\n"
+                f"{setup}\n"
+                "os.dup2(obj.fileno(), 3)\n"
+                'os.environ["LISTEN_FDS"] = "1"\n'
+                f'os.environ["LISTEN_PID"] = {listen_pid}\n'
+                "from cswap_pin import proxy as pin_proxy\n"
+                "sys.stdout.write('NONE' if pin_proxy._inherited_listener() is None"
+                " else 'ADOPTED')\n"
+            )
+            src = str(pathlib.Path(pin_proxy.__file__).parent.parent)
+            out = subprocess.run(
+                [sys.executable, "-c", prog, src],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert out.returncode == 0, (
+                f"the probe child died: {out.returncode}\n{out.stderr[-400:]}")
+            return out.stdout.strip() == "NONE"
 
-            os.environ["LISTEN_PID"] = me
-            # A regular file on fd 3.
-            f = tempfile.NamedTemporaryFile(delete=False)
-            os.dup2(f.fileno(), 3)
-            assert pin_proxy._inherited_listener() is None, "adopted a plain file"
-            f.close()
-            os.unlink(f.name)
-
-            # A socket that was never listened on.
-            s2 = socket.socket()
-            s2.bind(("127.0.0.1", 0))
-            os.dup2(s2.fileno(), 3)
-            assert pin_proxy._inherited_listener() is None, "adopted a non-listener"
-            s2.close()
-        finally:
-            os.environ.pop("LISTEN_FDS", None)
-            os.environ.pop("LISTEN_PID", None)
-            lsn.close()
-            if _saved_fd3 is not None:
-                os.dup2(_saved_fd3, 3)
-                os.close(_saved_fd3)
-            else:
-                try:
-                    os.close(3)          # dup2's leftover, owned by nobody
-                except OSError:
-                    pass
+        assert _refuses(
+            "obj = socket.socket(); obj.bind(('127.0.0.1', 0)); obj.listen(1)",
+            "str(os.getpid() + 1)",
+        ), "adopted another pid's fd"
+        assert _refuses(
+            "obj = tempfile.NamedTemporaryFile(delete=False)",
+            "str(os.getpid())",
+        ), "adopted a plain file"
+        assert _refuses(
+            "obj = socket.socket(); obj.bind(('127.0.0.1', 0))",
+            "str(os.getpid())",
+        ), "adopted a non-listener"
 
         # The hand-down variables, same guard. A grandchild inherits them but
         # NOT the fd (Popen closes what it does not pass), so without the
