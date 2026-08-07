@@ -271,8 +271,9 @@ class TestRepinIsLive:
 
 @pytest.mark.xfail(
     strict=False,
-    reason="measured open defect: a holder SIGKILL can drop the address "
-           "for 30s+ with no recovery, non-deterministically",
+    reason="measured open defect: a holder SIGKILL costs 3 arrivals that "
+           "never complete (deterministic, 6/6 fresh processes); a second "
+           "kill in the same process has also cost the address for 30s+",
 )
 class TestHolderCrashIsNotYetSurvivable:
     """A crash of the process HOLDING the socket, which nothing tested.
@@ -289,27 +290,58 @@ class TestHolderCrashIsNotYetSurvivable:
           0      900       0      0       -           -          -
           1      128     678     94     1.30s      30.26s      never
 
-    NON-DETERMINISTIC, and that is the finding. One run took the kill
-    without losing a single connection; the next lost the address for
-    thirty seconds and had not recovered when the probe gave up. A live
-    session cannot re-read its HTTPS_PROXY, so the second shape ends it.
+    THOSE TWO TRIALS RAN IN ONE PROCESS, and that turns out to be the
+    whole difference. Trial 1 followed a kill that trial 0 had already
+    performed. Re-measured as SIX FRESH SINGLE-TRIAL PROCESSES, with
+    `--runxfail` so the numbers surface instead of being swallowed by the
+    xfail:
 
-    XFAIL, NOT DELETED, and NOT strict. There is no invariant to assert
-    here — the outcome is a coin flip, so a plain assertion would redden
-    CI at random and a test asserting only the premise would assert
-    nothing. Non-strict keeps the lucky run from failing the suite while
-    the instrument stays in the tree for whoever closes the defect; make
-    it strict the day the standby accepts across the takeover.
+        run 1..6   128 served, 0 REFUSED, 3 never completed
 
-    THIS REPLACES THREE WRONG READINGS OF MINE, recorded so the next
-    reader does not repeat them. (1) "232/241 refused on lmd42, caused by
-    PR_SET_PDEATHSIG" — the mechanism was invented; PDEATHSIG binds the
-    holder to its LAUNCHER and sends TERM. (2) "the address is never
-    lost" — measured with a 5s window that ended before the refusals
-    began. (3) "exactly one arrival is lost, it plateaus at 1" — an
-    artifact of a fixed 5s window, where one never-returning connect eats
-    `budget` seconds of it, so the count fell as the budget rose BY
-    CONSTRUCTION.
+    Identical every run. A first kill in a clean process NEVER loses the
+    address; what it loses is three arrivals that miss a 2s connect
+    timeout. The 678-refusal collapse has only ever appeared as a SECOND
+    trial, which is the shape of leftover state from the first — a peer
+    component hit the same class four times in one day and named it
+    before this run confirmed it here.
+
+    NOT ESTABLISHED: the coupling. Each trial had its own certdir and its
+    own `bind(0)` port, so a leftover sitting on trial 0's port cannot be
+    on trial 1's. Do not write a mechanism into this docstring until one
+    is measured.
+
+    LISTENERS, sampled with lsof: n=3 before the kill (holder + two),
+    n=2 after, and in every clean run those two keep serving. No failing
+    run was ever caught with lsof attached — the instrumented probe is
+    slower, and every instrumented run was a first trial.
+
+    XFAIL, NOT DELETED, and NOT strict. The 3 never-completed arrivals
+    are deterministic, so a strict assertion on them would be honest —
+    but the same case also covers the second-trial collapse, whose
+    magnitude is unmeasured. Non-strict keeps CI truthful either way
+    while the instrument stays in the tree; make it strict the day the
+    standby accepts across the takeover.
+
+    FOUR WRONG READINGS OF MINE, recorded so the next reader does not
+    repeat them. Every one came from an instrument, not from the system.
+
+      1. "232/241 refused on lmd42, caused by PR_SET_PDEATHSIG" — the
+         mechanism was invented. PDEATHSIG binds the holder to its
+         LAUNCHER and sends TERM.
+      2. "the address is never lost" — a 5s window that ended before the
+         refusals began.
+      3. "exactly one arrival is lost, it plateaus at 1 across budgets" —
+         an artifact of a fixed 5s window, where one never-returning
+         connect eats `budget` seconds of it, so the count fell as the
+         budget rose BY CONSTRUCTION. The 2s row said `never=3` and
+         contradicted it.
+      4. "the address is lost in ~83% of fresh processes" — that control
+         counted XFAIL, and this case xfails on `refused == 0 AND
+         never == 0`. Three slow connects scored identically to losing
+         the address. `--runxfail` shows 0 refused in 6 of 6.
+
+    The pattern in all four: a number that looked clean, from a probe
+    nobody had pointed at a control.
     """
 
     def test_all(self, request, tmp_path_factory):
