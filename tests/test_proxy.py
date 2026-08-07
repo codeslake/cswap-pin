@@ -1231,6 +1231,54 @@ class TestWireGlobalConfig:
         assert wire_global_config(9955, Path("/tmp/ca.pem")) is False
 
 
+    def case_a_config_only_receipt_is_not_mistaken_for_the_users_own_values(
+        self, tmp_path, monkeypatch
+    ):
+        """An emptied sidecar beside a surviving config marker must not make
+        our own leftover keys look like the user's.
+
+        The two packages read the receipt differently ON PURPOSE:
+        `cswap_pin._read_ledger` stops at a sidecar that says "not wired" (an
+        unwire wrote exactly that, and falling through would resurrect it),
+        while claude-swap's `_clear_ledger` deliberately does NOT silence a
+        marker in the config ("a receipt this clear never saw"). So both can
+        be true at once: empty sidecar, config marker still present.
+
+        Read as "nothing of ours is wired", the rewire leaves the old keys in
+        `env` and then records them as `Saved` — the values to put back on the
+        next unwire. That restores OUR dead proxy vars as if the user had set
+        them. Losslessness aimed at the wrong owner.
+        """
+        import json as _json
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import ensure_ca
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(exist_ok=True)
+        ensure_ca(certdir, "api.anthropic.com")
+
+        stale = "http://127.0.0.1:9999"
+        path = self._config(tmp_path, monkeypatch, {
+            "env": {"HTTPS_PROXY": stale, "CSWAP_PIN_PORT": "9999"},
+            pin_proxy._WIRE_MARK: ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        })
+        # The sidecar an unwire leaves behind: present, and saying "not wired".
+        led = pin_proxy._ledger_path(path)
+        led.parent.mkdir(parents=True, exist_ok=True)
+        led.write_text(_json.dumps({pin_proxy._WIRE_MARK: []}), encoding="utf-8")
+
+        assert pin_proxy.wire_global_config(41234, certdir / "ca.pem")
+
+        saved = pin_proxy._read_ledger(
+            path, _json.loads(path.read_text(encoding="utf-8"))
+        ).get(f"{pin_proxy._WIRE_MARK}Saved") or {}
+        assert stale not in saved.values(), (
+            "our own displaced proxy was recorded as a value to RESTORE — an "
+            f"unwire would put {stale} back as if the user had set it; saved={saved}"
+        )
+
+
 class TestEnsureProxy:
     """ensure_proxy: no pin → None; live daemon → reuse; else spawn."""
 
