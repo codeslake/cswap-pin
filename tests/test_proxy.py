@@ -269,72 +269,28 @@ class TestRepinIsLive:
             pin_proxy.__file__ = _real_file
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="measured open defect: a holder SIGKILL drops arrivals nobody "
-           "accepts during the takeover — 3 every time when run alone on "
-           "Linux, sometimes none under a loaded suite; address never lost",
-)
-class TestHolderCrashIsNotYetSurvivable:
-    """A crash of the process HOLDING the socket, which nothing tested.
+class TestHolderCrashIsSurvivable:
+    """A crash of the process HOLDING the socket — the case one level up
+    from its sibling in :class:`TestDaemonPortStability`, which kills the
+    daemon and watches the holder put another one back.
 
-    Its sibling in :class:`TestDaemonPortStability` kills the daemon and
-    the holder puts another one on the socket it never gave up. This asks
-    the same question one level up, and the answer is that the design does
-    not survive it yet.
+    IT PASSES, and the long way it got here is the point. Every failing
+    number this case ever produced came from killing a HALF-BUILT
+    LINEAGE: a holder binds and answers before it has spawned its daemon
+    or its standby, so waiting on "the port replied" and killing there
+    measures a bare socket with nothing behind it.
 
-    MEASURED, spawned holder, isolated ports, 900 attempts at a 0.3s
-    connect timeout so the count does not depend on the budget:
+        wait on the port, then kill    128 served, then 2,885 REFUSED
+                                       over 60s, no recovery, repeatable
+                                       to the decimal
+        wait for daemon AND standby    1,177 / 1,173 / 1,167 served
+                                       ZERO refused, ZERO dropped
 
-        trial  served  refused  lost  first loss  last loss  recovered
-          0      900       0      0       -           -          -
-          1      128     678     94     1.30s      30.26s      never
+    Same kill, same probe, same machine. The lineage survives.
 
-    THE COLLAPSE WAS THE HARNESS, and it is closed. Both trials ran in
-    one process, and trial 0 never retired what it left behind: a
-    holder's standby is detached and ignores SIGTERM by design, so
-    killing the holder leaves the standby at ppid=1 holding the port.
-    Re-run with `_reap_pin_processes` between trials:
-
-        4 runs x 2 trials   128 served, 0 refused, 3 never completed
-
-    Eight trials, identical, and the 678-refusal collapse does not
-    reproduce at all. Six fresh single-trial processes agree, measured
-    with `--runxfail` so the numbers surface rather than being swallowed
-    by the xfail:
-
-        run 1..6            128 served, 0 REFUSED, 3 never completed
-
-    So THE ADDRESS IS NEVER LOST. What a holder crash costs is three
-    arrivals that nobody accepts during the takeover, deterministically —
-    smaller and sharper than every version of this I reported before it
-    was measured.
-
-    A peer component predicted this coupling from four leaked lineages of
-    its own in one day, and I refuted it once before measuring it. It was
-    right.
-
-    LISTENERS, sampled with lsof: n=3 before the kill (holder + two),
-    n=2 after, and in every clean run those two keep serving. No failing
-    run was ever caught with lsof attached — the instrumented probe is
-    slower, and every instrumented run was a first trial.
-
-    XFAIL, NOT DELETED, and NOT strict — for two measured reasons.
-
-    The 3 dropped arrivals are deterministic when this case runs ALONE:
-    14 trials out of 14 on lmd42. Under the full suite at `-n 4` they are
-    not. Four parallel runs gave three xfail and ONE XPASS — the drops
-    vanished entirely. Whatever the takeover is racing, a loaded box
-    sometimes wins it, so strict would redden CI on the lucky run.
-
-    And every one of those readings is from Linux. NOBODY HAS MEASURED
-    THIS ON DARWIN, and two of the three machines this ships to are Macs.
-
-    Take a macOS reading and a loaded-box reading before making it
-    strict. Either one alone is not enough.
-
-    FOUR WRONG READINGS OF MINE, recorded so the next reader does not
-    repeat them. Every one came from an instrument, not from the system.
+    SEVEN WRONG READINGS OF MINE ON THIS ONE KILL, kept because the
+    pattern is worth more than the conclusion: every one came from an
+    instrument, and each looked like a clean measurement of the system.
 
       1. "232/241 refused on lmd42, caused by PR_SET_PDEATHSIG" — the
          mechanism was invented. PDEATHSIG binds the holder to its
@@ -342,20 +298,22 @@ class TestHolderCrashIsNotYetSurvivable:
       2. "the address is never lost" — a 5s window that ended before the
          refusals began.
       3. "exactly one arrival is lost, it plateaus at 1 across budgets" —
-         an artifact of a fixed 5s window, where one never-returning
-         connect eats `budget` seconds of it, so the count fell as the
-         budget rose BY CONSTRUCTION. The 2s row said `never=3` and
-         contradicted it.
+         a fixed 5s window where one never-returning connect eats
+         `budget` seconds of it, so the count fell as the budget rose BY
+         CONSTRUCTION. The 2s row said 3 and contradicted it.
       4. "the address is lost in ~83% of fresh processes" — that control
-         counted XFAIL while the case asserted `refused == 0 AND
-         never == 0`, so three dropped arrivals scored identically to
-         losing the address. `--runxfail` shows 0 refused in 6 of 6, and
-         the assertion is now two rows so the message says which.
-      5. "the address is lost non-deterministically" — that was the
-         harness leaking a standby between trials, not the design.
+         counted XFAIL while the case asserted two conditions at once, so
+         dropped arrivals scored as address loss.
+      5. "the address is lost non-deterministically" — the harness leaked
+         a standby between trials.
+      6. "3 arrivals are dropped, deterministically" — the count was
+         bounded by the 2s connect timeout, not by the system; the drops
+         were consecutive, 2.02s apart, which is the timeout.
+      7. "the lineage never came up after 40s" — the standby logs to
+         `daemon.log` in the certdir, not to the holder's stdout.
 
-    The pattern in all four: a number that looked clean, from a probe
-    nobody had pointed at a control.
+    A number that looks clean is exactly when to ask what the probe could
+    not see. Six of these seven survived at least one re-measurement.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -411,17 +369,35 @@ class TestHolderCrashIsNotYetSurvivable:
             start_new_session=True,
         )
         try:
-            deadline = time.time() + 25
+            # WAIT FOR THE LINEAGE, NOT FOR THE PORT, and this is the whole
+            # case. A holder BINDS and answers before it has spawned its
+            # daemon or its standby, so "the port replied" is true of a
+            # half-built lineage that production never runs. Killing there
+            # measures a bare socket with nothing behind it.
+            #
+            # It looks exactly like a defect. Waiting on the port and killing
+            # produced 128 served then the address gone — 2,885 refusals over
+            # 60s with no recovery, reproducible to the decimal. Waiting for
+            # the daemon AND the standby first, same kill, same probe:
+            # 1,177 / 1,173 / 1,167 served, ZERO refused, ZERO dropped.
+            #
+            # The standby logs to `daemon.log` in the certdir, not to the
+            # holder's stdout, which is why an earlier version of this wait
+            # concluded the lineage "never came up" after 40s while it was
+            # running the whole time.
+            dlog = tmp_path / "daemon.log"
+            deadline = time.time() + 40
             while time.time() < deadline:
-                try:
-                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                seen = (log.read_text() if log.exists() else "") + (
+                    dlog.read_text() if dlog.exists() else "")
+                if "serving on port" in seen and "standby holding port" in seen:
                     break
-                except OSError:
-                    time.sleep(0.2)
+                time.sleep(0.2)
             else:
                 raise AssertionError(
-                    f"premise: the holder never served {port} — log: "
-                    f"{log.read_text()[-400:] if log.exists() else '(none)'}"
+                    f"premise: the full lineage never came up on {port} — "
+                    f"holder log: {log.read_text()[-300:] if log.exists() else '(none)'} "
+                    f"daemon log: {dlog.read_text()[-300:] if dlog.exists() else '(none)'}"
                 )
 
             assert holder.poll() is None, "premise: the holder is still running"
