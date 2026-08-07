@@ -1876,6 +1876,26 @@ def _wire_global_config_locked(
     ours = prev.get(_WIRE_MARK)
     ours = list(ours) if isinstance(ours, list) else []
 
+    # AND ANY MARKER THE CONFIG STILL CARRIES, which the sidecar answer hides.
+    # `_read_ledger` stops at a sidecar that says "not wired" — correct, an
+    # unwire writes exactly that and falling through would resurrect what it
+    # emptied. But claude-swap's `_clear_ledger` deliberately does NOT silence
+    # a marker in the config ("a receipt this clear never saw"), so the two
+    # states coexist: empty sidecar, config marker still present.
+    #
+    # Read as `ours == []` that is not merely a missed cleanup. The keys stay
+    # in `env`, and twenty lines down `displaced` records them as the USER'S
+    # pre-existing values — so the next unwire faithfully restores our own
+    # dead proxy vars as if they had always been there. Losslessness pointed
+    # at the wrong owner.
+    #
+    # Union, not fallback: the sidecar remains authoritative for what IT
+    # recorded, and a config-only receipt from an older cswap-pin is added
+    # rather than allowed to override.
+    config_mark = raw.get(_WIRE_MARK) if isinstance(raw, dict) else None
+    if isinstance(config_mark, list):
+        ours += [k for k in config_mark if k not in ours]
+
     # Drop what we wrote last time, restoring anything we displaced.
     saved = prev.get(f"{_WIRE_MARK}Saved")
     saved = dict(saved) if isinstance(saved, dict) else {}
