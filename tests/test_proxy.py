@@ -410,10 +410,21 @@ class TestHolderCrashIsNotYetSurvivable:
                 f"wait {worst:.0f}ms."
             )
         finally:
+            # KILLING THE HOLDER IS NOT CLEANUP. Its standby is detached and
+            # ignores SIGTERM by design (proxy.py installs SIG_IGN for TERM and
+            # INT, and _release only on SIGHUP), so a case that signals the
+            # holder alone leaves the standby holding the port at ppid=1
+            # forever. Measured: one run took the leftover count from 2 to 3,
+            # and a night of them left 59 alive on this machine, the oldest 42
+            # minutes. Every sibling case in this file already reaps; this one
+            # did not, and it is the only one that spawns a holder to kill it.
             try:
                 os.kill(holder.pid, signal.SIGKILL)
             except OSError:
                 pass
+            from conftest import _reap_pin_processes
+
+            _reap_pin_processes(tmp_path)
 
 
 class TestPinCodeResolvesItsNames:
