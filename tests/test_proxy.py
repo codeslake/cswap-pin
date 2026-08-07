@@ -11677,3 +11677,144 @@ class TestAHolderDoesNotOutliveItsLauncher:
                     pass
             if launcher.poll() is None:
                 launcher.kill()
+
+
+class TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt:
+    """What a client sees when the upstream cannot be reached.
+
+    ASKED BY A PEER COMPONENT, and it had no test at all: `grep` for
+    `_drop_upstream` or `_forward(` across this file was empty before this
+    class. The peer had just found the mirror bug in its own node proxy — a
+    relayed request that threw while its abort signal was wired to the CLIENT
+    REQUEST's "close" event, which node emits when the request BODY completes
+    rather than when the client leaves. Its catch opened with
+    ``if (signal.aborted) return``, so the client was still there and got
+    NOTHING: `POST /v1/messages -> TIMEOUT (10016ms)`.
+
+    That shape cannot happen here, for a structural reason rather than luck:
+    there is no abort listener and no response stream held open awaiting an
+    abort decision. The pin is a synchronous thread-per-connection socket
+    relay, and a client going away surfaces as an OSError on the next read or
+    write. But "cannot happen" was an argument from reading, and the two
+    failure routes below are DIFFERENT enough that a refactor could break one
+    without touching the other:
+
+      * `_upstream_conn()` is called OUTSIDE `_forward`'s `try`, so a DIAL
+        failure propagates out through `_mitm`'s `finally` to
+        `_handle_client`'s `except Exception` -> `conn.close()`.
+      * a failure once connected lands in `_forward`'s own
+        `except (OSError, ssl.SSLError)` -> `_drop_upstream(); return False`,
+        and `return False` ends the keep-alive loop.
+
+    Both converge on: the client connection closes and NOTHING is written to
+    it. That second half is deliberate and is the mirror of the peer's own
+    trade-off — they chose an honest leak over a hang, we close rather than
+    synthesise a 502. A 502 is only defensible before the first response byte,
+    and `_relay_response` sits inside the same `try`, so a status line
+    invented after a partial stream would be a second status line inside one
+    response. Closing is unambiguous at every point in the exchange; that is
+    why there is no 502, and why deleting the close in favour of one would be
+    a regression rather than an improvement.
+    """
+
+    def _proxy(self, upstream):
+        """A `PinProxy` with only what `_forward` touches, and `upstream` as
+        its dial. Not a full daemon: this asserts one branch's effect on one
+        client socket, and building a listening proxy to reach it would test
+        the scaffolding instead."""
+        import types
+
+        from cswap_pin.proxy import PinProxy
+
+        p = object.__new__(PinProxy)
+        p._local = types.SimpleNamespace(up=None, cid=0, detached=False)
+        p._upstream_conn = upstream
+        return p
+
+    def _pair(self):
+        """A connected pair, PROVEN to carry bytes before it is used to assert
+        that none arrived.
+
+        Both assertions below are absence checks, and an absence check on a
+        channel that transmits nothing passes for the reason it exists to rule
+        out. The control costs three lines and is the only thing separating
+        "the proxy wrote nothing" from "this test could not have seen it".
+        """
+        import socket
+
+        a, b = socket.socketpair()
+        b.settimeout(2.0)
+        a.sendall(b"control")
+        assert b.recv(16) == b"control", (
+            "the socketpair does not carry bytes, so a recv() of b\'\' below "
+            "would prove nothing about what the proxy wrote"
+        )
+        return a, b
+
+    def test_a_dial_failure_reaches_the_client_as_a_closed_connection(self):
+        """The route that does NOT go through `_forward`'s own handler."""
+        import socket
+
+        def _dial():
+            raise OSError("no route to upstream")
+
+        proxy = self._proxy(_dial)
+        client, peer = self._pair()
+        try:
+            with pytest.raises(OSError):
+                proxy._forward("POST", "/v1/messages", [], b"", client)
+            # `_mitm`/`_handle_client` do the closing above this frame, so the
+            # fact under test here is that NOTHING was written first — an
+            # invented status line would reach the client and then be
+            # contradicted by the close.
+            client.close()
+            peer.settimeout(2.0)
+            assert peer.recv(4096) == b"", (
+                "bytes reached the client on a dial failure; the frames above "
+                "this one then close the connection, so whatever was written "
+                "is a response the client can never rely on"
+            )
+        finally:
+            for s in (client, peer):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    def test_a_failure_once_connected_ends_the_keepalive_loop_silently(self):
+        """The route that DOES: `except (OSError, ssl.SSLError) -> False`.
+
+        False is what `_mitm`'s `while` reads as "no more requests on this
+        connection", so it is the close, not merely a status code.
+        """
+        import socket
+
+        class _Dead:
+            def sendall(self, _data):
+                raise OSError("upstream went away mid-write")
+
+            def close(self):
+                pass
+
+        proxy = self._proxy(lambda: _Dead())
+        client, peer = self._pair()
+        try:
+            assert proxy._forward("POST", "/v1/messages", [], b"", client) is False, (
+                "a broken upstream left the MITM connection open for another "
+                "request; the next one dials the same dead socket"
+            )
+            assert proxy._local.up is None, (
+                "_drop_upstream did not run: the dead socket is still the "
+                "cached upstream for this connection"
+            )
+            client.close()
+            peer.settimeout(2.0)
+            assert peer.recv(4096) == b"", (
+                "bytes reached the client before the connection was closed"
+            )
+        finally:
+            for s in (client, peer):
+                try:
+                    s.close()
+                except OSError:
+                    pass
