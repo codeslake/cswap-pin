@@ -4037,6 +4037,125 @@ class TestDaemonPortStability:
         finally:
             holder.stop()
 
+    def case_the_port_answers_across_a_SIGKILL_of_the_HOLDER(self, tmp_path):
+        """The sibling of the case above, one level up: kill the SUPERVISOR.
+
+        The case above kills the daemon and the holder puts another one on the
+        socket it never gave up. This asks what happens when the process
+        holding that socket is the one that dies — the only remaining question
+        about this design's crash behaviour, and the one it had no test for.
+
+        WHY IT NEEDED ONE. I reported a `kill -9` of the holder on host-a as
+        232/241 refused, and explained it to a peer component as
+        `PR_SET_PDEATHSIG` making the kernel take the daemon too. That
+        explanation was wrong: PDEATHSIG binds the holder to its LAUNCHER, to
+        stop an orphan-holder leak (measured elsewhere at 151 processes,
+        9.17 GiB), and it sends TERM precisely so a teardown still runs. So the
+        number was real and the mechanism was invented. One uncontrolled
+        observation on a live machine is not a characterisation.
+
+        SPAWNED, NOT `run_service`. The holder in the case above IS this
+        process, so there is nothing to signal. `--hold-port` gives a real
+        holder in its own session, which is also the shape production runs.
+
+        NO SLEEP BETWEEN PROBES, for the same reason as the case above: a
+        structural window here is narrow, and a probe that pauses looks away
+        for most of what it is meant to catch.
+        """
+        import os
+        import signal
+        import socket
+        import subprocess
+        import sys
+        import time
+
+        from cswap_pin.proxy import ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        log = tmp_path / "holder.log"
+        holder = subprocess.Popen(
+            [sys.executable, "-m", "cswap_pin.proxy", "--hold-port", str(port),
+             "1", "a@example.com", str(tmp_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=open(log, "wb"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                raise AssertionError(
+                    f"premise: the holder never served {port} — log: "
+                    f"{log.read_text()[-400:] if log.exists() else '(none)'}"
+                )
+
+            assert holder.poll() is None, "premise: the holder is still running"
+            os.kill(holder.pid, signal.SIGKILL)
+
+            # REFUSAL AND DELAY ARE DIFFERENT FAILURES, and the first draft of
+            # this case conflated them. A refusal means the address is GONE,
+            # which for a live session is permanent — its HTTPS_PROXY was
+            # fixed at exec and is never re-read. A slow connect means the
+            # socket is still bound and the arrival is sitting in the backlog
+            # until the successor accepts it: late, but not lost.
+            #
+            # So this counts refusals and measures WAITS, with a budget long
+            # enough that a backlogged connection completes rather than being
+            # scored as a loss. Reporting the worst wait is the point — it is
+            # the number a caller would feel.
+            refused = 0
+            hung = 0
+            waits = []
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                t0 = time.monotonic()
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                    waits.append(time.monotonic() - t0)
+                except ConnectionRefusedError:
+                    refused += 1
+                except OSError:
+                    hung += 1
+            worst = max(waits) * 1000 if waits else -1
+
+            # THE BAR THIS SUITE ALREADY SETS, and the one that decides whether
+            # a live session survives: the address is never lost. Its sibling
+            # above asserts exactly this and nothing about latency.
+            assert refused == 0, (
+                f"across a SIGKILL of the holder: {len(waits)} served, "
+                f"{refused} REFUSED, {hung} did not complete in 2s, worst "
+                f"completed wait {worst:.0f}ms. A refusal means the address is "
+                f"gone, and a live session's HTTPS_PROXY was fixed at exec and "
+                f"is never re-read, so it is permanent for that session."
+            )
+
+            # ponytail: THE GAP IS NOT FREE, and this case does not assert it
+            # away. Measured here: 0 refused, but connections that did not
+            # complete inside 2s while the successor took over. A hang is not
+            # a loss — the socket is still bound and the arrival is in the
+            # backlog — but it is not service either, and to a user it reads as
+            # "the network is slow" rather than as a handover. Left unasserted
+            # because closing it means changing WHO accepts during the gap,
+            # which is a design change and not a test change. Upgrade path: if
+            # a session ever reports a stall across a holder crash, make the
+            # standby accept during the gap and assert the wait here.
+        finally:
+            try:
+                os.kill(holder.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
     def case_a_term_is_never_dropped_by_a_parked_main_thread(self, tmp_path):
         """One SIGTERM must be enough, whichever thread the kernel picks.
 
