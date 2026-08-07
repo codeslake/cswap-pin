@@ -2739,6 +2739,66 @@ class TestHealthEndpoint:
         finally:
             hop.stop()
 
+        # AND THE OUTAGE MUST OUTLIVE THE RECOVERY. `egress` is the state RIGHT
+        # NOW, so a chain that breaks and comes back reads green to every probe
+        # that arrives afterwards — which is every probe, because nobody is
+        # watching at the instant it breaks. Measured on via-work-mac
+        # 2026-08-06, the fifth outage in the count above:
+        #
+        #   22:35:44Z  hop 9901 unusable — accepted but did not tunnel
+        #   22:36:46Z  hop 8118 unusable — accepted but did not tunnel
+        #   22:36:46Z  egress DIRECT
+        #   22:36:47Z  egress via 127.0.0.1:9901       <- green again
+        #
+        # One second of green-again and the incident is gone. Nothing on this
+        # host recorded that it happened except a log line, and a probe an hour
+        # later reads a healthy daemon — which is how the four before it were
+        # each repaired by hand without anyone knowing why.
+        #
+        # These are UTC; claude-swap.log is local. A session hunting an
+        # unrelated artifact failure compared the two directly, matched this
+        # outage to a symptom four hours away, and shipped it as the cause.
+        # The field this test guards must not invite that: /health emits UTC.
+        #
+        # `direct_last` is the transition TIME, not a flag: "we went direct"
+        # with no when cannot be told from an hour ago or a week ago, and the
+        # only question a reader has is whether it explains what they are
+        # looking at. Null until it happens — same reason `egress` is null
+        # before the first dial.
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            chain_proxy=("127.0.0.1", 9901),
+        )
+        assert proxy.direct_last is None, (
+            "a daemon that has never gone direct must not claim it did"
+        )
+        proxy._note_egress(direct=True, configured=True)
+        fell_at = proxy.direct_last
+        assert fell_at is not None, "the DIRECT transition was not recorded"
+        proxy._note_egress(direct=False, hop=("127.0.0.1", 9901))
+        assert proxy.direct_last == fell_at, (
+            "recovering to a healthy hop erased the outage — this is the bug: "
+            "every probe after the flap sees a green daemon and the incident "
+            "becomes invisible"
+        )
+
+        # A HOST WITH NO CHAIN AT ALL IS NOT AN OUTAGE. `configured=False` is
+        # the steady state on a machine with no egress proxy; stamping it would
+        # leave every such machine permanently reporting a fault it does not
+        # have — the same conflation the `egress`-vs-null split already avoids.
+        never = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+        )
+        never._note_egress(direct=True, configured=False)
+        assert never.direct_last is None, (
+            "a host with no configured chain was recorded as having fallen "
+            "back to direct — it never had a chain to fall back from"
+        )
+
 
 
 class _KeepAliveUpstream:
