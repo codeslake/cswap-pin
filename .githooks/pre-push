@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# A CODE CHANGE THAT DOES NOT MOVE THE VERSION REACHES NOBODY.
+#
+# publish.yml fires on a `v*` tag and tag-on-version-bump.yml derives that tag
+# from `version` in pyproject.toml. So a commit that edits src/cswap_pin/ and
+# leaves the version alone lands on main, goes green, and the tag job
+# short-circuits with "already tagged" — correctly, and invisibly. PyPI keeps
+# serving the release before it, and every machine that installs from PyPI
+# keeps running code the fix was supposed to replace.
+#
+# Measured 2026-08-06/07, both directions of the same hole:
+#   nine bumps with no tag   -> PyPI stuck at 0.1.55 while main said 0.1.64
+#   one fix with no bump     -> 3e91a06 sat on main until 0.1.65 carried it
+# The tag workflow closed the first. This closes the second.
+#
+# WARNS, NEVER BLOCKS, matching the global pre-push hook's own rule. A branch
+# that is not ready to release is a normal thing to push; being told is not.
+set -uo pipefail
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+ver_at() {  # version string at a rev, empty if unreadable
+    git show "$1:pyproject.toml" 2>/dev/null \
+        | sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | head -1
+}
+
+warned=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -z "${local_sha:-}" ] && continue
+    case "$local_sha" in *[!0]*) ;; *) continue;; esac   # deleting a ref
+
+    # A NEW BRANCH HAS NO REMOTE SIDE to diff against. Use the merge base with
+    # the default branch rather than skipping: the first push of a branch is
+    # exactly when a forgotten bump is cheapest to catch.
+    case "$remote_sha" in
+        *[!0]*) base="$remote_sha" ;;
+        *) base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || continue ;;
+    esac
+    [ -z "$base" ] && continue
+
+    git diff --quiet "$base" "$local_sha" -- "$repo_root/src/cswap_pin" 2>/dev/null && continue
+    [ "$(ver_at "$base")" != "$(ver_at "$local_sha")" ] && continue
+
+    printf '\n\033[33mpre-push: src/cswap_pin changed and version did NOT.\033[0m\n' >&2
+    printf '  version is still %s at both ends of %s..%s\n' \
+        "$(ver_at "$local_sha")" "${base:0:8}" "${local_sha:0:8}" >&2
+    printf '  Nothing publishes: the tag job keys on this version and will\n' >&2
+    printf '  short-circuit, so PyPI keeps the release before this one.\n' >&2
+    printf '  Bump `version` in pyproject.toml, or push knowing it stays unreleased.\n\n' >&2
+    warned=1
+done
+
+exit 0   # never block
