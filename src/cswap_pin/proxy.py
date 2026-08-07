@@ -3391,7 +3391,7 @@ def _holder_owns(certdir: Path) -> bool:
 
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pid=,command="], capture_output=True, text=True,
+            ["ps", "-ww", "-eo", "pid=,command="], capture_output=True, text=True,
             timeout=5,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -3415,7 +3415,7 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
     pids: list[int] = []
     try:
         out = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
+            ["ps", "-ww", "-axo", "pid=,command="],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -5975,7 +5975,7 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
     retired = 0
     try:
         out = subprocess.run(
-            ["ps", "-axo", "pid=,command="],
+            ["ps", "-ww", "-axo", "pid=,command="],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except (OSError, subprocess.SubprocessError):

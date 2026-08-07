@@ -4172,7 +4172,15 @@ class TestDaemonPortStability:
             for _ in range(2):
                 st = read_daemon_state(tmp_path)
                 if st:
-                    os.kill(int(st["pid"]), 15)  # a deploy's own signal
+                    # THROUGH THE OWNERSHIP CHECK, not the bare number. The
+                    # recorded daemon may already have been replaced, and on
+                    # macOS its pid is handed out again fast — this line
+                    # SIGTERM'd a pytest-xdist worker on macos-latest and read
+                    # as `node down: keyboard-interrupt`, green on ubuntu the
+                    # whole time. The standby made it deterministic by adding a
+                    # third process to every lineage.
+                    from conftest import signal_if_still_ours
+                    signal_if_still_ours(int(st["pid"]), tmp_path, 15)
                 # WAIT FOR THE SUCCESSOR, don't sleep a fixed 1.2s hoping it
                 # arrived. The successor is what the next kill needs to find,
                 # and it usually lands well inside the old budget — the wait
