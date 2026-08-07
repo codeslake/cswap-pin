@@ -375,7 +375,16 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
 
     def _mine():
         try:
-            out = subprocess.run(["ps", "-eo", "pid=,command="],
+            # `-ww` OR THIS SWEEP REAPS NOTHING. ps truncates to COLUMNS,
+            # pytest sets it to 80, and the certdir gate below matches on
+            # the LAST argv token — so every line came back cut off
+            # mid-path and `_mine()` returned an empty list. On Linux
+            # PDEATHSIG hides it by taking children down with their
+            # holder; on macOS nothing does, so a lineage leaked per case
+            # until the worker could not shut down and execnet SIGINT'd
+            # it — `node down: keyboard-interrupt`, macOS red, ubuntu
+            # green, traced to execnet's own `_terminate_execution`.
+            out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
                                  capture_output=True, text=True, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
             return [], []
