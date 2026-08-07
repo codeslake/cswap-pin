@@ -74,6 +74,51 @@ def _stdlib_ssl():
     yield
 
 
+def _ask_for_a_reply(port, timeout=2.0):
+    """One CONNECT to ``port``, requiring an answer. ``"served"`` or why not.
+
+    A REQUEST, NOT A CONNECT, and this file already argued why at length in
+    `case_a_real_spawned_successor_drops_no_connection`: while a daemon
+    drains, the port stays BOUND — the holder's socket queues arrivals — so
+    `create_connection().close()` always succeeds and `refused` is
+    structurally 0 no matter how long nobody is behind it. Measured on lmd42
+    during a 30s held-exit drain: refused=0, and 30 requests died on a 3s
+    timeout with no reply. A connect-only probe calls that window healthy.
+
+    Control for the instrument itself, measured on a plain `listen(128)`
+    socket with no `accept()` at all: a connect-only probe scored
+    ``served=129 refused=0``, because 128 arrivals fit in the backlog. This
+    one scores them all as no-reply, which is what they are to a session.
+
+    MODULE LEVEL because a third copy of the request logic is how the weaker
+    instrument survived beside the stronger one — the holder-crash probe was
+    counting connects while its sibling twelve hundred lines down was already
+    requiring replies.
+    """
+    import socket
+
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except ConnectionRefusedError:
+        return "refused"
+    except OSError as exc:
+        return f"no connect ({type(exc).__name__})"
+    try:
+        s.settimeout(timeout)
+        s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                  b"Host: api.anthropic.com:443\r\n\r\n")
+        return "served" if s.recv(64) else "no reply (EOF)"
+    except socket.timeout:
+        return "no reply (timeout)"
+    except OSError as exc:
+        return f"no reply ({type(exc).__name__})"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 class TestLiveRemoteControlSessions:
     """A re-pin cannot move an RC session that is already open (the server
     fixed its owner at creation), so `cswap pin` names the ones affected
@@ -286,7 +331,21 @@ class TestHolderCrashIsSurvivable:
         wait for daemon AND standby    1,177 / 1,173 / 1,167 served
                                        ZERO refused, ZERO dropped
 
-    Same kill, same probe, same machine. The lineage survives.
+    Same kill, same probe, same machine.
+
+    WHAT ACTUALLY SURVIVES IS THE DAEMON, and the difference matters
+    because this docstring is the spec. Measured with `ps` before and
+    1.5s after the SIGKILL: the DAEMON is what lives on at ppid=1 and
+    answers CONNECT. The standby survives too but never acts — it arms
+    only when the holder AND the daemon are both gone
+    (`_standby_tick`). So the property here is "a SIGKILL of the holder
+    does not take its daemon down", not "the standby caught it", and a
+    regression that broke standby promotion would leave this case green.
+    That path is covered by `TestStandbyPromotion` instead.
+
+    Waiting on the standby marker is still right — it is the LATER of
+    the two, so it subsumes the daemon marker and keeps the kill off a
+    half-built lineage. It is the wait, not the survival.
 
     SEVEN WRONG READINGS OF MINE ON THIS ONE KILL, kept because the
     pattern is worth more than the conclusion: every one came from an
@@ -360,11 +419,15 @@ class TestHolderCrashIsSurvivable:
         probe.close()
 
         log = tmp_path / "holder.log"
+        # BOUND, so the `finally` can close it. `stdout=open(...)` handed the
+        # handle to Popen and kept no reference, and Popen does not own it —
+        # a ResourceWarning run reported the unclosed file.
+        logf = open(log, "wb")
         holder = subprocess.Popen(
             [sys.executable, "-m", "cswap_pin.proxy", "--hold-port", str(port),
              "1", "a@example.com", str(tmp_path)],
             stdin=subprocess.DEVNULL,
-            stdout=open(log, "wb"),
+            stdout=logf,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -380,6 +443,14 @@ class TestHolderCrashIsSurvivable:
             # 60s with no recovery, reproducible to the decimal. Waiting for
             # the daemon AND the standby first, same kill, same probe:
             # 1,177 / 1,173 / 1,167 served, ZERO refused, ZERO dropped.
+            # (Those figures are from the connect-only probe this case used
+            # to run; the request-level one below counts fewer and means
+            # more. What the wait buys is unchanged.)
+            #
+            # The standby is waited ON, not credited: it is the later of the
+            # two markers, so waiting for it subsumes the daemon's. The
+            # process that actually keeps serving after the kill is the
+            # DAEMON — see the class docstring.
             #
             # The standby logs to `daemon.log` in the certdir, not to the
             # holder's stdout, which is why an earlier version of this wait
@@ -410,25 +481,36 @@ class TestHolderCrashIsSurvivable:
             # means the address is still bound and nobody will serve that
             # arrival. Only "served" keeps a session alive.
             #
-            # The class docstring carries the measurement and why this is
-            # xfail rather than a plain assertion.
+            # The class docstring carries the measurement.
+            #
+            # A REPLY, NOT A CONNECT — see `_ask_for_a_reply`. This counted
+            # `create_connection().close()`, which the sibling case at
+            # `case_a_real_spawned_successor_drops_no_connection` had already
+            # rejected in writing: the port stays BOUND while nobody serves
+            # it, so connects succeed from the backlog and "served" means
+            # "the kernel queued me". Control on a plain listen(128) with no
+            # accept(): connect-only scored 129 served / 0 refused.
+            #
+            # FIXED N, NOT A FIXED WINDOW, because wrong-reading #3 below
+            # diagnoses exactly that bias — a duration budget makes the counts
+            # move with the machine and with the timeout, so the numbers
+            # quoted in a failure message are not comparable across runs.
             refused = 0
             never = 0
             waits = []
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
+            for _ in range(200):
                 t0 = time.monotonic()
-                try:
-                    socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                verdict = _ask_for_a_reply(port)
+                if verdict == "served":
                     waits.append(time.monotonic() - t0)
-                except ConnectionRefusedError:
+                elif verdict == "refused":
                     refused += 1
-                except OSError:
+                else:
                     never += 1
             worst = max(waits) * 1000 if waits else -1
             counts = (
                 f"{len(waits)} served, {refused} refused, {never} never "
-                f"completed, worst served wait {worst:.0f}ms"
+                f"answered, worst served round-trip {worst:.0f}ms"
             )
 
             # TWO ROWS, NOT ONE BUCKET. `refused == 0 and never == 0` was a
@@ -466,6 +548,22 @@ class TestHolderCrashIsSurvivable:
             try:
                 os.kill(holder.pid, signal.SIGKILL)
             except OSError:
+                pass
+            # AND REAP THE HOLDER ITSELF. `_reap_pin_processes` matches on
+            # `cswap_pin.proxy` appearing in the ps command line, which a
+            # DEFUNCT process no longer shows — so the SIGKILLed holder sat
+            # as a zombie for the life of the worker and the sweep could not
+            # see it. `Popen.__del__` then warned about it at interpreter
+            # shutdown, which is where a ResourceWarning run found it.
+            try:
+                holder.wait(timeout=5)
+            except Exception:  # noqa: BLE001 — best effort; the sweep follows
+                pass
+            # The log handle is ours, not Popen's: it was opened for stderr
+            # and never closed, so the same run reported an unclosed file.
+            try:
+                logf.close()
+            except Exception:  # noqa: BLE001
                 pass
             from conftest import _reap_pin_processes
 
@@ -11753,7 +11851,6 @@ class TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt:
 
     def test_a_dial_failure_reaches_the_client_as_a_closed_connection(self):
         """The route that does NOT go through `_forward`'s own handler."""
-        import socket
 
         def _dial():
             raise OSError("no route to upstream")
@@ -11787,18 +11884,40 @@ class TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt:
         False is what `_mitm`'s `while` reads as "no more requests on this
         connection", so it is the close, not merely a status code.
         """
-        import socket
 
         class _Dead:
+            def __init__(self):
+                self.closed = False
+
             def sendall(self, _data):
                 raise OSError("upstream went away mid-write")
 
             def close(self):
-                pass
+                # RECORDED, not a no-op. `_drop_upstream` closes the socket AND
+                # nulls the ref; a version that only nulled it would leak the
+                # fd and still satisfy the `is None` check below.
+                self.closed = True
 
-        proxy = self._proxy(lambda: _Dead())
+        dead = _Dead()
+        proxy = self._proxy(lambda: dead)
+
+        def _dial():
+            # ASSIGNS `_local.up`, BECAUSE THE REAL ONE DOES (proxy.py:7891).
+            # The stub returned the socket without caching it while `_proxy()`
+            # initialises `_local.up = None` — so the assertion after the call
+            # was re-reading the value the FIXTURE wrote and could not fail.
+            # Measured by review: deleting `_drop_upstream()` from `_forward`'s
+            # handler left both tests in this class green.
+            proxy._local.up = dead
+            return dead
+
+        proxy._upstream_conn = _dial
         client, peer = self._pair()
         try:
+            assert proxy._local.up is None, (
+                "premise: the cached upstream must start empty, or the "
+                "assertion after the call describes the fixture's own state"
+            )
             assert proxy._forward("POST", "/v1/messages", [], b"", client) is False, (
                 "a broken upstream left the MITM connection open for another "
                 "request; the next one dials the same dead socket"
@@ -11806,6 +11925,10 @@ class TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt:
             assert proxy._local.up is None, (
                 "_drop_upstream did not run: the dead socket is still the "
                 "cached upstream for this connection"
+            )
+            assert dead.closed, (
+                "the cached ref was nulled but the socket was never closed — "
+                "the fd leaks for the life of the process"
             )
             client.close()
             peer.settimeout(2.0)
