@@ -306,6 +306,48 @@ def _short_hop_budgets(monkeypatch):
 _STANDBY_ARG = "--standby"
 
 
+def signal_if_still_ours(pid: int, certdir, sig: int) -> bool:
+    """Signal ``pid`` only while it is still a pin process for ``certdir``.
+
+    A PID FROM A FILE IS A NUMBER, NOT A PROCESS. `read_daemon_state` records
+    the daemon that was serving; by the time a test signals it, that daemon
+    may have been replaced and its pid handed to somebody else. This suite
+    already paid for that once — "signalling a bare number once killed a
+    pytest-xdist worker" — and the guard it grew (`Popen.returncode is None`)
+    only covers children we own, not pids we read.
+
+    PORTABLE ON PURPOSE. Every existing ownership check here reads /proc, so
+    it silently passes on macOS and the hazard is unguarded on exactly the
+    platform where it fires: pid space is small there and reuse is fast, which
+    is why CI went red on macos-latest and stayed green on ubuntu once the
+    standby put a third process in every lineage and doubled the pid churn.
+
+    Returns whether the signal was sent.
+    """
+    import os
+    import subprocess as _sp
+
+    target = str(pathlib.Path(certdir).resolve())
+    try:
+        # `-ww`, NOT bare `-o command=`. ps honours COLUMNS and pytest sets it
+        # to 80, so the certdir this predicate matches on was CUT OFF mid-path
+        # and every check refused. Measured:
+        #   cmd='... -m cswap_pin.proxy 1 a@b.c /tmp/pytest-of-j.'
+        # A width-dependent predicate fails toward "not ours", which is the
+        # safe direction here and the silent direction everywhere else.
+        cmd = _sp.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                      capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, _sp.SubprocessError):
+        return False
+    if "cswap_pin.proxy" not in cmd or not cmd.rstrip().endswith(" " + target):
+        return False
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
+    return True
+
+
 def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
     """Kill every pin process serving ``certdir``, PARENTS FIRST, and WAIT.
 
