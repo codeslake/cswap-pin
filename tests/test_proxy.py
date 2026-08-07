@@ -189,13 +189,38 @@ class TestRepinIsLive:
         """
         import os
         import pathlib
+        import shutil
 
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import daemon_fingerprint
 
-        src = pathlib.Path(pin_proxy.__file__)
+        # ON A COPY, because the mutations below are the one thing the
+        # production path says cannot happen to it. `daemon_fingerprint`
+        # argues it needs no torn-read guard: an installer replaces the file
+        # by RENAME, so a reader sees the whole old file or the whole new one.
+        # True — but `write_bytes` truncates the SAME inode, so mutating the
+        # shipped module here manufactures exactly the torn read production is
+        # exempt from, on a file the other xdist workers are reading.
+        #
+        # Measured: same commit 9beadf60, two runs, one green and one
+        # `OSError: lineno is out of bounds` out of `inspect.getsource` in an
+        # unrelated class — a worker had cached this file mid-truncate. Code
+        # cannot be the differentiator when the SHA is identical; test order
+        # is.
+        #
+        # `daemon_fingerprint` walks `Path(__file__).parent` of the proxy
+        # module, read at call time, so pointing that at the copy moves the
+        # whole walk with it and the assertions below keep their exact
+        # meaning.
+        pkg = pathlib.Path(pin_proxy.__file__).parent
+        copy_pkg = tmp_path / pkg.name
+        shutil.copytree(pkg, copy_pkg, ignore=shutil.ignore_patterns("__pycache__"))
+
+        src = copy_pkg / "proxy.py"
         original = src.read_bytes()
         st = src.stat()
+        _real_file = pin_proxy.__file__
+        pin_proxy.__file__ = str(src)
         before = daemon_fingerprint()
         try:
             # NEW CONTENT, OLD MTIME — what an archive-mode copy leaves.
@@ -241,8 +266,7 @@ class TestRepinIsLive:
                 "a same-LENGTH edit read as unchanged — size is not content"
             )
         finally:
-            src.write_bytes(original)
-            os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns))
+            pin_proxy.__file__ = _real_file
 
 
 class TestPinCodeResolvesItsNames:
