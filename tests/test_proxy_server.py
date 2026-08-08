@@ -2799,6 +2799,92 @@ class TestHealthEndpoint:
             "back to direct — it never had a chain to fall back from"
         )
 
+    def case_direct_last_is_a_wire_contract_another_repo_reads(self, certdir):
+        """The JSON KEY and its TYPE, not the Python property.
+
+        The case above asserts `proxy.direct_last`, an attribute of this
+        object. The consumer is in ANOTHER REPOSITORY and reads
+        `json["direct_last"]` off the wire — cswap_fork's .claude/verify.sh,
+        the chain-egress check, running per host on every deploy. Renaming the
+        key or changing its type breaks that consumer and leaves BOTH suites
+        green, because nothing here has ever looked at the payload.
+
+        `chain` and `egress` are already pinned by name: the case above
+        asserts `data.get("chain") == ...` and `"egress" in data`, so a rename
+        of either fails. `direct_last` had neither, and it is the field with
+        the subtler failure — a retype still renders in the consumer's
+        f-string and produces a plausible wrong answer instead of a crash.
+
+        THE Z IS LOAD-BEARING. daemon.log is UTC while claude-swap.log is
+        local; a session compared the two directly, matched an outage to a
+        symptom four hours away and shipped it as the cause. A naive
+        `isoformat()` drops the suffix and re-opens exactly that.
+
+        NULL, NOT ABSENT, before the first fallback: `.get()` cannot tell
+        those apart, so it has to be asserted at the source.
+        """
+        import datetime
+        import json as _json
+
+        from cswap_pin.proxy import PinProxy
+
+        def _payload(proxy):
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            try:
+                raw.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                raw.settimeout(5)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                body = resp.split(b"\r\n\r\n", 1)[1]
+                try:
+                    body += raw.recv(4096)
+                except OSError:
+                    pass
+            finally:
+                raw.close()
+            return _json.loads(body.decode() or "{}")
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            chain_proxy=("127.0.0.1", 9901),
+        )
+        proxy.start()
+        try:
+            fresh = _payload(proxy)
+            assert "direct_last" in fresh, (
+                "/health dropped the direct_last KEY — the cross-repo "
+                "chain-egress check reads it by that exact name"
+            )
+            assert fresh["direct_last"] is None, (
+                f"a daemon that has never gone direct published "
+                f"{fresh['direct_last']!r} — null is what 'not yet' looks like"
+            )
+
+            proxy._note_egress(direct=True, configured=True)
+            fell = _payload(proxy)["direct_last"]
+            assert isinstance(fell, str), (
+                f"direct_last went out as {type(fell).__name__} ({fell!r}). A "
+                f"retype breaks the consumer as hard as a rename, and worse: "
+                f"an epoch float still renders in its message and reads as a "
+                f"plausible timestamp"
+            )
+            assert fell.endswith("Z"), (
+                f"direct_last published {fell!r} with no UTC marker. "
+                f"daemon.log is UTC and claude-swap.log is local; a reader "
+                f"already compared the two and blamed the wrong incident"
+            )
+            # Parses as a real instant, so "Z" cannot be satisfied by a string
+            # that merely ends in one.
+            datetime.datetime.strptime(fell, "%Y-%m-%dT%H:%M:%SZ")
+        finally:
+            proxy.stop()
+
 
 
 class _KeepAliveUpstream:
