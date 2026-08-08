@@ -2885,6 +2885,116 @@ class TestHealthEndpoint:
         finally:
             proxy.stop()
 
+    def case_health_names_who_holds_the_socket(self, certdir):
+        """WHICH process owns the address, answered by the kernel, not a record.
+
+        Nothing on the box published this and it cost a peer session a false
+        finding: they read the ROLE off argv, which is fixed at exec, so a
+        standby that ARMED and became the holder still reads `--standby`
+        forever. They reported a machine as deviating when its triad was
+        intact. proxy.json records the DAEMON pid, never the holder's.
+
+        COMPUTED AT REQUEST TIME, NEVER STORED, and that is the whole design.
+        A stored holder goes stale in exactly the event this field exists to
+        report: the holder dies, a standby arms, and the record still names
+        the dead one until the next daemon respawn. `held_by_a_holder()`
+        compares the spawn-time marker against a LIVE `getppid()`, so the
+        kernel owns the comparand and pid reuse cannot forge it — a reused pid
+        would have to be this process's actual parent.
+
+        NOT `getppid()` ALONE, which is the tempting one-liner. A daemon
+        nobody holds — a bare `daemon_main`, a test harness — still has a
+        parent, so the naive version names an unrelated process as the holder
+        of a socket it has never heard of. `null` is the honest answer there,
+        and it is also the useful one: no holder means this address dies with
+        this process.
+
+        NOT `ppid == 1` EITHER. A PR_SET_CHILD_SUBREAPER ancestor collects
+        orphans instead of init, so an orphaned daemon never reads 1 — the
+        same trap `_spawn_standby` already documents for the standby's arming
+        predicate, where getting it wrong left the address ACCEPTING AND
+        HANGING (a peer measured 15,010ms) rather than refusing.
+        """
+        import json as _json
+        import os as _os
+
+        from cswap_pin.proxy import _HELD_BY_ENV, PinProxy
+
+        def _payload(proxy):
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            try:
+                raw.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                raw.settimeout(5)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                body = resp.split(b"\r\n\r\n", 1)[1]
+                try:
+                    body += raw.recv(4096)
+                except OSError:
+                    pass
+            finally:
+                raw.close()
+            return _json.loads(body.decode() or "{}")
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+        )
+        proxy.start()
+        try:
+            # UNHELD: this test process was not spawned by a holder.
+            unheld = _payload(proxy)
+            assert "holder_pid" in unheld, (
+                "/health does not say who holds the socket — the one question "
+                "argv cannot answer and proxy.json does not record"
+            )
+            assert unheld["holder_pid"] is None, (
+                f"a daemon nobody holds named {unheld['holder_pid']!r} as its "
+                f"holder — that is just getppid(), and it points at a process "
+                f"that has never heard of this socket"
+            )
+
+            # HELD: the marker names our real parent, which is what a holder
+            # sets at spawn. CONTROL below proves the field is not simply
+            # echoing getppid() regardless.
+            real_ppid = _os.getppid()
+            saved = _os.environ.get(_HELD_BY_ENV)
+            _os.environ[_HELD_BY_ENV] = str(real_ppid)
+            try:
+                held = _payload(proxy)["holder_pid"]
+            finally:
+                if saved is None:
+                    _os.environ.pop(_HELD_BY_ENV, None)
+                else:
+                    _os.environ[_HELD_BY_ENV] = saved
+            assert held == real_ppid, (
+                f"held daemon reported holder_pid={held!r}, expected the live "
+                f"parent {real_ppid}"
+            )
+
+            # CONTROL: a marker naming somebody who is NOT our parent must not
+            # be believed. This is the pid-reuse case in miniature — a stored
+            # number that no longer refers to the process that stored it.
+            _os.environ[_HELD_BY_ENV] = str(real_ppid + 1000000)
+            try:
+                stale = _payload(proxy)["holder_pid"]
+            finally:
+                if saved is None:
+                    _os.environ.pop(_HELD_BY_ENV, None)
+                else:
+                    _os.environ[_HELD_BY_ENV] = saved
+            assert stale is None, (
+                f"a marker naming a non-parent was reported as the holder "
+                f"({stale!r}) — the field trusted a record over the kernel"
+            )
+        finally:
+            proxy.stop()
+
 
 
 class _KeepAliveUpstream:

@@ -7524,9 +7524,28 @@ class PinProxy:
             egress = None
         # `egress` is instantaneous; `direct_last` is the same fault in a tense
         # a later probe can still read. See :attr:`direct_last`.
+        # WHO HOLDS THE ADDRESS — the one question argv cannot answer. A
+        # standby that ARMS becomes the holder and its argv still says
+        # `--standby` forever, because argv is fixed at exec; a peer read the
+        # role off it and reported an intact triad as deviating. proxy.json
+        # records the DAEMON pid, which is a different process.
+        #
+        # COMPUTED HERE, NEVER STORED. A recorded holder goes stale in exactly
+        # the event this reports: holder dies, standby arms, and the record
+        # still names the dead one until the next respawn. `held_by_a_holder`
+        # compares the spawn-time marker against a LIVE `getppid()`, so the
+        # kernel owns the comparand — a reused pid cannot forge it without
+        # actually being our parent.
+        #
+        # `null` when nothing holds us, which is not the same as "unknown": it
+        # says this address dies with this process. Reporting a bare
+        # `getppid()` instead would name an unrelated process as the holder of
+        # a socket it has never heard of.
+        holder_pid = os.getppid() if held_by_a_holder() else None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
              "can_pin": can_pin, "egress": egress,
+             "holder_pid": holder_pid,
              "direct_last": _iso_utc(self._egress_direct_last)}
         )
         try:
