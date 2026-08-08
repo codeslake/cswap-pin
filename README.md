@@ -361,11 +361,39 @@ changes nothing; use `--set_port`.
 
 ## Running the tests
 
+Against the **released** host, which is what CI gates on:
+
 ```bash
-uv sync --group dev                 # pytest, pytest-xdist, and the host
 S="$(mktemp -d)" && HOME="$S" XDG_DATA_HOME="$S/.local/share" \
-  uv run python -m pytest tests -q
+  uv run --with pytest --with pytest-xdist --with cryptography \
+         --with claude-swap \
+         python -m pytest tests -q -m "not needs_host_seam"
 ```
+
+Against your **claude-swap checkout**, which also runs the seam tests:
+
+```bash
+S="$(mktemp -d)" && HOME="$S" XDG_DATA_HOME="$S/.local/share" \
+  uv run --with pytest --with pytest-xdist --with cryptography \
+         --with-editable /path/to/claude-swap \
+         python -m pytest tests -q
+```
+
+Measured, both: 114 passed / 6 skipped for the first, 115 / 6 for the second.
+The extra one is `TestAutoViewPinBadge` — it reads a seam that only exists in a
+host new enough to have it, so it is `@pytest.mark.needs_host_seam` and CI
+excludes it by marker rather than skipping it silently.
+
+**`--with claude-swap` (or `--with-editable`) is not optional.** Five test
+files import the HOST, and `claude-swap` is deliberately absent from
+`[dependency-groups] dev` — listing it there made `uv run` unresolvable and
+took the publish workflow down with it (the reason sits beside the group in
+`pyproject.toml`). So the host arrives on the command line or not at all.
+Without it the suite does not fail, it **errors**: 14 collection errors,
+`ModuleNotFoundError: No module named 'claude_swap'`.
+
+`--with pytest-xdist` is not optional either: `addopts` carries `-n 4`, and a
+pytest without xdist refuses the flag rather than ignoring it.
 
 **Redirect `HOME` and `XDG_DATA_HOME`.** The suite drives real cert dirs,
 daemon state and config wiring; a run against your own `HOME` will rewrite
