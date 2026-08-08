@@ -6631,6 +6631,10 @@ class PinProxy:
         # arrives after it — and every probe arrives after it, because nobody
         # is watching at the instant it breaks. See `direct_last`.
         self._egress_direct_last: "float | None" = None
+        # DEGRADED, not abandoned — see `hop_degraded_last`. Separate from the
+        # one above because falling to a LATER hop is still egress through a
+        # configured proxy, so `direct` stays False and that stamp never runs.
+        self._hop_degraded_last: "float | None" = None
         # The last hop fault reported, so a steadily-down hop costs one line
         # instead of one per connection — see _note_hop_unusable.
         self._hop_fault: "tuple[tuple[str, int], str] | None" = None
@@ -7472,6 +7476,17 @@ class PinProxy:
         """
         return self._egress_direct_last
 
+    @property
+    def hop_degraded_last(self) -> "float | None":
+        """When the walk last fell through to a hop that was not preferred.
+
+        The sibling of :attr:`direct_last`, for the fault it does not cover.
+        DIRECT means the chain was abandoned; this means the chain was USED
+        with its first hop skipped — different incidents, different owners,
+        and only one of them was readable after the fact.
+        """
+        return self._hop_degraded_last
+
     def _serve_health(self, conn: socket.socket) -> None:
         import json
 
@@ -7546,7 +7561,8 @@ class PinProxy:
             {"pin_proxy": True, "port": self.port, "chain": chain,
              "can_pin": can_pin, "egress": egress,
              "holder_pid": holder_pid,
-             "direct_last": _iso_utc(self._egress_direct_last)}
+             "direct_last": _iso_utc(self._egress_direct_last),
+             "hop_degraded_last": _iso_utc(self._hop_degraded_last)}
         )
         try:
             conn.sendall(
@@ -8047,7 +8063,7 @@ class PinProxy:
         """One pass over the chain. The socket and its loopback flag, or None
         when no hop was usable this time round."""
         candidates = self._chain_candidates()
-        for chain in candidates:
+        for i, chain in enumerate(candidates):
             # A HOP THAT REFUSES AND A HOP THAT WILL NOT DIAL ARE ONE EVENT.
             # A dial that raises OSError, a CONNECT answered non-200, and a
             # hop that accepts and never answers all mean the same thing:
@@ -8092,7 +8108,12 @@ class PinProxy:
                     pass
                 continue
             raw.settimeout(None)
-            self._note_egress(direct=False, hop=chain.address)
+            # PREFERENCE, not identity. `_chain_candidates` returns the re-read
+            # current chain FIRST and recorded next-hops behind it, so index 0
+            # is the hop that should have carried this. Anything else means the
+            # preferred one did not, which is the degradation nothing recorded.
+            self._note_egress(direct=False, hop=chain.address,
+                              preferred=(i == 0))
             return raw, chain.host in _LOOPBACK
         # NO HOP ANSWERED THIS PASS. The caller decides whether that is final:
         # a hop mid-restart refuses for ~1s and then serves again, so the
@@ -8126,6 +8147,7 @@ class PinProxy:
         direct: bool,
         hop: "tuple[str, int] | None" = None,
         configured: bool = True,
+        preferred: bool = True,
     ) -> None:
         """Log egress path changes; silence means the path is unchanged.
 
@@ -8169,8 +8191,20 @@ class PinProxy:
                 "configured proxy chain"
             )
         else:
+            # DEGRADED IS STILL A FAULT, and until now it was the only one
+            # with no tense a later probe could read. `direct_last` exists
+            # because a chain flaps back within seconds and every probe after
+            # that reads green; a fall-through to a later hop does exactly the
+            # same and was left out only because the sticky record was built
+            # for DIRECT and never generalised. Measured on host-a:
+            # 9901 died at 06:18:09Z, 8118 carried, 9901 was back at 06:18:10Z.
+            # One second, and afterwards nothing on the box said it happened.
+            if not preferred:
+                self._hop_degraded_last = time.time()
             where = f"{hop[0]}:{hop[1]}" if hop else "the proxy chain"
-            _log_lifecycle(f"egress via {where}")
+            _log_lifecycle(f"egress via {where}"
+                           + ("" if preferred else " — DEGRADED, the preferred "
+                              "hop did not carry this"))
 
     def learn_next_hop(self) -> None:
         """Ask the recorded hop what IT chains through, and record the answer.
