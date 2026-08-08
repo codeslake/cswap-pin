@@ -2995,6 +2995,147 @@ class TestHealthEndpoint:
         finally:
             proxy.stop()
 
+    def case_a_hop_that_self_heals_leaves_a_record(self, certdir):
+        """A fall-through to a LATER hop, in a tense a later probe can read.
+
+        `direct_last` covers the chain being abandoned entirely. It does not
+        cover the chain being DEGRADED — the preferred hop dying and the walk
+        carrying on through the one behind it. That is still egress through a
+        configured proxy, so `direct` is False and nothing was stamped.
+
+        MEASURED ON lambda-docker, and this is the whole case:
+
+            06:18:09Z  hop 9901 unusable — accepted but did not tunnel
+            06:18:09Z  hop 9901 unusable — dial failed: ConnectionRefusedError
+            06:18:09Z  egress via 127.0.0.1:8118      <- degraded
+            06:18:10Z  egress via 127.0.0.1:9901      <- healthy again
+
+        ONE SECOND. The peer's per-deploy chain check would have failed inside
+        that window and no per-deploy probe can ever land in it. Afterwards the
+        daemon reads green on every field, so the event is unreadable — which
+        is `direct_last`'s own argument for existing, applied to a different
+        hop. The sticky record was built for DIRECT and never generalised.
+
+        DEGRADED IS DEFINED BY PREFERENCE, not by hop identity:
+        `_chain_candidates()` returns the re-read current chain first and
+        recorded next-hops behind it, so anything that is not candidates[0]
+        means the preferred hop did not carry this request.
+
+        CONTROL below is the healthy hop: it must NOT stamp, or the field
+        would read as a permanent fault on every machine whose chain works.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        # Two ports nothing listens on. The fake dial keys on them, so they
+        # only have to be distinct and unused.
+        _s = socket.socket(); _s.bind(("127.0.0.1", 0)); dead_port = _s.getsockname()[1]; _s.close()
+        _s = socket.socket(); _s.bind(("127.0.0.1", 0)); live_port = _s.getsockname()[1]; _s.close()
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            chain_proxy=("127.0.0.1", 9901),
+        )
+        assert proxy.hop_degraded_last is None, (
+            "a daemon that has never fallen through claimed it had"
+        )
+
+        # CONTROL FIRST: the PREFERRED hop carrying the request must not stamp.
+        # Without this the assertion below passes for a field that stamps on
+        # every successful dial, which is the same as never stamping at all.
+        proxy._note_egress(direct=False, hop=("127.0.0.1", 9901), preferred=True)
+        assert proxy.hop_degraded_last is None, (
+            "the preferred hop carrying traffic was recorded as degradation — "
+            "the field would report a permanent fault on every healthy machine"
+        )
+
+        proxy._note_egress(direct=False, hop=("127.0.0.1", 8118), preferred=False)
+        fell = proxy.hop_degraded_last
+        assert fell is not None, (
+            "the walk fell through to a later hop and nothing recorded it — "
+            "this is the 06:18:09Z event, invisible one second later"
+        )
+
+        # AND IT MUST OUTLIVE THE RECOVERY, for the same reason direct_last
+        # does: the probe that could read it arrives after the flap, always.
+        proxy._note_egress(direct=False, hop=("127.0.0.1", 9901), preferred=True)
+        assert proxy.hop_degraded_last == fell, (
+            "recovering to the preferred hop erased the degradation — every "
+            "probe after the flap sees a green daemon, which is the bug"
+        )
+
+        # AND THE WALK MUST ACTUALLY SAY SO. Everything above drives
+        # `_note_egress` by hand, so it proves the STAMP and nothing about the
+        # caller — `preferred=(i == 0)` could be inverted, or hardcoded True,
+        # and every assertion above still passes while the field never fires
+        # on a real dial. This drives `_walk_chain_once` itself with hop 0
+        # dead and hop 1 answering.
+        seen = {}
+
+        # HELD, NOT CLOSED. Closing the peer before the walk writes its
+        # CONNECT makes sendall raise EPIPE, which `_walk_chain_once` treats
+        # as "hop unusable" — so the fixture reported hop 1 as dead too and
+        # the walk returned None. The guard above caught it; without that
+        # assertion this case would have gone green while proving nothing.
+        peers = []
+
+        def _fake_dial(chain, extra_ca=None):
+            if chain.port == dead_port:
+                raise OSError("refused")
+            ours, theirs = socket.socketpair()
+            theirs.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            peers.append(theirs)
+            return ours
+
+        import cswap_pin.proxy as _mod
+
+        write_upstream_hint(
+            certdir, f"http://127.0.0.1:{dead_port}",
+            next_hop=f"http://127.0.0.1:{live_port}",
+        )
+        walker = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            rediscover_chain=True,
+        )
+        # BOUND TO `walker`, and it has to be spelled out: the first draft
+        # captured `proxy._note_egress` — the OTHER object — so the walk
+        # stamped a proxy nobody was asserting on and `hop_degraded_last`
+        # read None on the one under test. Right call, wrong instance.
+        _real_note = walker._note_egress
+
+        def _spy(**kw):
+            seen.update(kw)
+            return _real_note(**kw)
+
+        walker._note_egress = _spy
+        saved_dial = _mod._dial_chain
+        _mod._dial_chain = _fake_dial
+        try:
+            got = walker._walk_chain_once()
+        finally:
+            _mod._dial_chain = saved_dial
+        assert got is not None, (
+            "the walk found no usable hop — the fixture never reached hop 1, "
+            "so anything it reports about preference is vacuous"
+        )
+        assert seen.get("hop") == ("127.0.0.1", live_port), (
+            f"hop 1 was expected to carry, but the walk reported "
+            f"{seen.get('hop')!r} — wrong subject, the preference claim below "
+            f"would be about a hop that never carried anything"
+        )
+        assert seen.get("preferred") is False, (
+            f"the walk skipped the preferred hop and told _note_egress "
+            f"preferred={seen.get('preferred')!r} — the stamp is wired to a "
+            f"flag the caller never sets correctly, so it can never fire in "
+            f"production"
+        )
+        assert walker.hop_degraded_last is not None, (
+            "a real fall-through through the real walk recorded nothing"
+        )
+
 
 
 class _KeepAliveUpstream:
