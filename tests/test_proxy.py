@@ -1054,6 +1054,75 @@ class TestPinStore:
         save_pin(tmp_path, None, None)
         assert load_pin(tmp_path) is None
 
+    def case_a_clear_and_re_pin_cycle_is_byte_stable(self, tmp_path):
+        """Identical content must produce an identical FILE, not just an
+        equal dict.
+
+        ``save_pin`` pops ``remoteControl`` to clear and re-assigns it to pin.
+        A pop-then-assign moves the key to the END of the dict, and the shared
+        writer serialises in insertion order (``json.dumps(data, indent=2)``,
+        no ``sort_keys``). So a clear+re-pin cycle rewrites the file with the
+        same content in a different order.
+
+        Not cosmetic: this settings file is symlinked into the dotfiles repo,
+        so the reordering shows up as a TRACKED file going dirty with zero
+        value change. Measured 2026-08-10 on host-c — four
+        `cswap pin` invocations dirtied it, three sessions spent two hours
+        unable to attribute the writer, and what git rendered was an
+        unrelated ``ui`` block appearing to jump.
+        """
+        from claude_swap.settings import settings_path
+        from cswap_pin.proxy import save_pin
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"enabled": True},
+            "remoteControl": {"pinnedEmail": "a@example.com",
+                              "pinnedOrganizationUuid": "org"},
+            "ui": {"theme": "dark"},
+        }, indent=2), encoding="utf-8")
+
+        # Normalise first, so the assertion is about the CYCLE and not about
+        # whatever order the hand-written fixture happened to use.
+        save_pin(tmp_path, "a@example.com", "org")
+        before = path.read_bytes()
+
+        save_pin(tmp_path, None, None)              # clear
+        save_pin(tmp_path, "a@example.com", "org")  # re-pin, same content
+        after = path.read_bytes()
+
+        assert json.loads(before) == json.loads(after), "content changed"
+        assert before == after, (
+            "clear+re-pin rewrote the same content in a different order; "
+            "a tracked file goes dirty for nothing"
+        )
+
+    def case_an_unrelated_key_keeps_its_place_across_a_pin(self, tmp_path):
+        """The guard above must hold for keys this code never touches.
+
+        Byte-stability of the pin section alone would still let a neighbouring
+        section move, which is precisely what was observed in the field: the
+        section that visibly jumped was ``ui``, which no pin code reads.
+        """
+        from claude_swap.settings import settings_path
+        from cswap_pin.proxy import save_pin
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_pin(tmp_path, "a@example.com", "org")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["ui"] = {"theme": "dark"}
+        path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+        save_pin(tmp_path, "a@example.com", "org")
+        first = path.read_bytes()
+        save_pin(tmp_path, None, None)
+        save_pin(tmp_path, "a@example.com", "org")
+
+        assert path.read_bytes() == first, "an untouched section moved"
+
     def case_a_malformed_settings_file_is_not_overwritten(self, tmp_path):
         """A read-modify-write must not start from ``{}``.
 
