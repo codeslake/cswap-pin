@@ -2825,7 +2825,26 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
         }
     else:
         raw.pop("remoteControl", None)
-    _settings.atomic_write_json(path, raw)
+    # SORTED, because position must not depend on insertion order. Clearing
+    # POPS this key and pinning re-ASSIGNS it, and a pop-then-assign moves it
+    # to the end of the dict; the shared writer serialises in insertion order
+    # (`json.dumps(data, indent=2)`, no sort_keys). So a clear+re-pin cycle
+    # rewrote identical content in a different order.
+    #
+    # This file is symlinked into the dotfiles repo, so that reordering
+    # dirtied a TRACKED file for nothing. Measured 2026-08-10 on
+    # via-personal-mac: four `cswap pin` runs, three sessions, two hours, and
+    # nobody could name the writer — git rendered it as an unrelated `ui`
+    # block jumping, which no pin code touches.
+    #
+    # Sorted HERE and not in `atomic_write_json`: that is the host's shared
+    # writer used by autoswitch and every future state file beside it, and
+    # the owner ruled changing it out of scope. The pop/append is ours.
+    #
+    # The cost is one reorder the first time this runs on an existing file,
+    # after which every write of the same content is byte-identical. Paying
+    # it once is the point; the alternative re-dirties the file forever.
+    _settings.atomic_write_json(path, dict(sorted(raw.items())))
 
 
 def live_remote_control_sessions() -> list[str]:
