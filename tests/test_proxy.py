@@ -5383,6 +5383,47 @@ class TestDaemonPortStability:
             f"nobody is serving, so it takes the SHORT budget"
         )
 
+    def case_the_module_imports_where_the_signals_do_not_exist(self):
+        """WINDOWS HAS NEITHER SIGUSR1 NOR SIGHUP, and this module is a
+        dependency of a package that supports it.
+
+        `_REPLACE_ME_SIGNAL = signal.SIGUSR1` ran at MODULE level, so importing
+        cswap_pin.proxy raised AttributeError before a single line of ours ran.
+        Not a degraded feature — the package could not be imported at all.
+        Measured on the fork's CI the moment its floor moved onto that release:
+
+            AttributeError: module 'signal' has no attribute 'SIGUSR1'
+            .venv\\Lib\\site-packages\\cswap_pin\\proxy.py:4503
+            1 failed, 276 passed
+
+        Reproduced the way the platform produces it — by taking the attributes
+        away — rather than by asserting that a getattr is spelled somewhere.
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        code = textwrap.dedent(
+            """
+            import signal
+            del signal.SIGUSR1
+            del signal.SIGHUP
+            import cswap_pin.proxy as p
+            print("OK", p._REPLACE_ME_SIGNAL, p._STAND_DOWN_SIGNAL)
+            """
+        )
+        r = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert r.returncode == 0, (
+            f"cswap_pin.proxy cannot be imported without SIGUSR1/SIGHUP — this "
+            f"is every Windows install:\n{r.stderr[-800:]}"
+        )
+        assert r.stdout.split() == ["OK", "None", "None"], (
+            f"imported, but the signal constants are not None on a platform "
+            f"that lacks them: {r.stdout!r}"
+        )
+
     def case_a_current_daemon_retires_a_holder_left_on_old_code(self, tmp_path):
         """NOTHING ELSE EVER RECYCLES A HOLDER, so a deploy half-lands.
 
@@ -5497,6 +5538,60 @@ class TestDaemonPortStability:
             f"asked the holder to stand down {len(sent)} times in 1.5 s at a "
             f"10 ms interval ({sent[:4]}) — a holder that stays alive turns "
             f"this into a signal storm"
+        )
+
+    def case_neither_mechanism_fires_where_its_signal_is_absent(self, tmp_path):
+        """IMPORTING IS NOT ENOUGH — the two paths must also decline.
+
+        With the constants at None, asking and retiring are both meaningless:
+        `os.kill(pid, None)` is a TypeError, and a watchdog that raises takes
+        the code watch down with it. Both must answer "not available" and leave
+        the daemon on the paths that need no signal at all.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        real_kill = os.kill
+        os.kill = lambda pid, sig: sent.append((pid, sig))
+        real_ask = pin_proxy._REPLACE_ME_SIGNAL
+        real_hup = pin_proxy._STAND_DOWN_SIGNAL
+        pin_proxy._REPLACE_ME_SIGNAL = None
+        pin_proxy._STAND_DOWN_SIGNAL = None
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        os.environ[pin_proxy._HOLDER_REPLACE_ENV] = "1"
+        os.environ[pin_proxy._HOLDER_SHA_ENV] = "a-release-we-no-longer-ship"
+        try:
+            retired = pin_proxy._retire_stale_holder(pin_proxy.daemon_fingerprint())
+            holder = pin_proxy._holder_pid()
+            ensure_ca(tmp_path, "api.anthropic.com")
+            h = pin_proxy.PortHolder(tmp_path, "1", "a@b.c")
+            try:
+                h._install_replace_handler()
+                installed = h._replace_channel
+            finally:
+                try:
+                    h._srv.close()
+                except OSError:
+                    pass
+        finally:
+            os.kill = real_kill
+            pin_proxy._REPLACE_ME_SIGNAL = real_ask
+            pin_proxy._STAND_DOWN_SIGNAL = real_hup
+            for k in (pin_proxy._HELD_BY_ENV, pin_proxy._HOLDER_REPLACE_ENV,
+                      pin_proxy._HOLDER_SHA_ENV):
+                os.environ.pop(k, None)
+
+        assert retired is False and sent == [], (
+            f"tried to retire a holder with no signal to do it with "
+            f"(retired={retired} sent={sent})"
+        )
+        assert holder is None, (
+            "offered a holder to ask when the ask cannot be delivered — the "
+            "caller would go on to os.kill(pid, None)"
+        )
+        assert installed is False, (
+            "advertised a replace channel on a platform that has no signal for "
+            "it, so every daemon it starts would try to use one"
         )
 
     def case_a_holder_on_the_same_code_is_left_alone(self, tmp_path):
