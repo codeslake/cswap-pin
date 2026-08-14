@@ -1084,9 +1084,20 @@ class TestPinStore:
             "ui": {"theme": "dark"},
         }, indent=2), encoding="utf-8")
 
-        # Normalise first, so the assertion is about the CYCLE and not about
-        # whatever order the hand-written fixture happened to use.
-        save_pin(tmp_path, "a@example.com", "org")
+        # STEADY STATE, not the first cycle. A clear genuinely REMOVES the key
+        # and a re-pin genuinely re-adds it, so the first cycle after this file
+        # was last written by something else moves it once — a diff that
+        # corresponds to a real removal and a real addition. Asserting
+        # byte-equality across THAT transition is a stronger invariant than the
+        # field defect needs, and 0.1.70 satisfied it only by sorting the whole
+        # file, which reorders sections four other writers own (see
+        # ``case_a_key_added_by_another_writer_is_not_reordered``).
+        #
+        # What the field defect actually was: FOUR `cswap pin` runs each
+        # dirtying the file. That is repetition, and repetition is what this
+        # now pins — cycle to settle, then every later cycle byte-identical.
+        save_pin(tmp_path, None, None)
+        save_pin(tmp_path, "a@example.com", "org")  # settle
         before = path.read_bytes()
 
         save_pin(tmp_path, None, None)              # clear
@@ -1095,8 +1106,8 @@ class TestPinStore:
 
         assert json.loads(before) == json.loads(after), "content changed"
         assert before == after, (
-            "clear+re-pin rewrote the same content in a different order; "
-            "a tracked file goes dirty for nothing"
+            "a repeated clear+re-pin rewrote the same content in a different "
+            "order; a tracked file goes dirty for nothing"
         )
 
     def case_an_unrelated_key_keeps_its_place_across_a_pin(self, tmp_path):
@@ -1116,12 +1127,61 @@ class TestPinStore:
         raw["ui"] = {"theme": "dark"}
         path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
 
+        # Settle first, for the reason spelled out in the byte-stability case
+        # above: the first cycle after another writer touched the file moves
+        # this key once, legitimately. What must never happen is the UNRELATED
+        # section moving — that is true from the very first write, and it is
+        # asserted separately below.
+        save_pin(tmp_path, None, None)
         save_pin(tmp_path, "a@example.com", "org")
         first = path.read_bytes()
+        first_keys = list(json.loads(first).keys())
+
         save_pin(tmp_path, None, None)
         save_pin(tmp_path, "a@example.com", "org")
 
         assert path.read_bytes() == first, "an untouched section moved"
+        assert list(json.loads(path.read_bytes()).keys()) == first_keys
+        assert "ui" in first_keys, "fixture lost the unrelated section"
+
+    def case_a_key_added_by_another_writer_is_not_reordered(self, tmp_path):
+        """A NEW section from a different writer must keep the place it got.
+
+        The two guards above only exercise pin-only cycles, where sorting and
+        position-preservation are indistinguishable. FOUR other functions write
+        this same file — ``save_settings``, ``set_setting``, ``unset_setting``
+        (claude_swap ``settings.py``) and ``_clear_pin_record`` — and each
+        appends a new section at the END, because ``raw[k] = v`` on a fresh key
+        does. Sorting the whole file here then moves that key inward on the next
+        pin: content identical, byte order different, on a file symlinked into
+        the dotfiles repo.
+
+        Measured on that file's real history: 9 commits in a month, and the ONLY
+        key-order change was the normalisation to this function's sorted form.
+        Two sections appeared in the same window (``remoteControl``, ``ui``) and
+        neither disturbed anything, because the other writers preserve order.
+        Sorting is stable in isolation and destabilising among peers.
+        """
+        from claude_swap.settings import settings_path
+        from cswap_pin.proxy import save_pin
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_pin(tmp_path, "a@example.com", "org")
+
+        # another writer appends a section, exactly as `raw[k] = v` does
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["pace"] = {"intervalSeconds": 360}
+        path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        before = list(raw.keys())
+
+        save_pin(tmp_path, "a@example.com", "org")
+        after = list(json.loads(path.read_text(encoding="utf-8")).keys())
+
+        assert after == before, (
+            f"a pin reordered a section it does not own: {before} -> {after}. "
+            "Position must survive a write by any other writer of this file."
+        )
 
     def case_a_malformed_settings_file_is_not_overwritten(self, tmp_path):
         """A read-modify-write must not start from ``{}``.
