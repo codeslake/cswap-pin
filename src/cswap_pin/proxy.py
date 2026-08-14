@@ -2825,26 +2825,32 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
         }
     else:
         raw.pop("remoteControl", None)
-    # SORTED, because position must not depend on insertion order. Clearing
-    # POPS this key and pinning re-ASSIGNS it, and a pop-then-assign moves it
-    # to the end of the dict; the shared writer serialises in insertion order
-    # (`json.dumps(data, indent=2)`, no sort_keys). So a clear+re-pin cycle
-    # rewrote identical content in a different order.
+    # ORDER PRESERVED, never sorted. The original defect was real — clearing
+    # POPS this key and pinning re-ASSIGNS it, and a pop-then-assign appends at
+    # the end, so a clear+re-pin rewrote identical content in a different order
+    # on a file symlinked into the dotfiles repo. 0.1.70 fixed that by sorting
+    # the whole file, and the reasoning held only while this was the sole
+    # writer.
     #
-    # This file is symlinked into the dotfiles repo, so that reordering
-    # dirtied a TRACKED file for nothing. Measured 2026-08-10 on
-    # via-personal-mac: four `cswap pin` runs, three sessions, two hours, and
-    # nobody could name the writer — git rendered it as an unrelated `ui`
-    # block jumping, which no pin code touches.
+    # It is not. FOUR others write this same path, all through the host's
+    # insertion-order writer (`json.dumps(data, indent=2)`, no sort_keys):
     #
-    # Sorted HERE and not in `atomic_write_json`: that is the host's shared
-    # writer used by autoswitch and every future state file beside it, and
-    # the owner ruled changing it out of scope. The pop/append is ours.
+    #   claude_swap settings.py  save_settings / set_setting / unset_setting
+    #   claude_swap pin.py       _clear_pin_record
     #
-    # The cost is one reorder the first time this runs on an existing file,
-    # after which every write of the same content is byte-identical. Paying
-    # it once is the point; the alternative re-dirties the file forever.
-    _settings.atomic_write_json(path, dict(sorted(raw.items())))
+    # Each appends a NEW section at the end, because `raw[k] = v` on a fresh
+    # key does. Sorting here then drags that key inward on the next pin —
+    # an order-only diff on a tracked file, once per new section, forever.
+    # Measured on the file's own history: 9 commits in a month, and the ONLY
+    # key-order change was 0.1.70's normalisation; the two sections added in
+    # that window (`remoteControl`, `ui`) disturbed nothing.
+    #
+    # So the invariant that matters on a SHARED file is agreeing with its other
+    # writers, not being internally tidy. Preserving order costs one move of
+    # this key the first time a clear+re-pin happens after this change — a
+    # content-meaningful diff, since the key really was removed and re-added —
+    # and is byte-stable from then on, under BOTH pin cycles and new sections.
+    _settings.atomic_write_json(path, raw)
 
 
 def live_remote_control_sessions() -> list[str]:
