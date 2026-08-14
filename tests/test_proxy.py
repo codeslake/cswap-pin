@@ -4911,39 +4911,81 @@ class TestDaemonPortStability:
             pin_proxy._spawn_daemon = real_spawn
             os._exit = real_exit
             os.environ.pop(pin_proxy._HELD_BY_ENV, None)
-        # RE-DERIVED 2026-08-14. This case used to assert the OPPOSITE — that a
-        # held daemon must NOT hand over — and the reason was the 10:13 outage
-        # above: the successor could not take the port and served UNHELD.
-        #
-        # That successor BOUND. The handdown path no longer does. Every spawn
-        # carries `_HOLDER_MODULE_ARG`, so the successor lands under a holder,
-        # and that holder ADOPTS the handed fd (`socket.socket(fileno=fd)`,
-        # guarded by `_HANDDOWN_FROM_ENV == getppid()`) instead of binding.
-        # There is no bind left to lose.
-        #
-        # What the old shape cost, every deploy, measured on host-a:
-        #
-        #   01:08:58 code on disk changed — exiting for the holder to replace
-        #   01:09:00 pid=3365277 serving on port 36301
-        #
-        # Two seconds with the port bound and nobody behind it, because
-        # `_supervise` is `self._proc.wait()` then `self._spawn()` — the holder
-        # cannot start the successor until the predecessor is gone. The unheld
-        # path has never had that gap: it spawns FIRST and drains after.
-        #
-        # So the requirement is the owner's, not a preference: whatever the pin
-        # does to itself, Claude keeps running. A handover under a holder must
-        # overlap, and the successor must still be held.
-        assert spawned, (
-            "a held daemon exited without handing its socket over, so the "
-            "port has nobody behind it until the holder notices and spawns "
-            "(measured 2s on host-a, 30s under load on 0.1.44->0.1.46)"
+        assert exited == [pin_proxy._RESTART_ME_CODE], (
+            f"a held daemon did not exit for its holder (exits={exited})"
         )
-        assert exited == [0], (
-            f"a held daemon that HANDED OVER must exit 0 — 'released, do not "
-            f"restart' — or the holder spawns a second successor on top of "
-            f"the one already serving (exits={exited})"
+        assert not spawned, (
+            "a held daemon handed its socket to a successor — the port leaves "
+            "the holder and a stranding is one failed bind away (measured: 76 "
+            "minutes of unwired pin on host-a)"
         )
+
+    def case_a_held_daemon_cannot_hand_the_socket_down_at_all(self, tmp_path):
+        """WHY the case above is the only shape available, not a preference.
+
+        ATTEMPTED AND REVERTED 2026-08-14 (0.1.72). The held branch was changed
+        to spawn a successor first and drain after — the unheld path's gapless
+        ordering — on the reasoning that a handdown successor lands under a
+        holder and ADOPTS the fd, so the 10:13 stranding could not recur.
+
+        It cannot work, and this is the line that decides it:
+
+            release_listener(hand_down=True)
+              if self._inherited and not _orphaned_from_its_holder():
+                  return None        # NOT OURS TO PASS ON
+
+        Under a LIVE holder the listening socket belongs to the holder, not to
+        the daemon, so there is no fd to hand down and the successor falls
+        through to binding a port its predecessor still holds. Measured on
+        host-a, running 0.1.72:
+
+            01:35:35 holder could not take the port (port 36301 is taken —
+                     refusing to hold a different one) — exiting
+            01:35:42 successor did not start — exiting for the holder to replace
+            01:35:44 pid=2150264 serving on port 36301
+
+        Which is the SAME line the source already recorded from 11:57:13. The
+        fallback kept the port up, so nothing broke — but the wasted spawn
+        attempt made the gap LONGER than the shape it replaced: ~9 s against
+        the 2 s measured on the same box an hour earlier.
+
+        The gap is real and worth removing. It cannot be removed from the
+        daemon side: only the party that owns the socket can overlap two
+        servers on it, and that is the HOLDER. `_supervise()` is
+        `self._proc.wait()` then `self._spawn()`, so the fix belongs there —
+        the daemon has to be able to say "replace me" while it is still
+        serving, instead of saying it by exiting.
+        """
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        certdir = tmp_path / "held"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+
+        srv = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        srv.start()
+        try:
+            # A daemon that BOUND its own socket may hand it down.
+            assert srv.release_listener(hand_down=True) is not None, (
+                "an unheld daemon must be able to hand its socket down — "
+                "that is the gapless path this case is contrasting with"
+            )
+        finally:
+            srv.stop(drain=0)
+
+        held = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        held.start()
+        try:
+            # Same object, but the socket came from a live supervisor.
+            held._inherited = True
+            assert held.release_listener(hand_down=True) is None, (
+                "a daemon under a live holder handed the holder's socket "
+                "away; the successor then accepts on a port its supervisor "
+                "still owns, and the holder's next respawn fights it"
+            )
+        finally:
+            held.stop(drain=0)
 
     def case_a_held_exit_does_not_drain_before_letting_the_holder_respawn(
         self, tmp_path
@@ -5008,84 +5050,19 @@ class TestDaemonPortStability:
             os._exit = real_exit
             os.environ.pop(pin_proxy._HELD_BY_ENV, None)
 
-        # RE-DERIVED 2026-08-14, with the premise this case rests on. The short
-        # budget existed because the drain was time NOBODY was serving: the
-        # holder could not spawn until this process was gone. The held path now
-        # hands the socket to a successor first, so the drain overlaps a
-        # serving successor and the full budget costs nothing — the same shape
-        # the unheld path has always had.
-        assert exits == [0], (
-            "premise: the held path hands over and releases (0), it no longer "
-            f"vacates for the holder (exits={exits})"
+        assert exits == [pin_proxy._RESTART_ME_CODE], (
+            "premise: this is the held-exit path"
         )
-        assert budgets, "the handover did not drain at all"
-        assert budgets[0] == pin_proxy._DRAIN_SECONDS, (
-            f"a handover drained {budgets[0]}s on the SHORT budget — that "
-            f"budget is for the fallback, where nobody is serving; here the "
-            f"successor already is, so cutting the drain short only cuts "
-            f"replies"
+        assert budgets, "the exit path did not drain at all"
+        assert budgets[0] <= pin_proxy._HELD_DRAIN_SECONDS, (
+            f"a held exit drained for {budgets[0]}s before the holder could "
+            f"respawn — the port is bound and nobody is behind it for all of it"
         )
         # AND IT IS STILL A DRAIN. Zero would cut a response mid-stream, which
         # is the 34-connections-reset outage `stop(drain=…)` exists to prevent.
         assert budgets[0] > 0, (
-            "a handover stopped draining entirely — in-flight requests are "
+            "a held exit stopped draining entirely — in-flight requests are "
             "still ours to finish, holder or no holder"
-        )
-
-    def case_a_held_handover_whose_successor_fails_still_gives_the_holder_a_turn(
-        self, tmp_path
-    ):
-        """A spawn that fails must fall back, never release.
-
-        THIS IS WHERE THE SHORT BUDGET WENT. The sibling above no longer needs
-        it because a successor is serving during its drain — but if the spawn
-        returns None there is no successor, and every property the old shape
-        protected comes back at once: the drain is unserved time, and an
-        exit 0 would tell the holder "released, do not restart" and leave the
-        port with no daemon behind it at all. That is strictly worse than the
-        gap this change removes, so it is asserted rather than assumed.
-        """
-        import threading
-
-        from cswap_pin import proxy as pin_proxy
-
-        budgets = []
-        exits = []
-
-        class _Srv:
-            def release_listener(self, hand_down=False):
-                return 7 if hand_down else None
-
-            def await_inflight(self, budget):
-                budgets.append(budget)
-
-        real_spawn = pin_proxy._spawn_daemon
-        real_exit = os._exit
-        pin_proxy._spawn_daemon = lambda *a, **k: None       # the spawn fails
-        os._exit = lambda code: exits.append(code) or (_ for _ in ()).throw(
-            SystemExit(code)
-        )
-        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
-        try:
-            pin_proxy._watch_own_code(
-                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
-                lambda *a: None, interval=0.01,
-                _own_fingerprint="never-matches",
-            )
-        except SystemExit:
-            pass
-        finally:
-            pin_proxy._spawn_daemon = real_spawn
-            os._exit = real_exit
-            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
-
-        assert exits == [pin_proxy._RESTART_ME_CODE], (
-            f"a failed handover released the port instead of asking the holder "
-            f"for a successor (exits={exits})"
-        )
-        assert budgets and 0 < budgets[0] <= pin_proxy._HELD_DRAIN_SECONDS, (
-            f"the fallback drained {budgets}s — with no successor this is time "
-            f"nobody is serving, so it takes the SHORT budget"
         )
 
     def case_an_idle_teardown_is_not_restarted(self, tmp_path):

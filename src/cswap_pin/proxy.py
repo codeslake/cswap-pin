@@ -5666,59 +5666,16 @@ def _watch_own_code(
             #            UNHELD on 33349
             #   10:18:15 33349: idle teardown — unwired .claude.json
             if held_by_a_holder():
-                # HAND OVER, DO NOT VACATE. The 10:13 outage above happened
-                # because the successor BOUND its own port and lost the race.
-                # It no longer binds: every spawn carries
-                # `_HOLDER_MODULE_ARG`, so the successor lands under a holder,
-                # and that holder ADOPTS the handed fd instead of binding
-                # (`socket.socket(fileno=fd)`, guarded by
-                # `_HANDDOWN_FROM_ENV == getppid()`). There is nothing left to
-                # race for, and the guard that outlived that race was charging
-                # a service gap on every deploy:
-                #
-                #   01:08:58 code on disk changed — exiting for the holder
-                #   01:09:00 pid=3365277 serving on port 36301
-                #
-                # Two seconds on host-a with the port bound and nobody
-                # behind it — 30 s under load on 0.1.44 -> 0.1.46, because
-                # `_supervise` is `self._proc.wait()` THEN `self._spawn()`:
-                # the holder cannot start the successor until we are gone.
-                # Arrivals queue rather than refuse, then time out, which is
-                # what a client reports as a connection lost mid-response.
-                #
-                # So the held path now does exactly what the unheld one has
-                # always done — successor first, drain after — and the drain
-                # is the FULL budget again, because it is no longer time
-                # nobody is serving.
-                with _spawn_lock(certdir):
-                    if daemon_fingerprint() == own and not orphaned:
-                        continue
-                    handed_fd = server.release_listener(hand_down=True)
-                    successor = _spawn_daemon(
-                        account_num, email, certdir, listen_fd=handed_fd
-                    )
-                    if successor is None:
-                        # FALL BACK TO THE OLD SHAPE, never to nothing. A
-                        # failed spawn with an exit 0 would tell the holder
-                        # "released, do not restart" and leave the port with
-                        # no daemon at all — strictly worse than the gap this
-                        # change removes.
-                        _log_lifecycle(
-                            "successor did not start — exiting for the holder "
-                            "to replace"
-                        )
-                        server.await_inflight(_HELD_DRAIN_SECONDS)
-                        os._exit(_RESTART_ME_CODE)
-                    _log_lifecycle(
-                        "code on disk changed — handed the socket to a "
-                        "successor under the holder"
-                    )
-                    server.await_inflight(_DRAIN_SECONDS)
-                    # EXIT 0, NOT `_RESTART_ME_CODE`. The successor is already
-                    # serving on this socket; 75 would make the holder spawn a
-                    # SECOND one on top of it. 0 is the holder's
-                    # "released — do not restart", which is now the truth.
-                    os._exit(0)
+                _log_lifecycle(
+                    "code on disk changed — exiting for the holder to replace"
+                )
+                # DRAIN FIRST, but on a SHORT budget — see
+                # `_HELD_DRAIN_SECONDS`. The holder cannot start the successor
+                # until we are gone, so unlike the handover path below this
+                # drain is time with nobody serving.
+                server.release_listener()
+                server.await_inflight(_HELD_DRAIN_SECONDS)
+                os._exit(_RESTART_ME_CODE)
             # NAME THE REASON THAT APPLIES. Both paths hand over, but saying
             # "code on disk changed" about an orphaning is a false line in the
             # one log a later reader has — measured, an orphan recovery logged
