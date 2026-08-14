@@ -5383,6 +5383,163 @@ class TestDaemonPortStability:
             f"nobody is serving, so it takes the SHORT budget"
         )
 
+    def case_a_current_daemon_retires_a_holder_left_on_old_code(self, tmp_path):
+        """NOTHING ELSE EVER RECYCLES A HOLDER, so a deploy half-lands.
+
+        A deploy re-execs every daemon and standby within one tick, because
+        they are spawned fresh. The holder is not: it is a long-lived process
+        running whatever it loaded when it started, and every lever misses it —
+        `pin <n>` on an already-pinned account is a no-op (measured: rc=0,
+        success line, same pids, zero new log lines), `--heal` only acts when
+        the port is NOT serving, and SIGTERM is ignored by design. Ages
+        measured when this was written: 7 days on one machine and 3 days on
+        another, both with daemons minutes old.
+
+        That is not cosmetic. A holder from before the replace channel cannot
+        take the ask — the handler does not exist in the code it loaded — so
+        every later deploy on that machine falls back to the slow path, for as
+        long as the process lives. "It will replace itself eventually" means
+        "at the next reboot".
+
+        The watch loop is where it goes because the daemon already knows the
+        answer without asking anything: its holder published its own code sha
+        into this process's environment at exec.
+        """
+        import signal as _signal
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        stop = threading.Event()
+        real_kill = os.kill
+        # STOP ON THE SIGNAL, so this case ends on the event it is about rather
+        # than on a timeout. The watch loop waits a tick after asking — it must
+        # not act again on the same pass, because reparenting has not happened
+        # yet — so without this the case would spin.
+        os.kill = lambda pid, sig: (sent.append((pid, sig)), stop.set())
+        # AND A DEADLINE THAT DOES NOT DEPEND ON THE SUBJECT. The line above
+        # only fires when the code under test does the right thing, so removing
+        # the guard left this case spinning until the runner's timeout —
+        # measured, it hung a mutation check. A timeout is the suite failing to
+        # answer, not a mutation caught, so the case has to end on its own and
+        # let the ASSERTION do the killing.
+        threading.Timer(1.5, stop.set).start()
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        os.environ[pin_proxy._HOLDER_SHA_ENV] = "a-release-we-no-longer-ship"
+        try:
+            # OUR OWN CODE IS CURRENT — that is the whole point. The daemon
+            # reaches this only on the branch where it would otherwise have
+            # gone back to sleep.
+            pin_proxy._watch_own_code(
+                None, "1", "a@b.c", tmp_path, stop,
+                lambda *a: None, interval=0.01,
+                _own_fingerprint=pin_proxy.daemon_fingerprint(),
+            )
+        except SystemExit:
+            pass
+        finally:
+            os.kill = real_kill
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            os.environ.pop(pin_proxy._HOLDER_SHA_ENV, None)
+
+        assert sent and sent[0] == (os.getppid(), _signal.SIGHUP), (
+            f"a daemon running current code left its stale holder in place "
+            f"(signals={sent}) — nothing else on the machine will ever retire "
+            f"it, so every later deploy stays on the slow path"
+        )
+
+    def case_the_stand_down_is_asked_once_not_every_tick(self, tmp_path):
+        """A HOLDER THAT DOES NOT GO IS NOT A HOLDER TO ASK AGAIN.
+
+        SIGHUP is deliberately version-blind: an old holder takes the default
+        and dies, a new one treats it as "give the address away". The second
+        one can still be ALIVE afterwards, and then the mismatch that triggered
+        us is still true on the next tick — so an unguarded ask becomes a
+        signal every interval, forever. This file already records where that
+        ends: 5 ticks, 5 kills, no convergence, each one costing live sessions
+        their in-flight requests.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        stop = threading.Event()
+        real_kill = os.kill
+
+        def _count(pid, sig):
+            sent.append((pid, sig))
+            if len(sent) >= 2:      # a second ask is the defect — stop and fail
+                stop.set()
+
+        os.kill = _count
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        os.environ[pin_proxy._HOLDER_SHA_ENV] = "a-release-we-no-longer-ship"
+        # The holder never goes away in this case: `held_by_a_holder` keeps
+        # answering yes, which is exactly the situation an unguarded ask repeats
+        # in. Bounded by the watchdog thread below rather than by the signal.
+        threading.Timer(1.5, stop.set).start()
+        try:
+            pin_proxy._watch_own_code(
+                None, "1", "a@b.c", tmp_path, stop,
+                lambda *a: None, interval=0.01,
+                _own_fingerprint=pin_proxy.daemon_fingerprint(),
+            )
+        except SystemExit:
+            pass
+        finally:
+            os.kill = real_kill
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            os.environ.pop(pin_proxy._HOLDER_SHA_ENV, None)
+
+        assert len(sent) == 1, (
+            f"asked the holder to stand down {len(sent)} times in 1.5 s at a "
+            f"10 ms interval ({sent[:4]}) — a holder that stays alive turns "
+            f"this into a signal storm"
+        )
+
+    def case_a_holder_on_the_same_code_is_left_alone(self, tmp_path):
+        """The retirement is for a MISMATCH, never for having a holder.
+
+        Signalling a healthy holder every watch tick would recycle the port
+        forever — the failure mode this file already records for the
+        unpinnable-daemon recycle: 5 ticks, 5 kills, no convergence, each one
+        costing live sessions their in-flight requests.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        stop = threading.Event()
+        real_kill = os.kill
+        # NOT `stop.set()` BEFORE THE CALL — that was the first version, and a
+        # loop that never runs a pass reports "no signal sent" for the wrong
+        # reason: the mutation that deletes the mismatch guard survives it,
+        # because nothing ever reached the guard. Let it run, and end on a clock
+        # the subject cannot influence.
+        os.kill = lambda pid, sig: (sent.append((pid, sig)), stop.set())
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        os.environ[pin_proxy._HOLDER_SHA_ENV] = pin_proxy.daemon_fingerprint()
+        threading.Timer(1.0, stop.set).start()
+        try:
+            pin_proxy._watch_own_code(
+                None, "1", "a@b.c", tmp_path, stop,
+                lambda *a: None, interval=0.01,
+                _own_fingerprint=pin_proxy.daemon_fingerprint(),
+            )
+        except SystemExit:
+            pass
+        finally:
+            os.kill = real_kill
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            os.environ.pop(pin_proxy._HOLDER_SHA_ENV, None)
+
+        assert sent == [], (
+            f"signalled a holder that is running exactly our code: {sent}"
+        )
+
     def case_the_handler_is_installed_before_the_first_spawn(self, tmp_path):
         """ORDER, because the advertisement is written ONCE per child.
 

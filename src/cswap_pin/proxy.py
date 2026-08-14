@@ -5668,6 +5668,13 @@ def _watch_own_code(
     # for a deploy to land in between and blind this watchdog permanently.
     own = _own_fingerprint if _own_fingerprint is not None else _OWN_FINGERPRINT
     attempts = 0
+    # ASKED ONCE, NOT EVERY TICK. `_retire_stale_holder` sends SIGHUP, and a
+    # holder new enough to HANDLE it gives the address away and stays alive — so
+    # the mismatch that triggered the ask is still true on the next pass. Left
+    # unguarded that is a signal every interval for the life of the daemon, the
+    # shape this file already records for the unpinnable recycle: 5 ticks, 5
+    # kills, no convergence, and live sessions paying for each one.
+    stand_down_asked = False
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
     while not done.wait(interval):
@@ -5732,6 +5739,32 @@ def _watch_own_code(
             # lose and must not recycle itself forever.
             orphaned = _orphaned_from_its_holder()
             if daemon_fingerprint() == own and not orphaned:
+                # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
+                # where a machine sat after every deploy: the daemon re-execs
+                # and matches, so the loop went back to sleep, and the holder
+                # above it kept running the previous release forever. Nothing
+                # else looks — see `_retire_stale_holder` for why no other lever
+                # reaches it.
+                #
+                # ASK, THEN WAIT A TICK — do not fall through. Reparenting is
+                # not instantaneous and `_HELD_BY_ENV` still names the pid we
+                # just signalled, so on THIS pass `held_by_a_holder()` is still
+                # true and the branch below would put the replace-ask to a
+                # holder that is on its way out — or, failing that, exit 75 to
+                # be restarted by something that no longer exists.
+                #
+                # The next tick sees the reparenting, `_orphaned_from_its_holder`
+                # turns true, and the orphan branch below hands the socket down
+                # to a successor that lands under a fresh holder. That is the
+                # one path here that keeps the port bound throughout, and it is
+                # already the tested one.
+                if stand_down_asked or not _retire_stale_holder(own):
+                    continue
+                stand_down_asked = True
+                _log_lifecycle(
+                    "the holder above this daemon is running code we no longer "
+                    "ship — asked it to stand down so a current one replaces it"
+                )
                 continue
             if orphaned:
                 _log_lifecycle(
@@ -6403,6 +6436,48 @@ def _holder_pid(env=None) -> "int | None":
         return int(raw)
     except ValueError:
         return None
+
+
+def _retire_stale_holder(own_fingerprint: str, env=None) -> bool:
+    """Send the holder above us away when it is running code we no longer ship.
+
+    THE ONE THING A DEPLOY CANNOT REACH. Daemons and standbys are spawned, so
+    they exec the new file within a tick of an install. A holder is not spawned
+    again — it keeps running whatever it loaded, and every lever misses it:
+    `pin <n>` on an already-pinned account is a no-op (measured: rc=0, a success
+    line, identical pids, zero new log lines), `heal` only acts when the port is
+    NOT serving, and SIGTERM is ignored by design. Measured ages at the time
+    this was written: 7 days and 3 days, on machines whose daemons were minutes
+    old. So the honest answer to "when does it recycle itself" was "at the next
+    reboot".
+
+    SIGHUP, and the choice is deliberately VERSION-BLIND — which is the whole
+    lesson of `_HOLDER_REPLACE_ENV` applied to the other direction. A holder new
+    enough to handle it treats HUP as "give the address away"; one too old has
+    no handler and takes the default, which terminates it. BOTH outcomes are the
+    one this wants, because the caller does not release the socket: it stays
+    bound in this daemon either way. Contrast the replace-ask, where the two
+    dispositions differ catastrophically and the capability therefore has to be
+    advertised first.
+
+    That the daemon survives losing its holder is not an assumption. This file
+    already records the experiment, isolated port 60759: after SIGHUP to the
+    holder, the daemon was reparented to init, HOLDERS REMAINING 0, PORT ALIVE
+    True.
+    """
+    env = os.environ if env is None else env
+    published = env.get(_HOLDER_SHA_ENV)
+    # Nothing published means no holder told us anything — a bare daemon, a
+    # test, or a holder too old to publish. Not a mismatch, so not our business.
+    if not published or published == own_fingerprint:
+        return False
+    if not held_by_a_holder(env=env):
+        return False  # the variable reached us through some other descendant
+    try:
+        os.kill(os.getppid(), signal.SIGHUP)
+    except OSError:
+        return False
+    return True
 
 
 def _orphaned_from_its_holder(env=None) -> bool:
