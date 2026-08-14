@@ -5452,13 +5452,13 @@ class TestDaemonPortStability:
     def case_the_stand_down_is_asked_once_not_every_tick(self, tmp_path):
         """A HOLDER THAT DOES NOT GO IS NOT A HOLDER TO ASK AGAIN.
 
-        SIGHUP is deliberately version-blind: an old holder takes the default
-        and dies, a new one treats it as "give the address away". The second
-        one can still be ALIVE afterwards, and then the mismatch that triggered
-        us is still true on the next tick — so an unguarded ask becomes a
-        signal every interval, forever. This file already records where that
-        ends: 5 ticks, 5 kills, no convergence, each one costing live sessions
-        their in-flight requests.
+        A holder is expected to die on the HUP — no version installs a handler
+        for it — but nothing here can insist. The signal may not land, or the
+        process may take a moment, and for as long as it is there the mismatch
+        that triggered the ask is still true. Unguarded that is a signal every
+        interval, forever. This file already records where that ends: 5 ticks,
+        5 kills, no convergence, each one costing live sessions their in-flight
+        requests.
         """
         import threading
 

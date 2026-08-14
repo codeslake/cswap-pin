@@ -5668,12 +5668,14 @@ def _watch_own_code(
     # for a deploy to land in between and blind this watchdog permanently.
     own = _own_fingerprint if _own_fingerprint is not None else _OWN_FINGERPRINT
     attempts = 0
-    # ASKED ONCE, NOT EVERY TICK. `_retire_stale_holder` sends SIGHUP, and a
-    # holder new enough to HANDLE it gives the address away and stays alive — so
-    # the mismatch that triggered the ask is still true on the next pass. Left
-    # unguarded that is a signal every interval for the life of the daemon, the
-    # shape this file already records for the unpinnable recycle: 5 ticks, 5
-    # kills, no convergence, and live sessions paying for each one.
+    # ASKED ONCE, NOT EVERY TICK. A holder is expected to die on the HUP, but
+    # nothing here can insist on it: the signal may not land, the process may
+    # take a moment to go, and the mismatch that triggered the ask stays true
+    # for as long as it does. Unguarded, that is a signal every interval for the
+    # life of the daemon — the shape this file already records for the
+    # unpinnable recycle: 5 ticks, 5 kills, no convergence, live sessions paying
+    # for each one. One shot leaves the machine exactly as it was if it fails,
+    # which is the safer of the two ways to be wrong.
     stand_down_asked = False
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
@@ -6451,14 +6453,23 @@ def _retire_stale_holder(own_fingerprint: str, env=None) -> bool:
     old. So the honest answer to "when does it recycle itself" was "at the next
     reboot".
 
-    SIGHUP, and the choice is deliberately VERSION-BLIND — which is the whole
-    lesson of `_HOLDER_REPLACE_ENV` applied to the other direction. A holder new
-    enough to handle it treats HUP as "give the address away"; one too old has
-    no handler and takes the default, which terminates it. BOTH outcomes are the
-    one this wants, because the caller does not release the socket: it stays
-    bound in this daemon either way. Contrast the replace-ask, where the two
-    dispositions differ catastrophically and the capability therefore has to be
-    advertised first.
+    SIGHUP, and the choice is deliberately VERSION-BLIND — the lesson of
+    `_HOLDER_REPLACE_ENV` applied to the other direction. NO holder of any
+    version handles it: the `_release` handler belongs to a STANDBY, and the
+    promotion path hands the signals back (`SIGHUP -> SIG_DFL`) precisely
+    because "a handler installed once outlives the reason for it". So a holder
+    always takes the default, which terminates it — the outcome this wants, in
+    every release, with nothing to advertise.
+
+    Measured before automating it, by hand on two machines whose holders were
+    7 and 3 days old: SIGHUP, and each was replaced by a fresh triad at a cost
+    of 0 failed requests out of 60.
+
+    That safety is NOT "the versions happen to agree". It is that this caller
+    does not release the socket, so the descriptor stays bound in this daemon
+    whatever the holder does. Contrast the replace-ask, where handled and
+    unhandled differ catastrophically — THAT is what makes a capability need
+    advertising, not the mere possibility of a version gap.
 
     That the daemon survives losing its holder is not an assumption. This file
     already records the experiment, isolated port 60759: after SIGHUP to the
