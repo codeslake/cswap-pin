@@ -4501,6 +4501,10 @@ _RESTART_ME_CODE = 75  # EX_TEMPFAIL, and nothing else in this file uses it
 # cannot start until the predecessor is gone. This signal separates the ASK
 # from the LEAVING, so the two can overlap on one socket.
 _REPLACE_ME_SIGNAL = signal.SIGUSR1
+# How long to let the ask land before reading whether the holder survived it.
+# An unhandled USR1 is fatal on delivery, so this only has to outlast the
+# kernel's trip to the other process, not any work the handler does.
+_ASK_SETTLE_SECONDS = 0.25
 # The ladder a daemon that keeps dying costs: one attempt every ~5s rather than
 # four a second, so a persistently broken build does not spin the box while the
 # port it holds stays answering.
@@ -4567,6 +4571,9 @@ class PortHolder:
         # (nothing left to serve). Both are exit 0 from the daemon's side, and
         # acting on the wrong one closes the port under a live successor.
         self._replacing = False
+        # Whether `_install_replace_handler` succeeded. Only then may `_spawn`
+        # tell a child this holder can be asked — see `_HOLDER_REPLACE_ENV`.
+        self._replace_channel = False
 
         # ADOPT A HANDED-DOWN SOCKET RATHER THAN BINDING. A predecessor that is
         # recycling passes its still-LISTENING socket down, and it has not let
@@ -4640,17 +4647,18 @@ class PortHolder:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        # BEFORE THE FIRST SPAWN, not merely before the supervisor thread. A
+        # child learns whether this holder can be asked from its ENVIRONMENT,
+        # written once at spawn time, so a handler installed afterwards is one
+        # no already-running daemon can ever be told about. Ordered the other
+        # way the first daemon falls back to the old gap for as long as it
+        # lives, and nothing reports it.
+        self._install_replace_handler()
         # The FIRST spawn happens here, not in the thread: `start()` returning
         # has to mean a daemon exists, or a caller that immediately reads
         # `daemon_pid` (or asks the port for a health probe) races the
         # supervisor's first loop iteration.
         self._spawn()
-        # BEFORE the supervisor thread, so a daemon that finds new code on its
-        # very first watch tick has somewhere to send the ask. Installing it
-        # after would leave a window where SIGUSR1 kills the holder outright —
-        # the default disposition for USR1 is terminate, and that takes the
-        # port with it.
-        self._install_replace_handler()
         # AFTER the daemon, so a machine that cannot start one at all does not
         # also leave a standby behind waiting for a holder that never worked.
         self._spawn_standby()
@@ -4699,6 +4707,11 @@ class PortHolder:
         # TERM here a recycle rather than a release. A predecessor handing over
         # is itself going away, so its child must exit 0 as it always has.
         env[_HELD_BY_ENV] = str(os.getpid())
+        # ONLY IF WE CAN ACTUALLY HEAR IT — see `_HOLDER_REPLACE_ENV`. Absent,
+        # the child asks by exiting 75 as it always has: a longer gap, never a
+        # dead holder.
+        if self._replace_channel:
+            env[_HOLDER_REPLACE_ENV] = "1"
         # WHAT THIS HOLDER IS RUNNING — see `_HOLDER_SHA_ENV`. The child never
         # reads it; a checker does, to answer the one question the daemon's own
         # fingerprint cannot.
@@ -4845,6 +4858,7 @@ class PortHolder:
         """
         try:
             signal.signal(_REPLACE_ME_SIGNAL, self._on_replace_request)
+            self._replace_channel = True
         except (ValueError, OSError):
             # Not the main thread, or no such signal. The daemon's exit-75 path
             # still works, so this degrades to the old gap rather than to
@@ -5754,6 +5768,24 @@ def _watch_own_code(
                     except OSError:
                         holder = None
                 if holder:
+                    # THE ASK IS NOT THE OUTCOME. `os.kill` returning says only
+                    # that the pid existed when we called it — nothing about a
+                    # successor. So verify the holder SURVIVED being asked: an
+                    # advertisement is written once at spawn and can be stale by
+                    # now, but whether that process is still there cannot be.
+                    #
+                    # A holder that dies here has started nobody, and releasing
+                    # into that leaves the socket with no listener at all — the
+                    # measured 30 s outage. Serving stale code beats serving
+                    # nothing, so we keep the port and say so.
+                    time.sleep(_ASK_SETTLE_SECONDS)
+                    if not _pid_alive(holder):
+                        _log_lifecycle(
+                            "asked the holder to replace us and it did not "
+                            "survive the ask — keeping the port rather than "
+                            "releasing it to nobody"
+                        )
+                        return
                     _log_lifecycle(
                         "code on disk changed — asked the holder to replace "
                         "us while we keep serving"
@@ -6060,6 +6092,20 @@ _HANDDOWN_FROM_ENV = "CSWAP_PIN_LISTEN_FROM"
 # way out" — the two look identical in the variables above, and they mean
 # opposite things when this daemon is TERM'd.
 _HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
+# Set by a holder that has ACTUALLY INSTALLED the replace handler, and only
+# then. A CAPABILITY IS THE RECEIVER'S TO CLAIM, never the sender's to assume:
+# `_REPLACE_ME_SIGNAL` is SIGUSR1, whose default disposition is TERMINATE, so
+# asking a holder that cannot hear it does not degrade — it kills the holder
+# and takes the listening socket with it.
+#
+# And the skew is not an edge case, it is THE case. `_watch_own_code` fires
+# exactly when the code on disk is newer than the code somebody loaded, which
+# is precisely when the holder above us is a long-lived process still running
+# the PREVIOUS release — with no handler, forever. Measured on lambda-docker
+# upgrading to 0.1.74: the ask killed the holder, port 36301 went REFUSED for
+# 30 s, and only a standby noticing the free port restored service. The gap
+# this whole mechanism exists to remove is 2 s.
+_HOLDER_REPLACE_ENV = "CSWAP_PIN_HOLDER_TAKES_REPLACE"
 # The bytes the HOLDER loaded, published into its child's environment.
 #
 # A DAEMON'S FRESHNESS SAYS NOTHING ABOUT THE HOLDER ABOVE IT. The holder execs
@@ -6343,6 +6389,13 @@ def _holder_pid(env=None) -> "int | None":
     ask to replace us.
     """
     env = os.environ if env is None else env
+    # THE HOLDER HAS TO CLAIM IT. Identity is not capability: our parent may be
+    # a holder from the PREVIOUS release, which is the normal case here since
+    # this path only runs when the disk is newer than somebody's memory. That
+    # holder has no handler, and `_REPLACE_ME_SIGNAL` unhandled is fatal — so
+    # an unclaimed holder is not one to ask, it is one to leave alone.
+    if env.get(_HOLDER_REPLACE_ENV) != "1":
+        return None
     raw = env.get(_HELD_BY_ENV)
     if not raw or raw != str(os.getppid()):
         return None

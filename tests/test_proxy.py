@@ -3234,6 +3234,34 @@ class TestDaemonPortStability:
             f"{pin_proxy._HOLDER_SHA_ENV}={env.get(pin_proxy._HOLDER_SHA_ENV)!r} "
             f"but this holder loaded {pin_proxy._OWN_FINGERPRINT!r}"
         )
+        # THE ADVERTISEMENT IS THE HANDLER'S, NOT THE CLASS'S. Nothing above
+        # installed one, so this holder cannot take the ask — and saying it can
+        # is what kills it, since SIGUSR1's default disposition is terminate.
+        assert pin_proxy._HOLDER_REPLACE_ENV not in env, (
+            f"a holder with no SIGUSR1 handler advertised the replace channel: "
+            f"{pin_proxy._HOLDER_REPLACE_ENV}="
+            f"{env.get(pin_proxy._HOLDER_REPLACE_ENV)!r}"
+        )
+        # THE REAL INSTALL, AND THE REAL UNINSTALL. Calling it puts a live
+        # SIGUSR1 handler on the PYTEST process, and leaving it there made
+        # every later case in this class run under a holder they never made —
+        # measured: the whole class went from 15.77 s green to SIGKILL.
+        import signal
+
+        prev_usr1 = signal.getsignal(pin_proxy._REPLACE_ME_SIGNAL)
+        holder._install_replace_handler()
+        try:
+            holder._spawn()
+        finally:
+            signal.signal(pin_proxy._REPLACE_ME_SIGNAL, prev_usr1)
+            try:
+                holder._srv.close()
+            except OSError:
+                pass
+        assert (seen.get("env") or {}).get(pin_proxy._HOLDER_REPLACE_ENV) == "1", (
+            "a holder that DID install the handler stayed silent about it, so "
+            "every daemon it starts falls back to the old gap forever"
+        )
 
     def case_the_fingerprint_covers_every_file_the_daemon_runs(self):
         """A file outside the hash ships SILENTLY, and nothing says so.
@@ -4908,6 +4936,10 @@ class TestDaemonPortStability:
             SystemExit(code)
         )
         os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        # A HOLDER THAT CLAIMS THE CHANNEL — see `_HOLDER_REPLACE_ENV`. Absent,
+        # the daemon correctly refuses to signal and this case's subject never
+        # runs.
+        os.environ[pin_proxy._HOLDER_REPLACE_ENV] = "1"
         try:
             pin_proxy._watch_own_code(
                 _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
@@ -4921,6 +4953,7 @@ class TestDaemonPortStability:
             os._exit = real_exit
             os.kill = real_kill
             os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            os.environ.pop(pin_proxy._HOLDER_REPLACE_ENV, None)
         # STILL NOT A HANDDOWN — that part of this case is unchanged and is
         # what the sibling above proves cannot work. What changed is that the
         # daemon no longer has to DIE to ask: it signals the holder first and
@@ -5242,6 +5275,9 @@ class TestDaemonPortStability:
             SystemExit(code)
         )
         os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        # A HOLDER THAT CLAIMS THE CHANNEL. Without this the daemon refuses to
+        # signal at all and the overlapping path below is never reached.
+        os.environ[pin_proxy._HOLDER_REPLACE_ENV] = "1"
 
         # THE ASK SUCCEEDS HERE, so this drives the overlapping path.
         # `_HELD_BY_ENV` is this process's real parent, so an unstubbed
@@ -5260,6 +5296,7 @@ class TestDaemonPortStability:
             os._exit = real_exit
             os.kill = real_kill
             os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            os.environ.pop(pin_proxy._HOLDER_REPLACE_ENV, None)
 
         # RE-DERIVED: the short budget existed because the drain was time
         # NOBODY was serving — the holder could not spawn until this process
@@ -5320,6 +5357,106 @@ class TestDaemonPortStability:
 
         os.kill = _refuse
         os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        # CLAIMED, so the refusal below is what stops the ask — not the
+        # capability gate. Without this the case would pass on the wrong branch.
+        os.environ[pin_proxy._HOLDER_REPLACE_ENV] = "1"
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                lambda *a: None, interval=0.01,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+        finally:
+            os._exit = real_exit
+            os.kill = real_kill
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            os.environ.pop(pin_proxy._HOLDER_REPLACE_ENV, None)
+
+        assert exits == [pin_proxy._RESTART_ME_CODE], (
+            f"an undeliverable ask released the port instead of asking the "
+            f"supervisor for a successor the slow way (exits={exits})"
+        )
+        assert budgets and 0 < budgets[0] <= pin_proxy._HELD_DRAIN_SECONDS, (
+            f"the fallback drained {budgets}s — with no successor this is time "
+            f"nobody is serving, so it takes the SHORT budget"
+        )
+
+    def case_the_handler_is_installed_before_the_first_spawn(self, tmp_path):
+        """ORDER, because the advertisement is written ONCE per child.
+
+        A child learns whether its holder can be asked from the environment it
+        was exec'd with. Install the handler after the first spawn and that
+        first daemon carries no advertisement for as long as it lives — it
+        falls back to the old gap, silently, on a holder that could have taken
+        the ask all along. Nothing in the logs distinguishes that from a holder
+        that genuinely cannot.
+        """
+        from cswap_pin.proxy import PortHolder
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        # `_supervise` returns on its first check, so the thread `start()` puts
+        # up cannot reach `self._proc` (never set, since `_spawn` is recorded).
+        holder._stop = True
+        order = []
+        holder._spawn = lambda: order.append("spawn")
+        holder._install_replace_handler = lambda: order.append("handler")
+        holder._spawn_standby = lambda: order.append("standby")
+        try:
+            holder.start()
+        finally:
+            try:
+                holder._srv.close()
+            except OSError:
+                pass
+
+        assert order[:2] == ["handler", "spawn"], (
+            f"start() ran {order} — the first daemon was spawned before the "
+            f"holder could tell it the replace channel exists"
+        )
+
+    def case_a_holder_that_does_not_advertise_is_never_signalled(self, tmp_path):
+        """A SIGNAL IS A CLAIM ABOUT ANOTHER PROCESS'S CODE VERSION.
+
+        Measured on lambda-docker, 0.1.74: the daemon asked, and port 36301
+        went REFUSED for 30 s — worse than the 2 s the ask exists to remove.
+        The holder was a process that predated the upgrade, so it ran code with
+        no SIGUSR1 handler, and USR1's default disposition is TERMINATE. The
+        ask killed the holder and took the listening socket with it; only a
+        standby noticing the free port brought the service back.
+
+        That skew is not an edge case, it is THE case: this path fires exactly
+        when the code on disk is newer than the code the holder loaded. So the
+        channel is advertised by the holder that installed the handler, never
+        assumed by the daemon — and an unadvertised holder is not signalled at
+        all, rather than signalled and hoped for.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        exits = []
+        kills = []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                return 7 if hand_down else None
+
+            def await_inflight(self, budget):
+                pass
+
+        real_exit = os._exit
+        real_kill = os.kill
+        os._exit = lambda code: exits.append(code) or (_ for _ in ()).throw(
+            SystemExit(code)
+        )
+        os.kill = lambda pid, sig: kills.append((pid, sig))
+        # A holder that IS our parent — the identity guard passes. What it does
+        # not have is the handler, and nothing in this environment says it does.
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        os.environ.pop(pin_proxy._HOLDER_REPLACE_ENV, None)
         try:
             pin_proxy._watch_own_code(
                 _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
@@ -5333,13 +5470,74 @@ class TestDaemonPortStability:
             os.kill = real_kill
             os.environ.pop(pin_proxy._HELD_BY_ENV, None)
 
-        assert exits == [pin_proxy._RESTART_ME_CODE], (
-            f"an undeliverable ask released the port instead of asking the "
-            f"supervisor for a successor the slow way (exits={exits})"
+        assert kills == [], (
+            f"signalled a holder that never claimed it could take it: {kills}. "
+            f"SIGUSR1 unhandled is fatal, so this is the port going down."
         )
-        assert budgets and 0 < budgets[0] <= pin_proxy._HELD_DRAIN_SECONDS, (
-            f"the fallback drained {budgets}s — with no successor this is time "
-            f"nobody is serving, so it takes the SHORT budget"
+        assert exits == [pin_proxy._RESTART_ME_CODE], (
+            f"expected the old exit-75 replace, got exits={exits}"
+        )
+
+    def case_an_ask_that_kills_the_holder_keeps_the_port(self, tmp_path):
+        """THE ASK IS NOT THE OUTCOME — the second half of the same lesson.
+
+        The advertisement above stops us asking a holder that cannot hear. It
+        cannot stop an advertisement that has gone STALE: it is written once,
+        at spawn, and says nothing about the holder as it is now. What cannot
+        be stale is whether that process is still alive after we asked it.
+
+        A holder that does not survive the ask has started no successor, so
+        releasing is releasing to nobody — the shape that took 36301 down for
+        30 s. Keeping the port on stale code is the worse-looking branch and
+        the better one.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        exits = []
+        released = []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                released.append(hand_down)
+                return 7 if hand_down else None
+
+            def await_inflight(self, budget):
+                pass
+
+        real_exit = os._exit
+        real_kill = os.kill
+        os._exit = lambda code: exits.append(code) or (_ for _ in ()).throw(
+            SystemExit(code)
+        )
+        os.kill = lambda pid, sig: None
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+        os.environ[pin_proxy._HOLDER_REPLACE_ENV] = "1"
+        real_alive = pin_proxy._pid_alive
+        pin_proxy._pid_alive = lambda pid: False
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                lambda *a: None, interval=0.01,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+        finally:
+            os._exit = real_exit
+            os.kill = real_kill
+            pin_proxy._pid_alive = real_alive
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+            os.environ.pop(pin_proxy._HOLDER_REPLACE_ENV, None)
+
+        assert released == [], (
+            f"released the listener after the holder died: {released}. Nobody "
+            f"is behind this socket now."
+        )
+        assert exits == [], (
+            f"exited after the holder died (exits={exits}) — with no holder "
+            f"there is nothing to restart us, so the port stays empty"
         )
 
     def case_an_idle_teardown_is_not_restarted(self, tmp_path):
