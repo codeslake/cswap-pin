@@ -4500,7 +4500,22 @@ _RESTART_ME_CODE = 75  # EX_TEMPFAIL, and nothing else in this file uses it
 # dying, which is why a redeploy under a holder costs a gap: the successor
 # cannot start until the predecessor is gone. This signal separates the ASK
 # from the LEAVING, so the two can overlap on one socket.
-_REPLACE_ME_SIGNAL = signal.SIGUSR1
+#
+# `getattr`, NOT `signal.SIGUSR1`. THIS LINE RAN AT IMPORT AND WINDOWS HAS NO
+# SIGUSR1, so every Windows install of this package failed to import — not a
+# degraded feature, no import at all. It reached CI the moment claude-swap's
+# pin extra floored onto the release carrying it:
+#
+#     AttributeError: module 'signal' has no attribute 'SIGUSR1'
+#     .venv\Lib\site-packages\cswap_pin\proxy.py:4503
+#
+# None means "this platform cannot do it", and every user below reads it as
+# that rather than assuming a signal exists. The whole holder/daemon protocol
+# is POSIX; what must survive a POSIX-less platform is the IMPORT, because
+# `heal`, `load_pin` and `apply_pin` are what the host actually calls there.
+_REPLACE_ME_SIGNAL = getattr(signal, "SIGUSR1", None)
+# The same, for the retirement path. SIGHUP is equally absent on Windows.
+_STAND_DOWN_SIGNAL = getattr(signal, "SIGHUP", None)
 # How long to let the ask land before reading whether the holder survived it.
 # An unhandled USR1 is fatal on delivery, so this only has to outlast the
 # kernel's trip to the other process, not any work the handler does.
@@ -4856,6 +4871,8 @@ class PortHolder:
         blocked in `Popen.wait()` — verified that the handler still runs and
         can spawn there, with the predecessor staying alive.
         """
+        if _REPLACE_ME_SIGNAL is None:
+            return  # no such signal here — see the constant
         try:
             signal.signal(_REPLACE_ME_SIGNAL, self._on_replace_request)
             self._replace_channel = True
@@ -6212,6 +6229,8 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
     """
     import subprocess
 
+    if _STAND_DOWN_SIGNAL is None:
+        return 0  # no SIGHUP here, so nothing to retire with — see the constant
     target = str(Path(certdir).resolve())
     retired = 0
     try:
@@ -6239,7 +6258,14 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
         if pid == keep_pid or pid == os.getpid():
             continue
         try:
-            os.kill(pid, signal.SIGHUP)
+            # THE SAME CONSTANT, not a second `signal.SIGHUP`. This call is
+            # older than the one in `_retire_stale_holder` and carried the same
+            # latent AttributeError on Windows; one guarded copy beside one
+            # unguarded copy is how the next reader concludes the guard is
+            # optional. The early return at the top is what actually keeps it
+            # off a platform with no SIGHUP — this line only stops there being
+            # two spellings of the same signal.
+            os.kill(pid, _STAND_DOWN_SIGNAL)
             retired += 1
         except OSError:
             pass
@@ -6424,6 +6450,11 @@ def _holder_pid(env=None) -> "int | None":
     ask to replace us.
     """
     env = os.environ if env is None else env
+    # NOTHING TO ASK WITH. Returning a pid here would hand the caller a number
+    # it goes on to `os.kill(pid, None)` with, which is a TypeError inside a
+    # watchdog — see `_REPLACE_ME_SIGNAL`.
+    if _REPLACE_ME_SIGNAL is None:
+        return None
     # THE HOLDER HAS TO CLAIM IT. Identity is not capability: our parent may be
     # a holder from the PREVIOUS release, which is the normal case here since
     # this path only runs when the disk is newer than somebody's memory. That
@@ -6476,6 +6507,8 @@ def _retire_stale_holder(own_fingerprint: str, env=None) -> bool:
     holder, the daemon was reparented to init, HOLDERS REMAINING 0, PORT ALIVE
     True.
     """
+    if _STAND_DOWN_SIGNAL is None:
+        return False  # no SIGHUP here — see the constant
     env = os.environ if env is None else env
     published = env.get(_HOLDER_SHA_ENV)
     # Nothing published means no holder told us anything — a bare daemon, a
@@ -6485,7 +6518,7 @@ def _retire_stale_holder(own_fingerprint: str, env=None) -> bool:
     if not held_by_a_holder(env=env):
         return False  # the variable reached us through some other descendant
     try:
-        os.kill(os.getppid(), signal.SIGHUP)
+        os.kill(os.getppid(), _STAND_DOWN_SIGNAL)
     except OSError:
         return False
     return True
