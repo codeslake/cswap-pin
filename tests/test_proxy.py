@@ -4894,6 +4894,15 @@ class TestDaemonPortStability:
 
         real_spawn = pin_proxy._spawn_daemon
         real_exit = os._exit
+        real_kill = os.kill
+        signalled = []
+        # STUB THE SIGNAL. `_HELD_BY_ENV` below is set to this process's REAL
+        # parent so `held_by_a_holder()` is true — which means the code under
+        # test would send SIGUSR1 to the actual pytest process. It did: the
+        # xdist workers died with "cannot send (already closed?)", because
+        # USR1's default disposition is terminate. In production that pid is a
+        # holder that installed a handler; in a test it is whoever ran pytest.
+        os.kill = lambda pid, sig: signalled.append((pid, sig))
         pin_proxy._spawn_daemon = lambda *a, **k: spawned.append(a) or 1234
         os._exit = lambda code: exited.append(code) or (_ for _ in ()).throw(
             SystemExit(code)
@@ -4910,14 +4919,25 @@ class TestDaemonPortStability:
         finally:
             pin_proxy._spawn_daemon = real_spawn
             os._exit = real_exit
+            os.kill = real_kill
             os.environ.pop(pin_proxy._HELD_BY_ENV, None)
-        assert exited == [pin_proxy._RESTART_ME_CODE], (
-            f"a held daemon did not exit for its holder (exits={exited})"
-        )
+        # STILL NOT A HANDDOWN — that part of this case is unchanged and is
+        # what the sibling above proves cannot work. What changed is that the
+        # daemon no longer has to DIE to ask: it signals the holder first and
+        # exits 0, because the successor is already on the socket.
         assert not spawned, (
             "a held daemon handed its socket to a successor — the port leaves "
             "the holder and a stranding is one failed bind away (measured: 76 "
             "minutes of unwired pin on lmd42)"
+        )
+        assert signalled and signalled[0][1] == pin_proxy._REPLACE_ME_SIGNAL, (
+            f"a held daemon did not ask its holder for a successor before "
+            f"leaving, so the port has nobody behind it until the supervisor "
+            f"notices the exit (signalled={signalled})"
+        )
+        assert exited == [0], (
+            f"a daemon that asked for a replacement exited {exited} — 75 tells "
+            f"the holder to spawn AGAIN, on top of the successor it just made"
         )
 
     def case_a_held_daemon_cannot_hand_the_socket_down_at_all(self, tmp_path):
@@ -4987,6 +5007,189 @@ class TestDaemonPortStability:
         finally:
             held.stop(drain=0)
 
+    def case_a_held_daemon_asks_the_holder_to_replace_it_while_still_serving(
+        self, tmp_path
+    ):
+        """The gap closes here, and only here.
+
+        The case above establishes that a held daemon cannot hand the socket
+        down — it is not its socket. The party that CAN is the holder, which
+        already passes its own listening fd to every daemon it starts:
+
+            PortHolder._spawn():
+                fd = self._srv.fileno()
+                env[_HANDDOWN_FD_ENV]   = str(fd)
+                env[_HANDDOWN_FROM_ENV] = str(os.getpid())
+                pass_fds = (fd,)
+
+        So a holder can put a SECOND daemon on that socket at any moment
+        without giving anything up. Nothing structural was ever in the way —
+        only the ORDER: `_supervise()` is `self._proc.wait()` then
+        `self._spawn()`, so the successor cannot start until the predecessor
+        is gone, and that wait IS the outage.
+
+        WHAT THE DAEMON LACKS IS A WAY TO SAY IT. Today "replace me" is exit
+        75 and "released, do not restart" is exit 0, and both are only
+        sayable by DYING. A peer running the same architecture in another
+        language hit exactly this and split it in two — SIGHUP meaning "give
+        the address away, do not replace yourself", SIGTERM meaning "stop,
+        and spawn your successor" — because one signal cannot carry both. A
+        draft of theirs that merged them took a test from 587 ms to 10,642 ms.
+
+        So: SIGUSR1 to the holder means REPLACE ME, sent while still
+        accepting. The holder spawns the successor on its socket, the
+        predecessor then stops accepting, drains, and exits 0 — and the
+        supervisor must NOT read that 0 as "release the port", because the
+        successor is on it.
+
+        Verified separately that the mechanism is available: with `_supervise`
+        blocked in `Popen.wait()` on a worker thread, a SIGUSR1 handler on the
+        main thread spawned successfully and the predecessor stayed alive.
+        """
+        import signal
+
+        from cswap_pin import proxy as pin_proxy
+
+        assert hasattr(pin_proxy, "_REPLACE_ME_SIGNAL"), (
+            "the holder has no 'replace me' channel, so a daemon can only ask "
+            "for a successor by exiting — which is the gap"
+        )
+        assert pin_proxy._REPLACE_ME_SIGNAL == signal.SIGUSR1
+
+        spawned = []
+
+        class _Holder(pin_proxy.PortHolder):
+            def __init__(self):            # no socket, no child: only the protocol
+                self._replacing = False
+                self._spawn_calls = spawned
+
+            def _spawn(self):
+                spawned.append("spawn")
+                self._replacing = True
+
+        # CALL THE HANDLER, DO NOT RAISE THE SIGNAL. Sending SIGUSR1 to this
+        # process killed the xdist worker outright: `_install_replace_handler`
+        # returns quietly off the main thread (it must — a holder that cannot
+        # install one still has to run), and USR1's default disposition is
+        # TERMINATE. So the test that proves the channel exists was itself the
+        # first casualty of the hazard the channel has to survive.
+        #
+        # The delivery mechanism is verified separately and does not belong
+        # here: with `_supervise` blocked in `Popen.wait()` on a worker thread,
+        # a main-thread SIGUSR1 handler spawned successfully and the
+        # predecessor stayed alive. What THIS case owns is the protocol —
+        # handler spawns, then records that the next exit 0 is a handover.
+        h = _Holder()
+        h._on_replace_request(signal.SIGUSR1, None)
+        assert spawned == ["spawn"], (
+            "SIGUSR1 to the holder did not start a successor, so the daemon "
+            "still has to exit before one can exist"
+        )
+        assert h._replacing is True, (
+            "the holder spawned a successor without recording that the next "
+            "exit 0 is a HANDOVER — it will read it as 'release the port' and "
+            "close the socket out from under the successor"
+        )
+
+        # AND THE ORDER IS PART OF THE CONTRACT, not a stylistic preference.
+        # Written as a comment first and NOT guarded — mutation-checked by
+        # swapping the two lines, and every case still passed. A claim about
+        # ordering that nothing can falsify is the kind the next refactor
+        # deletes, so it gets its own failing input: a spawn that raises must
+        # leave the flag alone, because `_supervise` reads it to decide whether
+        # an exit 0 is a handover or a release.
+        class _FailingHolder(pin_proxy.PortHolder):
+            def __init__(self):
+                self._replacing = False
+
+            def _spawn(self):
+                raise OSError("no successor today")
+
+        f = _FailingHolder()
+        try:
+            f._on_replace_request(signal.SIGUSR1, None)
+        except OSError:
+            pass
+        assert f._replacing is False, (
+            "a spawn that failed still marked the handover done; the next "
+            "exit 0 would then be read as 'successor is serving' when nothing "
+            "is, and the supervisor skips the respawn that would have saved it"
+        )
+
+        # THE LOAD-BEARING HALF, and it was unguarded until a mutation said so.
+        # Deleting the supervisor's handover branch entirely left all 115 cases
+        # green — so the one line that stops the holder closing its socket out
+        # from under a live successor had no test at all. An exit 0 means
+        # "released, do not restart" everywhere else in this class; only
+        # `_replacing` separates it from "I handed over and left".
+        closed = []
+
+        class _Sock:
+            def close(self):
+                closed.append("closed")
+
+        class _Proc:
+            def __init__(self, code):
+                self._code = code
+
+            def wait(self):
+                return self._code
+
+        class _Handover(pin_proxy.PortHolder):
+            def __init__(self, replacing):
+                self._stop = False
+                self._replacing = replacing
+                self._proc = _Proc(0)
+                self._srv = _Sock()
+                self.port = 36301
+                self.daemon_pid = 4242
+                self._rounds = 0
+
+            def _reap_standby(self):
+                pass
+
+            # One pass, then stop, so `_supervise` cannot loop forever on a
+            # `wait()` that returns instantly.
+            def _spawn(self):
+                self._stop = True
+
+        # STOP ON THE SECOND ROUND, NOT THE FIRST. Written the other way first
+        # — `wait()` setting `_stop` and returning 0 — and it was VACUOUS:
+        # `_supervise` checks `if self._stop: return` immediately after
+        # `wait()`, so the loop left before reaching the branch under test and
+        # the case passed with the branch deleted. Caught by re-applying the
+        # mutation and running SERIALLY: the parallel run had crashed a worker
+        # for an unrelated reason, which reads exactly like a caught mutation.
+        def _twice(holder):
+            holder._rounds += 1
+            if holder._rounds > 1:
+                holder._stop = True
+            return 0
+
+        h_over = _Handover(replacing=True)
+        h_over._proc.wait = lambda: _twice(h_over)
+        h_over._supervise()
+        assert h_over._rounds >= 2, (
+            "premise: the loop must have gone round at least once WITH the "
+            "handover flag set, or this case tests nothing"
+        )
+        assert closed == [], (
+            "the holder closed its listening socket on a HANDOVER exit — the "
+            "successor is already accepting on it, so this takes the port down "
+            "with a live daemon on it"
+        )
+
+        # CONTROL: the same exit 0 WITHOUT a handover must still release, or
+        # the assertion above would pass on a holder that never closes at all.
+        closed.clear()
+        h_rel = _Handover(replacing=False)
+        h_rel._proc.wait = lambda: 0
+        h_rel._supervise()
+        assert closed == ["closed"], (
+            "a plain exit 0 no longer releases the port — idle teardown would "
+            "leave the address held forever"
+        )
+
     def case_a_held_exit_does_not_drain_before_letting_the_holder_respawn(
         self, tmp_path
     ):
@@ -5034,9 +5237,88 @@ class TestDaemonPortStability:
                 budgets.append(budget)
 
         real_exit = os._exit
+        real_kill = os.kill
         os._exit = lambda code: exits.append(code) or (_ for _ in ()).throw(
             SystemExit(code)
         )
+        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
+
+        # THE ASK SUCCEEDS HERE, so this drives the overlapping path.
+        # `_HELD_BY_ENV` is this process's real parent, so an unstubbed
+        # `os.kill` signals whoever ran pytest — measured, it killed the xdist
+        # workers, because SIGUSR1 terminates by default.
+        os.kill = lambda pid, sig: None
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                lambda *a: None, interval=0.01,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+        finally:
+            os._exit = real_exit
+            os.kill = real_kill
+            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
+
+        # RE-DERIVED: the short budget existed because the drain was time
+        # NOBODY was serving — the holder could not spawn until this process
+        # was gone. It can now, and does, before we stop accepting. So the
+        # drain overlaps a serving successor and takes the FULL budget, which
+        # is what the unheld path has always done for the same reason.
+        assert exits == [0], (
+            f"premise: the ask succeeded, so this releases (0) rather than "
+            f"vacating for the holder (exits={exits})"
+        )
+        assert budgets, "the handover did not drain at all"
+        assert budgets[0] == pin_proxy._DRAIN_SECONDS, (
+            f"a handover drained {budgets[0]}s on the SHORT budget — that one "
+            f"is for the fallback, where no successor exists; cutting the "
+            f"drain short while one is already serving only cuts replies"
+        )
+        # AND IT IS STILL A DRAIN. Zero would cut a response mid-stream, which
+        # is the 34-connections-reset outage `stop(drain=…)` exists to prevent.
+        assert budgets[0] > 0, (
+            "a handover stopped draining entirely — in-flight requests are "
+            "still ours to finish, holder or no holder"
+        )
+
+    def case_a_held_daemon_whose_holder_will_not_take_the_signal_falls_back(
+        self, tmp_path
+    ):
+        """No successor means the OLD shape, never a release.
+
+        THIS IS WHERE THE SHORT BUDGET WENT. If the ask cannot be delivered —
+        no `_HELD_BY_ENV`, a holder that died between our read and our kill —
+        then nobody has started a successor, and every property the old shape
+        protected is back: the drain is unserved time, and exiting 0 would tell
+        the supervisor "released, do not restart" and leave the port with no
+        daemon behind it at all. Strictly worse than the gap being removed.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        budgets = []
+        exits = []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                return 7 if hand_down else None
+
+            def await_inflight(self, budget):
+                budgets.append(budget)
+
+        real_exit = os._exit
+        real_kill = os.kill
+        os._exit = lambda code: exits.append(code) or (_ for _ in ()).throw(
+            SystemExit(code)
+        )
+
+        def _refuse(pid, sig):
+            raise ProcessLookupError("holder is gone")
+
+        os.kill = _refuse
         os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
         try:
             pin_proxy._watch_own_code(
@@ -5048,21 +5330,16 @@ class TestDaemonPortStability:
             pass
         finally:
             os._exit = real_exit
+            os.kill = real_kill
             os.environ.pop(pin_proxy._HELD_BY_ENV, None)
 
         assert exits == [pin_proxy._RESTART_ME_CODE], (
-            "premise: this is the held-exit path"
+            f"an undeliverable ask released the port instead of asking the "
+            f"supervisor for a successor the slow way (exits={exits})"
         )
-        assert budgets, "the exit path did not drain at all"
-        assert budgets[0] <= pin_proxy._HELD_DRAIN_SECONDS, (
-            f"a held exit drained for {budgets[0]}s before the holder could "
-            f"respawn — the port is bound and nobody is behind it for all of it"
-        )
-        # AND IT IS STILL A DRAIN. Zero would cut a response mid-stream, which
-        # is the 34-connections-reset outage `stop(drain=…)` exists to prevent.
-        assert budgets[0] > 0, (
-            "a held exit stopped draining entirely — in-flight requests are "
-            "still ours to finish, holder or no holder"
+        assert budgets and 0 < budgets[0] <= pin_proxy._HELD_DRAIN_SECONDS, (
+            f"the fallback drained {budgets}s — with no successor this is time "
+            f"nobody is serving, so it takes the SHORT budget"
         )
 
     def case_an_idle_teardown_is_not_restarted(self, tmp_path):

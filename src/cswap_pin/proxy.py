@@ -4496,6 +4496,11 @@ _EXIT_WITH_PARENT_ENV = "CSWAP_PIN_EXIT_WITH_PARENT"
 # holder keeps the port and respawns, so a redeploy loads new code without the
 # address ever unbinding. A plain 0 still means "released — do not restart".
 _RESTART_ME_CODE = 75  # EX_TEMPFAIL, and nothing else in this file uses it
+# "REPLACE ME, I AM STILL SERVING." The exit codes above can only be said by
+# dying, which is why a redeploy under a holder costs a gap: the successor
+# cannot start until the predecessor is gone. This signal separates the ASK
+# from the LEAVING, so the two can overlap on one socket.
+_REPLACE_ME_SIGNAL = signal.SIGUSR1
 # The ladder a daemon that keeps dying costs: one attempt every ~5s rather than
 # four a second, so a persistently broken build does not spin the box while the
 # port it holds stays answering.
@@ -4557,6 +4562,11 @@ class PortHolder:
         self._account = account_num
         self._email = email
         self._standby = None
+        # Set by `_on_replace_request` so `_supervise` can tell a HANDOVER exit
+        # (successor already serving on our socket) from a RELEASE exit
+        # (nothing left to serve). Both are exit 0 from the daemon's side, and
+        # acting on the wrong one closes the port under a live successor.
+        self._replacing = False
 
         # ADOPT A HANDED-DOWN SOCKET RATHER THAN BINDING. A predecessor that is
         # recycling passes its still-LISTENING socket down, and it has not let
@@ -4635,6 +4645,12 @@ class PortHolder:
         # `daemon_pid` (or asks the port for a health probe) races the
         # supervisor's first loop iteration.
         self._spawn()
+        # BEFORE the supervisor thread, so a daemon that finds new code on its
+        # very first watch tick has somewhere to send the ask. Installing it
+        # after would leave a window where SIGUSR1 kills the holder outright —
+        # the default disposition for USR1 is terminate, and that takes the
+        # port with it.
+        self._install_replace_handler()
         # AFTER the daemon, so a machine that cannot start one at all does not
         # also leave a standby behind waiting for a holder that never worked.
         self._spawn_standby()
@@ -4803,11 +4819,65 @@ class PortHolder:
         )
         self._standby = None
 
+    def _install_replace_handler(self) -> None:
+        """Let a still-serving daemon ask for its successor.
+
+        THE GAP THIS EXISTS TO CLOSE. `_supervise` is `wait()` then `_spawn()`,
+        so under a holder the successor cannot start until the predecessor is
+        gone, and that wait is time with the port bound and nobody behind it —
+        measured 2 s on lambda-docker, 30 s under load on 0.1.44 -> 0.1.46.
+
+        The socket was never the obstacle: `_spawn` already hands this holder's
+        own listening fd to every daemon it starts, so a second one can join it
+        at any moment. What was missing is a way for the daemon to SAY "replace
+        me" without dying, because exit 75 (replace) and exit 0 (release) are
+        both only sayable by exiting.
+
+        SIGUSR1 is that channel, and it has to be a separate one: a peer whose
+        redeploy is gapless splits the same meanings across SIGHUP ("give the
+        address away, do NOT replace yourself") and SIGTERM ("stop, and spawn
+        your successor"), and records a draft that merged them taking a test
+        from 587 ms to 10,642 ms.
+
+        Signals reach the MAIN thread only, and `_supervise` runs on a worker
+        blocked in `Popen.wait()` — verified that the handler still runs and
+        can spawn there, with the predecessor staying alive.
+        """
+        try:
+            signal.signal(_REPLACE_ME_SIGNAL, self._on_replace_request)
+        except (ValueError, OSError):
+            # Not the main thread, or no such signal. The daemon's exit-75 path
+            # still works, so this degrades to the old gap rather than to
+            # nothing.
+            pass
+
+    def _on_replace_request(self, signum, frame) -> None:
+        # SPAWN FIRST, FLAG SECOND is not optional. `_supervise` is blocked in
+        # `wait()` on the predecessor; the moment that returns it reads
+        # `_replacing` to decide whether an exit 0 means "handover" or "release
+        # the port". Setting the flag before the successor exists would make a
+        # failed spawn look like a completed handover, and the holder would
+        # close the socket with nothing on it.
+        self._spawn()
+        self._replacing = True
+
     def _supervise(self) -> None:
         while not self._stop:
             code = self._proc.wait()
             if self._stop:
                 return
+            # A HANDOVER, NOT A RELEASE. The predecessor asked us to replace it
+            # while it was still serving, we did, and it then drained and left
+            # with 0. That 0 means "released — do not restart" everywhere else,
+            # and acting on it here would close the listening socket the
+            # successor is already accepting on.
+            if self._replacing:
+                self._replacing = False
+                _log_lifecycle(
+                    f"daemon {code} retired after handing over — successor "
+                    f"already serving on port {self.port}"
+                )
+                continue
             # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
             # this loop already wakes on every daemon exit, so it costs a
             # `poll()` and no timer. Reaping is the load-bearing half: an
@@ -5666,13 +5736,42 @@ def _watch_own_code(
             #            UNHELD on 33349
             #   10:18:15 33349: idle teardown — unwired .claude.json
             if held_by_a_holder():
+                # ASK WHILE STILL ACCEPTING, then leave. The socket is the
+                # holder's and cannot be handed down from here — that is what
+                # `release_listener(hand_down=True)` refuses, and rightly. But
+                # the holder can put a second daemon on it whenever it likes
+                # (`_spawn` passes its own listening fd), so the only thing
+                # ever missing was a way to ASK without dying first.
+                #
+                # ORDER IS THE WHOLE FIX: signal, then stop accepting, then
+                # drain. The successor is already on the socket before we stop,
+                # so the drain overlaps a serving process instead of replacing
+                # one — which is also why it gets the FULL budget here.
+                holder = _holder_pid()
+                if holder:
+                    try:
+                        os.kill(holder, _REPLACE_ME_SIGNAL)
+                    except OSError:
+                        holder = None
+                if holder:
+                    _log_lifecycle(
+                        "code on disk changed — asked the holder to replace "
+                        "us while we keep serving"
+                    )
+                    server.release_listener()
+                    server.await_inflight(_DRAIN_SECONDS)
+                    # 0, NOT 75: the successor is already serving on this
+                    # socket. 75 would make the holder spawn a SECOND one.
+                    os._exit(0)
+                # FALL BACK TO THE OLD SHAPE, never to nothing. No holder pid,
+                # or a holder that will not take the signal, means nobody has
+                # started a successor — so we must still exit 75 and let the
+                # supervisor do it the slow way. A gap is worse than the old
+                # behaviour only if it is longer; no daemon at all is worse
+                # than either.
                 _log_lifecycle(
                     "code on disk changed — exiting for the holder to replace"
                 )
-                # DRAIN FIRST, but on a SHORT budget — see
-                # `_HELD_DRAIN_SECONDS`. The holder cannot start the successor
-                # until we are gone, so unlike the handover path below this
-                # drain is time with nobody serving.
                 server.release_listener()
                 server.await_inflight(_HELD_DRAIN_SECONDS)
                 os._exit(_RESTART_ME_CODE)
@@ -6232,6 +6331,25 @@ def held_by_a_holder(ppid: int | None = None, env=None) -> bool:
     env = os.environ if env is None else env
     ppid = os.getppid() if ppid is None else ppid
     return env.get(_HELD_BY_ENV) == str(ppid)
+
+
+def _holder_pid(env=None) -> "int | None":
+    """The pid of the holder above us, or None if there is not one.
+
+    THE SAME GUARD `held_by_a_holder` USES, and for the same reason: the
+    variable reaches every descendant, so a grandchild reading it bare would
+    signal a pid that is not its parent — and by then that number may belong to
+    something else entirely. Only a holder that is our own parent is one we may
+    ask to replace us.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(_HELD_BY_ENV)
+    if not raw or raw != str(os.getppid()):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _orphaned_from_its_holder(env=None) -> bool:
