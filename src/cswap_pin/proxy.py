@@ -2956,6 +2956,50 @@ def live_bridge_names() -> dict[str, str]:
     return names
 
 
+_GENERATED_TITLE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-[a-z]+-[a-z]+$")
+
+
+def _looks_generated(title: str) -> bool:
+    """A title nobody chose: the server's, not the user's.
+
+    Two shapes, both measured on this account. The slug the server mints for a
+    nameless bridge — `host-a-cozy-badger`, `host-b-pure-newell`
+    — and a sentence it wrote from the conversation, which is how
+    'Session interrupted by user' and 'Debug unresolved issue root cause' got
+    there. A session name is a handle: `cswap`, `RVP_fork`, `rewake`.
+
+    A blank title counts: there is nothing to overwrite.
+    """
+    title = title.strip()
+    if not title:
+        return True
+    return bool(_GENERATED_TITLE.match(title)) or " " in title
+
+
+def should_wait_for_pin(method: str, path: str) -> bool:
+    """Is this the request where failing open costs something PERMANENT?
+
+    The swap fails open everywhere by design — a pin that cannot resolve must
+    never block work — and that is right for `/v1/messages`: the request bills
+    the other account and the next one is fine.
+
+    Creating a bridge is the exception. `POST /v1/code/sessions` is where the
+    server fixes the session's owner, and there is no transfer afterwards, so
+    one lost race gives a session away for good: its name, its history, and
+    the account it appears under. Measured with the pin set and every health
+    check green — 12 of 14 bridges on one machine and 11 of 11 on another had
+    been created under an account that was not the pin.
+
+    The usual cause is momentary. `consume-busy` means the usage collector
+    holds that slot's refresh lock for an instant, and the daemon's own note
+    calls it "a race with the usage collector, not a broken daemon". So the
+    answer here is only whether to RETRY briefly; the caller still gives up
+    and sends, because a launch that hangs is worse than a session on the
+    wrong account.
+    """
+    return method == "POST" and path.rstrip("/") == "/v1/code/sessions"
+
+
 def titles_to_restore(
     sessions: list[dict], names: dict[str, str]
 ) -> list[tuple[str, str]]:
@@ -2969,8 +3013,19 @@ def titles_to_restore(
     for item in sessions:
         sid = item.get("id")
         want = names.get(sid)
-        if sid and want and (item.get("title") or "").strip() != want:
-            out.append((sid, want))
+        if not sid or not want:
+            continue
+        current = (item.get("title") or "").strip()
+        if current == want.strip():
+            continue
+        # ONLY OVER A TITLE NOBODY CHOSE. Restoring on any DIFFERENCE means a
+        # name set in the claude.ai web app is reverted the next time any
+        # session on this machine opens a bridge — permanently, with no way to
+        # make it stick. The local name is the fallback for a title the server
+        # invented, never an override of the user's own words.
+        if not _looks_generated(current):
+            continue
+        out.append((sid, want.strip()))
     return out
 
 
@@ -4580,6 +4635,14 @@ _STAND_DOWN_SIGNAL = getattr(signal, "SIGHUP", None)
 # An unhandled USR1 is fatal on delivery, so this only has to outlast the
 # kernel's trip to the other process, not any work the handler does.
 _ASK_SETTLE_SECONDS = 0.25
+
+# How long a bridge creation waits for a token it could not mint. Three tries
+# at 0.3s is under a second — below the noise of opening Remote Control, and
+# far longer than a `consume-busy` deferral, which is one process finishing a
+# refresh. Deliberately small: the point is to survive a lock race, not to
+# outlast a broken credential store, and a launch must never hang on this.
+_PIN_WAIT_TRIES = 3
+_PIN_WAIT_S = 0.3
 # The ladder a daemon that keeps dying costs: one attempt every ~5s rather than
 # four a second, so a persistently broken build does not spin the box while the
 # port it holds stays answering.
@@ -7551,14 +7614,17 @@ class PinProxy:
                 if ":" in h:
                     k, v = h.split(":", 1)
                     headers.append((k.strip(), v.strip()))
-            body = _read_body(up, headers)
+            # `resp`, not `body`: rebinding the request-body parameter here is
+            # harmless only because `sendall` already happened, and any future
+            # retry would re-send the RESPONSE as the request.
+            resp = _read_body(up, headers)
             try:
                 code = int(status_line.split(" ")[1])
             except (IndexError, ValueError):
                 return None
             if code >= 400:
                 return None
-            return json.loads(body) if body else {}
+            return json.loads(resp) if resp else {}
         except Exception:  # noqa: BLE001 — could not ask
             return None
         finally:
@@ -7691,6 +7757,21 @@ class PinProxy:
                 continue
             if (item.get("last_event_at") or "") >= newest[title]:
                 continue  # the newest of its name — someone put this away
+            # THE SUPERSEDER MUST BE ONE OF OURS. Titles used to be unique by
+            # accident: a replacement bridge got a server-invented slug, so
+            # `newest[title]` had one member and nothing was ever closed — the
+            # 551-against-14 symptom. Restoring names makes titles MEANINGFUL,
+            # and meaningful names repeat: this machine alone runs two sessions
+            # called `rewake`, and a third on another host would look, from
+            # here, like a newer bridge superseding them. `live` is
+            # machine-local by design, so without this the delete pass would
+            # close another machine's archived conversation on the strength of
+            # a name collision.
+            if not any(other["id"] in live
+                       for other in sessions
+                       if (other.get("title") or "").strip() == title
+                       and other.get("id") != sid):
+                continue
             if self._bridge_api(
                 "DELETE", f"/v1/code/sessions/{sid}", token
             ) is not None:
@@ -8148,6 +8229,27 @@ class PinProxy:
         original_headers = list(headers)
         if pinned:
             token = self._pin_token_provider()
+            # ONE REQUEST IS WORTH A RETRY, and only one. Everywhere else a
+            # missing token costs a single request billed elsewhere; here it
+            # gives the session away permanently, because the server fixes the
+            # owner at creation and offers no transfer. The usual cause is
+            # `consume-busy` — the usage collector holding the slot's refresh
+            # lock for an instant — so a short retry converts a permanent loss
+            # into a wait nobody notices. Bounded, and it still goes without a
+            # token afterwards: a launch that hangs is worse than this fault.
+            if not token and should_wait_for_pin(method, path) \
+                    and not _pin_is_noop(self._pin_token_provider):
+                for _ in range(_PIN_WAIT_TRIES):
+                    time.sleep(_PIN_WAIT_S)
+                    token = self._pin_token_provider()
+                    if token:
+                        break
+                if not token:
+                    _log_lifecycle(
+                        "a bridge was created without the pin: the token could "
+                        "not be minted in time, so this session belongs to the "
+                        "active account permanently and cannot be transferred"
+                    )
             if token:
                 headers = [
                     (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
