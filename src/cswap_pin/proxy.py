@@ -8118,6 +8118,12 @@ class PinProxy:
         def _run():
             try:
                 self.sweep_superseded_bridges(token)
+                # ...and then the OTHER direction in time. The sweep above is
+                # about bridges that already exist; the restore is about the
+                # one this request is creating, which cannot be in a listing
+                # taken before the server answered. See
+                # `restore_titles_after_connect`.
+                self.restore_titles_after_connect(token)
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
             finally:
@@ -8125,6 +8131,99 @@ class PinProxy:
                     self._bridge_sweeping = False
 
         threading.Thread(target=_run, daemon=True).start()
+
+    # Bounded, and the bound is what keeps a quiet connect cheap: three
+    # listings at four seconds, then give up until the next one. Measured
+    # shape, not a guess at latency — the loop stops the moment nothing of
+    # ours is missing from the listing, so the common case (the bridge is
+    # already there) costs exactly one listing and no sleep at all.
+    _RESTORE_ATTEMPTS = 3
+    _RESTORE_DELAY = 4.0
+
+    def restore_titles_after_connect(self, token: str) -> int:
+        """Put local names back on bridges the server titled for itself.
+
+        SPLIT OUT OF THE SUPERSEDED SWEEP, because the two look in opposite
+        directions in time and one listing cannot serve both.
+
+        Measured 2026-08-15 on host-a. A session named `CCF` reconnected
+        Remote Control at 16:55:25Z and claude.ai showed
+        `host-a-serene-unicorn` from then on. Every piece was in place:
+
+            live_bridge_names()['cse_01VHLjpz…']            == 'CCF'
+            _looks_generated('host-a-serene-unicorn') is True
+
+        so the selection would have picked it — given a listing that contained
+        it. `_sweep_bridges_after_connect` fires from the REQUEST path of
+        `POST /v1/code/sessions`, and its own comment says so: *"Fired on the
+        request rather than the response."* That is sound for closing a
+        superseded bridge, whose subject already exists, and wrong for
+        restoring a title, whose subject is the bridge the request is about to
+        create.
+
+        It failed silently, too: `_restore_bridge_titles` logs only `if done:`,
+        so zero restored writes nothing. The daemon log showed six restores
+        that day and none after 15:46:22Z — which reads exactly like a healthy
+        daemon with nothing to do. And there is no second chance, because the
+        trigger is that one request: a bridge missed here stays wrong until
+        some OTHER session happens to connect. That is why the name comes back
+        sometimes — each of those six was fixing a PREVIOUS session's title.
+
+        THE STOP CONDITION IS OBSERVED, NOT TIMED. Sleeping "long enough" for
+        the create to land is a guess that is wrong on a slow day and wasteful
+        on a fast one. This asks a question with an answer: is any bridge this
+        machine believes it holds still absent from the server's listing? When
+        none is, there is nothing to wait for and the loop ends — usually on
+        the first pass, having spent one listing.
+        """
+        # Pass 0 REUSES the sweep's listing and dials nothing. The sweep ran a
+        # moment ago and already restored what that listing could support, so
+        # this pass exists only to answer "is anything of ours still missing" —
+        # and the answer is already in hand. Everything below it is the wait
+        # for a create that had not landed yet.
+        _UNSET = object()
+        carried = getattr(self, "_sweep_listing", _UNSET)
+        self._sweep_listing = _UNSET
+        if carried is None:
+            # The sweep asked and got nothing. Asking again immediately is the
+            # extra call this loop must not make; the next connect will retry.
+            return 0
+        for attempt in range(self._RESTORE_ATTEMPTS):
+            if attempt or carried is _UNSET:
+                if attempt:
+                    time.sleep(self._RESTORE_DELAY)
+                sessions = self._list_bridges(token)
+            else:
+                sessions, carried = carried, _UNSET
+            if sessions is None:
+                # COULD NOT ASK IS TERMINAL, not a reason to sleep and ask
+                # again — the same answer `sweep_superseded_bridges` gives one
+                # screen up. Retrying here waits on the wrong thing: this loop
+                # exists for a listing that SUCCEEDS and does not yet show our
+                # bridge, and an unreachable API is not that. Measured, and it
+                # is why this is written down: with the retry covering both,
+                # `TestAMisroutedSwapCannotKillASession` failed on two
+                # consecutive full runs and passed alone. That test drives a
+                # real `POST /v1/code/sessions` against a deliberately dead
+                # upstream, so every listing failed and this thread sat in
+                # `sleep` for 8s per request, inside the daemon's own sweep
+                # guard.
+                return 0
+            done = self._restore_bridge_titles(sessions, token)
+            if done:
+                return done
+            listed = {item.get("id") for item in sessions}
+            # `live_bridge_names` carries BOTH spellings and the listing only
+            # ever uses `cse_`, so comparing the raw keys would always report
+            # something missing and loop to the bound every single time.
+            pending = {sid for sid in live_bridge_names()
+                       if sid.startswith("cse_") and sid not in listed}
+            if not pending:
+                return 0          # nothing of ours is unaccounted for
+        # Falling out means the last attempt restored nothing — `if done` above
+        # returns on any other outcome. Written as a literal rather than the
+        # loop variable so the function cannot depend on the loop having run.
+        return 0
 
     def _serve_client(self, conn: socket.socket) -> None:
         """``_handle_client`` with the connection counted for its lifetime.
@@ -8334,8 +8433,27 @@ class PinProxy:
         sessions in use, and that is for the human to fix with `/rename`.
         """
         sessions = self._list_bridges(token)
+        # SET EVEN WHEN THE LISTING FAILED, and that is the whole point of the
+        # attribute: `None` here means "asked, got nothing", which the retry
+        # must treat as terminal. Leaving it unset let the retry read "the
+        # sweep never ran" and dial its own listing — one extra API call per
+        # connect on precisely the path where the last one just failed.
+        # Measured: with that call present,
+        # `case_a_403_on_a_swapped_route_is_retried_unswapped` saw
+        # `Bearer PIN-TOKEN` in place of the retry's own `Bearer disk-token`,
+        # on 3 of 5 full runs, while HEAD was green 6 of 6.
+        self._sweep_listing = sessions
         if sessions is None:
             return 0  # could not ask — certainly not "delete everything"
+
+        # HANDED TO THE RESTORE RETRY so it does not list again a millisecond
+        # later. Two listings back to back is not just waste: measured, the
+        # second one arrives after a test's assertion and overwrites what the
+        # fake upstream recorded — `case_a_403_on_a_swapped_route_is_retried_
+        # unswapped` saw `Bearer PIN-TOKEN` where the retry's own
+        # `Bearer disk-token` had been, on 3 of 5 full runs. In production the
+        # same shape is one extra API call per RC connect for nothing.
+        self._sweep_listing = sessions
 
         # RESTORE NAMES FIRST, and not as a courtesy: the close pass below
         # matches on TITLE, so a successor that never inherited its name means

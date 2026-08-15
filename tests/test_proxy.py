@@ -700,6 +700,109 @@ class TestLiveRemoteControlSessions:
             ("cse_y", "RVP_main_maintainer")
         ]
 
+    def case_the_bridge_being_created_is_not_in_the_listing_yet(self, monkeypatch):
+        """The sweep fires on the REQUEST, so its listing predates the bridge.
+
+        Measured 2026-08-15 on host-a. A session named `CCF` reconnected
+        Remote Control at 16:55:25Z and claude.ai showed it as
+        `host-a-serene-unicorn` from then on. Every part of the repair
+        was in place and correct:
+
+            live_bridge_names()['cse_01VHLjpz…']            == 'CCF'
+            _looks_generated('host-a-serene-unicorn') is True
+
+        so `titles_to_restore` would have selected it — with a listing that
+        contained it. It never did. `_sweep_bridges_after_connect` is fired
+        from the request path for `POST /v1/code/sessions`, and the comment
+        there says so outright: *"Fired on the request rather than the
+        response."* The bridge that request creates cannot appear in a listing
+        taken before the server has answered.
+
+        That reasoning is sound for the half it was written for — closing a
+        SUPERSEDED bridge is about the ones that already exist, and "a create
+        that fails simply finds nothing new to supersede" is true. Restoring a
+        title is the opposite direction: its subject is the bridge that request
+        is about to make. One function, two subjects, one listing taken at the
+        only moment that suits just one of them.
+
+        And it fails SILENTLY: `_restore_bridge_titles` logs only `if done:`,
+        so zero restored writes no line at all. The daemon log showed six
+        restores today and nothing after 15:46:22Z — which reads exactly like
+        a quiet, healthy daemon.
+
+        There is no second chance either. The trigger is that one request, so
+        a bridge missed here stays wrong until some OTHER session happens to
+        connect. That is why the name comes back sometimes: today's six were
+        each fixing a PREVIOUS session's title.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        listings = [
+            [{"id": "cse_old", "title": "cswap"}],                    # pre-create
+            [{"id": "cse_old", "title": "cswap"},
+             {"id": "cse_new", "title": "host-a-serene-unicorn"}],
+        ]
+        puts: list[tuple[str, bytes]] = []
+
+        def _list(self, token):
+            """The pre-create listing first, the post-create one after."""
+            return listings.pop(0) if len(listings) > 1 else listings[0]
+
+        def _api(self, method, path, token, body=None, **kw):
+            if method == "PUT":
+                puts.append((path, body))
+            return {}
+
+        monkeypatch.setattr(pin_proxy, "live_bridge_names",
+                            lambda: {"cse_new": "CCF", "cse_old": "cswap"})
+        monkeypatch.setattr(pin_proxy.PinProxy, "_list_bridges", _list)
+        monkeypatch.setattr(pin_proxy.PinProxy, "_bridge_api", _api)
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids", lambda: {"cse_new"})
+        monkeypatch.setattr(pin_proxy.time, "sleep", lambda *_: None)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon.restore_titles_after_connect("tok")
+
+        assert puts, (
+            "the bridge just created kept its server-invented title. The "
+            "listing was taken before the create landed, and nothing looked "
+            "again."
+        )
+        assert puts[0][0] == "/v1/code/sessions/cse_new"
+        assert b"CCF" in puts[0][1]
+
+    def case_the_connect_hook_actually_runs_the_restore(self):
+        """The wiring, not just the method.
+
+        Written because removing the call from `_sweep_bridges_after_connect`
+        SURVIVED the case above: that one calls `restore_titles_after_connect`
+        directly, so it proves the logic and says nothing about whether
+        anything invokes it. A restore nothing calls is exactly the defect
+        being repaired, one layer up.
+        """
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        called: list[str] = []
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._sweep_lock = threading.Lock()
+        daemon._bridge_sweeping = False
+        daemon.sweep_superseded_bridges = lambda tok: called.append("sweep")
+        daemon.restore_titles_after_connect = lambda tok: called.append("restore")
+
+        daemon._sweep_bridges_after_connect("tok")
+        for _ in range(200):                      # the hook runs in a thread
+            if "restore" in called:
+                break
+            time.sleep(0.01)
+
+        assert called == ["sweep", "restore"], (
+            f"the connect hook did not run both passes: {called}. The sweep "
+            f"looks at bridges that already exist; the restore is for the one "
+            f"this connect just created."
+        )
+
 
 class TestRepinIsLive:
     """Switching accounts in cswap never asks you to restart a session, and
