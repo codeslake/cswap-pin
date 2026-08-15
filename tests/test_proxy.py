@@ -190,6 +190,55 @@ class TestLiveRemoteControlSessions:
             "session_x": "RVP_fork", "cse_x": "RVP_fork"
         }
 
+    def case_creating_a_bridge_is_worth_waiting_for_a_token(self):
+        """Failing open is right everywhere except the one permanent request.
+
+        The swap fails OPEN by design — a pin that cannot resolve must never
+        block work — and for `/v1/messages` that is plainly correct: one
+        message bills the other account and the next one is fine.
+
+        `POST /v1/code/sessions` is not like that. It is where the server
+        fixes the session's owner, and there is no transfer afterwards, so a
+        single lost race hands a session to the wrong account FOREVER — its
+        name, its history and its place on claude.ai. Measured on two machines
+        while the pin was set and healthy: 12 of 14 bridges here and 11 of 11
+        on the laptop were created under an account that was not the pin.
+
+        The usual cause is not a broken daemon: `consume-busy` means the usage
+        collector holds the slot's refresh lock for a moment. Worth a short
+        retry; never worth blocking a launch over, which is why this answers
+        only whether to RETRY and the caller still gives up and goes.
+        """
+        from cswap_pin.proxy import should_wait_for_pin
+
+        assert should_wait_for_pin("POST", "/v1/code/sessions") is True
+        # Everything else keeps today's fail-open: the cost is one request.
+        assert should_wait_for_pin("POST", "/v1/messages") is False
+        assert should_wait_for_pin("GET", "/v1/code/sessions") is False
+        assert should_wait_for_pin("GET", "/v1/code/sessions/cse_x/bridge") is False
+
+    def case_a_name_the_user_typed_on_the_web_is_never_overwritten(self):
+        """The local name is a FALLBACK, not an override.
+
+        Restoring on any difference meant a title set in the claude.ai web app
+        was reverted the next time any session on this machine opened a
+        bridge — permanently, with no way to make it stick. The fault being
+        repaired is a title nobody chose; a title someone chose is not it.
+        """
+        from cswap_pin.proxy import titles_to_restore
+
+        names = {"cse_a": "cswap", "cse_b": "cswap", "cse_c": "cswap"}
+        listing = [
+            # Server slug and server sentence: nobody chose these.
+            {"id": "cse_a", "title": "lambda-docker-cozy-badger"},
+            {"id": "cse_b", "title": "Session interrupted by user"},
+            # A human sat down and typed this. Leave it alone.
+            {"id": "cse_c", "title": "paper-rebuttal"},
+        ]
+        assert titles_to_restore(listing, names) == [
+            ("cse_a", "cswap"), ("cse_b", "cswap")
+        ]
+
     def case_a_bridge_the_server_already_titles_correctly_is_left_alone(self):
         """No PUT for a title that already matches.
 
