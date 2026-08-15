@@ -1558,15 +1558,6 @@ def heal(backup_root: Path) -> bool:
         return False
     if not pin:
         return False  # nothing pinned — not our business
-    # BEFORE anything else, and regardless of whether the daemon needs healing:
-    # a cleared binding costs a session its cloud identity on the NEXT connect,
-    # and this is the last moment before that connect. Independent of the port
-    # repair below — a perfectly healthy daemon does not stop a session coming
-    # back as a stranger.
-    try:
-        heal_cleared_bindings()
-    except Exception:  # noqa: BLE001 — a launch must not fail on a repair
-        pass
     email = pin[0]
     # AN UPGRADE MUST NOT WAIT FOR A LAUNCH. `ensure_proxy` recycles a stale
     # daemon, but it only runs when a NEW session starts — so installing a fix
@@ -2963,117 +2954,6 @@ def live_bridge_names() -> dict[str, str]:
             for spelling in _both_spellings(bridge):
                 names[spelling] = name
     return names
-
-
-def _bridge_records(transcript: Path) -> list[dict]:
-    """Every ``bridge-session`` record in a transcript, in order.
-
-    Line-wise and tolerant: a transcript is append-only JSONL that Claude Code
-    is writing WHILE this reads it, so a torn last line is normal and must not
-    take the launch path down.
-    """
-    out: list[dict] = []
-    try:
-        with transcript.open("rb") as fh:
-            for raw in fh:
-                if b'"type":"bridge-session"' not in raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if isinstance(rec, dict) and rec.get("type") == "bridge-session":
-                    out.append(rec)
-    except OSError:
-        return []
-    return out
-
-
-def heal_cleared_bindings() -> int:
-    """Give back the bridge id a cleared binding threw away. Count repaired.
-
-    THE LAUNCH PATH, not the daemon's. By the time a connect reaches the proxy
-    the fresh session has already been minted; the only moment the id can still
-    be handed back is before the session starts, which is where `cswap pin
-    --ensure` already runs.
-
-    No token and no server call, deliberately. `heal` is tokenless by design,
-    and the check is not worth what it would cost: if the bridge really is
-    gone, Claude Code mints one exactly as it does today, so the worst case of
-    being wrong is the behaviour we are trying to replace.
-
-    Best-effort throughout. A launch must never fail because a transcript was
-    unreadable or a directory moved.
-    """
-    get_claude_config_home = require("paths").get_claude_config_home
-    try:
-        home = get_claude_config_home()
-        records = list((home / "sessions").glob("*.json"))
-    except OSError:
-        return 0
-
-    healed = 0
-    for path in records:
-        try:
-            rec = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(rec, dict):
-            continue
-        sid, pid = rec.get("sessionId"), rec.get("pid")
-        if not sid or not isinstance(pid, int) or not _pid_alive(pid):
-            continue
-        # Glob rather than re-deriving the project directory from cwd: the
-        # encoding is Claude Code's and a session that moved directories would
-        # be missed by a copy of it.
-        for transcript in (home / "projects").glob(f"*/{sid}.jsonl"):
-            entries = _bridge_records(transcript)
-            previous = binding_to_restore(entries)
-            if not previous:
-                continue
-            restored = dict(entries[-1])
-            restored["bridgeSessionId"] = previous
-            try:
-                with transcript.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(restored) + "\n")
-            except OSError:
-                continue
-            healed += 1
-            _log_lifecycle(
-                f"restored the remote-control binding for session {sid[:8]} "
-                f"— it had been cleared, and without the id back the next "
-                f"connect mints a new cloud session with a generated title "
-                f"and no history"
-            )
-    return healed
-
-
-def binding_to_restore(records: list[dict]) -> str | None:
-    """The bridge id a CLEARED binding should be pointed back at, or None.
-
-    THE CLEAR IS THE EVENT, not the restart. Claude Code rewrites this record
-    constantly — measured here, 4,362 records carrying ONE id — so counting
-    them says nothing. An EMPTY one is different: after it there is no id to
-    reattach to, so the next connect mints a fresh cloud session, which arrives
-    with a server-invented title and (`noHistoryBackfill`) none of the
-    conversation. Sessions that restarted 36 times today and never cleared kept
-    both.
-
-    The id it had is still in the record above, so handing that back is the
-    repair.
-
-    ONLY when the last record is empty. Repointing a LIVE binding at an older
-    bridge would move a working session onto a superseded one — worse than the
-    fault — and a session that legitimately moved on (a fork mints its own)
-    must keep what it has.
-    """
-    if not records or records[-1].get("bridgeSessionId"):
-        return None
-    for rec in reversed(records[:-1]):
-        previous = rec.get("bridgeSessionId")
-        if previous:
-            return str(previous)
-    return None
 
 
 def titles_to_restore(

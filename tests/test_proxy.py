@@ -190,69 +190,6 @@ class TestLiveRemoteControlSessions:
             "session_x": "RVP_fork", "cse_x": "RVP_fork"
         }
 
-    def case_a_cleared_binding_is_pointed_back_at_the_bridge_it_had(self):
-        """A CLEARED binding is what makes Claude Code mint a fresh session.
-
-        The record is a checkpoint, rewritten thousands of times with the same
-        id; an EMPTY one is the event. After it, Claude Code has no id to
-        reattach to, so it creates a new cloud session — new title, and the
-        conversation does not come with it (`noHistoryBackfill`).
-
-        The id it had is still sitting in the record above. Handing that back
-        is the whole repair, and it is the difference between the session
-        coming back as itself and coming back as
-        'host-a-<word>-<word>' with an empty history.
-        """
-        from cswap_pin.proxy import binding_to_restore
-
-        cleared = [
-            {"bridgeSessionId": "cse_old"},
-            {"bridgeSessionId": "cse_old"},
-            {"bridgeSessionId": ""},
-        ]
-        assert binding_to_restore(cleared) == "cse_old"
-
-    def case_the_launch_path_actually_runs_the_binding_repair(
-        self, tmp_path, monkeypatch
-    ):
-        """A repair nothing calls is not a repair.
-
-        `heal` is what `cswap pin --ensure` routes to, and it is the LAST
-        moment before a session connects — after that the fresh cloud session
-        already exists. It must run the repair whether or not the daemon needs
-        healing, so this asserts the call on the path that returns early.
-        """
-        from cswap_pin import proxy
-
-        called = []
-        monkeypatch.setattr(proxy, "heal_cleared_bindings",
-                            lambda: called.append(True) or 0)
-        monkeypatch.setattr(proxy, "load_pin", lambda _root: ("a@co.com", "org"))
-        # Whatever the daemon state turns out to be, the repair has already run.
-        try:
-            proxy.heal(tmp_path)
-        except Exception:  # noqa: BLE001 — the daemon half is not under test
-            pass
-        assert called, (
-            "heal() returned without running the binding repair — the one "
-            "moment it can hand the id back is before the session connects"
-        )
-
-    def case_a_binding_that_is_not_cleared_is_never_rewritten(self):
-        """Only the cleared case. Pointing a LIVE binding at an older bridge
-        would move a working session onto a superseded one, which is worse
-        than the fault this repairs — and a session that legitimately moved on
-        (a fork mints its own) must keep what it has."""
-        from cswap_pin.proxy import binding_to_restore
-
-        assert binding_to_restore([{"bridgeSessionId": "cse_new"}]) is None
-        assert binding_to_restore(
-            [{"bridgeSessionId": "cse_old"}, {"bridgeSessionId": "cse_new"}]
-        ) is None
-        # Nothing to go back to: a first connect that has not landed yet.
-        assert binding_to_restore([{"bridgeSessionId": ""}]) is None
-        assert binding_to_restore([]) is None
-
     def case_a_bridge_the_server_already_titles_correctly_is_left_alone(self):
         """No PUT for a title that already matches.
 
