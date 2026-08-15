@@ -119,6 +119,446 @@ def _ask_for_a_reply(port, timeout=2.0):
             pass
 
 
+class TestHistoryCarriesAcrossASwitch:
+    """Keep a session's bridge when cswap rotates the account under it.
+
+    Read out of the Claude Code 2.1.233 binary. At launch CC hydrates a pointer
+    and compares its owner against `~/.claude.json`'s `oauthAccount`; a
+    mismatch logs "reattach vetoed ... minting fresh, history channels
+    suppressed". CC stamps that owner with its OWN login, not with the bearer
+    this proxy swapped in, so one rotation between two runs vetoes a bridge
+    that was perfectly reattachable — 14 of 14 live sessions measured here.
+
+    Restamping the pointer with the CURRENT login clears the veto AND keeps
+    CC's fallback:
+
+        if (!He) { He = Qe.id, Oe = Qe.seq;
+                   if (!Ir || !hzs()) Ke = true;   // Ir = owner matches login
+                   ... `${Ke ? "reattach-or-fail" : "fresh-mint fallback"}` }
+
+    Removing the owner instead also clears the veto, but leaves `Ir` false and
+    `Ke` true — reattach-or-fail, no fallback — so a pointer naming a bridge
+    that another machine's sweep already deleted becomes "no Remote Control at
+    all". A match costs a fresh mint when it is wrong, which is today's
+    behaviour, so nothing has to be proven and nothing has to be cached.
+    """
+
+    LOGIN = ("acct-1", "org-1")
+
+    def _pointer(self, **kw):
+        rec = {"type": "bridge-session", "sessionId": "s",
+               "bridgeSessionId": "cse_x", "lastSequenceNum": 34,
+               "ownerAccountUuid": "acct-3", "ownerOrganizationUuid": "org-3"}
+        rec.update(kw)
+        return rec
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_pointer_from_another_account_is_restamped(self):
+        from cswap_pin.proxy import _TRANSCRIPT_OWNER, _carry_pointer
+
+        out = _carry_pointer(self._pointer(), self.LOGIN, _TRANSCRIPT_OWNER)
+        assert out is not None, "this is the session the veto would strand"
+        assert out["ownerAccountUuid"] == "acct-1"
+        assert out["ownerOrganizationUuid"] == "org-1"
+        assert out["bridgeSessionId"] == "cse_x", "same bridge, or it reattaches nowhere"
+        assert out["lastSequenceNum"] == 34, "the seq is where history resumes"
+
+    def case_an_organization_only_difference_still_vetoes(self):
+        """`Pne` requires BOTH uuids, so a matching account under a different
+        org is a veto — and a carry that compares only the account would call
+        it settled."""
+        from cswap_pin.proxy import _TRANSCRIPT_OWNER, _carry_pointer
+
+        rec = self._pointer(ownerAccountUuid="acct-1", ownerOrganizationUuid="org-9")
+        out = _carry_pointer(rec, self.LOGIN, _TRANSCRIPT_OWNER)
+        assert out is not None and out["ownerOrganizationUuid"] == "org-1"
+
+    def case_a_pointer_that_already_agrees_is_left_alone(self):
+        """Otherwise every launch rewrites every record for no reason."""
+        from cswap_pin.proxy import _TRANSCRIPT_OWNER, _carry_pointer
+
+        rec = self._pointer(ownerAccountUuid="acct-1", ownerOrganizationUuid="org-1")
+        assert _carry_pointer(rec, self.LOGIN, _TRANSCRIPT_OWNER) is None
+
+    def case_a_pointer_with_no_owner_is_stamped_and_nothing_else(self):
+        """The case that looks like it needs no help, and the one where an
+        extra kindness costs the most.
+
+        `bt = Boolean(Qe.ownerAccountUuid)` gates the veto, so an ownerless
+        pointer is not vetoed — but `Ir = bt && Pne(…)` is false as well, and
+        `if (!Ir || !hzs()) Ke = true` turns the fresh-mint fallback OFF. The
+        stamp buys that fallback back.
+
+        NOTHING ELSE IS WRITTEN. A draft added `noHistoryBackfill: True` here
+        to preserve a suppression on the host-directed arm; that arm needs
+        `reattachSessionId`, which is undefined at a launch, while
+        `if (Qe.noHistoryBackfill) le = true` fires on every branch and costs
+        the conversation its messages AND its name — CC derives the title only
+        under `else if (!le)`, so the session would come up as
+        `<host>-<adj>-<noun>`, the invented name this feature exists to stop.
+        """
+        from cswap_pin.proxy import _TRANSCRIPT_OWNER, _carry_pointer
+
+        rec = self._pointer()
+        del rec["ownerAccountUuid"]
+        del rec["ownerOrganizationUuid"]
+        out = _carry_pointer(rec, self.LOGIN, _TRANSCRIPT_OWNER)
+        assert out["ownerAccountUuid"] == "acct-1"
+        assert out["ownerOrganizationUuid"] == "org-1"
+        assert "noHistoryBackfill" not in out, (
+            "suppressing history here takes the name too, and CC latches the "
+            "flag forever"
+        )
+        assert set(out) - set(rec) == {"ownerAccountUuid",
+                                       "ownerOrganizationUuid"}
+
+    def case_an_existing_suppression_is_carried_through_untouched(self):
+        """Not ours to clear either: CC set it, and `{**record}` keeps it."""
+        from cswap_pin.proxy import _TRANSCRIPT_OWNER, _carry_pointer
+
+        rec = self._pointer(noHistoryBackfill=True)
+        out = _carry_pointer(rec, self.LOGIN, _TRANSCRIPT_OWNER)
+        assert out["noHistoryBackfill"] is True
+
+    def case_an_equal_but_distinct_key_pair_still_guards(self):
+        """`is` on the constants fails OPEN — an equal-but-distinct tuple makes
+        `other` the pair itself and the guard becomes `not x and x`, false
+        forever, in the one direction it exists to catch."""
+        from cswap_pin.proxy import _carry_pointer
+
+        job = {"bridgeSessionId": "cse_x", "bridgeOwnerAccountUuid": "acct-3"}
+        copy = ("ownerAccountUuid", "ownerOrganizationUuid")
+        assert _carry_pointer(job, self.LOGIN, copy) is None
+
+    def case_the_login_is_read_through_the_config_resolver(self, tmp_path,
+                                                           monkeypatch):
+        """NOT `Path.home()`, which is what this first did.
+
+        Everything else in the sweep enumerates from `get_claude_config_home()`,
+        so under `CLAUDE_CONFIG_DIR` — which `cswap run` sets for an isolated
+        profile — a hardcoded `~/.claude.json` reads the DEFAULT profile's login
+        while walking the ISOLATED profile's sessions. That does not miss a fix,
+        it manufactures the fault: pointers that already agreed get rewritten
+        until they disagree.
+
+        Deliberately does NOT stub `_login_identity`, because stubbing it in
+        every other case is why this had no coverage at all.
+        """
+        from pathlib import Path
+
+        from cswap_pin.proxy import _login_identity
+
+        isolated = Path(tmp_path) / "isolated"
+        isolated.mkdir()
+        (isolated / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": "ISOLATED",
+                              "organizationUuid": "ISOLATED-ORG"}}))
+        monkeypatch.setattr("claude_swap.paths.get_global_config_path",
+                            lambda: isolated / ".claude.json")
+        assert _login_identity() == ("ISOLATED", "ISOLATED-ORG")
+
+    def case_both_stores_are_fixed_not_whichever_answered_first(
+            self, tmp_path, monkeypatch):
+        """A rotation leaves BOTH stale, and skipping the transcript once the
+        job record was fixed strands the same session the moment anyone resumes
+        it interactively — `claude --resume` has no CLAUDE_JOB_DIR, so Claude
+        Code reads the transcript. Measured on job `15a12e92`: three different
+        accounts across the login, the job record and the transcript."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dead", pid=999)
+        (home / "sessions" / "dead.json").write_text(json.dumps(
+            {"sessionId": "dead", "pid": 999, "jobId": "j1",
+             "bridgeSessionId": "session_x"}))
+        state = self._job(home, "j1", "dead")
+
+        assert _carry_history_pointers(home) == 2
+        assert json.loads(state.read_text())["bridgeOwnerAccountUuid"] == "acct-1"
+        assert self._tail_pointer(path)["ownerAccountUuid"] == "acct-1", (
+            "the job record was fixed and the transcript was left stale"
+        )
+
+    def case_a_cleared_pointer_is_not_resurrected(self):
+        """`clearBridgeSession` appends `bridgeSessionId: ""` — that is CC
+        saying this conversation has no bridge."""
+        from cswap_pin.proxy import _TRANSCRIPT_OWNER, _carry_pointer
+
+        assert _carry_pointer(self._pointer(bridgeSessionId=""), self.LOGIN,
+                             _TRANSCRIPT_OWNER) is None
+
+    def case_the_job_store_spells_the_owner_differently(self):
+        """One pointer, two vocabularies: the transcript writes
+        `ownerAccountUuid`, the job record writes `bridgeOwnerAccountUuid`.
+        Reading the wrong pair sees no owner and decides there is nothing to
+        do — silently, on the store 12 of 13 sessions actually use."""
+        from cswap_pin.proxy import _JOB_OWNER, _TRANSCRIPT_OWNER, _carry_pointer
+
+        job = {"bridgeSessionId": "cse_x", "bridgeOwnerAccountUuid": "acct-3",
+               "bridgeOwnerOrganizationUuid": "org-3", "tokens": 7}
+        out = _carry_pointer(job, self.LOGIN, _JOB_OWNER)
+        assert out["bridgeOwnerAccountUuid"] == "acct-1"
+        assert out["tokens"] == 7, "every other key is the harness's, not ours"
+        assert _carry_pointer(job, self.LOGIN, _TRANSCRIPT_OWNER) is None, (
+            "a record carrying the OTHER store's owner is proof the key pair "
+            "is wrong — and since an ownerless record is now stamped, this is "
+            "the only thing left that can tell a wiring mistake from a real "
+            "ownerless pointer"
+        )
+
+    # --- the sweep that applies it, on the launch path ------------------
+
+    def _fleet(self, tmp_path, monkeypatch, alive=()):
+        from pathlib import Path
+
+        import cswap_pin.proxy as pp
+
+        home = Path(tmp_path) / "cfg"
+        (home / "sessions").mkdir(parents=True)
+        (home / "projects" / "proj").mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.paths.get_claude_config_home", lambda: home)
+        monkeypatch.setattr(pp, "_pid_alive", lambda pid: pid in alive)
+        monkeypatch.setattr(pp, "_login_identity", lambda: self.LOGIN)
+        return home
+
+    def _session(self, home, sid, pid, job=None, bridge="session_x"):
+        rec = {"sessionId": sid, "pid": pid, "name": sid,
+               "bridgeSessionId": bridge}
+        if job:
+            rec["jobId"] = job
+        (home / "sessions" / f"{sid}.json").write_text(json.dumps(rec))
+        path = home / "projects" / "proj" / f"{sid}.jsonl"
+        path.write_text(json.dumps({"type": "user", "sessionId": sid}) + "\n"
+                        + json.dumps(self._pointer(sessionId=sid,
+                                                   bridgeSessionId=bridge)) + "\n")
+        return path
+
+    def _job(self, home, job, sid, bridge="session_x", owner="acct-3", **extra):
+        d = home / "jobs" / job
+        d.mkdir(parents=True)
+        state = {"name": job, "sessionId": sid, "tokens": 1234,
+                 "bridgeSessionId": bridge, "bridgeNoHistoryBackfill": True}
+        if owner:
+            state["bridgeOwnerAccountUuid"] = owner
+            state["bridgeOwnerOrganizationUuid"] = "org-3"
+        state.update(extra)
+        (d / "state.json").write_text(json.dumps(state))
+        return d / "state.json"
+
+    def _tail_pointer(self, path):
+        for line in reversed(path.read_text().splitlines()):
+            rec = json.loads(line)
+            if rec.get("type") == "bridge-session":
+                return rec
+        return None
+
+    def case_a_background_session_is_carried_in_its_job_record(self, tmp_path,
+                                                               monkeypatch):
+        """THE STORE MOST SESSIONS ACTUALLY USE — 12 of 13 live RC sessions
+        here have a job record, and their transcript record is a leftover."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        state = self._job(home, "j1", "dead")
+
+        assert _carry_history_pointers(home) == 1
+        out = json.loads(state.read_text())
+        assert out["bridgeOwnerAccountUuid"] == "acct-1"
+        assert out["tokens"] == 1234, "the harness's keys survive"
+        assert out["bridgeNoHistoryBackfill"] is True, (
+            "deliberately preserved: clearing it would push history to the "
+            "server, which is not this proxy's call"
+        )
+
+    def case_liveness_is_keyed_on_the_JOB_id(self, tmp_path, monkeypatch):
+        """A resume writes the NEW session id into the registry and leaves
+        `state.json`'s `sessionId` at the id the job was created with.
+        Measured: job `bbc76cfa` reads `sessionId=bbc76cfa` while `1e49df17`
+        runs on pid 465486 with three tasks in flight. Comparing session ids
+        called that job ENDED — so the sweep's one candidate on that machine
+        was a LIVE session it was about to rewrite underneath."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch, alive={4242})
+        state = self._job(home, "j1", "old-id")
+        (home / "sessions" / "new.json").write_text(json.dumps(
+            {"sessionId": "new-id", "pid": 4242, "jobId": "j1",
+             "name": "resumed", "bridgeSessionId": "session_x"}))
+        before = state.read_text()
+
+        assert _carry_history_pointers(home) == 0
+        assert state.read_text() == before
+
+    def case_a_live_session_is_never_written_to(self, tmp_path, monkeypatch):
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch, alive={4242})
+        path = self._session(home, "live", pid=4242)
+        before = path.read_text()
+
+        assert _carry_history_pointers(home) == 0
+        assert path.read_text() == before
+
+    def case_a_session_with_no_job_dir_is_carried_in_its_transcript(
+            self, tmp_path, monkeypatch):
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dead", pid=999)
+
+        assert _carry_history_pointers(home) == 1
+        assert self._tail_pointer(path)["ownerAccountUuid"] == "acct-1"
+
+    def case_two_transcripts_for_one_id_are_left_alone(self, tmp_path,
+                                                       monkeypatch):
+        """Measured 1 duplicate in 1869 ids, and only one of the two files
+        held a pointer — so declining when both do costs nothing, and it
+        avoids re-deriving Claude Code's project-directory rule, which the
+        registry's `cwd` does not even agree with for a worktree session."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dead", pid=999)
+        other = home / "projects" / "elsewhere"
+        other.mkdir(parents=True)
+        (other / "dead.jsonl").write_text(path.read_text())
+        before = path.read_text()
+
+        assert _carry_history_pointers(home) == 0
+        assert path.read_text() == before
+
+    def case_no_readable_login_carries_nothing(self, tmp_path, monkeypatch):
+        """Nothing to agree WITH is not permission to guess."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dead", pid=999)
+        monkeypatch.setattr(pp, "_login_identity", lambda: None)
+        before = path.read_text()
+
+        assert _carry_history_pointers(home) == 0
+        assert path.read_text() == before
+
+    def case_carrying_twice_appends_once(self, tmp_path, monkeypatch):
+        """AGAINST THE TRANSCRIPT, which is the store where a repeat would
+        actually cost something. The job record is replaced whole, so a second
+        pass there is invisible by construction and asserting on it proves
+        nothing — this store APPENDS, so a missing idempotence guard grows the
+        file on every launch, forever."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dead", pid=999)
+
+        assert _carry_history_pointers(home) == 1
+        after_first = path.read_text()
+        assert _carry_history_pointers(home) == 0
+        assert path.read_text() == after_first
+
+    def case_a_resumed_job_carries_the_transcript_of_the_id_it_RESUMED(
+            self, tmp_path, monkeypatch):
+        """`state.json`'s `sessionId` is the id the job was CREATED with and a
+        resume never rewrites it — the new id goes in `resumeSessionId`, and it
+        has its own transcript. Measured on job `bbc76cfa`: the created id's
+        transcript is 5.8 MB last written in July, the resumed id's is 316 MB
+        written today. Keying on the created id restamps the dead file and
+        leaves the live one vetoed."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        (home / "sessions" / "old.json").write_text(json.dumps(
+            {"sessionId": "created", "pid": 999, "jobId": "j1",
+             "bridgeSessionId": "session_x"}))
+        self._job(home, "j1", "created", resumeSessionId="resumed")
+        for sid in ("created", "resumed"):
+            (home / "projects" / "proj" / f"{sid}.jsonl").write_text(
+                json.dumps(self._pointer(sessionId=sid)) + "\n")
+
+        _carry_history_pointers(home)
+        live = home / "projects" / "proj" / "resumed.jsonl"
+        assert self._tail_pointer(live)["ownerAccountUuid"] == "acct-1", (
+            "the transcript the resumed session actually reads was skipped"
+        )
+
+    def case_a_live_session_claiming_a_job_record_by_ID_is_also_skipped(
+            self, tmp_path, monkeypatch):
+        """The second half of the liveness guard: a job record whose session id
+        is running under a registry entry that names no job. Belt to
+        `case_liveness_is_keyed_on_the_JOB_id`'s braces, and untested until
+        now."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch, alive={4242})
+        state = self._job(home, "j1", "same-id")
+        (home / "sessions" / "s.json").write_text(json.dumps(
+            {"sessionId": "same-id", "pid": 4242, "name": "live",
+             "bridgeSessionId": "session_x"}))
+        before = state.read_text()
+
+        assert _carry_history_pointers(home) == 0
+        assert state.read_text() == before
+
+    def case_a_record_belonging_to_another_session_is_not_taken(
+            self, tmp_path, monkeypatch):
+        """A transcript holds one session's records today, so this is latent —
+        but if it ever stops holding, restamping X while appending to Y's file
+        counts a carry that fixed nobody and leaves both wrong."""
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dead", pid=999)
+        path.write_text(json.dumps({"type": "user", "sessionId": "dead"}) + "\n"
+                        + json.dumps(self._pointer(sessionId="somebody-else"))
+                        + "\n")
+        before = path.read_text()
+
+        assert _carry_history_pointers(home) == 0
+        assert path.read_text() == before
+
+    def case_an_empty_organization_is_omitted_not_written(self):
+        """An account with no organization must not get `""` written beside it.
+        Claude Code's transcript scanner validates BOTH fields against a uuid
+        regex and drops the PAIR when either fails, so an empty org discards
+        the good account uuid with it — leaving no owner, which is the
+        reattach-or-fail shape this design exists to avoid."""
+        from cswap_pin.proxy import _TRANSCRIPT_OWNER, _carry_pointer
+
+        out = _carry_pointer(self._pointer(), ("acct-1", ""), _TRANSCRIPT_OWNER)
+        assert out["ownerAccountUuid"] == "acct-1"
+        assert "ownerOrganizationUuid" not in out
+
+    def case_the_job_record_keeps_its_private_mode(self, tmp_path, monkeypatch):
+        """Claude Code writes it `mode:384`; it holds account uuids, the cwd
+        and the session's output tail. A plain write under the usual umask
+        would publish that to every user on a shared box."""
+        import os
+
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        state = self._job(home, "j1", "dead")
+        os.chmod(state, 0o600)
+
+        assert _carry_history_pointers(home) == 1
+        assert os.stat(state).st_mode & 0o777 == 0o600
+
+    def case_a_transcript_missing_its_final_newline_is_not_concatenated(
+            self, tmp_path, monkeypatch):
+        from cswap_pin.proxy import _carry_history_pointers
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dead", pid=999)
+        path.write_text(path.read_text().rstrip("\n"))
+
+        assert _carry_history_pointers(home) == 1
+        for line in path.read_text().splitlines():
+            json.loads(line)          # every line still parses on its own
+
+
 class TestLiveRemoteControlSessions:
     """A re-pin cannot move an RC session that is already open (the server
     fixed its owner at creation), so `cswap pin` names the ones affected

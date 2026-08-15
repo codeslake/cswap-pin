@@ -63,6 +63,92 @@ and when the *swap* is what was refused it re-sends the request exactly as it
 arrived. "Wrong about this route" degrades to "this request went out unpinned",
 which is the failure mode everything else here is already built to tolerate.
 
+### Keeping a session's bridge when the account rotates
+
+Swapping the bearer is only half of it. Claude Code also writes a *pointer* —
+naming the bridge, the sequence to resume at, and the account it believes it is
+— and on the next launch compares that recorded account against
+`~/.claude.json`'s `oauthAccount`. A mismatch is a veto:
+
+```
+reattach vetoed: the credential store account changed since this conversation's
+pointer was persisted — minting fresh, history channels suppressed
+```
+
+The comparison is against the account cswap currently has **active**, never
+against the pin. And Claude Code stamps the pointer with its own login, not
+with the bearer this proxy swapped in — so under a perfectly working pin the
+bridge belongs to the pinned account while the pointer names whichever account
+happened to be active. Rotate once between two runs and the veto strands a
+bridge that was reattachable the whole time. Measured on one machine: **14 of
+14** live sessions held a pointer that disagreed with the login. What follows
+from that — veto, fresh mint, history suppressed — is Claude Code's code path
+as read at 2.1.233, not a second measurement and not documentation: none of
+this is documented anywhere, it is decompiled. Nobody relaunched all fourteen
+to watch it happen.
+
+So since 0.1.81 the pin restamps the pointer of sessions that are **not
+running** with the account that is live right now, and the pointer then agrees
+with the login by construction. Two hooks, because neither covers the other's
+sessions:
+
+| hook | reached by | timing |
+| --- | --- | --- |
+| `heal` | `cswap pin --ensure`, the rc hook before every hand-launched `claude` | backgrounded by the rc file, so it can lose the race against the launch it precedes |
+| `ensure_proxy` | `cswap run`, and a hand-typed `cswap pin <n>` | synchronous, before `execvpe` — but it runs with the DEFAULT profile's environment, so on `cswap run <account>` it sweeps that profile, not the isolated one it is about to launch |
+
+Losing that race costs the current launch and nothing else: the pointer a pass
+misses is restamped by the next launch on the machine, and a session that gets
+vetoed once still ends up with a working bridge — just a new one.
+
+**Restamped, not blanked.** Removing the owner also clears the veto, and it is
+the more obvious move, but the same branch decides something else:
+
+```js
+if (!He) { He = Qe.id, Oe = Qe.seq;
+           if (!Ir || !hzs()) Ke = true;      // Ir = owner matches the login
+           … `${Ke ? "reattach-or-fail" : "fresh-mint fallback"}` }
+```
+
+No owner means no match means **reattach-or-fail, with the fresh-mint fallback
+switched off** — so a pointer naming a bridge that has since been deleted (by
+another machine's sweep, by `/cleanup-rc`, from claude.ai) leaves that session
+with no Remote Control at all. A *matching* owner keeps the fallback, which
+makes a wrong guess cost exactly what it costs today: a new bridge. That is why
+nothing here has to prove which account owns a bridge, and why there is no
+cache to go stale.
+
+The `hzs()` in that condition is a server-side feature gate whose `true` is a
+client default, so the fallback is Anthropic's to keep rather than something
+this package can guarantee. Removing the owner loses it unconditionally;
+matching loses it only if that gate is ever turned off.
+
+**Two stores, and the live one is not the obvious one.** The pointer lives in
+`~/.claude/jobs/<jobId>/state.json` when `CLAUDE_JOB_DIR` is set and in the
+transcript's last `bridge-session` record otherwise. A session that has been
+both keeps a stale transcript record forever — 12 of 13 live sessions here are
+background jobs whose transcript record disagrees with their job record.
+
+**What it restores is the bridge, not the backfill.** `noHistoryBackfill` is
+copied through, and `if (Qe.noHistoryBackfill) le = true` runs on the reattach
+branch too, so a pointer carrying it reattaches with history channels still
+suppressed — 12 of 12 job records here carry it, and Claude Code ORs it forward
+so it never clears. The session keeps the same conversation and the same
+sequence position instead of starting over on a new bridge.
+
+That `le` also skips Claude Code's own title derivation (the block is
+`else if (!le)`), so the name does not come back from CC either — it comes from
+this package: the daemon's sweep puts each session's local name on its bridge
+whenever the server has invented one, which is what `titles_to_restore` is for
+and what 0.1.80 shipped. Restamping and title restore are two halves of the
+same outcome, and neither replaces the other.
+
+Nothing here clears the flag. Doing that would push transcript history to the
+server, which is not this proxy's call to make — and a draft that wrote the
+flag ON, to preserve a suppression on a branch that turns out to be unreachable
+at launch, would have cost every ownerless pointer its messages and its name,
+permanently. It was removed.
+
 ## Install
 
 ```bash
