@@ -2882,23 +2882,24 @@ def live_remote_control_sessions() -> list[str]:
     return names
 
 
-def _live_bridge_ids() -> set[str]:
-    """Bridge ids whose owning process is still alive on THIS machine.
+def _live_bridge_records() -> list[tuple[str, str | None]]:
+    """``(bridge id, name)`` for every session with a process still alive here.
 
     A record alone is not liveness: Claude Code leaves the file behind when a
     session dies, so the registry accumulates. Measured here: 562 records, 293
     of them still ``connected`` server-side, 16 with a process.
 
-    Both spellings, because the API renames the id it hands back:
-    ``session_…`` locally, ``cse_…`` in the listing.
+    The name comes back unfiltered — ``None`` included — because the two
+    callers need different things from it and one of them must not drop a
+    nameless session (see ``_live_bridge_ids``).
     """
     get_claude_config_home = require("paths").get_claude_config_home
 
-    live: set[str] = set()
+    out: list[tuple[str, str | None]] = []
     try:
         entries = list((get_claude_config_home() / "sessions").glob("*.json"))
     except OSError:
-        return live
+        return out
     for path in entries:
         try:
             rec = json.loads(path.read_text(encoding="utf-8"))
@@ -2909,9 +2910,68 @@ def _live_bridge_ids() -> set[str]:
         bridge, pid = rec.get("bridgeSessionId"), rec.get("pid")
         if not bridge or not isinstance(pid, int) or not _pid_alive(pid):
             continue
-        live.add(str(bridge))
-        live.add(str(bridge).replace("session_", "cse_"))
+        name = rec.get("name")
+        out.append((str(bridge), str(name) if name else None))
+    return out
+
+
+def _both_spellings(bridge: str) -> tuple[str, str]:
+    """The API renames the id it hands back: ``session_…`` here, ``cse_…``
+    in the listing. Every lookup has to work either way round."""
+    return bridge, bridge.replace("session_", "cse_")
+
+
+def _live_bridge_ids() -> set[str]:
+    """Bridge ids whose owning process is still alive on THIS machine.
+
+    NAMELESS SESSIONS COUNT. This set is the sweep's negative guard — never
+    close something running here — so a session that never took a name is
+    exactly as protected as one that did.
+    """
+    live: set[str] = set()
+    for bridge, _name in _live_bridge_records():
+        live.update(_both_spellings(bridge))
     return live
+
+
+def live_bridge_names() -> dict[str, str]:
+    """Bridge id -> the name its live session goes by, in both spellings.
+
+    THE PAIRING THE CLOUD LOSES. A restart drops the RC binding; Claude Code
+    mints a NEW cloud session and never writes the new id back to the
+    transcript, so the name the user chose stays local while claude.ai shows
+    whatever the server invented for the replacement. Measured on this account
+    after one `cc-update --apply --force`: 'Session interrupted by user' twice
+    and six 'host-a-<word>-<word>', for sessions that all had names.
+
+    This registry is the one place both halves live in a single record, keyed
+    by a pid that says whether the session is still there. No cwd to resolve,
+    no branch signature to match, no ambiguity to decline.
+    """
+    names: dict[str, str] = {}
+    for bridge, name in _live_bridge_records():
+        if name:
+            for spelling in _both_spellings(bridge):
+                names[spelling] = name
+    return names
+
+
+def titles_to_restore(
+    sessions: list[dict], names: dict[str, str]
+) -> list[tuple[str, str]]:
+    """``(bridge id, name)`` for listed bridges the server titles wrongly.
+
+    Only a DIFFERENCE is worth a request. This runs on every RC connect, so
+    rewriting titles that already match would put one PUT per live session on
+    the wire every time any one of them opens a bridge.
+    """
+    out: list[tuple[str, str]] = []
+    for item in sessions:
+        sid = item.get("id")
+        want = names.get(sid)
+        if sid and want and (item.get("title") or "").strip() != want:
+            out.append((sid, want))
+    return out
 
 
 def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
@@ -7440,7 +7500,8 @@ class PinProxy:
         with self._live_lock:
             return len(self._open_conns)
 
-    def _bridge_api(self, method: str, path: str, token: str, timeout: float = 30.0):
+    def _bridge_api(self, method: str, path: str, token: str, timeout: float = 30.0,
+                    body: bytes | None = None):
         """One call to the sessions API, over the daemon's own egress.
 
         NOT THROUGH OUR OWN PORT. `/v1/code/sessions` is a PINNED ROUTE, so a
@@ -7466,6 +7527,10 @@ class PinProxy:
             raw, via_loopback = self._connect_upstream()
             up = _wrap_upstream(self._upstream_ctx(via_loopback), raw, UPSTREAM_HOST)
             up.settimeout(timeout)
+            framing = (
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                if body is not None else ""
+            )
             req = (
                 f"{method} {path} HTTP/1.1\r\n"
                 f"Host: {UPSTREAM_HOST}\r\n"
@@ -7473,9 +7538,10 @@ class PinProxy:
                 "anthropic-beta: oauth-2025-04-20\r\n"
                 "anthropic-version: 2023-06-01\r\n"
                 "Accept: application/json\r\n"
+                f"{framing}"
                 "Connection: close\r\n\r\n"
             )
-            up.sendall(req.encode("latin1"))
+            up.sendall(req.encode("latin1") + (body or b""))
             status_line = _read_line(up) or ""
             headers = []
             while True:
@@ -7522,6 +7588,46 @@ class PinProxy:
                 break
         return out
 
+    def _restore_bridge_titles(self, sessions: list[dict], token: str) -> int:
+        """Put each live session's own name back on its bridge.
+
+        A restart drops the RC binding, Claude Code mints a NEW cloud session,
+        and it never writes the new id back — so `/rename` afterwards has no id
+        to PUT to and fails silently (the client accepts anything under 500).
+        The name then only exists locally while claude.ai shows whatever the
+        server invented. Measured after one forced restart on this fleet:
+        'Session interrupted by user' twice, six 'host-a-<word>-<word>',
+        and a reconnect on another machine produced 'host-b-curious-
+        torvalds' for a session called `slack`.
+
+        The registry is the exact pairing — name, bridge id and owning pid in
+        one record — so nothing here guesses from cwd, branch or timing.
+
+        Renamed items are updated IN PLACE because the caller's close pass
+        matches on title: leaving it reading the stale listing would decide
+        against titles that are one request out of date.
+        """
+        names = live_bridge_names()
+        if not names:
+            return 0
+        done = 0
+        for sid, want in titles_to_restore(sessions, names):
+            body = json.dumps({"title": want}).encode("utf-8")
+            if self._bridge_api(
+                "PUT", f"/v1/code/sessions/{sid}", token, body=body
+            ) is None:
+                continue
+            for item in sessions:
+                if item.get("id") == sid:
+                    item["title"] = want
+            done += 1
+        if done:
+            _log_lifecycle(
+                f"restored the session name on {done} bridge(s) the "
+                f"reconnect had left under a generated title"
+            )
+        return done
+
     def sweep_superseded_bridges(self, token: str) -> int:
         """Close bridges that a NEWER bridge of the same name has replaced.
 
@@ -7557,6 +7663,13 @@ class PinProxy:
         sessions = self._list_bridges(token)
         if sessions is None:
             return 0  # could not ask — certainly not "delete everything"
+
+        # RESTORE NAMES FIRST, and not as a courtesy: the close pass below
+        # matches on TITLE, so a successor that never inherited its name means
+        # nothing supersedes the predecessor and nothing is ever closed. That
+        # is how 551 bridges accumulated here against 14 live processes — the
+        # sweep's premise was false in exactly the case it was built for.
+        self._restore_bridge_titles(sessions, token)
 
         live = _live_bridge_ids()
         newest: dict[str, str] = {}

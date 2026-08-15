@@ -157,6 +157,60 @@ class TestLiveRemoteControlSessions:
         (d / "bad.json").write_text("{not json")
         assert live_remote_control_sessions() == []
 
+    def case_the_registry_pairs_a_bridge_with_the_name_it_goes_by(
+        self, tmp_path, monkeypatch
+    ):
+        """THE PAIRING THE CLOUD LOSES, held locally the whole time.
+
+        A restart drops the RC binding and Claude Code mints a NEW cloud
+        session, then never writes the new id back into the transcript. So the
+        name the user gave is on one side and the live bridge is on the other,
+        and claude.ai shows a title the server invented — measured on this
+        account: 'Session interrupted by user' and six 'host-a-<word>'
+        for sessions that had names.
+
+        This registry is the one place both halves sit in one record, keyed by
+        a pid we can check. `session_` locally, `cse_` in the listing, so both
+        spellings are emitted — the same rename `_live_bridge_ids` does.
+        """
+        from cswap_pin.proxy import live_bridge_names
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps(
+            {"sessionId": "a", "name": "RVP_fork",
+             "bridgeSessionId": "session_x", "pid": os.getpid()}))
+        # No pid to check means no evidence the session is still there.
+        (d / "2.json").write_text(json.dumps(
+            {"sessionId": "b", "name": "gone", "bridgeSessionId": "session_y"}))
+        # A record can exist before RC ever connects; it names nothing.
+        (d / "3.json").write_text(json.dumps(
+            {"sessionId": "c", "name": "no-rc", "pid": os.getpid()}))
+
+        assert live_bridge_names() == {
+            "session_x": "RVP_fork", "cse_x": "RVP_fork"
+        }
+
+    def case_a_bridge_the_server_already_titles_correctly_is_left_alone(self):
+        """No PUT for a title that already matches.
+
+        A rename is a write to someone's account, and this runs on every RC
+        connect. Rewriting what is already right would put a request on the
+        wire for all fourteen live sessions every time any one of them opens a
+        bridge.
+        """
+        from cswap_pin.proxy import titles_to_restore
+
+        listing = [
+            {"id": "cse_x", "title": "RVP_fork"},          # already right
+            {"id": "cse_y", "title": "host-a-misty-crayon"},
+            {"id": "cse_z", "title": "someone else's"},    # no live session
+        ]
+        names = {"cse_x": "RVP_fork", "cse_y": "RVP_main_maintainer"}
+
+        assert titles_to_restore(listing, names) == [
+            ("cse_y", "RVP_main_maintainer")
+        ]
+
 
 class TestRepinIsLive:
     """Switching accounts in cswap never asks you to restart a session, and
