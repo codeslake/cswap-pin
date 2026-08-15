@@ -1528,8 +1528,16 @@ def heal(backup_root: Path) -> bool:
     re-pin by hand.
 
     So this needs no switcher: the pinned identity comes from settings.json and
-    the slot from the account registry, both on disk. Cheap when healthy — a
-    state read plus one loopback connect, and it returns immediately.
+    the slot from the account registry, both on disk. The repair itself is
+    cheap when healthy — a state read plus one loopback connect, and it returns
+    immediately — but this is no longer the whole cost: since 0.1.81 the bridge
+    pointer sweep runs first on every call. It always reads the registry and
+    every job record (13 and 12 on this machine), and then one glob plus a
+    64 KiB tail read PER CANDIDATE — up to two per job, since a resumed job
+    offers both of its session ids. Candidates are sessions that ended and have
+    not been restamped yet, so the steady state is zero and the worst case is
+    bounded by how many sessions the machine runs. The rc hook backgrounds this
+    call, so a launch waits on none of it.
 
     WHO CALLS IT, stated because the previous answer here was wrong and cost 22
     hours. This used to say "callable from anything that already runs
@@ -1537,9 +1545,13 @@ def heal(backup_root: Path) -> bool:
     ONE MACHINE'S PERSONAL CONFIG, so recovery living there means every user
     without that hook has no recovery at all — the hook was removed on purpose,
     and this docstring was left as the only record of a design that no longer
-    existed. The periodic caller today is :func:`_watch_own_code`, INSIDE the
-    daemon, which needs no host cooperation. `heal` remains the launch-path
-    repair and the manual one (``cswap pin --heal``); it is not on a timer.
+    existed. It then said the periodic caller is :func:`_watch_own_code` — also
+    wrong, in the same field, on the second try: that watcher recycles itself
+    through `_spawn_daemon` and never calls this function. **Nothing calls
+    `heal` periodically.** Its callers are `cswap pin --ensure` (the rc hook,
+    before a hand-launched `claude`) and a hand-run `cswap pin --heal`, both of
+    which are per-launch or per-command. Verified by grep in this package and
+    in the host, not by reading the sentence above.
 
     The port is REBOUND, not reallocated: the daemon reclaims the port recorded
     in proxy.json, else port.hint. That is what makes live sessions recover on
@@ -1567,8 +1579,12 @@ def heal(backup_root: Path) -> bool:
     # the whole point of the release was that upgrading no longer costs a
     # session anything. The installer changes files; nothing told the daemon.
     #
-    # This function already runs every few seconds from the status line, which
-    # makes it the one periodic caller that can notice. It just never asked:
+    # This function runs before every hand-launched `claude` (the rc hook's
+    # `cswap pin --ensure`), which makes it the one caller positioned to
+    # notice. It just never asked: an earlier draft of this sentence said
+    # "every few seconds from the status line" — the third time that claim was
+    # written into this function, and wrong every time; the status line's
+    # `_try_heal_pin` was removed and nothing calls `heal` on a timer.
     # `_read_alive_port` without a fingerprint reads a stale daemon as healthy.
     # Ask WITH one, and an upgrade takes effect on its own, on the same port,
     # with no session restarted and no command typed.
@@ -1612,6 +1628,29 @@ def heal(backup_root: Path) -> bool:
     # that would otherwise have worked (measured: serving daemon on 33967, the
     # config left `{}`).
     account_num = _resolve_pinned_slot(backup_root, email)
+
+    # THE ACTUAL PER-LAUNCH HOOK LANDS HERE, NOT IN `ensure_proxy`. The rc file
+    # runs `cswap pin --ensure` before every hand-launched `claude`, and that
+    # flag routes to THIS function — `ensure_proxy` is reached only from
+    # `cswap run` and a hand-typed `cswap pin <n>`. Hooking only there meant
+    # the carry never ran for the way sessions are actually started here.
+    #
+    # AFTER the slot resolve, so a dangling pin (account gone from the
+    # registry) stays the total no-op the rest of this function works to keep.
+    # And NOT on a timer. The status line used to spawn `cswap pin --heal`
+    # every 60s; `_try_heal_pin` is gone from `statusline/account.py` and only
+    # a comment remains. That is the whole evidence — an earlier draft here
+    # also cited a dotfiles test as asserting it, and that test asserts
+    # something else (no-spawn in the feature-ABSENT case) against a function
+    # that no longer exists. The placement is safe because of the code, not
+    # because of that test.
+    #
+    # The rc hook backgrounds this (`&!`), so it can lose the race against the
+    # launch it precedes. That costs the CURRENT launch, never correctness: a
+    # pointer this pass misses is fixed by the next launch on the machine, and
+    # `ensure_proxy` runs the same sweep synchronously before `execvpe`.
+    if account_num:
+        _carry_history_pointers(certdir)
 
     stale_st = read_daemon_state(certdir)
     stale_fp = (stale_st or {}).get("fingerprint")
@@ -2921,6 +2960,446 @@ def _both_spellings(bridge: str) -> tuple[str, str]:
     return bridge, bridge.replace("session_", "cse_")
 
 
+# The same two facts under two spellings, because Claude Code keeps ONE bridge
+# pointer in TWO stores and picks by whether `CLAUDE_JOB_DIR` is set: `Ekw`
+# writes `~/.claude/jobs/<jobId>/state.json`, `Rsr` appends a `bridge-session`
+# record to the transcript. Measured here: 12 of 13 live RC sessions have a job
+# record, and where a transcript record also exists it is a leftover from before
+# — one of the twelve has none at all. A carry that knows only the transcript
+# reaches almost nobody; one that knows only the job record strands every
+# session resumed interactively, so both are needed.
+_TRANSCRIPT_OWNER = ("ownerAccountUuid", "ownerOrganizationUuid")
+_JOB_OWNER = ("bridgeOwnerAccountUuid", "bridgeOwnerOrganizationUuid")
+# Keyed by VALUE, not identity. `owner_keys is _TRANSCRIPT_OWNER` looked
+# equivalent and fails open: an equal-but-distinct tuple makes `other` the pair
+# itself, and the wrong-pair guard degenerates to `not x and x` — permanently
+# false, in the one direction it exists to catch.
+_OTHER_OWNER = {_TRANSCRIPT_OWNER: _JOB_OWNER, _JOB_OWNER: _TRANSCRIPT_OWNER}
+
+
+def _login_identity() -> tuple[str, str] | None:
+    """``(accountUuid, organizationUuid)`` of the login, or None.
+
+    The identity Claude Code compares a bridge pointer against, read from the
+    same file it reads. cswap rewrites this on every account switch, which is
+    the whole reason the pointer goes stale.
+
+    THROUGH THE RESOLVER, NOT ``Path.home()``. This first hardcoded
+    ``~/.claude.json`` while everything else in the sweep enumerates from
+    ``get_claude_config_home()``, so wherever ``CLAUDE_CONFIG_DIR`` is set the
+    two disagree: it read the DEFAULT profile's login while walking the
+    ISOLATED profile's sessions and stamped one account's pointers with
+    another's. That does not miss a fix, it manufactures the fault — a pointer
+    that already agreed is rewritten until it disagrees, and its session is
+    vetoed on a launch that would otherwise have reattached cleanly.
+
+    WHICH CALLER, stated precisely because an earlier draft named the wrong
+    one. It is NOT ``cswap run``: the host puts ``CLAUDE_CONFIG_DIR`` only in
+    the CHILD's env dict, never in ``os.environ``, so `wire_launch_env` runs
+    with the default profile on both sides and is self-consistent. The split
+    happens one hop further in — a ``heal`` fired from INSIDE a session-mode
+    `claude`, whose environ does carry it. The resolver also knows about the
+    legacy ``.config.json``, which this had no chance of finding.
+    """
+    raw = _read_json(require("paths").get_global_config_path()) or {}
+    acct = raw.get("oauthAccount")
+    if not isinstance(acct, dict) or not acct.get("accountUuid"):
+        return None
+    return str(acct["accountUuid"]), str(acct.get("organizationUuid") or "")
+
+
+def _carry_pointer(record: dict, login: tuple[str, str],
+                  owner_keys: tuple[str, str]) -> dict | None:
+    """The pointer restamped with the CURRENT login, or None to leave it alone.
+
+    THE FAULT. At launch Claude Code hydrates a bridge pointer and compares the
+    owner it carries against ``~/.claude.json``'s ``oauthAccount``:
+
+        bt = Boolean(Qe.ownerAccountUuid)
+        if (bt && _t?.accountUuid && !Pne(_t, {accountUuid: …, organizationUuid: …}))
+            -> "reattach vetoed … minting fresh, history channels suppressed"
+
+    ``Pne`` requires both uuids. CC stamps that field with its OWN login rather
+    than the bearer this proxy swapped in, so cswap rotating the active account
+    between two runs of one session is enough to veto a bridge that was
+    perfectly reattachable — measured, 14 of 14 live sessions in that state.
+
+    WHY RESTAMP RATHER THAN REMOVE, which is what this did first. Removing the
+    owner also clears the veto (``bt`` gates it), but look at what it costs::
+
+        if (!He) { He = Qe.id, Oe = Qe.seq;
+                   if (!Ir || !hzs()) Ke = true;      // Ir = owner MATCHES login
+                   … `${Ke ? "reattach-or-fail" : "fresh-mint fallback"}` }
+
+    No owner means ``Ir`` false means ``Ke`` true: **reattach-or-fail, with the
+    fresh-mint fallback switched off.** So a pointer naming a bridge that is
+    gone — deleted by another machine's sweep, by `/cleanup-rc`, or from
+    claude.ai — stops being "you get a new bridge" and becomes "you get no
+    Remote Control at all". Proving the bridge still exists would need the
+    pin's own token and a network call on the launch path, and any cached proof
+    is a window in which that answer can go wrong.
+
+    A MATCHING owner has neither problem. ``Ir`` is true, so CC reattaches with
+    ``restored_owner_match`` and keeps the fallback it would have used anyway.
+    A wrong guess then costs a fresh mint, which is exactly today's behaviour —
+    which is why nothing here has to prove who owns a bridge, and why there is
+    no cache to go stale.
+
+    ONE CAVEAT, VISIBLE IN THE SNIPPET ABOVE: the fallback also depends on
+    ``hzs()``, a statsig gate (``tengu_sequential_puffin``) whose ``true`` is
+    only a client-side default. If it is ever turned off, a MATCH also yields
+    reattach-or-fail. That is not a reason to prefer removing the owner —
+    removing it fails that way unconditionally, matching only if the gate
+    flips — but the guarantee is Anthropic's to keep, not ours to assert.
+
+    WHAT IT DOES NOT RECOVER. ``noHistoryBackfill`` is copied through, and
+    ``if (Qe.noHistoryBackfill) le = true`` runs on the reattach branch too, so
+    a pointer carrying it reattaches with history channels still suppressed —
+    12 of 12 job records here carry it, and CC ORs it forward so it never
+    clears. What this restores is the bridge itself: same conversation, same
+    name, same sequence position, instead of a new one under an invented title.
+    Clearing the flag would push transcript history to the server, which is not
+    this proxy's call to make.
+    """
+    if not record.get("bridgeSessionId"):
+        # `clearBridgeSession` appends `bridgeSessionId: ""` to say this
+        # conversation has no bridge. Pointing it at one would undo that.
+        return None
+    account, org = login
+    if record.get(owner_keys[0]) == account \
+            and (record.get(owner_keys[1]) or "") == org:
+        return None  # already matches; rewriting it every launch would never stop
+    # AN OWNERLESS POINTER IS STAMPED TOO, which the first version declined on
+    # the grounds that `bt` gates the veto so it "already reattaches". Half
+    # right: no veto, but `Ir = bt && Pne(…)` is false as well, so
+    # `if (!Ir || !hzs()) Ke = true` — reattach-or-fail with the fresh-mint
+    # fallback OFF, the exact state the argument above exists to avoid. It is
+    # therefore the case where stamping helps most, not the one to skip.
+    #
+    # ...WHICH COSTS THE ONE SIGNAL THAT CAUGHT A WRONG KEY PAIR. Before, a job
+    # record read with the transcript spelling looked ownerless and returned
+    # None; now it would look ownerless and get transcript-shaped keys grafted
+    # onto it. The two vocabularies are mutually exclusive in a real record, so
+    # carrying the OTHER store's owner is proof this pair is the wrong one.
+    had_owner = bool(record.get(owner_keys[0]))
+    other = _OTHER_OWNER.get(owner_keys, owner_keys)
+    if not had_owner and record.get(other[0]):
+        return None
+    # NOTHING IS ADDED BESIDE THE OWNER — and one draft did add something. It
+    # wrote `noHistoryBackfill: True` on the ownerless branch, reasoning that
+    # stamping makes `Ir` true and so disables the host-directed arm's
+    # `else le = true` ("attaching with history channels suppressed"). That arm
+    # needs `He` truthy, `He` is `reattachSessionId`, and at a LAUNCH — the
+    # only moment this write is read — it is undefined. The arm was
+    # unreachable; the suppression it protected did not exist.
+    #
+    # What the flag did reach is one line higher and fires on every branch:
+    # `if (Qe.noHistoryBackfill) le = true`. That costs the conversation's
+    # messages (`initialMessages: le ? void 0 : A`), and the name — the title
+    # block is `else if (!le)`, so the session gets `<host>-<adj>-<noun>`, the
+    # invented name this whole feature exists to stop. And permanently: CC
+    # latches it into `M.current` and writes it back on every connect.
+    #
+    # An ownerless pointer already reattaches with its history and its name.
+    # The stamp alone adds the fresh-mint fallback. There was nothing to
+    # protect and something to lose.
+    out = {**record, owner_keys[0]: account}
+    # AN EMPTY ORGANIZATION IS NOT AN ORGANIZATION, and writing one would undo
+    # the whole fix. BOTH stores validate the pair against a uuid regex — the
+    # transcript scanner and the job-record schema's own transform — and drop
+    # BOTH fields when either fails, so `""` discards the perfectly good
+    # account uuid beside it and lands back in the ownerless shape above.
+    # Omission is what `Rsr` itself writes, and `Pne` normalizes absent,
+    # `null` and `""` alike, so an org-less login still matches an org-less
+    # pointer.
+    out.pop(owner_keys[1], None)
+    if org:
+        out[owner_keys[1]] = org
+    return out
+
+
+# How much of a transcript's tail to read looking for the pointer. Bridge
+# checkpoints are appended as the session runs, so the live one is near the
+# end — but "near" is the honest word: measured across twelve transcripts here,
+# one holds 38 records with the last 33 KB from EOF, one holds 1, and one holds
+# none at all. This is a BOUND on the launch path, not a search, and two of the
+# twelve have nothing in this window. Finding nothing is "skip", never "there
+# is no pointer".
+_POINTER_TAIL_BYTES = 65536
+
+
+def _log_carry(certdir: Path, what: str) -> None:
+    """Append one carry event to the daemon log, with a timestamp.
+
+    NOT ``_log_lifecycle``, which writes to stderr. That is right for the
+    daemon, whose stderr IS ``daemon.log`` — but this sweep runs in the
+    LAUNCHING CLI, moments before ``os.execvpe``, so its stderr is the user's
+    terminal and Claude Code paints over it immediately. A record of what was
+    written into Claude Code's own files has to outlive the launch that wrote
+    it, or the comment justifying it is not true.
+    """
+    try:
+        with daemon_log_path(certdir).open("a", encoding="utf-8") as fh:
+            fh.write(f"[{_iso_utc(time.time())}] carry: {what}\n")
+    except OSError:
+        pass
+
+
+def _read_json(path: Path):
+    """Parsed JSON object at ``path``, or None for anything else."""
+    try:
+        out = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def _carry_candidates() -> list[tuple[str, str | None]]:
+    """``(session id, job id)`` for sessions with a bridge and no process.
+
+    ENUMERATED FROM THE JOB DIRS, NOT THE REGISTRY. Claude Code garbage-collects
+    the registry itself — every enumeration unlinks records whose pid is gone,
+    and its callers include the resume picker — so "a dead registry record" is a
+    set that empties itself. Measured: 15 of 15 registry records had a LIVE pid
+    while 12 job dirs sat on disk. Keying on the registry would have found
+    nobody and looked exactly like a fix with nothing to do.
+
+    LIVENESS IS KEYED ON THE JOB ID, NOT THE JOB RECORD'S OWN SESSION ID, and
+    that distinction is the difference between this and rewriting a running
+    session's state. `state.json` keeps the id the job was CREATED with; a
+    resume writes the NEW id into `resumeSessionId` and into the registry and
+    leaves `sessionId` alone. Measured: job `bbc76cfa` reads `sessionId=bbc76cfa`
+    with `resumeSessionId=1e49df17`, and 1e49df17 is alive on pid 465486 with
+    three tasks in flight. Comparing session ids called that job ENDED, so the
+    first version of this had exactly one candidate on this machine and it was
+    a live session. Comparing job ids gives the true answer: 0.
+    """
+    get_claude_config_home = require("paths").get_claude_config_home
+    home = get_claude_config_home()
+    live: set[str] = set()
+    found: dict[str, str | None] = {}
+
+    for path in (home / "sessions").glob("*.json"):
+        rec = _read_json(path)
+        if not rec:
+            continue
+        sid, pid, job = rec.get("sessionId"), rec.get("pid"), rec.get("jobId")
+        if not sid:
+            continue
+        if isinstance(pid, int) and _pid_alive(pid):
+            # Both keys go in one set: a session uuid and a job id cannot
+            # collide, and if they somehow did the only effect is skipping a
+            # candidate, which is the safe direction.
+            live.add(str(sid))
+            if job:
+                live.add(str(job))
+        elif rec.get("bridgeSessionId") and not job:
+            # No job dir: the pointer is in the transcript. One of thirteen
+            # here — and the one covering a foreground `claude`, which has no
+            # CLAUDE_JOB_DIR at all.
+            found[str(sid)] = None
+
+    for path in (home / "jobs").glob("*/state.json"):
+        st = _read_json(path)
+        if not st or not st.get("bridgeSessionId"):
+            continue
+        job = path.parent.name
+        # THE RESUMED ID IS THE ONE WITH A LIVE TRANSCRIPT. `sessionId` is the
+        # id the job was CREATED with and a resume never rewrites it — it puts
+        # the new id in `resumeSessionId`, and that id has its OWN transcript
+        # file. Measured on job `bbc76cfa`: `sessionId`'s transcript is 5.8 MB
+        # last written in July, `resumeSessionId`'s is 316 MB written today.
+        # Keying the transcript half on the created id restamps a dead file and
+        # leaves the live one vetoed — the exact fault the both-stores fix
+        # exists to close, reintroduced through the id rather than the store.
+        # Both are offered; whichever has a pointer gets it.
+        for sid in (st.get("resumeSessionId"), st.get("sessionId")):
+            if not sid or job in live or str(sid) in live:
+                continue
+            # A job record OVERWRITES a transcript-only entry rather than
+            # deferring to it: with both stores now written, naming the job is
+            # strictly more work done, and `setdefault` here would leave a job
+            # record unfixed whenever its session also has a jobId-less
+            # registry record.
+            found[str(sid)] = job
+    return list(found.items())
+
+
+def _carry_job_record(job_id: str, login: tuple[str, str]) -> bool:
+    """Restamp a background session's job record. True when it changed.
+
+    The store Claude Code uses whenever ``CLAUDE_JOB_DIR`` is set, which here is
+    12 of 13 live Remote Control sessions. Rewritten whole rather than appended
+    to, so every key the harness owns is copied through untouched.
+
+    NOT ``settings.atomic_write_json``, which chmods the PARENT to 0700 — this
+    parent is Claude Code's job directory, not ours to narrow. The file's own
+    0600 is preserved by hand instead: CC writes it ``mode:384``, and matching
+    that is the point — ``~/.claude`` is 0700 here so no other user can
+    traverse in today, which makes the narrower mode a defence that costs
+    nothing rather than a wall holding something back.
+    """
+    # ponytail: read-modify-write with no lock, self-healing at the next
+    # connect. Ceiling — the job's own process writes this file too (`Ekw`,
+    # `ojh`), and the two overlap only in the narrow windows where it is alive
+    # but not yet in the registry, or gone from the registry and still writing.
+    # A lost update there overwrites a fresh `bridgeSessionId`/`Seq` with the
+    # stale one and costs the next respawn one reattach. Upgrade path: take the
+    # same re-read-after-write CC uses, if that window is ever observed firing.
+    get_claude_config_home = require("paths").get_claude_config_home
+    path = get_claude_config_home() / "jobs" / job_id / "state.json"
+    state = _read_json(path)
+    if state is None:
+        return False
+    out = _carry_pointer(state, login, _JOB_OWNER)
+    if out is None:
+        return False
+    # DOT-PREFIXED AND PID-SUFFIXED. Claude Code watches this directory with
+    # `if (u && !u.startsWith("state.json")) return;` — a `state.json.tmp` name
+    # passes that filter and wakes the watcher for a file that is not the
+    # state; a leading dot does not. The pid keeps two concurrent launches on
+    # one job dir from writing the same temp.
+    tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
+    try:
+        # 0600 AT CREATION, not after. `write_text` makes the file 0644 under
+        # the usual umask and the content is already on disk before a later
+        # chmod narrows it — a window, however short, on a file holding account
+        # uuids and the session's output tail.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(out, fh, indent=2)
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass  # a temp we cannot remove must not abort the whole sweep
+        return False
+    return True
+
+
+def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
+    """The transcript and its last ``bridge-session`` record, from the tail.
+
+    ONE SESSION ID CAN NAME TWO FILES, and when it does this declines rather
+    than picking. Measured on this account, 1 duplicate in 1869 ids: a 7.3 MB
+    transcript under one project and a 146-byte stub under another, and only
+    the stub holds a pointer — so "exactly one candidate carries a pointer" is
+    both the safe rule and, at 0 ambiguous candidates today, a free one.
+
+    The alternative was to derive the project directory from the session's
+    ``cwd``. That rule belongs to Claude Code, and a copy of it drifts in
+    silence: the registry's ``cwd`` for a worktree session is the repo root
+    while the transcript is filed under the worktree path, so the derived name
+    missed a real session on the first machine it was tried on.
+    """
+    get_claude_config_home = require("paths").get_claude_config_home
+    found: list[tuple[Path, dict]] = []
+    # No guard on the glob: measured on this interpreter, a missing directory
+    # yields `[]` (it suppresses scan errors) and the `ValueError` it can raise
+    # needs a `**` component, which a session id cannot contain. A guard here
+    # would also make `_carry_history_pointers`' stated reason for its outer
+    # catch-all untrue.
+    for path in (get_claude_config_home() / "projects").glob(f"*/{session_id}.jsonl"):
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - _POINTER_TAIL_BYTES))
+                lines = fh.read().split(b"\n")
+        except OSError:
+            continue
+        for raw in reversed(lines):
+            if b"bridge-session" not in raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue  # also swallows the leading partial line
+            if not isinstance(rec, dict) or rec.get("type") != "bridge-session":
+                continue
+            if rec.get("sessionId") not in (None, session_id):
+                # A transcript holds one session's records today, so this is
+                # latent — but if that ever stops holding, restamping X while
+                # appending to Y's file counts a carry that fixed nobody.
+                continue
+            found.append((path, rec))
+            break
+    return found[0] if len(found) == 1 else None
+
+
+def _carry_history_pointers(certdir: Path) -> int:
+    """Let sessions that are not running keep their bridge across a rotation.
+
+    See :func:`_carry_pointer` for what the stamp does and why matching beats
+    removing. This is the sweep that applies it, on the LAUNCH path: the
+    pointer has to agree with the login before Claude Code reads it, and at
+    that moment the session about to be resumed is the ended one.
+
+    IT IS GLOBAL, not scoped to the session being launched: every idle
+    session's pointer is set to whatever account is live at this launch. That
+    is self-correcting for anything started through cswap, since the next
+    launch restamps again, and background respawns read the job record this
+    just fixed. It is NOT self-correcting for a bare ``claude --resume`` or an
+    IDE integration that never runs this hook — those get whatever the last
+    cswap launch left, which is still strictly better than the veto.
+
+    NEVER RAISES, and that is load-bearing rather than tidy. The caller wraps
+    ``ensure_proxy`` in ``except Exception: pass`` and then falls through to
+    clearing the wiring — so an exception here does not skip the carry, it
+    skips the daemon spawn and unpins the machine. ``require`` raises
+    ``HostMissing`` and ``Path.glob`` raises ``ValueError``, neither of which
+    the inner handlers catch, hence the outer one.
+    """
+    carried: list[str] = []
+    try:
+        login = _login_identity()
+        if login is None:
+            return 0  # no readable login: nothing to agree with
+        for sid, job in _carry_candidates():
+            # BOTH STORES, NOT WHICHEVER ONE ANSWERED FIRST. This used to skip
+            # the transcript whenever the job record was fixed — so in the
+            # normal case, where a rotation left BOTH stale, the transcript
+            # stayed wrong and the same session was vetoed the moment anyone
+            # resumed it interactively (`claude --resume`, no CLAUDE_JOB_DIR,
+            # so CC reads the transcript). Measured on job `15a12e92`: three
+            # different accounts across the login, the job record and the
+            # transcript. Writing both costs nothing — a record that already
+            # agrees returns None and is not rewritten.
+            if job and _carry_job_record(job, login):
+                carried.append(f"{job}(job)")
+            found = _last_pointer(sid)
+            if not found:
+                continue
+            path, rec = found
+            out = _carry_pointer(rec, login, _TRANSCRIPT_OWNER)
+            if out is None:
+                continue
+            try:
+                # O_APPEND, so a second launch appending at the same moment
+                # cannot land on the offset this one computed. The seek is only
+                # to read the last byte: a transcript truncated mid-write ends
+                # without a newline, and appending to that would concatenate
+                # two records into one line neither side can parse.
+                with path.open("a+b") as fh:
+                    fh.seek(-1, os.SEEK_END)
+                    if fh.read(1) != b"\n":
+                        fh.write(b"\n")
+                    fh.write(json.dumps(out).encode("utf-8") + b"\n")
+            except OSError:
+                continue
+            carried.append(sid[:8])
+    except Exception:  # noqa: BLE001 — see the docstring: a raise unpins the box
+        _log_carry(certdir, "the bridge-pointer carry stopped early after "
+                            f"{len(carried)} record(s)")
+    if carried:
+        # WRITING INTO CLAUDE CODE'S OWN FILES LEAVES NO OTHER TRACE. The
+        # appended line is deliberately shaped like one CC writes, so without
+        # this nothing afterwards can say what touched what.
+        _log_carry(certdir, "restamped the bridge pointer for "
+                            + ", ".join(sorted(carried)))
+    return len(carried)
+
+
 def _live_bridge_ids() -> set[str]:
     """Bridge ids whose owning process is still alive on THIS machine.
 
@@ -2986,11 +3465,20 @@ def should_wait_for_pin(method: str, path: str) -> bool:
     Creating a bridge is the exception. `POST /v1/code/sessions` is where the
     server fixes the session's owner, and there is no transfer afterwards, so
     one lost race gives a session away for good: its name, its history, and
-    the account it appears under. Measured with the pin set and every health
-    check green — 12 of 14 bridges on one machine and 11 of 11 on another had
-    been created under an account that was not the pin.
+    the account it appears under.
 
-    The usual cause is momentary. `consume-busy` means the usage collector
+    THE "12 OF 14" THAT USED TO BE CITED HERE WAS NOT THIS. That count came
+    from a health check reading `ownerAccountUuid` out of transcripts, and
+    Claude Code writes that field from its OWN login rather than from the
+    bearer we swapped in — so it says nothing about whether the swap fired.
+    Re-measured against the pinned account's own listing: the bridges it called
+    mis-owned are listed under the pin, meaning the swap had worked every time.
+    The retry below is still right — an unpinned bridge really is permanent —
+    but it is a guard against a race nobody has yet caught in the act, not the
+    fix for a fault that was measured. See `_carry_pointer` for what those
+    sessions were actually losing.
+
+    The race it guards is momentary. `consume-busy` means the usage collector
     holds that slot's refresh lock for an instant, and the daemon's own note
     calls it "a race with the usage collector, not a broken daemon". So the
     answer here is only whether to RETRY briefly; the caller still gives up
@@ -3310,6 +3798,12 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         return None
     certdir = switcher.backup_dir / "pin-proxy"
     certdir.mkdir(parents=True, exist_ok=True)
+
+    # The second of the sweep's two hooks; `heal` carries the other, and the
+    # README's table says which sessions each one reaches. This one is
+    # synchronous before `execvpe`, so a `cswap run` launch never races it.
+    _carry_history_pointers(certdir)
+
     # Re-stamp the egress proxy on EVERY launch, before any reuse decision.
     # This is what makes the daemon follow the environment instead of the
     # environment that happened to exist when it spawned: a wrapper that sets
