@@ -857,6 +857,101 @@ class TestRepinIsLive:
             pin_proxy.__file__ = _real_file
 
 
+class TestASuccessorThatCannotStart:
+    """The port stays BOUND and stops ANSWERING, which is the worst shape.
+
+    Measured on lambda-docker 2026-08-15, caused by installing the PyPI
+    release over an editable checkout — it took `cswap_pin` out of the tool
+    env, and the daemon's own code watcher then asked for a successor that
+    could not import:
+
+        python: Error while finding module specification for 'cswap_pin.proxy'
+                (ModuleNotFoundError: No module named 'cswap_pin')   x4
+
+    The holder kept the socket bound and kept retrying, so nothing was
+    REFUSED — every session wired to that port hung instead, and the whole
+    machine went out. `ConnectionRefused` at least fails fast; a bound socket
+    with no acceptor fails slowly, everywhere, at once.
+
+    A holder that cannot start a daemon still has a working relay in its own
+    memory. Serving unpinned beats serving nothing: the pin is optional, the
+    session is not.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_degraded_holder_answers_on_the_held_port(self, tmp_path):
+        """The capability itself: a holder with no daemon still serves.
+
+        No `start()`, no spawn, no supervisor — this is the state the machine
+        was in for four minutes, reproduced directly.
+        """
+        import socket
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        try:
+            holder.degrade_now()
+            s = socket.create_connection(("127.0.0.1", holder.port), timeout=5)
+            try:
+                s.settimeout(5)
+                s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                          b"Host: api.anthropic.com:443\r\n\r\n")
+                assert s.recv(64), (
+                    "bound with nobody accepting — the hang that took the "
+                    "machine out, which is worse than a refusal because it "
+                    "fails slowly and everywhere at once"
+                )
+            finally:
+                s.close()
+        finally:
+            holder.stop()
+
+    def case_the_ladder_degrades_instead_of_retrying_forever(self, tmp_path,
+                                                             monkeypatch):
+        """And it has to be REACHED. The supervisor retried without limit, so
+        a successor that can never start meant a port that never answers."""
+        import time
+
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        seen = {"degraded": False}
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "degrade_now",
+                            lambda self: seen.__setitem__("degraded", True))
+
+        class _DeadProc:
+            def wait(self):
+                return 1
+
+            def poll(self):
+                return 1
+
+        def _fail(self):
+            self._proc = _DeadProc()
+            self.daemon_pid = -1
+
+        monkeypatch.setattr(PortHolder, "_spawn", _fail)
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        try:
+            holder.start()
+            deadline = time.time() + 10
+            while not seen["degraded"] and time.time() < deadline:
+                time.sleep(0.05)
+            assert seen["degraded"], (
+                f"{_HOLD_DEGRADE_AT} failed spawns and the holder is still "
+                f"retrying into a port nobody answers"
+            )
+        finally:
+            holder.stop()
+
+
 class TestHolderCrashIsSurvivable:
     """A crash of the process HOLDING the socket — the case one level up
     from its sibling in :class:`TestDaemonPortStability`, which kills the

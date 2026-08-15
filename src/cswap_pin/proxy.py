@@ -5142,6 +5142,21 @@ _PIN_WAIT_S = 0.3
 # port it holds stays answering.
 _HOLD_RESTART_BASE_S = 0.25
 _HOLD_RESTART_MAX_S = 5.0
+# Consecutive failed spawns before the holder stops waiting for a successor
+# and serves the socket itself, unpinned.
+#
+# THE FAILURE THIS CLOSES, measured on lambda-docker 2026-08-15: the PyPI
+# release was installed over an editable checkout, which took `cswap_pin` out
+# of the tool env, and the daemon's own code watcher then asked for a successor
+# that could not import. Four spawns died on `ModuleNotFoundError` and the
+# holder kept the socket BOUND while it retried — so nothing was refused and
+# every session wired to that port hung instead. A refusal fails fast and
+# locally; a bound socket with no acceptor fails slowly, everywhere, at once.
+#
+# At the ladder's cap this is ~30s of unbroken failure, which separates "it
+# crashed, the next one will be fine" from "nothing this holder starts will
+# ever run". The first is what the ladder is for; the second is this.
+_HOLD_DEGRADE_AT = 8
 
 # Consecutive failed respawns before the holder says the successor cannot
 # start. NOT a ceiling — it keeps retrying, because a machine that recovers on
@@ -5296,6 +5311,97 @@ class PortHolder:
         self._spawn_standby()
         self._thread = threading.Thread(target=self._supervise, daemon=True)
         self._thread.start()
+
+    def degrade_now(self) -> None:
+        """Serve the held socket ourselves, unpinned, and stop respawning.
+
+        THE PIN IS OPTIONAL AND THE SESSION IS NOT. Every session on the
+        machine has this address baked into its environment at exec, so a
+        holder that cannot start a daemon is not deciding whether the pin
+        works — it is deciding whether those sessions have a network. Retrying
+        into a bound-but-unaccepted socket answers that question the worst way
+        available: they hang, all of them, until a human notices.
+
+        NO MITM AND NO SWAP. This forwards `CONNECT` and nothing else, which is
+        exactly the pin turned off: bearers are untouched because the bytes are
+        never read. That also makes it survivable in the case it exists for —
+        the code is already in this process's memory, so it keeps working when
+        the package is gone from disk, which is what put a machine here.
+
+        Idempotent, and it does not un-degrade: recovery is a fresh triad, and
+        `heal` builds one before the next `claude`.
+        """
+        if getattr(self, "_degraded", False):
+            return
+        self._degraded = True
+        _log_lifecycle(
+            f"no successor could start — this holder is serving port "
+            f"{self.port} itself, UNPINNED. Remote Control and artifacts "
+            f"follow the active account until a daemon starts again; "
+            f"`cswap pin --heal` or the next launch rebuilds one."
+        )
+        threading.Thread(target=self._accept_degraded, daemon=True).start()
+
+    def _accept_degraded(self) -> None:
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._relay_one, args=(conn,),
+                             daemon=True).start()
+
+    def _relay_one(self, conn: socket.socket) -> None:
+        """One blind CONNECT tunnel, through whatever chain the pin recorded."""
+        upstream = None
+        try:
+            conn.settimeout(_HOP_REPLY_BUDGET_S)
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 8192:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            line = head.split(b"\r\n", 1)[0].decode("latin1")
+            parts = line.split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                # Only CONNECT is forwarded. A plain request here would need
+                # the bytes read and rewritten, which is the MITM this mode
+                # exists to avoid.
+                conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n"
+                             b"Content-Length: 0\r\n\r\n")
+                return
+            host, _, port_s = parts[1].rpartition(":")
+            # PARSED, not passed through. `_ambient_chain` and the recorded
+            # hint are both URL STRINGS; `_dial_chain` takes a `_Chain`, and
+            # handing it a str fails on `.address` at the moment this mode is
+            # the only thing holding the machine up.
+            chain = parse_upstream_proxy(
+                _ambient_chain(certdir=self._certdir)[0]
+                or _read_upstream(self._certdir, "proxy")
+            )
+            upstream = _dial_chain(chain) if chain else \
+                socket.create_connection((host, int(port_s)), timeout=15)
+            if chain:
+                upstream.sendall(
+                    f"CONNECT {parts[1]} HTTP/1.1\r\nHost: {parts[1]}\r\n\r\n"
+                    .encode("latin1"))
+                reply = upstream.recv(4096)
+                if b" 200" not in reply.split(b"\r\n", 1)[0]:
+                    conn.sendall(reply or b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    return
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            conn.settimeout(None)
+            _pump(conn, upstream)
+        except OSError:
+            pass
+        finally:
+            for s in (conn, upstream):
+                try:
+                    if s is not None:
+                        s.close()
+                except OSError:
+                    pass
 
     def _self_heal_on(self) -> bool:
         return os.environ.get(_SELF_HEAL_ENV, "").lower() not in ("off", "0", "no")
@@ -5610,6 +5716,13 @@ class PortHolder:
                     f"one holder death away from being unrecoverable. The "
                     f"daemon's own stderr is above in this file."
                 )
+            if self._failures >= _HOLD_DEGRADE_AT:
+                # STOP WAITING FOR A SUCCESSOR THAT IS NOT COMING. Retrying
+                # past here is not patience, it is an outage held open: the
+                # socket stays bound and unaccepted, so every wired session
+                # hangs rather than failing over. See `degrade_now`.
+                self.degrade_now()
+                return
             time.sleep(self._backoff(self._failures))
             if self._stop:
                 return
