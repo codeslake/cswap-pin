@@ -386,6 +386,186 @@ class TestStreamingRelay:
             upstream.stop()
 
 
+    def case_a_recycle_mid_stream_does_not_cut_the_reply(self, certdir):
+        """THE MEASUREMENT THE WHOLE DRAIN EXISTS FOR, taken end to end.
+
+        Everything else about the drain is asserted on counters. This drives a
+        REAL reply that is mid-body, performs the REAL teardown a recycle
+        performs, and then reads the rest of the body off the wire. If the
+        drain cuts, `event: b` never arrives and the client sees EOF or a
+        reset — which is exactly what three sessions got on 2026-08-18 as
+        "API Error: Connection lost mid-response".
+
+        WHY THIS IS NOT ALREADY COVERED by `case_a_planned_restart_under_a_
+        holder_loses_nothing`: that one sends a CONNECT and reads a short
+        answer, so it proves no request went UNANSWERED. It cannot see a long
+        answer being TRUNCATED, because its requests finish faster than any
+        drain. The user's failure was the truncation, and nothing measured it —
+        which is why "the mechanism is fixed" was as far as anyone could
+        honestly go before this case existed.
+
+        The old code fails here for a reason worth stating precisely: it
+        waited on `live_client_count()`, this connection holds that count at
+        1, so the wait ran to its ceiling and `_close_open_connections()` then
+        cut the very stream it had spent the ceiling waiting for.
+        """
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _StreamingUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(
+                b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                b"Host: api.anthropic.com:443\r\n\r\n"
+            )
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += raw.recv(1)
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            tls.sendall(
+                b"GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                b"Authorization: Bearer t\r\n\r\n"
+            )
+            tls.settimeout(10)
+            got = b""
+            while b"event: a" not in got:
+                chunk = tls.recv(4096)
+                assert chunk, "connection closed before the reply even started"
+                got += chunk
+
+            # THE RECYCLE, MID-BODY. `stop(drain=...)` is what both handover
+            # paths and `_teardown` call. Run it in a thread because a correct
+            # drain BLOCKS here — it is waiting for this very reply — and the
+            # reply cannot finish until the origin is released below.
+            # THE TIMING IS THE DISCRIMINATOR, and a first version got it
+            # wrong: it drained for 8s and released the origin after 0.3s, so
+            # the reply finished long before ANY ceiling expired and the case
+            # passed on the old code too. A control that passes proves
+            # nothing, and it nearly shipped as proof.
+            #
+            # Here the reply needs ~1.5s and the drain budget is 1.0s. The old
+            # drain waits on `live_client_count()`, which this connection
+            # holds at 1, so it burns the whole 1.0s and then cuts a reply
+            # that had 0.5s left. The fixed drain sees a request in flight and
+            # returns only once it is done.
+            done = threading.Event()
+
+            def _recycle():
+                proxy.stop(drain=1.0)
+                done.set()
+
+            def _finish_late():
+                time.sleep(1.5)
+                upstream.release.set()
+
+            threading.Thread(target=_finish_late, daemon=True).start()
+            threading.Thread(target=_recycle, daemon=True).start()
+            while b"event: b" not in got:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                got += chunk
+            assert b"event: b" in got, (
+                "the reply was CUT mid-stream by a recycle — this is the exact "
+                "failure the drain exists to prevent, and the one three "
+                "sessions hit on 2026-08-18")
+            assert done.wait(timeout=10), "the drain never returned"
+            tls.close()
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_drain_outlasts_the_reply_it_is_waiting_for(self, certdir):
+        """WHAT ACTUALLY CUTS IS `os._exit`, and the drain is what delays it.
+
+        Measured, after the first version of the case above passed against the
+        OLD drain too and therefore proved nothing:
+
+            before wrap: raw.fileno() = 3
+            after  wrap: raw.fileno() = -1     <- ssl.wrap_socket DETACHES
+                         tls.fileno() = 3
+
+        `_open_conns` holds the RAW accepted socket, whose fileno is -1 by the
+        time anything is streaming. So `_close_open_connections()` closes
+        objects that no longer own the connection: on the MITM path it cuts
+        NOTHING, and the "cut N in-flight request(s)" line counts sockets it
+        cannot reach. The reply dies when the process exits and the kernel
+        closes the real fds.
+
+        That makes the drain's only job DELAYING THE EXIT until the reply is
+        done — and the thing to assert is therefore how long `await_inflight`
+        blocks, not what it closes. A drain that returns while a reply is in
+        flight is a reply cut, one `os._exit()` later.
+
+        This is what `_HELD_DRAIN_SECONDS = 2.0` did on 2026-08-18:
+            03:42:04 stopping (refcount)  ->  03:42:06 drained
+        two seconds on the nose, with a reply streaming, then exit.
+        """
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _StreamingUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(
+                b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                b"Host: api.anthropic.com:443\r\n\r\n"
+            )
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += raw.recv(1)
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            tls.sendall(
+                b"GET /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                b"Authorization: Bearer t\r\n\r\n"
+            )
+            tls.settimeout(20)
+            got = b""
+            while b"event: a" not in got:
+                chunk = tls.recv(4096)
+                assert chunk, "closed before the reply started"
+                got += chunk
+
+            assert proxy.inflight_requests() >= 1, (
+                "precondition: the drain must have something to wait for, or "
+                "this case measures nothing — which is how its predecessor "
+                "passed against the old code")
+
+            # The origin finishes at +1.5s. A correct drain must still be
+            # blocking then, because that is the whole reason it exists.
+            threading.Thread(
+                target=lambda: (time.sleep(1.5), upstream.release.set()),
+                daemon=True).start()
+
+            t0 = time.monotonic()
+            proxy.await_inflight(30.0)
+            waited = time.monotonic() - t0
+
+            assert waited >= 1.4, (
+                f"the drain returned after {waited:.2f}s while the reply was "
+                f"still streaming. os._exit() lands next, and the reply dies "
+                f"there — this is the 2.0s _HELD_DRAIN_SECONDS cut, reproduced")
+            assert waited < 25, (
+                f"waited {waited:.1f}s after the reply finished — the drain is "
+                "counting something that never reaches zero again")
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+
 class _FramingUpstream:
     """A TLS server that answers with a caller-chosen raw response.
 
@@ -3654,13 +3834,11 @@ class TestDrainReportsWhatItCut:
         try:
             with proxy._live_lock:
                 proxy._open_conns.add(a)
-            # AND IT IS AN OPAQUE TUNNEL — that is what an RC WebSocket is
-            # after its 101, and it is the only kind of open connection that
-            # is not work. A bare open connection DOES hold the drain, and it
-            # must: `case_a_planned_restart_under_a_holder_loses_nothing`
-            # failed the moment a version stopped counting one, with "1
-            # requests connected and were never answered".
-            proxy._note_opaque_tunnel(True)
+            # OPEN, AND OWING NOTHING — an RC WebSocket after its 101, or a
+            # keep-alive socket between requests. Both are connections nobody
+            # is waiting on, and the drain must not hold for either. Modelled
+            # by simply not putting it in `_owed`, which is what the accept
+            # path does and then undoes at the 101 and between requests.
             assert proxy.live_client_count() == 1, "precondition: a conn is open"
             assert proxy.inflight_requests() == 0, (
                 "precondition: a tunnel owes nobody an answer")
@@ -3691,12 +3869,12 @@ class TestDrainReportsWhatItCut:
                             upstream=("127.0.0.1", 1))
         a, b = socket.socketpair()
         try:
-            # A PLAIN OPEN CONNECTION IS A REQUEST IN FLIGHT. No tunnel mark,
-            # so this is a client that has been accepted and is owed an
-            # answer — a streaming `/v1/messages`, or one whose headers are
-            # still arriving. Both must hold the drain.
+            # OWED AN ANSWER — what the accept path marks, and what a
+            # streaming `/v1/messages` stays marked as for every second it
+            # streams. This is the state a recycle must never walk away from.
             with proxy._live_lock:
                 proxy._open_conns.add(a)
+            proxy._owe_answer(a, True)
             assert proxy.inflight_requests() == 1
             started = time.monotonic()
             with contextlib.redirect_stderr(io.StringIO()):
