@@ -4006,6 +4006,123 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_the_cut_says_whether_the_reply_had_started(self, certdir):
+        """A CUT BEFORE HEADERS IS A RETRY; A CUT MID-RESPONSE IS A LOSS.
+
+        The line said "a reply may have ended mid-stream" over both, so the
+        number could not be used for the one thing it exists for: telling the
+        user whether a recycle cost them an answer. A request cut before its
+        headers went out has sent the client nothing — the SDK retries and it
+        costs a round trip. One cut after has delivered part of an answer, and
+        no retry repairs that.
+
+        Measured on the sibling CCF proxy the same night, which already splits
+        them: `cut 4 in-flight request(s) after 5s (4 mid-response, 0 before
+        headers)`. Its counts were the only ones defensible as user-visible
+        while ours reported sockets and hedged about the phase.
+
+        BOTH DIRECTIONS IN ONE CASE, because either alone passes on a version
+        that hardcodes the other: a constant "0 mid-response" survives the
+        before-headers half, and a constant "0 before headers" survives the
+        mid-response half.
+        """
+        import cswap_pin.proxy as pp
+
+        for started, want in ((False, "0 mid-response, 1 before headers"),
+                              (True, "1 mid-response, 0 before headers")):
+            proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                                upstream=("127.0.0.1", 1))
+            a, b = socket.socketpair()
+            err = io.StringIO()
+            try:
+                with proxy._live_lock:
+                    proxy._open_conns.add(a)
+                proxy._owe_answer(a, True)
+                if started:
+                    proxy._note_response_started(a)
+                assert proxy.inflight_requests() == 1, "precondition: owed"
+                assert proxy.inflight_mid_response() == (1 if started else 0)
+                with contextlib.redirect_stderr(err):
+                    proxy.await_inflight(0.0)
+                assert want in err.getvalue(), (
+                    f"started={started}: the line does not say which kind of "
+                    f"cut this was: {err.getvalue()}")
+            finally:
+                for s_ in (a, b):
+                    try: s_.close()
+                    except OSError: pass
+
+    def case_the_relay_is_what_says_the_reply_started(self, certdir):
+        """THE WIRING, not the method — and the mutation that proved it missing.
+
+        The two cases around this one call `_note_response_started` themselves,
+        so deleting the `on_headers()` call from the relay left them both GREEN.
+        Measured: mutation "the relay never says the reply started" SURVIVED,
+        which means nothing connected the marker to the only event that can set
+        it. That is the same hole as a drain fix landing on the path Remote
+        Control does not take — a correct function nobody calls.
+
+        So this drives the real `_relay_response` over a real socket pair with
+        a canned upstream response, and asks whether the callback fired.
+        """
+        from cswap_pin.proxy import _relay_response
+
+        up_a, up_b = socket.socketpair()
+        cl_a, cl_b = socket.socketpair()
+        fired = []
+        try:
+            up_b.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+            up_b.shutdown(socket.SHUT_WR)
+            _relay_response(up_a, cl_a, 0,
+                            on_headers=lambda: fired.append(1))
+            assert fired, (
+                "the relay wrote the response head to the client without "
+                "saying so, so every cut is reported as retryable no matter "
+                "how much of the answer had already been delivered")
+            # AND THE CLIENT REALLY GOT IT — otherwise a relay that fires the
+            # callback and sends nothing would pass.
+            cl_a.shutdown(socket.SHUT_WR)
+            got = cl_b.recv(4096)
+            assert got.startswith(b"HTTP/1.1 200"), got[:60]
+            assert got.endswith(b"hi"), got[-20:]
+        finally:
+            for s_ in (up_a, up_b, cl_a, cl_b):
+                try: s_.close()
+                except OSError: pass
+
+    def case_marking_a_response_started_cannot_rewind(self, certdir):
+        """RE-OWING MUST NOT UNDO IT, and `_owe_answer` is called again mid-request.
+
+        The accept path marks a connection owed, and `_handle_one_request`
+        marks it owed AGAIN when the request line arrives — so a plain
+        `self._owed[conn] = False` would reset a response already in flight to
+        "before headers" and under-report exactly the cuts that matter.
+        `setdefault` is what makes that impossible, and this is the case that
+        says so.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        try:
+            proxy._owe_answer(a, True)
+            proxy._note_response_started(a)
+            proxy._owe_answer(a, True)          # the second marking
+            assert proxy.inflight_mid_response() == 1, (
+                "re-marking an owed connection rewound a reply that had "
+                "already started, so a real mid-response cut would be counted "
+                "as a retryable one")
+            # And paying the debt really does clear it, or the rewind guard
+            # would be a leak instead.
+            proxy._owe_answer(a, False)
+            assert proxy.inflight_requests() == 0
+            assert proxy.inflight_mid_response() == 0
+        finally:
+            for s_ in (a, b):
+                try: s_.close()
+                except OSError: pass
+
     def case_a_request_in_flight_holds_the_drain(self, certdir):
         """THE OTHER HALF, and the one that must never regress to "fast".
 
