@@ -4776,8 +4776,16 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
     that fell out of proxy.json (a redeploy/recycle replaced them but they
     didn't die) hold ports and never idle-teardown. Best-effort; never raises."""
     for pid in _pin_daemon_pids(certdir):
-        if pid != keep_pid and pid != os.getpid():
-            _kill_daemon(pid)
+        if pid == keep_pid or pid == os.getpid():
+            continue
+        # A PREDECESSOR FINISHING ITS REPLIES IS NOT AN ORPHAN. See
+        # `announce_draining`: it accepts nothing and exits by itself, which is
+        # the opposite of the "holds a port and never idle-teardowns" this
+        # sweep exists for. Killing it is how a handover that cut nothing
+        # became a TERM one second later that cut 13 mid-response replies.
+        if is_draining(certdir, pid):
+            continue
+        _kill_daemon(pid)
 
 
 def _install_signal_teardown(cleanup) -> None:
@@ -4883,6 +4891,78 @@ def _settings_port(certdir: Path) -> object:
     except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
         return None
     return raw.get("port") if isinstance(raw, dict) else None
+
+
+def draining_marker_path(certdir: Path, pid: int) -> Path:
+    """Where a daemon announces that it is finishing replies and will exit."""
+    return Path(certdir) / f".draining-{pid}"
+
+
+def announce_draining(certdir: Path, pid: int | None = None):
+    """Say "I am leaving on my own" so the orphan sweep does not TERM us.
+
+    THE TWO FIXES THAT WERE EACH RIGHT ALONE AND OPPOSED TOGETHER. A handover
+    releases the port and then waits up to `_HANDOVER_DRAIN_SECONDS` for the
+    replies it already owes. `_sweep_orphan_daemons` kills every pin daemon for
+    this certdir that is not the recorded one, and `_spawn_daemon` runs it the
+    moment the successor is serving. To that sweep, a predecessor patiently
+    draining is indistinguishable from an orphan.
+
+    Measured on host-a 2026-08-18, the 0.1.100 rollout:
+
+        08:21:19Z  pid=616877  serving on port 36301
+        08:21:19Z  pid=2932386 stopping (signal SIGTERM)
+        08:21:49Z  pid=2932386 cut 13 (13 mid-response, 0 before headers)
+
+    one second between the successor serving and its predecessor being
+    signalled. And the 0.1.99 ceiling is what made it bite: before it the
+    predecessor exited inside thirty seconds and the sweep usually found
+    nothing, so widening the wait twentyfold widened the window to be killed in.
+
+    THE SWEEP'S OWN DOCSTRING NAMES A DIFFERENT POPULATION — daemons that "hold
+    ports and never idle-teardown". A drainer holds no port it will accept on
+    and exits by itself within the ceiling. Two populations, one pid filter.
+
+    ANNOUNCED RATHER THAN INFERRED. "Is it still listening" cannot separate
+    them: site 1 releases its listener but site 3 keeps a duplicate fd on
+    purpose, so the observable is the same for a drainer and an orphan. The
+    process that knows is the one doing it.
+
+    NOT A LOCK AND NOT A PROMISE. A marker that cannot be written changes
+    nothing — the drain still runs, the sweep still kills, and the outcome is
+    exactly today's. Failing open here is the whole design: this file may only
+    ever REMOVE a kill, never cause one.
+    """
+    pid = os.getpid() if pid is None else pid
+    path = draining_marker_path(certdir, pid)
+    try:
+        path.write_text(str(time.time()))
+    except OSError:
+        return lambda: None
+
+    def _done():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    return _done
+
+
+def is_draining(certdir: Path, pid: int) -> bool:
+    """Has ``pid`` announced that it is draining and will leave on its own?
+
+    STALE MARKERS EXPIRE, because a drainer that is SIGKILLed cannot remove its
+    own, and a pid is reused freely. Past the TTL the marker protects nobody:
+    the answer goes back to what it was before this existed, which is the safe
+    direction for a function whose only power is to spare a process.
+    """
+    path = draining_marker_path(certdir, pid)
+    try:
+        stamp = float(path.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return (time.time() - stamp) < _DRAINING_MARKER_TTL
 
 
 def refcount_fifo_path(certdir: Path) -> Path:
@@ -5078,6 +5158,14 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 # expects to pay. The loop exits on zero owed, so a quiet box returns in
 # milliseconds and a busy one returns when its last reply lands.
 _HANDOVER_DRAIN_SECONDS = 600.0
+
+# A drainer's marker outlives its own longest wait plus the slack a supervisor
+# would allow, and no longer — a pid is reused freely, so a marker that outlived
+# its writer must never protect whoever inherits the number. Defined HERE rather
+# than beside `is_draining`, which reads it: it is derived from the ceiling above
+# and placing it 200 lines earlier made it a forward reference that broke the
+# import outright (caught by a suite that ran zero tests and said so).
+_DRAINING_MARKER_TTL = _HANDOVER_DRAIN_SECONDS + 60.0
 
 _FIRST_HOLDER_TIMEOUT = 300.0
 
@@ -8833,12 +8921,25 @@ class PinProxy:
         # so the count is never zero." It sat two constants above the loop that
         # depended on the opposite.
         started = time.monotonic()
-        if budget > 0:
-            deadline = started + budget
-            while time.monotonic() < deadline:
-                if self.inflight_requests() == 0:
-                    break
-                time.sleep(0.05)
+        # ANNOUNCED HERE, NOT AT THE CALL SITES, because there are four of them
+        # and tonight's entire bug list is fixes that landed on some paths and
+        # not the one that mattered. Every drain goes through this function by
+        # construction, so a fifth exit path added later is covered without
+        # anyone remembering to cover it.
+        #
+        # See `announce_draining`: without it the orphan sweep TERMs a
+        # predecessor that is patiently finishing its replies, one second after
+        # the successor starts serving.
+        done_draining = announce_draining(self._certdir)
+        try:
+            if budget > 0:
+                deadline = started + budget
+                while time.monotonic() < deadline:
+                    if self.inflight_requests() == 0:
+                        break
+                    time.sleep(0.05)
+        finally:
+            done_draining()
         elapsed = time.monotonic() - started
         # TWO NUMBERS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS AND THIS LINE
         # USED TO CONFLATE THEM. The loop waits on OWED ANSWERS; the message
