@@ -2386,6 +2386,63 @@ class TestWireEnv:
         assert "PIN-CA" in text and "CCF-CA" in text
 
 
+class TestCaPathForTrust:
+    """The CA a PYTHON client must add to verify the proxy it is routed through.
+
+    `SSL_CERT_FILE` cannot serve this: it REPLACES OpenSSL's store, so it is
+    safe only where the bundle subsumes what it displaces. Measured per
+    machine, by certificate SET:
+
+        host-a     ambient 124  bundle 126  safe
+        host-b      ambient 128  bundle 167  NOT — 27 missing
+        host-c  ambient 128  bundle   2  NOT — 128 missing
+
+    so the writer correctly refuses on both Macs and every python caller of
+    the pin stays broken there. A caller that ADDS this CA to a default
+    context keeps the ambient roots and needs no variable. Measured on
+    host-c, same process and proxy: default context
+    CERTIFICATE_VERIFY_FAILED, default context + this CA HTTP 200.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_it_names_the_ca_this_machine_actually_serves(self, tmp_path,
+                                                          monkeypatch):
+        import claude_swap.paths as paths
+        from cswap_pin.proxy import ca_path_for_trust, ensure_ca
+
+        monkeypatch.setattr(paths, "get_backup_root", lambda: str(tmp_path))
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+
+        got = ca_path_for_trust()
+        assert got is not None and Path(got) == certdir / "ca.pem", got
+        assert Path(got).read_bytes().startswith(b"-----BEGIN CERTIFICATE")
+
+    def case_no_ca_yet_is_None_not_a_path_that_does_not_exist(self, tmp_path,
+                                                             monkeypatch):
+        """THE CONTROL. A caller loads this into an SSL context; handing it a
+        path with no file raises there and takes down a call that would have
+        worked unpinned. None means "nothing to add", which is the honest
+        answer on a machine that has never pinned."""
+        import claude_swap.paths as paths
+        from cswap_pin.proxy import ca_path_for_trust
+
+        monkeypatch.setattr(paths, "get_backup_root", lambda: str(tmp_path))
+        assert ca_path_for_trust() is None
+
+        # AND AN EMPTY ONE IS ALSO NOTHING TO ADD. `load_verify_locations`
+        # raises on a file with no certificate in it, which would take down a
+        # call that worked fine unpinned — the same failure as handing over a
+        # path that does not exist, one step later.
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        (certdir / "ca.pem").write_bytes(b"")
+        assert ca_path_for_trust() is None, "an empty CA is not a CA"
+
+
 class TestWireGlobalConfig:
     """Wiring hand-launched sessions through .claude.json — the file cswap
     already rewrites to swap accounts. Claude Code applies its `env` block
