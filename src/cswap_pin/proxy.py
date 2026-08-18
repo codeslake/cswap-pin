@@ -8737,20 +8737,46 @@ class PinProxy:
         # was: "Remote Control's WebSocket lives as long as the session does,
         # so the count is never zero." It sat two constants above the loop that
         # depended on the opposite.
+        started = time.monotonic()
         if budget > 0:
-            deadline = time.monotonic() + budget
+            deadline = started + budget
             while time.monotonic() < deadline:
                 if self.inflight_requests() == 0:
                     break
                 time.sleep(0.05)
-        cut = self.live_client_count()
+        elapsed = time.monotonic() - started
+        # TWO NUMBERS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS AND THIS LINE
+        # USED TO CONFLATE THEM. The loop waits on OWED ANSWERS; the message
+        # reported `live_client_count()`, which counts every open socket
+        # including opaque tunnels that owe nobody anything. So "cut 14
+        # in-flight request(s)" was 14 sockets closed, an unknown subset of
+        # which had anybody waiting — and both numbers quoted to the user
+        # tonight (34, then 30) were sockets, not truncated replies.
+        cut = self.inflight_requests()
+        closed = self.live_client_count()
         self._close_open_connections()
+        # ONE LINE PER DRAIN, ALWAYS — silence was the problem, not the noise.
+        # This used to log only `if cut`, on the reasoning that a clean drain
+        # must not train anyone to skim the log. The cost of that: "no line"
+        # meant BOTH "drained clean" and "this daemon never drained", and a
+        # peer reading the log tonight could not tell a healthy departure from
+        # one that never happened. A departure is a rare event — one line each
+        # is not noise, and it is the only record that a recycle cost nothing.
+        #
+        # AND THE TWO OUTCOMES READ DIFFERENTLY, because they are different
+        # facts. `cut` is somebody's reply ending mid-stream. `closed` alone is
+        # sockets that owed nobody anything — an RC WebSocket, a keep-alive
+        # between requests — and closing those costs the user nothing.
         if cut:
-            # Quiet when it costs nothing: a drain that empties is the normal
-            # case and must not train anyone to skim this log.
             _log_lifecycle(
-                f"cut {cut} in-flight request(s) after {budget:.0f}s "
-                f"— a reply may have ended mid-stream"
+                f"cut {cut} in-flight request(s) after {elapsed:.1f}s of a "
+                f"{budget:.0f}s budget (and closed {closed - cut} idle "
+                f"connection(s)) — a reply may have ended mid-stream"
+            )
+        else:
+            _log_lifecycle(
+                f"drained clean in {elapsed:.1f}s of a {budget:.0f}s budget "
+                f"— closed {closed} idle connection(s), none owed an answer"
             )
         return cut
 
@@ -10642,10 +10668,40 @@ class PinProxy:
         # read timeout left on it would tear down an idle-but-healthy stream.
         up.settimeout(None)
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        # A TUNNEL OWES NOTHING, AND THIS IS THE PATH THE RC WEBSOCKET TAKES.
+        # The connection was marked OWED at accept, and until this line existed
+        # it stayed owed for its entire life — so `inflight_requests()` could
+        # never reach zero on any machine that had ever connected Remote
+        # Control, and every drain paid its full ceiling exactly as it did
+        # before the drain was "fixed".
+        #
+        # THE FIX LANDED ON THE OTHER PATH. `_mitm` clears the debt at its 101
+        # handover, beside `_note_opaque_tunnel(True)`, and that is where I put
+        # it. But this function's own docstring says where RC actually goes:
+        # "Remote Control receives over a WebSocket to the ingress host the
+        # /bridge response names — NOT api.anthropic.com — so it lands here,
+        # not in the MITM." The premise was written down twelve lines up from
+        # the code that needed it.
+        #
+        # Measured on host-a 2026-08-18: 0.1.93, 0.1.94 and 0.1.96 all produced
+        # `cut N in-flight request(s) after 30s` on departure — identical
+        # signature across three versions, because none of them cleared this.
+        self._note_opaque_tunnel(True)
+        _c = getattr(self._local, "conn", None) or conn
+        self._owe_answer(_c, False)
+        release = getattr(self._local, "release", None)
+
+        def _release_tunnel():
+            # Tunnel first, then the connection — the same order `_mitm` uses,
+            # so the two counters can never cross.
+            self._note_opaque_tunnel(False)
+            if release:
+                release()
+
         # DETACHED: nothing after the 200 is ours to parse, so the thread that
         # built the tunnel has no work left. It hands the pair to the shared
         # selector along with its own teardown and returns.
-        _pump_detached(conn, up, getattr(self._local, "release", None))
+        _pump_detached(conn, up, _release_tunnel)
         return True
 
 

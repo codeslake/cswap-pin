@@ -3793,6 +3793,14 @@ class TestDrainReportsWhatItCut:
         try:
             with proxy._live_lock:
                 proxy._open_conns.add(a)
+            # OWED, NOT MERELY OPEN. This case used to put the connection in
+            # `_open_conns` alone and assert the drain reported 1 — which
+            # pinned the conflation rather than the behaviour: the loop waits
+            # on owed answers and the message counted open sockets, so an
+            # opaque tunnel that owed nobody anything was reported as a cut
+            # request. Both numbers quoted to the user on 2026-08-18 (34, then
+            # 30) came out of that gap.
+            proxy._owe_answer(a, True)
             assert proxy.live_client_count() == 1, "precondition"
             with contextlib.redirect_stderr(err):
                 cut = proxy.await_inflight(0.0)
@@ -3820,7 +3828,10 @@ class TestDrainReportsWhatItCut:
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             assert proxy.await_inflight(0.0) == 0
+        # NOT SILENCE — a clean drain now says it drained clean, because "no
+        # line" meant both that and "this daemon never drained at all".
         assert "cut" not in err.getvalue(), err.getvalue()
+        assert "drained clean" in err.getvalue(), err.getvalue()
 
     def case_an_open_connection_with_no_request_does_not_hold_the_drain(self, certdir):
         """THE DEADLINE MUST STOP FIRING EVERY TIME, and this is why it did.
@@ -3868,6 +3879,128 @@ class TestDrainReportsWhatItCut:
                 f"waited {waited:.1f}s for a connection carrying no request; "
                 "the drain is still counting connections, so an RC WebSocket "
                 "makes it pay the full ceiling on every recycle")
+        finally:
+            for s_ in (a, b):
+                try: s_.close()
+                except OSError: pass
+
+    def case_the_blind_tunnel_gives_its_debt_back(self, certdir):
+        """THE FOURTH UNREACHABLE ZERO, and it is the same connection as the first.
+
+        `_blind_tunnel` never called `_owe_answer(conn, False)`. The accept path
+        marks every connection OWED, so a blind tunnel stayed owed for its
+        entire life and `inflight_requests()` could not reach zero on any
+        machine that had ever connected Remote Control. Every drain then paid
+        its full ceiling — exactly the behaviour the `_owed` set was introduced
+        to end.
+
+        AND THIS IS THE RC PATH. `_blind_tunnel`'s own docstring: "Remote
+        Control receives over a WebSocket to the ingress host the /bridge
+        response names — NOT api.anthropic.com — so it lands here, not in the
+        MITM." The fix went to `_mitm`'s 101 handover, which is the path RC
+        does not take.
+
+        Measured on host-a 2026-08-18, three versions, one signature:
+            0.1.93 departing  cut 14 / cut 16  after 30s
+            0.1.94 departing  cut 14           after 30s
+            0.1.96 departing  cut 16           after 30s
+
+        DRIVEN THROUGH THE REAL FUNCTION, not by arranging the state it should
+        produce. The sibling cases above model "a tunnel owes nothing" by simply
+        not adding it to `_owed` — which asserts the conclusion and can never
+        catch a path that fails to reach it. This one dials a real listener,
+        lets `_blind_tunnel` send its own 200, and then asks the counter.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(128)
+        target = "127.0.0.1:%d" % srv.getsockname()[1]
+        client, conn = socket.socketpair()
+        accepted = []
+        try:
+            # THE ACCEPT PATH'S OWN MARKING, reproduced exactly: open, and owed
+            # from the moment it is accepted.
+            with proxy._live_lock:
+                proxy._open_conns.add(conn)
+            proxy._owe_answer(conn, True)
+            assert proxy.inflight_requests() == 1, "precondition: owed at accept"
+
+            proxy._local.conn = conn
+            proxy._local.release = lambda: None
+            proxy._blind_tunnel(target, conn)
+            accepted.append(srv.accept()[0])
+
+            assert proxy.inflight_requests() == 0, (
+                "the tunnel still owes an answer. Nobody is waiting on it — it "
+                "is two sockets being copied into each other — so it holds "
+                "every drain to its full ceiling, and this is the path Remote "
+                "Control's WebSocket takes")
+            assert proxy.live_client_count() == 1, (
+                "and it is still an OPEN connection, which teardown must close")
+
+            # AND THE DRAIN MUST SAY SO. This is the one state where the two
+            # counters disagree — one socket open, nothing owed — so it is the
+            # only place that can catch a message reporting open sockets as
+            # cut requests. That conflation is what put "cut 14 in-flight
+            # request(s)" in the log for fourteen sockets nobody was waiting on.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assert proxy.await_inflight(0.0) == 0, (
+                    "a tunnel owes nobody an answer, so cutting it costs "
+                    "nothing and must not be reported as a cut request")
+            assert "cut" not in err.getvalue(), err.getvalue()
+            assert "closed 1 idle connection(s)" in err.getvalue(), (
+                "the tunnel WAS closed and the line must account for it, or "
+                "the two counters go back to being one number: "
+                + err.getvalue())
+        finally:
+            for s_ in accepted + [client, conn, srv]:
+                try: s_.close()
+                except OSError: pass
+
+    def case_the_drain_line_measures_instead_of_quoting_its_budget(self, certdir):
+        """"after 30s" was the ARGUMENT, printed whether or not it was spent.
+
+            f"cut {cut} in-flight request(s) after {budget:.0f}s"
+
+        `budget` is the ceiling passed in. A drain that broke out in 20ms
+        printed the same "after 30s" as one that burned the whole thing, so the
+        one field that says whether the wait was real could not be read — and a
+        peer session correctly refused to conclude anything from it.
+
+        Here the drain returns at once (nothing is owed) on a large budget, and
+        the line must not claim the budget was spent.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        err = io.StringIO()
+        try:
+            # OPEN, OWING NOTHING, ON A LARGE BUDGET. The elapsed and the
+            # budget must DIFFER or the assertion cannot tell them apart —
+            # this case first drove `await_inflight(0.0)`, where `0.0` and
+            # `0.0` are the same string, and the mutation that put the budget
+            # back into the field passed it. A test whose two candidate values
+            # are equal is not a test.
+            with proxy._live_lock:
+                proxy._open_conns.add(a)
+            assert proxy.inflight_requests() == 0, "precondition: nothing owed"
+            with contextlib.redirect_stderr(err):
+                proxy.await_inflight(20.0)
+            line = err.getvalue()
+            assert "drained clean" in line, (
+                "a departure that cost nothing must still say so — silence "
+                "reads the same as a daemon that never drained: " + line)
+            assert "in 0.0s" in line, (
+                "the line quotes its budget rather than what it waited: " + line)
+            assert "20s budget" in line, (
+                "and it must still name the ceiling it did not need: " + line)
         finally:
             for s_ in (a, b):
                 try: s_.close()
