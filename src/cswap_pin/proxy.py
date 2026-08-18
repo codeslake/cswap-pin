@@ -5083,6 +5083,24 @@ def draining_owed(certdir: Path, pid: int) -> int:
         return _OWED_UNKNOWN
 
 
+def this_process_is_draining() -> bool:
+    """Has this daemon begun handing over?
+
+    Read from the same depth map `announce_draining` keeps, so it is true from
+    the moment a handover starts — before the drain, which is the window that
+    matters: both handover sites announce before the successor can exist.
+
+    OUR OWN MARKER, not any marker this process has written. The depth map is
+    keyed by marker path and a marker names a PID, so a process that announced
+    on somebody else's behalf — which only tests do, but the distinction is
+    free — must not answer yes for itself.
+    """
+    mine = f"{_DRAINING_PREFIX}{os.getpid()}"
+    with _DRAINING_LOCK:
+        return any(n > 0 for key, n in _DRAINING_DEPTH.items()
+                   if key.rsplit("/", 1)[-1] == mine)
+
+
 def is_draining(certdir: Path, pid: int) -> bool:
     """Has ``pid`` announced that it is draining and will leave on its own?
 
@@ -11726,6 +11744,25 @@ def _relay_response(
         # "1a\r\n" as body bytes, or to wait for a close that a keep-alive
         # upstream never sends. This IS our hop's encoding: re-declare it.
         out.append(b"Transfer-Encoding: chunked")
+    if keep and not interim and this_process_is_draining():
+        # A DEPARTING DAEMON STOPS TAKING NEW WORK, and until this line it did
+        # not. `release_listener` stops accepting new CONNECTIONS; nothing
+        # stopped accepting new REQUESTS on the keep-alives it already holds.
+        # So a predecessor shed arrivals and kept answering the mail
+        # indefinitely, and from the client's side nothing was wrong with the
+        # socket — measured on host-a 2026-08-18, eleven sessions whose ONLY
+        # path was a process that had stopped being the front door.
+        #
+        # NOTHING IS CUT. This reply completes normally; the header only says
+        # "do not send me another". The client then opens a fresh connection,
+        # which lands on the successor through the shared listener, so sessions
+        # migrate one completed reply at a time and one that is still thinking
+        # is untouched until its answer arrives.
+        #
+        # IT DOES NOT END THE DRAIN and is not meant to: a reply that never
+        # completes still holds, exactly as it must. This stops new work
+        # entering a departing process, which is the half that stranded people.
+        keep = False
     if not keep:
         # Connection is hop-by-hop too, and `close` was read into `keep` and
         # then dropped — so the proxy was about to close while the client
