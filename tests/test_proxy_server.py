@@ -3892,6 +3892,62 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_a_refcount_shutdown_is_not_a_recycle_and_not_a_signal(self, certdir):
+        """THE FOURTH EXIT PATH, found by fixing the other three.
+
+        Measured on lmd42, the 0.1.99 rollout, in this order:
+
+            08:04:18Z  handover — NO drain line at all. The departing daemon
+                       handed the port on and kept living, which is what
+                       `_HANDOVER_DRAIN_SECONDS` is for. Nothing cut.
+            08:08:18Z  `stopping (refcount)` on that same lingering daemon,
+                       cut 13 (13 mid-response, 0 before headers), 30s budget.
+
+        So the handover stopped costing anything and a shutdown four minutes
+        later cost the same as before. The cost was MOVED, not removed — which
+        is only visible because the other three were fixed first.
+
+        WHAT EACH ARM IS REALLY ASKING is who is waiting for this process to be
+        gone, and the three answers are genuinely different:
+
+          held      the holder cannot put the successor on the socket until we
+                    exit, so waiting is unserved port time
+          signal    a supervisor is counting `_DRAIN_SECONDS + 2` and then
+                    SIGKILLs. Waiting past that does not save a reply, it
+                    guarantees a harder kill partway through one
+          refcount  nobody is waiting at all: no successor, no supervisor, and
+                    the listener is already released so a fresh daemon could
+                    bind now
+
+        THE SIGNAL ROW IS THE ONE THAT MATTERS MOST, because "a shutdown is a
+        shutdown" would give it the long ceiling and make things WORSE than
+        before — a SIGKILL at 32 seconds cuts harder than an orderly drain.
+        """
+        from cswap_pin.proxy import (
+            teardown_drain_budget,
+            _DRAIN_SECONDS,
+            _HANDOVER_DRAIN_SECONDS,
+            _HELD_DRAIN_SECONDS,
+        )
+
+        assert teardown_drain_budget("refcount", False) == _HANDOVER_DRAIN_SECONDS, (
+            "a refcount shutdown cut 13 mid-response replies on the short "
+            "ceiling. Nobody is waiting for this process — no successor, no "
+            "supervisor — so the only cost of waiting is finishing what it owes")
+
+        assert teardown_drain_budget("signal TERM", False) == _DRAIN_SECONDS, (
+            "a signalled shutdown took the long ceiling. The supervisor "
+            "SIGKILLs at _DRAIN_SECONDS + 2, so draining past it cuts a reply "
+            "harder than an orderly drain would have")
+        assert teardown_drain_budget("signal INT", False) == _DRAIN_SECONDS
+
+        # HELD WINS OVER EVERY REASON, including refcount: the holder is
+        # blocked on our exit whatever brought us here.
+        assert teardown_drain_budget("refcount", True) == _HELD_DRAIN_SECONDS, (
+            "a held shutdown took a ceiling other than the held one — that is "
+            "unserved port time, however the shutdown started")
+        assert teardown_drain_budget("signal TERM", True) == _HELD_DRAIN_SECONDS
+
     def case_each_exit_path_drains_on_the_ceiling_that_fits_it(self, certdir):
         """THREE DRAINS, TWO SITUATIONS — and they were collapsed into one number.
 
