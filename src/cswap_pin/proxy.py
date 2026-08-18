@@ -4783,10 +4783,29 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
                 f"owing {'?' if owed == _OWED_UNKNOWN else owed} repl"
                 f"{'y' if owed == 1 else 'ies'} of which "
                 f"{'?' if live == _OWED_UNKNOWN else live} still being "
-                f"written. A drain that never ends is "
+                f"written, quiet for "
+                f"{_quiet_phrase(draining_quiet(certdir, pid))}. "
+                "A drain that never ends is "
                 "the leak the removed wall clock used to bound; this line is "
                 "the signal it happened")
             _kill_daemon(pid)
+
+
+def _quiet_phrase(secs: "float | None") -> str:
+    """How long the reaped daemon's worst reply had been silent, in words.
+
+    THREE STATES, NOT TWO. `draining_quiet` answers None for a marker written
+    by a version that did not record it, and that is not the same as 0.0 — a
+    predecessor from an older release must not read as the healthiest thing on
+    the box at the moment somebody decides to kill it.
+
+    This is `draining_quiet`'s production caller, and it exists because a
+    reader with no caller is a reader the next person deletes and then
+    re-derives from the marker by hand, one file over, slightly differently.
+    """
+    if secs is None:
+        return "an unknown time (older daemon, no such record)"
+    return f"{secs:.0f}s"
 
 
 def _collect_dead_markers(certdir: Path) -> None:
@@ -9105,7 +9124,6 @@ class PinProxy:
         # what separates a reply still being written from one that stopped and
         # is only being kept warm — see `_is_only_keepalive`. Cleared with the
         # debt, like `_delivered`.
-        self._content: dict = {}
         # WHEN CONTENT LAST REACHED THIS CLIENT — the clock `_content` counts
         # against. `now - this` is the interval `await_inflight` names as the
         # one measurement its refused stall predicate is waiting on, and it
@@ -9465,10 +9483,12 @@ class PinProxy:
         # It becomes decidable the day somebody measures the longest
         # content-free interval a live reply produces. The cut line records the
         # inputs for that now; nothing here guesses it.
-        with self._live_lock:
-            content_at_start = dict(self._content)
+        # NO SNAPSHOT. `live_replies` used to compare a per-connection COUNT
+        # against a copy of every count taken here; `_content_at` answers the
+        # same question directly, so the copy and the second dict it copied
+        # both go. One structure fewer to keep popped at three call sites.
         beat_draining(self._certdir, owed=self.inflight_requests(),
-                      live=self.live_replies(content_at_start),
+                      live=self.live_replies(started),
                       quiet=self.content_free_seconds())
         beat_at = started
         try:
@@ -9488,7 +9508,7 @@ class PinProxy:
                     if now - beat_at >= _DRAINING_BEAT_SECONDS:
                         beat_draining(
                             self._certdir, owed=self.inflight_requests(),
-                            live=self.live_replies(content_at_start),
+                            live=self.live_replies(started),
                             quiet=self.content_free_seconds())
                         beat_at = now
                     time.sleep(0.05)
@@ -9844,7 +9864,6 @@ class PinProxy:
                 self._open_conns.discard(conn)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
-                self._content.pop(conn, None)
                 self._content_at.pop(conn, None)
                 self._gap.pop(conn, None)
 
@@ -9895,7 +9914,7 @@ class PinProxy:
                 return True
         return False
 
-    def live_replies(self, content_at_start: dict) -> int:
+    def live_replies(self, started: float) -> int:
         """Owed connections that have delivered CONTENT since the drain began.
 
         NOT 'since the debt began'. Measured on lmd42 2026-08-18, the twelve
@@ -9916,10 +9935,8 @@ class PinProxy:
         is not a safe reason to stop waiting.
         """
         with self._live_lock:
-            return sum(
-                1 for conn in self._owed
-                if self._content.get(conn, 0) > content_at_start.get(conn, 0)
-            )
+            return sum(1 for conn in self._owed
+                       if self._content_at.get(conn, 0.0) > started)
 
     def _delivered_summary(self) -> str:
         """How many bytes each still-owed reply has actually delivered.
@@ -10115,7 +10132,6 @@ class PinProxy:
                 self._owed[conn] = time.monotonic()
                 self._delivered[conn] = self._delivered.get(conn, 0) + written
                 if content:
-                    self._content[conn] = self._content.get(conn, 0) + 1
                     # BANK THE GAP BEFORE OVERWRITING THE STAMP. The first
                     # version only read `now - _content_at` at COMPLETION, and
                     # `_note_reply_finished` runs one frame after the last
@@ -10180,7 +10196,6 @@ class PinProxy:
                 # is waiting for its next request starts the next one at zero,
                 # or a keep-alive would look busier the longer it lives.
                 self._delivered.pop(conn, None)
-                self._content.pop(conn, None)
                 self._content_at.pop(conn, None)
                 self._gap.pop(conn, None)
 
