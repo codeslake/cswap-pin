@@ -1683,6 +1683,71 @@ class TestEnsureCA:
             fresh.signature, fresh.tbs_certificate_bytes,
             padding.PKCS1v15(), fresh.signature_hash_algorithm)
 
+    def case_an_over_long_leaf_is_replaced_even_though_it_is_not_expiring(
+        self, tmp_path
+    ):
+        """THE CASE THAT REACHES THE MACHINES THAT ALREADY HAVE THE PROBLEM.
+
+        Capping `_LEAF_DAYS` only helps a cert that gets generated. Every
+        install already carrying a 3650-day leaf keeps it: `_certs_consistent`
+        asks about expiry, SAN and signature, and a 3650-day leaf passes all
+        three for another decade. So the fix would have shipped and changed
+        nothing on the two machines that actually fail — which is the whole
+        reason it exists.
+
+        An over-long leaf is not merely suboptimal, it is REJECTED by the
+        verifier this proxy has to satisfy, so "usable" has to mean short
+        enough as well. The CA is untouched: it is the client's trusted root and
+        it is not what macOS objects to.
+        """
+        import datetime as _dt
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cswap_pin.proxy import _LEAF_DAYS, _make_leaf
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        ca_before = (tmp_path / "ca.pem").read_bytes()
+        ca_cert = x509.load_pem_x509_certificate(ca_before)
+        ca_priv = serialization.load_pem_private_key(
+            (tmp_path / "ca.key").read_bytes(), password=None)
+
+        # A leaf exactly like the ones in the field: valid, correctly signed,
+        # right SAN, nowhere near expiry — and 3650 days long.
+        _, key = _make_leaf("api.anthropic.com", ca_cert, ca_priv)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        old = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(
+                x509.NameOID.COMMON_NAME, "api.anthropic.com")]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - _dt.timedelta(days=1))
+            .not_valid_after(now + _dt.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName(
+                [x509.DNSName("api.anthropic.com")]), critical=False)
+            .add_extension(x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                ca_cert.public_key()), critical=False)
+            .sign(ca_priv, hashes.SHA256())
+        )
+        (tmp_path / "leaf.pem").write_bytes(
+            old.public_bytes(serialization.Encoding.PEM))
+        (tmp_path / "leaf.key").write_bytes(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+
+        after = ensure_ca(tmp_path, "api.anthropic.com")
+        fresh = x509.load_pem_x509_certificate(after.leaf_path.read_bytes())
+        span = (fresh.not_valid_after_utc - fresh.not_valid_before_utc).days
+        assert span == _LEAF_DAYS + 1, (
+            f"the 3650-day leaf survived: still {span} days. Every machine that "
+            "already has one keeps failing on macOS.")
+        assert after.ca_path.read_bytes() == ca_before, (
+            "rotating an over-long leaf must not take the CA with it")
+
     def case_an_unusable_ca_still_replaces_both(self, tmp_path):
         """THE CONTROL, and the case the original comment was about. Without it,
         "keeps the CA" also passes on a version that never replaces a CA at all
