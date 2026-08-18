@@ -3959,11 +3959,27 @@ class TestDrainReportsWhatItCut:
                     time.sleep(0.1)
                 proxy2._owe_answer(c, False)     # the reply completed
 
+            # AND THE WIRING FOR THE BEAT, on the drain that actually loops.
+            # A marker refreshed by a function nothing calls is the fourth
+            # orphaned guard tonight; the drain is the only thing that knows
+            # it is still alive, so it is the only thing that can say so.
+            beats = []
+            real_beat = pp.beat_draining
+            monkeypatch.setattr(pp, "_DRAINING_BEAT_SECONDS", 0.05)
+            monkeypatch.setattr(
+                pp, "beat_draining",
+                lambda cd, pid=None: (beats.append(cd), real_beat(cd, pid))[1])
+
             threading.Thread(target=_stream, daemon=True).start()
             t0 = time.monotonic()
             with contextlib.redirect_stderr(io.StringIO()):
                 cut = proxy2.await_inflight(30.0)
             moving_wait = time.monotonic() - t0
+
+            assert len(beats) >= 3, (
+                f"the drain beat {len(beats)} time(s) while it waited a second "
+                "on a moving reply. Without the beat the marker goes stale on "
+                "its own TTL and the orphan sweep kills a daemon mid-reply")
 
             assert moving_wait > 0.8, (
                 f"the drain returned after {moving_wait:.2f}s while bytes were "
@@ -4092,6 +4108,32 @@ class TestDrainReportsWhatItCut:
                 "a real orphan must still be killed — a sweep that spares "
                 "everything is not a fix, it is a disabled sweep. "
                 f"killed={killed}")
+
+            # --- AND A PILE OF THEM IS A LEAK, which is the bound that
+            # replaces the wall clock. ONE predecessor lingering three hours
+            # on a box serving a three-hour reply is CORRECT behaviour, and a
+            # per-process clock cannot tell it from a leak. A count can. The
+            # quantity moved because the old one answered the wrong question,
+            # not because the number was too small.
+            killed.clear()
+            pids = list(range(5000, 5000 + pp._MAX_DRAINING_PREDECESSORS + 2))
+            pp._pin_daemon_pids = lambda certdir: list(pids)
+            for i, pid in enumerate(pids):
+                pp.announce_draining(certdir, pid)
+                # OLDEST LAST, against the order they are enumerated in. Ages
+                # ascending with the pid would make "take the first two" and
+                # "take the two oldest" the same answer, and the ordering —
+                # the only judgement this bound makes — would go untested.
+                pp.draining_marker_path(certdir, pid).write_text(
+                    str(time.time() - 1000 - i))
+
+            pp._sweep_orphan_daemons(certdir, keep_pid=999)
+
+            assert sorted(killed) == pids[-2:], (
+                "with no ceiling on a drain, nothing else bounds a drainer "
+                "that never finishes. Over the limit the sweep must take the "
+                "ones draining LONGEST, and only the excess. "
+                f"killed={killed}, oldest two are {pids[-2:]}")
         finally:
             pp._kill_daemon = real_kill
             pp._pin_daemon_pids = real_pids
@@ -4203,15 +4245,31 @@ class TestDrainReportsWhatItCut:
         """
         import cswap_pin.proxy as pp
 
+        import os
+
         pp.announce_draining(certdir, 4242)
         assert pp.is_draining(certdir, 4242) is True
 
-        # Backdate it past the ceiling plus a supervisor's slack.
+        # STALE MEANS UNTOUCHED, NOT OLD, and that distinction is the change.
+        # A handover drain has no ceiling any more, so age cannot mean
+        # abandoned — a drain that has run three hours because a reply has run
+        # three hours is healthy. Only silence separates them.
         path = pp.draining_marker_path(certdir, 4242)
-        path.write_text(str(time.time() - pp._DRAINING_MARKER_TTL - 1))
+        old_t = time.time() - pp._DRAINING_MARKER_TTL - 1
+        os.utime(path, (old_t, old_t))
         assert pp.is_draining(certdir, 4242) is False, (
-            "a marker older than the longest possible drain still protected a "
-            "pid — an orphan inheriting that number would never be swept")
+            "a marker nothing has touched since before the TTL still protected "
+            "a pid — an orphan inheriting that number would never be swept")
+
+        # AND A BEAT BRINGS IT BACK. This is what lets a drain outlive its own
+        # marker TTL: an hour-long reply keeps its protection by SAYING SO
+        # every few seconds, not by having been handed a big enough number in
+        # advance. Every number handed out in advance tonight was wrong.
+        pp.beat_draining(certdir, 4242)
+        assert pp.is_draining(certdir, 4242) is True, (
+            "a beat did not refresh the marker, so a long drain loses its "
+            "protection mid-reply and the sweep TERMs it — the 08:21:19Z line "
+            "again, with the clock moved from the drain into the marker")
 
         # AND AN UNWRITABLE MARKER MUST NOT BREAK THE DRAIN. Failing open here
         # means the outcome is exactly what it was before this existed; failing
@@ -4344,11 +4402,34 @@ class TestDrainReportsWhatItCut:
         )
 
         # AND THE NUMBERS THEMSELVES, or the names above are decoration.
-        assert pp._HANDOVER_DRAIN_SECONDS > pp._DRAIN_SECONDS, (
-            "the handover ceiling must exceed the supervisor's patience — it "
-            "is waiting for a streaming reply, not for a process to die")
+        #
+        # THE HANDOVER CEILING IS NOT A NUMBER ANY MORE, and no number can be
+        # right: 1800 cuts a 31-minute reply, 3600 cuts a 61-minute one, and
+        # this box runs subagent replies past an hour. Nothing waits on this
+        # process — the successor is already serving — so a clock buys nothing
+        # here and spends a reply every time it is wrong.
+        assert pp._HANDOVER_DRAIN_SECONDS == float("inf"), (
+            "the handover drain is capped by a clock again. A clock cannot "
+            "tell a slow reply from a wedged one; `_owed_still_moving` can, "
+            f"and it is what ends a healthy drain. Got "
+            f"{pp._HANDOVER_DRAIN_SECONDS}")
         assert pp._HELD_DRAIN_SECONDS <= pp._DRAIN_SECONDS, (
-            "the held ceiling holds the port dark, so it must not grow")
+            "the held ceiling holds the port dark, and the supervisor SIGKILLs "
+            "at `_DRAIN_SECONDS + 2` — raising it past that trades a logged "
+            "cut for an unlogged one")
+
+        # AND THE MARKER TTL MUST NOT FOLLOW THE CEILING. It was
+        # `_HANDOVER_DRAIN_SECONDS + 60`, which is now infinite — a marker
+        # that never expires spares whatever pid inherits the number, forever.
+        # Freshness comes from a beat instead, so this stays small.
+        assert pp._DRAINING_MARKER_TTL < 600.0, (
+            "the draining marker outlives its writer by "
+            f"{pp._DRAINING_MARKER_TTL}s. A SIGKILLed drainer cannot unlink "
+            "it, and pids are reused — that window is a real orphan wearing a "
+            "dead process's badge")
+        assert pp._DRAINING_BEAT_SECONDS * 3 < pp._DRAINING_MARKER_TTL, (
+            "the beat is too slow for the TTL it refreshes: a drain that is "
+            "alive and working would look abandoned between two beats")
 
     def case_the_blind_tunnel_gives_its_debt_back(self, certdir):
         """THE FOURTH UNREACHABLE ZERO, and it is the same connection as the first.
@@ -4467,6 +4548,21 @@ class TestDrainReportsWhatItCut:
                 "the line quotes its budget rather than what it waited: " + line)
             assert "20s budget" in line, (
                 "and it must still name the ceiling it did not need: " + line)
+
+            # AND WITH NO CEILING AT ALL it must say that, not print a float.
+            # "of a infs budget" reads as a number nobody can act on, and this
+            # is the one line a later session reads to decide whether a pin
+            # departure cost somebody a reply.
+            err2 = io.StringIO()
+            with contextlib.redirect_stderr(err2):
+                proxy.await_inflight(pp._HANDOVER_DRAIN_SECONDS)
+            line2 = err2.getvalue()
+            assert "inf" not in line2, (
+                "the drain line printed a raw infinity: " + line2)
+            assert "no wall-clock cap" in line2, (
+                "an uncapped drain must name that it is uncapped — otherwise "
+                "the log cannot tell it from one that had a budget and did "
+                "not spend it: " + line2)
         finally:
             for s_ in (a, b):
                 try: s_.close()
