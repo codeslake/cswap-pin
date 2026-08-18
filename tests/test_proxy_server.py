@@ -3624,6 +3624,92 @@ class TestDrainReportsWhatItCut:
             assert proxy.await_inflight(0.0) == 0
         assert "cut" not in err.getvalue(), err.getvalue()
 
+    def case_an_open_connection_with_no_request_does_not_hold_the_drain(self, certdir):
+        """THE DEADLINE MUST STOP FIRING EVERY TIME, and this is why it did.
+
+        The drain waited for the CONNECTION count to reach zero. It cannot:
+        Remote Control's WebSocket is opaque after the 101 and lives as long as
+        the session, so a connection is always open. The wait therefore always
+        ran to the full ceiling and then cut EVERYTHING still open — including a
+        `/v1/messages` stream that had started two seconds earlier. Measured on
+        host-a 2026-08-18: one code change produced two full swaps 70s apart and
+        three sessions took "API Error: Connection lost mid-response".
+
+        The pin's own comment had already written down the premise — "Remote
+        Control's WebSocket lives as long as the session does, so the count is
+        never zero" — and nobody followed it to the conclusion that the ceiling
+        is therefore paid in full on every single recycle.
+
+        A LONG-LIVED CONNECTION WITH NO REQUEST IN FLIGHT IS NOT WORK. So the
+        drain must count REQUESTS. Here: a connection is open, no request is in
+        flight, and the drain must return AT ONCE rather than burn the budget.
+        The budget is deliberately large so that a version still counting
+        connections cannot pass by being fast.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        try:
+            with proxy._live_lock:
+                proxy._open_conns.add(a)
+            # AND IT IS AN OPAQUE TUNNEL — that is what an RC WebSocket is
+            # after its 101, and it is the only kind of open connection that
+            # is not work. A bare open connection DOES hold the drain, and it
+            # must: `case_a_planned_restart_under_a_holder_loses_nothing`
+            # failed the moment a version stopped counting one, with "1
+            # requests connected and were never answered".
+            proxy._note_opaque_tunnel(True)
+            assert proxy.live_client_count() == 1, "precondition: a conn is open"
+            assert proxy.inflight_requests() == 0, (
+                "precondition: a tunnel owes nobody an answer")
+            started = time.monotonic()
+            with contextlib.redirect_stderr(io.StringIO()):
+                proxy.await_inflight(20.0)
+            waited = time.monotonic() - started
+            assert waited < 2.0, (
+                f"waited {waited:.1f}s for a connection carrying no request; "
+                "the drain is still counting connections, so an RC WebSocket "
+                "makes it pay the full ceiling on every recycle")
+        finally:
+            for s_ in (a, b):
+                try: s_.close()
+                except OSError: pass
+
+    def case_a_request_in_flight_holds_the_drain(self, certdir):
+        """THE OTHER HALF, and the one that must never regress to "fast".
+
+        Counting requests is only right if a request actually holds the drain.
+        Without this case, `await_inflight` could return immediately always and
+        the case above would still pass — which is the same "verified where it
+        cannot fail" shape as the drain line that reported a constant 0.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        try:
+            # A PLAIN OPEN CONNECTION IS A REQUEST IN FLIGHT. No tunnel mark,
+            # so this is a client that has been accepted and is owed an
+            # answer — a streaming `/v1/messages`, or one whose headers are
+            # still arriving. Both must hold the drain.
+            with proxy._live_lock:
+                proxy._open_conns.add(a)
+            assert proxy.inflight_requests() == 1
+            started = time.monotonic()
+            with contextlib.redirect_stderr(io.StringIO()):
+                proxy.await_inflight(1.0)
+            waited = time.monotonic() - started
+            assert waited >= 0.9, (
+                f"returned after {waited:.2f}s with a request in flight — a "
+                "streaming reply would be cut mid-response")
+        finally:
+            for s_ in (a, b):
+                try: s_.close()
+                except OSError: pass
+
 
 class TestTunnelIsOpen:
     """`_tunnel_is_open` on its own, with nothing racing.
@@ -4102,6 +4188,44 @@ class TestFailOpenIsNotSilent:
         body = log.read_text(encoding="utf-8")
         assert "UNPINNED" in body
         assert "cswap pin" in body
+
+    def case_the_cap_rotates_rather_than_deleting(self, certdir):
+        """THE INSTRUMENT MUST NOT BE DESTROYED BY THE EVENT IT DESCRIBES.
+
+        `_open_daemon_log` runs at DAEMON START, and past the size cap it used
+        to `unlink` the file. Daemon start is the instant a handover completes,
+        so the INCOMING daemon was deleting the OUTGOING daemon's teardown
+        record — the "drained, N" and "cut N in-flight request(s)" lines that
+        exist to say whether a recycle cost anyone their reply.
+
+        Measured 2026-08-18: three sessions took "API Error: Connection lost
+        mid-response" during a two-stage recycle, and the log covering it had
+        been unlinked 8 seconds in. A second question riding the same window —
+        who emptied `.claude.json`'s env block — could not be settled either,
+        by anyone, ever.
+
+        An empty log reads as "the daemon had nothing to say", which is why
+        this is worse than having no log at all.
+        """
+        from cswap_pin import proxy as pp
+
+        log = pp.daemon_log_path(certdir)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        marker = "THE-DEPARTING-DAEMONS-LAST-WORDS"
+        log.write_text(marker + "x" * (pp._LOG_MAX_BYTES + 1), encoding="utf-8")
+
+        handle = pp._open_daemon_log(certdir)
+        try:
+            assert log.stat().st_size < pp._LOG_MAX_BYTES, (
+                "the cap has to hold, or the log grows without bound")
+            kept = log.with_suffix(log.suffix + ".1")
+            assert kept.is_file(), (
+                "the previous generation was deleted, not rotated — the next "
+                "recycle's evidence dies with it")
+            assert marker in kept.read_text(encoding="utf-8", errors="replace"), (
+                "the rotated file does not carry what the old daemon wrote")
+        finally:
+            handle.close()
 
     def case_warns_only_once_per_daemon(self, certdir, monkeypatch):
         """A pinned session makes these calls continuously; a line each would

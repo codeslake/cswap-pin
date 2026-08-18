@@ -17,6 +17,7 @@ not a dependency.
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime as _dt
 import glob
 import itertools
@@ -1966,6 +1967,20 @@ def heal(backup_root: Path) -> bool:
         return False
 
 
+# How many times, and how far apart, `unwire_if_dead` asks before it strips a
+# wiring. Sized against a HANDOVER, not against a timeout: the measured gap on
+# host-a between "successor serving" and the second stage completing was under a
+# second each time, and the whole two-stage recycle spanned 70 s. Three probes
+# a second apart clear a single-stage blip outright and cost a genuinely dead
+# pin about two extra seconds at launch.
+#
+# Deliberately NOT sized to survive the full 70 s: a launch must never block
+# that long, and a pin that is dead for a minute SHOULD be unwired. The target
+# is the momentary gap, which is what was producing false positives.
+_UNWIRE_PROBES = 3
+_UNWIRE_PROBE_GAP = 1.0
+
+
 def unwire_if_dead(certdir: Path) -> bool:
     """Strip a pin wiring whose daemon is gone. True when it removed one.
 
@@ -2014,13 +2029,29 @@ def unwire_if_dead(certdir: Path) -> bool:
     # So ask the WIRING itself, which is the thing we are about to remove: if
     # the port it names still answers, something is serving on it and the
     # wiring is correct regardless of what any file says.
+    # ONE REFUSED CONNECT IS NOT DEATH, IT IS A MOMENT. A recycle can take the
+    # socket down and put it back within the same second, and a two-stage
+    # recycle does it twice — measured on host-a 2026-08-18, 70 seconds apart.
+    # A single 1 s probe landing in either gap reads "the pin is dead" and this
+    # function then strips the WHOLE env block, so every claude launched from
+    # then on runs unpinned, silently, until someone notices.
+    #
+    # That is what a live machine was found in that night: the pin healthy and
+    # serving on 36301, `env` empty, and nothing in any log able to say which
+    # of two implementations with identical clear-semantics had done it.
+    #
+    # So ask again, spaced past a handover rather than inside one. The cost of
+    # being slow here is a launch waiting a couple of seconds for a pin that
+    # really is dead; the cost of being fast is unpinning the machine.
     port = _wired_port()
     if port is not None:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                return False  # the wired address is live — do not touch it
-        except OSError:
-            pass
+        for attempt in range(_UNWIRE_PROBES):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    return False  # the wired address is live — do not touch it
+            except OSError:
+                if attempt + 1 < _UNWIRE_PROBES:
+                    time.sleep(_UNWIRE_PROBE_GAP)
 
     try:
         return wire_global_config(None, None)
@@ -4733,7 +4764,27 @@ def _open_daemon_log(certdir: Path):
     path = daemon_log_path(certdir)
     try:
         if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
-            path.unlink()
+            # ROTATE, NEVER UNLINK. This runs at DAEMON START, which is the
+            # instant a handover completes — so deleting here means the
+            # INCOMING daemon destroys the OUTGOING daemon's teardown record.
+            # The lines that say whether a recycle cost anything ("drained,
+            # N", "cut N in-flight request(s)") are written by the process
+            # that is dying, and were being erased by the one replacing it.
+            #
+            # Measured 2026-08-18: three sessions took "API Error: Connection
+            # lost mid-response" during a two-stage recycle, and the log that
+            # covered it had been unlinked 8 seconds into the swap. The window
+            # that would have named the cause was gone, and a second question
+            # that hung on the same window — who emptied `.claude.json`'s env
+            # block — could not be settled either.
+            #
+            # An instrument destroyed by the event it exists to describe is
+            # worse than no instrument, because the empty file reads as "the
+            # daemon had nothing to say".
+            try:
+                path.replace(path.with_suffix(path.suffix + ".1"))
+            except OSError:
+                path.unlink()  # rotation impossible; the cap still has to hold
         return open(path, "a", buffering=1, encoding="utf-8", errors="replace")
     except OSError:
         return subprocess.DEVNULL
@@ -8199,6 +8250,15 @@ class PinProxy:
         # them before the process exits — see the note there on why a drained
         # request still ends in RST without this.
         self._open_conns: set = set()
+        # REQUESTS IN FLIGHT, which is a different question from connections
+        # open, and it is the one a drain has to ask. A connection can be open
+        # for the whole session while carrying no work at all — Remote
+        # Control's WebSocket is opaque after the 101 and is pumped by the
+        # shared selector, not by a request thread. Counting connections made
+        # the drain wait for a zero that could never arrive, so it always ran
+        # to its ceiling and then cut whatever was open, including a reply that
+        # had started two seconds earlier.
+        self._opaque_tunnels = 0
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -8478,10 +8538,26 @@ class PinProxy:
         This is the only function that cuts, so it is the only place that can
         report every path, including ones written after today.
         """
+        # WAIT ON REQUESTS, NOT ON CONNECTIONS. This loop asked
+        # `live_client_count() == 0` and that zero is unreachable: Remote
+        # Control's WebSocket is opaque after the 101, is pumped by the shared
+        # selector rather than a request thread, and stays open for the whole
+        # session. So the condition never held, the full budget was always
+        # spent, and every recycle then cut everything open — including a
+        # `/v1/messages` reply that had started moments earlier.
+        #
+        # Measured on host-a 2026-08-18: one code change produced two complete
+        # swaps 70 s apart and three separate sessions took "API Error:
+        # Connection lost mid-response" inside that window.
+        #
+        # The premise was written down in this file long before the conclusion
+        # was: "Remote Control's WebSocket lives as long as the session does,
+        # so the count is never zero." It sat two constants above the loop that
+        # depended on the opposite.
         if budget > 0:
             deadline = time.monotonic() + budget
             while time.monotonic() < deadline:
-                if self.live_client_count() == 0:
+                if self.inflight_requests() == 0:
                     break
                 time.sleep(0.05)
         cut = self.live_client_count()
@@ -8774,6 +8850,65 @@ class PinProxy:
             if not detached:
                 _release()
             self._local.release = None
+
+    def inflight_requests(self) -> int:
+        """Connections that still owe somebody an answer.
+
+        OPEN CONNECTIONS MINUS OPAQUE TUNNELS, and each half of that was
+        learned from a failure.
+
+        Counting CONNECTIONS made the drain wait for a zero that cannot
+        arrive: Remote Control's WebSocket goes opaque after the 101, is
+        pumped by the shared selector rather than a request thread, and lives
+        as long as the session. So the wait always ran to its ceiling and then
+        cut everything open — including a `/v1/messages` reply that had
+        started seconds earlier. Measured on host-a 2026-08-18: one code change
+        produced two full swaps 70 s apart and three sessions took "API Error:
+        Connection lost mid-response".
+
+        Counting only the REQUEST/RESPONSE span was the over-correction, and
+        the suite caught it in one run:
+        `case_a_planned_restart_under_a_holder_loses_nothing` failed with "1
+        requests connected and were never answered", and the log said exactly
+        why — `cut 1 in-flight request(s) after 0s`. A client that has been
+        accepted but has not yet sent its request line is not visible to a
+        span that begins at the request line, so the drain returned instantly
+        and dropped it. Accepted IS owed an answer.
+
+        Subtracting tunnels keeps both properties: a fresh connection counts
+        from the moment it is accepted, and a WebSocket stops counting the
+        moment it stops being work.
+        """
+        with self._live_lock:
+            return max(0, len(self._open_conns) - self._opaque_tunnels)
+
+    @contextlib.contextmanager
+    def _request_in_flight(self):
+        """Kept for tests that drive the counter directly.
+
+        The real accounting is `inflight_requests()`: open connections minus
+        opaque tunnels. This raises the visible count by one for the duration
+        of the block, by pretending one fewer tunnel — so a test can assert
+        "a request in flight holds the drain" without opening a socket.
+        """
+        with self._live_lock:
+            self._opaque_tunnels -= 1
+        try:
+            yield
+        finally:
+            with self._live_lock:
+                self._opaque_tunnels += 1
+
+    def _note_opaque_tunnel(self, opened: bool) -> None:
+        """A connection became (or stopped being) an opaque byte tunnel.
+
+        Called at the 101 handover and again when the pump gives the sockets
+        back. A tunnel is still an OPEN CONNECTION — it must be closed on
+        teardown like any other — but it is not WORK, and a drain that treats
+        it as work waits for a zero that never comes.
+        """
+        with self._live_lock:
+            self._opaque_tunnels += 1 if opened else -1
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
@@ -9457,6 +9592,9 @@ class PinProxy:
         request_line = _read_line(tls)
         if not request_line:
             return False
+        return self._handle_one_request_inner(request_line, tls)
+
+    def _handle_one_request_inner(self, request_line: str, tls: ssl.SSLSocket) -> bool:
         _parts = request_line.split(" ")
         method, path = _parts[0], _parts[1] if len(_parts) > 1 else "/"
         headers: list[tuple[str, str]] = []
@@ -9666,11 +9804,34 @@ class PinProxy:
                     # Control WebSocket, which stays open for the whole
                     # session — the single longest-lived thing the pin holds.
                     self._local.up = None  # the pump owns it now
-                    _pump_detached(up, client, getattr(self._local, "release", None))
+                    # STOPS BEING WORK HERE. From the 101 on, this connection
+                    # carries no request the daemon can finish — it is two
+                    # sockets being copied into each other for the life of the
+                    # session. A drain that counts it waits for a zero that
+                    # never arrives, pays its whole ceiling on every recycle,
+                    # and then cuts whatever else was open. It is still an OPEN
+                    # connection and is still closed on teardown; it is simply
+                    # not something to wait for.
+                    self._note_opaque_tunnel(True)
+                    release = getattr(self._local, "release", None)
+
+                    def _release_tunnel():
+                        # Give the tunnel back BEFORE the connection, so the
+                        # two counters can never cross and leave
+                        # `inflight_requests()` reading negative.
+                        self._note_opaque_tunnel(False)
+                        if release:
+                            release()
+
+                    _pump_detached(up, client, _release_tunnel)
                     self._local.detached = True
                     return False
                 self._drop_upstream()
                 return False
+            # COUNTED BY THE CALLER, around the whole request — see
+            # `_handle_one_request`. Counting only from here reported zero for
+            # a request still being read or written upstream, and the drain
+            # then cut it "after 0s".
             return _relay_response(
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
