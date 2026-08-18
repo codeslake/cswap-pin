@@ -1579,6 +1579,121 @@ class TestEnsureCA:
             ) as tls:
                 tls.send(b"hi")  # handshake completed if we get here
 
+    def case_the_leaf_is_under_apples_cap_and_the_ca_is_not(self, tmp_path):
+        """macOS rejects the leaf outright, and no amount of trust repairs it.
+
+        Measured 2026-08-18 on host-c — same proxy, same certificate,
+        three verifiers:
+
+            stdlib, default trust     CERTIFICATE_VERIFY_FAILED
+            stdlib, our CA bundle     HTTP 401   <- TLS SUCCEEDED
+            truststore (OS native)    "certificate is not standards compliant"
+
+        Row 2 proves the OpenSSL path only ever needed trust. Row 3 rejects the
+        identical certificate WITH that trust available, because Apple has
+        capped TLS *server* certificate lifetime at 398 days since September
+        2020 and this leaf was issued for 3650. cswap injects truststore, so
+        row 3 is the path that actually runs on a Mac.
+
+        The CA is asserted LONG on purpose: the cap is on server certificates,
+        and a CA that rotated with the leaf would take every already-wired
+        session's trust with it.
+        """
+        b = ensure_ca(tmp_path, "api.anthropic.com")
+        leaf = x509.load_pem_x509_certificate(b.leaf_path.read_bytes())
+        ca = x509.load_pem_x509_certificate(b.ca_path.read_bytes())
+        leaf_days = (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days
+        ca_days = (ca.not_valid_after_utc - ca.not_valid_before_utc).days
+        # STRICTLY under, not equal. `_make_leaf` backdates not_valid_before by
+        # a day, so the span Apple measures is `_LEAF_DAYS + 1` — setting the
+        # constant to 397 produced a 398-day certificate sitting exactly on the
+        # cap with no room for a clock skew either side. Measured by generating
+        # one and reading its own dates back, which is why this asserts the SPAN
+        # and not the constant.
+        assert leaf_days < 398, (
+            f"leaf lives {leaf_days} days; Security.framework rejects anything "
+            "over 398 as 'not standards compliant', and landing exactly on the "
+            "cap leaves no margin for clock skew")
+        assert ca_days > 398, (
+            f"CA lives {ca_days} days — a CA that rotates with the leaf takes "
+            "every already-wired session's trust with it")
+
+    def case_a_leaf_near_expiry_is_reissued_under_the_SAME_ca(self, tmp_path):
+        """THE HALF THAT MAKES A SHORT LEAF SAFE.
+
+        `ensure_ca` regenerated BOTH whenever either was near expiry. At 3650
+        days that fires once a decade and nobody notices; at 397 it fires every
+        year, and a new CA breaks every session already wired to the old one —
+        the one thing the pin must never do.
+
+        The comment that justified regenerating both argues the REVERSE case (a
+        CA that must be replaced cannot keep its leaf). A leaf can always be
+        re-issued from a CA that is still good.
+        """
+        import datetime as _dt
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cswap_pin.proxy import _make_leaf
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        ca_before = (tmp_path / "ca.pem").read_bytes()
+        ca_cert = x509.load_pem_x509_certificate(ca_before)
+        ca_priv = serialization.load_pem_private_key(
+            (tmp_path / "ca.key").read_bytes(), password=None)
+
+        # Age ONLY the leaf into the 30-day renewal window, signed by the same
+        # CA, so the fixture differs from production in exactly one variable.
+        stale, stale_key = _make_leaf("api.anthropic.com", ca_cert, ca_priv)
+        stale = (
+            x509.CertificateBuilder()
+            .subject_name(stale.subject)
+            .issuer_name(ca_cert.subject)
+            .public_key(stale_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_dt.datetime.now(_dt.timezone.utc)
+                              - _dt.timedelta(days=1))
+            .not_valid_after(_dt.datetime.now(_dt.timezone.utc)
+                             + _dt.timedelta(days=5))
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.DNSName("api.anthropic.com")]), critical=False)
+            .add_extension(x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    ca_cert.public_key()), critical=False)
+            .sign(ca_priv, hashes.SHA256())
+        )
+        (tmp_path / "leaf.pem").write_bytes(
+            stale.public_bytes(serialization.Encoding.PEM))
+        (tmp_path / "leaf.key").write_bytes(stale_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+
+        after = ensure_ca(tmp_path, "api.anthropic.com")
+        assert after.ca_path.read_bytes() == ca_before, (
+            "the CA was regenerated for a LEAF-only expiry — every wired "
+            "session's trust just broke")
+        fresh = x509.load_pem_x509_certificate(after.leaf_path.read_bytes())
+        assert fresh.not_valid_after_utc > stale.not_valid_after_utc, (
+            "the near-expiry leaf was left in place")
+        # "Same CA" must be true of the SIGNATURE, not merely of the file.
+        ca_cert.public_key().verify(
+            fresh.signature, fresh.tbs_certificate_bytes,
+            padding.PKCS1v15(), fresh.signature_hash_algorithm)
+
+    def case_an_unusable_ca_still_replaces_both(self, tmp_path):
+        """THE CONTROL, and the case the original comment was about. Without it,
+        "keeps the CA" also passes on a version that never replaces a CA at all
+        — which would leave a dead root in place forever."""
+        ensure_ca(tmp_path, "api.anthropic.com")
+        ca_before = (tmp_path / "ca.pem").read_bytes()
+        (tmp_path / "ca.key").write_bytes(b"-----BEGIN PRIVATE KEY-----\nrot\n")
+
+        after = ensure_ca(tmp_path, "api.anthropic.com")
+        assert after.ca_path.read_bytes() != ca_before, (
+            "a CA whose key cannot be loaded was kept")
 
 class TestResolvePinToken:
     """resolve_pin_token returns a LIVE access token for the pinned account,
