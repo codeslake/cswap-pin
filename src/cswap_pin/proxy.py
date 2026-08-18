@@ -1330,105 +1330,6 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
     return carries_us
 
 
-def _cert_der_set(body: bytes) -> set:
-    """DER of every certificate in a PEM blob, as a set.
-
-    Built on this file's own `_pem_blocks` rather than a second scanner: that
-    one already knows about welded BEGINs and fused ENDs, and the comment on
-    it says why two scanners drift apart. A SET of DER, not a count: measured
-    on via-work-mac, the bundle holds 167 certs against a 128-cert store and
-    is still missing 27 of them, so "bigger" is not "contains".
-    """
-    out = set()
-    for label, _head, _end, block in _pem_blocks(body):
-        if label is None:
-            continue
-        cert = _load_cert(block)
-        if cert is not None:
-            out.add(cert.public_bytes(serialization.Encoding.DER))
-    return out
-
-
-def _ambient_store() -> "Path | None":
-    """The FILE this interpreter verifies against, or None if none is nameable.
-
-    `SSL_CERT_FILE` replaces a FILE; `SSL_CERT_DIR` covers the directory. So
-    what can be LOST is whatever file OpenSSL would have read, and
-    `get_default_verify_paths().cafile` is only sometimes that file. Measured
-    on the interpreter that actually runs cswap (the uv tool env), all three
-    machines:
-
-        lambda-docker     cafile None  -> capath/ca-certificates.crt (124)
-        via-work-mac      cafile /private/etc/ssl/cert.pem (128)
-        via-personal-mac  cafile /private/etc/ssl/cert.pem (128)
-
-    Reading `.cafile` alone returns None on lambda-docker — the one machine
-    where the fix is needed — so the change would ship as a NO-OP there.
-    Giving up on macOS "because the keychain is not a file" is the mirror
-    error: macOS ships an OpenSSL-format export at that path. (The keychain is
-    what `truststore` reads, a different path that never consults this
-    variable.)
-    """
-    vp = ssl.get_default_verify_paths()
-    for cand in (vp.cafile, vp.openssl_cafile):
-        if cand and os.path.exists(cand):
-            return Path(cand)
-    capath = vp.capath or vp.openssl_capath
-    if capath:
-        for name in ("ca-certificates.crt", "ca-bundle.crt", "cert.pem"):
-            cand = Path(capath) / name
-            if cand.exists():
-                return cand
-    return None
-
-
-def _python_trust_file(ca_path: Path, node_bundle: "Path | str | None") -> "Path | None":
-    """The file to name in ``SSL_CERT_FILE``, or None to leave it unset.
-
-    THE MERGED BUNDLE, NEVER OUR OWN CA, AND ONLY WHEN IT PROVABLY SUBSUMES
-    THE STORE IT REPLACES. ``NODE_EXTRA_CA_CERTS`` ADDS to node's built-in
-    roots; ``SSL_CERT_FILE`` REPLACES OpenSSL's file. Measured: a context
-    holding 136 CAs drops to 1 when SSL_CERT_FILE names a one-certificate
-    file. Exporting `ca.pem` would leave a python client trusting our proxy
-    and nothing else on the internet.
-
-    "USE THE MERGED BUNDLE" IS NOT ENOUGH EITHER, and this is the part three
-    sessions agreed on before anyone measured it. The merged bundle is a
-    superset of the ambient roots only where an ambient store was merged IN.
-    Measured against each machine's own interpreter, by certificate SET:
-
-        lambda-docker     ambient 124   bundle 126   subsumes YES -> written
-        via-work-mac      ambient 128   bundle 167   subsumes NO, 27 missing -> refused
-        via-personal-mac  ambient 128   bundle   2   subsumes NO, 128 missing -> refused
-
-    via-work-mac is the case a count-based check cannot see: the bundle is
-    BIGGER than the store it would replace and still not a superset. And
-    via-personal-mac has no corporate bundle to merge, so its "merged" file is
-    just the two component CAs — writing it there is the lone-CA bug wearing a
-    safer name.
-
-    So the gate is subsumption, not the file's name and not a platform test.
-    It lands where it is provable, which is where the failures are, and stays
-    silent where it is not.
-    """
-    if not node_bundle:
-        return None
-    bundle = Path(node_bundle)
-    body = _read_or_empty(bundle)
-    if not body.strip() or not _carries(body, Path(ca_path)):
-        # Not a bundle that trusts the hop we terminate against.
-        return None
-    ambient = _ambient_store()
-    if ambient is None:
-        return None
-    system = _read_or_empty(ambient)
-    if not system.strip() or not _cert_der_set(system) <= _cert_der_set(body):
-        # Unset fails only against the pin; a non-superset fails against
-        # everything else.
-        return None
-    return bundle
-
-
 def _trust_file(ca_path: Path, existing: str | None) -> Path:
     """The single file to name in ``NODE_EXTRA_CA_CERTS``.
 
@@ -1979,8 +1880,16 @@ def heal(backup_root: Path) -> bool:
 # wiring. Sized against a HANDOVER, not against a timeout: the measured gap on
 # lmd42 between "successor serving" and the second stage completing was under a
 # second each time, and the whole two-stage recycle spanned 70 s. Three probes
-# a second apart clear a single-stage blip outright and cost a genuinely dead
-# pin about two extra seconds at launch.
+# a second apart clear a single-stage blip outright.
+#
+# WHAT IT COSTS A DEAD PIN, and it is not one number. A REFUSED connect — the
+# loopback case, and what "dead" normally looks like — returns at once, so the
+# cost is the two gaps: about two seconds. A BLACKHOLED port, which is a stale
+# wiring pointing at something a firewall rule or a wedged listener owns, burns
+# each probe's full `timeout=1` as well: 3 x 1 s of connect plus 2 x 1 s of gap
+# is five. That second shape is exactly the state this function exists to clean
+# up, so it is the one to size against, and it lands on the interactive path of
+# every session start.
 #
 # Deliberately NOT sized to survive the full 70 s: a launch must never block
 # that long, and a pin that is dead for a minute SHOULD be unwired. The target
@@ -2234,10 +2143,10 @@ def _wire_global_config_locked(
         }
         # NO SSL_CERT_FILE. NOT "gated better" — NOT WRITTEN AT ALL.
         #
-        # This used to write it behind `_python_trust_file`, a subsumption gate
-        # comparing certificate SETS. The gate was correct and still the wrong
-        # shape, for two reasons that only appeared once two independent
-        # implementations were compared:
+        # This used to write it behind a subsumption gate comparing certificate
+        # SETS — `_python_trust_file`, DELETED, so do not go looking for it.
+        # The gate was correct and still the wrong shape, for two reasons that
+        # only appeared once two independent implementations were compared:
         #
         #   A PROOF GOES STALE. It holds at the moment of writing. The store it
         #   proved against can be replaced by MDM, become unreadable, or simply
@@ -4033,25 +3942,48 @@ def server_generated_titles() -> set[str]:
         transcripts = list(projects.rglob("*.jsonl"))
     except OSError:
         return titles
+    # STREAMED, NOT MATERIALISED. This read each file whole with
+    # `read_text()`. Measured on this account: 11,584 transcripts totalling
+    # 11 GB, the largest single file 422 MB — which becomes one str of that
+    # size, and then `splitlines()` builds a list on top of it. A transcript
+    # is one JSON record per line, so a line at a time answers the same
+    # question in bounded memory.
+    chosen: set[str] = set()
     for path in transcripts:
         try:
-            body = path.read_text(encoding="utf-8", errors="replace")
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"ai-title"' in line:
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        if rec.get("type") == "ai-title":
+                            t = (rec.get("aiTitle") or "").strip()
+                            if t:
+                                titles.add(t)
+                    elif '"custom-title"' in line:
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        if rec.get("type") == "custom-title":
+                            t = (rec.get("customTitle") or "").strip()
+                            if t:
+                                chosen.add(t)
         except OSError:
             continue
-        if '"ai-title"' not in body:
-            continue
-        for line in body.splitlines():
-            if '"ai-title"' not in line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if rec.get("type") == "ai-title":
-                t = (rec.get("aiTitle") or "").strip()
-                if t:
-                    titles.add(t)
-    return titles
+    # A NAME SOMEBODY TYPED IS NEVER THE SERVER'S, whatever else matched. The
+    # set is machine-global and all-time, so a title a user chooses can
+    # collide with an `aiTitle` written months ago under an unrelated project
+    # — and this function's own docstring says that direction is the
+    # unacceptable one, because a false positive OVERWRITES a name somebody
+    # typed while a false negative only leaves one wrong.
+    #
+    # Claude Code records the two in different fields for exactly this
+    # distinction, so the veto costs nothing beyond reading a second record
+    # type out of the walk that is already open.
+    return titles - chosen
 
 
 def _looks_generated(title: str) -> bool:
@@ -4092,13 +4024,22 @@ def _host_slug() -> str:
     `lambda-docker`, `seca2033000822`, `mbpm1p-saic` — measured from the
     titles this account actually received. Lowercased, non-alphanumerics to
     hyphens, which is what produced those three from the real hostnames.
+
+    THE DOMAIN GOES FIRST, and for a while it went nowhere. This ended with
+    `slug.split(".")[0]`, run AFTER a regex that has already replaced every
+    `.` with a `-` — so it could never match anything and an FQDN hostname
+    slugified whole: `MBPm1p-SAIC.local` -> `mbpm1p-saic-local`.
+    `gethostname()` returning an FQDN is routine on macOS and on any
+    DNS-suffixed Linux box, and `mbpm1p-saic` above is what the SERVER
+    produced from that same machine, so the anchor stopped matching the slug
+    it is anchored to and the restore silently did nothing there — with no
+    log line to separate it from "nothing to do".
     """
     try:
         raw = socket.gethostname()
     except OSError:
         return ""
-    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
-    return slug.split(".")[0]
+    return re.sub(r"[^a-z0-9]+", "-", raw.split(".")[0].lower()).strip("-")
 
 
 def should_wait_for_pin(method: str, path: str) -> bool:
@@ -4143,9 +4084,16 @@ def titles_to_restore(
     rewriting titles that already match would put one PUT per live session on
     the wire every time any one of them opens a bridge.
     """
-    # READ ONCE, not per item. This walks every transcript on the machine, and
-    # the loop below runs over the whole listing on every RC connect.
-    generated = server_generated_titles()
+    # READ ONCE, AND ONLY IF SOMETHING ASKS. This walks every transcript on
+    # the machine — 11,584 files, 11 GB, measured — and it ran unconditionally
+    # on every Remote Control connect, above the two filters that reject
+    # almost everything. The set is consulted only for a session whose server
+    # title DIFFERS from its local name, which on a healthy machine is none of
+    # them, so the whole walk was being paid for an answer nobody read.
+    #
+    # Still once per call, not per item: the loop below runs over the entire
+    # listing, and that is what the original comment here was protecting.
+    generated: set[str] | None = None
     out: list[tuple[str, str]] = []
     for item in sessions:
         sid = item.get("id")
@@ -4170,6 +4118,8 @@ def titles_to_restore(
         #   no local record.
         # Anything else is a human's words — including a human's words that
         # happen to look like a slug, which no regex can tell apart.
+        if generated is None:
+            generated = server_generated_titles()
         if current not in generated and not _looks_generated(current):
             continue
         out.append((sid, want.strip()))
@@ -5178,8 +5128,22 @@ def _open_daemon_log(certdir: Path):
             # An instrument destroyed by the event it exists to describe is
             # worse than no instrument, because the empty file reads as "the
             # daemon had nothing to say".
+            #
+            # TWO GENERATIONS, because one is destroyed by the same event.
+            # `_open_daemon_log` runs in the SPAWNING process before the child
+            # starts, so it renames the inode the OUTGOING daemon still holds
+            # as stderr — its `cut N` / `drained clean` lines land in `.1`.
+            # A recycle is two-stage (measured 70 s apart), and if the second
+            # stage also finds the log over the cap it rotates again and
+            # overwrites `.1` with the first stage's teardown record still in
+            # it. That is the same "instrument destroyed by the event it
+            # describes" one generation further out.
             try:
-                path.replace(path.with_suffix(path.suffix + ".1"))
+                older = path.with_suffix(path.suffix + ".2")
+                previous = path.with_suffix(path.suffix + ".1")
+                if previous.exists():
+                    previous.replace(older)
+                path.replace(previous)
             except OSError:
                 path.unlink()  # rotation impossible; the cap still has to hold
         return open(path, "a", buffering=1, encoding="utf-8", errors="replace")
@@ -8897,7 +8861,6 @@ class PinProxy:
         # the drain wait for a zero that could never arrive, so it always ran
         # to its ceiling and then cut whatever was open, including a reply that
         # had started two seconds earlier.
-        self._opaque_tunnels = 0
         # Connections that owe an answer right now — see `inflight_requests`,
         # which is the only reader, and `_owe_answer`, the only writer.
         # conn -> whether any response byte has reached that client yet.
@@ -9674,6 +9637,21 @@ class PinProxy:
         them (`cut 4 in-flight request(s) after 5s (4 mid-response, 0 before
         headers)`), and its counts were the only ones defensible as
         user-visible while ours said "a reply MAY have ended mid-stream".
+        
+        NOT MOVED OFF `_live_lock`, and it was raised as a hot-path
+        contention: this runs per `sendall`, and the lock is also taken by
+        `accept`, `live_client_count`, `_owed_still_moving`,
+        `inflight_requests` and `_close_open_connections`. What it holds the
+        lock FOR is one dict item assignment.
+
+        Measured on lmd42 2026-08-18, a departing daemon with 24 established
+        connections: ~31 bytes/s in total, one 39-byte frame roughly every
+        second across the whole set. That is the shape this path actually sees
+        between token bursts, and it is nowhere near contention. An unlocked
+        write is not free either — the entry can be popped concurrently by
+        `_owe_answer`, and resurrecting a removed connection is a leak in the
+        set the drain reads. Change it when a profile shows the lock, not
+        because the shape looks expensive.
         """
         with self._live_lock:
             if conn in self._owed:
@@ -9706,65 +9684,6 @@ class PinProxy:
                 self._owed.setdefault(conn, 0.0)
             else:
                 self._owed.pop(conn, None)
-
-    def _unused_legacy_inflight(self) -> int:
-        """The previous definition, kept only to document what it counted.
-
-        OPEN CONNECTIONS MINUS OPAQUE TUNNELS, and each half of that was
-        learned from a failure.
-
-        Counting CONNECTIONS made the drain wait for a zero that cannot
-        arrive: Remote Control's WebSocket goes opaque after the 101, is
-        pumped by the shared selector rather than a request thread, and lives
-        as long as the session. So the wait always ran to its ceiling and then
-        cut everything open — including a `/v1/messages` reply that had
-        started seconds earlier. Measured on lmd42 2026-08-18: one code change
-        produced two full swaps 70 s apart and three sessions took "API Error:
-        Connection lost mid-response".
-
-        Counting only the REQUEST/RESPONSE span was the over-correction, and
-        the suite caught it in one run:
-        `case_a_planned_restart_under_a_holder_loses_nothing` failed with "1
-        requests connected and were never answered", and the log said exactly
-        why — `cut 1 in-flight request(s) after 0s`. A client that has been
-        accepted but has not yet sent its request line is not visible to a
-        span that begins at the request line, so the drain returned instantly
-        and dropped it. Accepted IS owed an answer.
-
-        Subtracting tunnels keeps both properties: a fresh connection counts
-        from the moment it is accepted, and a WebSocket stops counting the
-        moment it stops being work.
-        """
-        with self._live_lock:
-            return max(0, len(self._open_conns) - self._opaque_tunnels)
-
-    @contextlib.contextmanager
-    def _request_in_flight(self):
-        """Kept for tests that drive the counter directly.
-
-        The real accounting is `inflight_requests()`: open connections minus
-        opaque tunnels. This raises the visible count by one for the duration
-        of the block, by pretending one fewer tunnel — so a test can assert
-        "a request in flight holds the drain" without opening a socket.
-        """
-        with self._live_lock:
-            self._opaque_tunnels -= 1
-        try:
-            yield
-        finally:
-            with self._live_lock:
-                self._opaque_tunnels += 1
-
-    def _note_opaque_tunnel(self, opened: bool) -> None:
-        """A connection became (or stopped being) an opaque byte tunnel.
-
-        Called at the 101 handover and again when the pump gives the sockets
-        back. A tunnel is still an OPEN CONNECTION — it must be closed on
-        teardown like any other — but it is not WORK, and a drain that treats
-        it as work waits for a zero that never comes.
-        """
-        with self._live_lock:
-            self._opaque_tunnels += 1 if opened else -1
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
@@ -10436,17 +10355,35 @@ class PinProxy:
         self._local.conn = conn
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
         self._local.detached = False
+        served_one = False
         try:
             while True:
-                # THE DEBT BOUNDARY. Between requests this connection is a
+                # THE DEBT BOUNDARY. BETWEEN requests this connection is a
                 # keep-alive socket nobody is waiting on, so it must not hold
                 # a drain — that was the third unreachable zero, measured as
                 # `cut 1 in-flight request(s) after 30s` with the reply long
                 # since delivered. `_read_line` inside then blocks until the
                 # next request line arrives, and the debt is taken back up the
                 # moment one does.
-                self._owe_answer(conn, False)
+                #
+                # BETWEEN, NOT BEFORE THE FIRST. This ran on every iteration
+                # including the first, which is one frame after `accept` took
+                # the debt precisely so a client whose request line is still
+                # in the kernel buffer is not dropped ("1 requests connected
+                # and were never answered", measured). Clearing it here undid
+                # that for every MITM'd connection: CONNECT parsed, TLS up,
+                # request on the wire, and `inflight_requests()` reporting
+                # zero. The accept-time debt now survives until this
+                # connection has actually answered something.
+                #
+                # It cannot strand the drain either: a connection owed but
+                # never written to is measured from the drain's own start by
+                # `_owed_still_moving`, so a client that connects and says
+                # nothing drops out after the stall window.
+                if served_one:
+                    self._owe_answer(conn, False)
                 got_one = self._handle_one_request(tls, conn)
+                served_one = True
                 if not got_one:
                     break
         finally:
@@ -10687,7 +10624,6 @@ class PinProxy:
                     # and then cuts whatever else was open. It is still an OPEN
                     # connection and is still closed on teardown; it is simply
                     # not something to wait for.
-                    self._note_opaque_tunnel(True)
                     # A TUNNEL OWES NOTHING. Nobody is waiting on a reply here
                     # — two sockets are being copied into each other for the
                     # life of the session. This is the RC WebSocket, and it is
@@ -10698,10 +10634,6 @@ class PinProxy:
                     release = getattr(self._local, "release", None)
 
                     def _release_tunnel():
-                        # Give the tunnel back BEFORE the connection, so the
-                        # two counters can never cross and leave
-                        # `inflight_requests()` reading negative.
-                        self._note_opaque_tunnel(False)
                         if release:
                             release()
 
@@ -11254,8 +11186,8 @@ class PinProxy:
         # before the drain was "fixed".
         #
         # THE FIX LANDED ON THE OTHER PATH. `_mitm` clears the debt at its 101
-        # handover, beside `_note_opaque_tunnel(True)`, and that is where I put
-        # it. But this function's own docstring says where RC actually goes:
+        # handover, and that is where I put it. But this function's own
+        # docstring says where RC actually goes:
         # "Remote Control receives over a WebSocket to the ingress host the
         # /bridge response names — NOT api.anthropic.com — so it lands here,
         # not in the MITM." The premise was written down twelve lines up from
@@ -11264,15 +11196,11 @@ class PinProxy:
         # Measured on lmd42 2026-08-18: 0.1.93, 0.1.94 and 0.1.96 all produced
         # `cut N in-flight request(s) after 30s` on departure — identical
         # signature across three versions, because none of them cleared this.
-        self._note_opaque_tunnel(True)
         _c = getattr(self._local, "conn", None) or conn
         self._owe_answer(_c, False)
         release = getattr(self._local, "release", None)
 
         def _release_tunnel():
-            # Tunnel first, then the connection — the same order `_mitm` uses,
-            # so the two counters can never cross.
-            self._note_opaque_tunnel(False)
             if release:
                 release()
 
@@ -11634,18 +11562,25 @@ def _relay_response(
         # answer and left the 200 in the buffer, so the next request read a
         # stale response. Forward it and loop for the final status.
         _send_head(b"\r\n".join(out) + b"\r\n\r\n")
+        # `client` IS ALREADY THE WRAPPER by the time we get here, so the
+        # recursion must not ask for a second one: passing both the wrapped
+        # socket and the callback nested a `_StampingWriter` per interim
+        # response, and every write then walked the chain stamping once per
+        # layer. Two 103 Early Hints gave three. The stamp is already in the
+        # chain — one wrapper per response is the whole point of wrapping at
+        # the top rather than at each `sendall` site.
         if rest:
             # Bytes already read past this head belong to the next response;
             # they cannot be pushed back, so hand them to the recursion.
             return _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
-                on_headers=on_headers,
+                on_headers=None,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
-            on_headers=on_headers,
+            on_headers=None,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send

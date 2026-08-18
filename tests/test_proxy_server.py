@@ -4001,6 +4001,60 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_the_accept_debt_survives_until_the_first_answer(self, certdir):
+        """THE ACCEPT-TIME OWE WAS UNDONE ONE FRAME LATER.
+
+        `accept` marks a connection OWED because a client that has connected
+        is waiting on us whether or not its request bytes have arrived — added
+        after `case_a_planned_restart_under_a_holder_loses_nothing` failed with
+        "1 requests connected and were never answered".
+
+        `_mitm`'s loop then cleared the debt at the TOP of every iteration,
+        including the first, which runs after CONNECT and the TLS handshake
+        and BEFORE `_read_line`. So for every MITM'd connection the accept-time
+        debt was gone while the request was on the wire, and
+        `inflight_requests()` reported zero for a client that was mid-request.
+
+        BETWEEN requests it must still clear — that is the third unreachable
+        zero, a keep-alive socket nobody waits on holding a drain — so this
+        checks the boundary rather than the release.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        seen = []
+
+        class _Ctx:
+            def wrap_socket(self, sock, server_side=False):
+                return sock
+
+        def _one_request(tls, conn=None):
+            seen.append(proxy.inflight_requests())
+            return len(seen) < 2          # one served, then end the loop
+
+        proxy._server_ctx = _Ctx()
+        proxy._handle_one_request = _one_request
+        try:
+            with proxy._live_lock:
+                proxy._open_conns.add(a)
+            proxy._owe_answer(a, True)     # what `accept` does
+            proxy._mitm(a)
+        finally:
+            for s_ in (a, b):
+                try: s_.close()
+                except OSError: pass
+
+        assert seen, "the loop never ran; the case proves nothing"
+        assert seen[0] == 1, (
+            "the accept-time debt was cleared before the first request line "
+            "was even read, so a recycle drops a client whose request is on "
+            f"the wire — inflight_requests() was {seen[0]}")
+        assert len(seen) > 1 and seen[1] == 0, (
+            "the debt was not released BETWEEN requests, so a keep-alive "
+            f"socket nobody is waiting on holds the drain: {seen}")
+
     def case_the_relay_stamps_every_write_not_only_the_head(self, certdir):
         """THE WIRING, for the fourth time — and the first three were misses.
 
@@ -4057,6 +4111,53 @@ class TestDrainReportsWhatItCut:
                     break
                 got += chunk
             assert b"event: a" in got and b"event: b" in got, got[:120]
+        finally:
+            for s_ in (up_a, up_b, cl_a, cl_b):
+                try: s_.close()
+                except OSError: pass
+
+        # --- AND ONE WRAPPER PER RESPONSE, not one per interim head.
+        # `client` is rebound to the `_StampingWriter` before the 1xx branch,
+        # and that branch recursed with the wrapper AND the callback — so a
+        # response preceded by two 103 Early Hints was written through three
+        # nested writers, each stamping on the way down. The count is what
+        # `_owed_still_moving` reads, and a stamp is also a lock acquisition.
+        up_a, up_b = socket.socketpair()
+        cl_a, cl_b = socket.socketpair()
+        stamps = []
+        try:
+            def _with_interim():
+                # Tolerant of the teardown race: the assertions below finish
+                # first and the fixture closes these, which is not a failure.
+                try:
+                    up_b.sendall(b"HTTP/1.1 103 Early Hints\r\n\r\n")
+                    time.sleep(0.1)
+                    up_b.sendall(b"HTTP/1.1 103 Early Hints\r\n\r\n")
+                    time.sleep(0.1)
+                    up_b.sendall(b"HTTP/1.1 200 OK\r\n"
+                                 b"Content-Length: 5\r\n\r\nhello")
+                    time.sleep(0.05)
+                    up_b.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+            threading.Thread(target=_with_interim, daemon=True).start()
+            _relay_response(up_a, cl_a, 0,
+                            on_headers=lambda: stamps.append(1))
+
+            cl_a.shutdown(socket.SHUT_WR)
+            got = b""
+            while True:
+                chunk = cl_b.recv(4096)
+                if not chunk:
+                    break
+                got += chunk
+            writes = got.count(b"HTTP/1.1")
+            assert b"hello" in got, got[:160]
+            assert len(stamps) <= writes + 1, (
+                f"{len(stamps)} stamps for {writes} response head(s) plus a "
+                "body — the interim recursion is nesting a writer per 1xx, so "
+                "every byte of the real answer is stamped once per layer")
         finally:
             for s_ in (up_a, up_b, cl_a, cl_b):
                 try: s_.close()
@@ -5341,6 +5442,25 @@ class TestFailOpenIsNotSilent:
                 "recycle's evidence dies with it")
             assert marker in kept.read_text(encoding="utf-8", errors="replace"), (
                 "the rotated file does not carry what the old daemon wrote")
+        finally:
+            handle.close()
+
+        # A SECOND ROTATION IN THE SAME RECYCLE MUST NOT EAT THE FIRST. A
+        # recycle is two-stage — measured 70 s apart — and each stage opens
+        # the log. One generation meant stage two overwrote stage one's
+        # teardown record, which is the very line the rotation exists to keep.
+        log.write_text("STAGE-TWO" + "x" * (pp._LOG_MAX_BYTES + 1),
+                       encoding="utf-8")
+        handle = pp._open_daemon_log(certdir)
+        try:
+            older = log.with_suffix(log.suffix + ".2")
+            assert older.is_file(), (
+                "a second rotation kept only one generation, so the departing "
+                "daemon's last words were overwritten by the next stage of "
+                "the same recycle")
+            assert marker in older.read_text(encoding="utf-8", errors="replace"), (
+                "the older generation is not the one that carried the "
+                "teardown record")
         finally:
             handle.close()
 
