@@ -3770,6 +3770,26 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
         assert "chain refused" in log.read_text(), log.read_text()
 
 
+def _fake_pids(base: int, count: int) -> list[int]:
+    """`count` pids starting at `base` that are NOT this process.
+
+    A CASE THAT ANNOUNCES FOR A FAKE PID MUST NOT ANNOUNCE FOR OURS.
+    `this_process_is_draining` reads the depth map filtered to our own pid, so
+    a fixture that happens to pick our number makes this process look like it
+    is handing over — and every relay in that worker then sheds keep-alives.
+
+    Found on macOS CI 2026-08-18, where a `range(7000, 7009)` fixture collided
+    with the runner's own pid: green on Linux, where pids are large, and red on
+    a machine that hands out low ones. The block is shifted rather than
+    filtered so the count stays exact.
+    """
+    import os
+
+    if base <= os.getpid() < base + count:
+        base += count
+    return list(range(base, base + count))
+
+
 class TestDrainReportsWhatItCut:
     """The drain line must say what was still open, not always zero.
 
@@ -4001,6 +4021,32 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_fake_pids_are_never_this_process(self, monkeypatch):
+        """THE FIXTURE THAT MADE macOS CI RED, pinned.
+
+        `this_process_is_draining` reads the depth map filtered to our own pid,
+        so a case that announces for a made-up pid which HAPPENS to be ours
+        makes this process look like it is handing over — and every relay in
+        that worker then sheds keep-alives. Green on Linux, where pids are
+        large; red on a runner that hands out low ones.
+
+        The helper shifts the whole block rather than filtering, so the count
+        a caller asked for is the count it gets.
+        """
+        import os
+
+        import cswap_pin.proxy as pp  # noqa: F401 — the module under test's home
+
+        monkeypatch.setattr(os, "getpid", lambda: 7003)
+        got = _fake_pids(7000, 9)
+        assert 7003 not in got, f"handed out our own pid: {got}"
+        assert len(got) == 9, f"lost or gained a pid while avoiding ours: {got}"
+
+        monkeypatch.setattr(os, "getpid", lambda: 999999)
+        assert _fake_pids(7000, 9) == list(range(7000, 7009)), (
+            "shifted when there was no collision — the block should only move "
+            "to get out of our own way")
+
     def case_a_departing_daemon_stops_taking_new_requests(self, certdir):
         """`release_listener` SHEDS ARRIVALS; NOTHING SHED THE KEEP-ALIVES.
 
@@ -4015,6 +4061,8 @@ class TestDrainReportsWhatItCut:
         through the shared listener, so sessions migrate one completed reply at
         a time.
         """
+        import os as _os
+
         import cswap_pin.proxy as pp
 
         def _relay_once():
@@ -4047,6 +4095,17 @@ class TestDrainReportsWhatItCut:
                     except OSError:
                         pass
 
+        # OUR OWN DEPTH, SET EXPLICITLY. Asserting the ambient value made this
+        # case depend on what ran before it in the same worker — see
+        # `_fake_pids`. The case is about the TRANSITION, so it establishes
+        # both ends itself and puts back whatever it found.
+        with pp._DRAINING_LOCK:
+            saved = dict(pp._DRAINING_DEPTH)
+            mine = f"{pp._DRAINING_PREFIX}{_os.getpid()}"
+            for key in [k for k in pp._DRAINING_DEPTH
+                        if k.rsplit("/", 1)[-1] == mine]:
+                pp._DRAINING_DEPTH.pop(key)
+
         # SERVING: the connection stays reusable.
         assert not pp.this_process_is_draining(), "precondition"
         serving = _relay_once()
@@ -4059,14 +4118,15 @@ class TestDrainReportsWhatItCut:
         # HANDING OVER: same reply, delivered in full, and the last one.
         # OUR OWN PID: the predicate asks whether THIS process is leaving, and
         # announcing on another pid's behalf must not answer yes for us.
-        import os as _os
-
         done = pp.announce_draining(certdir, _os.getpid())
         try:
             assert pp.this_process_is_draining(), "precondition"
             departing = _relay_once()
         finally:
             done()
+            with pp._DRAINING_LOCK:
+                pp._DRAINING_DEPTH.clear()
+                pp._DRAINING_DEPTH.update(saved)
 
         assert b"hi" in departing, (
             "the reply was not delivered — this must shed the CONNECTION, "
@@ -4219,7 +4279,7 @@ class TestDrainReportsWhatItCut:
         killed = []
         real_kill, real_pids = pp._kill_daemon, pp._pin_daemon_pids
         pp._kill_daemon = lambda pid: killed.append(pid)
-        pids = list(range(7000, 7000 + pp._MAX_DRAINING_PREDECESSORS + 1))
+        pids = _fake_pids(7000, pp._MAX_DRAINING_PREDECESSORS + 1)
         pp._pin_daemon_pids = lambda certdir: list(pids)
         try:
             for pid in pids:
@@ -4540,7 +4600,7 @@ class TestDrainReportsWhatItCut:
             # quantity moved because the old one answered the wrong question,
             # not because the number was too small.
             killed.clear()
-            pids = list(range(5000, 5000 + pp._MAX_DRAINING_PREDECESSORS + 2))
+            pids = _fake_pids(5000, pp._MAX_DRAINING_PREDECESSORS + 2)
             pp._pin_daemon_pids = lambda certdir: list(pids)
             for i, pid in enumerate(pids):
                 pp.announce_draining(certdir, pid)
