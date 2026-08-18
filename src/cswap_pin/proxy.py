@@ -2527,9 +2527,38 @@ class CertBundle:
     leaf_key_path: Path
 
 
-# 100 years — the proxy's certs are ephemeral local trust; a long life avoids
-# spurious expiry mid-session and matches the 10-year leaf a sibling proxy issues.
-_CERT_DAYS = 3650
+# TWO LIFETIMES, because the two certificates answer to different rules.
+#
+# The CA stays long. It is what the client trusts through NODE_EXTRA_CA_CERTS,
+# and rotating it invalidates every session already wired to it — so its life
+# should be as long as we can make it, not as short as the leaf's.
+#
+# The LEAF is capped by Apple. Security.framework rejects a TLS *server*
+# certificate whose lifetime exceeds 398 days, issued after September 2020,
+# with "certificate is not standards compliant" — and that is a rejection of
+# SHAPE, so no CA and no bundle repairs it. Measured 2026-08-18 on
+# host-c, same proxy and same certificate, three verifiers:
+#
+#     stdlib, default trust     CERTIFICATE_VERIFY_FAILED
+#     stdlib, our CA bundle     HTTP 401   <- TLS succeeded
+#     truststore (OS native)    "certificate is not standards compliant"
+#
+# cswap injects truststore, so the third row is the path that actually runs on
+# a Mac: every Python client in a pinned session was failing there while the
+# same certificate verified fine under OpenSSL.
+#
+# 396, NOT 397, and the difference is the whole margin. `_make_leaf` backdates
+# `not_valid_before` by a day, so the SPAN Apple measures is `_LEAF_DAYS + 1`.
+# 397 produced a 398-day certificate — exactly on the cap, with no room for a
+# clock skew either side. Measured on host-c by generating a cert and
+# reading its own dates back, which is also why the test asserts the span rather
+# than the constant.
+#
+# The previous single constant was justified as matching "the 10-year leaf a
+# sibling proxy issues" — an argument from another implementation rather than
+# from any client that has to verify ours.
+_CA_DAYS = 3650
+_LEAF_DAYS = 396
 
 
 def ensure_ca(ca_dir: Path, host: str) -> CertBundle:
@@ -2561,17 +2590,72 @@ def ensure_ca(ca_dir: Path, host: str) -> CertBundle:
     # deleted the directory.
     with _spawn_lock(ca_dir, name=".ca.lock"):
         if not _certs_consistent(ca_pem, ca_key, leaf_pem, leaf_key, host):
-            # Regenerate BOTH. Keeping a CA whose leaf must be reissued would
-            # leave already-wired sessions trusting a root that no longer
-            # matches what this proxy serves.
-            ca_cert, ca_priv = _make_ca()
-            _write_public(ca_pem, ca_cert.public_bytes(serialization.Encoding.PEM))
-            _write_key(ca_key, ca_priv)
+            # KEEP A CA THAT IS STILL GOOD, and re-issue only the leaf under it.
+            #
+            # This used to regenerate BOTH, justified as "keeping a CA whose
+            # leaf must be reissued would leave already-wired sessions trusting
+            # a root that no longer matches". That argues the REVERSE case: a CA
+            # being replaced cannot keep its leaf. A leaf can always be
+            # re-issued from a CA that is still valid, and doing so is what
+            # keeps the client's trusted root stable.
+            #
+            # It only became load-bearing when the leaf's life dropped from 3650
+            # days to 397 for Apple's cap. At 3650 the renewal fired once a
+            # decade and nobody noticed the CA going with it; at 397 it fires
+            # every year, and a new CA breaks every session already wired to the
+            # old one. That is the one thing the pin must never do.
+            reused = _load_ca_if_usable(ca_pem, ca_key)
+            if reused is None:
+                ca_cert, ca_priv = _make_ca()
+                _write_public(
+                    ca_pem, ca_cert.public_bytes(serialization.Encoding.PEM))
+                _write_key(ca_key, ca_priv)
+            else:
+                ca_cert, ca_priv = reused
             leaf_cert, leaf_priv = _make_leaf(host, ca_cert, ca_priv)
             _write_public(leaf_pem, leaf_cert.public_bytes(serialization.Encoding.PEM))
             _write_key(leaf_key, leaf_priv)
 
     return CertBundle(ca_path=ca_pem, leaf_path=leaf_pem, leaf_key_path=leaf_key)
+
+
+def _load_ca_if_usable(
+    ca_pem: Path, ca_key: Path
+) -> tuple[x509.Certificate, rsa.RSAPrivateKey] | None:
+    """The CA on disk when it can still sign a new leaf, else ``None``.
+
+    Asks about the CA ALONE. `_certs_consistent` answers "is this whole set
+    usable", which is the right question for the caller and the wrong one here:
+    a near-expiry leaf makes it False while the CA is perfectly good, and
+    replacing that CA is what breaks every session already wired to it.
+
+    Four ways it can be unusable, and each returns None rather than raising —
+    the caller's next move is to mint a fresh CA, which is correct for all of
+    them:
+      - either file missing
+      - the certificate does not parse
+      - the key does not parse, or is not the key that signed the certificate
+      - the CA is inside its own 30-day renewal window (matching
+        `_certs_consistent`; a root that expires mid-session takes the session
+        with it, and a leaf issued now under a CA expiring next week is not a
+        repair)
+    """
+    try:
+        cert = x509.load_pem_x509_certificate(ca_pem.read_bytes())
+        priv = serialization.load_pem_private_key(
+            ca_key.read_bytes(), password=None,
+            unsafe_skip_rsa_key_validation=True,
+        )
+    except Exception:  # noqa: BLE001 — any unreadable half means "mint a new one"
+        return None
+    if not isinstance(priv, rsa.RSAPrivateKey):
+        return None
+    if priv.public_key().public_numbers() != cert.public_key().public_numbers():
+        return None
+    soon = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=30)
+    if cert.not_valid_after_utc <= soon:
+        return None
+    return cert, priv
 
 
 def _certs_consistent(
@@ -2698,7 +2782,7 @@ def _make_ca() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - _dt.timedelta(days=1))
-        .not_valid_after(now + _dt.timedelta(days=_CERT_DAYS))
+        .not_valid_after(now + _dt.timedelta(days=_CA_DAYS))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .add_extension(
             # OpenSSL 3 (Python 3.14's ssl, Node) rejects a signing CA that
@@ -2738,7 +2822,7 @@ def _make_leaf(
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - _dt.timedelta(days=1))
-        .not_valid_after(now + _dt.timedelta(days=_CERT_DAYS))
+        .not_valid_after(now + _dt.timedelta(days=_LEAF_DAYS))
         .add_extension(
             x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False
         )
