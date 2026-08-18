@@ -280,6 +280,70 @@ def _ledger_path(config_path: Path) -> Path:
     return root / "pin-wiring" / f"{key}.json"
 
 
+def _own_version() -> str:
+    """The version of the package doing the writing, or "" if unknowable.
+
+    ponytail: version string, not a content hash. `daemon_fingerprint` would
+    also catch an editable checkout whose version never moves, but it reads
+    every module in the package, and the reader of this field runs from an rc
+    hook before every launch. Upgrade to the fingerprint if a dev install ever
+    needs the rewrite too.
+    """
+    try:
+        from cswap_pin import __version__
+        return str(__version__ or "")
+    except Exception:  # noqa: BLE001 — a missing version must not block a wire
+        return ""
+
+
+def rewire_if_version_changed(certdir: "Path | str") -> bool:
+    """Re-apply the config wiring once, after the pin package changed.
+
+    THE GAP THIS CLOSES, measured on lambda-docker. `cswap-pin` went 0.1.86 ->
+    0.1.87 on all three machines, the daemon recycled onto the new code, and
+    `.claude.json` kept the FIVE keys the old version wrote — the new
+    `SSL_CERT_FILE` never appeared. `cswap pin --ensure`, the rc hook that
+    runs before every launch, does not refresh a LIVE wiring: it heals a
+    broken daemon and clears DEAD configs, and a config whose port answers is
+    neither. So the key waited for the next full session launch while the
+    deploy looked finished. It was reported as deployed.
+
+    WHY NOT JUST REWIRE EVERY LAUNCH. `--ensure` promises never-fails,
+    silent, and CHEAP WHEN IDLE, and a read-modify-write under the config lock
+    is exactly what that contract keeps off the launch path — the same lock a
+    routine credential refresh holds, measured at 9.5s once. So the receipt
+    names its writer and this compares two strings: one small read on a
+    settled machine, one rewrite per upgrade.
+
+    Never raises: the caller is a launch hook.
+    """
+    try:
+        certdir = Path(certdir)
+        get_global_config_path = require("paths").get_global_config_path
+        cfg = get_global_config_path()
+        try:
+            raw = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — unreadable config: nothing to refresh
+            raw = {}
+        led = _read_ledger(cfg, raw)
+        if not led.get(_WIRE_MARK):
+            # Not wired by us. An unwired machine must not pay for this.
+            return False
+        if led.get("writtenBy") == _own_version():
+            return False
+        # THE RECORDED PORT, not a probe. `--ensure` has already healed a dead
+        # daemon and cleared dead configs by the time this runs, so a port
+        # here that is not serving is a state those steps own; adding another
+        # socket probe would put a second timeout on the launch path.
+        state = read_daemon_state(certdir)
+        port = (state or {}).get("port")
+        if not port:
+            return False
+        return bool(wire_global_config(int(port), certdir / "ca.pem"))
+    except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+        return False
+
+
 def _read_ledger(config_path: Path, raw: dict) -> dict:
     """The receipt for ``config_path``: sidecar first, config as fallback.
 
@@ -2042,7 +2106,8 @@ def _wire_global_config_locked(
     for key, value in saved.items():
         env[key] = value
 
-    ledger = {_WIRE_MARK: [], f"{_WIRE_MARK}Saved": {}}
+    ledger = {_WIRE_MARK: [], f"{_WIRE_MARK}Saved": {},
+              "writtenBy": _own_version()}
     if port is None or ca_path is None:
         pass  # `ledger` above already records "not wired"
     else:
@@ -2095,7 +2160,12 @@ def _wire_global_config_locked(
         # Remember what we are about to displace, so unwiring is lossless.
         displaced = {k: env[k] for k in wanted if k in env}
         env.update(wanted)
-        ledger = {_WIRE_MARK: list(wanted), f"{_WIRE_MARK}Saved": displaced}
+        ledger = {_WIRE_MARK: list(wanted),
+                  f"{_WIRE_MARK}Saved": displaced,
+                  # WHO WROTE THIS, so a later launch can tell a
+                  # wiring produced by the installed code from one
+                  # produced by the version before it.
+                  "writtenBy": _own_version()}
 
     if env == before and _WIRE_MARK not in raw and not ours:
         return False

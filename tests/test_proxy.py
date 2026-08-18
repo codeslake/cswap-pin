@@ -2456,6 +2456,87 @@ class TestWireGlobalConfig:
         assert wire_global_config(None, None) is True
         assert "SSL_CERT_FILE" not in json.loads(cfg.read_text()).get("env", {})
 
+    def case_an_upgraded_pin_rewires_once_and_only_once(self, tmp_path,
+                                                        monkeypatch):
+        """A package upgrade that ADDS an env key never reaches .claude.json.
+
+        Measured on lambda-docker the night SSL_CERT_FILE was added: the
+        package went 0.1.86 -> 0.1.87 on all three machines, the daemon
+        recycled onto the new code, and the env block kept its five old keys.
+        `cswap pin --ensure` -- the rc hook that runs before every launch --
+        does NOT refresh a LIVE wiring: it heals a broken daemon and clears
+        DEAD configs, and a config whose port answers is neither. So the new
+        key waited for the next full session launch, and in the meantime the
+        deploy looked done and was not. I reported it as deployed.
+
+        `--ensure` cannot simply rewire every launch: its contract is
+        never-fails / silent / CHEAP WHEN IDLE, and a read-modify-write under
+        the config lock is what that contract exists to keep off the launch
+        path. So the receipt records WHO wrote it, and the rewrite happens
+        only when the installed version is not that one -- once per upgrade,
+        one small read otherwise.
+        """
+        from pathlib import Path
+
+        from cswap_pin.proxy import (_ledger_path, _read_ledger,
+                                     rewire_if_version_changed,
+                                     wire_global_config)
+
+        ca = Path(tmp_path) / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        certdir = Path(tmp_path)
+        # `read_daemon_state` requires port AND pid -- a record with only a
+        # port reads as "no daemon", which is how the first version of this
+        # test passed its own precondition and then measured nothing.
+        (certdir / "proxy.json").write_text(
+            json.dumps({"port": 9955, "pid": 4242, "fingerprint": "abc"}))
+        cfg = self._config(tmp_path, monkeypatch, {})
+
+        assert wire_global_config(9955, ca) is True
+        first = json.loads(cfg.read_text())["env"]
+        assert _read_ledger(cfg, {}).get("writtenBy"), (
+            "the receipt must name the version that wrote it, or nothing can "
+            "tell a stale wiring from a current one")
+
+        # SAME VERSION -> no write. This is every launch on a settled machine.
+        assert rewire_if_version_changed(certdir) is False
+        assert json.loads(cfg.read_text())["env"] == first
+
+        # OLDER VERSION IN THE RECEIPT -> exactly one rewrite.
+        led = _read_ledger(cfg, {})
+        led["writtenBy"] = "0.0.1"
+        _ledger_path(cfg).write_text(json.dumps(led))
+        assert rewire_if_version_changed(certdir) is True, (
+            "an upgraded pin must re-apply the block once")
+        assert _read_ledger(cfg, {}).get("writtenBy") != "0.0.1"
+        assert rewire_if_version_changed(certdir) is False, (
+            "a second call must be a no-op, or the hook writes on every launch")
+
+        # NO DAEMON RECORD -> refuse. There is no port to point the block at,
+        # and inventing one wires a session to nothing.
+        led = _read_ledger(cfg, {})
+        led["writtenBy"] = "0.0.1"
+        _ledger_path(cfg).write_text(json.dumps(led))
+        (certdir / "proxy.json").unlink()
+        assert rewire_if_version_changed(certdir) is False, (
+            "no daemon record is not a reason to rewrite the block")
+
+        # NEVER WIRED BY US -> refuse, and this is the cheap-when-idle half of
+        # the launch contract: a machine that has never pinned runs this hook
+        # before every `claude` and must pay one small read, not a config
+        # lock.
+        # The daemon record is restored FIRST, so the only thing that can
+        # refuse here is the not-wired-by-us guard. Without this the previous
+        # block's `unlink` masks it and a mutation removing the guard
+        # survives -- measured.
+        (certdir / "proxy.json").write_text(
+            json.dumps({"port": 9955, "pid": 4242, "fingerprint": "abc"}))
+        bare = self._config(tmp_path, monkeypatch, {"env": {"HTTPS_PROXY": "x"}})
+        _ledger_path(bare).unlink(missing_ok=True)
+        assert rewire_if_version_changed(certdir) is False
+        assert json.loads(bare.read_text())["env"] == {"HTTPS_PROXY": "x"}, (
+            "a user's own proxy must not be touched on an unpinned machine")
+
     def case_a_receipt_that_cannot_be_written_leaves_the_config_unwired(
         self, tmp_path, monkeypatch
     ):
