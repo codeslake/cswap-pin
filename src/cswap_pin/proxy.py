@@ -339,6 +339,17 @@ def rewire_if_version_changed(certdir: "Path | str") -> bool:
         port = (state or {}).get("port")
         if not port:
             return False
+        # SAME PORT ONLY. A block naming a DIFFERENT port is a repair, and the
+        # repair belongs to `heal` — which reports what it fixed, and whose
+        # caller renders that verdict. Rewriting it here first left heal with
+        # nothing to correct and turned its True into a False: the config was
+        # right and the message said nothing had been wrong. Caught by
+        # `case_wired_to_the_WRONG_port_is_corrected`, not by reasoning.
+        #
+        # So this stays what it is for: a wiring that is already correct
+        # except that an older version of this package wrote it.
+        if str((raw.get("env") or {}).get("CSWAP_PIN_PORT") or "") != str(port):
+            return False
         return bool(wire_global_config(int(port), certdir / "ca.pem"))
     except Exception:  # noqa: BLE001 — a launch must never fail on the pin
         return False
@@ -1734,6 +1745,26 @@ def heal(backup_root: Path) -> bool:
     if not pin:
         return False  # nothing pinned — not our business
     email = pin[0]
+    # THE CONFIG HALF OF THE SAME RULE the block below states for the DAEMON.
+    # A release that ADDS an env key kept the old key set in `.claude.json`
+    # until a full session launch: `--ensure` heals a broken daemon and clears
+    # DEAD configs, and a live wiring with a stale key set is neither.
+    # Measured on lambda-docker — 0.1.86 -> 0.1.87 landed on all three
+    # machines, the daemon recycled onto the new code, and the new
+    # SSL_CERT_FILE never appeared. The deploy looked finished and was not.
+    #
+    # HERE AND NOT IN THE HOST: `cswap pin --ensure` already reaches this
+    # function on every launch, so the bridge package needs no new line to
+    # trigger it. Pin behaviour stays in the pin.
+    #
+    # The return value is deliberately untouched — the caller reads True as
+    # "the daemon was restarted" and renders "Restored the cloud pin", which a
+    # refreshed config is not. And it cannot raise: this runs from an rc hook
+    # before every launch.
+    try:
+        rewire_if_version_changed(certdir)
+    except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+        pass
     # AN UPGRADE MUST NOT WAIT FOR A LAUNCH. `ensure_proxy` recycles a stale
     # daemon, but it only runs when a NEW session starts — so installing a fix
     # left every running daemon on the old code until someone happened to open
