@@ -289,6 +289,61 @@ class TestHistoryCarriesAcrossASwitch:
         assert _carry_pointer(self._pointer(bridgeSessionId=""), self.LOGIN,
                              _TRANSCRIPT_OWNER) is None
 
+    def case_a_pin_on_another_org_stops_the_sweep(self, tmp_path):
+        """THE COST MODEL IN THIS CLASS'S DOCSTRING IS WRONG, and a user's
+        session paid for it.
+
+        "A match costs a fresh mint when it is wrong, which is today's
+        behaviour" — measured 2026-08-17, it cost `API Error: 500 Internal
+        server error`, twice, and the session was unusable until Remote Control
+        was switched off:
+
+            2026-08-15T15:07:18Z carry: restamped the bridge pointer for b0415c31
+            2026-08-17 19:02:33  cswap: Switched from account 2 to 3
+            2026-08-17T23:15:12Z history-suppression cause="migration"
+            2026-08-17T23:15:12Z bridge-session cse_01QBck… ownerOrg=da3631be (acct 2)
+            2026-08-17T23:15:15Z API Error: 500 Internal server error
+
+        The stamp only changes what the LOCAL pointer claims. The bridge's owner
+        on the server does not move, so restamping it to a login that does not
+        own it hands Claude Code a bridge it cannot use — and the veto this
+        exists to defeat was the thing keeping that failure down to "lose the
+        history".
+
+        A lost history is survivable. A 500 is not. So when a pin names an org
+        and the login is a DIFFERENT org, the sweep does nothing: the veto
+        fires, the session mints fresh, and it stays alive.
+        """
+        from unittest.mock import patch
+
+        import cswap_pin.proxy as P
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        with patch.object(P, "_login_identity", return_value=("acct-1", "org-1")), \
+             patch.object(P, "load_pin", return_value=("pinned@example.com", "org-9")), \
+             patch.object(P, "_carry_candidates") as candidates:
+            assert P._carry_history_pointers(certdir) == 0
+            assert not candidates.called, (
+                "the sweep must not even enumerate: every record it touches is "
+                "one more session handed a bridge its login does not own")
+
+        # CONTROL, or the assertion above also passes on a sweep that never
+        # works. Same fixture, pin org == login org: enumeration proceeds.
+        with patch.object(P, "_login_identity", return_value=("acct-1", "org-1")), \
+             patch.object(P, "load_pin", return_value=("pinned@example.com", "org-1")), \
+             patch.object(P, "_carry_candidates", return_value=[]) as candidates:
+            P._carry_history_pointers(certdir)
+            assert candidates.called, "control: a matching pin must not block it"
+
+        # AND AN UNPINNED MACHINE IS UNTOUCHED. The guard keys on the pin, so a
+        # box with no pin keeps the carry it has always had.
+        with patch.object(P, "_login_identity", return_value=("acct-1", "org-1")), \
+             patch.object(P, "load_pin", return_value=None), \
+             patch.object(P, "_carry_candidates", return_value=[]) as candidates:
+            P._carry_history_pointers(certdir)
+            assert candidates.called, "no pin: nothing to disagree with"
+
     def case_the_job_store_spells_the_owner_differently(self):
         """One pointer, two vocabularies: the transcript writes
         `ownerAccountUuid`, the job record writes `bridgeOwnerAccountUuid`.

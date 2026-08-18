@@ -3355,6 +3355,35 @@ def _carry_history_pointers(certdir: Path) -> int:
         login = _login_identity()
         if login is None:
             return 0  # no readable login: nothing to agree with
+        # A PIN ON ANOTHER ORG MEANS THE STAMP WOULD LIE, so do not stamp.
+        #
+        # `_carry_pointer`'s docstring reasons that "a wrong guess then costs a
+        # fresh mint, which is exactly today's behaviour — which is why nothing
+        # here has to prove who owns a bridge". Measured 2026-08-17, a wrong
+        # guess cost `API Error: 500 Internal server error`, twice, and the
+        # session was unusable until Remote Control was switched off:
+        #
+        #   15:07:18Z(08-15)  carry: restamped the bridge pointer for b0415c31
+        #   19:02:33(08-17)   cswap: Switched from account 2 to 3
+        #   23:15:12Z         history-suppression cause="migration"
+        #   23:15:12Z         bridge-session cse_01QBck… ownerOrg=da3631be (acct 2)
+        #   23:15:15Z         API Error: 500 Internal server error
+        #
+        # The stamp moves only what the LOCAL pointer claims; the bridge's owner
+        # on the server does not move. So restamping to a login that does not
+        # own it hands CC a bridge it cannot use — and the veto this sweep
+        # exists to defeat was the thing keeping that failure down to "lose the
+        # history". A lost history is survivable, a 500 is not.
+        #
+        # KEYED ON THE PIN, not on the bridge's owner, because the owner is the
+        # thing this file deliberately never proves (see `_carry_pointer`: it
+        # would need a network call on the launch path). The pin's org is on
+        # disk and free to read, and a pin naming a different org is sufficient
+        # evidence that a bridge minted under it will not match this login.
+        # Unpinned machines keep the carry unchanged.
+        pin = load_pin(Path(certdir).parent)
+        if pin and pin[1] and pin[1] != login[1]:
+            return 0
         for sid, job in _carry_candidates():
             # BOTH STORES, NOT WHICHEVER ONE ANSWERED FIRST. This used to skip
             # the transcript whenever the job record was fixed — so in the
