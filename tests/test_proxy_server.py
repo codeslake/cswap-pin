@@ -550,8 +550,15 @@ class TestStreamingRelay:
                 target=lambda: (time.sleep(1.5), upstream.release.set()),
                 daemon=True).start()
 
+            # THE HANDOVER CEILING, not a literal — and driving the real one
+            # is what answers the only objection to raising it. Ten minutes
+            # sounds like ten minutes of teardown; it is not, because the loop
+            # exits on zero owed. This waits for a reply that lands at +1.5s
+            # under a 600s budget and must return there, not at the ceiling.
+            from cswap_pin.proxy import _HANDOVER_DRAIN_SECONDS
+
             t0 = time.monotonic()
-            proxy.await_inflight(30.0)
+            proxy.await_inflight(_HANDOVER_DRAIN_SECONDS)
             waited = time.monotonic() - t0
 
             assert waited >= 1.4, (
@@ -560,7 +567,8 @@ class TestStreamingRelay:
                 f"there — this is the 2.0s _HELD_DRAIN_SECONDS cut, reproduced")
             assert waited < 25, (
                 f"waited {waited:.1f}s after the reply finished — the drain is "
-                "counting something that never reaches zero again")
+                "counting something that never reaches zero again, so the "
+                "600s handover ceiling would be paid in full on every recycle")
         finally:
             proxy.stop()
             upstream.stop()
@@ -3883,6 +3891,81 @@ class TestDrainReportsWhatItCut:
             for s_ in (a, b):
                 try: s_.close()
                 except OSError: pass
+
+    def case_each_exit_path_drains_on_the_ceiling_that_fits_it(self, certdir):
+        """THREE DRAINS, TWO SITUATIONS — and they were collapsed into one number.
+
+        Measured 2026-08-18, all three hosts, with the phase split live:
+
+            host-a  cut 16   (16 mid-response, 0 before headers)
+            wmac   cut  3   ( 3 mid-response, 0 before headers)
+            pmac   drained clean
+
+        Zero "before headers" anywhere, so those are replies that had already
+        begun streaming to a user and did not finish inside thirty seconds. The
+        drain was working; the ceiling was wrong.
+
+        THE TWO SITUATIONS ARE NOT INTERCHANGEABLE:
+
+          successor already serving  the holder spawned it, or we handed the
+                                     listening socket down by fd. This process
+                                     accepts nothing and nobody is waiting on
+                                     it, so waiting costs one idle process and
+                                     nothing else -> `_HANDOVER_DRAIN_SECONDS`.
+
+          holder respawns after us   the holder cannot start the successor
+                                     until we are gone, so every second here is
+                                     a second with nothing serving the port.
+                                     Cutting is the lesser evil
+                                     -> `_HELD_DRAIN_SECONDS`.
+
+        AND `_DRAIN_SECONDS` COULD NOT SIMPLY BE RAISED, which is why this is a
+        third constant rather than a bigger one: it is also the supervisor's
+        patience (`proc.wait(timeout=_DRAIN_SECONDS + 2)`, the SIGKILL
+        escalation, the stop poll). Raising it makes every teardown wait ten
+        minutes for a process that is not coming back.
+
+        Read out of the source because the property IS the wiring. A behavioural
+        test would have to run for ten minutes to tell 600 from 30, and the
+        regression this guards is somebody tidying three constants into one.
+        """
+        import ast
+        import inspect
+        import cswap_pin.proxy as pp
+
+        tree = ast.parse(inspect.getsource(pp))
+        named = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "await_inflight"
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)
+                    # CONSTANTS ONLY. `stop()` forwards its own `drain`
+                    # parameter through here, and a parameter says nothing
+                    # about which ceiling an exit path chose.
+                    and node.args[0].id.isupper()):
+                named.append(node.args[0].id)
+
+        assert named, (
+            "no `await_inflight(<CONSTANT>)` call found at all — the scan is "
+            "broken, and a broken scan passes every assertion below it")
+        assert sorted(named) == [
+            "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
+            "_HELD_DRAIN_SECONDS",
+        ], (
+            "the exit paths no longer drain on the ceilings that fit them. Two "
+            "hand over to a successor that is already serving (free to wait) "
+            "and one exits so a holder can start the successor (every second "
+            "is an unserved port). Got: " + ", ".join(sorted(named))
+        )
+
+        # AND THE NUMBERS THEMSELVES, or the names above are decoration.
+        assert pp._HANDOVER_DRAIN_SECONDS > pp._DRAIN_SECONDS, (
+            "the handover ceiling must exceed the supervisor's patience — it "
+            "is waiting for a streaming reply, not for a process to die")
+        assert pp._HELD_DRAIN_SECONDS <= pp._DRAIN_SECONDS, (
+            "the held ceiling holds the port dark, so it must not grow")
 
     def case_the_blind_tunnel_gives_its_debt_back(self, certdir):
         """THE FOURTH UNREACHABLE ZERO, and it is the same connection as the first.
