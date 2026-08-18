@@ -3442,6 +3442,54 @@ def _live_bridge_ids() -> set[str]:
     return live
 
 
+def observed_bridge_owners() -> dict[str, str | None]:
+    """``bridge id -> the organizationUuid its record says it belongs to``.
+
+    OBSERVED, not configured. `load_pin` returns what we WROTE; this returns
+    what the machine actually has. Measured 2026-08-17, all three at once:
+
+        cswap pin says       codeslake@gmail.com          (pinned, acct 1)
+        the live bridge is   org da3631be…                (acct 2)
+        the login is         org b7e54904…                (acct 3)
+
+    `cswap pin` reported the first and nothing compared it to the second, so a
+    session ran on a bridge its login did not own until the server answered
+    `500` and the user had to switch Remote Control off to recover.
+
+    LOCAL AND FREE. The owner is already in the job record next to the pointer.
+    This is NOT the server-side proof `_carry_pointer` declines to obtain — that
+    one needs the pin's token and a network call on the launch path. Reading a
+    file we already read is a different thing entirely.
+
+    ``None`` for a live bridge whose owner is not recorded, and the key is kept.
+    Absent and unknown carry opposite remedies: absent means there is nothing to
+    disagree with, unknown means the caller must not claim agreement. Dropping
+    the key would let a status line report a match for a session it could not
+    read — the same shape as the defect this exists to surface.
+    """
+    home = require("paths").get_claude_config_home()
+    owners: dict[str, str | None] = {}
+    try:
+        entries = list((home / "sessions").glob("*.json"))
+    except OSError:
+        return owners
+    for path in entries:
+        rec = _read_json(path)
+        if not isinstance(rec, dict):
+            continue
+        bridge, pid, job = (rec.get("bridgeSessionId"), rec.get("pid"),
+                            rec.get("jobId"))
+        if not bridge or not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        owner = None
+        if job:
+            st = _read_json(home / "jobs" / str(job) / "state.json")
+            if isinstance(st, dict):
+                owner = st.get(_JOB_OWNER[1]) or None
+        owners[str(bridge)] = owner
+    return owners
+
+
 def live_bridge_names() -> dict[str, str]:
     """Bridge id -> the name its live session goes by, in both spellings.
 
