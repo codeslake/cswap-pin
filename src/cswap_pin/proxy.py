@@ -7894,10 +7894,12 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # under a holder is a RECYCLE, and the holder cannot put the successor
         # on the socket until we are gone. Draining the full ceiling there is
         # time with the port bound and nobody behind it.
-        proxy.stop(
+        cut = proxy.stop(
             drain=_HELD_DRAIN_SECONDS if held_by_a_holder() else _DRAIN_SECONDS
         )
-        _log_lifecycle(f"drained, {proxy.live_client_count()} client(s) still open")
+        # THE NUMBER FROM BEFORE THE CUT. Reading it back off the proxy here
+        # returns 0 always — `await_inflight` empties the set it counts.
+        _log_lifecycle(f"drained, {cut} client(s) still open")
         # ``done`` must be set on EVERY exit from here: ``daemon_main`` blocks
         # on it and the signal path ends in ``os._exit(0)``, so an exception
         # escaping before it leaves the server stopped, ``.claude.json`` naming
@@ -8411,12 +8413,37 @@ class PinProxy:
             self._srv = None
         return None
 
-    def await_inflight(self, budget: float) -> None:
+    def await_inflight(self, budget: float) -> int:
         """Wait up to ``budget`` for open connections to finish, then cut them.
 
         A CEILING, not a wait: zero clients returns at once. Kept separate from
         releasing the port so a handover can do this while its successor is
         already accepting.
+
+        RETURNS HOW MANY IT CUT, and the return value is the whole reason this
+        signature changed. The caller logs "drained, N client(s) still open",
+        and it read N from `live_client_count()` AFTER this ran — but the last
+        thing this does is `_close_open_connections`, which empties the set
+        that count reads. So N was 0 by construction, whatever was cut.
+
+        Measured across all three machines' daemon logs: every non-zero value
+        is from 2026-08-04/05 (`634`, `8`, `7`, `7`, `6`, `6`, `4`, `4`), and
+        every value from 08-08 onward is 0 — the ordering changed in between.
+        The one line that says whether a recycle cost a session anything has
+        been a constant ever since, including through the night a user lost a
+        response mid-stream and asked whether the pin did it. Nobody could
+        answer from the log.
+
+        A fix that deletes the evidence its own check reads turns a loud
+        failure into a silent one; this hands the number back before cutting.
+
+        AND IT SAYS SO HERE, not at the call sites. Three places drain — the
+        two code-handover exits and ``_teardown``, which is the one that
+        actually cut something on 2026-08-18 (a TERM under a holder, on the
+        2s budget, one second after a handover began). A warning bolted onto
+        the handovers would have missed exactly the event that prompted this.
+        This is the only function that cuts, so it is the only place that can
+        report every path, including ones written after today.
         """
         if budget > 0:
             deadline = time.monotonic() + budget
@@ -8424,9 +8451,18 @@ class PinProxy:
                 if self.live_client_count() == 0:
                     break
                 time.sleep(0.05)
+        cut = self.live_client_count()
         self._close_open_connections()
+        if cut:
+            # Quiet when it costs nothing: a drain that empties is the normal
+            # case and must not train anyone to skim this log.
+            _log_lifecycle(
+                f"cut {cut} in-flight request(s) after {budget:.0f}s "
+                f"— a reply may have ended mid-stream"
+            )
+        return cut
 
-    def stop(self, drain: float = 0.0) -> None:
+    def stop(self, drain: float = 0.0) -> int:
         """Stop accepting, and optionally let in-flight requests FINISH.
 
         Closing the listener is instant and correct — a new connection should
@@ -8448,7 +8484,7 @@ class PinProxy:
         — completes.
         """
         self.release_listener()
-        self.await_inflight(drain)
+        return self.await_inflight(drain)
 
     def _close_open_connections(self) -> None:
         """Close every open connection, write end first.

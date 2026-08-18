@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import io
 import json
 import pathlib
 import socket
@@ -3561,6 +3562,67 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
 
         assert reached.is_set(), "the ingress host was never dialled"
         assert "chain refused" in log.read_text(), log.read_text()
+
+
+class TestDrainReportsWhatItCut:
+    """The drain line must say what was still open, not always zero.
+
+    `await_inflight` ends with `_close_open_connections()`, which does
+    `conns, self._open_conns = list(self._open_conns), set()` — it EMPTIES the
+    set. The caller then logs `live_client_count()`, which reads that set. So
+    "drained, N client(s) still open" is N=0 by construction, whatever it cut.
+
+    Measured across all three machines' daemon logs: every non-zero value is
+    from 2026-08-04/05 (`drained, 634 client(s)`, `6`, `7`, `8`, `4`); every
+    value from 08-08 onward is 0. The ordering changed in between, and the one
+    line that exists to say whether a recycle cost anything has been a constant
+    ever since — while the user was losing a response mid-stream and nobody
+    could tell from the log whether the pin did it.
+
+    That is the shape where a fix deletes the evidence its own check reads.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_the_count_survives_the_cut(self, certdir):
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        err = io.StringIO()
+        try:
+            with proxy._live_lock:
+                proxy._open_conns.add(a)
+            assert proxy.live_client_count() == 1, "precondition"
+            with contextlib.redirect_stderr(err):
+                cut = proxy.await_inflight(0.0)
+            assert cut == 1, (
+                "await_inflight must report what it cut; the set it counted is "
+                "the set it just emptied")
+            assert proxy.live_client_count() == 0, "and the set is emptied"
+            # THE PATH THAT CUT SOMETHING TONIGHT WAS `_teardown`, not a code
+            # handover — so the warning belongs in the one function all three
+            # drains go through, or it misses the event that prompted it.
+            assert "cut 1 in-flight request(s)" in err.getvalue(), err.getvalue()
+        finally:
+            for s_ in (a, b):
+                try: s_.close()
+                except OSError: pass
+
+    def case_an_idle_drain_reports_zero(self, certdir):
+        """THE CONTROL. Without it, "reports what it cut" also passes on a
+        version that returns a constant 1 — and "warns when it cut" also
+        passes on one that warns every time."""
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert proxy.await_inflight(0.0) == 0
+        assert "cut" not in err.getvalue(), err.getvalue()
 
 
 class TestTunnelIsOpen:
