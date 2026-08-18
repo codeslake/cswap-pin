@@ -13660,3 +13660,77 @@ class TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt:
                     s.close()
                 except OSError:
                     pass
+
+
+class TestObservedBridgeOwners:
+    """What the bridges on this machine ACTUALLY belong to, not what we pinned.
+
+    `cswap pin` prints `load_pin()` — the value it wrote itself. Measured
+    2026-08-17 that read "codeslake@gmail.com" while the live bridge belonged
+    to j.lee8@samsung.com and the login was codeslake.canada@gmail.com: three
+    accounts, one confident status line, and a 500 that took the session down
+    before anyone noticed the disagreement.
+
+    The discriminator is local and free — the job record already carries
+    `bridgeOwnerOrganizationUuid`. Nothing here reaches the network; proving
+    ownership SERVER-side is what `_carry_pointer` refuses to do, and this is
+    not that.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _home(self, tmp_path, sessions, jobs):
+        home = tmp_path / "cch"
+        (home / "sessions").mkdir(parents=True)
+        for i, rec in enumerate(sessions):
+            (home / "sessions" / f"s{i}.json").write_text(json.dumps(rec))
+        for job, st in jobs.items():
+            d = home / "jobs" / job
+            d.mkdir(parents=True)
+            (d / "state.json").write_text(json.dumps(st))
+        return home
+
+    def _wire(self, monkeypatch, home, alive=True):
+        from cswap_pin import proxy as P
+        monkeypatch.setattr(P, "_pid_alive", lambda pid: alive)
+        monkeypatch.setattr(P, "require", lambda n: type(
+            "M", (), {"get_claude_config_home": staticmethod(lambda: home)})())
+        return P
+
+    def case_a_live_bridge_reports_the_org_its_job_record_names(self, tmp_path,
+                                                                monkeypatch):
+        home = self._home(
+            tmp_path,
+            [{"bridgeSessionId": "cse_a", "pid": 4242, "jobId": "j1"}],
+            {"j1": {"bridgeSessionId": "cse_a",
+                    "bridgeOwnerOrganizationUuid": "org-2"}},
+        )
+        P = self._wire(monkeypatch, home)
+        assert P.observed_bridge_owners() == {"cse_a": "org-2"}
+
+    def case_a_dead_session_is_not_reported(self, tmp_path, monkeypatch):
+        """The registry accumulates — 562 records, 16 with a process. Reading a
+        dead one would report an org nothing is using."""
+        home = self._home(
+            tmp_path,
+            [{"bridgeSessionId": "cse_a", "pid": 4242, "jobId": "j1"}],
+            {"j1": {"bridgeSessionId": "cse_a",
+                    "bridgeOwnerOrganizationUuid": "org-2"}},
+        )
+        P = self._wire(monkeypatch, home, alive=False)
+        assert P.observed_bridge_owners() == {}
+
+    def case_a_live_bridge_with_no_recorded_owner_is_None_not_absent(
+            self, tmp_path, monkeypatch):
+        """`None` and "not there" carry opposite remedies: unknown means the
+        caller must not claim agreement, absent means there is nothing to
+        disagree with. Dropping the key would let a status line report OK for a
+        session it could not read."""
+        home = self._home(
+            tmp_path,
+            [{"bridgeSessionId": "cse_a", "pid": 4242, "jobId": "j1"}],
+            {"j1": {"bridgeSessionId": "cse_a"}},
+        )
+        P = self._wire(monkeypatch, home)
+        assert P.observed_bridge_owners() == {"cse_a": None}
