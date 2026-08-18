@@ -4998,7 +4998,8 @@ def announce_draining(certdir: Path, pid: int | None = None):
 
 
 def beat_draining(certdir: Path, pid: int | None = None,
-                  owed: int | None = None, live: int | None = None) -> None:
+                  owed: int | None = None, live: int | None = None,
+                  quiet: float | None = None) -> None:
     """Say the drain is still alive, so its marker does not go stale under it.
 
     A HANDOVER DRAIN HAS NO CEILING ANY MORE, so the marker cannot expire on
@@ -5027,7 +5028,20 @@ def beat_draining(certdir: Path, pid: int | None = None,
         # it would cost in debts. They differ exactly when a predecessor holds
         # replies that stopped: twelve owed, zero live.
         live_n = int(owed) if live is None else int(live)
-        path.write_text(f"{start}\n{int(owed)}\n{live_n}")
+        # FOURTH LINE IS THE LONGEST SILENCE ANY OWED REPLY IS SITTING IN.
+        # Published here and not only in the drain line because the daemon
+        # this number exists to describe is the one that NEVER reaches a drain
+        # line — measured on host-a 2026-08-18, pid 609285 held twelve live
+        # sessions on keepalive-only traffic for 45 minutes and was still
+        # draining. An exit-time instrument says nothing about the case that
+        # does not exit.
+        #
+        # APPENDED, never inserted: `draining_owed` and `draining_live` index
+        # lines 2 and 3 by position, and a reader from a version that predates
+        # this one takes the first three and ignores the rest. See
+        # `draining_quiet` for the other half of the skew.
+        tail = "" if quiet is None else f"\n{float(quiet):.1f}"
+        path.write_text(f"{start}\n{int(owed)}\n{live_n}{tail}")
     except (OSError, ValueError):
         pass
 
@@ -5063,6 +5077,26 @@ def draining_live(certdir: Path, pid: int) -> int:
         return int(body[2].strip())
     except (OSError, ValueError, IndexError):
         return _OWED_UNKNOWN
+
+
+def draining_quiet(certdir: Path, pid: int) -> "float | None":
+    """The longest silence any of ``pid``'s owed replies is sitting in.
+
+    Fourth line of the marker; ``None`` when it is absent, which is a marker
+    written by a version that did not record it. NOT 0.0 for that case — zero
+    reads as "answering this instant", the safest number there is, and this
+    fleet runs mixed versions through every upgrade, so an older predecessor
+    would be reported as the healthiest thing on the box.
+
+    Nothing DECIDES on this. It is read by a human, or by a later version that
+    has a population to choose a threshold from; see `content_free_intervals`
+    for why the number cannot come from anywhere else.
+    """
+    try:
+        body = draining_marker_path(certdir, pid).read_text().split("\n")
+        return float(body[3].strip())
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def draining_owed(certdir: Path, pid: int) -> int:
@@ -8918,6 +8952,26 @@ class PinProxy:
         # is only being kept warm — see `_is_only_keepalive`. Cleared with the
         # debt, like `_delivered`.
         self._content: dict = {}
+        # WHEN CONTENT LAST REACHED THIS CLIENT — the clock `_content` counts
+        # against. `now - this` is the interval `await_inflight` names as the
+        # one measurement its refused stall predicate is waiting on, and it
+        # only means anything PER CONNECTION: a process-wide byte rate cannot
+        # produce it, because twelve replies staggered ten seconds apart look
+        # busy every ten seconds while each one is silent for two minutes.
+        # Seeded when the debt is taken so a reply that has sent nothing at
+        # all is timed from the moment somebody started waiting.
+        self._content_at: dict = {}
+        # THE LONGEST SILENCE A REPLY SAT IN AND THEN FINISHED ANYWAY. High
+        # water, not a snapshot, because the drain that matters most ends with
+        # `_owed` EMPTY — that is what "drained clean" means — so anything read
+        # off the live set at that moment is 0 by construction, an instrument
+        # reporting a constant on the one branch it exists for.
+        #
+        # Only a COMPLETED response updates it (see `_note_reply_finished`). A
+        # connection that closed mid-silence proves nothing about how long a
+        # reply can be waited for, and counting it would inflate this in the
+        # direction that makes a longer wait look proven safe.
+        self._quiet_peak = 0.0
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -9249,7 +9303,8 @@ class PinProxy:
         with self._live_lock:
             content_at_start = dict(self._content)
         beat_draining(self._certdir, owed=self.inflight_requests(),
-                      live=self.live_replies(content_at_start))
+                      live=self.live_replies(content_at_start),
+                      quiet=self.content_free_seconds())
         beat_at = started
         try:
             if budget > 0:
@@ -9268,7 +9323,8 @@ class PinProxy:
                     if now - beat_at >= _DRAINING_BEAT_SECONDS:
                         beat_draining(
                             self._certdir, owed=self.inflight_requests(),
-                            live=self.live_replies(content_at_start))
+                            live=self.live_replies(content_at_start),
+                            quiet=self.content_free_seconds())
                         beat_at = now
                     time.sleep(0.05)
         finally:
@@ -9284,6 +9340,10 @@ class PinProxy:
         cut = self.inflight_requests()
         mid = self.inflight_mid_response()
         delivered = self._delivered_summary()
+        # READ BEFORE `_close_open_connections`, like `cut` and for the same
+        # reason: the close empties the sets this counts over, so taken after
+        # it this field would be a constant 0 s on every drain that ever ran.
+        quiet = self._content_free_summary()
         closed = self.live_client_count()
         self._close_open_connections()
         # ONE LINE PER DRAIN, ALWAYS — silence was the problem, not the noise.
@@ -9309,13 +9369,21 @@ class PinProxy:
             _log_lifecycle(
                 f"cut {cut} in-flight request(s) after {elapsed:.1f}s of "
                 f"{ceiling} ({mid} mid-response, {cut - mid} before "
-                f"headers; delivered {delivered} per reply; and closed "
-                f"{closed - cut} idle connection(s))"
+                f"headers; delivered {delivered} per reply, content-free "
+                f"{quiet}; and closed {closed - cut} idle connection(s))"
             )
         else:
+            # THE CLEAN BRANCH CARRIES THE HIGH WATER, NOT THE LIVE SET.
+            # `drained clean` means `_owed` is empty, so `_content_free_summary`
+            # here is 0 s on every clean drain there will ever be — a field
+            # that cannot fail, on the one branch that matters most. See
+            # `_note_reply_finished`: a reply that went quiet for N and THEN
+            # delivered is the only observation that proves N was safe to wait.
             _log_lifecycle(
                 f"drained clean in {elapsed:.1f}s of {ceiling} "
-                f"— closed {closed} idle connection(s), none owed an answer"
+                f"— closed {closed} idle connection(s), none owed an answer; "
+                f"longest content-free wait a completed reply survived "
+                f"{self._quiet_peak:.0f}s"
             )
         return cut
 
@@ -9607,6 +9675,7 @@ class PinProxy:
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
                 self._content.pop(conn, None)
+                self._content_at.pop(conn, None)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
@@ -9713,6 +9782,65 @@ class PinProxy:
         return (f"{counts[0]}/{counts[len(counts) // 2]}/{counts[-1]} B "
                 "min/med/max")
 
+    def content_free_intervals(self) -> "list[float]":
+        """Seconds since CONTENT last reached each owed client, ascending.
+
+        THE ONE MEASUREMENT `await_inflight` NAMES AND NOBODY HAD TAKEN. Its
+        refusal to stop waiting on a content-free reply ends "it becomes
+        decidable the day somebody measures the longest content-free interval
+        a live reply produces", and until this existed no run produced that
+        number — so the refusal could never be revisited on evidence, only
+        argued about.
+
+        IT HAS TO BE PER CONNECTION, and that is why it lives here rather than
+        in a sampler. A peer tried `/proc/<pid>/io` deltas with a burst
+        detector; the gap it finds means "no burst on ANY reply", and twelve
+        replies staggered ten seconds apart give a burst every ten seconds
+        while each one is silent for two minutes. The aggregate reads twelve
+        times safer than the truth, in the direction that cuts live work.
+        `/proc` has no per-connection byte counter at all, so no resolution
+        fixes it — the quantity is not available at that layer.
+
+        Content, not bytes: `_is_only_keepalive` separates them by SSE event
+        NAME, so an idle stream scores its true silence however many pings it
+        carries.
+        """
+        now = time.monotonic()
+        with self._live_lock:
+            return sorted(now - self._content_at.get(c, now)
+                          for c in self._owed)
+
+    def _content_free_summary(self) -> str:
+        """`content_free_intervals` as one field of the drain line."""
+        gaps = self.content_free_intervals()
+        if not gaps:
+            return "0 s"
+        return (f"{gaps[0]:.0f}/{gaps[len(gaps) // 2]:.0f}/{gaps[-1]:.0f} s "
+                "min/med/max")
+
+    def content_free_seconds(self) -> float:
+        """The worst of `content_free_intervals`, for the marker's one slot."""
+        gaps = self.content_free_intervals()
+        return gaps[-1] if gaps else 0.0
+
+    def _note_reply_finished(self, conn) -> None:
+        """This connection's response completed. Bank the silence it survived.
+
+        THE ONLY EVIDENCE THAT RAISES A CEILING. A cut reports what was still
+        open when patience ran out, which bounds nothing: those replies never
+        finished, so their silence is not known to have been survivable. A
+        reply that went quiet for N seconds and THEN delivered says N was safe
+        to wait, and it is the only observation that does.
+
+        Called from `_mitm` where a response has actually been relayed, not
+        from `_owe_answer`, which also fires when a connection simply closes.
+        """
+        with self._live_lock:
+            since = self._content_at.get(conn)
+            if since is not None:
+                self._quiet_peak = max(self._quiet_peak,
+                                       time.monotonic() - since)
+
     def inflight_mid_response(self) -> int:
         """Of the owed requests, how many have already sent the client bytes.
 
@@ -9794,6 +9922,7 @@ class PinProxy:
                 self._delivered[conn] = self._delivered.get(conn, 0) + written
                 if content:
                     self._content[conn] = self._content.get(conn, 0) + 1
+                    self._content_at[conn] = self._owed[conn]
 
     def _owe_answer(self, conn, owed: bool) -> None:
         """Mark a connection as owing an answer, or as having paid it.
@@ -9820,6 +9949,12 @@ class PinProxy:
                 # `setdefault` so re-marking an already-owed connection cannot
                 # rewind it; only paying the debt clears the entry.
                 self._owed.setdefault(conn, 0.0)
+                # SEEDED AT THE DEBT, not at the first content byte. A reply
+                # that has sent nothing has still been silent, and for longer
+                # than one that sent a token a second ago — a missing entry
+                # would have to be reported as either 0 (reads as answering
+                # right now) or unknown, and both hide the worst case.
+                self._content_at.setdefault(conn, time.monotonic())
             else:
                 self._owed.pop(conn, None)
                 # THE COUNT BELONGS TO THE DEBT. A connection that has paid and
@@ -9827,6 +9962,7 @@ class PinProxy:
                 # or a keep-alive would look busier the longer it lives.
                 self._delivered.pop(conn, None)
                 self._content.pop(conn, None)
+                self._content_at.pop(conn, None)
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
@@ -10524,6 +10660,7 @@ class PinProxy:
                 # `_owed_still_moving`, so a client that connects and says
                 # nothing drops out after the stall window.
                 if served_one:
+                    self._note_reply_finished(conn)
                     self._owe_answer(conn, False)
                 got_one = self._handle_one_request(tls, conn)
                 served_one = True
