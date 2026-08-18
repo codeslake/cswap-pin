@@ -2720,6 +2720,39 @@ def is_pinned_route(path: str) -> bool:
         return False
     if _WORKER_SUBTREE.search(path):
         return False
+    # ``/api/oauth/validate`` IS THE ROUTE THAT KEEPS A LIVE BRIDGE ALIVE
+    # ACROSS A SWAP, and it is the only one here that is not about creating or
+    # owning an asset — it is a QUESTION.
+    #
+    # Claude Code pins the bridge's owner and watches ``~/.claude.json`` for a
+    # change. When cswap rotates the active account, CC sees the identity file
+    # name someone else and does NOT give up: it asks the server who the new
+    # credential actually belongs to (2.1.234, ``a7t()``):
+    #
+    #     POST ${BASE_API_URL}/api/oauth/validate
+    #     Authorization: Bearer <token from ~/.claude.json>
+    #
+    # If the server attributes it to the bridge's owner, CC logs
+    # ``[bridge:owner-pin] identity file names another account but the server
+    # attributes the credential to the owner — re-baselining``, returns
+    # "unchanged", and KEEPS SERVING. Otherwise it returns "changed", which
+    # tears the bridge down with ``Remote Control disconnected — signed-in
+    # claude.ai account or organization changed on this machine``.
+    #
+    # Unswapped, that question travels under the NEW account's bearer, so the
+    # server answers with the NEW account and every rotation reads as a real
+    # login change — killing every live bridge on the machine at once, which
+    # is exactly what a user reported while this was being traced. Swapped,
+    # the server sees the pinned account, the answer matches the owner, and CC
+    # re-baselines instead of disconnecting.
+    #
+    # EXACT MATCH, NOT A ``/api/oauth/`` PREFIX. The sibling ``/api/oauth/
+    # token`` is a REFRESH: it mints a credential for whoever's refresh_token
+    # was sent. Swapping its bearer would mint against a different account —
+    # handing one account's credential to another, which is the objection that
+    # ruled out pinning ``oauthAccount`` itself.
+    if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
+        return True
     return (
         path.startswith("/v1/code/sessions")
         or path.startswith("/v1/sessions/")
