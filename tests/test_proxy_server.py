@@ -3988,8 +3988,9 @@ class TestDrainReportsWhatItCut:
             monkeypatch.setattr(pp, "_DRAINING_BEAT_SECONDS", 0.05)
             monkeypatch.setattr(
                 pp, "beat_draining",
-                lambda cd, pid=None, owed=None, live=None: (
-                    beats.append(owed), real_beat(cd, pid, owed, live))[1])
+                lambda cd, pid=None, owed=None, live=None, quiet=None: (
+                    beats.append(owed),
+                    real_beat(cd, pid, owed, live, quiet))[1])
 
             threading.Thread(target=_stream, daemon=True).start()
             t0 = time.monotonic()
@@ -4231,8 +4232,9 @@ class TestDrainReportsWhatItCut:
         real_beat = pp.beat_draining
         monkeypatch.setattr(
             pp, "beat_draining",
-            lambda cd, pid=None, owed=None, live=None: (
-                seen.append((owed, live)), real_beat(cd, pid, owed, live))[1])
+            lambda cd, pid=None, owed=None, live=None, quiet=None: (
+                seen.append((owed, live)),
+                real_beat(cd, pid, owed, live, quiet))[1])
 
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
                             upstream=("127.0.0.1", 1))
@@ -4299,6 +4301,152 @@ class TestDrainReportsWhatItCut:
                 f"debts, not answers. killed={killed}")
         finally:
             pp._kill_daemon, pp._pin_daemon_pids = real_kill, real_pids
+
+    def case_a_reply_that_has_gone_quiet_is_timed_not_guessed(self, certdir):
+        """THE NUMBER `await_inflight` SAYS THE DECISION IS WAITING ON.
+
+        That comment names its own unblocking condition — "it becomes decidable
+        the day somebody measures the longest content-free interval a live
+        reply produces" — and nothing was measuring it. A peer tried, from
+        `/proc/<pid>/io` deltas with a burst detector, and could not: that rate
+        is process-wide, so its gap means "no burst on ANY of twelve replies"
+        while the rule needs "no content on ONE". Twelve replies staggered ten
+        seconds apart produce a burst every ten seconds while each one is
+        content-free for two minutes, so the aggregate reads small and safe and
+        a threshold chosen from it cuts live work.
+
+        `_StampingWriter` is the only thing that sees bytes attributed to one
+        connection, and `_is_only_keepalive` already separates content from a
+        ping BY NAME. So the interval is exact here and a heuristic anywhere
+        else.
+
+        AND IT GOES IN THE MARKER, not only the exit line. The daemon this
+        question exists for is the one that NEVER exits — measured on lmd42
+        2026-08-18, pid 609285, twelve live sessions, keepalive-only for 45
+        minutes and still draining. A number printed on the way out is a
+        number that case never produces.
+
+        AN INSTRUMENT ONLY. Nothing decides on it yet; see `_owed_still_moving`
+        for why a content-based stall stays refused until this has run.
+        """
+        import os
+
+        import cswap_pin.proxy as pp
+
+        class _Clock:
+            t = 1000.0
+
+            def monotonic(self):
+                return self.t
+
+            def time(self):
+                return 1787000000.0 + self.t
+
+            def sleep(self, _s):
+                pass
+
+        clock = _Clock()
+        real_time = pp.time
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        c, d = socket.socketpair()
+        e, f = socket.socketpair()
+        err = io.StringIO()
+        try:
+            pp.time = clock
+            # `e` IS OWED AND NEVER WRITTEN TO — a request on the wire whose
+            # upstream has said nothing. It is the SILENTEST thing here, and
+            # timing it from its first content byte would report the silentest
+            # reply on the box as the busiest: there is no first byte, so the
+            # clock would start now and read 0 s. It is timed from the debt.
+            for sock in (a, c, e):
+                with proxy._live_lock:
+                    proxy._open_conns.add(sock)
+                proxy._owe_answer(sock, True)
+            proxy._note_response_started(a, 500, True)
+            proxy._note_response_started(c, 500, True)
+
+            # `a` GOES QUIET AND KEEPS PINGING; `c` KEEPS ANSWERING. Both stay
+            # owed, both keep moving bytes, both look identical to
+            # `_owed_still_moving` — which is exactly the pair a byte rate
+            # cannot separate and this line has to.
+            clock.t = 1300.0
+            proxy._note_response_started(a, 39, False)
+            clock.t = 1305.0
+            proxy._note_response_started(c, 500, True)
+
+            clock.t = 1310.0
+            # THE NEVER-WRITTEN REPLY SCORES ITS FULL SILENCE, same as the one
+            # that went quiet 310s ago. Read before the drain, because
+            # `await_inflight` closes the connections this counts over.
+            assert proxy.content_free_intervals() == [5.0, 310.0, 310.0], (
+                "a reply that has sent nothing did not report the silence it "
+                "has actually been sitting in — timed from its first content "
+                "byte it has none, so the worst case on the box reads as the "
+                f"best: {proxy.content_free_intervals()}")
+
+            with contextlib.redirect_stderr(err):
+                proxy.await_inflight(0.0)
+            line = err.getvalue()
+
+            # MIN AND MAX, not the median: with three samples the middle is
+            # still a formatter detail. The fact is that the quiet replies and
+            # the busy one land at opposite ends of the same line.
+            assert "content-free 5/" in line and "/310 s min/med/max" in line, (
+                "the drain line does not say how long each reply has gone "
+                "without content, so the interval a stall threshold would "
+                "have to clear is still unmeasured: " + line)
+
+            # AND READABLE ON A DAEMON THAT HAS NOT FINISHED. The exit line is
+            # written by a drain that ended; this marker is what a stuck one
+            # publishes every beat.
+            pid = os.getpid()
+            pp.announce_draining(certdir, pid)
+            pp.beat_draining(certdir, pid, owed=2, live=2, quiet=310.0)
+            assert pp.draining_quiet(certdir, pid) == 310.0, (
+                "the beat marker does not carry the quiet interval, so the "
+                "one daemon this question is about — the one that never "
+                "exits — publishes no answer to it")
+            # A MARKER FROM A VERSION THAT DID NOT RECORD IT MUST NOT READ AS
+            # ZERO. Zero means "answering right now", the safest possible
+            # reading, and this fleet runs mixed versions through every
+            # upgrade.
+            pp.draining_marker_path(certdir, pid).write_text("1787000000\n2\n2")
+            assert pp.draining_quiet(certdir, pid) is None, (
+                "a marker with no quiet line answered a number, so an older "
+                "daemon would be reported as freshly answering")
+
+            # AND THE CLEAN BRANCH, which is the one the number is FOR and the
+            # one where a snapshot of the live set is 0 by construction:
+            # `drained clean` means nothing is owed. Only a reply that went
+            # quiet and then FINISHED can raise a ceiling, so that is what the
+            # line has to carry.
+            clock.t = 1400.0
+            for sock in (a, c, e):
+                proxy._note_reply_finished(sock)
+                proxy._owe_answer(sock, False)
+            clean = io.StringIO()
+            with contextlib.redirect_stderr(clean):
+                proxy.await_inflight(0.0)
+            got = clean.getvalue()
+            assert "drained clean" in got, (
+                "the second drain still had debts, so this proves nothing "
+                "about the clean branch: " + got)
+            assert "content-free wait a completed reply survived 400s" in got, (
+                "the clean drain reported no content-free interval, or "
+                "reported it from the live set — which is empty on every "
+                "clean drain, so the field could never be anything but "
+                "zero: " + got)
+        finally:
+            pp.time = real_time
+            try:
+                pp.draining_marker_path(certdir, os.getpid()).unlink()
+            except OSError:
+                pass
+            for s_ in (a, b, c, d, e, f):
+                try: s_.close()
+                except OSError: pass
 
     def case_the_cut_line_says_how_much_each_reply_delivered(self, certdir):
         """`mid-response` CANNOT TELL A LIVE STREAM FROM A CORPSE.
