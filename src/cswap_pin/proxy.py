@@ -8441,7 +8441,10 @@ class PinProxy:
         self._opaque_tunnels = 0
         # Connections that owe an answer right now — see `inflight_requests`,
         # which is the only reader, and `_owe_answer`, the only writer.
-        self._owed: set = set()
+        # conn -> whether any response byte has reached that client yet.
+        # A dict rather than a set so a cut can say which of the two it was;
+        # see `_note_response_started`.
+        self._owed: dict = {}
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -8753,6 +8756,7 @@ class PinProxy:
         # which had anybody waiting — and both numbers quoted to the user
         # tonight (34, then 30) were sockets, not truncated replies.
         cut = self.inflight_requests()
+        mid = self.inflight_mid_response()
         closed = self.live_client_count()
         self._close_open_connections()
         # ONE LINE PER DRAIN, ALWAYS — silence was the problem, not the noise.
@@ -8770,8 +8774,8 @@ class PinProxy:
         if cut:
             _log_lifecycle(
                 f"cut {cut} in-flight request(s) after {elapsed:.1f}s of a "
-                f"{budget:.0f}s budget (and closed {closed - cut} idle "
-                f"connection(s)) — a reply may have ended mid-stream"
+                f"{budget:.0f}s budget ({mid} mid-response, {cut - mid} before "
+                f"headers; and closed {closed - cut} idle connection(s))"
             )
         else:
             _log_lifecycle(
@@ -9065,7 +9069,7 @@ class PinProxy:
         def _release():
             with self._live_lock:
                 self._open_conns.discard(conn)
-                self._owed.discard(conn)
+                self._owed.pop(conn, None)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
@@ -9081,6 +9085,15 @@ class PinProxy:
             if not detached:
                 _release()
             self._local.release = None
+
+    def inflight_mid_response(self) -> int:
+        """Of the owed requests, how many have already sent the client bytes.
+
+        See `_note_response_started`: these are the ones a cut cannot be
+        retried out of.
+        """
+        with self._live_lock:
+            return sum(1 for started in self._owed.values() if started)
 
     def inflight_requests(self) -> int:
         """Connections that owe somebody an answer RIGHT NOW.
@@ -9116,6 +9129,26 @@ class PinProxy:
         with self._live_lock:
             return len(self._owed)
 
+    def _note_response_started(self, conn) -> None:
+        """The first response byte for this connection has gone to the client.
+
+        THE DIFFERENCE BETWEEN AN INCONVENIENCE AND A LOSS. A request cut
+        BEFORE its headers went out has sent the client nothing, so the client
+        sees a dropped connection and the SDK retries — it costs a round trip.
+        One cut MID-RESPONSE has already delivered part of an answer, and there
+        is no retry that repairs it: that is the "API Error: Connection lost
+        mid-response" a user reads.
+
+        Reported separately because the log could not tell them apart and the
+        number was therefore unusable. The sibling CCF proxy already splits
+        them (`cut 4 in-flight request(s) after 5s (4 mid-response, 0 before
+        headers)`), and its counts were the only ones defensible as
+        user-visible while ours said "a reply MAY have ended mid-stream".
+        """
+        with self._live_lock:
+            if conn in self._owed:
+                self._owed[conn] = True
+
     def _owe_answer(self, conn, owed: bool) -> None:
         """Mark a connection as owing an answer, or as having paid it.
 
@@ -9131,9 +9164,13 @@ class PinProxy:
         """
         with self._live_lock:
             if owed:
-                self._owed.add(conn)
+                # A DICT, NOT A SET — the value is "have any response bytes
+                # reached this client yet". `setdefault` so re-marking an
+                # already-owed connection cannot rewind it to "before
+                # headers"; only paying the debt clears the entry.
+                self._owed.setdefault(conn, False)
             else:
-                self._owed.discard(conn)
+                self._owed.pop(conn, None)
 
     def _unused_legacy_inflight(self) -> int:
         """The previous definition, kept only to document what it counted.
@@ -10142,9 +10179,15 @@ class PinProxy:
             # `_handle_one_request`. Counting only from here reported zero for
             # a request still being read or written upstream, and the drain
             # then cut it "after 0s".
+            _conn = getattr(self._local, "conn", None)
             return _relay_response(
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
+                # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
+                # client has received nothing and the SDK retries; after it,
+                # part of an answer is already delivered.
+                on_headers=(lambda: self._note_response_started(_conn))
+                if _conn is not None else None,
                 # A HEAD response carries the headers of the GET it mirrors,
                 # Content-Length included, but no body — only the request
                 # method says so.
@@ -10914,6 +10957,7 @@ def _relay_response(
     cid: int = 0,
     reject_on_auth_error: bool = False,
     method: str | None = None,
+    on_headers=None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -10929,6 +10973,19 @@ def _relay_response(
     Bytes are forwarded as they arrive, so an SSE stream reaches the client
     event-by-event instead of being buffered whole.
     """
+    def _send_head(payload: bytes) -> None:
+        """Write the response head, telling the caller bytes have left.
+
+        Every branch below that first writes to the client goes through here,
+        so a fourth branch added later cannot silently skip the notification —
+        which is the failure this whole change exists to stop repeating.
+        `on_headers` is idempotent, so the interim-response recursion may fire
+        it twice without consequence.
+        """
+        if on_headers is not None:
+            on_headers()
+        client.sendall(payload)
+
     buf = bytearray()
     while b"\r\n\r\n" not in buf:
         try:
@@ -11007,17 +11064,19 @@ def _relay_response(
         # connection. Returning here delivered the 103 as though it were the
         # answer and left the 200 in the buffer, so the next request read a
         # stale response. Forward it and loop for the final status.
-        client.sendall(b"\r\n".join(out) + b"\r\n\r\n")
+        _send_head(b"\r\n".join(out) + b"\r\n\r\n")
         if rest:
             # Bytes already read past this head belong to the next response;
             # they cannot be pushed back, so hand them to the recursion.
             return _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
+                on_headers=on_headers,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
+            on_headers=on_headers,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
@@ -11025,9 +11084,9 @@ def _relay_response(
         # the close-delimited branch would block on recv until the upstream
         # closes — which a keep-alive server need not ever do — and the
         # client's request just hangs.
-        client.sendall(b"\r\n".join(out) + b"\r\n\r\n" + rest)
+        _send_head(b"\r\n".join(out) + b"\r\n\r\n" + rest)
         return keep
-    client.sendall(b"\r\n".join(out) + b"\r\n\r\n" + rest)
+    _send_head(b"\r\n".join(out) + b"\r\n\r\n" + rest)
 
     if chunked:
         return _pipe_chunked(up, client, bytearray(rest)) and keep
