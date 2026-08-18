@@ -2245,6 +2245,147 @@ class TestWireEnv:
         assert "PIN-CA" in text and "CCF-CA" in text
 
 
+    def case_ssl_cert_file_only_when_it_provably_subsumes_the_store(
+        self, tmp_path, monkeypatch
+    ):
+        """SSL_CERT_FILE REPLACES; NODE_EXTRA_CA_CERTS only ADDS.
+
+        Measured: a context holding 136 CAs drops to 1 when SSL_CERT_FILE
+        names a one-certificate file. So the export is only safe when the
+        bundle contains everything the store it replaces contained.
+
+        "Just use the merged bundle" is NOT that guarantee, which is what
+        three sessions agreed before anyone measured per machine:
+
+            host-a     ambient 124  bundle 126  subsumes YES
+            host-b      ambient 128  bundle 167  subsumes NO  (27 missing)
+            host-c  ambient 128  bundle   2  subsumes NO  (128 missing)
+
+        host-b is the row a count cannot see -- BIGGER than the store
+        and still not a superset. host-c has no corporate bundle to
+        merge, so its "merged" file is just the component CAs.
+        """
+        import ssl as _ssl
+        from pathlib import Path
+
+        from cryptography.hazmat.primitives import serialization
+
+        from cswap_pin.proxy import _make_ca, wire_env
+
+        def _write(path, certs):
+            path.write_bytes(b"".join(
+                c.public_bytes(serialization.Encoding.PEM) for c in certs))
+
+        ours, _ = _make_ca()
+        root_a, _ = _make_ca()
+        root_b, _ = _make_ca()
+        ca = tmp_path / "ca.pem"
+        _write(ca, [ours])
+        ambient = tmp_path / "ambient.pem"
+        _write(ambient, [root_a, root_b])
+        monkeypatch.setattr(
+            _ssl, "get_default_verify_paths",
+            lambda: _ssl.DefaultVerifyPaths(str(ambient), None, "",
+                                            str(ambient), "", ""))
+
+        # SUBSUMES -> exported, and it is the merged bundle itself.
+        good = tmp_path / "ca-bundle.pem"
+        _write(good, [ours, root_a, root_b])
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(good)}, 9955, ca)
+        assert env.get("SSL_CERT_FILE") == str(good), env.get("SSL_CERT_FILE")
+
+        # BIGGER BUT NOT A SUPERSET -> refused. This is host-b.
+        extra, _ = _make_ca()
+        big = tmp_path / "ca-bundle.pem"
+        _write(big, [ours, root_a, extra])          # root_b missing
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(big)}, 9955, ca)
+        assert "SSL_CERT_FILE" not in env, (
+            "a bundle missing one ambient root still blinds the client to it")
+
+        # SUBSUMES BUT WITHOUT OUR CA -> refused. Every other host verifies
+        # and the ONE hop this session is routed through does not, which is
+        # the only hop the export exists for; subsumption alone cannot catch
+        # it, because such a bundle is a perfectly good superset.
+        #
+        # ASSERTED ON `_python_trust_file` DIRECTLY, not through wire_env,
+        # because wire_env cannot produce this input: `_trust_file` merges our
+        # CA in before we ever see the bundle. It IS reachable in production
+        # through the other door -- the shared `ca-trust.pem` is built by an
+        # EXTERNAL builder from `ca-trust.d`, and a builder that drops our pem
+        # hands us exactly this file. The peer maintaining that builder
+        # shipped and removed a bug in the same area tonight.
+        from cswap_pin.proxy import _python_trust_file
+        foreign = tmp_path / "someone-elses-bundle.pem"
+        _write(foreign, [root_a, root_b])
+        assert _python_trust_file(ca, foreign) is None, (
+            "a bundle that cannot verify our own proxy must not be exported")
+
+        # OUR CA ALONE -> refused. The lone-CA bug, in our direction.
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(ca)}, 9955, ca)
+        assert "SSL_CERT_FILE" not in env
+
+        # cafile None BUT capath HAS A FILE -> still exported. This is
+        # host-a, the only machine where the fix is needed: its uv tool
+        # env reports cafile=None and openssl_cafile missing, so a gate that
+        # reads `.cafile` alone gives up there and the whole change ships as a
+        # no-op on the one box with the failures.
+        capath = tmp_path / "certs"
+        capath.mkdir()
+        _write(capath / "ca-certificates.crt", [root_a, root_b])
+        monkeypatch.setattr(
+            _ssl, "get_default_verify_paths",
+            lambda: _ssl.DefaultVerifyPaths(None, str(capath), "",
+                                            str(tmp_path / "absent.pem"),
+                                            "", str(capath)))
+        _write(good, [ours, root_a, root_b])
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(good)}, 9955, ca)
+        assert env.get("SSL_CERT_FILE") == str(good), (
+            "cafile=None is host-a's normal state, not 'unknowable'")
+
+        # NOTHING NAMEABLE -> refused rather than guessed.
+        monkeypatch.setattr(
+            _ssl, "get_default_verify_paths",
+            lambda: _ssl.DefaultVerifyPaths(None, None, "", "", "", ""))
+        _write(good, [ours, root_a, root_b])
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(good)}, 9955, ca)
+        assert "SSL_CERT_FILE" not in env
+
+        # The node path is untouched throughout -- it ADDS, so it never had
+        # this hazard.
+        assert "NODE_EXTRA_CA_CERTS" in env
+
+    def case_rewrites_an_all_proxy_but_never_invents_one(self, tmp_path):
+        """An ALL_PROXY already in play names the hop we chain THROUGH, so it
+        is rewritten to us. An absent one stays absent: this env can be eval'd
+        into the user's SHELL (pin-env), where an ALL_PROXY we invented would
+        route that shell's git, uv and gh through a MITM built for one
+        client."""
+        from cswap_pin.proxy import wire_env
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+
+        env = wire_env({"ALL_PROXY": "http://127.0.0.1:9901"}, 9955, ca)
+        assert env["ALL_PROXY"] == "http://127.0.0.1:9955"
+
+        env = wire_env({"all_proxy": "http://127.0.0.1:9901"}, 9955, ca)
+        assert env["all_proxy"] == "http://127.0.0.1:9955"
+
+        env = wire_env({}, 9955, ca)
+        assert "ALL_PROXY" not in env and "all_proxy" not in env
+
+    def case_merges_existing_node_extra_ca(self, tmp_path):
+        from cswap_pin.proxy import wire_env
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        other = tmp_path / "ccf-ca.pem"
+        other.write_text("CCF-CA\n")
+        env = wire_env({"NODE_EXTRA_CA_CERTS": str(other)}, 9955, ca)
+        bundle = env["NODE_EXTRA_CA_CERTS"]
+        assert bundle not in (str(ca), str(other))  # a merged file
+        text = (tmp_path / "ca-bundle.pem").read_text()
+        assert "PIN-CA" in text and "CCF-CA" in text
+
+
 class TestWireGlobalConfig:
     """Wiring hand-launched sessions through .claude.json — the file cswap
     already rewrites to swap accounts. Claude Code applies its `env` block
@@ -2262,6 +2403,58 @@ class TestWireGlobalConfig:
             "claude_swap.paths.get_global_config_path", lambda: path
         )
         return path
+
+    def case_the_env_block_carries_ssl_cert_file(self, tmp_path, monkeypatch):
+        """THE BLOCK THE FAILING CALLER ACTUALLY INHERITS.
+
+        cswap's usage poll is plain urllib, so it obeys the proxy vars this
+        block sets while trusting nothing that signs them. Control on the same
+        host and proxy: without SSL_CERT_FILE, CERTIFICATE_VERIFY_FAILED; with
+        it, HTTP 429. Children of a claude session inherit this env, so the
+        shell path (`wire_env`) alone would not have reached them.
+
+        Same subsumption gate as `wire_env` -- see that case for why "the
+        merged bundle" is not by itself a guarantee.
+        """
+        import ssl as _ssl
+        from pathlib import Path
+
+        from cryptography.hazmat.primitives import serialization
+
+        from cswap_pin.proxy import _make_ca, wire_global_config
+
+        def _write(path, certs):
+            path.write_bytes(b"".join(
+                c.public_bytes(serialization.Encoding.PEM) for c in certs))
+
+        ours, _ = _make_ca()
+        root, _ = _make_ca()
+        ca = Path(tmp_path) / "ca.pem"
+        _write(ca, [ours])
+        ambient = Path(tmp_path) / "ambient.pem"
+        _write(ambient, [root])
+        monkeypatch.setattr(
+            _ssl, "get_default_verify_paths",
+            lambda: _ssl.DefaultVerifyPaths(str(ambient), None, "",
+                                            str(ambient), "", ""))
+        # `_merged_ca` builds ca-bundle.pem beside the CA; seed it so the
+        # merge has the ambient root to carry, which is the wired-machine
+        # shape rather than a bare first launch.
+        monkeypatch.setenv("NODE_EXTRA_CA_CERTS", str(ambient))
+        cfg = self._config(tmp_path, monkeypatch, {})
+
+        assert wire_global_config(9955, ca) is True
+        env = json.loads(cfg.read_text())["env"]
+        assert "SSL_CERT_FILE" in env, (
+            "python children of a pinned session trust nothing on the pin")
+        assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"], (
+            "one merged bundle, so the peer writing the same variable writes "
+            "the same value and order stops mattering")
+
+        # UNWIRING MUST TAKE IT BACK. The ledger records the keys we set; one
+        # left behind points a shell at a bundle nobody maintains.
+        assert wire_global_config(None, None) is True
+        assert "SSL_CERT_FILE" not in json.loads(cfg.read_text()).get("env", {})
 
     def case_a_receipt_that_cannot_be_written_leaves_the_config_unwired(
         self, tmp_path, monkeypatch
