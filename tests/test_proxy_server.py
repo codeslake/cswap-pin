@@ -3948,6 +3948,59 @@ class TestDrainReportsWhatItCut:
             pp._kill_daemon = real_kill
             pp._pin_daemon_pids = real_pids
 
+    def case_two_teardowns_at_once_do_not_unprotect_each_other(self, certdir):
+        """MEASURED, SAME PID, SAME SECOND — both terminators fired.
+
+            08:41:19Z pid=616877 stopping (refcount)
+            08:41:19Z pid=616877 stopping (signal SIGTERM)
+            08:41:49Z pid=616877 cut 14 (14 mid-response, 0 before headers)
+
+        Two teardowns in one process means two `stop()` calls, two drains, and
+        two announcements. They take DIFFERENT ceilings by design — refcount
+        600s, signal 30s — so the short one finishes first, and the first
+        version of the marker had it unlink the file out from under the drain
+        still waiting. That hands the sweep exactly the process the marker
+        exists to protect, at the moment it is most exposed.
+
+        The bug was one hour old and its evidence was already in the log that
+        motivated the marker. Counted rather than flagged: the LAST release
+        removes it.
+        """
+        import cswap_pin.proxy as pp
+
+        first = pp.announce_draining(certdir, 4242)   # the long, still waiting
+        second = pp.announce_draining(certdir, 4242)  # the short, about to end
+        assert pp.is_draining(certdir, 4242) is True, "precondition"
+
+        second()
+        assert pp.is_draining(certdir, 4242) is True, (
+            "the short drain's release unprotected the long one that is still "
+            "running — the sweep can now TERM a daemon mid-reply, which is the "
+            "whole fault this marker was added for")
+
+        first()
+        assert pp.is_draining(certdir, 4242) is False, (
+            "the marker outlived every drain that announced it, so a genuine "
+            "orphan on this pid is spared until the TTL expires")
+
+        # A CALLER THAT RELEASES TWICE MUST NOT SPEND SOMEBODY ELSE'S COUNT.
+        # The first version of this assertion released twice AFTER everything
+        # had already released, where `dict.get(key, 1) - 1` lands on zero
+        # either way — so the mutation that removes the idempotence guard
+        # SURVIVED it. Tested where it can fail: a second drain is still
+        # running, and the double release must not take the count to zero
+        # under it.
+        long_drain = pp.announce_draining(certdir, 4242)
+        short_drain = pp.announce_draining(certdir, 4242)
+        short_drain()
+        short_drain()      # the same caller, twice
+        assert pp.is_draining(certdir, 4242) is True, (
+            "one caller's double release spent the OTHER drain's count and "
+            "unlinked the marker while it was still waiting — the sweep can "
+            "now TERM it mid-reply")
+        long_drain()
+        assert pp.is_draining(certdir, 4242) is False
+
     def case_the_drain_is_what_announces_itself(self, certdir):
         """THE WIRING, and it is the third time tonight the guard was orphaned.
 

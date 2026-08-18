@@ -4935,12 +4935,34 @@ def announce_draining(certdir: Path, pid: int | None = None):
     """
     pid = os.getpid() if pid is None else pid
     path = draining_marker_path(certdir, pid)
-    try:
-        path.write_text(str(time.time()))
-    except OSError:
-        return lambda: None
+    key = str(path)
+    with _DRAINING_LOCK:
+        first = _DRAINING_DEPTH.get(key, 0) == 0
+        _DRAINING_DEPTH[key] = _DRAINING_DEPTH.get(key, 0) + 1
+    if first:
+        try:
+            path.write_text(str(time.time()))
+        except OSError:
+            with _DRAINING_LOCK:
+                _DRAINING_DEPTH[key] -= 1
+            return lambda: None
+
+    released = False
 
     def _done():
+        # IDEMPOTENT PER CALLER, so a caller that releases twice cannot take
+        # the count below the drains still running.
+        nonlocal released
+        if released:
+            return
+        released = True
+        with _DRAINING_LOCK:
+            _DRAINING_DEPTH[key] = _DRAINING_DEPTH.get(key, 1) - 1
+            last = _DRAINING_DEPTH[key] <= 0
+            if last:
+                _DRAINING_DEPTH.pop(key, None)
+        if not last:
+            return
         try:
             path.unlink()
         except OSError:
@@ -5166,6 +5188,24 @@ _HANDOVER_DRAIN_SECONDS = 600.0
 # and placing it 200 lines earlier made it a forward reference that broke the
 # import outright (caught by a suite that ran zero tests and said so).
 _DRAINING_MARKER_TTL = _HANDOVER_DRAIN_SECONDS + 60.0
+
+# TWO TEARDOWNS CAN RUN AT ONCE IN ONE PROCESS, and the first version of this
+# marker did not survive that. Measured on lmd42 2026-08-18, same pid, SAME
+# SECOND:
+#
+#     08:41:19Z pid=616877 stopping (refcount)
+#     08:41:19Z pid=616877 stopping (signal SIGTERM)
+#
+# Both terminators fired, so both ran `stop()`, so both drained — and each
+# drain announced. The one on the SHORT budget finishes first and used to
+# unlink the marker out from under the one still waiting on the long budget,
+# handing the sweep exactly the process this exists to protect, at exactly the
+# moment it is most exposed.
+#
+# Counted rather than flagged, and the LAST release removes it. A depth of one
+# is the ordinary case and costs a dict lookup.
+_DRAINING_LOCK = threading.Lock()
+_DRAINING_DEPTH: dict[str, int] = {}
 
 _FIRST_HOLDER_TIMEOUT = 300.0
 
