@@ -5179,7 +5179,7 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 # Ten minutes is a safety net for a wedged connection, not a wait anyone
 # expects to pay. The loop exits on zero owed, so a quiet box returns in
 # milliseconds and a busy one returns when its last reply lands.
-_HANDOVER_DRAIN_SECONDS = 600.0
+_HANDOVER_DRAIN_SECONDS = 1800.0
 
 # A drainer's marker outlives its own longest wait plus the slack a supervisor
 # would allow, and no longer — a pid is reused freely, so a marker that outlived
@@ -5187,6 +5187,13 @@ _HANDOVER_DRAIN_SECONDS = 600.0
 # than beside `is_draining`, which reads it: it is derived from the ceiling above
 # and placing it 200 lines earlier made it a forward reference that broke the
 # import outright (caught by a suite that ran zero tests and said so).
+# NO BYTES FOR THIS LONG AND IT IS WEDGED, NOT SLOW. See
+# `_owed_still_moving`: this is what actually ends a drain now, and the budgets
+# above are backstops against a bug in that predicate. Ninety seconds is far
+# past any gap a live stream produces (SSE keep-alives are seconds apart) and
+# far short of the ten minutes that was cutting real replies.
+_DRAIN_STALL_SECONDS = 90.0
+
 _DRAINING_MARKER_TTL = _HANDOVER_DRAIN_SECONDS + 60.0
 
 # TWO TEARDOWNS CAN RUN AT ONCE IN ONE PROCESS, and the first version of this
@@ -8975,7 +8982,7 @@ class PinProxy:
             if budget > 0:
                 deadline = started + budget
                 while time.monotonic() < deadline:
-                    if self.inflight_requests() == 0:
+                    if not self._owed_still_moving(started):
                         break
                     time.sleep(0.05)
         finally:
@@ -9319,6 +9326,38 @@ class PinProxy:
                 _release()
             self._local.release = None
 
+    def _owed_still_moving(self, since: float) -> bool:
+        """Is any owed connection still DELIVERING, rather than merely open?
+
+        THE DISCRIMINATOR A DEADLINE CANNOT MAKE. Measured on lmd42
+        2026-08-18: a departing daemon burned its full 600s ceiling and cut 12
+        replies, every one of them `mid-response` and every one of them still
+        streaming when it was cut. The drain gave up on live work because a
+        clock said so.
+
+            09:02:20Z cut 12 in-flight request(s) after 600.0s of a 600s budget
+                      (12 mid-response, 0 before headers)
+
+        A wedged connection and a four-minute answer are identical to a
+        deadline — which is exactly why the deadline was there. They are not
+        identical to the CONNECTION: one is moving bytes and one is not. So the
+        wait ends when nothing has moved for `_DRAIN_STALL_SECONDS`, and the
+        budget above it becomes a backstop against a bug in this predicate
+        rather than the thing that decides.
+
+        A connection owed but not yet started (value 0.0) is measured from the
+        drain's own start: its request is being read or relayed upstream, which
+        is real work, but an upstream that never answers must not hold the
+        daemon open forever either.
+        """
+        now = time.monotonic()
+        with self._live_lock:
+            stamps = list(self._owed.values())
+        for stamp in stamps:
+            if now - (stamp or since) < _DRAIN_STALL_SECONDS:
+                return True
+        return False
+
     def inflight_mid_response(self) -> int:
         """Of the owed requests, how many have already sent the client bytes.
 
@@ -9326,7 +9365,7 @@ class PinProxy:
         retried out of.
         """
         with self._live_lock:
-            return sum(1 for started in self._owed.values() if started)
+            return sum(1 for stamp in self._owed.values() if stamp)
 
     def inflight_requests(self) -> int:
         """Connections that owe somebody an answer RIGHT NOW.
@@ -9380,7 +9419,7 @@ class PinProxy:
         """
         with self._live_lock:
             if conn in self._owed:
-                self._owed[conn] = True
+                self._owed[conn] = time.monotonic()
 
     def _owe_answer(self, conn, owed: bool) -> None:
         """Mark a connection as owing an answer, or as having paid it.
@@ -9397,11 +9436,16 @@ class PinProxy:
         """
         with self._live_lock:
             if owed:
-                # A DICT, NOT A SET — the value is "have any response bytes
-                # reached this client yet". `setdefault` so re-marking an
-                # already-owed connection cannot rewind it to "before
-                # headers"; only paying the debt clears the entry.
-                self._owed.setdefault(conn, False)
+                # A DICT, NOT A SET, AND THE VALUE IS A TIMESTAMP. 0.0 means
+                # "owed, but no response byte has gone out yet"; anything else
+                # is the monotonic clock at the LAST byte written to this
+                # client. One field answers both questions the drain asks —
+                # has the reply started (a cut is unretryable) and is it still
+                # moving (a cut is premature).
+                #
+                # `setdefault` so re-marking an already-owed connection cannot
+                # rewind it; only paying the debt clears the entry.
+                self._owed.setdefault(conn, 0.0)
             else:
                 self._owed.pop(conn, None)
 
@@ -11184,6 +11228,33 @@ class _Prefixed:
         return getattr(self._sock, name)
 
 
+class _StampingWriter:
+    """A client socket that reports every write, and is otherwise itself.
+
+    ONE METHOD, because `sendall` is the only thing the relay path calls on the
+    client — checked rather than assumed. Everything else falls through, so a
+    future caller reaching for another method gets the real socket's behaviour
+    instead of an AttributeError.
+    """
+
+    __slots__ = ("_sock", "_note")
+
+    def __init__(self, sock, note):
+        self._sock = sock
+        self._note = note
+
+    def sendall(self, data):
+        # NOTE FIRST, SEND SECOND. A stamp after a blocking `sendall` records
+        # when the write COMPLETED, and a slow client is exactly the case where
+        # that gap matters — the drain would see the connection as stale for
+        # the whole time it was busy delivering to it.
+        self._note()
+        return self._sock.sendall(data)
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
 def _relay_response(
     up: ssl.SSLSocket,
     client: ssl.SSLSocket,
@@ -11206,17 +11277,24 @@ def _relay_response(
     Bytes are forwarded as they arrive, so an SSE stream reaches the client
     event-by-event instead of being buffered whole.
     """
-    def _send_head(payload: bytes) -> None:
-        """Write the response head, telling the caller bytes have left.
+    # EVERY WRITE, NOT JUST THE FIRST. `on_headers` began as "the reply has
+    # started", which the drain needed to tell a retryable cut from a lost one.
+    # It now also answers "is this reply still MOVING", and that question has
+    # to be asked of every byte rather than the first — so the client is
+    # wrapped once here and the body loops, the chunked pipe and anything added
+    # later stamp by construction, because they write through the object they
+    # were handed.
+    #
+    # THE ALTERNATIVE IS THE BUG THIS FILE KEEPS REPEATING: stamping at each
+    # `sendall` site is the same shape as clearing the drain debt at `_mitm`'s
+    # handover and not at `_blind_tunnel`'s, which is where Remote Control
+    # actually goes. One place, or it will be missed.
+    if on_headers is not None:
+        client = _StampingWriter(client, on_headers)
 
-        Every branch below that first writes to the client goes through here,
-        so a fourth branch added later cannot silently skip the notification —
-        which is the failure this whole change exists to stop repeating.
-        `on_headers` is idempotent, so the interim-response recursion may fire
-        it twice without consequence.
-        """
-        if on_headers is not None:
-            on_headers()
+    def _send_head(payload: bytes) -> None:
+        """Write the response head. Kept because the branches read better with
+        a name on this, not because it is where the stamping happens."""
         client.sendall(payload)
 
     buf = bytearray()
