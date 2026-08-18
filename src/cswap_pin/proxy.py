@@ -7906,6 +7906,55 @@ def _successor_is_serving() -> bool:
     return not held_by_a_holder()
 
 
+def teardown_drain_budget(reason: str, held: bool) -> float:
+    """How long a shutdown may wait for the replies it still owes.
+
+    A FOURTH EXIT PATH, AND THE ONLY ONE STILL CUTTING. Measured on host-a, the
+    0.1.99 rollout: the handover at 08:04:18Z emitted no drain line at all — it
+    handed the port over and kept living, which is exactly what the handover
+    ceiling is for. Then at 08:08:18Z this path fired `stopping (refcount)` on
+    that same lingering daemon and cut 13 replies, every one of them
+    mid-response, on thirty seconds. The cost had been moved, not removed.
+
+    THREE ARMS, AND THE REASON STRING IS WHAT SEPARATES THEM — the same field
+    that was added so a TERM and an idle teardown would stop leaving identical
+    traces. What each arm is really asking is *who is waiting for this process
+    to be gone*:
+
+    ``held``
+        A recycle. The holder cannot put the successor on the socket until we
+        are gone, so every second here is a second with nothing behind the
+        port. Short.
+
+    a signal
+        Somebody is waiting, and the supervisor's patience is
+        ``_DRAIN_SECONDS + 2`` before SIGKILL. Draining longer than that saves
+        no reply — it guarantees a harder kill partway through one. Short, and
+        this is why the handover ceiling must NOT be used here.
+
+    ``refcount``
+        Nobody is waiting. No successor is coming for this port, no supervisor
+        is counting, and ``release_listener`` has already freed the address so
+        a fresh daemon could bind at once. The only cost of waiting is this
+        process finishing the replies it already owes. Long.
+
+    THE COMMON CASE PAYS NOTHING EITHER WAY: refcount reaching zero normally
+    means no sessions, so nothing is owed and ``await_inflight`` returns in
+    milliseconds. The long ceiling is only ever spent by a daemon that outlived
+    its holder and still has work — precisely the one measured above.
+
+    A FUNCTION RATHER THAN A BRANCH INSIDE ``_teardown``, because in there it
+    is reachable only through a live daemon's sockets and state file, and a
+    harness that reconstructs those can be wrong in its own right — the same
+    reason `case_teardown_restores_the_config` asserts on the parse tree.
+    """
+    if held:
+        return _HELD_DRAIN_SECONDS
+    if reason == "refcount":
+        return _HANDOVER_DRAIN_SECONDS
+    return _DRAIN_SECONDS
+
+
 def held_by_a_holder(ppid: int | None = None, env=None) -> bool:
     """Whether a holder owns this daemon's socket and will outlive it.
 
@@ -8201,9 +8250,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # under a holder is a RECYCLE, and the holder cannot put the successor
         # on the socket until we are gone. Draining the full ceiling there is
         # time with the port bound and nobody behind it.
-        cut = proxy.stop(
-            drain=_HELD_DRAIN_SECONDS if held_by_a_holder() else _DRAIN_SECONDS
-        )
+        cut = proxy.stop(drain=teardown_drain_budget(reason, held_by_a_holder()))
         # THE NUMBER FROM BEFORE THE CUT. Reading it back off the proxy here
         # returns 0 always — `await_inflight` empties the set it counts.
         _log_lifecycle(f"drained, {cut} client(s) still open")
