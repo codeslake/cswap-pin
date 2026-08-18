@@ -4897,7 +4897,32 @@ _LOG_NAME = "daemon.log"
 #
 # AT THE FUNNEL rather than on the two lines that collide today, so a line type
 # added next month gets it without anyone remembering to.
-_COMPONENT = "cswap-pin"
+def _component_tag() -> str:
+    """`cswap-pin/<version>`, or the bare name if the version cannot be read.
+
+    THE VERSION IS PART OF THE PROVENANCE, and leaving it out cost a night.
+    0.1.113-0.1.115 printed a `content-free` value that measured the wrong
+    quantity; 0.1.116 fixed it. Both shapes sit in the same log, spelled
+    identically, so every reader — my own watcher, a peer's table, me — has to
+    know WHEN each machine was upgraded to tell a usable number from a
+    worthless one. A line that names the code that wrote it never needs that.
+
+    Cheap enough to compute once at import: this is the same funnel the
+    component name goes through, so a line type added later is covered without
+    anyone remembering.
+
+    Falls back to the bare name rather than raising or printing "unknown": a
+    daemon that cannot read its own metadata must still log.
+    """
+    try:
+        from cswap_pin import __version__
+
+        return f"cswap-pin/{__version__}"
+    except Exception:  # noqa: BLE001 — a log line is not worth an exception
+        return "cswap-pin"
+
+
+_COMPONENT = _component_tag()
 _LOG_MAX_BYTES = 64 * 1024
 
 

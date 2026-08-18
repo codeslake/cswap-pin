@@ -4504,9 +4504,14 @@ class TestDrainReportsWhatItCut:
                 assert re.search(pat, where), (
                     f"the format change broke `{pat}`, which peer tooling "
                     f"greps unanchored: {where}")
-            assert re.search(r"\] cswap-pin pid=\d+ ", line), (
-                "the drain line does not name the component that wrote it, so "
-                f"a reader cannot tell it from the sibling proxy's: {line}")
+            # NAME AND VERSION. The name alone was not enough: 0.1.113-0.1.115
+            # printed a `content-free` value measuring the wrong quantity and
+            # 0.1.116 fixed it, and both spell the line identically — so every
+            # reader had to know when each machine was upgraded to tell a
+            # usable number from a worthless one.
+            assert re.search(r"\] cswap-pin/\d+\.\d+\.\d+ pid=\d+ ", line), (
+                "the drain line does not name the component AND VERSION that "
+                f"wrote it, so its numbers carry no provenance: {line}")
         finally:
             pp.time = real_time
             with pp._DRAINING_LOCK:

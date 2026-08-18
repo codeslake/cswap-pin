@@ -10344,7 +10344,8 @@ class TestTheDaemonLogRecordsItsOwnDeath:
         # on `serving on port` rather than on a drain line for exactly that
         # reason: tagging only the two lines that collide today is the version
         # of this fix that rots.
-        assert re.search(r"\] cswap-pin pid=\d+ serving on port", text), (
+        assert re.search(
+            r"\] cswap-pin/\d+\.\d+\.\d+ pid=\d+ serving on port", text), (
             "a lifecycle line does not name the component that wrote it: "
             + text)
         # The insertion point is pinned by the regex above; the phrases peer
