@@ -3892,6 +3892,132 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_the_orphan_sweep_spares_a_daemon_that_is_draining(self, certdir):
+        """THE FIFTH CAUSE, and it is two of my own fixes in direct opposition.
+
+        `_spawn_daemon` runs `_sweep_orphan_daemons(keep_pid=<successor>)` the
+        moment the successor is serving and recorded. A predecessor that handed
+        the port on and is patiently finishing its replies is, to that filter,
+        exactly "a pin daemon for this certdir that is not keep_pid".
+
+        Measured on lmd42 2026-08-18, the 0.1.100 rollout — one second between
+        the two lines:
+
+            08:21:19Z  pid=616877  serving on port 36301
+            08:21:19Z  pid=2932386 stopping (signal SIGTERM)
+            08:21:49Z  pid=2932386 cut 13 (13 mid-response, 0 before headers)
+
+        AND THE HANDOVER CEILING IS WHAT MADE IT BITE. Before 0.1.99 the
+        predecessor exited inside thirty seconds and the sweep usually found
+        nothing; widening the wait twentyfold widened the window to be killed
+        in. Each fix was right alone. Nothing in either said the other existed.
+
+        THE POPULATIONS ARE GENUINELY DIFFERENT and the sweep's own docstring
+        says so — it targets daemons that "hold ports and never idle-teardown".
+        A drainer accepts nothing and exits by itself. So the fix is in the
+        sweep, not in the drain, and NOT in making the drainer ignore SIGTERM:
+        that would defeat a real supervisor and buy a SIGKILL at 32s, which
+        cuts harder than the drain it was meant to protect.
+        """
+        import cswap_pin.proxy as pp
+
+        killed = []
+        real_kill = pp._kill_daemon
+        real_pids = pp._pin_daemon_pids
+        pp._kill_daemon = lambda pid: killed.append(pid)
+        # A PREDECESSOR AND A REAL ORPHAN, so the case cannot pass by sparing
+        # everything — which is the failure mode of a guard that only ever
+        # removes a kill.
+        pp._pin_daemon_pids = lambda certdir: [4242, 7777]
+        try:
+            pp.announce_draining(certdir, 4242)
+            assert pp.is_draining(certdir, 4242) is True, "precondition"
+            assert pp.is_draining(certdir, 7777) is False, "precondition"
+
+            pp._sweep_orphan_daemons(certdir, keep_pid=999)
+
+            assert 4242 not in killed, (
+                "the sweep TERMed a daemon that had announced it was draining. "
+                "That is the 08:21:19Z line: a handover that cut nothing, "
+                "followed one second later by a signal that cut 13 replies")
+            assert killed == [7777], (
+                "a real orphan must still be killed — a sweep that spares "
+                "everything is not a fix, it is a disabled sweep. "
+                f"killed={killed}")
+        finally:
+            pp._kill_daemon = real_kill
+            pp._pin_daemon_pids = real_pids
+
+    def case_the_drain_is_what_announces_itself(self, certdir):
+        """THE WIRING, and it is the third time tonight the guard was orphaned.
+
+        The sibling cases call `announce_draining` themselves, so removing the
+        call from `await_inflight` leaves them green — a correct function that
+        nothing invokes, which is the exact shape of `_blind_tunnel` never
+        clearing its debt and of the relay never marking a reply started.
+
+        ANNOUNCED INSIDE `await_inflight` ON PURPOSE. There are four exit paths
+        that drain and tonight's whole bug list is fixes that landed on some
+        paths and not the one that mattered, so the announcement lives in the
+        one function all four go through. This case is what makes that claim
+        checkable rather than aspirational.
+        """
+        import cswap_pin.proxy as pp
+
+        calls, released = [], []
+        real = pp.announce_draining
+
+        def _spy(certdir_arg, pid=None):
+            calls.append(Path(certdir_arg))
+            done = real(certdir_arg, pid)
+            return lambda: (released.append(True), done())[1]
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        pp.announce_draining = _spy
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                proxy.await_inflight(0.0)
+        finally:
+            pp.announce_draining = real
+
+        assert calls, (
+            "the drain did not announce itself, so the orphan sweep will TERM "
+            "this daemon while it is finishing replies — the 08:21:19Z line")
+        assert calls[0] == Path(certdir), (
+            f"announced against the wrong certdir: {calls[0]} != {certdir}. A "
+            "marker under another daemon's directory protects nobody")
+        assert released, (
+            "the marker was never removed. It expires on a TTL, so this is not "
+            "a leak that lasts — but until it does, a genuinely orphaned pin "
+            "daemon on that pid is spared by a sweep that should have taken it")
+
+    def case_a_draining_marker_does_not_outlive_its_writer(self, certdir):
+        """A SIGKILLED DRAINER CANNOT CLEAN UP AFTER ITSELF, and pids are reused.
+
+        The marker's only power is to spare a process, so a stale one is a
+        pin daemon that never gets swept — the orphan this sweep exists for,
+        wearing a dead process's badge. Past the TTL the answer goes back to
+        what it was before any of this existed, which is the safe direction.
+        """
+        import cswap_pin.proxy as pp
+
+        pp.announce_draining(certdir, 4242)
+        assert pp.is_draining(certdir, 4242) is True
+
+        # Backdate it past the ceiling plus a supervisor's slack.
+        path = pp.draining_marker_path(certdir, 4242)
+        path.write_text(str(time.time() - pp._DRAINING_MARKER_TTL - 1))
+        assert pp.is_draining(certdir, 4242) is False, (
+            "a marker older than the longest possible drain still protected a "
+            "pid — an orphan inheriting that number would never be swept")
+
+        # AND AN UNWRITABLE MARKER MUST NOT BREAK THE DRAIN. Failing open here
+        # means the outcome is exactly what it was before this existed; failing
+        # closed would mean a drain that cannot start.
+        done = pp.announce_draining(Path("/nonexistent-dir-for-a-marker"), 1)
+        done()
+
     def case_a_refcount_shutdown_is_not_a_recycle_and_not_a_signal(self, certdir):
         """THE FOURTH EXIT PATH, found by fixing the other three.
 
