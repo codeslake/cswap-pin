@@ -5040,6 +5040,45 @@ _DRAIN_SECONDS = 30.0
 # is correct.
 _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 
+# THE CEILING FOR A HANDOVER WHOSE SUCCESSOR IS ALREADY SERVING, and it is a
+# different number from `_DRAIN_SECONDS` because it buys a different thing.
+#
+# MEASURED 2026-08-18, and this is the number that moved the problem. With the
+# `_blind_tunnel` debt fixed, three hosts departed and reported the phase split:
+#
+#     host-a  cut 16   (16 mid-response, 0 before headers)
+#     wmac   cut 3    ( 3 mid-response, 0 before headers)
+#     pmac   drained clean — 0 owed, 0 live bridges
+#
+# ZERO "before headers" ON EVERY HOST. So the drain is not malfunctioning and
+# the count is not bookkeeping: those are replies that had already begun
+# streaming to a user and genuinely did not finish inside thirty seconds. A
+# pooled-idle-connection explanation was proposed and died on this measurement.
+#
+# So the fault is the CEILING, and at these two call sites paying it costs
+# nothing. `release_listener()` has already handed the port on — site 1's
+# successor was spawned by the holder and is serving, site 3's took the
+# listening socket by fd — so this process accepts nothing and holds nothing
+# anyone is waiting for. It is one idle process finishing the replies it
+# already owes, and `await_inflight` returns the instant it owes none.
+#
+# `_DRAIN_SECONDS` CANNOT SIMPLY BE RAISED. It is also the supervisor's
+# patience (`proc.wait(timeout=_DRAIN_SECONDS + 2)`, the SIGKILL escalation,
+# the stop poll), so raising it would make every teardown wait ten minutes for
+# a process that is not coming back. Two numbers because there are two
+# questions.
+#
+# NOT USED ON THE HELD PATH. There the daemon exits so the HOLDER can spawn the
+# successor, which it cannot do until this process is gone — every second of
+# that drain is a second with nothing serving the port. That path keeps the
+# small ceiling and cutting there is the lesser evil; see
+# `_HELD_DRAIN_SECONDS`.
+#
+# Ten minutes is a safety net for a wedged connection, not a wait anyone
+# expects to pay. The loop exits on zero owed, so a quiet box returns in
+# milliseconds and a busy one returns when its last reply lands.
+_HANDOVER_DRAIN_SECONDS = 600.0
+
 _FIRST_HOLDER_TIMEOUT = 300.0
 
 # How long to wait before re-asking whether a daemon whose last FIFO holder
@@ -7277,7 +7316,10 @@ def _watch_own_code(
                         "us while we keep serving"
                     )
                     server.release_listener()
-                    server.await_inflight(_DRAIN_SECONDS)
+                    # THE SUCCESSOR IS ALREADY SERVING, so this wait is free —
+                    # see `_HANDOVER_DRAIN_SECONDS`. Thirty seconds here cut 16
+                    # mid-response replies on this box.
+                    server.await_inflight(_HANDOVER_DRAIN_SECONDS)
                     # 0, NOT 75: the successor is already serving on this
                     # socket. 75 would make the holder spawn a SECOND one.
                     os._exit(0)
@@ -7344,7 +7386,10 @@ def _watch_own_code(
                 spawned = _spawn_daemon(
                     account_num, email, certdir, listen_fd=handed_fd
                 )
-                server.await_inflight(_DRAIN_SECONDS)
+                # THE PORT NEVER LEFT: the listening socket went down by fd,
+                # so arrivals queue in the backlog the whole time this waits.
+                # Free, for the same reason as site 1.
+                server.await_inflight(_HANDOVER_DRAIN_SECONDS)
                 if spawned is not None:
                     _log_lifecycle("successor is serving — leaving the wiring to it")
                     # OUR COPY OF THE FD STAYS OPEN, deliberately. This process
