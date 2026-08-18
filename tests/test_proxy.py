@@ -1434,10 +1434,44 @@ class TestIsPinnedRoute:
             # disk account, the reconnect resolves there, and the pinned
             # account never sees it.
             ("/v1/sessions/cse_01ABC/unarchive", True, "RC reconnect unarchive"),
+            # THE ROUTE THAT DECIDES WHETHER RC SURVIVES AN ACCOUNT SWITCH.
+            # Read out of the 2.1.234 binary: when the identity file names an
+            # account other than the bridge's owner, `confirmChanged()` does
+            # NOT give up. It asks the server who the new credential belongs
+            # to, via `a7t()`:
+            #     POST ${BASE_API_URL}/api/oauth/validate
+            #     Authorization: Bearer <token from ~/.claude.json>
+            # and when the server attributes it to the OWNER it logs
+            #     "[bridge:owner-pin] identity file names another account but
+            #      the server attributes the credential to the owner —
+            #      re-baselining"
+            # and returns "unchanged", so the bridge KEEPS RUNNING. Only the
+            # unattributed case returns "changed", and that calls `pn()`,
+            # which prints "Remote Control disconnected — signed-in claude.ai
+            # account or organization changed on this machine".
+            #
+            # UNSWAPPED, that question goes out under the NEW account's bearer,
+            # so the server answers with the NEW account, the answer does not
+            # match the owner, and every cswap switch reads as a genuine login
+            # change — killing every live bridge on the machine at once, which
+            # is what the user reported. Swapped, the server sees the pinned
+            # account, the answer matches, and CC re-baselines instead.
+            ("/api/oauth/validate", True,
+             "CC asks the server who the credential belongs to; the pinned "
+             "answer is what keeps a live bridge alive across a swap"),
             ("/v1/messages", False,
              "inference must follow the swapped disk account, never the pin"),
             ("/v1/sessions", False,
              "a plain list must not be swept in by the unarchive rule"),
+            # THE NEIGHBOUR THAT MUST NOT BE SWEPT IN, and the reason the new
+            # rule is an exact match rather than a `/api/oauth/` prefix.
+            # Validation ASKS about a token; refresh MINTS one. A refresh
+            # carries the refresh_token of whichever account cswap has active,
+            # and swapping its bearer would mint against a different account —
+            # handing one account's credential to another, which is the exact
+            # objection that killed the "hold oauthAccount" design.
+            ("/api/oauth/token", False,
+             "refresh must mint for the account whose refresh_token was sent"),
         ):
             assert is_pinned_route(path) is pinned, f"{path}: {why}"
 
