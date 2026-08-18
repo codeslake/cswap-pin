@@ -3807,6 +3807,54 @@ def observed_bridge_owners() -> dict[str, str | None]:
     return owners
 
 
+def ca_path_for_trust() -> "Path | None":
+    """The CA a PYTHON client should ADD to verify the proxy it dials, or None.
+
+    A python caller routed through the pin is talking to a MITM of
+    api.anthropic.com, so a default SSL context cannot verify it and every
+    request dies CERTIFICATE_VERIFY_FAILED. The fix is one line at the call
+    site — `ctx.load_verify_locations(cafile=ca_path_for_trust())` — and this
+    exists so the caller does not have to know where the pin keeps its files,
+    which is not the same path on every platform.
+
+    NOT `SSL_CERT_FILE`, and the difference decides whether the fix works.
+    That variable REPLACES OpenSSL's store, so it is safe only where the
+    bundle subsumes what it displaces. Measured per machine, by certificate
+    SET:
+
+        host-a     ambient 124  bundle 126  safe
+        host-b      ambient 128  bundle 167  NOT — 27 missing
+        host-c  ambient 128  bundle   2  NOT — 128 missing
+
+    So the writer that sets it refuses on both Macs — correctly — and every
+    python caller there stays broken. Adding this CA to a default context
+    keeps every ambient root and needs no variable at all. Measured on
+    host-c, same process and proxy: default context
+    CERTIFICATE_VERIFY_FAILED; default context plus this CA, HTTP 200.
+
+    OUR OWN CA, NOT THE MERGED BUNDLE. The bundle exists for
+    NODE_EXTRA_CA_CERTS, which ADDS to node's built-in roots; handed to a
+    python context it would still only add, but it also carries whatever a
+    launcher merged in, and a caller asking "what do I need to trust YOU"
+    should get exactly that. One certificate, one reason.
+
+    None when there is nothing to add: no pin state, or a CA that is not
+    there. A path that does not exist would raise inside the caller's SSL
+    context and take down a call that worked fine unpinned.
+    """
+    try:
+        from cswap_pin._host import require
+
+        root = Path(require("paths").get_backup_root())
+    except Exception:  # noqa: BLE001 — no host, no pin, nothing to add
+        return None
+    ca = root / "pin-proxy" / "ca.pem"
+    try:
+        return ca if ca.is_file() and ca.stat().st_size else None
+    except OSError:
+        return None
+
+
 def live_bridge_names() -> dict[str, str]:
     """Bridge id -> the name its live session goes by, in both spellings.
 
