@@ -4775,6 +4775,7 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
     """Kill every pin_proxy daemon for ``certdir`` except ``keep_pid`` — orphans
     that fell out of proxy.json (a redeploy/recycle replaced them but they
     didn't die) hold ports and never idle-teardown. Best-effort; never raises."""
+    draining: list[tuple[float, int]] = []
     for pid in _pin_daemon_pids(certdir):
         if pid == keep_pid or pid == os.getpid():
             continue
@@ -4784,8 +4785,27 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
         # sweep exists for. Killing it is how a handover that cut nothing
         # became a TERM one second later that cut 13 mid-response replies.
         if is_draining(certdir, pid):
+            draining.append((draining_since(certdir, pid), pid))
             continue
         _kill_daemon(pid)
+
+    # BUT A PILE OF THEM IS A LEAK, and this count is the only thing bounding
+    # it now that `_HANDOVER_DRAIN_SECONDS` is infinite. That is deliberate:
+    # one predecessor draining for hours because a reply has run for hours is
+    # correct, and a per-process clock scored it identically to a drain that
+    # will never end. The count tells them apart; the clock was cutting the
+    # first to catch the second.
+    excess = len(draining) - _MAX_DRAINING_PREDECESSORS
+    if excess > 0:
+        draining.sort()  # longest-running drain first
+        for _since, pid in draining[:excess]:
+            _log_lifecycle(
+                f"{len(draining)} draining predecessors, over the "
+                f"{_MAX_DRAINING_PREDECESSORS} this fleet can produce — "
+                f"taking pid={pid}, draining {time.time() - _since:.0f}s. "
+                "A drain that never ends is the leak the removed wall clock "
+                "used to bound; this line is the signal it happened")
+            _kill_daemon(pid)
 
 
 def _install_signal_teardown(cleanup) -> None:
@@ -4971,20 +4991,64 @@ def announce_draining(certdir: Path, pid: int | None = None):
     return _done
 
 
+def beat_draining(certdir: Path, pid: int | None = None) -> None:
+    """Say the drain is still alive, so its marker does not go stale under it.
+
+    A HANDOVER DRAIN HAS NO CEILING ANY MORE, so the marker cannot expire on
+    the drain's longest possible duration — there isn't one. It expires on
+    SILENCE instead, and this is what breaks the silence. A drain that is
+    genuinely finishing an hour-long reply keeps its protection by saying so
+    every few seconds; a drainer that was SIGKILLed says nothing and its
+    marker is stale inside `_DRAINING_MARKER_TTL`.
+
+    Best-effort, exactly like the announcement: a beat that cannot be written
+    changes nothing except that the sweep may take this daemon, which is the
+    outcome that existed before any of this.
+    """
+    path = draining_marker_path(certdir, os.getpid() if pid is None else pid)
+    try:
+        os.utime(path)
+    except OSError:
+        pass
+
+
+def draining_since(certdir: Path, pid: int) -> float:
+    """When ``pid``'s drain STARTED — `time.time()`, not monotonic.
+
+    The marker's contents are its start; its mtime is its last beat. Two
+    different questions, and the sweep asks the first one: over the limit it
+    takes the drains that have been running LONGEST, which are the ones least
+    likely to still be delivering.
+
+    An unreadable marker answers "just now", because this number only ever
+    decides who is killed FIRST and a file we cannot parse is not evidence
+    that the process behind it is wedged.
+    """
+    try:
+        return float(draining_marker_path(certdir, pid).read_text().strip())
+    except (OSError, ValueError):
+        return time.time()
+
+
 def is_draining(certdir: Path, pid: int) -> bool:
     """Has ``pid`` announced that it is draining and will leave on its own?
 
-    STALE MARKERS EXPIRE, because a drainer that is SIGKILLed cannot remove its
-    own, and a pid is reused freely. Past the TTL the marker protects nobody:
-    the answer goes back to what it was before this existed, which is the safe
-    direction for a function whose only power is to spare a process.
+    SILENT MARKERS EXPIRE, because a drainer that is SIGKILLed cannot remove
+    its own, and a pid is reused freely. Freshness is the mtime rather than
+    the contents: the contents are the drain's START, and with the handover
+    ceiling gone, age says nothing about health. A drain that has run three
+    hours because a reply has run three hours is working. Only silence
+    separates it from a dead one, so only silence expires the marker.
+
+    Past the TTL the marker protects nobody: the answer goes back to what it
+    was before this existed, which is the safe direction for a function whose
+    only power is to spare a process.
     """
-    path = draining_marker_path(certdir, pid)
     try:
-        stamp = float(path.read_text().strip())
-    except (OSError, ValueError):
+        beat = draining_marker_path(certdir, pid).stat().st_mtime
+    except OSError:
         return False
-    return (time.time() - stamp) < _DRAINING_MARKER_TTL
+    return (time.time() - beat) < _DRAINING_MARKER_TTL
 
 
 def refcount_fifo_path(certdir: Path) -> Path:
@@ -5166,9 +5230,10 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 #
 # `_DRAIN_SECONDS` CANNOT SIMPLY BE RAISED. It is also the supervisor's
 # patience (`proc.wait(timeout=_DRAIN_SECONDS + 2)`, the SIGKILL escalation,
-# the stop poll), so raising it would make every teardown wait ten minutes for
-# a process that is not coming back. Two numbers because there are two
-# questions.
+# the stop poll), so raising it would make every teardown wait on a process
+# that is not coming back — and the handover ceiling below is now unbounded,
+# which as a supervisor's patience would mean never giving up at all. Two
+# numbers because there are two questions.
 #
 # NOT USED ON THE HELD PATH. There the daemon exits so the HOLDER can spawn the
 # successor, which it cannot do until this process is gone — every second of
@@ -5176,10 +5241,27 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 # small ceiling and cutting there is the lesser evil; see
 # `_HELD_DRAIN_SECONDS`.
 #
-# Ten minutes is a safety net for a wedged connection, not a wait anyone
-# expects to pay. The loop exits on zero owed, so a quiet box returns in
-# milliseconds and a busy one returns when its last reply lands.
-_HANDOVER_DRAIN_SECONDS = 1800.0
+# AND THEN THERE IS NO RIGHT NUMBER, which is where this ended up. 1800 cuts
+# a 31-minute reply and 3600 cuts a 61-minute one; this box runs subagent
+# replies past an hour, and a single cut restarts the whole run from scratch.
+# Every value of this constant tonight was chosen against a population that
+# turned out to be wider than the one it was measured on — 30s, then 600s,
+# then 1800s, each cutting live replies until the next one was measured.
+#
+# THE QUANTITY IS WRONG, NOT THE VALUE. A clock cannot tell a slow reply from
+# a wedged one; `_owed_still_moving` can, and it is what ends every healthy
+# drain. On THESE TWO SITES ONLY, nothing waits on this process — the
+# successor is already serving, this one accepts nothing — so the clock was
+# never buying a faster handover. It was bounding a LEAK, and a per-process
+# clock cannot tell one predecessor legitimately finishing a three-hour reply
+# from a pile of them that will never finish. A COUNT can, so the leak bound
+# moved to `_MAX_DRAINING_PREDECESSORS` and this became infinite.
+#
+# NOT ON THE OTHER TWO. The held path exits so a HOLDER can respawn, and
+# `_teardown` under a signal has a supervisor doing `proc.wait(_DRAIN_SECONDS
+# + 2)` before SIGKILL. There the clock is load-bearing and raising it past
+# the supervisor's patience only trades a logged cut for an unlogged one.
+_HANDOVER_DRAIN_SECONDS = float("inf")
 
 # A drainer's marker outlives its own longest wait plus the slack a supervisor
 # would allow, and no longer — a pid is reused freely, so a marker that outlived
@@ -5194,7 +5276,23 @@ _HANDOVER_DRAIN_SECONDS = 1800.0
 # far short of the ten minutes that was cutting real replies.
 _DRAIN_STALL_SECONDS = 90.0
 
-_DRAINING_MARKER_TTL = _HANDOVER_DRAIN_SECONDS + 60.0
+# STALE MEANS UNTOUCHED, NOT OLD. This was `_HANDOVER_DRAIN_SECONDS + 60`,
+# which is now infinite — a marker that never expires spares whatever pid
+# inherits the number, forever, which is the exact orphan this file's only
+# reader exists to kill. A drain says it is still alive instead, every
+# `_DRAINING_BEAT_SECONDS`, so the TTL bounds SILENCE rather than duration and
+# a three-hour drain and a SIGKILLed one stop looking alike.
+_DRAINING_MARKER_TTL = 150.0
+_DRAINING_BEAT_SECONDS = 15.0
+
+# THE LEAK BOUND THAT REPLACED THE WALL CLOCK, and it is a different quantity
+# on purpose. One predecessor draining for three hours because a reply has run
+# three hours is CORRECT; ten of them at once is a drain that cannot end. A
+# clock scores those the same and a count separates them. Eight because a
+# recycle produces one predecessor, so eight is more back-to-back deploys than
+# this fleet has ever done inside one drain — and being wrong high costs idle
+# RAM while being wrong low costs a reply.
+_MAX_DRAINING_PREDECESSORS = 8
 
 # TWO TEARDOWNS CAN RUN AT ONCE IN ONE PROCESS, and the first version of this
 # marker did not survive that. Measured on host-a 2026-08-18, same pid, SAME
@@ -8995,12 +9093,24 @@ class PinProxy:
         # predecessor that is patiently finishing its replies, one second after
         # the successor starts serving.
         done_draining = announce_draining(self._certdir)
+        beat_at = started
         try:
             if budget > 0:
                 deadline = started + budget
                 while time.monotonic() < deadline:
                     if not self._owed_still_moving(started):
                         break
+                    # SAY WE ARE STILL HERE. The marker used to be given a TTL
+                    # covering the longest possible drain, and the longest
+                    # possible drain is now unbounded — so the drain refreshes
+                    # it instead. Without this a wait past
+                    # `_DRAINING_MARKER_TTL` looks abandoned and the orphan
+                    # sweep TERMs a daemon that is mid-reply, which is the
+                    # 08:21:19Z line with the clock moved rather than removed.
+                    now = time.monotonic()
+                    if now - beat_at >= _DRAINING_BEAT_SECONDS:
+                        beat_draining(self._certdir)
+                        beat_at = now
                     time.sleep(0.05)
         finally:
             done_draining()
@@ -9028,15 +9138,22 @@ class PinProxy:
         # facts. `cut` is somebody's reply ending mid-stream. `closed` alone is
         # sockets that owed nobody anything — an RC WebSocket, a keep-alive
         # between requests — and closing those costs the user nothing.
+        #
+        # AND THE CEILING IS NOT ALWAYS A NUMBER. `_HANDOVER_DRAIN_SECONDS` is
+        # infinite, and "of a infs budget" reads as a quantity nobody can act
+        # on — this is the one line a later session reads to decide whether a
+        # departure cost anybody a reply, so it says which regime it ran in.
+        ceiling = ("no wall-clock cap" if budget == float("inf")
+                   else f"a {budget:.0f}s budget")
         if cut:
             _log_lifecycle(
-                f"cut {cut} in-flight request(s) after {elapsed:.1f}s of a "
-                f"{budget:.0f}s budget ({mid} mid-response, {cut - mid} before "
+                f"cut {cut} in-flight request(s) after {elapsed:.1f}s of "
+                f"{ceiling} ({mid} mid-response, {cut - mid} before "
                 f"headers; and closed {closed - cut} idle connection(s))"
             )
         else:
             _log_lifecycle(
-                f"drained clean in {elapsed:.1f}s of a {budget:.0f}s budget "
+                f"drained clean in {elapsed:.1f}s of {ceiling} "
                 f"— closed {closed} idle connection(s), none owed an answer"
             )
         return cut
