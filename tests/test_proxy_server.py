@@ -3892,6 +3892,154 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_a_moving_reply_holds_the_drain_and_a_silent_one_does_not(
+        self, certdir, monkeypatch
+    ):
+        """THE DISCRIMINATOR A DEADLINE CANNOT MAKE.
+
+        Measured on host-a 2026-08-18, the 0.1.102 rollout:
+
+            09:02:20Z cut 12 in-flight request(s) after 600.0s of a 600s budget
+                      (12 mid-response, 0 before headers)
+
+        Twelve replies were STILL STREAMING when the clock cut them. A wedged
+        connection and a four-minute answer are identical to a deadline — which
+        is why the deadline was there — and not identical to the connection:
+        one is moving bytes and one is not.
+
+        BOTH DIRECTIONS IN ONE CASE, because either alone passes on a version
+        that always waits or always returns. The stall window is shrunk so this
+        runs in seconds; the production value is ninety.
+        """
+        import cswap_pin.proxy as pp
+
+        monkeypatch.setattr(pp, "_DRAIN_STALL_SECONDS", 0.3)
+
+        # --- SILENT: owed, and nothing has moved since well before the drain.
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        try:
+            with proxy._live_lock:
+                proxy._open_conns.add(a)
+            proxy._owe_answer(a, True)
+            proxy._note_response_started(a)
+            time.sleep(0.4)                      # past the stall window
+            t0 = time.monotonic()
+            with contextlib.redirect_stderr(io.StringIO()):
+                proxy.await_inflight(30.0)
+            silent_wait = time.monotonic() - t0
+            assert silent_wait < 2.0, (
+                f"waited {silent_wait:.1f}s on a connection that has sent "
+                "nothing since before the drain began — that is a wedged "
+                "socket holding the budget, which is what the stall window "
+                "exists to end")
+        finally:
+            for s_ in (a, b):
+                try: s_.close()
+                except OSError: pass
+
+        # --- MOVING: the same shape, but bytes keep arriving for a while.
+        proxy2 = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                             upstream=("127.0.0.1", 1))
+        c, d = socket.socketpair()
+        stop = threading.Event()
+        try:
+            with proxy2._live_lock:
+                proxy2._open_conns.add(c)
+            proxy2._owe_answer(c, True)
+
+            def _stream():
+                # A reply delivering a chunk every 100ms for a second, then
+                # finishing — the shape the 600s ceiling was cutting.
+                for _ in range(10):
+                    if stop.is_set():
+                        return
+                    proxy2._note_response_started(c)
+                    time.sleep(0.1)
+                proxy2._owe_answer(c, False)     # the reply completed
+
+            threading.Thread(target=_stream, daemon=True).start()
+            t0 = time.monotonic()
+            with contextlib.redirect_stderr(io.StringIO()):
+                cut = proxy2.await_inflight(30.0)
+            moving_wait = time.monotonic() - t0
+
+            assert moving_wait > 0.8, (
+                f"the drain returned after {moving_wait:.2f}s while bytes were "
+                "still going to the client. A stall window shorter than the "
+                "gaps in a live stream cuts exactly the replies it exists to "
+                "protect")
+            assert cut == 0, (
+                f"cut {cut} — the reply finished on its own and the drain "
+                "should have had nothing left to cut")
+        finally:
+            stop.set()
+            for s_ in (c, d):
+                try: s_.close()
+                except OSError: pass
+
+    def case_the_relay_stamps_every_write_not_only_the_head(self, certdir):
+        """THE WIRING, for the fourth time — and the first three were misses.
+
+        `_blind_tunnel` never cleared its drain debt, the relay never marked a
+        reply started, and `await_inflight` never announced it was draining.
+        Each was a correct function nothing called, and each passed a suite
+        that tested the function directly.
+
+        Here the question is whether BODY bytes stamp, not just the head. A
+        version that notifies once — which is exactly what `on_headers` did
+        before this change — keeps every long reply looking frozen after its
+        first chunk, so the stall window cuts it. That is the 600s bug back in
+        a smaller window.
+        """
+        from cswap_pin.proxy import _relay_response
+
+        up_a, up_b = socket.socketpair()
+        cl_a, cl_b = socket.socketpair()
+        stamps = []
+        try:
+            # PACED, because writing it all at once is not the case under test.
+            # The first version of this sent the head and both events before
+            # the relay read anything, so one `recv` took the lot and the whole
+            # response went out in a single write — the assertion failed on a
+            # premise, not on the code. A stream the drain has to survive
+            # arrives in separate reads, so the upstream has to produce it that
+            # way.
+            def _upstream():
+                up_b.sendall(b"HTTP/1.1 200 OK\r\n"
+                             b"Content-Type: text/event-stream\r\n\r\n")
+                time.sleep(0.15)
+                up_b.sendall(b"event: a\n\n")
+                time.sleep(0.15)
+                up_b.sendall(b"event: b\n\n")
+                time.sleep(0.05)
+                up_b.shutdown(socket.SHUT_WR)
+
+            threading.Thread(target=_upstream, daemon=True).start()
+            _relay_response(up_a, cl_a, 0,
+                            on_headers=lambda: stamps.append(time.monotonic()))
+
+            assert len(stamps) >= 3, (
+                f"the relay reported {len(stamps)} write(s). The head plus two "
+                "body chunks is three: a relay that notifies only on the head "
+                "leaves a streaming reply looking frozen from its second chunk "
+                "onward, and the stall window then cuts it")
+            # AND THE CLIENT REALLY GOT THE BODY, or a wrapper that notifies
+            # and swallows would pass.
+            cl_a.shutdown(socket.SHUT_WR)
+            got = b""
+            while True:
+                chunk = cl_b.recv(4096)
+                if not chunk:
+                    break
+                got += chunk
+            assert b"event: a" in got and b"event: b" in got, got[:120]
+        finally:
+            for s_ in (up_a, up_b, cl_a, cl_b):
+                try: s_.close()
+                except OSError: pass
+
     def case_the_orphan_sweep_spares_a_daemon_that_is_draining(self, certdir):
         """THE FIFTH CAUSE, and it is two of my own fixes in direct opposition.
 
