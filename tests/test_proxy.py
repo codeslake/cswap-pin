@@ -636,6 +636,126 @@ class TestLiveRemoteControlSessions:
         """
         monkeypatch.setattr("cswap_pin.proxy._host_slug", lambda: slug)
 
+    def case_a_name_somebody_typed_is_never_the_servers(
+        self, tmp_path, monkeypatch
+    ):
+        """THE FUNCTION ITSELF, which nothing tested — every other case here
+        monkeypatches it.
+
+        The set is machine-global and all-time, so a title a user chooses can
+        collide with an `aiTitle` written months ago under an unrelated
+        project, and the caller would then OVERWRITE the name they typed. This
+        function's own docstring calls that the unacceptable direction: a
+        false positive destroys a human's words, a false negative only leaves
+        one bridge wrong.
+
+        Claude Code records the two in different fields precisely so they can
+        be told apart, so the veto reads `custom-title` out of the same walk.
+        """
+        import json as _json
+
+        import cswap_pin.proxy as pp
+
+        home = tmp_path / "cfg"
+        proj = home / "projects" / "some-project"
+        proj.mkdir(parents=True)
+        monkeypatch.setattr(
+            "claude_swap.paths.get_claude_config_home", lambda: home)
+
+        (proj / "a.jsonl").write_text("\n".join([
+            _json.dumps({"type": "ai-title", "aiTitle": "Add a status line"}),
+            _json.dumps({"type": "ai-title", "aiTitle": "shared name"}),
+            "not json at all",
+        ]) + "\n")
+        # ANOTHER PROJECT, MONTHS LATER: the user types a name that happens to
+        # equal an old aiTitle above.
+        other = home / "projects" / "another"
+        other.mkdir()
+        (other / "b.jsonl").write_text(
+            _json.dumps({"type": "custom-title", "customTitle": "shared name"})
+            + "\n")
+
+        got = pp.server_generated_titles()
+
+        assert "Add a status line" in got, (
+            f"the aiTitle records were not read at all: {got}")
+        assert "shared name" not in got, (
+            "a title the user typed is in the set of things the server wrote, "
+            "so the restore would overwrite their own name with the local one "
+            f"— {got}")
+
+    def case_the_transcript_walk_is_paid_only_when_something_asks(
+        self, tmp_path, monkeypatch
+    ):
+        """IT WALKED EVERY TRANSCRIPT ON THE MACHINE, ON EVERY RC CONNECT.
+
+        Measured on this account: 11,584 `*.jsonl` under ~/.claude/projects,
+        11 GB, the largest single file 422 MB. `server_generated_titles` was
+        called at the top of `titles_to_restore`, ABOVE the two filters that
+        reject almost everything — so a listing where every bridge already
+        carries its own name, which is what a healthy machine looks like, paid
+        the entire walk for a set nothing then read.
+
+        The set is still computed at most once per call: the loop runs over
+        the whole listing and re-walking per item is the thing the original
+        hoist existed to prevent.
+        """
+        import cswap_pin.proxy as pp
+
+        calls = []
+        monkeypatch.setattr(
+            pp, "server_generated_titles",
+            lambda: calls.append(1) or {"an ai title"})
+
+        names = {"cse_a": "keep", "cse_b": "also"}
+        # EVERY TITLE ALREADY CORRECT — nothing can need restoring.
+        pp.titles_to_restore(
+            [{"id": "cse_a", "title": "keep"}, {"id": "cse_b", "title": "also"}],
+            names)
+        assert calls == [], (
+            "the whole-machine transcript walk ran for a listing with nothing "
+            "to restore — 11 GB read for a set no branch reaches")
+
+        # AND ONCE, NOT PER ITEM, the moment one of them differs.
+        pp.titles_to_restore(
+            [{"id": "cse_a", "title": "an ai title"},
+             {"id": "cse_b", "title": "an ai title"}],
+            names)
+        assert calls == [1], (
+            f"walked {len(calls)} time(s) for one listing; the hoist that "
+            "made it once per call is what this must not undo")
+
+    def case_the_slug_drops_the_domain(self, tmp_path, monkeypatch):
+        """THE FUNCTION EVERY OTHER CASE HERE REPLACES, so nothing tested it.
+
+        `_host_slug` stripped the domain with `slug.split(".")[0]` — AFTER a
+        regex that has already turned every `.` into a `-`. Inert: on a host
+        whose `gethostname()` returns an FQDN, which is routine on macOS and
+        on any DNS-suffixed Linux box, `HOST-C.local` slugified to
+        `host-c-local`.
+
+        `_looks_generated` anchors `^{host}(?:-[a-z0-9]+)+$`, so the real
+        server slug `host-c-cozy-badger` stopped matching and the title
+        restore silently did nothing on that machine, with no log line
+        distinguishing it from "nothing to do". The measured slugs in this
+        function's own docstring — `host-c` — are what the server
+        produces, and the server drops the domain.
+        """
+        import cswap_pin.proxy as pp
+
+        for raw, want in (
+            ("HOST-C.local", "host-c"),
+            ("host-a", "host-a"),
+            ("HOST-B.corp.example.com", "host-b"),
+            ("fv-az1234-567", "fv-az1234-567"),
+        ):
+            monkeypatch.setattr(pp.socket, "gethostname", lambda _r=raw: _r)
+            got = pp._host_slug()
+            assert got == want, (
+                f"{raw!r} slugified to {got!r}, not {want!r} — the anchor no "
+                "longer matches the slug the server invents and the restore "
+                "stops on that machine without saying so")
+
     def _sessions_dir(self, tmp_path, monkeypatch):
         from pathlib import Path
 
