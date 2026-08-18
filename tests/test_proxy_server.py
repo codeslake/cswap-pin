@@ -4583,6 +4583,83 @@ class TestDrainReportsWhatItCut:
                 pp._DRAINING_DEPTH.clear()
                 pp._DRAINING_DEPTH.update(before)
 
+    def case_the_opt_in_trace_files_are_capped_like_the_daemon_log(self):
+        """THE CAP WAS ON THE FILE NOBODY ENABLES.
+
+        `daemon.log` is bounded — 64 KiB, rotated through `.1` and `.2`, so a
+        machine can hold ~192 KiB of it however long the daemon runs. That care
+        was taken for the log that is always on and always small.
+
+        `CSWAP_PIN_DEBUG` and `CSWAP_PIN_SHAPE` open in append mode and write
+        one line PER REQUEST through a path `_LOG_MAX_BYTES` never touched. Off
+        by default, so a fresh install is safe — but a human turns them on
+        precisely when something is going wrong, which is also when they stop
+        watching the disk. The careful bound was on the file that could not
+        grow and absent from the two that can.
+
+        Asserted by WRITING PAST THE CAP rather than by reading the source: the
+        question is what a downstream user's disk does, and only bytes answer
+        it.
+        """
+        import os
+        import tempfile
+
+        import cswap_pin.proxy as pp
+
+        d = tempfile.mkdtemp()
+        for env, writer in (
+            ("CSWAP_PIN_DEBUG", "debug"),
+            ("CSWAP_PIN_SHAPE", "shape"),
+        ):
+            target = os.path.join(d, f"{writer}.log")
+            line = "x" * 512 + "\n"
+            # FIVE TIMES THE CAP, so the rotation runs several times. At one
+            # overflow an unbounded-generations bug leaves a single extra file
+            # and hides under any sane threshold; it only becomes visible once
+            # the policy has been applied repeatedly.
+            need = 5 * (pp._LOG_MAX_BYTES // len(line))
+            fh = None
+            try:
+                for _ in range(need):
+                    fh = pp._append_capped(target, line, fh)
+            finally:
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
+            live = os.path.getsize(target)
+            assert live <= pp._LOG_MAX_BYTES, (
+                f"{env} grew to {live} B with no cap; a trace left on after an "
+                "incident fills the disk of somebody who installed this")
+            # AND THE ROTATIONS ARE BOUNDED TOO, or the cap just moves the
+            # growth one filename over.
+            #
+            # GLOBBED, NOT A SUFFIX LIST. The first version summed `""`, `.1`
+            # and `.2`, so a rotation that minted a fresh name per pass — the
+            # unbounded-generations mutation — produced files it never looked
+            # at and passed. A check whose input is a hardcoded list goes stale
+            # the first time the thing it watches grows a new shape, which is
+            # the defect being tested one level up.
+            siblings = [
+                f for f in os.listdir(os.path.dirname(target))
+                if f.startswith(os.path.basename(target))
+            ]
+            total = sum(
+                os.path.getsize(os.path.join(os.path.dirname(target), f))
+                for f in siblings
+            )
+            assert len(siblings) <= 3, (
+                f"{env} left {len(siblings)} generations behind ({siblings}); "
+                "the rotation keeps two plus the live file, or the ceiling is "
+                "per file and the directory is unbounded")
+            assert total <= 3 * pp._LOG_MAX_BYTES, (
+                f"{env} plus its rotations reached {total} B; the ceiling has "
+                "to hold across generations, not per file")
+            # CONTROL: it must still be WRITING. A cap that works by dropping
+            # everything passes both asserts above and records nothing.
+            assert live > 0, f"{env} is capped because it writes nothing"
+
     def case_the_cut_line_says_how_much_each_reply_delivered(self, certdir):
         """`mid-response` CANNOT TELL A LIVE STREAM FROM A CORPSE.
 
