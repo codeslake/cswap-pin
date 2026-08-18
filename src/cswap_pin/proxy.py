@@ -8967,6 +8967,7 @@ class PinProxy:
         # and the answer is already in hand. Everything below it is the wait
         # for a create that had not landed yet.
         _UNSET = object()
+        restored = 0
         carried = getattr(self, "_sweep_listing", _UNSET)
         self._sweep_listing = _UNSET
         if carried is None:
@@ -8994,9 +8995,23 @@ class PinProxy:
                 # `sleep` for 8s per request, inside the daemon's own sweep
                 # guard.
                 return 0
-            done = self._restore_bridge_titles(sessions, token)
-            if done:
-                return done
+            # ACCUMULATE, NEVER RETURN ON THE FIRST SUCCESS. A pass that
+            # restores something has said nothing about the bridge this connect
+            # is FOR: the listing is full of other sessions, and repairing one
+            # of those is the most likely outcome of pass 0 precisely because
+            # those bridges have existed long enough to be listed.
+            #
+            # Returning there is what kept the original defect alive after the
+            # re-listing loop was built to fix it. Measured 2026-08-18 with the
+            # loop deployed: `ai-inter-session-peer1` still read
+            # `lambda-docker-robust-dream`, and the daemon's restores were each
+            # fixing a PREVIOUS session — the exact trace of a first pass that
+            # succeeded and stopped.
+            #
+            # The stop condition below is the only one that answers the right
+            # question: is anything this machine holds still missing from the
+            # listing? Nothing else may short-circuit it.
+            restored += self._restore_bridge_titles(sessions, token)
             listed = {item.get("id") for item in sessions}
             # `live_bridge_names` carries BOTH spellings and the listing only
             # ever uses `cse_`, so comparing the raw keys would always report
@@ -9004,11 +9019,11 @@ class PinProxy:
             pending = {sid for sid in live_bridge_names()
                        if sid.startswith("cse_") and sid not in listed}
             if not pending:
-                return 0          # nothing of ours is unaccounted for
-        # Falling out means the last attempt restored nothing — `if done` above
-        # returns on any other outcome. Written as a literal rather than the
-        # loop variable so the function cannot depend on the loop having run.
-        return 0
+                return restored   # nothing of ours is unaccounted for
+        # Falling out means a bridge we hold never appeared within the bound.
+        # Whatever WAS repaired on the way still counts, so the caller's log
+        # line reports the work rather than swallowing it.
+        return restored
 
     def _serve_client(self, conn: socket.socket) -> None:
         """``_handle_client`` with the connection counted for its lifetime.
