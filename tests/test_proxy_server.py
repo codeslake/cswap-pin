@@ -4001,6 +4001,82 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_a_departing_daemon_stops_taking_new_requests(self, certdir):
+        """`release_listener` SHEDS ARRIVALS; NOTHING SHED THE KEEP-ALIVES.
+
+        A departing daemon stopped accepting new CONNECTIONS and kept accepting
+        new REQUESTS on the ones it already held, indefinitely. From the
+        client's side nothing was wrong with the socket, so it never
+        reconnected — measured on lmd42 2026-08-18, eleven sessions whose ONLY
+        path to the pin was a process that had stopped being the front door.
+
+        The reply still COMPLETES; the header only says "do not send another".
+        The client then opens a fresh connection and lands on the successor
+        through the shared listener, so sessions migrate one completed reply at
+        a time.
+        """
+        import cswap_pin.proxy as pp
+
+        def _relay_once():
+            up_a, up_b = socket.socketpair()
+            cl_a, cl_b = socket.socketpair()
+            try:
+                def _upstream():
+                    try:
+                        up_b.sendall(b"HTTP/1.1 200 OK\r\n"
+                                     b"Content-Length: 2\r\n\r\nhi")
+                        time.sleep(0.05)
+                        up_b.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+
+                threading.Thread(target=_upstream, daemon=True).start()
+                pp._relay_response(up_a, cl_a, 0)
+                cl_a.shutdown(socket.SHUT_WR)
+                got = b""
+                while True:
+                    chunk = cl_b.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+                return got
+            finally:
+                for s_ in (up_a, up_b, cl_a, cl_b):
+                    try:
+                        s_.close()
+                    except OSError:
+                        pass
+
+        # SERVING: the connection stays reusable.
+        assert not pp.this_process_is_draining(), "precondition"
+        serving = _relay_once()
+        assert b"hi" in serving, serving[:120]
+        assert b"Connection: close" not in serving, (
+            "a serving daemon told the client to stop reusing the connection; "
+            "every request would then pay a fresh TLS handshake: "
+            + serving[:200].decode("latin1"))
+
+        # HANDING OVER: same reply, delivered in full, and the last one.
+        # OUR OWN PID: the predicate asks whether THIS process is leaving, and
+        # announcing on another pid's behalf must not answer yes for us.
+        import os as _os
+
+        done = pp.announce_draining(certdir, _os.getpid())
+        try:
+            assert pp.this_process_is_draining(), "precondition"
+            departing = _relay_once()
+        finally:
+            done()
+
+        assert b"hi" in departing, (
+            "the reply was not delivered — this must shed the CONNECTION, "
+            "never the answer: " + departing[:200].decode("latin1"))
+        assert b"Connection: close" in departing, (
+            "a departing daemon kept the connection reusable, so the client "
+            "sends its next request into a process that has stopped being the "
+            "front door and never reaches the successor: "
+            + departing[:200].decode("latin1"))
+
     def case_a_keepalive_is_told_from_an_answer_by_NAME(self, certdir):
         """NO THRESHOLD, NO RATE, NO FRAME WIDTH — the protocol says which is
         which, and the pin has the plaintext because it is the MITM.
