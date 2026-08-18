@@ -2132,7 +2132,16 @@ class TestChainRediscovery:
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
-        srv.listen(4)
+        # BACKLOG, NOT 4. A full accept queue makes `connect()` to a LISTENING
+        # loopback socket time out rather than refuse, and the daemon then logs
+        # `hop unusable — dial failed: TimeoutError`, never reaches accept, and
+        # the case's premise (`seen`) is empty. That is what turned CI red on
+        # macos-latest for 0.1.94 while 33 consecutive Linux runs were green:
+        #     hop 127.0.0.1:49793 unusable — dial failed: TimeoutError('timed out')
+        # Loopback refusal is instant on Linux, so the queue never built there.
+        # This class drives 23 cases through the same helper on a shared
+        # runner; 128 costs nothing and removes the queue as a variable.
+        srv.listen(128)
         assert srv.getsockname()[1] != 36301, srv.getsockname()
         seen = []
 
@@ -2489,6 +2498,15 @@ class TestChainRediscovery:
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
             )
+            # THE PREMISE IS SAMPLED, AND A SAMPLE LOSES A RACE. `seen` is
+            # appended by the stub's accept thread, which runs on its own
+            # schedule — the request can return before that thread is
+            # scheduled, and on a loaded runner it does. Poll briefly instead
+            # of reading it once: a hop that really was never dialled stays
+            # empty for the whole window and still fails, loudly.
+            deadline = time.monotonic() + 3.0
+            while not seen and time.monotonic() < deadline:
+                time.sleep(0.02)
             assert seen, "premise: the refusing hop was never dialled"
             assert outer.connects == 1, (
                 "a hop that ACCEPTED and then refused the CONNECT did not fall "
