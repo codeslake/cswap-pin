@@ -5212,6 +5212,64 @@ def refcount_fifo_path(certdir: Path) -> Path:
     return Path(certdir) / _FIFO_NAME
 
 
+def _rotate_if_over(path: Path) -> None:
+    """Rotate ``path`` through ``.1`` and ``.2`` once it passes the cap.
+
+    Extracted from `_open_daemon_log` so the OPT-IN traces get the same
+    ceiling. They did not have one: `CSWAP_PIN_DEBUG` and `CSWAP_PIN_SHAPE`
+    append a line PER REQUEST through a path `_LOG_MAX_BYTES` never touched,
+    so the careful bound was on the file that is always on and always small,
+    and absent from the two a human enables during an incident and then stops
+    watching. Off by default, so a fresh install was never exposed; left on and
+    forgotten, they are exactly the unbounded growth the cap exists to prevent.
+
+    Best-effort: a rotation that cannot happen must not stop the write, and an
+    unlink is the fallback the cap falls back to rather than giving up on it.
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= _LOG_MAX_BYTES:
+            return
+        previous = path.with_suffix(path.suffix + ".1")
+        if previous.exists():
+            previous.replace(path.with_suffix(path.suffix + ".2"))
+        path.replace(previous)
+    except OSError:
+        try:
+            path.unlink()  # rotation impossible; the cap still has to hold
+        except OSError:
+            pass
+
+
+def _append_capped(path, line: str, fh=None):
+    """Append ``line`` to ``path`` under `_LOG_MAX_BYTES`. Returns the handle.
+
+    Pass the previous handle back in to keep it; this reopens only when the
+    file rotated underneath it, which is the one case a held descriptor cannot
+    survive — it would keep writing to an inode nobody can find.
+
+    Size is read from the HANDLE (`tell()` on an append stream) rather than
+    with a stat per request: the trace is opt-in and hot, one line per request
+    through the proxy's own path.
+
+    Never raises. A trace that cannot be written is a diagnostic that is
+    missing, not a proxy that stops relaying.
+    """
+    try:
+        if fh is None or fh.closed:
+            _rotate_if_over(Path(path))
+            fh = open(path, "a", buffering=1, encoding="utf-8",
+                      errors="replace")
+        fh.write(line)
+        if fh.tell() > _LOG_MAX_BYTES:
+            fh.close()
+            _rotate_if_over(Path(path))
+            fh = open(path, "a", buffering=1, encoding="utf-8",
+                      errors="replace")
+        return fh
+    except OSError:
+        return None
+
+
 def daemon_log_path(certdir: Path) -> Path:
     """Where the detached daemon's stderr goes.
 
@@ -5237,6 +5295,9 @@ def _open_daemon_log(certdir: Path):
 
     path = daemon_log_path(certdir)
     try:
+        # THE SAME PRIMITIVE THE OPT-IN TRACES USE — see `_rotate_if_over`.
+        # Two copies of a rotation policy is how one of them ends up with a
+        # different number of generations than the comment below promises.
         if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
             # ROTATE, NEVER UNLINK. This runs at DAEMON START, which is the
             # instant a handover completes — so deleting here means the
@@ -9090,8 +9151,10 @@ class PinProxy:
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
         # request (method, path, whether it matched a pinned route and was
         # swapped). Off by default; used to diagnose routing end to end.
-        debug_path = os.environ.get("CSWAP_PIN_DEBUG")
-        self._debug = open(debug_path, "a") if debug_path else None
+        # CAPPED, like `daemon.log`. This wrote one line per request into an
+        # uncapped append; see `_append_capped`.
+        self._debug_path = os.environ.get("CSWAP_PIN_DEBUG")
+        self._debug = None
 
     def start(self) -> None:
         if self._handed_fd is not None:
@@ -10061,6 +10124,19 @@ class PinProxy:
                     # long quiet in the middle that the field exists to find.
                     # A reply that pings for two minutes of extended thinking
                     # and then delivers scored zero.
+                    #
+                    # AND IT COULD REPORT LARGER, NOT ONLY SMALLER, which is
+                    # the half that would have done damage. A reply with NO
+                    # content write never moved `_content_at` off its
+                    # `_owe_answer` seed, so it banked its whole REQUEST
+                    # DURATION. Measured on host-a: pid 1269189 started 19:31,
+                    # drained 2h06m, and printed 27s — larger than every
+                    # trustworthy value on the fleet at the time. Anyone still
+                    # reading those numbers would have concluded a 27-second
+                    # wait was proven survivable, off a field that had measured
+                    # no reply's silence at all. A wrong instrument is not
+                    # conservative just because its first few samples were
+                    # small.
                     prev = self._content_at.get(conn)
                     if prev is not None:
                         self._gap[conn] = max(self._gap.get(conn, 0.0),
@@ -10904,7 +10980,7 @@ class PinProxy:
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
-        if self._debug:
+        if self._debug_path:
             hdrs = " | ".join(
                 f"{k}: {v[:60]}" for k, v in headers
                 if k.lower() in (
@@ -10912,11 +10988,12 @@ class PinProxy:
                     "sec-websocket-version", "cache-control", "content-type",
                 )
             )
-            self._debug.write(
+            self._debug = _append_capped(
+                self._debug_path,
                 f"[c{getattr(self._local, 'cid', 0)}] "
-                f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n"
+                f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n",
+                self._debug,
             )
-            self._debug.flush()
 
         # Opt-in: when CSWAP_PIN_SHAPE names a file, record the message-array
         # SHAPE of a /v1/messages request — role order and content-block types
@@ -10936,17 +11013,22 @@ class PinProxy:
                      if isinstance(m.get("content"), list) else "str")
                     for m in (payload.get("messages") or [])
                 ]
-                with open(shape_path, "a") as fh:
-                    fh.write(json.dumps({
-                        "cid": getattr(self._local, "cid", 0),
-                        "n": len(shape),
-                        "roles": [r for r, _ in shape],
-                        "head": shape[:4],
-                        "tail": shape[-4:],
-                        "has_output_config": any(
-                            "output_config" in m for m in (payload.get("messages") or [])
-                        ),
-                    }) + "\n")
+                # CAPPED, like the request trace and `daemon.log`. Opened per
+                # write here rather than held, so the handle is closed
+                # immediately; `_append_capped` still enforces the ceiling and
+                # rotates through `.1`/`.2`.
+                fh = _append_capped(shape_path, json.dumps({
+                    "cid": getattr(self._local, "cid", 0),
+                    "n": len(shape),
+                    "roles": [r for r, _ in shape],
+                    "head": shape[:4],
+                    "tail": shape[-4:],
+                    "has_output_config": any(
+                        "output_config" in m for m in (payload.get("messages") or [])
+                    ),
+                }) + "\n")
+                if fh is not None:
+                    fh.close()
             except Exception:
                 pass
 
