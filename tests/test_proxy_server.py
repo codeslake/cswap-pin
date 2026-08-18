@@ -3563,6 +3563,65 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
         assert "chain refused" in log.read_text(), log.read_text()
 
 
+class TestTunnelIsOpen:
+    """`_tunnel_is_open` on its own, with nothing racing.
+
+    The integration case above proves the FALLBACK happens; this proves the
+    DETECTOR that is supposed to trigger it, and it can do so without a
+    scheduler in the loop — a socket whose peer has already closed is EOF now,
+    not in 0.35 s.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_peer_that_closed_reads_as_EOF(self):
+        import cswap_pin.proxy as pp
+        a, b = socket.socketpair()
+        b.close()
+        try:
+            assert pp.PinProxy._tunnel_is_open(a) is None, (
+                "a closed peer must read as EOF — this is the whole detector")
+        finally:
+            a.close()
+
+    def case_a_live_idle_socket_reads_as_OPEN(self):
+        """THE CONTROL. Without it, "closed reads as EOF" also passes on a
+        detector that answers None for everything — which would send every
+        healthy tunnel down the direct-dial path."""
+        import cswap_pin.proxy as pp
+        a, b = socket.socketpair()
+        try:
+            assert pp.PinProxy._tunnel_is_open(a) is a, (
+                "an idle tunnel has nothing to read and that means OPEN")
+        finally:
+            a.close(); b.close()
+
+    def case_a_byte_already_waiting_is_pushed_back(self):
+        """It READS to test, so the byte it consumed has to reappear or the
+        caller's stream is corrupted — the reason it returns a socket rather
+        than a bool."""
+        import cswap_pin.proxy as pp
+        a, b = socket.socketpair()
+        try:
+            b.sendall(b"XY")
+            out = pp.PinProxy._tunnel_is_open(a)
+            assert out is not None and out is not a, "expected the wrapper"
+            # READ UNTIL SATISFIED, not one recv. `_Prefixed` hands back the
+            # single probed byte first and the socket's own data after it, so
+            # a `recv(2) == b"XY"` expectation is the TEST being wrong about
+            # stream semantics, not the wrapper losing anything. What the
+            # contract actually promises is that no byte disappears.
+            got = b""
+            while len(got) < 2:
+                chunk = out.recv(2 - len(got))
+                assert chunk, "the stream ended early — a byte was swallowed"
+                got += chunk
+            assert got == b"XY", got
+        finally:
+            a.close(); b.close()
+
+
 class TestOptimisticConnectIsDetected:
     """A CONNECT 200 means the chain ACCEPTED the request, not that it reached
     the host. privoxy answers optimistically and dials afterwards, closing the
@@ -3667,7 +3726,21 @@ class TestOptimisticConnectIsDetected:
             pp._TRACE = prev
 
         assert reached.is_set(), "the host was never dialled directly"
-        assert "already EOF" in log.read_text(), log.read_text()
+        # THE CONTRACT, NOT THE BRANCH THAT DELIVERED IT. This used to assert
+        # `"already EOF" in log`, which names one internal path. Measured on
+        # macOS CI 2026-08-18: the two behavioural assertions above BOTH passed
+        # — the host was dialled directly and answered PONG, so the dead chain
+        # was correctly not used — while the log read
+        # `CONNECT … tunnelled (no pin: bearer never seen)`. The chain closes
+        # immediately after its 200, so whether the proxy observes a FIN inside
+        # `_tunnel_is_open`'s 0.35 s select or an RST earlier is a scheduling
+        # question, and both answers are right.
+        #
+        # The detector itself is pinned deterministically instead, with no
+        # sockets in flight, by `TestTunnelIsOpen` below. Asserting a log line
+        # here bought nothing that case does not, and cost a red CI on a
+        # correct build — which blocked a release.
+        assert log.read_text().strip(), "the connection was not traced at all"
 
 
 class TestTheTrustFileActuallyVerifies:
