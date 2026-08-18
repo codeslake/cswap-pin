@@ -4551,13 +4551,25 @@ class TestDrainReportsWhatItCut:
                 return real_write(self, *a, **kw)
 
             pathlib.Path.write_text = _boom
+            # ASSERTED ON THIS CASE'S OWN KEY, not on the process-wide
+            # predicate. `this_process_is_draining()` matches ANY entry whose
+            # marker basename is `.draining-<our pid>`, across every certdir in
+            # the map — so a sibling case in the same xdist worker that
+            # announced for this pid makes both directions vacuous. It passed
+            # on linux and failed on macOS purely on which cases shared the
+            # worker, which is a scheduling detail, not a fact about the fix.
+            key = str(pp.draining_marker_path(certdir, os.getpid()))
             done = pp.announce_draining(certdir, os.getpid())
-            assert pp.this_process_is_draining(), (
+            assert pp._DRAINING_DEPTH.get(key, 0) == 1, (
                 "a marker that could not be written made this daemon forget "
                 "it is draining, so its next teardown takes the short ceiling "
-                "and cuts the replies the uncapped one exists to finish")
+                f"and cuts the replies the uncapped one exists to finish: "
+                f"{pp._DRAINING_DEPTH.get(key)}")
+            assert pp.this_process_is_draining(), (
+                "the depth is set but the predicate production reads does not "
+                "see it")
             done()
-            assert not pp.this_process_is_draining(), (
+            assert key not in pp._DRAINING_DEPTH, (
                 "the releaser handed back nothing, so the state it set on the "
                 "failed-write path leaks for the life of the process")
         finally:
