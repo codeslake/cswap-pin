@@ -5084,6 +5084,38 @@ class TestDrainReportsWhatItCut:
             "unserved port time, however the shutdown started")
         assert teardown_drain_budget("signal TERM", True) == _HELD_DRAIN_SECONDS
 
+        # ...UNLESS THE SUCCESSOR IS ALREADY SERVING, and that is the whole
+        # premise of the held arm rather than a corner of it. Its reasoning is
+        # "the holder cannot put the successor on the socket until we are
+        # gone", which was true before the replace-ask existed and is FALSE
+        # for a daemon that has already handed over: `_watch_own_code` asks,
+        # verifies the holder survived, and the successor is serving on the
+        # same socket while this process drains.
+        #
+        # MEASURED ON host-b 2026-08-18, and this is what it cost:
+        #   20:01:32Z pid=96075 code on disk changed — asked the holder to
+        #             replace us while we keep serving      (uncapped drain)
+        #   20:01:32Z pid=25445 serving on port 53749       (successor is UP)
+        #   20:02:01Z pid=96075 stopping (refcount)         (second drain)
+        #   20:02:31Z pid=96075 cut 4 in-flight request(s) after 30.1s of a
+        #             30s budget (4 mid-response, content-free 0/2/9 s)
+        # Four replies, every one still delivering — the content-free field is
+        # what proves that; `4 mid-response` alone cannot tell a live stream
+        # from one that stopped. The uncapped handover ceiling was overridden
+        # by a second drain that re-armed a clock the first had removed.
+        assert teardown_drain_budget(
+            "refcount", True, handed_over=True) == _HANDOVER_DRAIN_SECONDS, (
+            "a daemon that had already handed over took the held ceiling. "
+            "Its successor is on the socket, so there is no unserved port "
+            "time to buy, and the 30s bought instead cut four live replies")
+        # THE SIGNAL ROW DOES NOT MOVE. A supervisor still SIGKILLs at
+        # _DRAIN_SECONDS + 2 whether or not we handed over, so a long ceiling
+        # here still buys a harder kill partway through a reply.
+        assert teardown_drain_budget(
+            "signal TERM", True, handed_over=True) == _DRAIN_SECONDS, (
+            "a signalled shutdown took a ceiling past the supervisor's "
+            "patience; handing over does not stop the SIGKILL")
+
     def case_each_exit_path_drains_on_the_ceiling_that_fits_it(self, certdir):
         """THREE DRAINS, TWO SITUATIONS — and they were collapsed into one number.
 
