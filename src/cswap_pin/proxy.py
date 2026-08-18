@@ -8328,7 +8328,8 @@ def _successor_is_serving() -> bool:
     return not held_by_a_holder()
 
 
-def teardown_drain_budget(reason: str, held: bool) -> float:
+def teardown_drain_budget(reason: str, held: bool,
+                          handed_over: bool = False) -> float:
     """How long a shutdown may wait for the replies it still owes.
 
     A FOURTH EXIT PATH, AND THE ONLY ONE STILL CUTTING. Measured on host-a, the
@@ -8370,7 +8371,28 @@ def teardown_drain_budget(reason: str, held: bool) -> float:
     harness that reconstructs those can be wrong in its own right — the same
     reason `case_teardown_restores_the_config` asserts on the parse tree.
     """
-    if held:
+    # THE HELD ARM'S PREMISE, CHECKED RATHER THAN ASSUMED. "The holder cannot
+    # put the successor on the socket until we are gone" was true before the
+    # replace-ask existed. For a daemon that has already handed over it is
+    # FALSE: `_watch_own_code` signals the holder, verifies it survived the
+    # ask, and the successor is serving on the same socket while this process
+    # drains. There is no unserved port time left to buy, so the short ceiling
+    # buys nothing and spends live replies.
+    #
+    # MEASURED ON host-b 2026-08-18, four replies:
+    #   20:01:32Z pid=96075 asked the holder to replace us while we keep serving
+    #   20:01:32Z pid=25445 serving on port 53749          <- successor UP
+    #   20:02:01Z pid=96075 stopping (refcount)            <- second drain
+    #   20:02:31Z pid=96075 cut 4 in-flight request(s) after 30.1s of a 30s
+    #             budget (4 mid-response, content-free 0/2/9 s)
+    # Every one still delivering — the content-free field is what says so;
+    # `mid-response` cannot separate a live stream from one that stopped. A
+    # second drain re-armed the very clock the first had removed.
+    #
+    # THE SIGNAL ROW STILL DOES NOT MOVE, handed over or not: the supervisor
+    # SIGKILLs at `_DRAIN_SECONDS + 2`, so a longer ceiling there buys a
+    # harder kill partway through a reply rather than a finished one.
+    if held and not handed_over:
         return _HELD_DRAIN_SECONDS
     if reason == "refcount":
         return _HANDOVER_DRAIN_SECONDS
@@ -8672,7 +8694,15 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # under a holder is a RECYCLE, and the holder cannot put the successor
         # on the socket until we are gone. Draining the full ceiling there is
         # time with the port bound and nobody behind it.
-        cut = proxy.stop(drain=teardown_drain_budget(reason, held_by_a_holder()))
+        # ALREADY DRAINING == ALREADY HANDED OVER. Every path into a drain
+        # announces first, and the only one that runs concurrently with this
+        # teardown is the code watchdog's post-ask wait — which reaches
+        # `await_inflight` only after the successor is confirmed serving. So
+        # this predicate is the cheapest true answer to "is anything actually
+        # blocked on our exit", and it is read HERE rather than inside
+        # `teardown_drain_budget` so that function stays pure and testable.
+        cut = proxy.stop(drain=teardown_drain_budget(
+            reason, held_by_a_holder(), handed_over=this_process_is_draining()))
         # THE NUMBER FROM BEFORE THE CUT. Reading it back off the proxy here
         # returns 0 always — `await_inflight` empties the set it counts.
         _log_lifecycle(f"drained, {cut} client(s) still open")
