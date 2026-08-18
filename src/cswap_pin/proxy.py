@@ -1246,6 +1246,105 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
     return carries_us
 
 
+def _cert_der_set(body: bytes) -> set:
+    """DER of every certificate in a PEM blob, as a set.
+
+    Built on this file's own `_pem_blocks` rather than a second scanner: that
+    one already knows about welded BEGINs and fused ENDs, and the comment on
+    it says why two scanners drift apart. A SET of DER, not a count: measured
+    on host-b, the bundle holds 167 certs against a 128-cert store and
+    is still missing 27 of them, so "bigger" is not "contains".
+    """
+    out = set()
+    for label, _head, _end, block in _pem_blocks(body):
+        if label is None:
+            continue
+        cert = _load_cert(block)
+        if cert is not None:
+            out.add(cert.public_bytes(serialization.Encoding.DER))
+    return out
+
+
+def _ambient_store() -> "Path | None":
+    """The FILE this interpreter verifies against, or None if none is nameable.
+
+    `SSL_CERT_FILE` replaces a FILE; `SSL_CERT_DIR` covers the directory. So
+    what can be LOST is whatever file OpenSSL would have read, and
+    `get_default_verify_paths().cafile` is only sometimes that file. Measured
+    on the interpreter that actually runs cswap (the uv tool env), all three
+    machines:
+
+        host-a     cafile None  -> capath/ca-certificates.crt (124)
+        host-b      cafile /private/etc/ssl/cert.pem (128)
+        host-c  cafile /private/etc/ssl/cert.pem (128)
+
+    Reading `.cafile` alone returns None on host-a — the one machine
+    where the fix is needed — so the change would ship as a NO-OP there.
+    Giving up on macOS "because the keychain is not a file" is the mirror
+    error: macOS ships an OpenSSL-format export at that path. (The keychain is
+    what `truststore` reads, a different path that never consults this
+    variable.)
+    """
+    vp = ssl.get_default_verify_paths()
+    for cand in (vp.cafile, vp.openssl_cafile):
+        if cand and os.path.exists(cand):
+            return Path(cand)
+    capath = vp.capath or vp.openssl_capath
+    if capath:
+        for name in ("ca-certificates.crt", "ca-bundle.crt", "cert.pem"):
+            cand = Path(capath) / name
+            if cand.exists():
+                return cand
+    return None
+
+
+def _python_trust_file(ca_path: Path, node_bundle: "Path | str | None") -> "Path | None":
+    """The file to name in ``SSL_CERT_FILE``, or None to leave it unset.
+
+    THE MERGED BUNDLE, NEVER OUR OWN CA, AND ONLY WHEN IT PROVABLY SUBSUMES
+    THE STORE IT REPLACES. ``NODE_EXTRA_CA_CERTS`` ADDS to node's built-in
+    roots; ``SSL_CERT_FILE`` REPLACES OpenSSL's file. Measured: a context
+    holding 136 CAs drops to 1 when SSL_CERT_FILE names a one-certificate
+    file. Exporting `ca.pem` would leave a python client trusting our proxy
+    and nothing else on the internet.
+
+    "USE THE MERGED BUNDLE" IS NOT ENOUGH EITHER, and this is the part three
+    sessions agreed on before anyone measured it. The merged bundle is a
+    superset of the ambient roots only where an ambient store was merged IN.
+    Measured against each machine's own interpreter, by certificate SET:
+
+        host-a     ambient 124   bundle 126   subsumes YES -> written
+        host-b      ambient 128   bundle 167   subsumes NO, 27 missing -> refused
+        host-c  ambient 128   bundle   2   subsumes NO, 128 missing -> refused
+
+    host-b is the case a count-based check cannot see: the bundle is
+    BIGGER than the store it would replace and still not a superset. And
+    host-c has no corporate bundle to merge, so its "merged" file is
+    just the two component CAs — writing it there is the lone-CA bug wearing a
+    safer name.
+
+    So the gate is subsumption, not the file's name and not a platform test.
+    It lands where it is provable, which is where the failures are, and stays
+    silent where it is not.
+    """
+    if not node_bundle:
+        return None
+    bundle = Path(node_bundle)
+    body = _read_or_empty(bundle)
+    if not body.strip() or not _carries(body, Path(ca_path)):
+        # Not a bundle that trusts the hop we terminate against.
+        return None
+    ambient = _ambient_store()
+    if ambient is None:
+        return None
+    system = _read_or_empty(ambient)
+    if not system.strip() or not _cert_der_set(system) <= _cert_der_set(body):
+        # Unset fails only against the pin; a non-superset fails against
+        # everything else.
+        return None
+    return bundle
+
+
 def _trust_file(ca_path: Path, existing: str | None) -> Path:
     """The single file to name in ``NODE_EXTRA_CA_CERTS``.
 
@@ -1951,6 +2050,20 @@ def _wire_global_config_locked(
         # is where the proxy credential lives too. Deriving it here keeps the
         # public signature unchanged for every caller.
         proxy = _proxy_url(port, Path(ca_path).parent)
+        node_ca = _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
+        # PYTHON DOES NOT READ NODE_EXTRA_CA_CERTS, and cswap's usage poll is
+        # plain urllib -- so it obeys the proxy vars above while trusting
+        # nothing that signs them. Measured with a control on the same host
+        # and proxy: without SSL_CERT_FILE, CERTIFICATE_VERIFY_FAILED; with
+        # it, HTTP 429 (i.e. the handshake completed and the server answered).
+        #
+        # A SEPARATE FILE from the node one, deliberately -- see
+        # `_python_trust_file`. SSL_CERT_FILE REPLACES OpenSSL's store where
+        # NODE_EXTRA_CA_CERTS only adds to node's, and the node bundle carries
+        # the system roots on some machines and not others (128 / 169 / 3
+        # certs across our three). None means "could not build it safely", and
+        # then the key is simply not written.
+        py_ca = _python_trust_file(ca_path, node_ca)
         wanted = {
             "HTTPS_PROXY": proxy,
             "https_proxy": proxy,
@@ -1969,9 +2082,7 @@ def _wire_global_config_locked(
             # Measured: with only our CA, `downloads.claude.ai` (MITM'd by the
             # upstream cache proxy) failed to verify and the session showed
             # "Auto-update failed · Run claude doctor".
-            "NODE_EXTRA_CA_CERTS": str(
-                _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
-            ),
+            "NODE_EXTRA_CA_CERTS": str(node_ca),
             # Self-loop marker. Claude Code applies this block into
             # process.env, which its Bash-tool children inherit — so a `cswap`
             # run from inside a pinned session sees our own proxy as its
@@ -1979,6 +2090,8 @@ def _wire_global_config_locked(
             # and the daemon starts CONNECTing to itself.
             "CSWAP_PIN_PORT": str(port),
         }
+        if py_ca is not None:
+            wanted["SSL_CERT_FILE"] = str(py_ca)
         # Remember what we are about to displace, so unwiring is lossless.
         displaced = {k: env[k] for k in wanted if k in env}
         env.update(wanted)
@@ -7794,6 +7907,15 @@ def wire_env(
     out["NODE_EXTRA_CA_CERTS"] = str(
         _trust_file(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
     )
+    # Python does not read NODE_EXTRA_CA_CERTS. The failing caller measured on
+    # host-a is the statusline nudge -- usage.py `Popen([cswap,
+    # "list"])` inherits this env, dials the pin, and every non-active account
+    # poll dies CERTIFICATE_VERIFY_FAILED. Evenly across all seven accounts;
+    # only the disabled one shows it, because the engine's other path never
+    # re-polls it to reset the counter.
+    _py_ca = _python_trust_file(ca_path, out["NODE_EXTRA_CA_CERTS"])
+    if _py_ca is not None:
+        out["SSL_CERT_FILE"] = str(_py_ca)
 
     # Attach this launch as a refcount holder: open a write fd on the FIFO and
     # mark it inheritable so the exec'd claude keeps it open for its lifetime.
