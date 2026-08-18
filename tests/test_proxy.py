@@ -620,6 +620,22 @@ class TestLiveRemoteControlSessions:
     instead of telling everyone to restart something."""
 
 
+    def _host(self, monkeypatch, slug="host-a"):
+        """Pin the host slug the anchor is derived from.
+
+        `_looks_generated` anchors on `_host_slug()`, which reads
+        `socket.gethostname()` AT CALL TIME — deliberately, so a renamed or a
+        new machine needs no edit in production. The TEST cannot inherit that:
+        its fixture titles hardcode `host-a-…` on one side while the
+        other side reads whatever box the suite runs on, so every case below
+        passed here and failed on a runner named `fv-az…` / `Mac-…`.
+
+        Measured on CI at fae276d: three cases red, every missing entry a
+        `host-a-` slug, and a local "120 passed" that was true and told
+        us nothing — it passed BECAUSE it ran on host-a.
+        """
+        monkeypatch.setattr("cswap_pin.proxy._host_slug", lambda: slug)
+
     def _sessions_dir(self, tmp_path, monkeypatch):
         from pathlib import Path
 
@@ -732,9 +748,10 @@ class TestLiveRemoteControlSessions:
         # wrote it" — the rule that used to claim 'Email advice' below.
         monkeypatch.setattr(pp, "server_generated_titles",
                             lambda: {"Session interrupted by user"})
+        self._host(monkeypatch)
 
         names = {"cse_a": "cswap", "cse_b": "cswap", "cse_c": "cswap",
-                 "cse_d": "cswap", "cse_e": "cswap"}
+                 "cse_d": "cswap", "cse_e": "cswap", "cse_f": "cswap"}
         listing = [
             # Server slug and server sentence: nobody chose these.
             {"id": "cse_a", "title": "host-a-cozy-badger"},
@@ -756,12 +773,28 @@ class TestLiveRemoteControlSessions:
             # `aiTitle` = what the server generated).
             {"id": "cse_d", "title": "ai-inter-session"},
             {"id": "cse_e", "title": "Email advice"},
+            # ANOTHER MACHINE'S SLUG, and the reason the anchor is an anchor.
+            # `host-b-eventual-cake` is a real title from this account,
+            # minted for the work Mac. Read from host-a it is not ours,
+            # and the un-anchored regex claimed it — which matters because the
+            # sweep runs across hosts. Without this row, pinning the slug above
+            # would leave the anchor untested in the only direction it exists
+            # for.
+            {"id": "cse_f", "title": "host-b-eventual-cake"},
         ]
         assert titles_to_restore(listing, names) == [
             ("cse_a", "cswap"), ("cse_b", "cswap")
-        ], "a title the user chose was selected for overwrite"
+        ], (
+            "the selection is wrong in one of two directions: a title a human "
+            "typed was picked for overwrite, or a title the server invented "
+            "was left in place. Compare the ids, not the count — the failure "
+            "CI produced at fae276d was the second kind (too few), while this "
+            "message used to name only the first."
+        )
 
-    def case_a_bridge_the_server_already_titles_correctly_is_left_alone(self):
+    def case_a_bridge_the_server_already_titles_correctly_is_left_alone(
+        self, monkeypatch
+    ):
         """No PUT for a title that already matches.
 
         A rename is a write to someone's account, and this runs on every RC
@@ -771,6 +804,7 @@ class TestLiveRemoteControlSessions:
         """
         from cswap_pin.proxy import titles_to_restore
 
+        self._host(monkeypatch)
         listing = [
             {"id": "cse_x", "title": "RVP_fork"},          # already right
             {"id": "cse_y", "title": "host-a-misty-crayon"},
@@ -819,9 +853,19 @@ class TestLiveRemoteControlSessions:
         """
         from cswap_pin import proxy as pin_proxy
 
+        # THE PRE-CREATE LISTING CARRIES WORK OF ITS OWN, which is the half
+        # that was still broken after the re-listing loop was added. `cse_old`
+        # is a PREVIOUS session whose title the server had already invented, so
+        # pass 0 finds something to restore and returns on `if done` — never
+        # reaching the pass where the bridge this request created appears.
+        #
+        # That is the live symptom, not a hypothetical: `ai-inter-session-peer1`
+        # was still showing `host-a-robust-dream` on 2026-08-18 with the
+        # loop deployed, and the daemon log's restores were each fixing a
+        # PREVIOUS session — exactly what a first pass that succeeds does.
         listings = [
-            [{"id": "cse_old", "title": "cswap"}],                    # pre-create
-            [{"id": "cse_old", "title": "cswap"},
+            [{"id": "cse_old", "title": "host-a-robust-dream"}],
+            [{"id": "cse_old", "title": "host-a-robust-dream"},
              {"id": "cse_new", "title": "host-a-serene-unicorn"}],
         ]
         puts: list[tuple[str, bytes]] = []
@@ -835,6 +879,7 @@ class TestLiveRemoteControlSessions:
                 puts.append((path, body))
             return {}
 
+        self._host(monkeypatch)
         monkeypatch.setattr(pin_proxy, "live_bridge_names",
                             lambda: {"cse_new": "CCF", "cse_old": "cswap"})
         monkeypatch.setattr(pin_proxy.PinProxy, "_list_bridges", _list)
@@ -850,8 +895,18 @@ class TestLiveRemoteControlSessions:
             "listing was taken before the create landed, and nothing looked "
             "again."
         )
-        assert puts[0][0] == "/v1/code/sessions/cse_new"
-        assert b"CCF" in puts[0][1]
+        by_id = {path.rsplit("/", 1)[-1]: body for path, body in puts}
+        # KEYED BY ID, NOT BY ORDER. `puts[0]` is the PREVIOUS session now —
+        # asserting on it would pass while the bridge this connect is for was
+        # never touched, which is the whole defect.
+        assert "cse_new" in by_id, (
+            "the restore stopped at the first pass that changed something. It "
+            "repaired a previous session and returned, so the bridge this "
+            "request created kept its slug until some other session happened "
+            "to connect. Restored: " + ", ".join(sorted(by_id))
+        )
+        assert b"CCF" in by_id["cse_new"]
+        assert b"cswap" in by_id["cse_old"]
 
     def case_the_connect_hook_actually_runs_the_restore(self):
         """The wiring, not just the method.
