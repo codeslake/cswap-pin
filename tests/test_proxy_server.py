@@ -4001,6 +4001,72 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_the_cut_line_says_how_much_each_reply_delivered(self, certdir):
+        """`mid-response` CANNOT TELL A LIVE STREAM FROM A CORPSE.
+
+        It means headers went out and nothing finished. A keepalive is bytes,
+        so `_owed_still_moving` counts it as movement and the connection stays
+        `mid-response` forever. Measured on lmd42 2026-08-18: twelve logged as
+        `12 mid-response` had delivered nothing but a fixed 39-byte frame for
+        thirty minutes, and the reaper's "cheapest to lose" sort weighed those
+        twelve corpses exactly as heavily as twelve live replies.
+
+        PER CONNECTION, which is why this cannot come from `/proc/<pid>/io`:
+        that is a process-wide rate and nobody could say how many connections
+        the content was flowing on. `_StampingWriter` sees bytes attributed to
+        one connection, so the count comes from there.
+
+        AN INSTRUMENT ONLY. Nothing decides on this number yet; it exists so
+        the population a threshold would be chosen from arrives in a log line
+        rather than from somebody sampling at the right moment.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        c, d = socket.socketpair()
+        err = io.StringIO()
+        try:
+            for sock in (a, c):
+                with proxy._live_lock:
+                    proxy._open_conns.add(sock)
+                proxy._owe_answer(sock, True)
+            # ONE CORPSE AND ONE LIVE REPLY, told apart only by volume: both
+            # are owed, both are mid-response, both have moved recently.
+            for _ in range(3):
+                proxy._note_response_started(a, 39)
+            proxy._note_response_started(c, 5000)
+
+            with contextlib.redirect_stderr(err):
+                proxy.await_inflight(0.0)
+            line = err.getvalue()
+
+            # MIN AND MAX, not the median: with two samples the middle is a
+            # tie-break convention and asserting it would pin the formatter
+            # rather than the fact. The fact is that the corpse and the live
+            # reply land at opposite ends of the same line.
+            # AND IT BELONGS TO THE DEBT. A keep-alive socket that has paid
+            # and is waiting for its next request starts the next one at zero,
+            # or a long-lived connection looks busier the longer it lives and
+            # outranks a genuinely streaming one forever.
+            proxy._owe_answer(a, False)
+            proxy._owe_answer(a, True)
+            with proxy._live_lock:
+                carried = proxy._delivered.get(a, 0)
+            assert carried == 0, (
+                f"{carried} bytes carried across the debt boundary — the next "
+                "request on this connection starts already looking busy")
+
+            assert "delivered 117/" in line and "/5000 B min/med/max" in line, (
+                "the cut line does not carry per-connection byte counts, so a "
+                "reply that stopped thirty minutes ago is indistinguishable "
+                "from one still streaming: " + line)
+        finally:
+            for s_ in (a, b, c, d):
+                try: s_.close()
+                except OSError: pass
+
     def case_the_accept_debt_survives_until_the_first_answer(self, certdir):
         """THE ACCEPT-TIME OWE WAS UNDONE ONE FRAME LATER.
 
@@ -4094,7 +4160,19 @@ class TestDrainReportsWhatItCut:
 
             threading.Thread(target=_upstream, daemon=True).start()
             _relay_response(up_a, cl_a, 0,
-                            on_headers=lambda: stamps.append(time.monotonic()))
+                            on_headers=lambda n: stamps.append((time.monotonic(), n)))
+
+            # AND THE SIZE IS REAL, not merely non-zero. The count is what
+            # separates a live reply from one delivering a keepalive, so a
+            # writer that reports every write as 0 bytes is the same defect as
+            # one that does not report at all — and the sibling case that
+            # drives `_note_response_started` directly cannot see it.
+            sizes = [n for _, n in stamps]
+            assert all(n > 0 for n in sizes), (
+                f"a write was reported as {min(sizes)} bytes: {sizes}")
+            assert sum(sizes) >= len(b"event: a\n\n") + len(b"event: b\n\n"), (
+                f"reported {sum(sizes)} bytes total, less than the body the "
+                f"client actually received: {sizes}")
 
             assert len(stamps) >= 3, (
                 f"the relay reported {len(stamps)} write(s). The head plus two "
@@ -4143,7 +4221,7 @@ class TestDrainReportsWhatItCut:
 
             threading.Thread(target=_with_interim, daemon=True).start()
             _relay_response(up_a, cl_a, 0,
-                            on_headers=lambda: stamps.append(1))
+                            on_headers=lambda n: stamps.append(n))
 
             cl_a.shutdown(socket.SHUT_WR)
             got = b""
@@ -4846,7 +4924,7 @@ class TestDrainReportsWhatItCut:
             up_b.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
             up_b.shutdown(socket.SHUT_WR)
             _relay_response(up_a, cl_a, 0,
-                            on_headers=lambda: fired.append(1))
+                            on_headers=lambda n: fired.append(n))
             assert fired, (
                 "the relay wrote the response head to the client without "
                 "saying so, so every cut is reported as retryable no matter "

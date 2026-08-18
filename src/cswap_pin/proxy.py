@@ -8863,6 +8863,10 @@ class PinProxy:
         # A dict rather than a set so a cut can say which of the two it was;
         # see `_note_response_started`.
         self._owed: dict = {}
+        # BYTES DELIVERED PER OWED CONNECTION, an instrument and nothing more.
+        # Kept beside `_owed` rather than inside its value so the drain's hot
+        # predicate keeps comparing a bare float. Cleared with the debt.
+        self._delivered: dict = {}
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -9207,6 +9211,7 @@ class PinProxy:
         # tonight (34, then 30) were sockets, not truncated replies.
         cut = self.inflight_requests()
         mid = self.inflight_mid_response()
+        delivered = self._delivered_summary()
         closed = self.live_client_count()
         self._close_open_connections()
         # ONE LINE PER DRAIN, ALWAYS — silence was the problem, not the noise.
@@ -9232,7 +9237,8 @@ class PinProxy:
             _log_lifecycle(
                 f"cut {cut} in-flight request(s) after {elapsed:.1f}s of "
                 f"{ceiling} ({mid} mid-response, {cut - mid} before "
-                f"headers; and closed {closed - cut} idle connection(s))"
+                f"headers; delivered {delivered} per reply; and closed "
+                f"{closed - cut} idle connection(s))"
             )
         else:
             _log_lifecycle(
@@ -9527,6 +9533,7 @@ class PinProxy:
             with self._live_lock:
                 self._open_conns.discard(conn)
                 self._owed.pop(conn, None)
+                self._delivered.pop(conn, None)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
@@ -9575,6 +9582,38 @@ class PinProxy:
                 return True
         return False
 
+    def _delivered_summary(self) -> str:
+        """How many bytes each still-owed reply has actually delivered.
+
+        AN INSTRUMENT, AND THE ONE THE NEXT DECISION NEEDS. `mid-response`
+        says headers went out and nothing finished — it cannot separate a
+        reply streaming right now from one that stopped half an hour ago,
+        because a keepalive is bytes and `_owed_still_moving` counts it as
+        movement. Measured on lmd42 2026-08-18: twelve connections logged as
+        `12 mid-response` had delivered nothing but a fixed 39-byte frame for
+        thirty minutes.
+
+        PER CONNECTION, WHICH IS THE POINT. The same night produced process-
+        wide byte rates from `/proc/<pid>/io` — 490 B/s during content against
+        35 B/s of heartbeat — and that separation cannot be carried to a
+        per-connection rule, because nobody knew how many of the twelve the
+        content was flowing on. `_StampingWriter` is the only thing in this
+        system that sees bytes attributed to a connection, so the count comes
+        from there and the number arrives in a log line on every machine
+        instead of from somebody sampling at the right moment.
+
+        NOTHING DECIDES ON IT YET. The reaper still sorts on replies owed and
+        the drain still ends on movement; this is here to produce the
+        population a threshold would have to be chosen from, which is the step
+        that was skipped for every ceiling that went wrong tonight.
+        """
+        with self._live_lock:
+            counts = sorted(self._delivered.get(c, 0) for c in self._owed)
+        if not counts:
+            return "0 B"
+        return (f"{counts[0]}/{counts[len(counts) // 2]}/{counts[-1]} B "
+                "min/med/max")
+
     def inflight_mid_response(self) -> int:
         """Of the owed requests, how many have already sent the client bytes.
 
@@ -9618,7 +9657,7 @@ class PinProxy:
         with self._live_lock:
             return len(self._owed)
 
-    def _note_response_started(self, conn) -> None:
+    def _note_response_started(self, conn, written: int = 0) -> None:
         """The first response byte for this connection has gone to the client.
 
         THE DIFFERENCE BETWEEN AN INCONVENIENCE AND A LOSS. A request cut
@@ -9652,6 +9691,7 @@ class PinProxy:
         with self._live_lock:
             if conn in self._owed:
                 self._owed[conn] = time.monotonic()
+                self._delivered[conn] = self._delivered.get(conn, 0) + written
 
     def _owe_answer(self, conn, owed: bool) -> None:
         """Mark a connection as owing an answer, or as having paid it.
@@ -9680,6 +9720,10 @@ class PinProxy:
                 self._owed.setdefault(conn, 0.0)
             else:
                 self._owed.pop(conn, None)
+                # THE COUNT BELONGS TO THE DEBT. A connection that has paid and
+                # is waiting for its next request starts the next one at zero,
+                # or a keep-alive would look busier the longer it lives.
+                self._delivered.pop(conn, None)
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
@@ -10649,7 +10693,7 @@ class PinProxy:
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
                 # client has received nothing and the SDK retries; after it,
                 # part of an answer is already delivered.
-                on_headers=(lambda: self._note_response_started(_conn))
+                on_headers=(lambda n: self._note_response_started(_conn, n))
                 if _conn is not None else None,
                 # A HEAD response carries the headers of the GET it mirrors,
                 # Content-Length included, but no body — only the request
@@ -11430,7 +11474,15 @@ class _StampingWriter:
         # when the write COMPLETED, and a slow client is exactly the case where
         # that gap matters — the drain would see the connection as stale for
         # the whole time it was busy delivering to it.
-        self._note()
+        #
+        # AND HOW MUCH, not only that something moved. A keepalive is bytes,
+        # so a timestamp alone cannot tell a live stream from one that stopped
+        # half an hour ago and is only being kept warm — measured on lmd42
+        # 2026-08-18, twelve connections reported `mid-response` while every
+        # one of them had delivered nothing but a fixed 39-byte frame for
+        # thirty minutes. This count is what makes that distinction possible;
+        # nothing decides on it yet.
+        self._note(len(data))
         return self._sock.sendall(data)
 
     def __getattr__(self, name):
