@@ -2697,6 +2697,25 @@ def _certs_consistent(
         soon = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=30)
         if min(ca.not_valid_after_utc, leaf.not_valid_after_utc) <= soon:
             return False
+        # AN OVER-LONG LEAF IS UNUSABLE, not merely unfashionable. Capping
+        # `_LEAF_DAYS` only affects a certificate that gets GENERATED, and every
+        # install already carrying a 3650-day leaf keeps it: it is unexpired,
+        # correctly signed, and has the right SAN, so every other test here
+        # passes for another decade. The cap would have shipped and changed
+        # nothing on the machines that actually fail — which is the entire
+        # reason it exists.
+        #
+        # Security.framework rejects it outright ("certificate is not standards
+        # compliant"), so for the verifier this proxy has to satisfy, a leaf
+        # this long is as broken as an expired one. Measured: 3651 days
+        # REJECTED, 397 days ACCEPTED, same CA, same probe.
+        #
+        # Only the leaf. The CA is the client's trusted root, the cap does not
+        # apply to it, and `ensure_ca` keeps a good one — so this rotates the
+        # certificate macOS objects to without disturbing the trust anyone is
+        # already wired to.
+        if (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days > _LEAF_DAYS + 1:
+            return False
         san = leaf.extensions.get_extension_for_class(
             x509.SubjectAlternativeName
         ).value.get_values_for_type(x509.DNSName)
