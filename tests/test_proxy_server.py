@@ -3968,8 +3968,8 @@ class TestDrainReportsWhatItCut:
             monkeypatch.setattr(pp, "_DRAINING_BEAT_SECONDS", 0.05)
             monkeypatch.setattr(
                 pp, "beat_draining",
-                lambda cd, pid=None, owed=None: (
-                    beats.append(owed), real_beat(cd, pid, owed))[1])
+                lambda cd, pid=None, owed=None, live=None: (
+                    beats.append(owed), real_beat(cd, pid, owed, live))[1])
 
             threading.Thread(target=_stream, daemon=True).start()
             t0 = time.monotonic()
@@ -4000,6 +4000,169 @@ class TestDrainReportsWhatItCut:
             for s_ in (c, d):
                 try: s_.close()
                 except OSError: pass
+
+    def case_a_keepalive_is_told_from_an_answer_by_NAME(self, certdir):
+        """NO THRESHOLD, NO RATE, NO FRAME WIDTH — the protocol says which is
+        which, and the pin has the plaintext because it is the MITM.
+
+        FAILS SAFE, which is the whole reason this is shippable where a byte
+        threshold was not. The test is "is EVERY event here a keepalive", so an
+        event name nobody has seen counts as CONTENT and the drain keeps
+        waiting. Phrased the other way — "does this contain a known content
+        event" — the day a new event type is added it would cut live replies.
+        """
+        import cswap_pin.proxy as pp
+
+        assert pp._is_only_keepalive(b"event: ping\ndata: {}\n\n") is True
+        assert pp._is_only_keepalive(
+            b"event: ping\ndata: {}\n\nevent: ping\ndata: {}\n\n") is True
+
+        for content in (
+            b"event: content_block_delta\ndata: {}\n\n",
+            b"event: ping\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+            b"event: some_event_added_next_year\ndata: {}\n\n",
+            b'{"id":"msg_1"}',
+            b"data: {}\n\n",
+            b"",
+        ):
+            assert pp._is_only_keepalive(content) is False, (
+                f"classified as a keepalive: {content!r} — anything this "
+                "cannot positively identify as all-keepalive must count as an "
+                "answer, or the drain stops waiting on a live reply")
+
+    def case_the_response_head_is_movement_but_not_an_answer(self, certdir):
+        """THE HEAD GOES THROUGH THE SAME WRITER, and counting it as content
+        would make every response look answered from its first byte — a rule
+        that ships, reads like a fix, and never fires.
+
+        It must still STAMP: a head reaching the client is the connection
+        moving, and the stall window is what reads that.
+        """
+        import cswap_pin.proxy as pp
+
+        seen = []
+        up_a, up_b = socket.socketpair()
+        cl_a, cl_b = socket.socketpair()
+        try:
+            def _upstream():
+                try:
+                    up_b.sendall(b"HTTP/1.1 200 OK\r\n"
+                                 b"Content-Type: text/event-stream\r\n\r\n")
+                    time.sleep(0.15)
+                    up_b.sendall(b"event: ping\ndata: {}\n\n")
+                    time.sleep(0.05)
+                    up_b.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+            threading.Thread(target=_upstream, daemon=True).start()
+            pp._relay_response(up_a, cl_a, 0,
+                               on_headers=lambda n, c: seen.append(c))
+        finally:
+            for s_ in (up_a, up_b, cl_a, cl_b):
+                try:
+                    s_.close()
+                except OSError:
+                    pass
+
+        assert seen, "nothing was stamped at all; the case proves nothing"
+        assert seen[0] is False, (
+            "the response HEAD was reported as content, so every reply looks "
+            "answered from its first byte and nothing can ever be classified "
+            "as a stopped one")
+        assert all(c is False for c in seen), (
+            f"a keepalive-only body was reported as content: {seen}")
+
+    def case_content_before_the_drain_does_not_make_a_reply_live(
+        self, certdir, monkeypatch
+    ):
+        """SINCE THE DRAIN BEGAN, NOT SINCE THE REQUEST BEGAN.
+
+        Measured on lmd42 2026-08-18: the twelve that mattered delivered real
+        content in the FIRST 20 SECONDS of their drain and nothing but
+        keepalives for the thirty minutes after. A counter that starts at the
+        request would call every one of them live, and the reaper would then
+        protect a process holding twelve stopped replies over one still
+        writing.
+
+        Drives `await_inflight`, not `live_replies` directly: the snapshot is
+        taken inside the drain and that wiring is the part that can be lost.
+        """
+        import cswap_pin.proxy as pp
+
+        monkeypatch.setattr(pp, "_DRAIN_STALL_SECONDS", 0.2)
+        seen = []
+        real_beat = pp.beat_draining
+        monkeypatch.setattr(
+            pp, "beat_draining",
+            lambda cd, pid=None, owed=None, live=None: (
+                seen.append((owed, live)), real_beat(cd, pid, owed, live))[1])
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        a, b = socket.socketpair()
+        try:
+            with proxy._live_lock:
+                proxy._open_conns.add(a)
+            proxy._owe_answer(a, True)
+            # AN ANSWER, DELIVERED BEFORE ANY OF THIS — then silence but for a
+            # keepalive, which is what the drain will actually see.
+            proxy._note_response_started(a, 4000, True)
+            proxy._note_response_started(a, 39, False)
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                proxy.await_inflight(1.0)
+        finally:
+            for s_ in (a, b):
+                try:
+                    s_.close()
+                except OSError:
+                    pass
+
+        assert seen, "the drain never beat, so nothing published a count"
+        owed, live = seen[0]
+        assert owed == 1, f"precondition: one reply is owed, got {owed}"
+        assert live == 0, (
+            "a reply whose only content predates the drain was counted as "
+            "still being written, so the reaper will protect a predecessor "
+            f"holding nothing but stopped replies. live={live}")
+
+    def case_the_reaper_prefers_the_predecessor_with_no_live_answers(
+        self, certdir
+    ):
+        """TWELVE CORPSES OUTWEIGHED TWO LIVE REPLIES.
+
+        The sort keyed on replies OWED, and a connection that stopped half an
+        hour ago is owed exactly as much as one still streaming — so at the
+        limit the reaper preferred to kill the process still doing real work.
+        Measured on lmd42 2026-08-18: `12 mid-response` over twelve
+        connections carrying nothing but a fixed frame.
+        """
+        import cswap_pin.proxy as pp
+
+        killed = []
+        real_kill, real_pids = pp._kill_daemon, pp._pin_daemon_pids
+        pp._kill_daemon = lambda pid: killed.append(pid)
+        pids = list(range(7000, 7000 + pp._MAX_DRAINING_PREDECESSORS + 1))
+        pp._pin_daemon_pids = lambda certdir: list(pids)
+        try:
+            for pid in pids:
+                pp.announce_draining(certdir, pid)
+                # pids[0] holds the MOST replies and none is being written;
+                # every other one holds fewer and all of theirs are live.
+                if pid == pids[0]:
+                    pp.beat_draining(certdir, pid, owed=12, live=0)
+                else:
+                    pp.beat_draining(certdir, pid, owed=2, live=2)
+
+            pp._sweep_orphan_daemons(certdir, keep_pid=999)
+
+            assert killed == [pids[0]], (
+                "the reaper took a predecessor that was still writing answers "
+                "while one holding twelve stopped ones survived — owed counts "
+                f"debts, not answers. killed={killed}")
+        finally:
+            pp._kill_daemon, pp._pin_daemon_pids = real_kill, real_pids
 
     def case_the_cut_line_says_how_much_each_reply_delivered(self, certdir):
         """`mid-response` CANNOT TELL A LIVE STREAM FROM A CORPSE.
@@ -4160,14 +4323,14 @@ class TestDrainReportsWhatItCut:
 
             threading.Thread(target=_upstream, daemon=True).start()
             _relay_response(up_a, cl_a, 0,
-                            on_headers=lambda n: stamps.append((time.monotonic(), n)))
+                            on_headers=lambda n, c: stamps.append((time.monotonic(), n, c)))
 
             # AND THE SIZE IS REAL, not merely non-zero. The count is what
             # separates a live reply from one delivering a keepalive, so a
             # writer that reports every write as 0 bytes is the same defect as
             # one that does not report at all — and the sibling case that
             # drives `_note_response_started` directly cannot see it.
-            sizes = [n for _, n in stamps]
+            sizes = [n for _, n, _c in stamps]
             assert all(n > 0 for n in sizes), (
                 f"a write was reported as {min(sizes)} bytes: {sizes}")
             assert sum(sizes) >= len(b"event: a\n\n") + len(b"event: b\n\n"), (
@@ -4221,7 +4384,7 @@ class TestDrainReportsWhatItCut:
 
             threading.Thread(target=_with_interim, daemon=True).start()
             _relay_response(up_a, cl_a, 0,
-                            on_headers=lambda n: stamps.append(n))
+                            on_headers=lambda n, c: stamps.append(n))
 
             cl_a.shutdown(socket.SHUT_WR)
             got = b""
@@ -4924,7 +5087,7 @@ class TestDrainReportsWhatItCut:
             up_b.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
             up_b.shutdown(socket.SHUT_WR)
             _relay_response(up_a, cl_a, 0,
-                            on_headers=lambda n: fired.append(n))
+                            on_headers=lambda n, c: fired.append(n))
             assert fired, (
                 "the relay wrote the response head to the client without "
                 "saying so, so every cut is reported as retryable no matter "
