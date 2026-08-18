@@ -8496,6 +8496,71 @@ class TestUnwireWhenDead:
         finally:
             srv.close()
 
+    def case_a_momentary_gap_does_not_unwire(self, tmp_path, monkeypatch):
+        """A RECYCLE IS NOT A DEATH, and one refused connect cannot tell them
+        apart.
+
+        A handover takes the socket down and puts it back within the same
+        second; a two-stage recycle does it twice. A single 1 s probe landing
+        in either gap read "the pin is dead" and this function then stripped
+        the WHOLE env block — so every claude launched afterwards ran unpinned,
+        silently, until somebody noticed.
+
+        Measured on lmd42 2026-08-18: the pin was healthy and serving on 36301
+        with `env` empty, after a two-stage recycle 70 s wide. Nothing in any
+        log could say which of two implementations with identical clear
+        semantics had done it.
+
+        Here the listener is absent for the first probe and present for the
+        rest, which is exactly the shape of that gap. The wiring must survive.
+        """
+        import json, os, socket, threading
+        from cswap_pin.proxy import unwire_if_dead
+
+        # A port that is closed NOW and listening a moment later.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        started = threading.Event()
+
+        def listen_late():
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            time.sleep(1.2)          # past the first probe, before the third
+            try:
+                srv.bind(("127.0.0.1", port))
+                srv.listen(1)
+                started.set()
+                for _ in range(8):
+                    srv.accept()
+            except OSError:
+                started.set()
+            finally:
+                srv.close()
+
+        t = threading.Thread(target=listen_late, daemon=True)
+        t.start()
+        try:
+            # CSWAP_PIN_PORT, because that is the key `_wired_port()` reads.
+            # A first version set only HTTPS_PROXY, so `_wired_port()` returned
+            # None, the retry loop was never entered, and the case "passed"
+            # through a path it never touched — the failure it reported was
+            # real but for the wrong reason.
+            cfg, certdir = self._cfg(
+                tmp_path, monkeypatch,
+                {"HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                 "CSWAP_PIN_PORT": str(port)})
+            # NO daemon record: that forces the decision down to the wired-port
+            # probe, which is the code under test here. With a record naming a
+            # live pid the first guard answers and the retry never runs.
+            assert unwire_if_dead(certdir) is False, (
+                "one refused connect during a recycle unwired the machine")
+            assert "HTTPS_PROXY" in json.loads(cfg.read_text())["env"]
+        finally:
+            started.wait(timeout=5)
+
     def case_teardown_restores_the_config(self):
         """The orderly path must unwire too, not only the crash path.
 
