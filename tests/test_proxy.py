@@ -712,7 +712,9 @@ class TestLiveRemoteControlSessions:
         assert should_wait_for_pin("GET", "/v1/code/sessions") is False
         assert should_wait_for_pin("GET", "/v1/code/sessions/cse_x/bridge") is False
 
-    def case_a_name_the_user_typed_on_the_web_is_never_overwritten(self):
+    def case_a_name_the_user_typed_on_the_web_is_never_overwritten(
+        self, monkeypatch
+    ):
         """The local name is a FALLBACK, not an override.
 
         Restoring on any difference meant a title set in the claude.ai web app
@@ -720,19 +722,44 @@ class TestLiveRemoteControlSessions:
         bridge — permanently, with no way to make it stick. The fault being
         repaired is a title nobody chose; a title someone chose is not it.
         """
+        import cswap_pin.proxy as pp
         from cswap_pin.proxy import titles_to_restore
 
-        names = {"cse_a": "cswap", "cse_b": "cswap", "cse_c": "cswap"}
+        # THE SERVER'S OWN SENTENCE, INJECTED RATHER THAN GUESSED. Claude Code
+        # records what it generated as an `ai-title` transcript record, and
+        # `server_generated_titles` reads them. Supplying it here is what makes
+        # `cse_b` selectable WITHOUT a rule like "a space means the server
+        # wrote it" — the rule that used to claim 'Email advice' below.
+        monkeypatch.setattr(pp, "server_generated_titles",
+                            lambda: {"Session interrupted by user"})
+
+        names = {"cse_a": "cswap", "cse_b": "cswap", "cse_c": "cswap",
+                 "cse_d": "cswap", "cse_e": "cswap"}
         listing = [
             # Server slug and server sentence: nobody chose these.
             {"id": "cse_a", "title": "host-a-cozy-badger"},
             {"id": "cse_b", "title": "Session interrupted by user"},
             # A human sat down and typed this. Leave it alone.
             {"id": "cse_c", "title": "paper-rebuttal"},
+            # AND THESE TWO, WHICH THE SHAPE TEST GETS WRONG. Both are names
+            # the user chose, and both are measured on this account:
+            #   `_looks_generated('ai-inter-session')` -> True, because the
+            #   regex only asks for lowercase-hyphen-word-word and never
+            #   checks that the prefix is THIS MACHINE's host slug.
+            #   `_looks_generated('Email advice')` -> True, because the rule
+            #   is "a space means the server wrote a sentence", which assumes
+            #   the user never puts a space in a name.
+            # A false positive here OVERWRITES a title somebody typed; a false
+            # negative only leaves one wrong. They are not symmetric, and the
+            # shape of a string cannot tell them apart — CC records the
+            # authority itself (`nameSource` absent = the user set it,
+            # `aiTitle` = what the server generated).
+            {"id": "cse_d", "title": "ai-inter-session"},
+            {"id": "cse_e", "title": "Email advice"},
         ]
         assert titles_to_restore(listing, names) == [
             ("cse_a", "cswap"), ("cse_b", "cswap")
-        ]
+        ], "a title the user chose was selected for overwrite"
 
     def case_a_bridge_the_server_already_titles_correctly_is_left_alone(self):
         """No PUT for a title that already matches.

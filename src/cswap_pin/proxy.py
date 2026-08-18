@@ -3980,24 +3980,125 @@ def live_bridge_names() -> dict[str, str]:
     return names
 
 
-_GENERATED_TITLE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-[a-z]+-[a-z]+$")
+# RETIRED, deliberately not left behind as a helper nobody calls. It matched
+# any lowercase-hyphen-word-word string with no anchor, so it claimed
+# `ai-inter-session` — a name the user chose — was the server's. See
+# `_looks_generated`, which is now anchored on this machine's host slug, and
+# `server_generated_titles`, which reads what Claude Code recorded instead of
+# inferring it.
+
+
+def server_generated_titles() -> set[str]:
+    """Every title CLAUDE CODE RECORDED as one it generated, on this machine.
+
+    THE AUTHORITY, NOT A GUESS. Claude Code resolves a session's display name
+    as `agentName || customTitle || aiTitle || summary || …`
+    (`getLogDisplayTitle` in the binary), so it distinguishes the name a USER
+    chose from one it invented BY FIELD, and it writes both to the transcript:
+
+        {"type":"custom-title","customTitle":"RVP_fork",   "sessionId":…}
+        {"type":"ai-title",    "aiTitle":"Stop and acknowledge","sessionId":…}
+
+    Measured across the 13 live sessions here: `customTitle` equals the local
+    name on 13 of 13, and `aiTitle` is a completely different sentence
+    ("Add status line featur…", "RVP ⑂ 프로젝트 계획 PPT를 만들어").
+
+    Reading these replaces `_looks_generated`, whose two rules were both
+    guesses about SHAPE and both produced false positives on this account:
+
+        _looks_generated('ai-inter-session')  -> True   (a name the user chose;
+            the regex asked for lowercase-hyphen-word-word and never checked
+            that the prefix is this machine's host slug)
+        _looks_generated('Email advice')      -> True   (the rule was "a space
+            means the server wrote a sentence", which assumes the user never
+            puts a space in a name)
+
+    The asymmetry is what makes that unacceptable rather than untidy: a false
+    positive OVERWRITES a title somebody typed, a false negative only leaves
+    one wrong. And the user's objection is unanswerable from shape alone — if
+    they rename a session to `host-a-myproject`, no regex can tell it
+    from the server's own slug.
+
+    Best effort by construction: a title we cannot find a record for is simply
+    not in the set, and the caller then leaves that bridge alone. Erring
+    towards "do not touch" is the whole point.
+    """
+    titles: set[str] = set()
+    try:
+        get_claude_config_home = require("paths").get_claude_config_home
+        projects = get_claude_config_home() / "projects"
+    except Exception:  # noqa: BLE001 — no host, nothing to read
+        return titles
+    try:
+        transcripts = list(projects.rglob("*.jsonl"))
+    except OSError:
+        return titles
+    for path in transcripts:
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if '"ai-title"' not in body:
+            continue
+        for line in body.splitlines():
+            if '"ai-title"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("type") == "ai-title":
+                t = (rec.get("aiTitle") or "").strip()
+                if t:
+                    titles.add(t)
+    return titles
 
 
 def _looks_generated(title: str) -> bool:
-    """A title nobody chose: the server's, not the user's.
+    """A SLUG the server minted for a nameless bridge.
 
-    Two shapes, both measured on this account. The slug the server mints for a
-    nameless bridge — `host-a-cozy-badger`, `host-b-pure-newell`
-    — and a sentence it wrote from the conversation, which is how
-    'Session interrupted by user' and 'Debug unresolved issue root cause' got
-    there. A session name is a handle: `cswap`, `RVP_fork`, `rewake`.
+    NARROWED TO THE ONE SHAPE THAT HAS NO RECORD. `ai-title` covers the
+    sentences Claude Code wrote from a conversation, and
+    `server_generated_titles` reads them — but the slug a bridge gets when it
+    has no name at all (`host-a-cozy-badger`) is minted SERVER-SIDE and
+    never lands in a transcript, so nothing local records it.
+
+    The two rules that used to live here are gone. The `" " in title` rule
+    claimed every title with a space was the server's, which overwrote
+    'Email advice'. And the regex had no anchor: it matched any
+    lowercase-hyphen-word-word string, including the user's own
+    `ai-inter-session`.
+
+    ANCHORED ON THIS MACHINE'S HOST SLUG, which is what the server actually
+    prefixes: `host-a-…`, `host-b-…`, `host-c-…`. Derived
+    at call time from the hostname rather than listed, so a new machine needs
+    no edit here — the failure mode of a hardcoded list is that it goes stale
+    the first time a host is renamed.
 
     A blank title counts: there is nothing to overwrite.
     """
     title = title.strip()
     if not title:
         return True
-    return bool(_GENERATED_TITLE.match(title)) or " " in title
+    host = _host_slug()
+    if not host:
+        return False
+    return bool(re.match(rf"^{re.escape(host)}(?:-[a-z0-9]+)+$", title))
+
+
+def _host_slug() -> str:
+    """This machine's name as the server slugifies it, or "" if unknowable.
+
+    `host-a`, `host-b`, `host-c` — measured from the
+    titles this account actually received. Lowercased, non-alphanumerics to
+    hyphens, which is what produced those three from the real hostnames.
+    """
+    try:
+        raw = socket.gethostname()
+    except OSError:
+        return ""
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    return slug.split(".")[0]
 
 
 def should_wait_for_pin(method: str, path: str) -> bool:
@@ -4042,6 +4143,9 @@ def titles_to_restore(
     rewriting titles that already match would put one PUT per live session on
     the wire every time any one of them opens a bridge.
     """
+    # READ ONCE, not per item. This walks every transcript on the machine, and
+    # the loop below runs over the whole listing on every RC connect.
+    generated = server_generated_titles()
     out: list[tuple[str, str]] = []
     for item in sessions:
         sid = item.get("id")
@@ -4056,7 +4160,17 @@ def titles_to_restore(
         # session on this machine opens a bridge — permanently, with no way to
         # make it stick. The local name is the fallback for a title the server
         # invented, never an override of the user's own words.
-        if not _looks_generated(current):
+        #
+        # TWO SOURCES, AND NEITHER IS A GUESS ABOUT SHAPE:
+        #   `generated` is what Claude Code RECORDED as its own — the
+        #   `ai-title` records it writes beside the `custom-title` ones. If a
+        #   title is in there, the server wrote it and restoring is right.
+        #   `_looks_generated` now covers only the host-anchored slug a
+        #   NAMELESS bridge gets, which is minted server-side and appears in
+        #   no local record.
+        # Anything else is a human's words — including a human's words that
+        # happen to look like a slug, which no regex can tell apart.
+        if current not in generated and not _looks_generated(current):
             continue
         out.append((sid, want.strip()))
     return out
