@@ -2512,6 +2512,21 @@ class TestWireGlobalConfig:
         assert rewire_if_version_changed(certdir) is False, (
             "a second call must be a no-op, or the hook writes on every launch")
 
+        # A DIFFERENT PORT IS `heal`'s JOB, NOT THIS ONE. Doing it here first
+        # left heal with nothing to correct and turned its True into a False,
+        # so the config was fixed and the message said nothing had been wrong.
+        led = _read_ledger(cfg, {})
+        led["writtenBy"] = "0.0.1"
+        _ledger_path(cfg).write_text(json.dumps(led))
+        (certdir / "proxy.json").write_text(
+            json.dumps({"port": 7777, "pid": 4242, "fingerprint": "abc"}))
+        assert rewire_if_version_changed(certdir) is False, (
+            "a wiring naming another port is a repair, and repairs are heal's")
+        assert json.loads(cfg.read_text())["env"]["CSWAP_PIN_PORT"] == "9955", (
+            "the block must be left for heal to correct")
+        (certdir / "proxy.json").write_text(
+            json.dumps({"port": 9955, "pid": 4242, "fingerprint": "abc"}))
+
         # NO DAEMON RECORD -> refuse. There is no port to point the block at,
         # and inventing one wires a session to nothing.
         led = _read_ledger(cfg, {})
@@ -9460,6 +9475,44 @@ class TestHealRestoresWithoutRestart:
                             lambda *a: called.append(a) or 1)
         assert pin_proxy.heal(root) is False
         assert not called
+
+    def case_heal_also_refreshes_a_wiring_written_by_an_older_version(
+        self, tmp_path, monkeypatch
+    ):
+        """THE CONFIG HALF OF "an upgrade must not wait for a launch".
+
+        `heal` already recycles a daemon left on old code, for exactly this
+        reason. The `.claude.json` block had no equivalent: a release that ADDS
+        an env key kept the old key set until a full session launch. Measured
+        on host-a — 0.1.86 -> 0.1.87 landed on all three machines, the
+        daemon recycled, and the new SSL_CERT_FILE never appeared. The deploy
+        looked finished and was not.
+
+        IT BELONGS HERE, not in the host. `cswap pin --ensure` already reaches
+        this function on every launch, so the bridge package needs no new line
+        to trigger it — the pin's behaviour stays in the pin.
+
+        The return value must NOT move: the caller reads True as "the daemon
+        was restarted" and renders "Restored the cloud pin". A refreshed
+        config is not that.
+        """
+        from cswap_pin import proxy as pin_proxy
+        root, _cfg = self._root(tmp_path, monkeypatch)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 45678)
+
+        seen = []
+        monkeypatch.setattr(pin_proxy, "rewire_if_version_changed",
+                            lambda cd: seen.append(cd) or True)
+        rc = pin_proxy.heal(root)
+        assert seen == [root / "pin-proxy"], (
+            "heal did not ask whether the wiring is still the current shape")
+        assert rc is True, "the refresh must not change what heal reports"
+
+        # AND IT MUST NOT TAKE A LAUNCH DOWN. This runs from an rc hook.
+        def boom(_cd):
+            raise RuntimeError("peer exploded")
+        monkeypatch.setattr(pin_proxy, "rewire_if_version_changed", boom)
+        assert pin_proxy.heal(root) is True
 
     def case_a_dead_daemon_is_respawned_and_rewired(self, tmp_path, monkeypatch):
         from cswap_pin import proxy as pin_proxy
