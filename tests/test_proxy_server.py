@@ -3968,7 +3968,8 @@ class TestDrainReportsWhatItCut:
             monkeypatch.setattr(pp, "_DRAINING_BEAT_SECONDS", 0.05)
             monkeypatch.setattr(
                 pp, "beat_draining",
-                lambda cd, pid=None: (beats.append(cd), real_beat(cd, pid))[1])
+                lambda cd, pid=None, owed=None: (
+                    beats.append(owed), real_beat(cd, pid, owed))[1])
 
             threading.Thread(target=_stream, daemon=True).start()
             t0 = time.monotonic()
@@ -3976,6 +3977,11 @@ class TestDrainReportsWhatItCut:
                 cut = proxy2.await_inflight(30.0)
             moving_wait = time.monotonic() - t0
 
+            assert sum(b is not None for b in beats) >= 2, (
+                "only the drain's opening beat published what it owes. The "
+                "count changes as replies land, so a loop beat that drops it "
+                "leaves the sweep reading a number from minutes ago — and a "
+                f"predecessor that has finished still looks expensive. beats={beats}")
             assert len(beats) >= 3, (
                 f"the drain beat {len(beats)} time(s) while it waited a second "
                 "on a moving reply. Without the beat the marker goes stale on "
@@ -4134,6 +4140,67 @@ class TestDrainReportsWhatItCut:
                 "that never finishes. Over the limit the sweep must take the "
                 "ones draining LONGEST, and only the excess. "
                 f"killed={killed}, oldest two are {pids[-2:]}")
+
+            # --- AND AGE IS THE TIEBREAK, NOT THE RULE. Measured on host-a
+            # 2026-08-18: a draining predecessor's connections carry a fixed
+            # 39-byte frame at ~1/s (GCD exact across 17 samples), so EVERY
+            # predecessor stays "moving" and age stops tracking doneness — it
+            # tracks how long a reply has been RUNNING. Reaping longest-first
+            # then takes the stream with the most work already sunk. Reap the
+            # one with the FEWEST replies to lose.
+            killed.clear()
+            owed = {pids[0]: 9, pids[1]: 0, pids[2]: 1}
+            for i, pid in enumerate(pids):
+                # Oldest FIRST this time, so age alone would pick pids[0..1]
+                # and only the owed counts can produce the expected answer.
+                pp.announce_draining(certdir, pid)
+                pp.beat_draining(certdir, pid, owed=owed.get(pid, 5))
+                path = pp.draining_marker_path(certdir, pid)
+                body = path.read_text().split("\n")
+                body[0] = str(time.time() - 1000 + i)
+                # ONE MARKER THAT DOES NOT SAY, and it is the OLDEST — written
+                # by a version that recorded no count, or caught between the
+                # announce and the first beat. Unknown must sort EXPENSIVE:
+                # this orders what to kill, and a file we cannot read is not
+                # permission to take the one that may be holding the most.
+                if pid == pids[3]:
+                    body = [str(time.time() - 2000)]
+                path.write_text("\n".join(body))
+
+            pp._sweep_orphan_daemons(certdir, keep_pid=999)
+
+            assert sorted(killed) == sorted([pids[1], pids[2]]), (
+                "the sweep reaped by age while every predecessor was equally "
+                "alive. The cheapest one to lose is the one owing the fewest "
+                f"replies. killed={killed}, owed={owed}")
+            assert pids[3] not in killed, (
+                "the sweep took the one marker that does not say what it "
+                "would cost, and it was the oldest — an unknown count sorted "
+                "as if it were cheap")
+
+            # --- AND THE DEAD ONES' MARKERS ARE COLLECTED. A drainer that is
+            # SIGKILLed cannot unlink its own, and every reap above produces
+            # one. `is_draining` already stops honouring it past the TTL, so
+            # this is litter rather than a safety hole — but it is litter in
+            # the one directory a human reads while debugging a handover, and
+            # the sweep already walks this exact set.
+            import os as _os
+            ghost = pp.draining_marker_path(certdir, 6001)
+            ghost.write_text(str(time.time() - 9999))
+            stale = time.time() - pp._DRAINING_MARKER_TTL - 1
+            _os.utime(ghost, (stale, stale))
+            live = pp.draining_marker_path(certdir, pids[0])
+            pp._pin_daemon_pids = lambda certdir: [pids[0]]
+
+            pp._sweep_orphan_daemons(certdir, keep_pid=999)
+
+            assert not ghost.exists(), (
+                "a marker whose writer is long gone survived the sweep. One "
+                "per hard-killed daemon accumulates forever in the directory "
+                "somebody opens to find out what a handover did")
+            assert live.exists(), (
+                "the sweep collected a marker that is still being beaten — "
+                "that is a live drainer losing its protection mid-reply")
         finally:
             pp._kill_daemon = real_kill
             pp._pin_daemon_pids = real_pids
@@ -4190,6 +4257,48 @@ class TestDrainReportsWhatItCut:
             "now TERM it mid-reply")
         long_drain()
         assert pp.is_draining(certdir, 4242) is False
+
+    def case_the_handover_announces_before_the_successor_can_exist(self, certdir):
+        """ANNOUNCING WHEN THE DRAIN STARTS IS ONE STEP TOO LATE.
+
+        `await_inflight` announces, and at the fd-handdown site it runs AFTER
+        `_spawn_daemon` returns. The successor publishes `proxy.json` the
+        instant it serves, so from that publish until the predecessor reaches
+        the drain, `read_daemon_state` names the successor as keep_pid while
+        the predecessor has written no marker. Any concurrent `ensure_proxy`
+        sweeps in that window and TERMs a daemon that is about to finish its
+        replies — the 08:21:19Z race through a door one frame higher.
+
+        Same shape at the ask-the-holder site: the holder spawns the successor
+        while we are still sleeping out `_ASK_SETTLE_SECONDS`.
+
+        READ OUT OF THE SOURCE because the property is an ORDERING, and the
+        window is a few hundred milliseconds wide on a machine that has to be
+        recycling and launching at the same moment to show it.
+        """
+        import inspect
+        import cswap_pin.proxy as pp
+
+        src = inspect.getsource(pp._watch_own_code)
+        ask = src.find("_REPLACE_ME_SIGNAL")
+        spawn = src.find("_spawn_daemon(")
+        assert -1 not in (ask, spawn) and ask < spawn, (
+            "the scan is broken: it assumes the ask-the-holder site precedes "
+            f"the fd-handdown site in this function. ask={ask} spawn={spawn}")
+
+        # ONE PER SITE, and the case must fail if EITHER is removed — a single
+        # "an announce exists somewhere above" check passes with the second
+        # site unprotected, because the first site's call is above both.
+        before_ask = src.rfind("announce_draining", 0, ask)
+        assert before_ask != -1, (
+            "nothing announces before the holder is asked to replace us. The "
+            "holder spawns the successor on that signal, and the successor's "
+            "publish is what makes this daemon sweepable")
+        between = src.rfind("announce_draining", ask, spawn)
+        assert between != -1, (
+            "nothing announces between the ask and `_spawn_daemon`, so the "
+            "fd-handdown site is protected only from inside `await_inflight` "
+            "— which runs after the spawn has already published a successor")
 
     def case_the_drain_is_what_announces_itself(self, certdir):
         """THE WIRING, and it is the third time tonight the guard was orphaned.

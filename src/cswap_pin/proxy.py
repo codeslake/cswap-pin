@@ -4611,6 +4611,15 @@ def _kill_daemon(pid: int) -> None:
     Two independently-chosen timeouts that must be ordered is a bug that comes
     back every time either is tuned, so the ordering is computed. The slack
     covers teardown that is not draining (closing conns, unlinking state).
+
+    AND IT IS THE SIGNAL ARM IT IS DERIVED FROM, which is the only one a TERM
+    can reach: `teardown_drain_budget` gives a signal `_DRAIN_SECONDS` while a
+    handover gets `_HANDOVER_DRAIN_SECONDS`, now infinite. So a daemon already
+    inside an uncapped drain, TERMed by `_sweep_orphan_daemons`' excess reap,
+    gets thirty seconds on the signal arm and is then KILLed with replies still
+    moving. That is the intended outcome and not an oversight — the sweep only
+    reaches that branch after deciding this predecessor is the cheapest one to
+    lose, and a reap that could be outwaited forever is not a reap.
     """
     import time
 
@@ -4775,7 +4784,8 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
     """Kill every pin_proxy daemon for ``certdir`` except ``keep_pid`` — orphans
     that fell out of proxy.json (a redeploy/recycle replaced them but they
     didn't die) hold ports and never idle-teardown. Best-effort; never raises."""
-    draining: list[tuple[float, int]] = []
+    _collect_dead_markers(certdir)
+    draining: list[tuple[int, float, int]] = []
     for pid in _pin_daemon_pids(certdir):
         if pid == keep_pid or pid == os.getpid():
             continue
@@ -4785,7 +4795,8 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
         # sweep exists for. Killing it is how a handover that cut nothing
         # became a TERM one second later that cut 13 mid-response replies.
         if is_draining(certdir, pid):
-            draining.append((draining_since(certdir, pid), pid))
+            draining.append(
+                (draining_owed(certdir, pid), draining_since(certdir, pid), pid))
             continue
         _kill_daemon(pid)
 
@@ -4795,17 +4806,55 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
     # correct, and a per-process clock scored it identically to a drain that
     # will never end. The count tells them apart; the clock was cutting the
     # first to catch the second.
+    #
+    # CHEAPEST FIRST, AND AGE IS ONLY THE TIEBREAK. The first version reaped
+    # the longest-running, on the reasoning that old means probably finished.
+    # Measured on host-a 2026-08-18 and it does not: a draining predecessor's
+    # connections carry a fixed 39-byte frame at ~1/s (GCD exact across 17
+    # samples, burstiness 1.57 — a keepalive, not a token stream), so every
+    # predecessor stays "moving" and age tracks how long a reply has been
+    # RUNNING rather than how close it is to done. Longest-first therefore
+    # took the stream with the most work already sunk and the worst retry
+    # odds. The count of replies owed is what a reap actually COSTS, so that
+    # is what orders it.
     excess = len(draining) - _MAX_DRAINING_PREDECESSORS
     if excess > 0:
-        draining.sort()  # longest-running drain first
-        for _since, pid in draining[:excess]:
+        draining.sort()  # fewest replies to lose first, then oldest
+        for owed, since, pid in draining[:excess]:
             _log_lifecycle(
                 f"{len(draining)} draining predecessors, over the "
                 f"{_MAX_DRAINING_PREDECESSORS} this fleet can produce — "
-                f"taking pid={pid}, draining {time.time() - _since:.0f}s. "
-                "A drain that never ends is the leak the removed wall clock "
-                "used to bound; this line is the signal it happened")
+                f"taking pid={pid}, draining {time.time() - since:.0f}s and "
+                f"owing {'?' if owed == _OWED_UNKNOWN else owed} repl"
+                f"{'y' if owed == 1 else 'ies'}. A drain that never ends is "
+                "the leak the removed wall clock used to bound; this line is "
+                "the signal it happened")
             _kill_daemon(pid)
+
+
+def _collect_dead_markers(certdir: Path) -> None:
+    """Remove `.draining-<pid>` markers nothing has beaten since the TTL.
+
+    A DRAINER THAT IS SIGKILLED CANNOT UNLINK ITS OWN, and every reap above
+    produces one, as does an OOM kill or a crash. `is_draining` already stops
+    honouring a silent marker, so this is litter rather than a safety hole —
+    but it is litter in the one directory somebody opens to find out what a
+    handover did, and this sweep already walks it.
+
+    Best-effort and silent: failing to tidy must never stop the sweep from
+    doing the job it exists for.
+    """
+    cutoff = time.time() - _DRAINING_MARKER_TTL
+    try:
+        markers = list(Path(certdir).glob(f"{_DRAINING_PREFIX}*"))
+    except OSError:
+        return
+    for path in markers:
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
 
 
 def _install_signal_teardown(cleanup) -> None:
@@ -4915,7 +4964,7 @@ def _settings_port(certdir: Path) -> object:
 
 def draining_marker_path(certdir: Path, pid: int) -> Path:
     """Where a daemon announces that it is finishing replies and will exit."""
-    return Path(certdir) / f".draining-{pid}"
+    return Path(certdir) / f"{_DRAINING_PREFIX}{pid}"
 
 
 def announce_draining(certdir: Path, pid: int | None = None):
@@ -4991,7 +5040,8 @@ def announce_draining(certdir: Path, pid: int | None = None):
     return _done
 
 
-def beat_draining(certdir: Path, pid: int | None = None) -> None:
+def beat_draining(certdir: Path, pid: int | None = None,
+                  owed: int | None = None) -> None:
     """Say the drain is still alive, so its marker does not go stale under it.
 
     A HANDOVER DRAIN HAS NO CEILING ANY MORE, so the marker cannot expire on
@@ -5007,8 +5057,17 @@ def beat_draining(certdir: Path, pid: int | None = None) -> None:
     """
     path = draining_marker_path(certdir, os.getpid() if pid is None else pid)
     try:
-        os.utime(path)
-    except OSError:
+        if owed is None:
+            os.utime(path)
+            return
+        # AND WHAT IT WOULD COST TO REAP US. The sweep runs in ANOTHER
+        # process, so it cannot read this daemon's `_owed` — the only channel
+        # is this file. See `_sweep_orphan_daemons`: over the limit it takes
+        # the predecessor with the fewest replies to lose, which it can only
+        # do if each one says how many it has.
+        start = path.read_text().split("\n")[0].strip()
+        path.write_text(f"{start}\n{int(owed)}")
+    except (OSError, ValueError):
         pass
 
 
@@ -5025,9 +5084,28 @@ def draining_since(certdir: Path, pid: int) -> float:
     that the process behind it is wedged.
     """
     try:
-        return float(draining_marker_path(certdir, pid).read_text().strip())
+        head = draining_marker_path(certdir, pid).read_text().split("\n")[0]
+        return float(head.strip())
     except (OSError, ValueError):
         return time.time()
+
+
+def draining_owed(certdir: Path, pid: int) -> int:
+    """How many replies ``pid`` would lose if it were reaped right now.
+
+    THE SWEEP CANNOT READ ANOTHER PROCESS'S `_owed`, so a drainer writes it
+    into its own marker on every beat and this reads it back. Second line of
+    the file; absent on a marker written by a version that did not record it.
+
+    An unknown count answers "expensive", because the sweep uses this to pick
+    what to KILL and a file we cannot parse is not permission to take the one
+    that might be holding the most work.
+    """
+    try:
+        body = draining_marker_path(certdir, pid).read_text().split("\n")
+        return int(body[1].strip())
+    except (OSError, ValueError, IndexError):
+        return _OWED_UNKNOWN
 
 
 def is_draining(certdir: Path, pid: int) -> bool:
@@ -5292,7 +5370,24 @@ _DRAINING_BEAT_SECONDS = 15.0
 # recycle produces one predecessor, so eight is more back-to-back deploys than
 # this fleet has ever done inside one drain — and being wrong high costs idle
 # RAM while being wrong low costs a reply.
+# AND IT IS A DEPLOY-RATE LIMIT, NOT A MEMORY KNOB — say so here or the next
+# reader tunes it as one. With a keepalive holding every drain open, the number
+# of live predecessors grows with how often the code is REDEPLOYED inside one
+# long client session, not with traffic. Measured 2026-08-18: two handovers 94s
+# apart, the one owing nothing drained clean in 33.9s and the one holding 24
+# connections was still alive twenty minutes later. Eight is "more back-to-back
+# deploys than this fleet has ever done inside one drain".
 _MAX_DRAINING_PREDECESSORS = 8
+
+# The marker's name, in one place: `_collect_dead_markers` globs for what
+# `draining_marker_path` writes, and a literal in both is a sweep that silently
+# stops matching the day the name changes.
+_DRAINING_PREFIX = ".draining-"
+
+# "This marker does not say what it would cost to reap me." Sorts after every
+# known count, because this orders what to KILL and an unparseable file is not
+# permission to take the one that may be holding the most work.
+_OWED_UNKNOWN = 1 << 30
 
 # TWO TEARDOWNS CAN RUN AT ONCE IN ONE PROCESS, and the first version of this
 # marker did not survive that. Measured on host-a 2026-08-18, same pid, SAME
@@ -7536,6 +7631,17 @@ def _watch_own_code(
                 # drain. The successor is already on the socket before we stop,
                 # so the drain overlaps a serving process instead of replacing
                 # one — which is also why it gets the FULL budget here.
+                # ANNOUNCED BEFORE THE ASK, NOT WHEN THE DRAIN STARTS. The
+                # holder spawns our successor as soon as it takes this signal,
+                # and the successor publishes `proxy.json` the instant it
+                # serves — so from that publish until we reach
+                # `await_inflight` a concurrent `ensure_proxy` sees us as "a
+                # daemon that is not keep_pid" with no marker written. That is
+                # the 08:21:19Z race one frame higher, and it is not narrow:
+                # `_ASK_SETTLE_SECONDS` sits inside the window on purpose.
+                # Never released here — every path out of this branch is
+                # `os._exit`, and `_collect_dead_markers` takes what is left.
+                announce_draining(certdir)
                 holder = _holder_pid()
                 if holder:
                     try:
@@ -7633,6 +7739,11 @@ def _watch_own_code(
                 # share.
                 handed_fd = server.release_listener(hand_down=True)
                 stopped = True
+                # SAME WINDOW, SAME REASON. `_spawn_daemon` blocks up to
+                # `_SPAWN_WAIT_S` waiting for the successor to publish, and the
+                # publish is what makes us sweepable. Announcing inside
+                # `await_inflight` — one line below — is one step too late.
+                done_draining = announce_draining(certdir)
                 spawned = _spawn_daemon(
                     account_num, email, certdir, listen_fd=handed_fd
                 )
@@ -7651,6 +7762,12 @@ def _watch_own_code(
                     # it over.
                     handed_over = True
                     return
+                # AND WE ARE NOT LEAVING AFTER ALL. The spawn failed, this
+                # daemon keeps serving, and a marker saying "draining" on a
+                # process that is back to accepting would spare a genuine
+                # orphan for the whole TTL. Released only on this path: every
+                # other way out of this block ends in `os._exit`.
+                done_draining()
                 _log_lifecycle("successor did not come up")
             # TRY AGAIN, BOUNDED. Returning here left the thread dead with the
             # code on disk still new, so the daemon served the stale code
@@ -9093,6 +9210,12 @@ class PinProxy:
         # predecessor that is patiently finishing its replies, one second after
         # the successor starts serving.
         done_draining = announce_draining(self._certdir)
+        # PUBLISHED IMMEDIATELY, not at the first beat fifteen seconds in. The
+        # sweep reads this to decide which predecessor is cheapest to reap, and
+        # a recycle storm can arrive inside those fifteen seconds — a marker
+        # that has not said its count yet reads as `_OWED_UNKNOWN`, which is
+        # the most expensive thing to be.
+        beat_draining(self._certdir, owed=self.inflight_requests())
         beat_at = started
         try:
             if budget > 0:
@@ -9109,7 +9232,8 @@ class PinProxy:
                     # 08:21:19Z line with the clock moved rather than removed.
                     now = time.monotonic()
                     if now - beat_at >= _DRAINING_BEAT_SECONDS:
-                        beat_draining(self._certdir)
+                        beat_draining(
+                            self._certdir, owed=self.inflight_requests())
                         beat_at = now
                     time.sleep(0.05)
         finally:
