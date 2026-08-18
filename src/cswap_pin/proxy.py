@@ -4742,8 +4742,9 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
         # sweep exists for. Killing it is how a handover that cut nothing
         # became a TERM one second later that cut 13 mid-response replies.
         if is_draining(certdir, pid):
-            draining.append(
-                (draining_owed(certdir, pid), draining_since(certdir, pid), pid))
+            draining.append((draining_live(certdir, pid),
+                             draining_owed(certdir, pid),
+                             draining_since(certdir, pid), pid))
             continue
         _kill_daemon(pid)
 
@@ -4764,16 +4765,25 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
     # took the stream with the most work already sunk and the worst retry
     # odds. The count of replies owed is what a reap actually COSTS, so that
     # is what orders it.
+    # AND 'CHEAPEST' MEANS LIVE ANSWERS, NOT DEBTS. Sorting on replies owed
+    # weighed twelve replies that stopped half an hour ago exactly as heavily
+    # as twelve still being written — measured on host-a 2026-08-18, where a
+    # daemon logged `12 mid-response` over twelve connections carrying nothing
+    # but keepalives. At the limit that made the reaper prefer to kill the
+    # predecessor still doing real work. `live_replies` counts answers rather
+    # than debts, by SSE event name rather than by any threshold.
     excess = len(draining) - _MAX_DRAINING_PREDECESSORS
     if excess > 0:
-        draining.sort()  # fewest replies to lose first, then oldest
-        for owed, since, pid in draining[:excess]:
+        draining.sort()  # fewest LIVE replies, then fewest owed, then oldest
+        for live, owed, since, pid in draining[:excess]:
             _log_lifecycle(
                 f"{len(draining)} draining predecessors, over the "
                 f"{_MAX_DRAINING_PREDECESSORS} this fleet can produce — "
-                f"taking pid={pid}, draining {time.time() - since:.0f}s and "
+                f"taking pid={pid}, draining {time.time() - since:.0f}s, "
                 f"owing {'?' if owed == _OWED_UNKNOWN else owed} repl"
-                f"{'y' if owed == 1 else 'ies'}. A drain that never ends is "
+                f"{'y' if owed == 1 else 'ies'} of which "
+                f"{'?' if live == _OWED_UNKNOWN else live} still being "
+                f"written. A drain that never ends is "
                 "the leak the removed wall clock used to bound; this line is "
                 "the signal it happened")
             _kill_daemon(pid)
@@ -4988,7 +4998,7 @@ def announce_draining(certdir: Path, pid: int | None = None):
 
 
 def beat_draining(certdir: Path, pid: int | None = None,
-                  owed: int | None = None) -> None:
+                  owed: int | None = None, live: int | None = None) -> None:
     """Say the drain is still alive, so its marker does not go stale under it.
 
     A HANDOVER DRAIN HAS NO CEILING ANY MORE, so the marker cannot expire on
@@ -5013,7 +5023,11 @@ def beat_draining(certdir: Path, pid: int | None = None,
         # the predecessor with the fewest replies to lose, which it can only
         # do if each one says how many it has.
         start = path.read_text().split("\n")[0].strip()
-        path.write_text(f"{start}\n{int(owed)}")
+        # THIRD LINE IS WHAT A REAP WOULD COST IN LIVE ANSWERS, second is what
+        # it would cost in debts. They differ exactly when a predecessor holds
+        # replies that stopped: twelve owed, zero live.
+        live_n = int(owed) if live is None else int(live)
+        path.write_text(f"{start}\n{int(owed)}\n{live_n}")
     except (OSError, ValueError):
         pass
 
@@ -5035,6 +5049,20 @@ def draining_since(certdir: Path, pid: int) -> float:
         return float(head.strip())
     except (OSError, ValueError):
         return time.time()
+
+
+def draining_live(certdir: Path, pid: int) -> int:
+    """How many of ``pid``'s owed replies are still being WRITTEN.
+
+    Third line of the marker. Absent — a marker from a version that did not
+    record it — answers `_OWED_UNKNOWN`, the same expensive default
+    `draining_owed` uses, because this decides what to kill.
+    """
+    try:
+        body = draining_marker_path(certdir, pid).read_text().split("\n")
+        return int(body[2].strip())
+    except (OSError, ValueError, IndexError):
+        return _OWED_UNKNOWN
 
 
 def draining_owed(certdir: Path, pid: int) -> int:
@@ -8867,6 +8895,11 @@ class PinProxy:
         # Kept beside `_owed` rather than inside its value so the drain's hot
         # predicate keeps comparing a bare float. Cleared with the debt.
         self._delivered: dict = {}
+        # HOW MANY WRITES CARRIED AN ANSWER rather than a keepalive. This is
+        # what separates a reply still being written from one that stopped and
+        # is only being kept warm — see `_is_only_keepalive`. Cleared with the
+        # debt, like `_delivered`.
+        self._content: dict = {}
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -9178,7 +9211,27 @@ class PinProxy:
         # a recycle storm can arrive inside those fifteen seconds — a marker
         # that has not said its count yet reads as `_OWED_UNKNOWN`, which is
         # the most expensive thing to be.
-        beat_draining(self._certdir, owed=self.inflight_requests())
+        # SNAPSHOT FIRST. `live_replies` compares against this, because content
+        # delivered BEFORE the drain started says nothing about whether this
+        # reply is still being written.
+        #
+        # AND THE DRAIN DOES NOT STOP WAITING ON A CONTENT-FREE REPLY, which
+        # was asked for and refused. "No content since the drain began" is a
+        # true statement about a reply whose model is THINKING: extended
+        # thinking emits keepalives and no content for as long as it takes, so
+        # a drain that stopped waiting on that would cut exactly the long reply
+        # this whole ceiling was removed to protect. The content count decides
+        # which predecessor is cheapest to REAP — a choice that is being made
+        # anyway, where being wrong costs one of several — and not whether to
+        # keep waiting, where being wrong costs a live answer.
+        #
+        # It becomes decidable the day somebody measures the longest
+        # content-free interval a live reply produces. The cut line records the
+        # inputs for that now; nothing here guesses it.
+        with self._live_lock:
+            content_at_start = dict(self._content)
+        beat_draining(self._certdir, owed=self.inflight_requests(),
+                      live=self.live_replies(content_at_start))
         beat_at = started
         try:
             if budget > 0:
@@ -9196,7 +9249,8 @@ class PinProxy:
                     now = time.monotonic()
                     if now - beat_at >= _DRAINING_BEAT_SECONDS:
                         beat_draining(
-                            self._certdir, owed=self.inflight_requests())
+                            self._certdir, owed=self.inflight_requests(),
+                            live=self.live_replies(content_at_start))
                         beat_at = now
                     time.sleep(0.05)
         finally:
@@ -9534,6 +9588,7 @@ class PinProxy:
                 self._open_conns.discard(conn)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
+                self._content.pop(conn, None)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
@@ -9581,6 +9636,32 @@ class PinProxy:
             if now - (stamp or since) < _DRAIN_STALL_SECONDS:
                 return True
         return False
+
+    def live_replies(self, content_at_start: dict) -> int:
+        """Owed connections that have delivered CONTENT since the drain began.
+
+        NOT 'since the debt began'. Measured on host-a 2026-08-18, the twelve
+        that mattered had delivered real content in the FIRST 20 SECONDS of
+        their drain and nothing but keepalives for the thirty minutes after —
+        so a counter that starts at the request would call every one of them
+        live. The comparison has to be against a snapshot taken when the drain
+        started, which is what this takes.
+
+        WHAT IT IS FOR: `_sweep_orphan_daemons` picks the cheapest predecessor
+        to reap, and it was picking by replies OWED — where twelve corpses
+        outweigh two live replies, so at the limit it preferred to kill the
+        process still doing real work. This is the same question asked about
+        answers instead of about debts.
+
+        NOT USED TO CUT ANYTHING. The drain still waits on movement; see the
+        comment in `await_inflight` for why "no content since the drain began"
+        is not a safe reason to stop waiting.
+        """
+        with self._live_lock:
+            return sum(
+                1 for conn in self._owed
+                if self._content.get(conn, 0) > content_at_start.get(conn, 0)
+            )
 
     def _delivered_summary(self) -> str:
         """How many bytes each still-owed reply has actually delivered.
@@ -9657,7 +9738,8 @@ class PinProxy:
         with self._live_lock:
             return len(self._owed)
 
-    def _note_response_started(self, conn, written: int = 0) -> None:
+    def _note_response_started(self, conn, written: int = 0,
+                               content: bool = True) -> None:
         """The first response byte for this connection has gone to the client.
 
         THE DIFFERENCE BETWEEN AN INCONVENIENCE AND A LOSS. A request cut
@@ -9692,6 +9774,8 @@ class PinProxy:
             if conn in self._owed:
                 self._owed[conn] = time.monotonic()
                 self._delivered[conn] = self._delivered.get(conn, 0) + written
+                if content:
+                    self._content[conn] = self._content.get(conn, 0) + 1
 
     def _owe_answer(self, conn, owed: bool) -> None:
         """Mark a connection as owing an answer, or as having paid it.
@@ -9724,6 +9808,7 @@ class PinProxy:
                 # is waiting for its next request starts the next one at zero,
                 # or a keep-alive would look busier the longer it lives.
                 self._delivered.pop(conn, None)
+                self._content.pop(conn, None)
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
@@ -10693,7 +10778,8 @@ class PinProxy:
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
                 # client has received nothing and the SDK retries; after it,
                 # part of an answer is already delivered.
-                on_headers=(lambda n: self._note_response_started(_conn, n))
+                on_headers=(
+                    lambda n, c: self._note_response_started(_conn, n, c))
                 if _conn is not None else None,
                 # A HEAD response carries the headers of the GET it mirrors,
                 # Content-Length included, but no body — only the request
@@ -11454,6 +11540,38 @@ class _Prefixed:
         return getattr(self._sock, name)
 
 
+# The SSE events that are KEEPALIVE rather than answer. Named, not sized: a
+# keepalive is a keepalive because the protocol calls it one, and no threshold,
+# rate or frame width has to be guessed. Measured on host-a 2026-08-18 — twelve
+# connections delivered nothing but a fixed 39-byte frame for thirty minutes
+# while reporting `mid-response`, because a keepalive is bytes and bytes read as
+# movement.
+#
+# FAILS SAFE BY CONSTRUCTION: the test is "is EVERY event in this chunk a
+# keepalive", so an event name we do not know counts as CONTENT and the drain
+# keeps waiting. A protocol change makes this conservative, never lethal. The
+# opposite phrasing — "does this chunk contain a known content event" — would
+# cut a live reply the day Anthropic adds an event type.
+_SSE_KEEPALIVE_EVENTS = (b"ping",)
+
+
+def _is_only_keepalive(data: bytes) -> bool:
+    """Does this chunk carry SSE events and nothing but keepalives?
+
+    False for anything else at all, including a chunk with no `event:` line —
+    a plain JSON body, a chunk split mid-line, the tail of a data payload.
+    Only a chunk that is unambiguously all-keepalive answers True.
+    """
+    seen = False
+    for line in data.split(b"\n"):
+        if not line.startswith(b"event:"):
+            continue
+        seen = True
+        if line[6:].strip() not in _SSE_KEEPALIVE_EVENTS:
+            return False
+    return seen
+
+
 class _StampingWriter:
     """A client socket that reports every write, and is otherwise itself.
 
@@ -11469,6 +11587,18 @@ class _StampingWriter:
         self._sock = sock
         self._note = note
 
+    def send_head(self, data):
+        """The response head: movement, never content.
+
+        THE HEAD GOES THROUGH THIS WRITER TOO, and classifying it as content
+        would make every response look like it had delivered an answer from
+        its first byte — a rule that ships, looks like a fix, and never fires.
+        It still stamps, because a head reaching the client IS the connection
+        moving.
+        """
+        self._note(len(data), False)
+        return self._sock.sendall(data)
+
     def sendall(self, data):
         # NOTE FIRST, SEND SECOND. A stamp after a blocking `sendall` records
         # when the write COMPLETED, and a slow client is exactly the case where
@@ -11482,7 +11612,7 @@ class _StampingWriter:
         # one of them had delivered nothing but a fixed 39-byte frame for
         # thirty minutes. This count is what makes that distinction possible;
         # nothing decides on it yet.
-        self._note(len(data))
+        self._note(len(data), not _is_only_keepalive(data))
         return self._sock.sendall(data)
 
     def __getattr__(self, name):
@@ -11529,7 +11659,8 @@ def _relay_response(
     def _send_head(payload: bytes) -> None:
         """Write the response head. Kept because the branches read better with
         a name on this, not because it is where the stamping happens."""
-        client.sendall(payload)
+        send = getattr(client, "send_head", None)
+        (send or client.sendall)(payload)
 
     buf = bytearray()
     while b"\r\n\r\n" not in buf:
