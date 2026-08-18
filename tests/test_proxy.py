@@ -2322,47 +2322,42 @@ class TestWireEnv:
             lambda: _ssl.DefaultVerifyPaths(str(ambient), None, "",
                                             str(ambient), "", ""))
 
-        # SUBSUMES -> exported, and it is the merged bundle itself.
-        good = tmp_path / "ca-bundle.pem"
-        _write(good, [ours, root_a, root_b])
-        env = wire_env({"NODE_EXTRA_CA_CERTS": str(good)}, 9955, ca)
-        assert env.get("SSL_CERT_FILE") == str(good), env.get("SSL_CERT_FILE")
-
-        # BIGGER BUT NOT A SUPERSET -> refused. This is host-b.
-        extra, _ = _make_ca()
-        big = tmp_path / "ca-bundle.pem"
-        _write(big, [ours, root_a, extra])          # root_b missing
-        env = wire_env({"NODE_EXTRA_CA_CERTS": str(big)}, 9955, ca)
-        assert "SSL_CERT_FILE" not in env, (
-            "a bundle missing one ambient root still blinds the client to it")
-
-        # SUBSUMES BUT WITHOUT OUR CA -> refused. Every other host verifies
-        # and the ONE hop this session is routed through does not, which is
-        # the only hop the export exists for; subsumption alone cannot catch
-        # it, because such a bundle is a perfectly good superset.
+        # THE CONTRACT IS NOW UNCONDITIONAL, and that is the point of the
+        # change: there is no input for which the variable is written, so
+        # there is no gate to audit, no proof to go stale, and no
+        # default-ALLOW arm to grow.
         #
-        # ASSERTED ON `_python_trust_file` DIRECTLY, not through wire_env,
-        # because wire_env cannot produce this input: `_trust_file` merges our
-        # CA in before we ever see the bundle. It IS reachable in production
-        # through the other door -- the shared `ca-trust.pem` is built by an
-        # EXTERNAL builder from `ca-trust.d`, and a builder that drops our pem
-        # hands us exactly this file. The peer maintaining that builder
-        # shipped and removed a bug in the same area tonight.
-        from cswap_pin.proxy import _python_trust_file
-        foreign = tmp_path / "someone-elses-bundle.pem"
-        _write(foreign, [root_a, root_b])
-        assert _python_trust_file(ca, foreign) is None, (
-            "a bundle that cannot verify our own proxy must not be exported")
+        # The rows below were the gate's cases. Each one is still driven, and
+        # each now expects the SAME answer — nothing written — including the
+        # one the gate used to allow. The measurements stay because they are
+        # what makes the ban legible:
+        #
+        #     host-a     ambient 124  bundle 126  gate said YES
+        #     host-b      ambient 128  bundle 167  gate said NO (27 missing)
+        #     host-c  ambient 128  bundle   2  gate said NO (128 missing)
+        #
+        # host-b is the row a COUNT cannot see: bigger than the store it
+        # would replace, and still not a superset.
+        good = tmp_path / "ca-bundle.pem"
+        _write(good, [ours, root_a, root_b])          # the gate's YES case
+        extra, _ = _make_ca()
+        big = tmp_path / "big-bundle.pem"
+        _write(big, [ours, root_a, extra])            # bigger, not a superset
+        lone = ca                                     # our CA alone
 
-        # OUR CA ALONE -> refused. The lone-CA bug, in our direction.
-        env = wire_env({"NODE_EXTRA_CA_CERTS": str(ca)}, 9955, ca)
-        assert "SSL_CERT_FILE" not in env
+        for label, bundle in (("subsumes (the gate's only YES)", good),
+                              ("bigger but not a superset", big),
+                              ("our CA alone", lone)):
+            env = wire_env({"NODE_EXTRA_CA_CERTS": str(bundle)}, 9955, ca)
+            assert "SSL_CERT_FILE" not in env, (
+                f"{label}: a replace-class CA variable was written")
+            assert "NODE_EXTRA_CA_CERTS" in env, (
+                f"{label}: node's ADDITIVE variable must survive the ban")
 
-        # cafile None BUT capath HAS A FILE -> still exported. This is
-        # host-a, the only machine where the fix is needed: its uv tool
-        # env reports cafile=None and openssl_cafile missing, so a gate that
-        # reads `.cafile` alone gives up there and the whole change ships as a
-        # no-op on the one box with the failures.
+        # AND WITH cafile=None, which is host-a's normal state — the
+        # machine the gate was built for, and the one where it passed for the
+        # wrong reason: a capath with no cafile is "nothing to compare", not
+        # "proven superset".
         capath = tmp_path / "certs"
         capath.mkdir()
         _write(capath / "ca-certificates.crt", [root_a, root_b])
@@ -2371,21 +2366,9 @@ class TestWireEnv:
             lambda: _ssl.DefaultVerifyPaths(None, str(capath), "",
                                             str(tmp_path / "absent.pem"),
                                             "", str(capath)))
-        _write(good, [ours, root_a, root_b])
         env = wire_env({"NODE_EXTRA_CA_CERTS": str(good)}, 9955, ca)
-        assert env.get("SSL_CERT_FILE") == str(good), (
-            "cafile=None is host-a's normal state, not 'unknowable'")
-
-        # NOTHING NAMEABLE -> refused rather than guessed.
-        monkeypatch.setattr(
-            _ssl, "get_default_verify_paths",
-            lambda: _ssl.DefaultVerifyPaths(None, None, "", "", "", ""))
-        _write(good, [ours, root_a, root_b])
-        env = wire_env({"NODE_EXTRA_CA_CERTS": str(good)}, 9955, ca)
-        assert "SSL_CERT_FILE" not in env
-
-        # The node path is untouched throughout -- it ADDS, so it never had
-        # this hazard.
+        assert "SSL_CERT_FILE" not in env, (
+            "cafile=None was the gate's silent-pass arm; nothing is written now")
         assert "NODE_EXTRA_CA_CERTS" in env
 
     def case_rewrites_an_all_proxy_but_never_invents_one(self, tmp_path):
@@ -2536,16 +2519,35 @@ class TestWireGlobalConfig:
 
         assert wire_global_config(9955, ca) is True
         env = json.loads(cfg.read_text())["env"]
-        assert "SSL_CERT_FILE" in env, (
-            "python children of a pinned session trust nothing on the pin")
-        assert env["SSL_CERT_FILE"] == env["NODE_EXTRA_CA_CERTS"], (
-            "one merged bundle, so the peer writing the same variable writes "
-            "the same value and order stops mattering")
+        # NEVER WRITTEN, ON ANY MACHINE. This case used to assert the
+        # opposite, behind a subsumption gate. The gate compared certificate
+        # SETS and was correct; the SHAPE was wrong, and two independent
+        # implementations proved it by growing the same default-ALLOW arm —
+        # this one passed on host-a partly because the ambient store is
+        # a capath with no cafile ("nothing to compare"), the sibling returned
+        # ok when the store was unreadable. A proof also goes stale: MDM can
+        # replace the store the proof was taken against, and the variable
+        # stays behind naming a bundle that subsumes nothing.
+        #
+        # Python is served by `oauth._pin_aware_ssl_context()`, which ADDS to
+        # a default context and cannot narrow trust anywhere.
+        assert "SSL_CERT_FILE" not in env, (
+            "a replace-class CA variable must never be written — python uses "
+            "an additive context instead")
+        assert "NODE_EXTRA_CA_CERTS" in env, (
+            "node still needs its ADDITIVE variable; only the replace-class "
+            "ones are banned")
 
-        # UNWIRING MUST TAKE IT BACK. The ledger records the keys we set; one
-        # left behind points a shell at a bundle nobody maintains.
+        # AND A MACHINE THAT ALREADY CARRIES ONE MUST HEAL ITSELF, whoever
+        # wrote it — an older cswap-pin, or a peer with the same behaviour.
+        # Without this, host-a keeps the key forever and only a hand edit
+        # removes it.
+        cfg.write_text(json.dumps({
+            "env": dict(env, SSL_CERT_FILE="/tmp/some-old-bundle.pem")}))
         assert wire_global_config(None, None) is True
-        assert "SSL_CERT_FILE" not in json.loads(cfg.read_text()).get("env", {})
+        healed = json.loads(cfg.read_text()).get("env", {})
+        assert "SSL_CERT_FILE" not in healed, (
+            f"unwire left a banned key behind: {healed}")
 
     def case_an_upgraded_pin_rewires_once_and_only_once(self, tmp_path,
                                                         monkeypatch):

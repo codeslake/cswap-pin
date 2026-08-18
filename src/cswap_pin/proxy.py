@@ -246,6 +246,14 @@ def read_upstream_ca(certdir: Path) -> str | None:
 _WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
 _WIRE_MARK = "_cswapPinWiredKeys"
 
+# Environment variables that REPLACE a TLS trust store rather than adding to
+# it. The pin writes none of them and removes any it finds — see the note in
+# `wire_global_config` for why a subsumption gate was not enough.
+#
+# NODE_EXTRA_CA_CERTS is deliberately absent: node ADDS it to its built-in
+# roots, so it can never narrow trust, and the pin does need it.
+_REPLACE_CLASS_CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
 # -- where the receipt lives -------------------------------------------------
 #
 # The `env` block stays in `.claude.json` — Claude Code reads it there at boot,
@@ -2165,6 +2173,20 @@ def _wire_global_config_locked(
     saved = dict(saved) if isinstance(saved, dict) else {}
     for key in ours:
         env.pop(key, None)
+    # HEAL A MACHINE THAT ALREADY CARRIES A BANNED KEY, whoever wrote it.
+    # `ours` only covers what THIS install recorded, so a config written by an
+    # older cswap-pin — or by a peer with the same behaviour — keeps its
+    # SSL_CERT_FILE forever and no amount of re-wiring removes it. Every one of
+    # these REPLACES a trust store rather than adding to it, so leaving one
+    # behind leaves a machine one MDM change away from trusting nothing.
+    #
+    # Unconditional, and deliberately not restored from `saved` below: if the
+    # user had set one themselves we would rather hand it back to them
+    # explicitly than resurrect it here, and no machine of ours ever had one
+    # that we did not write.
+    for banned in _REPLACE_CLASS_CA_VARS:
+        env.pop(banned, None)
+        saved.pop(banned, None)
     for key, value in saved.items():
         env[key] = value
 
@@ -2184,13 +2206,6 @@ def _wire_global_config_locked(
         # and proxy: without SSL_CERT_FILE, CERTIFICATE_VERIFY_FAILED; with
         # it, HTTP 429 (i.e. the handshake completed and the server answered).
         #
-        # A SEPARATE FILE from the node one, deliberately -- see
-        # `_python_trust_file`. SSL_CERT_FILE REPLACES OpenSSL's store where
-        # NODE_EXTRA_CA_CERTS only adds to node's, and the node bundle carries
-        # the system roots on some machines and not others (128 / 169 / 3
-        # certs across our three). None means "could not build it safely", and
-        # then the key is simply not written.
-        py_ca = _python_trust_file(ca_path, node_ca)
         wanted = {
             "HTTPS_PROXY": proxy,
             "https_proxy": proxy,
@@ -2217,8 +2232,32 @@ def _wire_global_config_locked(
             # and the daemon starts CONNECTing to itself.
             "CSWAP_PIN_PORT": str(port),
         }
-        if py_ca is not None:
-            wanted["SSL_CERT_FILE"] = str(py_ca)
+        # NO SSL_CERT_FILE. NOT "gated better" — NOT WRITTEN AT ALL.
+        #
+        # This used to write it behind `_python_trust_file`, a subsumption gate
+        # comparing certificate SETS. The gate was correct and still the wrong
+        # shape, for two reasons that only appeared once two independent
+        # implementations were compared:
+        #
+        #   A PROOF GOES STALE. It holds at the moment of writing. The store it
+        #   proved against can be replaced by MDM, become unreadable, or simply
+        #   change — and the variable stays behind naming a bundle that no
+        #   longer subsumes anything. On a corporate laptop that is total: no
+        #   system roots means no TLS to anywhere.
+        #
+        #   EVERY GATE GREW A DEFAULT-ALLOW ARM. This one passed on
+        #   host-a partly because the ambient store is a capath with no
+        #   cafile, which is "nothing to compare", not "proven superset". The
+        #   sibling implementation returned ok when the store was UNREADABLE,
+        #   on the same reasoning. Two authors, one hole: a property of the
+        #   approach, not a pair of bugs.
+        #
+        # The replacement cannot narrow anything and so needs no proof:
+        # `oauth._pin_aware_ssl_context()` builds `create_default_context()`
+        # and calls `load_verify_locations(pin CA)`. Python ADDS. Node ADDS via
+        # NODE_EXTRA_CA_CERTS, kept above. Nothing is left for a replace-class
+        # variable to do.
+        #
         # Remember what we are about to displace, so unwiring is lossless.
         displaced = {k: env[k] for k in wanted if k in env}
         env.update(wanted)
@@ -4860,7 +4899,32 @@ _DRAIN_SECONDS = 30.0
 #
 # Still a drain, not zero: a response mid-stream must not be cut, which is the
 # 34-connections-reset outage `stop(drain=…)` exists to prevent.
-_HELD_DRAIN_SECONDS = 2.0
+# THE 2 SECONDS THAT CUT THREE SESSIONS, and why the number is gone.
+#
+# The reasoning above is sound and its PREMISE was false. It says every second
+# of drain here is a second with the port bound and nobody behind it, so the
+# budget must be small. True — but only because the wait could never end early:
+# it polled the CONNECTION count, an RC WebSocket holds that above zero for the
+# life of the session, so the daemon sat here for the whole budget whether it
+# had work or not. A cap was the only defence against a wait that never
+# finished, and 2.0 was chosen to make the pointless wait cheap.
+#
+# `await_inflight` now waits on REQUESTS, which do reach zero. An idle daemon
+# returns from it in milliseconds — the thing the small cap was buying — so the
+# cap is no longer paying for anything except cutting real replies.
+#
+# Measured 2026-08-18 03:42, the incident this file now exists to prevent:
+#     03:42:04  stopping (refcount)
+#     03:42:06  drained
+# 2.0s on the nose, one second after a code handover began, with a reply
+# streaming. `os._exit()` then closed every fd — which is what actually cuts,
+# `_close_open_connections()` having handed its fds to the TLS wrappers long
+# before (measured: fileno() == -1 on the raw socket after wrap_socket).
+#
+# So both exit paths now get the same generous ceiling. The port is only held
+# while a reply is genuinely in flight, which is the one case where holding it
+# is correct.
+_HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 
 _FIRST_HOLDER_TIMEOUT = 300.0
 
@@ -8148,9 +8212,11 @@ def wire_env(
     # poll dies CERTIFICATE_VERIFY_FAILED. Evenly across all seven accounts;
     # only the disabled one shows it, because the engine's other path never
     # re-polls it to reset the counter.
-    _py_ca = _python_trust_file(ca_path, out["NODE_EXTRA_CA_CERTS"])
-    if _py_ca is not None:
-        out["SSL_CERT_FILE"] = str(_py_ca)
+    # NO SSL_CERT_FILE HERE EITHER — see the note in `wire_global_config`. The
+    # python callers this was written for (the statusline nudge shelling out to
+    # `cswap list`, the usage poll) are served by
+    # `oauth._pin_aware_ssl_context()`, which ADDS the pin CA to a default
+    # context and cannot narrow trust on any machine.
 
     # Attach this launch as a refcount holder: open a write fd on the FIFO and
     # mark it inheritable so the exec'd claude keeps it open for its lifetime.
@@ -8259,6 +8325,9 @@ class PinProxy:
         # to its ceiling and then cut whatever was open, including a reply that
         # had started two seconds earlier.
         self._opaque_tunnels = 0
+        # Connections that owe an answer right now — see `inflight_requests`,
+        # which is the only reader, and `_owe_answer`, the only writer.
+        self._owed: set = set()
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -8683,6 +8752,12 @@ class PinProxy:
             # accepted IS connected, whatever the scheduler does next.
             with self._live_lock:
                 self._open_conns.add(conn)
+            # OWED FROM ACCEPT. The request line may still be in the kernel
+            # buffer, and a client that has connected is waiting on us whether
+            # or not its bytes have arrived. Counting only from the request
+            # line let a recycle drop exactly those — measured as "1 requests
+            # connected and were never answered".
+            self._owe_answer(conn, True)
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
@@ -8835,6 +8910,7 @@ class PinProxy:
         def _release():
             with self._live_lock:
                 self._open_conns.discard(conn)
+                self._owed.discard(conn)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
@@ -8852,7 +8928,60 @@ class PinProxy:
             self._local.release = None
 
     def inflight_requests(self) -> int:
-        """Connections that still owe somebody an answer.
+        """Connections that owe somebody an answer RIGHT NOW.
+
+        THREE DEFINITIONS WERE TRIED AND TWO WERE WRONG. Each was measured,
+        and each failure is a different unreachable zero:
+
+          1. OPEN CONNECTIONS. An RC WebSocket is opaque after its 101 and
+             lives as long as the session, so the count never fell to zero,
+             every recycle paid its whole ceiling, and `os._exit` then cut
+             whatever was streaming. This is the original defect.
+
+          2. THE REQUEST/RESPONSE SPAN ONLY. Zero became reachable, and a
+             client that had been accepted but had not yet sent its request
+             line was invisible: the drain returned instantly and the exit
+             dropped it. `case_a_planned_restart_under_a_holder_loses_nothing`
+             failed at once with "1 requests connected and were never
+             answered", and the log said `cut 1 in-flight request(s) after 0s`.
+
+          3. OPEN CONNECTIONS MINUS TUNNELS. Both of the above are handled and
+             a third unreachable zero appears: after a reply finishes, an
+             HTTP keep-alive connection sits open and idle, still counted, so
+             the drain again burns the full ceiling. Measured: `cut 1
+             in-flight request(s) after 30s` with the reply long since
+             delivered.
+
+        What all three were reaching for is the thing named here: a connection
+        is work while somebody is WAITING on it. That starts at accept — a
+        client whose request is still in the kernel buffer is owed an answer —
+        and ends when its response has been written. A keep-alive connection
+        between requests is owed nothing, and a tunnel is owed nothing.
+        """
+        with self._live_lock:
+            return len(self._owed)
+
+    def _owe_answer(self, conn, owed: bool) -> None:
+        """Mark a connection as owing an answer, or as having paid it.
+
+        Called at accept (owed), when a response has been fully written
+        (paid), when the next request begins (owed again), when the connection
+        becomes an opaque tunnel (paid, permanently), and at close (paid).
+
+        Idempotent by construction: a set, not a counter. A counter would have
+        to be decremented exactly once per increment across four call sites and
+        two exception paths, and the first version that got that wrong would
+        leave the daemon believing it is forever busy — which is the same
+        outcome as the bug this replaces.
+        """
+        with self._live_lock:
+            if owed:
+                self._owed.add(conn)
+            else:
+                self._owed.discard(conn)
+
+    def _unused_legacy_inflight(self) -> int:
+        """The previous definition, kept only to document what it counted.
 
         OPEN CONNECTIONS MINUS OPAQUE TUNNELS, and each half of that was
         learned from a failure.
@@ -9573,11 +9702,25 @@ class PinProxy:
         must not run the per-connection teardown that the pump will run at EOF.
         """
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        # STASHED BEFORE THE WRAP, because `wrap_socket` DETACHES: after it,
+        # `conn.fileno()` is -1 and the SSLSocket owns the fd. The debt is
+        # keyed on this object, which is the same one `_open_conns` holds, so
+        # the two stay in step.
+        self._local.conn = conn
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
         self._local.detached = False
         try:
             while True:
-                if not self._handle_one_request(tls):
+                # THE DEBT BOUNDARY. Between requests this connection is a
+                # keep-alive socket nobody is waiting on, so it must not hold
+                # a drain — that was the third unreachable zero, measured as
+                # `cut 1 in-flight request(s) after 30s` with the reply long
+                # since delivered. `_read_line` inside then blocks until the
+                # next request line arrives, and the debt is taken back up the
+                # moment one does.
+                self._owe_answer(conn, False)
+                got_one = self._handle_one_request(tls, conn)
+                if not got_one:
                     break
         finally:
             if not getattr(self._local, "detached", False):
@@ -9588,10 +9731,15 @@ class PinProxy:
                     pass
         return bool(getattr(self._local, "detached", False))
 
-    def _handle_one_request(self, tls: ssl.SSLSocket) -> bool:
+    def _handle_one_request(self, tls: ssl.SSLSocket, conn=None) -> bool:
         request_line = _read_line(tls)
         if not request_line:
             return False
+        # A REQUEST LINE ARRIVED, so somebody is waiting again. The debt runs
+        # until this returns, which is after the response has been relayed —
+        # so a streaming reply is owed for every second it streams.
+        if conn is not None:
+            self._owe_answer(conn, True)
         return self._handle_one_request_inner(request_line, tls)
 
     def _handle_one_request_inner(self, request_line: str, tls: ssl.SSLSocket) -> bool:
@@ -9813,6 +9961,13 @@ class PinProxy:
                     # connection and is still closed on teardown; it is simply
                     # not something to wait for.
                     self._note_opaque_tunnel(True)
+                    # A TUNNEL OWES NOTHING. Nobody is waiting on a reply here
+                    # — two sockets are being copied into each other for the
+                    # life of the session. This is the RC WebSocket, and it is
+                    # the connection that made the original zero unreachable.
+                    _c = getattr(self._local, "conn", None)
+                    if _c is not None:
+                        self._owe_answer(_c, False)
                     release = getattr(self._local, "release", None)
 
                     def _release_tunnel():
