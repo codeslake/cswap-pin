@@ -5783,9 +5783,26 @@ def read_daemon_state(certdir: Path) -> dict | None:
 
 
 def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
-    """Identity of the daemon's CODE, so a redeploy of pin_proxy.py makes a
+    """Identity of the daemon's CODE, so a redeploy of this module makes a
     running daemon stale and the launcher recycles it — mirrors the fingerprint
     staleness a sibling proxy's ensure step uses.
+
+    IT NAMED `pin_proxy.py` UNTIL 0.1.104, which is where this code lived
+    before the pin became its own package. A reader following that name looks
+    for a file that has not existed for months, in the docstring whose whole
+    job is to say what gets hashed.
+
+    AND THE HASH IS WHY THIS RELEASE EXISTS AT ALL. Content, not version: a
+    release that bumps only `pyproject.toml` leaves this file byte-identical,
+    so the fingerprint does not move and no daemon recycles. That is correct
+    behaviour and it is also what made 0.1.103's drain untestable — every
+    departure since it shipped happened to owe nothing, and
+    `uv pip install --reinstall` of the same version could not force one,
+    exactly as designed. Measured by the cswap session: T0 14:22:21Z, four
+    minutes, no handover.
+
+    So the one-line correction above is the trigger, and saying so here is
+    cheaper than a reader later wondering what 0.1.104 changed.
 
     The pinned account is deliberately NOT part of this. It is re-read per
     request (see :func:`make_pin_token_provider`), so re-pinning takes effect
