@@ -4884,6 +4884,20 @@ _SPAWN_WAIT_S = 10.0
 _SETTINGS_FILE = "settings.json"
 _FIFO_NAME = "refcount.fifo"
 _LOG_NAME = "daemon.log"
+# WHO WROTE THE LINE. Two proxies on this fleet emit drain lines — this one and
+# the cache-fix fork — and `drained clean` was a phrase neither owned, so a
+# reader handed one line could not say which produced it. That is a defect in
+# the line whether or not anything is pointed at a shared stream today.
+#
+# INSERTED BEFORE `pid=`, never around the phrases. Peer readers match
+# `drained clean` and `cut .* in-flight` UNANCHORED (checked, not assumed:
+# `pin_cut_count` in the fleet tooling, and this file's own suite, whose only
+# positional assertion is `"pid=" in text`). Renaming or wrapping those tokens
+# would break every one of them; a token ahead of `pid=` cannot.
+#
+# AT THE FUNNEL rather than on the two lines that collide today, so a line type
+# added next month gets it without anyone remembering to.
+_COMPONENT = "cswap-pin"
 _LOG_MAX_BYTES = 64 * 1024
 
 
@@ -5261,7 +5275,8 @@ def _log_lifecycle(what: str) -> None:
     """
     try:
         stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        print(f"[{stamp}] pid={os.getpid()} {what}", file=sys.stderr, flush=True)
+        print(f"[{stamp}] {_COMPONENT} pid={os.getpid()} {what}",
+              file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001
         pass
 

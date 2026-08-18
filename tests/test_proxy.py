@@ -10334,6 +10334,24 @@ class TestTheDaemonLogRecordsItsOwnDeath:
         # question the empty log could not answer.
         assert re.search(r"\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\]", text), text
         assert "pid=" in text, text
+        # EVERY LINE NAMES ITS WRITER. Two proxies on this fleet write drain
+        # lines — this one and the cache-fix fork — and `drained clean` is a
+        # phrase neither owned. A reader handed one line could not say which
+        # component produced it, which is a defect in the line whether or not
+        # anything is currently pointed at a shared stream.
+        #
+        # AT THE FUNNEL, so a line type added later cannot forget it. Asserted
+        # on `serving on port` rather than on a drain line for exactly that
+        # reason: tagging only the two lines that collide today is the version
+        # of this fix that rots.
+        assert re.search(r"\] cswap-pin pid=\d+ serving on port", text), (
+            "a lifecycle line does not name the component that wrote it: "
+            + text)
+        # AND THE TOKEN GOES BEFORE `pid=`, NOT AROUND THE PHRASES. Peer
+        # readers match `drained clean` and `cut .* in-flight` unanchored;
+        # wrapping or renaming those breaks them, inserting ahead of `pid=`
+        # cannot.
+        assert "stopping (signal SIGTERM)" in text, text
 
     def case_the_teardown_reason_distinguishes_signal_from_idle(self):
         """A TERM from a recycle and an idle teardown are the same code path.

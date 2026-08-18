@@ -4330,6 +4330,7 @@ class TestDrainReportsWhatItCut:
         for why a content-based stall stays refused until this has run.
         """
         import os
+        import re
 
         import cswap_pin.proxy as pp
 
@@ -4438,6 +4439,21 @@ class TestDrainReportsWhatItCut:
                 "reported it from the live set — which is empty on every "
                 "clean drain, so the field could never be anything but "
                 "zero: " + got)
+
+            # THE PHRASES OTHER PEOPLE MATCH ON, checked against the rendered
+            # lines rather than against my memory of them. Two peer readers on
+            # this fleet grep these UNANCHORED, so the component tag added to
+            # `_log_lifecycle` had to go ahead of `pid=` and leave both tokens
+            # in place. Asserting it here, where the real lines exist, is the
+            # only place that can tell a safe insertion from a rename.
+            for pat, where in ((r"cut \d+ in-flight", line),
+                               (r"drained clean", got)):
+                assert re.search(pat, where), (
+                    f"the format change broke `{pat}`, which peer tooling "
+                    f"greps unanchored: {where}")
+            assert re.search(r"\] cswap-pin pid=\d+ ", line), (
+                "the drain line does not name the component that wrote it, so "
+                f"a reader cannot tell it from the sibling proxy's: {line}")
         finally:
             pp.time = real_time
             try:
