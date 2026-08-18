@@ -3953,24 +3953,21 @@ def server_generated_titles() -> set[str]:
         try:
             with path.open(encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    if '"ai-title"' in line:
-                        try:
-                            rec = json.loads(line)
-                        except ValueError:
-                            continue
-                        if rec.get("type") == "ai-title":
-                            t = (rec.get("aiTitle") or "").strip()
-                            if t:
-                                titles.add(t)
-                    elif '"custom-title"' in line:
-                        try:
-                            rec = json.loads(line)
-                        except ValueError:
-                            continue
-                        if rec.get("type") == "custom-title":
-                            t = (rec.get("customTitle") or "").strip()
-                            if t:
-                                chosen.add(t)
+                    if '"ai-title"' not in line and '"custom-title"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    kind = rec.get("type")
+                    if kind == "ai-title":
+                        t = (rec.get("aiTitle") or "").strip()
+                        if t:
+                            titles.add(t)
+                    elif kind == "custom-title":
+                        t = (rec.get("customTitle") or "").strip()
+                        if t:
+                            chosen.add(t)
         except OSError:
             continue
     # A NAME SOMEBODY TYPED IS NEVER THE SERVER'S, whatever else matched. The
@@ -5139,10 +5136,9 @@ def _open_daemon_log(certdir: Path):
             # it. That is the same "instrument destroyed by the event it
             # describes" one generation further out.
             try:
-                older = path.with_suffix(path.suffix + ".2")
                 previous = path.with_suffix(path.suffix + ".1")
                 if previous.exists():
-                    previous.replace(older)
+                    previous.replace(path.with_suffix(path.suffix + ".2"))
                 path.replace(previous)
             except OSError:
                 path.unlink()  # rotation impossible; the cap still has to hold
@@ -9637,7 +9633,7 @@ class PinProxy:
         them (`cut 4 in-flight request(s) after 5s (4 mid-response, 0 before
         headers)`), and its counts were the only ones defensible as
         user-visible while ours said "a reply MAY have ended mid-stream".
-        
+
         NOT MOVED OFF `_live_lock`, and it was raised as a hot-path
         contention: this runs per `sendall`, and the lock is also taken by
         `accept`, `live_client_count`, `_owed_still_moving`,
