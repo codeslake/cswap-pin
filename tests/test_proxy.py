@@ -6748,10 +6748,18 @@ class TestDaemonPortStability:
             f"vacating for the holder (exits={exits})"
         )
         assert budgets, "the handover did not drain at all"
-        assert budgets[0] == pin_proxy._DRAIN_SECONDS, (
-            f"a handover drained {budgets[0]}s on the SHORT budget — that one "
-            f"is for the fallback, where no successor exists; cutting the "
-            f"drain short while one is already serving only cuts replies"
+        # THE LITERAL WAS ONLY EVER RIGHT BECAUSE THE THREE NUMBERS WERE EQUAL.
+        # This case's own re-derivation above says the drain here "overlaps a
+        # serving successor and takes the FULL budget", and its message says
+        # cutting short while one is serving only cuts replies — both describe
+        # `_HANDOVER_DRAIN_SECONDS`. `_DRAIN_SECONDS` was indistinguishable from
+        # it until 2026-08-18, when 16 mid-response replies were measured cut at
+        # exactly thirty seconds and the two questions had to get two numbers.
+        assert budgets[0] == pin_proxy._HANDOVER_DRAIN_SECONDS, (
+            f"a handover drained {budgets[0]}s rather than the handover "
+            f"ceiling. The successor is already serving, so waiting is free "
+            f"and cutting only cuts replies — the short budget is for the "
+            f"fallback, where no successor exists"
         )
         # AND IT IS STILL A DRAIN. Zero would cut a response mid-stream, which
         # is the 34-connections-reset outage `stop(drain=…)` exists to prevent.
@@ -8789,14 +8797,17 @@ class TestTheDaemonWatchesItsOwnCode:
 
         assert ("stop", None) in events, events
         assert ("spawn", "1") in events, events
-        assert ("drain", pin_proxy._DRAIN_SECONDS) in events, events
+        # The successor was spawned above with the listening socket handed
+        # down, so the port never goes dark and the wait is free — the
+        # handover ceiling, not the supervisor's patience.
+        assert ("drain", pin_proxy._HANDOVER_DRAIN_SECONDS) in events, events
         # THE DRAIN COMES AFTER THE SPAWN. Draining before it meant the port
         # stayed unbound for the whole budget and every new connection was
         # refused — measured at 31s on a live daemon. Releasing the listener
         # first lets the successor bind at once; the requests still in flight
         # here are finished afterwards, while the new daemon already accepts.
         assert events.index(("spawn", "1")) < events.index(
-            ("drain", pin_proxy._DRAIN_SECONDS)
+            ("drain", pin_proxy._HANDOVER_DRAIN_SECONDS)
         ), events
         # ORDER IS LOAD-BEARING: the port must be free before the successor
         # tries to bind it, and _spawn_daemon blocks until the successor is
