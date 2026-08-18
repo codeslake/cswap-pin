@@ -3469,7 +3469,7 @@ def _log_carry(certdir: Path, what: str) -> None:
     """
     try:
         with daemon_log_path(certdir).open("a", encoding="utf-8") as fh:
-            fh.write(f"[{_iso_utc(time.time())}] carry: {what}\n")
+            fh.write(f"[{_iso_utc(time.time())}] {_COMPONENT} carry: {what}\n")
     except OSError:
         pass
 
@@ -4983,9 +4983,20 @@ def announce_draining(certdir: Path, pid: int | None = None):
         try:
             path.write_text(str(time.time()))
         except OSError:
-            with _DRAINING_LOCK:
-                _DRAINING_DEPTH[key] -= 1
-            return lambda: None
+            # THE FILE IS ADVICE TO OTHER PROCESSES; THE DEPTH IS OUR OWN
+            # KNOWLEDGE. This used to roll the depth back and hand out a no-op
+            # releaser, which was harmless while nothing in-process read it —
+            # the sweep simply stayed as blind as it was before markers
+            # existed, which is this function's documented fail-open.
+            #
+            # `teardown_drain_budget(handed_over=this_process_is_draining())`
+            # reads it now, so the rollback broke the promise one paragraph up:
+            # an ENOSPC or a read-only certdir made a daemon mid-handover
+            # report "not draining", take the 30s held ceiling instead of the
+            # uncapped one, and cut the live mid-response replies that ceiling
+            # was removed to save. A failed write must cost the SWEEP its
+            # information, never cost us a reply.
+            pass
 
     released = False
 
@@ -7694,9 +7705,17 @@ def _watch_own_code(
                 # daemon that is not keep_pid" with no marker written. That is
                 # the 08:21:19Z race one frame higher, and it is not narrow:
                 # `_ASK_SETTLE_SECONDS` sits inside the window on purpose.
-                # Never released here — every path out of this branch is
-                # `os._exit`, and `_collect_dead_markers` takes what is left.
-                announce_draining(certdir)
+                #
+                # THE RELEASER IS KEPT, and the comment here used to say it was
+                # not needed because "every path out of this branch is
+                # `os._exit`". One is not: the holder-did-not-survive branch
+                # below RETURNS and this daemon goes back to serving, leaving
+                # the depth raised for the life of the process. Harmless while
+                # nothing read it; `teardown_drain_budget(handed_over=...)` now
+                # does, so a daemon that never handed over would take the
+                # uncapped ceiling on every later teardown and put
+                # `Connection: close` on every response it ever writes again.
+                _asked_done = announce_draining(certdir)
                 holder = _holder_pid()
                 if holder:
                     try:
@@ -7721,6 +7740,10 @@ def _watch_own_code(
                             "survive the ask — keeping the port rather than "
                             "releasing it to nobody"
                         )
+                        # WE ARE NOT DRAINING AFTER ALL. This is the one exit
+                        # from this branch that keeps serving, so it is the one
+                        # that has to hand the announcement back.
+                        _asked_done()
                         return
                     _log_lifecycle(
                         "code on disk changed — asked the holder to replace "
@@ -7964,7 +7987,7 @@ def _accept_probe(sock: "socket.socket") -> int:
         conn, _ = sock.accept()
         _ADOPTED_BACKLOG.append(conn)
         _log_lifecycle(
-            f"pid={os.getpid()} adopt probe accepted a waiting client — "
+            "adopt probe accepted a waiting client — "
             f"parked to serve, not dropped"
         )
         return 1
@@ -9017,6 +9040,15 @@ class PinProxy:
         # reply can be waited for, and counting it would inflate this in the
         # direction that makes a longer wait look proven safe.
         self._quiet_peak = 0.0
+        # NEVER OBSERVED IS NOT MEASURED ZERO. A daemon that completed no reply
+        # at all printed `survived 0s`, identical to one whose replies were
+        # never silent — and the field exists to build a population a threshold
+        # would be chosen from, so synthetic zeros drag it toward "short waits
+        # are enough". Absent renders `n/a`.
+        self._quiet_seen = False
+        # THE LONGEST GAP BETWEEN CONTENT WRITES, per connection, accumulated
+        # as they happen. Cleared with the debt like its siblings.
+        self._gap: dict = {}
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -9385,9 +9417,14 @@ class PinProxy:
         cut = self.inflight_requests()
         mid = self.inflight_mid_response()
         delivered = self._delivered_summary()
-        # READ BEFORE `_close_open_connections`, like `cut` and for the same
-        # reason: the close empties the sets this counts over, so taken after
-        # it this field would be a constant 0 s on every drain that ever ran.
+        # READ BEFORE `_close_open_connections`, and NOT for the reason this
+        # comment first gave. That function swaps out `_open_conns` and nothing
+        # else — it never touches `_owed`, `_content_at` or `_delivered`. What
+        # empties those is each serving thread's `_release()` as its socket
+        # dies, asynchronously, once the close lands. So the ordering is right
+        # and the mechanism is a RACE, not a synchronous wipe. Naming the wrong
+        # one is worse than naming none: the next reader moves the line on the
+        # strength of a mechanism that does not exist.
         quiet = self._content_free_summary()
         closed = self.live_client_count()
         self._close_open_connections()
@@ -9428,7 +9465,7 @@ class PinProxy:
                 f"drained clean in {elapsed:.1f}s of {ceiling} "
                 f"— closed {closed} idle connection(s), none owed an answer; "
                 f"longest content-free wait a completed reply survived "
-                f"{self._quiet_peak:.0f}s"
+                f"{f'{self._quiet_peak:.0f}s' if self._quiet_seen else 'n/a'}"
             )
         return cut
 
@@ -9515,7 +9552,7 @@ class PinProxy:
             if _ADOPTED_BACKLOG:
                 conn = _ADOPTED_BACKLOG.pop(0)
                 _log_lifecycle(
-                    f"pid={os.getpid()} serving the client the adopt probe "
+                    "serving the client the adopt probe "
                     f"had to accept"
                 )
             else:
@@ -9721,6 +9758,7 @@ class PinProxy:
                 self._delivered.pop(conn, None)
                 self._content.pop(conn, None)
                 self._content_at.pop(conn, None)
+                self._gap.pop(conn, None)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
@@ -9850,8 +9888,13 @@ class PinProxy:
         NAME, so an idle stream scores its true silence however many pings it
         carries.
         """
-        now = time.monotonic()
+        # INSIDE THE LOCK. Sampled outside it, a concurrent content write can
+        # land between the read and the acquire, making `now` older than the
+        # stamp and the interval NEGATIVE — `content-free -0/-0/-0 s` on the
+        # cut line, and a marker whose 4th line parses fine and reads as
+        # impossible.
         with self._live_lock:
+            now = time.monotonic()
             return sorted(now - self._content_at.get(c, now)
                           for c in self._owed)
 
@@ -9882,9 +9925,27 @@ class PinProxy:
         """
         with self._live_lock:
             since = self._content_at.get(conn)
-            if since is not None:
-                self._quiet_peak = max(self._quiet_peak,
-                                       time.monotonic() - since)
+            if since is None:
+                return
+            # BOTH KINDS OF GAP. `_gap[conn]` is the longest interval BETWEEN
+            # content writes, accumulated as they happen; the term below is the
+            # final one, from the last content byte to completion. A reply that
+            # went quiet and then delivered, and one that went quiet and then
+            # ENDED, are both evidence that a wait of that length was safe —
+            # the client got its answer either way.
+            #
+            # A REPLY THAT DELIVERED NO CONTENT AT ALL COUNTS TOO, and that is
+            # deliberate against a review finding that called it inflation. Its
+            # `_content_at` is still the seed from `_owe_answer`, so a 204 or a
+            # 5xx after a 30s upstream stall banks 30s. The threshold this
+            # feeds is "cut a reply silent for longer than T", so a LARGER
+            # measured maximum makes T larger and cuts fewer live replies.
+            # Under-reporting is the direction that costs somebody an answer,
+            # and excluding these would under-report.
+            self._quiet_peak = max(self._quiet_peak,
+                                   self._gap.get(conn, 0.0),
+                                   time.monotonic() - since)
+            self._quiet_seen = True
 
     def inflight_mid_response(self) -> int:
         """Of the owed requests, how many have already sent the client bytes.
@@ -9967,6 +10028,18 @@ class PinProxy:
                 self._delivered[conn] = self._delivered.get(conn, 0) + written
                 if content:
                     self._content[conn] = self._content.get(conn, 0) + 1
+                    # BANK THE GAP BEFORE OVERWRITING THE STAMP. The first
+                    # version only read `now - _content_at` at COMPLETION, and
+                    # `_note_reply_finished` runs one frame after the last
+                    # `sendall` — so it recorded the TRAILING gap, ~0 for every
+                    # reply still streaming when it ends, and threw away the
+                    # long quiet in the middle that the field exists to find.
+                    # A reply that pings for two minutes of extended thinking
+                    # and then delivers scored zero.
+                    prev = self._content_at.get(conn)
+                    if prev is not None:
+                        self._gap[conn] = max(self._gap.get(conn, 0.0),
+                                              self._owed[conn] - prev)
                     self._content_at[conn] = self._owed[conn]
 
     def _owe_answer(self, conn, owed: bool) -> None:
@@ -10008,6 +10081,7 @@ class PinProxy:
                 self._delivered.pop(conn, None)
                 self._content.pop(conn, None)
                 self._content_at.pop(conn, None)
+                self._gap.pop(conn, None)
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a

@@ -10347,11 +10347,13 @@ class TestTheDaemonLogRecordsItsOwnDeath:
         assert re.search(r"\] cswap-pin pid=\d+ serving on port", text), (
             "a lifecycle line does not name the component that wrote it: "
             + text)
-        # AND THE TOKEN GOES BEFORE `pid=`, NOT AROUND THE PHRASES. Peer
-        # readers match `drained clean` and `cut .* in-flight` unanchored;
-        # wrapping or renaming those breaks them, inserting ahead of `pid=`
-        # cannot.
-        assert "stopping (signal SIGTERM)" in text, text
+        # The insertion point is pinned by the regex above; the phrases peer
+        # readers grep unanchored are pinned where the real drain lines exist,
+        # in `case_a_reply_that_has_gone_quiet_is_timed_not_guessed`. A second
+        # copy of the `stopping (signal SIGTERM)` assert lived here under a
+        # comment claiming to check the token position — it checks a phrase
+        # containing neither the tag nor `pid=`, so it passes with the tag
+        # inserted anywhere, or removed.
 
     def case_the_teardown_reason_distinguishes_signal_from_idle(self):
         """A TERM from a recycle and an idle teardown are the same code path.

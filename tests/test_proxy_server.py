@@ -4354,6 +4354,9 @@ class TestDrainReportsWhatItCut:
         c, d = socket.socketpair()
         e, f = socket.socketpair()
         err = io.StringIO()
+        # BOUND BEFORE THE `try`, or a failure earlier in the body makes the
+        # `finally` raise NameError and hide it.
+        _depth_before = dict(pp._DRAINING_DEPTH)
         try:
             pp.time = clock
             # `e` IS OWED AND NEVER WRITTEN TO — a request on the wire whose
@@ -4403,6 +4406,12 @@ class TestDrainReportsWhatItCut:
             # written by a drain that ended; this marker is what a stuck one
             # publishes every beat.
             pid = os.getpid()
+            # SAVED AND RESTORED. The depth map is a module global keyed by
+            # marker basename, and `this_process_is_draining()` matches on it,
+            # so an announcement left standing here makes every later case in
+            # this worker take the draining branch — `Connection: close` on
+            # every response and `handed_over=True` in the teardown budget.
+            # Only definition order kept the sibling case's precondition green.
             pp.announce_draining(certdir, pid)
             pp.beat_draining(certdir, pid, owed=2, live=2, quiet=310.0)
             assert pp.draining_quiet(certdir, pid) == 310.0, (
@@ -4423,10 +4432,54 @@ class TestDrainReportsWhatItCut:
             # `drained clean` means nothing is owed. Only a reply that went
             # quiet and then FINISHED can raise a ceiling, so that is what the
             # line has to carry.
-            clock.t = 1400.0
-            for sock in (a, c, e):
+            #
+            # DRIVEN IN THE ORDER `_mitm` PRODUCES, which the first version of
+            # this case did not. It called `_note_reply_finished` at a clock
+            # 400s past the last content write — a state the relay cannot
+            # reach, because that call sits at the top of the next loop
+            # iteration, immediately after the last `sendall` refreshed the
+            # stamp. So the assertion was green about behaviour that never
+            # happens, and the field it certified banked the TRAILING gap
+            # (~0 for every streaming reply) instead of the longest one.
+            #
+            # `c` is the shape that matters: quiet from t=1305 to t=1395, then
+            # DELIVERS, then completes one tick later. The peak has to be the
+            # 90s it survived, not the ~0s between its last token and its end.
+            clock.t = 1395.0
+            proxy._note_response_started(c, 500, True)
+            # THE MID-STREAM GAP, ASSERTED PER CONNECTION, because the fleet
+            # maximum cannot isolate it: `a` and `e` end after long TRAILING
+            # silences that legitimately dominate. `c` delivered at t=1000,
+            # 1305 and 1395, so its longest quiet-then-delivered interval is
+            # 305s — a number the old code could not produce at all, since it
+            # only ever read the gap after the LAST content byte.
+            assert proxy._gap[c] == 305.0, (
+                "the longest interval between content writes was not banked, "
+                "so a reply that pings through a long think and then delivers "
+                f"scores nothing: {proxy._gap.get(c)}")
+            clock.t = 1395.5
+            # `c` FINISHES ALONE FIRST, so the peak it produces can only have
+            # come from its MID-STREAM gap. Finished alongside `a` and `e` — as
+            # the first version did — their 395s TRAILING silences dominate the
+            # process-wide maximum, and dropping `_gap` from the peak entirely
+            # changes nothing observable. That mutation survived until this
+            # ordering existed.
+            proxy._note_reply_finished(c)
+            proxy._owe_answer(c, False)
+            assert proxy._quiet_peak == 305.0, (
+                "the peak did not come from the longest gap BETWEEN content "
+                "writes; this reply's trailing silence was 0.5s and its "
+                f"mid-stream quiet was 305s: {proxy._quiet_peak}")
+            for sock in (a, e):
                 proxy._note_reply_finished(sock)
                 proxy._owe_answer(sock, False)
+            # AND THE DEBT BOUNDARY CLEARS IT, like every other per-debt
+            # counter — or the next request on a keep-alive starts already
+            # holding the last one's silence.
+            assert c not in proxy._gap, (
+                "the gap survived the debt it belongs to; the next reply on "
+                "this connection would inherit it")
+            clock.t = 1400.0
             clean = io.StringIO()
             with contextlib.redirect_stderr(clean):
                 proxy.await_inflight(0.0)
@@ -4434,7 +4487,7 @@ class TestDrainReportsWhatItCut:
             assert "drained clean" in got, (
                 "the second drain still had debts, so this proves nothing "
                 "about the clean branch: " + got)
-            assert "content-free wait a completed reply survived 400s" in got, (
+            assert "content-free wait a completed reply survived 396s" in got, (
                 "the clean drain reported no content-free interval, or "
                 "reported it from the live set — which is empty on every "
                 "clean drain, so the field could never be anything but "
@@ -4456,6 +4509,9 @@ class TestDrainReportsWhatItCut:
                 f"a reader cannot tell it from the sibling proxy's: {line}")
         finally:
             pp.time = real_time
+            with pp._DRAINING_LOCK:
+                pp._DRAINING_DEPTH.clear()
+                pp._DRAINING_DEPTH.update(_depth_before)
             try:
                 pp.draining_marker_path(certdir, os.getpid()).unlink()
             except OSError:
@@ -4463,6 +4519,52 @@ class TestDrainReportsWhatItCut:
             for s_ in (a, b, c, d, e, f):
                 try: s_.close()
                 except OSError: pass
+
+    def case_an_unwritable_marker_does_not_shorten_our_own_drain(self, certdir):
+        """FAILING OPEN FOR THE SWEEP, NOT FOR US.
+
+        `announce_draining` promises in its own docstring that this file "may
+        only ever REMOVE a kill, never cause one" — the marker is advice to
+        OTHER processes, so a certdir that cannot be written just leaves the
+        sweep as blind as it was before markers existed.
+
+        Then `teardown_drain_budget(handed_over=this_process_is_draining())`
+        started reading the same state, and the rollback broke the promise: an
+        ENOSPC or a read-only certdir made a daemon mid-handover report
+        `handed_over=False`, take the 30s held ceiling instead of the uncapped
+        one, and cut exactly the live mid-response replies that ceiling was
+        removed to save.
+
+        The DEPTH is in-process knowledge and is true whether or not the file
+        landed. Only the file is advice, and only the file may fail.
+        """
+        import os
+
+        import cswap_pin.proxy as pp
+
+        before = dict(pp._DRAINING_DEPTH)
+        real_write = pathlib.Path.write_text
+        try:
+            def _boom(self, *a, **kw):
+                if self.name.startswith(pp._DRAINING_PREFIX):
+                    raise OSError(28, "No space left on device")
+                return real_write(self, *a, **kw)
+
+            pathlib.Path.write_text = _boom
+            done = pp.announce_draining(certdir, os.getpid())
+            assert pp.this_process_is_draining(), (
+                "a marker that could not be written made this daemon forget "
+                "it is draining, so its next teardown takes the short ceiling "
+                "and cuts the replies the uncapped one exists to finish")
+            done()
+            assert not pp.this_process_is_draining(), (
+                "the releaser handed back nothing, so the state it set on the "
+                "failed-write path leaks for the life of the process")
+        finally:
+            pathlib.Path.write_text = real_write
+            with pp._DRAINING_LOCK:
+                pp._DRAINING_DEPTH.clear()
+                pp._DRAINING_DEPTH.update(before)
 
     def case_the_cut_line_says_how_much_each_reply_delivered(self, certdir):
         """`mid-response` CANNOT TELL A LIVE STREAM FROM A CORPSE.
@@ -5111,10 +5213,19 @@ class TestDrainReportsWhatItCut:
         # THE SIGNAL ROW DOES NOT MOVE. A supervisor still SIGKILLs at
         # _DRAIN_SECONDS + 2 whether or not we handed over, so a long ceiling
         # here still buys a harder kill partway through a reply.
+        #
+        # ASSERTED AGAINST THE UNCAPPED CEILING, not against `_DRAIN_SECONDS`.
+        # `_HELD_DRAIN_SECONDS IS _DRAIN_SECONDS` (both 30.0), so `== _DRAIN_
+        # SECONDS` passes with the handed-over guard, without it, and with it
+        # inverted — a verdict it can never produce. What can actually go wrong
+        # here is the row going UNCAPPED, so that is what is pinned.
         assert teardown_drain_budget(
-            "signal TERM", True, handed_over=True) == _DRAIN_SECONDS, (
-            "a signalled shutdown took a ceiling past the supervisor's "
-            "patience; handing over does not stop the SIGKILL")
+            "signal TERM", True, handed_over=True) != _HANDOVER_DRAIN_SECONDS, (
+            "a signalled shutdown took the uncapped ceiling; the supervisor "
+            "SIGKILLs at _DRAIN_SECONDS + 2, so waiting past it buys a harder "
+            "kill partway through a reply rather than a finished one")
+        assert teardown_drain_budget(
+            "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
     def case_each_exit_path_drains_on_the_ceiling_that_fits_it(self, certdir):
         """THREE DRAINS, TWO SITUATIONS — and they were collapsed into one number.
