@@ -9283,6 +9283,63 @@ class PinProxy:
         """
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
+        self._title_thread = threading.Thread(
+            target=self._title_sweep_loop, daemon=True)
+        self._title_thread.start()
+
+    #: How often the daemon re-checks cloud titles. The same cadence the
+    #: auto-switch engine used, kept so the API cost is unchanged — this moves
+    #: the repair, it does not add a second one.
+    _TITLE_SWEEP_S = 300.0
+
+    def _title_sweep_loop(self) -> None:
+        """Re-check cloud titles on a cadence, because the connect hook cannot.
+
+        THE CONNECT HOOK CANNOT SEE A TITLE THAT DOES NOT EXIST YET. The server
+        renames an ACTIVE bridge from the conversation's content long after it
+        was created, and `restore_titles_after_connect` has finished by then —
+        its own docstring says there is no second chance, "a bridge missed here
+        stays wrong until some OTHER session happens to connect".
+
+        The periodic repair that covered this lived in
+        `AutoSwitchEngine.tick()`, so THE PIN'S OWN FEATURE WAS SWITCHED OFF BY
+        A COMPONENT THE PIN DOES NOT NEED. Measured on host-a
+        2026-08-19: `.auto-live.lock` free (no live engine — the TUI's
+        `on_unmount` releases it), last restore logged 03:08:39Z, and the
+        bridge created 03:29:53Z sat under 'RC process unexpected behavior'
+        and then 'Account switching to claude.ai'. The 21 archived bridges
+        beside it were all correct, because their conversations had stopped
+        and the server had stopped renaming them.
+
+        The daemon is always running; the repair belongs here. Sleep in short
+        steps so `_stop` ends the thread promptly rather than up to five
+        minutes later.
+        """
+        while not self._stop:
+            waited = 0.0
+            while waited < self._TITLE_SWEEP_S and not self._stop:
+                time.sleep(0.5)
+                waited += 0.5
+            if self._stop:
+                return
+            try:
+                self.sweep_titles_once()
+            except Exception:  # noqa: BLE001 — never take the daemon down
+                pass
+
+    def sweep_titles_once(self) -> int:
+        """One pass: mint, list, restore. Returns how many titles were put.
+
+        Separate from the loop so the behaviour is testable without timing,
+        and so a caller that already knows something changed can run it now.
+        """
+        token = self._pin_token_provider()
+        if not token:
+            return 0            # nothing to do without the pinned identity
+        sessions = self._list_bridges(token)
+        if sessions is None:
+            return 0            # asked and got nothing — not "nothing to fix"
+        return self._restore_bridge_titles(sessions, token)
 
     def release_listener(self, hand_down: bool = False) -> "int | None":
         """Stop accepting, leaving open connections alone. The fd if handed down.
