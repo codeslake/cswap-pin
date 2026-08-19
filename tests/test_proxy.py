@@ -1148,8 +1148,13 @@ class TestLiveRemoteControlSessions:
         daemon._accept_loop = lambda: None
         ticks: list[int] = []
         daemon.sweep_titles_once = lambda: ticks.append(1)
-        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_S", 0.0)
+        # ONLY THE PERIOD IS SHORTENED, never the first-pass delay: if the loop
+        # goes back to sleeping a whole period before its first sweep, this
+        # test must fail. MEASURED — it did exactly that, and a daemon replaced
+        # every few minutes then swept never.
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_S", 600.0)
 
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_FIRST_S", 0.0)
         daemon._start_accept_loop()
         try:
             for _ in range(400):
