@@ -3897,141 +3897,6 @@ def live_bridge_names() -> dict[str, str]:
 # inferring it.
 
 
-def server_generated_titles() -> set[str]:
-    """Every title CLAUDE CODE RECORDED as one it generated, on this machine.
-
-    THE AUTHORITY, NOT A GUESS. Claude Code resolves a session's display name
-    as `agentName || customTitle || aiTitle || summary || …`
-    (`getLogDisplayTitle` in the binary), so it distinguishes the name a USER
-    chose from one it invented BY FIELD, and it writes both to the transcript:
-
-        {"type":"custom-title","customTitle":"RVP_fork",   "sessionId":…}
-        {"type":"ai-title",    "aiTitle":"Stop and acknowledge","sessionId":…}
-
-    Measured across the 13 live sessions here: `customTitle` equals the local
-    name on 13 of 13, and `aiTitle` is a completely different sentence
-    ("Add status line featur…", "RVP ⑂ 프로젝트 계획 PPT를 만들어").
-
-    Reading these replaces `_looks_generated`, whose two rules were both
-    guesses about SHAPE and both produced false positives on this account:
-
-        _looks_generated('ai-inter-session')  -> True   (a name the user chose;
-            the regex asked for lowercase-hyphen-word-word and never checked
-            that the prefix is this machine's host slug)
-        _looks_generated('Email advice')      -> True   (the rule was "a space
-            means the server wrote a sentence", which assumes the user never
-            puts a space in a name)
-
-    The asymmetry is what makes that unacceptable rather than untidy: a false
-    positive OVERWRITES a title somebody typed, a false negative only leaves
-    one wrong. And the user's objection is unanswerable from shape alone — if
-    they rename a session to `host-a-myproject`, no regex can tell it
-    from the server's own slug.
-
-    Best effort by construction: a title we cannot find a record for is simply
-    not in the set, and the caller then leaves that bridge alone. Erring
-    towards "do not touch" is the whole point.
-    """
-    titles: set[str] = set()
-    try:
-        get_claude_config_home = require("paths").get_claude_config_home
-        projects = get_claude_config_home() / "projects"
-    except Exception:  # noqa: BLE001 — no host, nothing to read
-        return titles
-    try:
-        transcripts = list(projects.rglob("*.jsonl"))
-    except OSError:
-        return titles
-    # STREAMED, NOT MATERIALISED. This read each file whole with
-    # `read_text()`. Measured on this account: 11,584 transcripts totalling
-    # 11 GB, the largest single file 422 MB — which becomes one str of that
-    # size, and then `splitlines()` builds a list on top of it. A transcript
-    # is one JSON record per line, so a line at a time answers the same
-    # question in bounded memory.
-    chosen: set[str] = set()
-    for path in transcripts:
-        try:
-            with path.open(encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if '"ai-title"' not in line and '"custom-title"' not in line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    kind = rec.get("type")
-                    if kind == "ai-title":
-                        t = (rec.get("aiTitle") or "").strip()
-                        if t:
-                            titles.add(t)
-                    elif kind == "custom-title":
-                        t = (rec.get("customTitle") or "").strip()
-                        if t:
-                            chosen.add(t)
-        except OSError:
-            continue
-    # A NAME SOMEBODY TYPED IS NEVER THE SERVER'S, whatever else matched. The
-    # set is machine-global and all-time, so a title a user chooses can
-    # collide with an `aiTitle` written months ago under an unrelated project
-    # — and this function's own docstring says that direction is the
-    # unacceptable one, because a false positive OVERWRITES a name somebody
-    # typed while a false negative only leaves one wrong.
-    #
-    # Claude Code records the two in different fields for exactly this
-    # distinction, so the veto costs nothing beyond reading a second record
-    # type out of the walk that is already open.
-    return titles - chosen
-
-
-def locally_chosen_titles() -> set[str]:
-    """Every title a HUMAN asked for on this machine, all-time.
-
-    The `custom-title` half of the same walk. It exists because the evidence
-    the restore needs is two-sided: `server_generated_titles` says which
-    strings Claude Code wrote, and this says which strings a person did — and
-    a cloud title that is in NEITHER came from the server, which records
-    nothing locally when it names a bridge from the conversation.
-
-    Kept as its own reader rather than folded into the caller so the walk's
-    cost stays where it already is: both are lazy and both are consulted only
-    for a bridge whose cloud title already disagrees with its local name.
-    """
-    return _title_records()[1]
-
-
-def _title_records() -> "tuple[set[str], set[str]]":
-    """``(ai-title strings, custom-title strings)`` from every transcript."""
-    generated: set[str] = set()
-    chosen: set[str] = set()
-    try:
-        get_claude_config_home = require("paths").get_claude_config_home
-        projects = get_claude_config_home() / "projects"
-        transcripts = list(projects.rglob("*.jsonl"))
-    except (Exception, OSError):  # noqa: BLE001 — no host, nothing to read
-        return generated, chosen
-    for path in transcripts:
-        try:
-            with path.open(encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if '"ai-title"' not in line and '"custom-title"' not in line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    if rec.get("type") == "ai-title":
-                        t = (rec.get("aiTitle") or "").strip()
-                        if t:
-                            generated.add(t)
-                    elif rec.get("type") == "custom-title":
-                        t = (rec.get("customTitle") or "").strip()
-                        if t:
-                            chosen.add(t)
-        except OSError:
-            continue
-    return generated, chosen
-
-
 def _looks_generated(title: str) -> bool:
     """A SLUG the server minted for a nameless bridge.
 
@@ -4139,8 +4004,6 @@ def titles_to_restore(
     #
     # Still once per call, not per item: the loop below runs over the entire
     # listing, and that is what the original comment here was protecting.
-    generated: set[str] | None = None
-    chosen: set[str] | None = None
     out: list[tuple[str, str]] = []
     for item in sessions:
         sid = item.get("id")
@@ -4150,55 +4013,27 @@ def titles_to_restore(
         current = (item.get("title") or "").strip()
         if current == want.strip():
             continue
-        # ONLY OVER A TITLE NOBODY CHOSE. Restoring on any DIFFERENCE means a
-        # name set in the claude.ai web app is reverted the next time any
-        # session on this machine opens a bridge — permanently, with no way to
-        # make it stick. The local name is the fallback for a title the server
-        # invented, never an override of the user's own words.
+        # ANY DIFFERENCE, BECAUSE THE REGISTRY ALREADY PROVED OWNERSHIP.
+        # `names` comes from this machine's own session registry, which pairs a
+        # name, a bridge id and a live pid in ONE record. A bridge is in it only
+        # because a session running HERE holds it and gave it that name, so a
+        # cloud title that differs is a title this side did not ask for.
         #
-        # TWO SOURCES, AND NEITHER IS A GUESS ABOUT SHAPE:
-        #   `generated` is what Claude Code RECORDED as its own — the
-        #   `ai-title` records it writes beside the `custom-title` ones. If a
-        #   title is in there, the server wrote it and restoring is right.
-        #   `_looks_generated` now covers only the host-anchored slug a
-        #   NAMELESS bridge gets, which is minted server-side and appears in
-        #   no local record.
-        # Anything else is a human's words — including a human's words that
-        # happen to look like a slug, which no regex can tell apart.
-        if generated is None:
-            generated = server_generated_titles()
-        if current in generated or _looks_generated(current):
-            out.append((sid, want.strip()))
-            continue
-        # A THIRD SOURCE, BECAUSE THE OTHER TWO CANNOT SEE THIS ONE. claude.ai
-        # renames an ACTIVE bridge from the conversation's content and writes
-        # that string to NO local record — not `ai-title`, not `custom-title`.
-        # So a rule that only restores what CC recorded leaves exactly the
-        # case the user notices: a live session's cloud name drifting from one
-        # server sentence to the next while its own name never changes.
+        # THREE NARROWER RULES CAME AND WENT, AND EACH BROKE THE FEATURE. A
+        # shape regex claimed names people had chosen. Reading only what Claude
+        # Code RECORDED (`ai-title`) missed every sentence claude.ai writes for
+        # an active bridge, because the server records those nowhere locally —
+        # so the restore selected nothing at all while a live session's cloud
+        # name drifted from one sentence to the next. A third pass added "not
+        # in any local record" plus a slug guard, and the slug guard was
+        # protecting a case the registry makes impossible.
         #
-        # The discriminator is still evidence, not shape: a string that appears
-        # in NO record on this machine and is NO live session's name was asked
-        # for by nobody here. Both false positives that killed the shape rule
-        # are covered by that — `ai-inter-session` is a live session's name and
-        # `Email advice` is a recorded `custom-title`.
-        #
-        # WHAT IT STILL CANNOT TELL APART: a title typed only in the claude.ai
-        # web app, which leaves no local trace either. That is a real cost and
-        # it is the reason this is the LAST branch rather than the first — a
-        # rename here is one PUT, and the alternative is the feature not
-        # working at all for any live session.
-        if chosen is None:
-            chosen = locally_chosen_titles()
-        if current in chosen or current in set(names.values()):
-            continue
-        # ANOTHER MACHINE'S SLUG IS NOT OURS TO REPAIR. `_looks_generated` is
-        # anchored on THIS host on purpose, so a slug minted for a different
-        # machine falls through to here with no local record — and restoring it
-        # would have this host rewrite a title that belongs to a session it
-        # cannot see. The sweep runs across hosts; that one stays theirs.
-        if re.match(r"^[a-z0-9]+(?:-[a-z0-9]+){2,}$", current):
-            continue
+        # WHAT THE NARROWING WAS FOR: a title typed in the claude.ai web app,
+        # which would be reverted here. Both examples that justified it turned
+        # out not to be that — one is a session's own name, and the other
+        # appears in NO local record at all and its owner never named it. With
+        # no case left to protect, the guard was costing the feature and buying
+        # nothing.
         out.append((sid, want.strip()))
     return out
 
