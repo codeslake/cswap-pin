@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
+import urllib.request
 from urllib.parse import quote, unquote, urlsplit
 
 from collections.abc import Callable
@@ -9026,6 +9027,144 @@ def _config_home_for_policy() -> Path:
     return require("paths").get_claude_config_home()
 
 
+#: What Claude Code prints when `isPolicyAllowed("allow_remote_control")` is
+#: false. It lands in the session's transcript as local command output, which
+#: is the ONLY external trace of a refusal — the verdict is decided in memory
+#: with no request on the wire, so there is nothing else to observe.
+_RC_POLICY_REFUSAL = "Remote Control is disabled by your organization's policy"
+
+#: Only the tail of a transcript is read. A refusal that matters is recent by
+#: construction (it has to be newer than the process), and these files reach
+#: gigabytes — one of them was 11 GB.
+_TRANSCRIPT_TAIL_BYTES = 262144
+
+
+def _proc_is_alive(pid: int, proc_start: "str | None") -> bool:
+    """Is `pid` alive AND still the process the registry recorded?
+
+    The second half is the point. Between reading a session record and
+    signalling it the kernel can hand that pid to something else entirely, and
+    a SIGTERM aimed at a session would land on whatever inherited the number.
+    `procStart` is the kernel's own start-time field, unique per pid lifetime.
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    if not proc_start:
+        return True                    # nothing recorded to compare against
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            return fh.read().rsplit(") ", 1)[1].split()[19] == str(proc_start)
+    except (OSError, IndexError):
+        return True                    # not Linux, or unreadable: do not block
+
+
+def _signal_worker(pid: int) -> bool:
+    """Ask a background session's worker to exit so the daemon respawns it.
+
+    SIGTERM, never SIGKILL: the worker gets to flush its transcript and release
+    its socket, and the Claude Code daemon then rebuilds the session from
+    `resumeSessionId` and `respawnFlags`.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def _live_session_records() -> "list[dict]":
+    """Registry records for sessions whose process is still the one recorded."""
+    out: list[dict] = []
+    try:
+        home = _config_home_for_policy()
+        for path in (home / "sessions").glob("*.json"):
+            rec = _read_json(path)
+            if not isinstance(rec, dict):
+                continue
+            try:
+                pid = int(rec.get("pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid > 0 and _proc_is_alive(pid, rec.get("procStart")):
+                out.append(rec)
+    except Exception:  # noqa: BLE001 — no host, nothing to enumerate
+        return []
+    return out
+
+
+def _session_is_idle(job_id: str) -> bool:
+    """Is this session between turns, with nothing in flight?
+
+    A worker exits on SIGTERM and the session resumes, but the turn it was in
+    the middle of does not: a tool call is abandoned and re-run. For a
+    background agent that can be a half-finished deploy repeated. Remote
+    Control being refused costs nothing by comparison, so wait for a gap.
+
+    Unreadable counts as BUSY. The whole point is to not act while work is in
+    flight, and "I could not tell" is not "there is none".
+    """
+    if not job_id:
+        return False
+    try:
+        rec = _read_json(_config_home_for_policy() / "jobs" / job_id /
+                         "state.json")
+        flight = (rec or {}).get("inFlight") or {}
+        return not int(flight.get("tasks") or 0) \
+            and not int(flight.get("queued") or 0)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _refused_rc_since(session_id: str, since_ms: float) -> bool:
+    """Did this session print the org-policy refusal after `since_ms`?
+
+    AFTER, because a transcript keeps every refusal it ever printed — including
+    the ones a previous worker printed before it was replaced. Without the age
+    test the daemon reads its own past success as a fresh fault and recycles
+    the same session forever.
+    """
+    try:
+        home = _config_home_for_policy()
+        paths = list((home / "projects").glob(f"*/{session_id}.jsonl"))
+    except Exception:  # noqa: BLE001
+        return False
+    for path in paths:
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as fh:
+                if size > _TRANSCRIPT_TAIL_BYTES:
+                    fh.seek(size - _TRANSCRIPT_TAIL_BYTES)
+                    fh.readline()      # drop the partial line seek landed in
+                for raw in fh:
+                    if _RC_POLICY_REFUSAL.encode() not in raw:
+                        continue
+                    try:
+                        rec = json.loads(raw.decode("utf-8", "replace"))
+                        # THE RECORD KIND IS THE WHOLE PRECISION OF THIS
+                        # CHECK. Claude Code writes a local command's output as
+                        # a `system` record; a session that merely QUOTES the
+                        # refusal — pasted by the user, echoed back by an agent
+                        # — carries it inside a `user` or `assistant` message.
+                        # MEASURED: a dry run against this machine flagged the
+                        # session that was writing this repair, because the
+                        # refusal had been discussed in it. Substring alone
+                        # restarts sessions for talking about the bug.
+                        if rec.get("type") != "system":
+                            continue
+                        stamp = str(rec.get("timestamp") or "")
+                        when = _dt.datetime.fromisoformat(
+                            stamp.replace("Z", "+00:00")).timestamp() * 1000
+                    except Exception:  # noqa: BLE001 — unparseable line
+                        continue
+                    if when >= since_ms:
+                        return True
+        except OSError:
+            continue
+    return False
+
+
 def _active_oauth_token() -> "str | None":
     """The access token of the account cswap currently has active.
 
@@ -9057,14 +9196,23 @@ def policy_limits_for(token: "str | None") -> "dict | None":
     if not token:
         return None
     try:
-        import urllib.request
         req = urllib.request.Request(
             "https://api.anthropic.com/api/claude_code/policy_limits",
             headers={"Authorization": f"Bearer {token}",
                      "Content-Type": "application/json",
                      "anthropic-version": "2023-06-01",
                      "anthropic-client-platform": "cli"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        # THROUGH THE PIN, WHICH RE-SIGNS THIS HOST. The daemon's own egress is
+        # wired to the pin, so this request is MITM'd with a certificate signed
+        # by the pin's CA — which a default context does not trust. MEASURED in
+        # production: every fetch died CERTIFICATE_VERIFY_FAILED, the `except`
+        # below turned it into `None`, and `sweep_policy_once` read `None` as
+        # "could not ask" and did nothing. `grep 'refreshed the org-policy
+        # cache' daemon.log` returned 0 across every rotation on this host —
+        # the repair had never once run, and nothing said so.
+        with urllib.request.urlopen(
+                req, timeout=10,
+                context=oauth._pin_aware_ssl_context()) as resp:
             doc = json.loads(resp.read().decode())
         return doc if isinstance(doc, dict) else None
     except Exception:  # noqa: BLE001 — never take the daemon down
@@ -9200,6 +9348,11 @@ class PinProxy:
         # THE LONGEST GAP BETWEEN CONTENT WRITES, per connection, accumulated
         # as they happen. Cleared with the debt like its siblings.
         self._gap: dict = {}
+        # Sessions this daemon has already asked to restart. Per daemon, not
+        # persisted: a recycle that did not help must not be repeated, and a
+        # NEW daemon is entitled to try once — its predecessor may have died
+        # before the worker came back.
+        self._recycled: set[str] = set()
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -9409,6 +9562,15 @@ class PinProxy:
                     self.carry_live_pointers(login)
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
+            # LAST, because it is the only one that acts on a PROCESS rather
+            # than on a file. Everything above repairs state a session will
+            # read next time it looks; this one is for the session that will
+            # never look again, because its refusal is cached in memory and
+            # nothing it does puts a request on the wire.
+            try:
+                self.recycle_denied_sessions()
+            except Exception:  # noqa: BLE001 — never take the daemon down
+                pass
 
     def carry_live_pointers(self, login: "tuple[str, str]") -> int:
         """Point a RUNNING session's bridge record at the account now signed in.
@@ -9557,6 +9719,65 @@ class PinProxy:
                 f"cleared {cleared} job record(s) naming a bridge the server no "
                 f"longer has, so those sessions can mint a live one")
         return cleared
+
+    def recycle_denied_sessions(self) -> int:
+        """Replace the worker of a session refusing Remote Control in error.
+
+        WHY A SIGNAL AND NOT A REPAIR. The verdict lives in the process's own
+        memory (`setSessionCache`), and every external surface was checked and
+        is closed: Claude Code installs no reload signal handler, the cache is
+        consulted BEFORE the file so rewriting `policy-limits.json` cannot
+        reach it, the eligibility inputs are exec-time env, and the gate's
+        pre-fetch returns early whenever a document is already cached — so
+        `/remote-control` refuses without putting one byte on the wire. The
+        only door left is the hourly poll, up to an hour away.
+
+        A background session is built to be replaced: its job record carries
+        `resumeSessionId` and `respawnFlags` and its transcript is on disk, so
+        a fresh worker resumes the same conversation. MEASURED on lambda-docker
+        2026-08-19: SIGTERM to a session that had refused for over two hours, a
+        new worker 12s later, Remote Control connected with no user action and
+        the conversation intact.
+
+        THREE THINGS THIS MUST NEVER DO, each of which it has a guard for:
+        end an interactive session (nothing respawns it — that is the user's
+        terminal); recycle on a refusal older than the process (its own past
+        success, read as a fresh fault, forever); or recycle when the pin's own
+        answer really does deny, where a fresh worker reads the same denial and
+        the loop never converges.
+        """
+        doc = policy_limits_for(
+            self._pin_token_provider() or _active_oauth_token())
+        if not isinstance(doc, dict):
+            return 0                   # unaskable; never act on no answer
+        entry = (doc.get("restrictions") or {}).get("allow_remote_control")
+        if isinstance(entry, dict) and entry.get("allowed") is False:
+            return 0                   # the refusal is CORRECT, not stale
+        done = 0
+        for rec in _live_session_records():
+            if rec.get("kind") != "bg":
+                continue               # only a bg session gets respawned
+            sid = str(rec.get("sessionId") or "")
+            try:
+                pid = int(rec.get("pid") or 0)
+                started = float(rec.get("startedAt") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not sid or pid <= 0 or sid in self._recycled:
+                continue
+            if not _refused_rc_since(sid, started):
+                continue
+            if not _session_is_idle(str(rec.get("jobId") or "")):
+                continue               # NOT marked recycled: try again later
+            self._recycled.add(sid)    # once per session per daemon, always
+            if _signal_worker(pid):
+                done += 1
+                _log_lifecycle(
+                    f"session {rec.get('name') or sid} was refusing Remote "
+                    "Control on a policy answer left by another account — "
+                    "asked its worker to restart so it re-reads one that "
+                    "allows it; the conversation is resumed from disk")
+        return done
 
     def sweep_policy_once(self) -> bool:
         """Put the ACTIVE account's real policy answer in CC's cache file.

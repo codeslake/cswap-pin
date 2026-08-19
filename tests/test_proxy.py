@@ -1142,6 +1142,198 @@ class TestLiveRemoteControlSessions:
         assert daemon.sweep_policy_once() is True
         assert asked == ["active-token"]
 
+    def _denied_fixture(self, pin_proxy, monkeypatch, tmp_path, kind="bg",
+                        refusal_at="2026-08-19T07:32:50.819Z",
+                        started_ms=1787000000000, allowed=True, busy=False,
+                        quoted=False):
+        """One live session that printed the org-policy refusal.
+
+        Shared by the four cases below because they differ in ONE input each --
+        the kind, the refusal's age, the pin's answer -- and the fixture is the
+        bulk of every one of them.
+        """
+        home = tmp_path / "config"
+        (home / "sessions").mkdir(parents=True)
+        (home / "projects" / "proj").mkdir(parents=True)
+        (home / "sessions" / "4242.json").write_text(json.dumps({
+            "pid": 4242, "sessionId": "sid-1", "kind": kind,
+            "startedAt": started_ms, "procStart": "999", "name": "RVP",
+            "jobId": "job-1"}))
+        (home / "jobs" / "job-1").mkdir(parents=True)
+        (home / "jobs" / "job-1" / "state.json").write_text(json.dumps({
+            "inFlight": {"tasks": 1 if busy else 0, "queued": 0}}))
+        refusal = ("<local-command-stdout>Remote Control is disabled by your "
+                   "organization's policy. Contact your organization admin "
+                   "for access.</local-command-stdout>")
+        # A REAL refusal is a `system` record; a paste of one lands inside a
+        # `user` message. Only the first is evidence about THIS process.
+        entry = ({"timestamp": refusal_at, "type": "user",
+                  "message": {"role": "user", "content": refusal}} if quoted
+                 else {"timestamp": refusal_at, "type": "system",
+                       "subtype": "local_command_output", "content": refusal})
+        (home / "projects" / "proj" / "sid-1.jsonl").write_text(
+            json.dumps({"timestamp": "2026-08-19T01:00:00.000Z",
+                        "type": "system", "content": "hello"}) + "\n" +
+            json.dumps(entry) + "\n")
+
+        doc = {"restrictions": {}, "compliance_taints": []}
+        if not allowed:
+            doc["restrictions"] = {"allow_remote_control": {"allowed": False}}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+        monkeypatch.setattr(pin_proxy, "_proc_is_alive",
+                            lambda pid, start: pid == 4242)
+        signalled = []
+        monkeypatch.setattr(pin_proxy, "_signal_worker",
+                            lambda pid: signalled.append(pid) or True)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        daemon._recycled = set()
+        return daemon, signalled
+
+    def case_a_session_refused_by_a_stale_policy_is_recycled(
+        self, tmp_path, monkeypatch
+    ):
+        """THE REPAIR THE DAEMON COULD NOT DO UNTIL NOW.
+
+        A process that once read another account's denial keeps refusing
+        Remote Control for its whole life: the verdict is cached in memory, the
+        gate's pre-fetch returns early when a document is cached, and every
+        external surface was checked and is closed -- no reload signal, the
+        file is behind the cache, the eligibility inputs are exec-time env.
+
+        What IS reachable is the process itself. A background session is built
+        to be respawned -- its job record carries `resumeSessionId` and
+        `respawnFlags` and its transcript is on disk -- so replacing the worker
+        costs nothing and clears both caches. MEASURED: SIGTERM to the worker,
+        a new one 12s later, Remote Control connected with no user action.
+        """
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
+                                                 tmp_path)
+        assert daemon.recycle_denied_sessions() == 1
+        assert signalled == [4242]
+        assert daemon.recycle_denied_sessions() == 0, (
+            "a second pass signalled the same session again — that is a "
+            "recycle loop, not a repair")
+
+    def case_the_policy_fetch_trusts_the_pins_own_certificate(
+        self, monkeypatch
+    ):
+        """MEASURED IN PRODUCTION: THIS REPAIR HAD NEVER ONCE RUN.
+
+        The daemon's own egress is wired through the pin, which MITMs
+        api.anthropic.com with a certificate signed by the pin's CA. A plain
+        `urlopen` does not trust it, so every policy fetch died
+        CERTIFICATE_VERIFY_FAILED, the `except` turned that into `None`, and
+        `sweep_policy_once` read `None` as "could not ask" and did nothing —
+        silently, forever. `grep 'refreshed the org-policy cache' daemon.log`
+        returned 0 across every rotation on this host.
+
+        `oauth._pin_aware_ssl_context()` exists for exactly this and its own
+        docstring names this failure; this call simply never used it. Assert
+        the context is passed, because the symptom is invisible: a repair that
+        cannot reach the server looks identical to one with nothing to repair.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        seen = {}
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return b'{"restrictions": {}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen["context"] = context
+            return _Resp()
+
+        monkeypatch.setattr(pin_proxy.urllib.request, "urlopen", fake_urlopen)
+        assert pin_proxy.policy_limits_for("tok") == {"restrictions": {}}
+        assert seen["context"] is not None, (
+            "the policy fetch went out on a default TLS context, so through "
+            "the pin it dies CERTIFICATE_VERIFY_FAILED and the repair is a "
+            "silent no-op — which is what production was doing")
+
+    def case_a_session_that_only_QUOTED_the_refusal_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """MEASURED, AND IT NEARLY SHIPPED. A dry run of this repair against
+        the real machine flagged the very session that was WRITING it: the
+        user had pasted the refusal into the conversation and it had been
+        quoted back. A session discussing the bug is indistinguishable from
+        one suffering it, by substring.
+
+        Claude Code writes a real local-command refusal as a `type: "system"`
+        record with `content`/`subtype` and no `message`; a paste lands inside
+        a `user` message. That field is the discriminator.
+        """
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
+                                                 tmp_path, quoted=True)
+        assert daemon.recycle_denied_sessions() == 0, (
+            "a session that merely quoted the refusal was restarted")
+        assert signalled == []
+
+    def case_a_session_mid_turn_is_left_alone(self, tmp_path, monkeypatch):
+        """A REFUSAL IS NOT AN EMERGENCY, AND WORK IN FLIGHT IS REAL.
+
+        The worker exits on SIGTERM and the session resumes, but whatever it
+        was doing at that moment does not: a tool call is abandoned and the
+        turn re-runs. For a background agent that can mean a half-finished
+        deploy repeated. Remote Control being refused costs nothing by
+        comparison, and the session will be idle again shortly.
+        """
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
+                                                 tmp_path, busy=True)
+        assert daemon.recycle_denied_sessions() == 0
+        assert signalled == []
+
+    def case_an_interactive_session_is_never_recycled(self, tmp_path,
+                                                      monkeypatch):
+        """THE GUARD THAT MATTERS MOST. Only a `bg` session is respawned by the
+        Claude Code daemon. Signalling an interactive one does not replace it,
+        it ENDS it — the user's terminal, mid-conversation, to fix a slash
+        command they may not even have run."""
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
+                                                 tmp_path, kind="interactive")
+        assert daemon.recycle_denied_sessions() == 0
+        assert signalled == []
+
+    def case_a_refusal_older_than_the_process_is_left_alone(self, tmp_path,
+                                                            monkeypatch):
+        """A transcript keeps every refusal it ever printed, including ones
+        belonging to a worker that has already been replaced. Without an age
+        test the daemon reads its own past success as a fresh fault and
+        recycles the session forever."""
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(
+            pin_proxy, monkeypatch, tmp_path,
+            refusal_at="2026-08-19T01:00:00.000Z",
+            started_ms=1787116800000)      # process started after the refusal
+        assert daemon.recycle_denied_sessions() == 0
+        assert signalled == []
+
+    def case_a_real_denial_recycles_nothing(self, tmp_path, monkeypatch):
+        """THE CONTROL. When the PIN's own answer denies Remote Control the
+        refusal is correct, and a fresh worker would read the same denial and
+        refuse again — an endless recycle of every session on the host."""
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
+                                                 tmp_path, allowed=False)
+        assert daemon.recycle_denied_sessions() == 0
+        assert signalled == []
+
     def case_an_unaskable_policy_leaves_the_file_alone(self, tmp_path,
                                                        monkeypatch):
         """THE CONTROL. Absent is DENIED on the reader's side
@@ -1385,6 +1577,7 @@ class TestLiveRemoteControlSessions:
         daemon.sweep_titles_once = lambda: ticks.append("titles")
         daemon.sweep_policy_once = lambda: ticks.append("policy")
         daemon.carry_live_pointers = lambda login: ticks.append("pointers")
+        daemon.recycle_denied_sessions = lambda: ticks.append("recycle")
         # ONLY THE PERIOD IS SHORTENED, never the first-pass delay: if the loop
         # goes back to sleeping a whole period before its first sweep, this
         # test must fail. MEASURED — it did exactly that, and a daemon replaced
@@ -1418,6 +1611,10 @@ class TestLiveRemoteControlSessions:
             "the policy repair is not on the daemon's beat, so a stale "
             "org-policy answer keeps refusing Remote Control machine-wide "
             "with nothing running to correct it")
+        assert "recycle" in ticks, (
+            "the worker recycle is not on the daemon's beat, so a session "
+            "already holding another account's denial refuses Remote Control "
+            "for the rest of its life with nothing running to release it")
 
 
 class TestRepinIsLive:
