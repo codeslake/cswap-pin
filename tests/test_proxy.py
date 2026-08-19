@@ -2340,6 +2340,39 @@ class TestIsPinnedRoute:
             # so the rule is an exact match, same as /api/oauth/validate.
             ("/api/claude_code/other", False,
              "only the policy question is pinned, not the whole subtree"),
+            # THE IMAGE A PERSON ATTACHES ON claude.ai, and the third symptom
+            # of the same cause as the two rows above.
+            #
+            # MEASURED 2026-08-19 in a live session: an image sent from
+            # claude.ai arrived as the literal text
+            # `[attachment could not be downloaded]`, while eight earlier
+            # images in the SAME session arrived fine as base64 blocks of
+            # 376-656 KB. The split is not the image and not the queue -- a
+            # queued image succeeded, so that hypothesis is dead. The
+            # successes predate the account rotations; the failure follows
+            # them.
+            #
+            # CC 2.1.236 resolves a bridge attachment in `nkA`:
+            #     GET ${BASE_API_URL}/api/oauth/files/<file_uuid>/content
+            #     Authorization: Bearer <the ACTIVE account's token>
+            # and turns any non-200 into `{failure:"download"}`, which `okA`
+            # renders as "it could not be downloaded". The file was uploaded
+            # on the PINNED account's claude.ai, so the active account cannot
+            # read it and the person sees an image that never loads.
+            #
+            # A READ of an asset the pin owns, exactly like /api/frame/. It
+            # creates no ownership, so pinning it cannot mis-attribute
+            # anything the way a mint or a create could.
+            ("/api/oauth/files/f0d3/content", True,
+             "the attachment lives on the PINNED account's claude.ai; asked "
+             "as the active account it is not 200 and the image never loads"),
+            # And the prefix is `/api/oauth/files/`, NOT `/api/oauth/`, for
+            # the reason the `/api/oauth/token` row above already gives:
+            # minting must never travel as the pin. That row is the guard, so
+            # it stays where it is rather than being duplicated here.
+            ("/api/oauth/files", False,
+             "the bare collection is not an owned asset; only a file's own "
+             "content is"),
         ):
             assert is_pinned_route(path) is pinned, f"{path}: {why}"
 
