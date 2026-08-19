@@ -1266,14 +1266,34 @@ class TestLiveRemoteControlSessions:
         # on a CI runner. The test passed here and failed there, asserting
         # about the developer's filesystem rather than about the code.
         sentinel = object()
+        # `raising=False` because the RELEASED host has no such attribute and
+        # setattr refuses to invent one — the same asymmetry the code under
+        # test exists to absorb.
         monkeypatch.setattr(pin_proxy.oauth, "_pin_aware_ssl_context",
-                            lambda: sentinel)
+                            lambda: sentinel, raising=False)
         monkeypatch.setattr(pin_proxy.urllib.request, "urlopen", fake_urlopen)
         assert pin_proxy.policy_limits_for("tok") == {"restrictions": {}}
         assert seen["context"] is sentinel, (
             "the policy fetch did not go out on the PIN-AWARE context, so "
             "through the pin it dies CERTIFICATE_VERIFY_FAILED and the "
             "repair is a silent no-op — which is what production was doing")
+
+        # AND ON A HOST THAT DOES NOT HAVE THAT HELPER. claude-swap is a PEER,
+        # not a dependency, so cswap-pin runs against whatever version is
+        # installed — and the RELEASED one has no `_pin_aware_ssl_context`;
+        # it ships with the host that is still unreleased. Referencing it
+        # unconditionally raises AttributeError, which this function's `except`
+        # turns into None: the same silent no-op, reintroduced for everyone on
+        # the released host. MEASURED on CI, which installs exactly that.
+        monkeypatch.delattr(pin_proxy.oauth, "_pin_aware_ssl_context",
+                            raising=False)
+        seen.clear()
+        assert pin_proxy.policy_limits_for("tok") == {"restrictions": {}}, (
+            "an older host made the policy fetch fail outright — the pin has "
+            "to build its own context when the host cannot lend one")
+        assert seen["context"] is not None, (
+            "fell back to the default TLS context, which cannot verify the "
+            "pin's own MITM certificate")
 
     def case_a_session_disconnected_by_a_rotation_is_recovered(
         self, tmp_path, monkeypatch

@@ -9191,6 +9191,38 @@ def _active_oauth_token() -> "str | None":
         return None
 
 
+def _verifying_context() -> "ssl.SSLContext":
+    """A context that trusts the pin's own MITM certificate.
+
+    THE HOST MAY NOT HAVE THE HELPER. `oauth._pin_aware_ssl_context` ships
+    with a host that is still unreleased, and claude-swap is a PEER whose
+    version we do not choose — the RELEASED one has no such attribute. Naming
+    it unconditionally raises AttributeError inside a function whose `except`
+    turns everything into `None`, so on a released host the policy repair goes
+    back to being the silent no-op it was before it was fixed. Measured on CI,
+    which installs exactly that host.
+
+    We do not need the host for this. The pin ISSUES the CA in question, so it
+    can add it itself; the helper is used when present only because it also
+    picks up whatever else that host knows to trust.
+    """
+    helper = getattr(oauth, "_pin_aware_ssl_context", None)
+    if helper is not None:
+        try:
+            return helper()
+        except Exception:  # noqa: BLE001 — fall through to our own
+            pass
+    ctx = ssl.create_default_context()
+    try:
+        bundle = require("switcher").ClaudeAccountSwitcher().backup_dir \
+            / "pin-proxy" / "ca-bundle.pem"
+        if bundle.exists():
+            ctx.load_verify_locations(cafile=str(bundle))
+    except Exception:  # noqa: BLE001 — an unpinned machine has no bundle
+        pass
+    return ctx
+
+
 def policy_limits_for(token: "str | None") -> "dict | None":
     """The org-policy document the server returns for ONE account.
 
@@ -9221,8 +9253,7 @@ def policy_limits_for(token: "str | None") -> "dict | None":
         # cache' daemon.log` returned 0 across every rotation on this host —
         # the repair had never once run, and nothing said so.
         with urllib.request.urlopen(
-                req, timeout=10,
-                context=oauth._pin_aware_ssl_context()) as resp:
+                req, timeout=10, context=_verifying_context()) as resp:
             doc = json.loads(resp.read().decode())
         return doc if isinstance(doc, dict) else None
     except Exception:  # noqa: BLE001 — never take the daemon down
