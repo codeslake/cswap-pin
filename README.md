@@ -151,13 +151,46 @@ permanently. It was removed.
 
 ## Install
 
-```bash
-uv tool install 'claude-swap[pin]'      # or: pipx install 'claude-swap[pin]'
+The pin is an optional extra of claude-swap, not a standalone tool: it reads
+cswap's account store, rewrites the config cswap already manages, and the
+`cswap pin` command itself lives in the host. Installing `cswap-pin` on its own
+does nothing useful.
+
+**The extra is not on PyPI yet, and the obvious line does not fail — it
+warns.** `claude-swap` 0.25.0 publishes only the `menubar` extra, so this
+installs a host with no pin in it and exits 0. Measured on a clean macOS HOME:
+
+```console
+$ uv tool install 'claude-swap[pin]'
+warning: The package `claude-swap==0.25.0` does not have an extra named `pin`
+Installed 2 executables: claude-swap, cswap
+$ cswap pin
+cswap: error: unrecognized arguments: pin
 ```
 
-The pin is an optional extra of claude-swap, not a standalone tool: it reads
-cswap's account store and rewrites the config cswap already manages. Installing
-`cswap-pin` on its own does nothing useful.
+Until a host release carries it, install from the branch that does. Measured
+the same way, on a HOME with nothing but `claude` on PATH — no proxy, no CA
+bundle, no other wiring:
+
+```bash
+uv tool install "claude-swap[pin] @ git+https://github.com/codeslake/claude-swap@feat/pin-package-seam"
+```
+
+```console
+$ cswap --version
+cswap 0.26.0b1
+$ cswap pin
+No cloud account pinned
+```
+
+Once the host release lands, the plain form is the one to use — and the line
+above keeps working, so there is no rush to change it:
+
+```bash
+uv tool install 'claude-swap[pin]'
+```
+
+`pipx` should take the same arguments, but this was verified with `uv` only.
 
 **On a machine running claude-swap from a checkout, keep it editable.** The
 command above installs the PyPI release and replaces whatever was there, extras
@@ -195,6 +228,21 @@ exec, because the successor came up with no holder above it. Every spawn now
 lands under one.
 
 ## Use
+
+**An account has to exist first.** The pin points at one of cswap's managed
+accounts by number, so on a machine that has none, the first command in this
+section is the one that fails:
+
+```console
+$ cswap pin 2
+Error: Account-2 does not exist
+$ cswap list
+No accounts are managed yet.
+No active Claude account found. Please log in first.
+```
+
+Log in with `claude` and let cswap pick the account up (`cswap list` shows the
+numbers), then:
 
 ```bash
 cswap pin 2          # RC / artifacts / ultrareview → account 2
