@@ -1060,6 +1060,90 @@ class TestLiveRemoteControlSessions:
             f"this connect just created."
         )
 
+    def case_a_title_the_server_rewrites_later_is_repaired_by_the_daemon(
+        self, monkeypatch
+    ):
+        """THE CONNECT HOOK CANNOT SEE A TITLE THAT DOES NOT EXIST YET.
+
+        The server renames an ACTIVE bridge from the conversation's content,
+        minutes to hours after it was created. `_sweep_bridges_after_connect`
+        has long finished, and its own docstring says there is no second
+        chance: "a bridge missed here stays wrong until some OTHER session
+        happens to connect".
+
+        The only periodic repair lived in `AutoSwitchEngine.tick()` — so the
+        pin's own feature was switched off by a component the pin does not
+        need. MEASURED on host-a 2026-08-19: `.auto-live.lock` FREE (no
+        live engine), last restore logged 03:08:39Z, and the bridge created at
+        03:29:53Z sat under 'RC process unexpected behavior' and then
+        'Account switching to claude.ai'. The 21 ARCHIVED bridges beside it
+        were all correct — their conversations had stopped, so the server had
+        stopped renaming them.
+
+        The daemon is always running. The repair belongs to it.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        puts: list[tuple[str, bytes]] = []
+
+        def _api(self, method, path, token, body=None, **kw):
+            if method == "PUT":
+                puts.append((path, body))
+            return {}
+
+        listing = [{"id": "cse_live", "title": "Account switching"}]
+        monkeypatch.setattr(pin_proxy, "live_bridge_names",
+                            lambda: {"cse_live": "cswap_pin_artifacts"})
+        monkeypatch.setattr(pin_proxy, "server_generated_titles",
+                            lambda: {"Account switching"})
+        monkeypatch.setattr(pin_proxy.PinProxy, "_bridge_api", _api)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        daemon._list_bridges = lambda token: listing
+
+        daemon.sweep_titles_once()
+
+        assert puts, (
+            "nothing repaired the title. With no auto-switch engine running, "
+            "the daemon is the only process left that can, and a pin feature "
+            "must not depend on the switch engine being alive."
+        )
+        assert b"cswap_pin_artifacts" in puts[0][1]
+
+    def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
+        """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
+        a repair nothing invokes is the defect being fixed, one layer up.
+
+        AND THE FIRST VERSION OF THIS TEST DID NOT TEST IT. It called
+        `_title_sweep_loop` directly, so deleting the `Thread(...).start()`
+        from `_start_accept_loop` left it GREEN — measured, the mutation
+        survived. Start where the daemon starts: the only thing that proves a
+        loop runs is the code that launches it.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._stop = False
+        daemon._accept_loop = lambda: None
+        ticks: list[int] = []
+        daemon.sweep_titles_once = lambda: ticks.append(1)
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_S", 0.0)
+
+        daemon._start_accept_loop()
+        try:
+            for _ in range(400):
+                if ticks:
+                    break
+                time.sleep(0.01)
+        finally:
+            daemon._stop = True
+
+        assert ticks, (
+            "starting the daemon did not arm the periodic title sweep, so the "
+            "repair exists and nothing runs it — which is how it came to "
+            "depend on the auto-switch engine in the first place")
+
 
 class TestRepinIsLive:
     """Switching accounts in cswap never asks you to restart a session, and
