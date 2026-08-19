@@ -1067,12 +1067,80 @@ class TestLiveRemoteControlSessions:
 
         fresh = {"restrictions": {}, "compliance_taints": []}
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
-        monkeypatch.setattr(pin_proxy, "active_policy_limits", lambda: fresh)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: fresh)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is True, (
             "the daemon left another account's restrictions in place")
         assert json.loads(cache.read_text()) == fresh
+
+    def case_the_daemon_asks_the_policy_question_as_the_pin(
+        self, tmp_path, monkeypatch
+    ):
+        """THE ANSWER THAT GOVERNS A PINNED SESSION IS THE PIN'S.
+
+        The file this writes is machine-wide, and every session on the host
+        reads it. Writing the ACTIVE account's answer applies one org's
+        restrictions to sessions whose work travels as another's — the exact
+        thing the pin exists to prevent, and the user's own framing of it:
+        the two accounts being in different orgs is the FEATURE.
+
+        MEASURED: an enterprise account carrying `allow_remote_control:
+        {"allowed": false}` was made active. That denial reached the file and
+        every live process's cache, and `/remote-control` refused for hours on
+        sessions pinned to an account the server placed no restriction on.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        asked = []
+        allows = {"restrictions": {}, "compliance_taints": []}
+        denies = {"restrictions": {"allow_remote_control": {"allowed": False}},
+                  "compliance_taints": []}
+
+        def fake(token):
+            asked.append(token)
+            return allows if token == "pin-token" else denies
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", fake)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "pin-token"
+        assert daemon.sweep_policy_once() is True
+        assert asked == ["pin-token"], (
+            f"asked as {asked!r}: the active account's restrictions do not "
+            "govern a session whose requests go out as the pin")
+        assert json.loads((cfg / "policy-limits.json").read_text()) == allows
+
+    def case_with_no_pin_the_active_account_still_answers(
+        self, tmp_path, monkeypatch
+    ):
+        """THE CONTROL for the case above. An unpinned machine has only one
+        account, so its answer is the right one — the pin must not become a
+        precondition for repairing the file at all."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        asked = []
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        def fake(token):
+            asked.append(token)
+            return doc
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", fake)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: "active-token")
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: None
+        assert daemon.sweep_policy_once() is True
+        assert asked == ["active-token"]
 
     def case_an_unaskable_policy_leaves_the_file_alone(self, tmp_path,
                                                        monkeypatch):
@@ -1090,9 +1158,10 @@ class TestLiveRemoteControlSessions:
         cache.write_text(json.dumps(stale))
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
-        monkeypatch.setattr(pin_proxy, "active_policy_limits", lambda: None)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: None)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is False
         assert json.loads(cache.read_text()) == stale, (
             "an unaskable policy cleared the cache, and absent is DENIED")
@@ -1964,6 +2033,39 @@ class TestIsPinnedRoute:
             # objection that killed the "hold oauthAccount" design.
             ("/api/oauth/token", False,
              "refresh must mint for the account whose refresh_token was sent"),
+            # THE ROUTE THAT DECIDES WHETHER RC SURVIVES AT ALL, and the one
+            # whose refusal cannot be undone without killing the session.
+            #
+            # Claude Code polls this hourly and feeds the answer straight into
+            # `setSessionCache`, which is what `isPolicyAllowed
+            # ('allow_remote_control')` reads. Two things make a wrong answer
+            # permanent rather than transient: the response is ALSO written to
+            # the machine-wide `policy-limits.json`, and the pre-fetch that
+            # `/remote-control` runs first returns early when a document is
+            # already cached — so nothing ever re-asks.
+            #
+            # MEASURED: an enterprise account whose document says
+            # `allow_remote_control: {"allowed": false}` was made active. Every
+            # live session's poll went out under it, cached the denial, and
+            # answered `/remote-control` with "Remote Control is disabled by
+            # your organization's policy" for the rest of the process's life —
+            # while the pinned account's own answer allowed it, and the server
+            # was never asked again.
+            #
+            # It belongs with `/api/oauth/validate`: both are QUESTIONS about
+            # who the session is, and the session's work travels as the pin, so
+            # the question must travel as the pin too. Asking under the active
+            # account applies one org's restrictions to another org's session,
+            # which is the exact thing the pin exists to prevent.
+            ("/api/claude_code/policy_limits", True,
+             "the policy that governs a pinned session is the PIN's; asking "
+             "under the active account caches another org's denial for the "
+             "life of the process"),
+            # The neighbour that must not be swept in by a prefix. Nothing
+            # else under /api/claude_code/ is known to be ownership-decided,
+            # so the rule is an exact match, same as /api/oauth/validate.
+            ("/api/claude_code/other", False,
+             "only the policy question is pinned, not the whole subtree"),
         ):
             assert is_pinned_route(path) is pinned, f"{path}: {why}"
 

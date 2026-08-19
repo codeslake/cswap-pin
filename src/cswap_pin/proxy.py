@@ -2732,6 +2732,38 @@ def is_pinned_route(path: str) -> bool:
     # ruled out pinning ``oauthAccount`` itself.
     if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
         return True
+    # ``/api/claude_code/policy_limits`` IS THE ROUTE THAT DECIDES WHETHER
+    # REMOTE CONTROL IS ALLOWED AT ALL, and a wrong answer here is permanent.
+    #
+    # Claude Code polls it hourly and feeds the answer into `setSessionCache`,
+    # which `isPolicyAllowed("allow_remote_control")` reads. The same answer is
+    # written to the machine-wide `policy-limits.json`, and the pre-fetch that
+    # `/remote-control` runs first (2.1.234) returns early when a document is
+    # already cached:
+    #
+    #     async function ...(){ try{ if(getResponseFromCache()!==null) return }
+    #
+    # so a denial that lands once is never re-asked for the life of the
+    # process. No restart, no recovery, and no request on the wire to see.
+    #
+    # MEASURED: an enterprise account whose document carries
+    # ``allow_remote_control: {"allowed": false}`` was made active. Every live
+    # session's poll went out under it and cached the denial; `/remote-control`
+    # answered "Remote Control is disabled by your organization's policy" for
+    # hours, while the PINNED account's own answer allowed it and the file on
+    # disk had already been repaired.
+    #
+    # Same reasoning as ``/api/oauth/validate`` above: both are QUESTIONS about
+    # who this session is, and its work travels as the pin — so the question
+    # must travel as the pin too. Asking under the active account applies one
+    # org's restrictions to another org's session, which is the exact thing
+    # the pin exists to prevent.
+    #
+    # EXACT MATCH, not an ``/api/claude_code/`` prefix, for the same reason
+    # validate is: nothing else known under that subtree is decided by
+    # ownership, and a prefix would swap routes nobody has looked at.
+    if path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits":
+        return True
     return (
         path.startswith("/v1/code/sessions")
         or path.startswith("/v1/sessions/")
@@ -8994,29 +9026,38 @@ def _config_home_for_policy() -> Path:
     return require("paths").get_claude_config_home()
 
 
-def active_policy_limits() -> "dict | None":
-    """The org-policy document the server returns for the ACTIVE account.
+def _active_oauth_token() -> "str | None":
+    """The access token of the account cswap currently has active.
 
-    The ACTIVE one, not the pinned one, and that is the whole point: this
-    document also carries `allow_routines` and compliance taints, so serving
-    the pinned account's answer would apply one org's permissions to another's
-    session. The pin decides who OWNS cloud assets; it does not decide whose
-    policy a machine runs under.
+    THROUGH cswap's OWN READER, not the credentials FILE. On macOS the live
+    credential lives in the Keychain and that path does not exist — so a file
+    version silently did nothing on two of three machines, which is exactly
+    the shape of failure the policy repair exists to end.
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        raw = json.loads(sw._read_credentials() or "{}")
+        return (raw.get("claudeAiOauth") or {}).get("accessToken") or None
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return None
+
+
+def policy_limits_for(token: "str | None") -> "dict | None":
+    """The org-policy document the server returns for ONE account.
+
+    Which account is the caller's decision, and on a pinned machine it is the
+    PIN's — see `sweep_policy_once`. This document carries
+    `allow_remote_control`, `allow_routines` and the compliance taints, so
+    asking as the wrong account applies one org's restrictions to another
+    org's session.
 
     ``None`` when it could not be asked, which the caller must keep apart from
     an empty document — see `sweep_policy_once`.
     """
+    if not token:
+        return None
     try:
         import urllib.request
-        # THROUGH cswap's OWN READER, not the credentials FILE. On macOS the
-        # live credential lives in the Keychain and that path does not exist —
-        # so the file version silently did nothing on two of three machines,
-        # which is exactly the shape of failure this repair exists to end.
-        sw = require("switcher").ClaudeAccountSwitcher()
-        raw = json.loads(sw._read_credentials() or "{}")
-        token = (raw.get("claudeAiOauth") or {}).get("accessToken")
-        if not token:
-            return None
         req = urllib.request.Request(
             "https://api.anthropic.com/api/claude_code/policy_limits",
             headers={"Authorization": f"Bearer {token}",
@@ -9536,8 +9577,18 @@ class PinProxy:
         A FETCH THAT FAILS CHANGES NOTHING. Absent is DENIED on the reader's
         side, so writing nothing is never the safe default, and truncating on
         an unreachable server would refuse Remote Control machine-wide.
+
+        ASKED AS THE PIN when there is one. The file is machine-wide and every
+        session reads it, and those sessions' requests go out as the pinned
+        account — so the pin's answer is the one that governs them. MEASURED:
+        an enterprise account carrying `allow_remote_control: {"allowed":
+        false}` was made active, that denial reached this file and every live
+        process's cache, and `/remote-control` refused for hours on sessions
+        pinned to an account the server placed no restriction on. Two accounts
+        in different orgs is the pin's whole purpose, not an edge case.
         """
-        doc = active_policy_limits()
+        doc = policy_limits_for(
+            self._pin_token_provider() or _active_oauth_token())
         if not isinstance(doc, dict):
             return False
         path = _config_home_for_policy() / "policy-limits.json"
@@ -9553,7 +9604,8 @@ class PinProxy:
             tmp.replace(path)      # atomic: no reader sees half a document
         except OSError:
             return False
-        _log_lifecycle("refreshed the org-policy cache for the active account")
+        _log_lifecycle("refreshed the org-policy cache for the account "
+                       "these sessions travel as")
         return True
 
     def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:
