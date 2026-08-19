@@ -9372,6 +9372,12 @@ class PinProxy:
     #: the repair, it does not add a second one.
     _TITLE_SWEEP_S = 300.0
 
+    #: The FIRST pass runs this soon after the daemon starts, not a full period
+    #: later. Long enough that a burst of handovers does not put three sweeps on
+    #: the wire at once; short enough that a daemon replaced every few minutes
+    #: still repairs something.
+    _TITLE_SWEEP_FIRST_S = 20.0
+
     def _title_sweep_loop(self) -> None:
         """Re-check cloud titles on a cadence, because the connect hook cannot.
 
@@ -9393,10 +9399,22 @@ class PinProxy:
         The daemon is always running; the repair belongs here. Sleep in short
         steps so `_stop` ends the thread promptly rather than up to five
         minutes later.
+
+        THE FIRST PASS IS EARLY, AND THAT IS NOT A DETAIL. This loop first
+        slept a full interval and only then worked, which is correct only for a
+        process that outlives its own period. This daemon does not: a deploy
+        replaces it, and so does a holder cycling its child — MEASURED, a
+        serving daemon 4.8 minutes old while titles had been wrong for over an
+        hour, because every handover restarted the clock before the first sweep
+        could fire. A repair that never runs is the defect this whole change
+        exists to remove, reintroduced one layer down.
         """
+        first = True
         while not self._stop:
             waited = 0.0
-            while waited < self._TITLE_SWEEP_S and not self._stop:
+            budget = self._TITLE_SWEEP_FIRST_S if first else self._TITLE_SWEEP_S
+            first = False
+            while waited < budget and not self._stop:
                 time.sleep(0.5)
                 waited += 0.5
             if self._stop:
