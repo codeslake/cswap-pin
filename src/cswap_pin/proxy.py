@@ -2765,11 +2765,37 @@ def is_pinned_route(path: str) -> bool:
     # ownership, and a prefix would swap routes nobody has looked at.
     if path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits":
         return True
+    # THE IMAGE A PERSON ATTACHES ON claude.ai, and the third symptom of the
+    # same cause as the two exact matches above.
+    #
+    # CC 2.1.236 resolves a bridge attachment in `nkA`:
+    #     GET ${BASE_API_URL}/api/oauth/files/<file_uuid>/content
+    #     Authorization: Bearer <the ACTIVE account's token>
+    #     if (status !== 200) return {failure:"download"}
+    # and `okA` renders that failure as "it could not be downloaded", which
+    # is what the person sees in place of their image.
+    #
+    # The file is uploaded on the PINNED account's claude.ai, so asked as the
+    # active account it is not 200. MEASURED 2026-08-19 in a live session:
+    # the image arrived as the literal text
+    # `[attachment could not be downloaded]`, while eight earlier images in
+    # the SAME session arrived fine as base64 blocks of 376-656 KB. The
+    # successes predate that day's account rotations and the failure follows
+    # them; the queue is not the discriminator, since a queued image
+    # succeeded.
+    #
+    # A READ of an asset the pin owns, like /api/frame/. It creates no
+    # ownership, so pinning it cannot mis-attribute anything the way a mint
+    # or a create could — which is why this one is safe as a PREFIX while
+    # /api/oauth/validate had to be an exact match. `/api/oauth/files/`, not
+    # `/api/oauth/`: minting must never travel as the pin, and the
+    # /api/oauth/token row in the table above is the guard for that.
     return (
         path.startswith("/v1/code/sessions")
         or path.startswith("/v1/sessions/")
         or path.startswith("/api/frame/")
         or path.startswith("/v1/ultrareview/")
+        or path.startswith("/api/oauth/files/")
     )
 
 
