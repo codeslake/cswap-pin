@@ -1169,6 +1169,10 @@ class TestLiveRemoteControlSessions:
         monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._certdir = tmp_path / "backup" / "pin-proxy"
+        # A pin whose ORG matches the login: the carry is allowed.
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@b.c", "new-org"))
         assert daemon.carry_live_pointers(("new-account", "new-org")) == 1
 
         after = json.loads(state.read_text())
@@ -1200,8 +1204,49 @@ class TestLiveRemoteControlSessions:
         monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._certdir = tmp_path / "backup" / "pin-proxy"
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@b.c", "same-org"))
         assert daemon.carry_live_pointers(("same-account", "same-org")) == 0
         assert state.stat().st_mtime_ns == before, "rewrote a record that agreed"
+
+    def case_a_pin_in_another_org_stops_the_carry_entirely(self, tmp_path,
+                                                           monkeypatch):
+        """THE GUARD `_carry_history_pointers` DOCUMENTS, and shipping without
+        it was a real defect on my side.
+
+        The stamp moves only what the LOCAL pointer claims; the bridge's owner
+        on the server does not move. Restamping to a login that does not own
+        the bridge therefore hands Claude Code a bridge it cannot use, and the
+        server answers 500 — while the veto this carry exists to defeat only
+        costs a history. A lost history is survivable; a 500 is not.
+
+        The pin's org is the evidence, because the bridge's true owner is the
+        thing this file deliberately never proves.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        job = tmp_path / "jobs" / "abc123"
+        job.mkdir(parents=True)
+        (job / "state.json").write_text(json.dumps({
+            "bridgeSessionId": "cse_keepme",
+            "bridgeOwnerAccountUuid": "old-account",
+            "bridgeOwnerOrganizationUuid": "old-org",
+        }))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                            lambda: tmp_path)
+        monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
+        # The pin belongs to a DIFFERENT org than the login.
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@b.c", "some-other-org"))
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._certdir = tmp_path / "backup" / "pin-proxy"
+        assert daemon.carry_live_pointers(("new-account", "new-org")) == 0
+        assert json.loads((job / "state.json").read_text())[
+            "bridgeOwnerAccountUuid"] == "old-account", (
+            "the carry ran across orgs and pointed a session at a bridge its "
+            "login does not own — the 500 this guard exists to prevent")
 
     def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
         """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
