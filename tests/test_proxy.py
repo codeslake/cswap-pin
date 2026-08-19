@@ -1023,6 +1023,66 @@ class TestLiveRemoteControlSessions:
         )
         assert b"cswap_pin_artifacts" in puts[0][1]
 
+    def case_the_daemon_repairs_a_policy_answer_left_by_another_account(
+        self, tmp_path, monkeypatch
+    ):
+        """A LIVE SESSION RE-READS THIS FILE, SO IT HAS TO BE RIGHT ALREADY.
+
+        `/remote-control` resolves `Ms('allow_remote_control')` -> `Hcd()` ->
+        `<config home>/policy-limits.json`, held in a per-process session
+        cache. Claude Code CLEARS that cache when it detects the signed-in
+        account changed (`... B_t.cache?.clear?.(), await AVs()`), so a live
+        session does re-read — without a restart.
+
+        What it re-reads is the file, and the file is machine-wide and written
+        with whatever account was ACTIVE at fetch time. MEASURED: a document
+        left by a restricted org sat on one host from the previous evening,
+        denying Remote Control to every session there, while the server
+        returned no such restriction for the account actually in use.
+
+        Nothing but the daemon is positioned to keep it honest: it is the one
+        process that is always running and always knows the active account.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        cache = cfg / "policy-limits.json"
+        cache.write_text(json.dumps(
+            {"restrictions": {"allow_remote_control": {"allowed": False}}}))
+
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "active_policy_limits", lambda: fresh)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        assert daemon.sweep_policy_once() is True, (
+            "the daemon left another account's restrictions in place")
+        assert json.loads(cache.read_text()) == fresh
+
+    def case_an_unaskable_policy_leaves_the_file_alone(self, tmp_path,
+                                                       monkeypatch):
+        """THE CONTROL. Absent is DENIED on the reader's side
+        (`if(!t){ if(aK_.has(e)){ if(fK()) return !1 }}`), so a fetch that
+        cannot reach the server must never clear or truncate the file. The old
+        answer may be wrong for this account; no answer is wrong for every
+        account."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        cache = cfg / "policy-limits.json"
+        stale = {"restrictions": {"allow_remote_control": {"allowed": True}}}
+        cache.write_text(json.dumps(stale))
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "active_policy_limits", lambda: None)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        assert daemon.sweep_policy_once() is False
+        assert json.loads(cache.read_text()) == stale, (
+            "an unaskable policy cleared the cache, and absent is DENIED")
+
     def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
         """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
         a repair nothing invokes is the defect being fixed, one layer up.
@@ -1039,7 +1099,8 @@ class TestLiveRemoteControlSessions:
         daemon._stop = False
         daemon._accept_loop = lambda: None
         ticks: list[int] = []
-        daemon.sweep_titles_once = lambda: ticks.append(1)
+        daemon.sweep_titles_once = lambda: ticks.append("titles")
+        daemon.sweep_policy_once = lambda: ticks.append("policy")
         # ONLY THE PERIOD IS SHORTENED, never the first-pass delay: if the loop
         # goes back to sleeping a whole period before its first sweep, this
         # test must fail. MEASURED — it did exactly that, and a daemon replaced
@@ -1056,10 +1117,14 @@ class TestLiveRemoteControlSessions:
         finally:
             daemon._stop = True
 
-        assert ticks, (
+        assert "titles" in ticks, (
             "starting the daemon did not arm the periodic title sweep, so the "
             "repair exists and nothing runs it — which is how it came to "
             "depend on the auto-switch engine in the first place")
+        assert "policy" in ticks, (
+            "the policy repair is not on the daemon's beat, so a stale "
+            "org-policy answer keeps refusing Remote Control machine-wide "
+            "with nothing running to correct it")
 
 
 class TestRepinIsLive:
