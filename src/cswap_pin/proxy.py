@@ -11367,6 +11367,21 @@ class PinProxy:
                 # fails simply finds nothing new to supersede.
                 if method == "POST" and path == "/v1/code/sessions":
                     self._sweep_bridges_after_connect(token)
+                # THE ONE MOMENT A DENIED SESSION BECOMES UN-DENIED, and the
+                # only evidence of it. Claude Code caches the policy answer per
+                # process and its `/remote-control` pre-fetch returns early
+                # when a document is already cached, so a session that once
+                # read a denial keeps refusing with no request on the wire.
+                # This poll is the sole thing that replaces that cache, and
+                # only on a 200 — a failure or a 304 re-seeds the same
+                # document. Saying so here is the difference between "the fix
+                # will reach it" and having watched it arrive.
+                if path.split("?", 1)[0].rstrip("/") == \
+                        "/api/claude_code/policy_limits":
+                    _log_lifecycle(
+                        "a session asked for its org policy — answered as the "
+                        "pinned account, so a cached denial from another "
+                        "account is replaced without a restart")
             else:
                 # Fail-open: the request still goes, on the disk bearer. That is
                 # deliberate — a pin that cannot resolve must never block work —
