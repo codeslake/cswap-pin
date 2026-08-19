@@ -1145,7 +1145,7 @@ class TestLiveRemoteControlSessions:
     def _denied_fixture(self, pin_proxy, monkeypatch, tmp_path, kind="bg",
                         refusal_at="2026-08-19T07:32:50.819Z",
                         started_ms=1787000000000, allowed=True, busy=False,
-                        quoted=False):
+                        quoted=False, marker=None):
         """One live session that printed the org-policy refusal.
 
         Shared by the four cases below because they differ in ONE input each --
@@ -1161,10 +1161,12 @@ class TestLiveRemoteControlSessions:
             "jobId": "job-1"}))
         (home / "jobs" / "job-1").mkdir(parents=True)
         (home / "jobs" / "job-1" / "state.json").write_text(json.dumps({
+            "bridgeSessionId": "cse_live",
             "inFlight": {"tasks": 1 if busy else 0, "queued": 0}}))
-        refusal = ("<local-command-stdout>Remote Control is disabled by your "
-                   "organization's policy. Contact your organization admin "
-                   "for access.</local-command-stdout>")
+        refusal = marker or (
+            "<local-command-stdout>Remote Control is disabled by your "
+            "organization's policy. Contact your organization admin "
+            "for access.</local-command-stdout>")
         # A REAL refusal is a `system` record; a paste of one lands inside a
         # `user` message. Only the first is evidence about THIS process.
         entry = ({"timestamp": refusal_at, "type": "user",
@@ -1190,6 +1192,7 @@ class TestLiveRemoteControlSessions:
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         daemon._recycled = set()
+        daemon._connected_bridges = set()
         return daemon, signalled
 
     def case_a_session_refused_by_a_stale_policy_is_recycled(
@@ -1262,6 +1265,51 @@ class TestLiveRemoteControlSessions:
             "the policy fetch went out on a default TLS context, so through "
             "the pin it dies CERTIFICATE_VERIFY_FAILED and the repair is a "
             "silent no-op — which is what production was doing")
+
+    def case_a_session_disconnected_by_a_rotation_is_recovered(
+        self, tmp_path, monkeypatch
+    ):
+        """RECOVERY, SINCE PREVENTION IS NOT AVAILABLE.
+
+        An account rotation tears a bridge down with "Remote Control
+        disconnected — signed-in claude.ai account or organization changed on
+        this machine". That comparison cannot be won from here: the owner field
+        it reads is wanted in opposite directions by the reattach check and the
+        live check, and the env that would bypass it cannot reach a background
+        worker, which is pre-spawned into a pool before its session exists.
+
+        So the daemon restores instead of preventing. The same worker recycle
+        that clears a cached policy denial also re-establishes the bridge —
+        MEASURED, Remote Control came back with no user action.
+        """
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(
+            pin_proxy, monkeypatch, tmp_path,
+            marker="Remote Control disconnected — signed-in claude.ai account "
+                   "or organization changed on this machine")
+        daemon._connected_bridges = set()          # its bridge is gone
+        assert daemon.recycle_denied_sessions() == 1
+        assert signalled == [4242]
+
+    def case_a_session_that_already_has_its_bridge_back_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """THE GUARD THAT KEEPS A ROTATION FROM RESTARTING THE WHOLE HOST.
+
+        Every session on the machine prints the disconnect line on the same
+        rotation, and most get their bridge back on their own. Recycling on the
+        transcript line alone would restart thirteen working sessions to fix
+        the one that did not recover. The server's own connected set is the
+        discriminator, and it is already paid for by the title sweep.
+        """
+        from cswap_pin import proxy as pin_proxy
+        daemon, signalled = self._denied_fixture(
+            pin_proxy, monkeypatch, tmp_path,
+            marker="Remote Control disconnected — signed-in claude.ai account "
+                   "or organization changed on this machine")
+        daemon._connected_bridges = {"cse_live"}   # it reconnected already
+        assert daemon.recycle_denied_sessions() == 0
+        assert signalled == []
 
     def case_a_session_that_only_QUOTED_the_refusal_is_left_alone(
         self, tmp_path, monkeypatch
