@@ -636,95 +636,6 @@ class TestLiveRemoteControlSessions:
         """
         monkeypatch.setattr("cswap_pin.proxy._host_slug", lambda: slug)
 
-    def case_a_name_somebody_typed_is_never_the_servers(
-        self, tmp_path, monkeypatch
-    ):
-        """THE FUNCTION ITSELF, which nothing tested — every other case here
-        monkeypatches it.
-
-        The set is machine-global and all-time, so a title a user chooses can
-        collide with an `aiTitle` written months ago under an unrelated
-        project, and the caller would then OVERWRITE the name they typed. This
-        function's own docstring calls that the unacceptable direction: a
-        false positive destroys a human's words, a false negative only leaves
-        one bridge wrong.
-
-        Claude Code records the two in different fields precisely so they can
-        be told apart, so the veto reads `custom-title` out of the same walk.
-        """
-        import json as _json
-
-        import cswap_pin.proxy as pp
-
-        home = tmp_path / "cfg"
-        proj = home / "projects" / "some-project"
-        proj.mkdir(parents=True)
-        monkeypatch.setattr(
-            "claude_swap.paths.get_claude_config_home", lambda: home)
-
-        (proj / "a.jsonl").write_text("\n".join([
-            _json.dumps({"type": "ai-title", "aiTitle": "Add a status line"}),
-            _json.dumps({"type": "ai-title", "aiTitle": "shared name"}),
-            "not json at all",
-        ]) + "\n")
-        # ANOTHER PROJECT, MONTHS LATER: the user types a name that happens to
-        # equal an old aiTitle above.
-        other = home / "projects" / "another"
-        other.mkdir()
-        (other / "b.jsonl").write_text(
-            _json.dumps({"type": "custom-title", "customTitle": "shared name"})
-            + "\n")
-
-        got = pp.server_generated_titles()
-
-        assert "Add a status line" in got, (
-            f"the aiTitle records were not read at all: {got}")
-        assert "shared name" not in got, (
-            "a title the user typed is in the set of things the server wrote, "
-            "so the restore would overwrite their own name with the local one "
-            f"— {got}")
-
-    def case_the_transcript_walk_is_paid_only_when_something_asks(
-        self, tmp_path, monkeypatch
-    ):
-        """IT WALKED EVERY TRANSCRIPT ON THE MACHINE, ON EVERY RC CONNECT.
-
-        Measured on this account: 11,584 `*.jsonl` under ~/.claude/projects,
-        11 GB, the largest single file 422 MB. `server_generated_titles` was
-        called at the top of `titles_to_restore`, ABOVE the two filters that
-        reject almost everything — so a listing where every bridge already
-        carries its own name, which is what a healthy machine looks like, paid
-        the entire walk for a set nothing then read.
-
-        The set is still computed at most once per call: the loop runs over
-        the whole listing and re-walking per item is the thing the original
-        hoist existed to prevent.
-        """
-        import cswap_pin.proxy as pp
-
-        calls = []
-        monkeypatch.setattr(
-            pp, "server_generated_titles",
-            lambda: calls.append(1) or {"an ai title"})
-
-        names = {"cse_a": "keep", "cse_b": "also"}
-        # EVERY TITLE ALREADY CORRECT — nothing can need restoring.
-        pp.titles_to_restore(
-            [{"id": "cse_a", "title": "keep"}, {"id": "cse_b", "title": "also"}],
-            names)
-        assert calls == [], (
-            "the whole-machine transcript walk ran for a listing with nothing "
-            "to restore — 11 GB read for a set no branch reaches")
-
-        # AND ONCE, NOT PER ITEM, the moment one of them differs.
-        pp.titles_to_restore(
-            [{"id": "cse_a", "title": "an ai title"},
-             {"id": "cse_b", "title": "an ai title"}],
-            names)
-        assert calls == [1], (
-            f"walked {len(calls)} time(s) for one listing; the hoist that "
-            "made it once per call is what this must not undo")
-
     def case_the_slug_drops_the_domain(self, tmp_path, monkeypatch):
         """THE FUNCTION EVERY OTHER CASE HERE REPLACES, so nothing tested it.
 
@@ -861,24 +772,6 @@ class TestLiveRemoteControlSessions:
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import titles_to_restore
 
-        # THE SERVER'S OWN SENTENCE, INJECTED RATHER THAN GUESSED. Claude Code
-        # records what it generated as an `ai-title` transcript record, and
-        # `server_generated_titles` reads them. Supplying it here is what makes
-        # `cse_b` selectable WITHOUT a rule like "a space means the server
-        # wrote it" — the rule that used to claim 'Email advice' below.
-        monkeypatch.setattr(pp, "server_generated_titles",
-                            lambda: {"Session interrupted by user"})
-        # THE OTHER HALF OF THE EVIDENCE. `custom-title` records are what a
-        # HUMAN asked for; a cloud title in neither set was written by nobody
-        # on this machine, which is the only thing that identifies the
-        # sentences claude.ai writes for an active bridge — it records them
-        # nowhere locally, so `ai-title` can never contain them.
-        monkeypatch.setattr(
-            pp, "locally_chosen_titles",
-            # Every one of these is a name somebody gave a session here, so CC
-            # wrote a `custom-title` record for it. That is what makes them
-            # evidence rather than shape.
-            lambda: {"Email advice", "paper-rebuttal", "ai-inter-session"})
         self._host(monkeypatch)
 
         names = {"cse_a": "cswap", "cse_b": "cswap", "cse_c": "cswap",
@@ -923,14 +816,15 @@ class TestLiveRemoteControlSessions:
             {"id": "cse_g", "title": "Account switching to claude.ai"},
         ]
         assert titles_to_restore(listing, names) == [
-            ("cse_a", "cswap"), ("cse_b", "cswap"),
+            ("cse_a", "cswap"), ("cse_b", "cswap"), ("cse_c", "cswap"),
+            ("cse_d", "cswap"), ("cse_e", "cswap"), ("cse_f", "cswap"),
             ("cse_g", "cswap_pin_artifacts"),
         ], (
-            "the selection is wrong in one of two directions: a title a human "
-            "typed was picked for overwrite, or a title the server invented "
-            "was left in place. Compare the ids, not the count — the failure "
-            "CI produced at fae276d was the second kind (too few), while this "
-            "message used to name only the first."
+            "every row here is a bridge THIS machine's registry says a live "
+            "session holds, under a name that session gave it, and every "
+            "cloud title differs from that name. Selecting fewer than all of "
+            "them means some live session keeps a name it never chose — which "
+            "is the whole defect. Compare the ids, not the count."
         )
 
     def case_a_bridge_the_server_already_titles_correctly_is_left_alone(
@@ -1114,8 +1008,6 @@ class TestLiveRemoteControlSessions:
         listing = [{"id": "cse_live", "title": "Account switching"}]
         monkeypatch.setattr(pin_proxy, "live_bridge_names",
                             lambda: {"cse_live": "cswap_pin_artifacts"})
-        monkeypatch.setattr(pin_proxy, "server_generated_titles",
-                            lambda: {"Account switching"})
         monkeypatch.setattr(pin_proxy.PinProxy, "_bridge_api", _api)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
