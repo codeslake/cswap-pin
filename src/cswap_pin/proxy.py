@@ -9309,39 +9309,6 @@ class PinProxy:
                 self.sweep_policy_once()
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
-            # AND THE POINTER, which decides whether a reattach is even
-            # attempted. A stale one sends Claude Code down the MINT path, and
-            # minting is what the policy gate can refuse — so this and the
-            # policy sweep are the two halves of "Remote Control still works
-            # after the account moved". Its own try/except for the same reason.
-            try:
-                self.sweep_pointers_once()
-            except Exception:  # noqa: BLE001 — never take the daemon down
-                pass
-
-    def sweep_pointers_once(self) -> int:
-        """Restamp live sessions' bridge pointers onto the current login.
-
-        WHY THE DAEMON, and it is the same argument as the title sweep one
-        frame up. `_carry_history_pointers` had exactly two callers and neither
-        reaches a session that is already running: `ensure_proxy` fires when a
-        NEW session starts, `heal` when a human types a cswap command. Its own
-        docstring says "everything else in this module reacts to a launch".
-
-        MEASURED: after several account rotations, thirteen live sessions held
-        a pointer matching the current login and ONE did not — the one that had
-        not relaunched since. Claude Code compares that pointer against
-        `~/.claude.json`'s `oauthAccount` and, on a mismatch, refuses to
-        reattach and MINTS a fresh bridge instead. Minting is the path the
-        org-policy gate can refuse, so that session was the only one on the
-        machine denied Remote Control, for three and a half hours, while its
-        siblings — which only had to reattach — were fine.
-
-        The daemon is always up and already resolves the login every pass, so
-        the repair belongs on its beat rather than on an event that may never
-        come again for a given session.
-        """
-        return _carry_history_pointers(self._certdir)
 
     def sweep_policy_once(self) -> bool:
         """Put the ACTIVE account's real policy answer in CC's cache file.

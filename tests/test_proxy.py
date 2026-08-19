@@ -1134,43 +1134,6 @@ class TestLiveRemoteControlSessions:
             f"`cse_theirs` belongs to a session this machine cannot see — "
             f"reviving either is acting on something that is not ours.")
 
-    def case_the_daemon_carries_pointers_for_sessions_already_running(
-        self, monkeypatch
-    ):
-        """THE POINTER REPAIR WAS ON THE LAUNCH PATH ONLY.
-
-        `_carry_history_pointers` has two callers and neither reaches a session
-        that is already up: `ensure_proxy` runs when a NEW session starts, and
-        `heal` when a human types a cswap command. Its own docstring says so —
-        "everything else in this module reacts to a launch".
-
-        MEASURED: after several account rotations, thirteen live sessions held
-        a pointer matching the current login and ONE did not. The odd one had
-        not relaunched, so nothing had restamped it. Its `/remote-control` then
-        had to MINT a bridge rather than reattach, and minting is what the
-        org-policy gate refuses — three and a half hours of a session being the
-        only one refused, for want of a repair that only runs at launch.
-
-        The daemon is always up and already knows the login. Same reasoning
-        that moved the title sweep here.
-        """
-        from cswap_pin import proxy as pin_proxy
-
-        called = []
-        monkeypatch.setattr(pin_proxy, "_carry_history_pointers",
-                            lambda certdir: called.append(certdir) or 1)
-
-        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
-        # THE REAL ATTRIBUTE NAME. The first cut of this test set
-        # `daemon.certdir`, which the constructor never defines — so it
-        # passed while the daemon would have died on AttributeError.
-        daemon._certdir = "/some/certdir"
-        assert daemon.sweep_pointers_once() == 1
-        assert called == ["/some/certdir"], (
-            "the daemon did not restamp live sessions' bridge pointers, so a "
-            "session that never relaunches keeps naming an account that is no "
-            "longer the login and is refused a reattach")
-
     def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
         """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
         a repair nothing invokes is the defect being fixed, one layer up.
@@ -1189,7 +1152,6 @@ class TestLiveRemoteControlSessions:
         ticks: list[int] = []
         daemon.sweep_titles_once = lambda: ticks.append("titles")
         daemon.sweep_policy_once = lambda: ticks.append("policy")
-        daemon.sweep_pointers_once = lambda: ticks.append("pointers")
         # ONLY THE PERIOD IS SHORTENED, never the first-pass delay: if the loop
         # goes back to sleeping a whole period before its first sweep, this
         # test must fail. MEASURED — it did exactly that, and a daemon replaced
@@ -1210,10 +1172,6 @@ class TestLiveRemoteControlSessions:
             "starting the daemon did not arm the periodic title sweep, so the "
             "repair exists and nothing runs it — which is how it came to "
             "depend on the auto-switch engine in the first place")
-        assert "pointers" in ticks, (
-            "the pointer restamp is not on the daemon's beat, so a session "
-            "that never relaunches keeps naming a stale account and is sent "
-            "down the mint path the policy gate refuses")
         assert "policy" in ticks, (
             "the policy repair is not on the daemon's beat, so a stale "
             "org-policy answer keeps refusing Remote Control machine-wide "
