@@ -8959,8 +8959,12 @@ def active_policy_limits() -> "dict | None":
     """
     try:
         import urllib.request
-        creds = require("paths").get_credentials_path()
-        raw = json.loads(Path(creds).read_text(encoding="utf-8"))
+        # THROUGH cswap's OWN READER, not the credentials FILE. On macOS the
+        # live credential lives in the Keychain and that path does not exist —
+        # so the file version silently did nothing on two of three machines,
+        # which is exactly the shape of failure this repair exists to end.
+        sw = require("switcher").ClaudeAccountSwitcher()
+        raw = json.loads(sw._read_credentials() or "{}")
         token = (raw.get("claudeAiOauth") or {}).get("accessToken")
         if not token:
             return None
