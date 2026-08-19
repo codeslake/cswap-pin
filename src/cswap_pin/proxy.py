@@ -9349,6 +9349,44 @@ class PinProxy:
         _log_lifecycle("refreshed the org-policy cache for the active account")
         return True
 
+    def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:
+        """Unarchive the bridges a LIVE session on this machine still holds.
+
+        AN ARCHIVED BRIDGE UNDER A LIVE SESSION IS A BROKEN RECONNECT.
+        `/remote-control` on an `active` bridge just reattaches; on an archived
+        one it has to unarchive first, and that step is where it fails.
+        MEASURED: thirteen live sessions on one host held `active` bridges and
+        reconnected fine, the fourteenth held an `archived` one and was refused
+        — the same account, the same machine, the same minute.
+
+        OWNERSHIP COMES FROM THE REGISTRY, exactly as it does for titles: a
+        bridge is in `live_bridge_names()` only because a process running HERE
+        holds it. Another machine's archived bridge is not ours to revive —
+        this host cannot see whether that session is still alive, and the pin
+        deliberately makes one account hold every machine's bridges.
+
+        Route read from the binary and confirmed against the live API:
+        `POST /v1/code/sessions/{id}/unarchive` -> 200. Two plausible
+        alternatives are not it — `/v1/sessions/{id}/unarchive` is 404 and
+        `DELETE .../archive` is 405 — so this is the shape, not a guess.
+        """
+        names = live_bridge_names()
+        revived = 0
+        for item in sessions:
+            sid = item.get("id")
+            if not sid or sid not in names:
+                continue
+            if item.get("status") != "archived":
+                continue
+            if self._bridge_api(
+                "POST", f"/v1/code/sessions/{sid}/unarchive", token
+            ) is not None:
+                revived += 1
+        if revived:
+            _log_lifecycle(
+                f"revived {revived} archived bridge(s) a live session still holds")
+        return revived
+
     def sweep_titles_once(self) -> int:
         """One pass: mint, list, restore. Returns how many titles were put.
 
@@ -9361,6 +9399,11 @@ class PinProxy:
         sessions = self._list_bridges(token)
         if sessions is None:
             return 0            # asked and got nothing — not "nothing to fix"
+        # ON THE LISTING WE ALREADY PAID FOR. Reviving an archived bridge and
+        # restoring its title are two repairs of the same object, and both are
+        # decided from the same rows — a second listing would buy nothing but
+        # a second chance for the account to have moved underneath us.
+        self.revive_archived_bridges(sessions, token)
         return self._restore_bridge_titles(sessions, token)
 
     def release_listener(self, hand_down: bool = False) -> "int | None":
