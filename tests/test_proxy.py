@@ -1016,9 +1016,15 @@ class TestLiveRemoteControlSessions:
         revived = []
         daemon.revive_archived_bridges = \
             lambda rows, tok: revived.append(len(rows))
+        cleared = []
+        daemon.clear_dead_bridge_records = \
+            lambda connected: cleared.append(connected)
 
         daemon.sweep_titles_once()
 
+        assert cleared and cleared[0] is not None, (
+            "the sweep never checked for a job record naming a dead bridge, "
+            "so a live session holding a corpse keeps reattaching to nothing")
         assert revived, (
             "the sweep restored titles without ever checking for an archived "
             "bridge, so a live session whose reconnect needs unarchiving is "
@@ -1210,43 +1216,86 @@ class TestLiveRemoteControlSessions:
         assert daemon.carry_live_pointers(("same-account", "same-org")) == 0
         assert state.stat().st_mtime_ns == before, "rewrote a record that agreed"
 
-    def case_a_pin_in_another_org_stops_the_carry_entirely(self, tmp_path,
-                                                           monkeypatch):
-        """THE GUARD `_carry_history_pointers` DOCUMENTS, and shipping without
-        it was a real defect on my side.
+    def case_a_job_record_pointing_at_a_dead_bridge_is_cleared(self, tmp_path,
+                                                               monkeypatch):
+        """A LIVE SESSION HOLDING A DEAD BRIDGE ID CAN NEVER RECONNECT.
 
-        The stamp moves only what the LOCAL pointer claims; the bridge's owner
-        on the server does not move. Restamping to a login that does not own
-        the bridge therefore hands Claude Code a bridge it cannot use, and the
-        server answers 500 — while the veto this carry exists to defeat only
-        costs a history. A lost history is survivable; a 500 is not.
+        MEASURED across fourteen live sessions on one host, same active
+        account, same pin. Thirteen had a job record naming a DIFFERENT bridge
+        than their transcript's last one — they had minted a new bridge and
+        moved on. One did not: both stores named the same id, and that id was a
+        bridge with no worker and no event since the session started. It was
+        the only session refused Remote Control.
 
-        The pin's org is the evidence, because the bridge's true owner is the
-        thing this file deliberately never proves.
+        Claude Code reads the job record for a background session, so it kept
+        trying to reattach to a corpse. `clearBridgeSession` is CC's own way of
+        saying "this conversation has no bridge" — and a session with no bridge
+        MINTS one, which is exactly what the other thirteen did.
+
+        So: when a live session's job record names a bridge the server no
+        longer has connected, clear the id and let CC do what it already does
+        everywhere else.
         """
         from cswap_pin import proxy as pin_proxy
 
         job = tmp_path / "jobs" / "abc123"
         job.mkdir(parents=True)
-        (job / "state.json").write_text(json.dumps({
-            "bridgeSessionId": "cse_keepme",
-            "bridgeOwnerAccountUuid": "old-account",
-            "bridgeOwnerOrganizationUuid": "old-org",
+        state = job / "state.json"
+        state.write_text(json.dumps({
+            "bridgeSessionId": "cse_dead",
+            "bridgeOwnerAccountUuid": "acct",
+            "name": "RVP",
         }))
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
                             lambda: tmp_path)
         monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
-        # The pin belongs to a DIFFERENT org than the login.
-        monkeypatch.setattr(pin_proxy, "load_pin",
-                            lambda root: ("a@b.c", "some-other-org"))
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
-        daemon._certdir = tmp_path / "backup" / "pin-proxy"
-        assert daemon.carry_live_pointers(("new-account", "new-org")) == 0
-        assert json.loads((job / "state.json").read_text())[
-            "bridgeOwnerAccountUuid"] == "old-account", (
-            "the carry ran across orgs and pointed a session at a bridge its "
-            "login does not own — the 500 this guard exists to prevent")
+        assert daemon.clear_dead_bridge_records({"cse_alive"}) == 1
+
+        after = json.loads(state.read_text())
+        assert after["bridgeSessionId"] == "", (
+            "the dead id survived, so the session keeps reattaching to a "
+            "bridge that is gone")
+        assert after["name"] == "RVP", "unrelated fields must be preserved"
+
+    def case_a_live_bridge_id_is_never_cleared(self, tmp_path, monkeypatch):
+        """THE CONTROL, and the one that matters: clearing a LIVE session's
+        working bridge would cost it its name and history for nothing. Only an
+        id the server does not report as connected may be cleared."""
+        from cswap_pin import proxy as pin_proxy
+
+        job = tmp_path / "jobs" / "abc123"
+        job.mkdir(parents=True)
+        state = job / "state.json"
+        state.write_text(json.dumps({"bridgeSessionId": "cse_alive"}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                            lambda: tmp_path)
+        monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        assert daemon.clear_dead_bridge_records({"cse_alive"}) == 0
+        assert json.loads(state.read_text())["bridgeSessionId"] == "cse_alive"
+
+    def case_an_unaskable_listing_clears_nothing(self, tmp_path, monkeypatch):
+        """AND THE SECOND CONTROL. `connected` comes from a server listing; if
+        that listing could not be taken, every id looks dead. Clearing on a
+        failed read would wipe the bridge of every live session on the machine
+        at once — the worst outcome available here, from the most ordinary
+        failure."""
+        from cswap_pin import proxy as pin_proxy
+
+        job = tmp_path / "jobs" / "abc123"
+        job.mkdir(parents=True)
+        state = job / "state.json"
+        state.write_text(json.dumps({"bridgeSessionId": "cse_whatever"}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                            lambda: tmp_path)
+        monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        assert daemon.clear_dead_bridge_records(None) == 0
+        assert json.loads(state.read_text())["bridgeSessionId"] == "cse_whatever"
 
     def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
         """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
