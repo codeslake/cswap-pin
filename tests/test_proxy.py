@@ -868,10 +868,22 @@ class TestLiveRemoteControlSessions:
         # wrote it" — the rule that used to claim 'Email advice' below.
         monkeypatch.setattr(pp, "server_generated_titles",
                             lambda: {"Session interrupted by user"})
+        # THE OTHER HALF OF THE EVIDENCE. `custom-title` records are what a
+        # HUMAN asked for; a cloud title in neither set was written by nobody
+        # on this machine, which is the only thing that identifies the
+        # sentences claude.ai writes for an active bridge — it records them
+        # nowhere locally, so `ai-title` can never contain them.
+        monkeypatch.setattr(
+            pp, "locally_chosen_titles",
+            # Every one of these is a name somebody gave a session here, so CC
+            # wrote a `custom-title` record for it. That is what makes them
+            # evidence rather than shape.
+            lambda: {"Email advice", "paper-rebuttal", "ai-inter-session"})
         self._host(monkeypatch)
 
         names = {"cse_a": "cswap", "cse_b": "cswap", "cse_c": "cswap",
-                 "cse_d": "cswap", "cse_e": "cswap", "cse_f": "cswap"}
+                 "cse_d": "cswap", "cse_e": "cswap", "cse_f": "cswap",
+                 "cse_g": "cswap_pin_artifacts"}
         listing = [
             # Server slug and server sentence: nobody chose these.
             {"id": "cse_a", "title": "host-a-cozy-badger"},
@@ -901,9 +913,18 @@ class TestLiveRemoteControlSessions:
             # would leave the anchor untested in the only direction it exists
             # for.
             {"id": "cse_f", "title": "host-b-eventual-cake"},
+            # THE CASE THE RECORD-ONLY RULE CANNOT SEE, and the one the user
+            # actually hits. claude.ai renames an ACTIVE bridge from the
+            # conversation's content and writes that string to NO local record
+            # — not `ai-title`, not `custom-title`. So it is in neither set,
+            # it is not a slug, and the previous rule left it alone forever.
+            # Measured: a session's cloud title went from one such sentence to
+            # another while its local name never changed.
+            {"id": "cse_g", "title": "Account switching to claude.ai"},
         ]
         assert titles_to_restore(listing, names) == [
-            ("cse_a", "cswap"), ("cse_b", "cswap")
+            ("cse_a", "cswap"), ("cse_b", "cswap"),
+            ("cse_g", "cswap_pin_artifacts"),
         ], (
             "the selection is wrong in one of two directions: a title a human "
             "typed was picked for overwrite, or a title the server invented "
@@ -1073,12 +1094,11 @@ class TestLiveRemoteControlSessions:
 
         The only periodic repair lived in `AutoSwitchEngine.tick()` — so the
         pin's own feature was switched off by a component the pin does not
-        need. MEASURED on host-a 2026-08-19: `.auto-live.lock` FREE (no
-        live engine), last restore logged 03:08:39Z, and the bridge created at
-        03:29:53Z sat under 'RC process unexpected behavior' and then
-        'Account switching to claude.ai'. The 21 ARCHIVED bridges beside it
-        were all correct — their conversations had stopped, so the server had
-        stopped renaming them.
+        need. MEASURED: `.auto-live.lock` FREE (no live engine), the last
+        restore logged 21 minutes BEFORE the bridge in question was created,
+        and that bridge then sat under two different server-written sentences
+        in turn. Every ARCHIVED bridge beside it was correct — their
+        conversations had stopped, so the server had stopped renaming them.
 
         The daemon is always running. The repair belongs to it.
         """
