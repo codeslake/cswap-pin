@@ -8939,6 +8939,44 @@ UPSTREAM_HOST = "api.anthropic.com"
 UPSTREAM_PORT = 443
 
 
+def _config_home_for_policy() -> Path:
+    """Where Claude Code keeps `policy-limits.json`. A seam, so a test can
+    point it somewhere that is not the developer's real config home."""
+    return require("paths").get_claude_config_home()
+
+
+def active_policy_limits() -> "dict | None":
+    """The org-policy document the server returns for the ACTIVE account.
+
+    The ACTIVE one, not the pinned one, and that is the whole point: this
+    document also carries `allow_routines` and compliance taints, so serving
+    the pinned account's answer would apply one org's permissions to another's
+    session. The pin decides who OWNS cloud assets; it does not decide whose
+    policy a machine runs under.
+
+    ``None`` when it could not be asked, which the caller must keep apart from
+    an empty document — see `sweep_policy_once`.
+    """
+    try:
+        import urllib.request
+        creds = require("paths").get_credentials_path()
+        raw = json.loads(Path(creds).read_text(encoding="utf-8"))
+        token = (raw.get("claudeAiOauth") or {}).get("accessToken")
+        if not token:
+            return None
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/claude_code/policy_limits",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json",
+                     "anthropic-version": "2023-06-01",
+                     "anthropic-client-platform": "cli"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            doc = json.loads(resp.read().decode())
+        return doc if isinstance(doc, dict) else None
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return None
+
+
 class PinProxy:
     """A CONNECT forward proxy that MITMs api.anthropic.com and swaps the
     Authorization bearer to a pinned token on the RC/Artifact routes.
@@ -9258,6 +9296,54 @@ class PinProxy:
                 self.sweep_titles_once()
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
+            # ON THE SAME BEAT, and deliberately after the titles: both are
+            # repairs of state a live session reads, and one API call each.
+            # Separate try/except so a title failure cannot skip the policy —
+            # the policy one is the difference between Remote Control working
+            # and being refused machine-wide.
+            try:
+                self.sweep_policy_once()
+            except Exception:  # noqa: BLE001 — never take the daemon down
+                pass
+
+    def sweep_policy_once(self) -> bool:
+        """Put the ACTIVE account's real policy answer in CC's cache file.
+
+        WHY THE DAEMON. `/remote-control` resolves
+        `Ms('allow_remote_control')` -> `Hcd()` -> that file, held in a
+        per-process session cache — and Claude Code CLEARS that cache when it
+        detects the signed-in account changed, so a LIVE session re-reads it
+        without restarting. What it re-reads has to be right already, and the
+        file is machine-wide, written with whatever account was active at fetch
+        time. MEASURED: a document left by a restricted org denied Remote
+        Control to every session on a host for the better part of a day while
+        the server placed no restriction on the account actually in use.
+
+        The daemon is the only process that is always running and always knows
+        the active account, so keeping this honest is its job.
+
+        A FETCH THAT FAILS CHANGES NOTHING. Absent is DENIED on the reader's
+        side, so writing nothing is never the safe default, and truncating on
+        an unreachable server would refuse Remote Control machine-wide.
+        """
+        doc = active_policy_limits()
+        if not isinstance(doc, dict):
+            return False
+        path = _config_home_for_policy() / "policy-limits.json"
+        try:
+            if path.exists() and json.loads(
+                    path.read_text(encoding="utf-8")) == doc:
+                return False       # already right; no write, no churn
+        except Exception:  # noqa: BLE001 — unreadable counts as "replace it"
+            pass
+        try:
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(doc), encoding="utf-8")
+            tmp.replace(path)      # atomic: no reader sees half a document
+        except OSError:
+            return False
+        _log_lifecycle("refreshed the org-policy cache for the active account")
+        return True
 
     def sweep_titles_once(self) -> int:
         """One pass: mint, list, restore. Returns how many titles were put.
