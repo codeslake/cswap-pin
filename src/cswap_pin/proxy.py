@@ -3983,6 +3983,55 @@ def server_generated_titles() -> set[str]:
     return titles - chosen
 
 
+def locally_chosen_titles() -> set[str]:
+    """Every title a HUMAN asked for on this machine, all-time.
+
+    The `custom-title` half of the same walk. It exists because the evidence
+    the restore needs is two-sided: `server_generated_titles` says which
+    strings Claude Code wrote, and this says which strings a person did — and
+    a cloud title that is in NEITHER came from the server, which records
+    nothing locally when it names a bridge from the conversation.
+
+    Kept as its own reader rather than folded into the caller so the walk's
+    cost stays where it already is: both are lazy and both are consulted only
+    for a bridge whose cloud title already disagrees with its local name.
+    """
+    return _title_records()[1]
+
+
+def _title_records() -> "tuple[set[str], set[str]]":
+    """``(ai-title strings, custom-title strings)`` from every transcript."""
+    generated: set[str] = set()
+    chosen: set[str] = set()
+    try:
+        get_claude_config_home = require("paths").get_claude_config_home
+        projects = get_claude_config_home() / "projects"
+        transcripts = list(projects.rglob("*.jsonl"))
+    except (Exception, OSError):  # noqa: BLE001 — no host, nothing to read
+        return generated, chosen
+    for path in transcripts:
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"ai-title"' not in line and '"custom-title"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("type") == "ai-title":
+                        t = (rec.get("aiTitle") or "").strip()
+                        if t:
+                            generated.add(t)
+                    elif rec.get("type") == "custom-title":
+                        t = (rec.get("customTitle") or "").strip()
+                        if t:
+                            chosen.add(t)
+        except OSError:
+            continue
+    return generated, chosen
+
+
 def _looks_generated(title: str) -> bool:
     """A SLUG the server minted for a nameless bridge.
 
@@ -4091,6 +4140,7 @@ def titles_to_restore(
     # Still once per call, not per item: the loop below runs over the entire
     # listing, and that is what the original comment here was protecting.
     generated: set[str] | None = None
+    chosen: set[str] | None = None
     out: list[tuple[str, str]] = []
     for item in sessions:
         sid = item.get("id")
@@ -4117,7 +4167,37 @@ def titles_to_restore(
         # happen to look like a slug, which no regex can tell apart.
         if generated is None:
             generated = server_generated_titles()
-        if current not in generated and not _looks_generated(current):
+        if current in generated or _looks_generated(current):
+            out.append((sid, want.strip()))
+            continue
+        # A THIRD SOURCE, BECAUSE THE OTHER TWO CANNOT SEE THIS ONE. claude.ai
+        # renames an ACTIVE bridge from the conversation's content and writes
+        # that string to NO local record — not `ai-title`, not `custom-title`.
+        # So a rule that only restores what CC recorded leaves exactly the
+        # case the user notices: a live session's cloud name drifting from one
+        # server sentence to the next while its own name never changes.
+        #
+        # The discriminator is still evidence, not shape: a string that appears
+        # in NO record on this machine and is NO live session's name was asked
+        # for by nobody here. Both false positives that killed the shape rule
+        # are covered by that — `ai-inter-session` is a live session's name and
+        # `Email advice` is a recorded `custom-title`.
+        #
+        # WHAT IT STILL CANNOT TELL APART: a title typed only in the claude.ai
+        # web app, which leaves no local trace either. That is a real cost and
+        # it is the reason this is the LAST branch rather than the first — a
+        # rename here is one PUT, and the alternative is the feature not
+        # working at all for any live session.
+        if chosen is None:
+            chosen = locally_chosen_titles()
+        if current in chosen or current in set(names.values()):
+            continue
+        # ANOTHER MACHINE'S SLUG IS NOT OURS TO REPAIR. `_looks_generated` is
+        # anchored on THIS host on purpose, so a slug minted for a different
+        # machine falls through to here with no local record — and restoring it
+        # would have this host rewrite a title that belongs to a session it
+        # cannot see. The sweep runs across hosts; that one stays theirs.
+        if re.match(r"^[a-z0-9]+(?:-[a-z0-9]+){2,}$", current):
             continue
         out.append((sid, want.strip()))
     return out
@@ -9303,13 +9383,12 @@ class PinProxy:
 
         The periodic repair that covered this lived in
         `AutoSwitchEngine.tick()`, so THE PIN'S OWN FEATURE WAS SWITCHED OFF BY
-        A COMPONENT THE PIN DOES NOT NEED. Measured on host-a
-        2026-08-19: `.auto-live.lock` free (no live engine — the TUI's
-        `on_unmount` releases it), last restore logged 03:08:39Z, and the
-        bridge created 03:29:53Z sat under 'RC process unexpected behavior'
-        and then 'Account switching to claude.ai'. The 21 archived bridges
-        beside it were all correct, because their conversations had stopped
-        and the server had stopped renaming them.
+        A COMPONENT THE PIN DOES NOT NEED. Measured: `.auto-live.lock` free
+        (no live engine — the TUI's `on_unmount` releases it), the last restore
+        logged 21 minutes before the bridge in question was even created, and
+        that bridge then sat under two different server-written sentences. The
+        archived bridges beside it were all correct, because their
+        conversations had stopped and the server had stopped renaming them.
 
         The daemon is always running; the repair belongs here. Sleep in short
         steps so `_stop` ends the thread promptly rather than up to five
