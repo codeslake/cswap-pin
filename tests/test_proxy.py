@@ -1013,8 +1013,16 @@ class TestLiveRemoteControlSessions:
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         daemon._list_bridges = lambda token: listing
+        revived = []
+        daemon.revive_archived_bridges = \
+            lambda rows, tok: revived.append(len(rows))
 
         daemon.sweep_titles_once()
+
+        assert revived, (
+            "the sweep restored titles without ever checking for an archived "
+            "bridge, so a live session whose reconnect needs unarchiving is "
+            "still on its own")
 
         assert puts, (
             "nothing repaired the title. With no auto-switch engine running, "
@@ -1082,6 +1090,49 @@ class TestLiveRemoteControlSessions:
         assert daemon.sweep_policy_once() is False
         assert json.loads(cache.read_text()) == stale, (
             "an unaskable policy cleared the cache, and absent is DENIED")
+
+    def case_a_live_sessions_archived_bridge_is_revived(self, monkeypatch):
+        """AN ARCHIVED BRIDGE UNDER A LIVE SESSION IS A BROKEN RECONNECT.
+
+        MEASURED: of fourteen live sessions on one host, thirteen held an
+        `active` bridge and their `/remote-control` reconnected normally. The
+        fourteenth held an `archived` one and was refused — reconnecting an
+        archived bridge has to go through unarchive, and that step was the one
+        failing. Unarchiving it by hand fixed that session and nothing else,
+        which is the definition of a patch rather than a repair.
+
+        The registry proves ownership the same way it does for titles: a bridge
+        is in `live_bridge_names()` only because a session running HERE holds
+        it. Archived-and-ours is a state the daemon can correct.
+
+        Route read from the binary and confirmed live: `POST
+        /v1/code/sessions/{id}/unarchive` -> 200. `/v1/sessions/{id}/unarchive`
+        is a 404 and `DELETE .../archive` a 405, both tried.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        calls = []
+
+        def _api(self, method, path, token, **kw):
+            calls.append((method, path))
+            return {}
+
+        listing = [
+            {"id": "cse_mine", "title": "RVP", "status": "archived"},
+            {"id": "cse_fine", "title": "cswap", "status": "active"},
+            {"id": "cse_theirs", "title": "elsewhere", "status": "archived"},
+        ]
+        monkeypatch.setattr(pin_proxy, "live_bridge_names",
+                            lambda: {"cse_mine": "RVP", "cse_fine": "cswap"})
+        monkeypatch.setattr(pin_proxy.PinProxy, "_bridge_api", _api)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        assert daemon.revive_archived_bridges(listing, "tok") == 1
+
+        assert calls == [("POST", "/v1/code/sessions/cse_mine/unarchive")], (
+            f"wrong set revived: {calls}. `cse_fine` is already active and "
+            f"`cse_theirs` belongs to a session this machine cannot see — "
+            f"reviving either is acting on something that is not ours.")
 
     def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
         """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
