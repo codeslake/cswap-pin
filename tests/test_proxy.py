@@ -1134,6 +1134,75 @@ class TestLiveRemoteControlSessions:
             f"`cse_theirs` belongs to a session this machine cannot see — "
             f"reviving either is acting on something that is not ours.")
 
+    def case_a_running_sessions_stale_pointer_is_restamped(self, tmp_path,
+                                                            monkeypatch):
+        """THE REPAIR THAT EXISTED SKIPPED EXACTLY THE SESSIONS THAT NEEDED IT.
+
+        `_carry_candidates` is documented "for sessions with a bridge and NO
+        PROCESS" — it deliberately excludes anything running. MEASURED: it
+        returned 0 candidates on a host where thirteen live sessions matched
+        the login and ONE did not, and the one that did not was the only
+        session on the machine being refused Remote Control. A repair that
+        cannot see a running session cannot fix a running session.
+
+        WHY EXCLUDING THEM WAS REASONABLE AND STILL IS NOT ENOUGH: the
+        session's own process writes that file, so a read-modify-write can lose
+        its update. But WE ONLY WRITE THE TWO OWNER FIELDS, and the session
+        writes `bridgeSessionId`/`lastSequenceNum`. Re-read immediately before
+        the rename and carry every other field from that fresh read, and a lost
+        race costs one sweep of ours and nothing of theirs.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        job = tmp_path / "jobs" / "abc123"
+        job.mkdir(parents=True)
+        state = job / "state.json"
+        state.write_text(json.dumps({
+            "bridgeSessionId": "cse_keepme",
+            "lastSequenceNum": 993,
+            "bridgeOwnerAccountUuid": "old-account",
+            "bridgeOwnerOrganizationUuid": "old-org",
+            "name": "RVP",
+        }))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                            lambda: tmp_path)
+        monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        assert daemon.carry_live_pointers(("new-account", "new-org")) == 1
+
+        after = json.loads(state.read_text())
+        assert after["bridgeOwnerAccountUuid"] == "new-account"
+        assert after["bridgeOwnerOrganizationUuid"] == "new-org"
+        assert after["bridgeSessionId"] == "cse_keepme", (
+            "the bridge id was rewritten; only the OWNER may be touched or a "
+            "lost race costs the session its bridge")
+        assert after["lastSequenceNum"] == 993
+        assert after["name"] == "RVP"
+
+    def case_a_matching_pointer_is_not_rewritten(self, tmp_path, monkeypatch):
+        """THE CONTROL: no write when it already agrees. This runs on a beat,
+        and rewriting a correct record every pass is a file the session's own
+        process is also writing — pure contention for nothing."""
+        from cswap_pin import proxy as pin_proxy
+
+        job = tmp_path / "jobs" / "abc123"
+        job.mkdir(parents=True)
+        state = job / "state.json"
+        state.write_text(json.dumps({
+            "bridgeSessionId": "cse_keepme",
+            "bridgeOwnerAccountUuid": "same-account",
+            "bridgeOwnerOrganizationUuid": "same-org",
+        }))
+        before = state.stat().st_mtime_ns
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                            lambda: tmp_path)
+        monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["abc123"])
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        assert daemon.carry_live_pointers(("same-account", "same-org")) == 0
+        assert state.stat().st_mtime_ns == before, "rewrote a record that agreed"
+
     def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
         """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
         a repair nothing invokes is the defect being fixed, one layer up.
@@ -1152,12 +1221,18 @@ class TestLiveRemoteControlSessions:
         ticks: list[int] = []
         daemon.sweep_titles_once = lambda: ticks.append("titles")
         daemon.sweep_policy_once = lambda: ticks.append("policy")
+        daemon.carry_live_pointers = lambda login: ticks.append("pointers")
         # ONLY THE PERIOD IS SHORTENED, never the first-pass delay: if the loop
         # goes back to sleeping a whole period before its first sweep, this
         # test must fail. MEASURED — it did exactly that, and a daemon replaced
         # every few minutes then swept never.
         monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_S", 600.0)
 
+        # A LOGIN MUST EXIST or the pointer branch is skipped and this
+        # test proves nothing about it — the first cut passed for
+        # exactly that reason.
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("acct", "org"))
         monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_FIRST_S", 0.0)
         daemon._start_accept_loop()
         try:
@@ -1172,6 +1247,10 @@ class TestLiveRemoteControlSessions:
             "starting the daemon did not arm the periodic title sweep, so the "
             "repair exists and nothing runs it — which is how it came to "
             "depend on the auto-switch engine in the first place")
+        assert "pointers" in ticks, (
+            "the live-pointer carry is not on the daemon's beat, so a "
+            "running session whose pointer names a dead account stays on "
+            "the mint path the policy gate refuses")
         assert "policy" in ticks, (
             "the policy repair is not on the daemon's beat, so a stale "
             "org-policy answer keeps refusing Remote Control machine-wide "

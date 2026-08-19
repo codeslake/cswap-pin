@@ -3483,6 +3483,33 @@ def _read_json(path: Path):
     return out if isinstance(out, dict) else None
 
 
+def _live_job_ids() -> list[str]:
+    """Job ids of sessions with a LIVE process, from the registry.
+
+    The opposite selection to `_carry_candidates`, which takes only sessions
+    with NO process. Both are needed: that one keeps an ended session's bridge
+    across a rotation, this one keeps a RUNNING session's reattach possible.
+    """
+    out: list[str] = []
+    try:
+        home = require("paths").get_claude_config_home()
+        for path in (home / "sessions").glob("*.json"):
+            rec = _read_json(path)
+            if not isinstance(rec, dict):
+                continue
+            pid, job = rec.get("pid"), rec.get("jobId")
+            if not pid or not job:
+                continue
+            try:
+                os.kill(int(pid), 0)
+            except Exception:  # noqa: BLE001 — gone, or not ours to signal
+                continue
+            out.append(str(job))
+    except Exception:  # noqa: BLE001 — no host, nothing to enumerate
+        return []
+    return out
+
+
 def _carry_candidates() -> list[tuple[str, str | None]]:
     """``(session id, job id)`` for sessions with a bridge and no process.
 
@@ -9309,6 +9336,70 @@ class PinProxy:
                 self.sweep_policy_once()
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
+            # AND THE POINTER, which decides whether a reattach is attempted at
+            # all. A stale one sends Claude Code down the MINT path, and
+            # minting is what the policy gate can refuse — so these two are the
+            # halves of "Remote Control still works after the account moved".
+            try:
+                login = _login_identity()      # (accountUuid, organizationUuid)
+                if login:
+                    self.carry_live_pointers(login)
+            except Exception:  # noqa: BLE001 — never take the daemon down
+                pass
+
+    def carry_live_pointers(self, login: "tuple[str, str]") -> int:
+        """Point a RUNNING session's bridge record at the account now signed in.
+
+        WHY THIS EXISTS BESIDE `_carry_history_pointers`. That one is documented
+        "for sessions with a bridge and NO PROCESS" and means it — measured, it
+        returned 0 candidates on a host where one live session's pointer named
+        a dead account and was the only session being refused Remote Control.
+        Claude Code compares that pointer to `~/.claude.json`'s `oauthAccount`;
+        on a mismatch it will not reattach, it MINTS — and minting is the path
+        the org-policy gate can refuse.
+
+        THE RACE THAT JUSTIFIED EXCLUDING LIVE SESSIONS IS HANDLED BY SCOPE,
+        not by a lock. The session's own process writes `bridgeSessionId` and
+        `lastSequenceNum` to this file; this writes ONLY the two owner fields,
+        and re-reads immediately before the rename so every other field comes
+        from the freshest copy on disk. A lost race therefore costs one sweep
+        of ours and nothing of theirs — the opposite of the read-modify-write
+        that made excluding them the safe choice.
+
+        NO WRITE WHEN IT ALREADY AGREES: this runs on a beat, and rewriting a
+        correct record every pass is contention on a file its owner is also
+        writing, bought for nothing.
+        """
+        account, org = login
+        if not account:
+            return 0
+        home = _config_home_for_policy()
+        carried = 0
+        for job in _live_job_ids():
+            path = home / "jobs" / job / "state.json"
+            rec = _read_json(path)
+            if not isinstance(rec, dict) or not rec.get("bridgeSessionId"):
+                continue
+            if rec.get(_JOB_OWNER[0]) == account and \
+                    (rec.get(_JOB_OWNER[1]) or "") == (org or ""):
+                continue
+            fresh = _read_json(path)          # re-read: theirs wins on the rest
+            if not isinstance(fresh, dict) or not fresh.get("bridgeSessionId"):
+                continue
+            fresh[_JOB_OWNER[0]] = account
+            fresh[_JOB_OWNER[1]] = org
+            tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
+            try:
+                tmp.write_text(json.dumps(fresh), encoding="utf-8")
+                tmp.replace(path)
+            except OSError:
+                continue
+            carried += 1
+        if carried:
+            _log_lifecycle(
+                f"carried {carried} running session(s) bridge pointer onto the "
+                f"current login")
+        return carried
 
     def sweep_policy_once(self) -> bool:
         """Put the ACTIVE account's real policy answer in CC's cache file.
