@@ -1259,12 +1259,21 @@ class TestLiveRemoteControlSessions:
             seen["context"] = context
             return _Resp()
 
+        # THE CONTEXT BUILDER IS STUBBED TOO, and the first cut of this test
+        # forgot to. It is called as an ARGUMENT to `urlopen`, so replacing
+        # `urlopen` alone does not stop it running: it reads the pin's CA
+        # bundle off disk, which exists on a machine that runs the pin and not
+        # on a CI runner. The test passed here and failed there, asserting
+        # about the developer's filesystem rather than about the code.
+        sentinel = object()
+        monkeypatch.setattr(pin_proxy.oauth, "_pin_aware_ssl_context",
+                            lambda: sentinel)
         monkeypatch.setattr(pin_proxy.urllib.request, "urlopen", fake_urlopen)
         assert pin_proxy.policy_limits_for("tok") == {"restrictions": {}}
-        assert seen["context"] is not None, (
-            "the policy fetch went out on a default TLS context, so through "
-            "the pin it dies CERTIFICATE_VERIFY_FAILED and the repair is a "
-            "silent no-op — which is what production was doing")
+        assert seen["context"] is sentinel, (
+            "the policy fetch did not go out on the PIN-AWARE context, so "
+            "through the pin it dies CERTIFICATE_VERIFY_FAILED and the "
+            "repair is a silent no-op — which is what production was doing")
 
     def case_a_session_disconnected_by_a_rotation_is_recovered(
         self, tmp_path, monkeypatch
