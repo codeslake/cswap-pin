@@ -9033,6 +9033,16 @@ def _config_home_for_policy() -> Path:
 #: with no request on the wire, so there is nothing else to observe.
 _RC_POLICY_REFUSAL = "Remote Control is disabled by your organization's policy"
 
+#: The OTHER way a session loses Remote Control, and the one that cannot be
+#: prevented from here. An account rotation tears the bridge down because the
+#: owner field is compared against two different things by two different
+#: checks, which want opposite values, and the env that would bypass the
+#: comparison cannot reach a background worker — those are pre-spawned into a
+#: pool before their session exists. So this is recovered, not avoided.
+_RC_DISCONNECTED = "Remote Control disconnected"
+
+_RC_LOST = (_RC_POLICY_REFUSAL, _RC_DISCONNECTED)
+
 #: Only the tail of a transcript is read. A refusal that matters is recent by
 #: construction (it has to be newer than the process), and these files reach
 #: gigabytes — one of them was 11 GB.
@@ -9138,7 +9148,7 @@ def _refused_rc_since(session_id: str, since_ms: float) -> bool:
                     fh.seek(size - _TRANSCRIPT_TAIL_BYTES)
                     fh.readline()      # drop the partial line seek landed in
                 for raw in fh:
-                    if _RC_POLICY_REFUSAL.encode() not in raw:
+                    if not any(m.encode() in raw for m in _RC_LOST):
                         continue
                     try:
                         rec = json.loads(raw.decode("utf-8", "replace"))
@@ -9353,6 +9363,10 @@ class PinProxy:
         # NEW daemon is entitled to try once — its predecessor may have died
         # before the worker came back.
         self._recycled: set[str] = set()
+        # What the server last said is CONNECTED, filled by the title sweep
+        # from the listing it already pays for. None until the first sweep, and
+        # None again is never treated as "nothing is connected".
+        self._connected_bridges: "set[str] | None" = None
         self._stop = False
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
@@ -9769,6 +9783,28 @@ class PinProxy:
                 continue
             if not _session_is_idle(str(rec.get("jobId") or "")):
                 continue               # NOT marked recycled: try again later
+            # AND ONLY IF IT REALLY HAS NO BRIDGE RIGHT NOW. Every session on
+            # the host prints the disconnect line on the same rotation, and
+            # most get their bridge back on their own; acting on the
+            # transcript alone would restart twelve working sessions to fix
+            # the one that did not recover. The server's own connected set is
+            # the discriminator, and the title sweep has already paid for it.
+            #
+            # `None` means the listing failed. Unknown is not "gone" — that
+            # conflation is what makes a repair start restarting the machine
+            # the moment the network hiccups.
+            if self._connected_bridges is None:
+                continue
+            # FROM THE JOB RECORD, not the registry one. The registry entry
+            # (`sessions/<pid>.json`) has no bridge field at all, so reading it
+            # there yields "" for every session and the guard never fires —
+            # measured, it recycled a session that already had its bridge back.
+            job_rec = _read_json(_config_home_for_policy() / "jobs" /
+                                 str(rec.get("jobId") or "") / "state.json")
+            bid = str((job_rec or {}).get("bridgeSessionId") or "")
+            if bid and bid.replace("session_", "cse_") in \
+                    self._connected_bridges:
+                continue               # it already has its bridge back
             self._recycled.add(sid)    # once per session per daemon, always
             if _signal_worker(pid):
                 done += 1
@@ -9890,6 +9926,9 @@ class PinProxy:
         # HERE keeps the "could not ask" case honest — `_list_bridges` already
         # returned above when it was None, so this is never a failed read
         # masquerading as an empty one.
+        self._connected_bridges = {
+            r.get("id") for r in sessions
+            if r.get("connection_status") == "connected" and r.get("id")}
         self.clear_dead_bridge_records({
             r.get("id") for r in sessions
             if r.get("connection_status") == "connected" and r.get("id")})
