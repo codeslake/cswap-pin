@@ -11667,6 +11667,23 @@ class PinProxy:
                 # only on a 200 — a failure or a 304 re-seeds the same
                 # document. Saying so here is the difference between "the fix
                 # will reach it" and having watched it arrive.
+                # THE ONE CALL THAT CAN SAVE A LIVE BRIDGE, and until now it
+                # was invisible. Claude Code asks this when the identity file
+                # names an account other than the bridge's owner; our answer
+                # names the PINNED account, which makes CC re-baseline rather
+                # than disconnect — and it REASSIGNS the owner to that answer,
+                # so every later rotation compares pin against pin.
+                #
+                # Its absence is the other half of the diagnosis: a bridge
+                # that died without this line never asked, and one that died
+                # after it asked is a different fault entirely. The
+                # `[bridge:owner-pin]` traces only exist under --debug, which
+                # no session here runs, so nothing else can tell those apart.
+                if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
+                    _log_lifecycle(
+                        "a session asked who its credential belongs to — "
+                        "answered as the pinned account, which is what lets a "
+                        "live bridge survive the account rotation")
                 if path.split("?", 1)[0].rstrip("/") == \
                         "/api/claude_code/policy_limits":
                     _log_lifecycle(
