@@ -23,7 +23,7 @@ import pytest
 
 from cswap_pin.proxy import ensure_ca
 
-from conftest import run_cases
+from conftest import PIN_STAMP, run_cases
 
 
 @pytest.fixture(autouse=True)
@@ -4509,7 +4509,7 @@ class TestDrainReportsWhatItCut:
             # 0.1.116 fixed it, and both spell the line identically — so every
             # reader had to know when each machine was upgraded to tell a
             # usable number from a worthless one.
-            assert re.search(r"\] cswap-pin/\d+\.\d+\.\d+ pid=\d+ ", line), (
+            assert re.search(PIN_STAMP, line), (
                 "the drain line does not name the component AND VERSION that "
                 f"wrote it, so its numbers carry no provenance: {line}")
         finally:

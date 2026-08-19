@@ -467,6 +467,27 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
         time.sleep(0.2)
 
 
+# --- the provenance stamp every lifecycle line carries -----------------------
+# Two proxies on this fleet write drain lines, so a line that does not name its
+# writer has no provenance. Two tests assert that, and both hardcoded a strict
+# semver -- which made the whole suite RED for anyone running it the way this
+# repo documents.
+#
+# `cswap_pin.__init__._derive_version` reads the INSTALLED distribution's
+# metadata, and its own docstring names the fallback case exactly:
+#
+#     "The fallback is for a source checkout with no distribution installed
+#      (this repo's own test run, `PYTHONPATH=src`)"
+#
+# So `0+unknown` is not a broken version, it is the DESIGNED value for the
+# supported way to run these tests. A test that refuses it contradicts the
+# contract the production code documents, and fails on a healthy tree.
+#
+# What the line must actually guarantee is unchanged and still asserted: the
+# component NAME, a version token that is not empty, and the pid. ONE
+# definition, because the two copies had to agree and nothing made them.
+PIN_STAMP = r"\] cswap-pin/(?:\d+\.\d+\.\d+|0\+unknown) pid=\d+ "
+
 # --- one pytest test per class, N cases inside -------------------------------
 # The suite's cases are cheap (54 ms each, measured) and its per-case pytest
 # overhead is not the cost — but 332 collected items is more surface than the

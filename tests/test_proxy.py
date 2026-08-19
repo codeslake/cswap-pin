@@ -25,7 +25,7 @@ from cswap_pin.proxy import (
     parse_upstream_proxy,
 )
 
-from conftest import run_cases
+from conftest import PIN_STAMP, run_cases
 
 # A REAL zero-serial root CA (GoDaddy Root Certificate Authority - G2),
 # extracted from this box's ambient `/etc/ssl/certs/ca-certificates.crt`.
@@ -11010,8 +11010,7 @@ class TestTheDaemonLogRecordsItsOwnDeath:
         # on `serving on port` rather than on a drain line for exactly that
         # reason: tagging only the two lines that collide today is the version
         # of this fix that rots.
-        assert re.search(
-            r"\] cswap-pin/\d+\.\d+\.\d+ pid=\d+ serving on port", text), (
+        assert re.search(PIN_STAMP + "serving on port", text), (
             "a lifecycle line does not name the component that wrote it: "
             + text)
         # The insertion point is pinned by the regex above; the phrases peer
