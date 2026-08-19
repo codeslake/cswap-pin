@@ -9395,18 +9395,19 @@ class PinProxy:
         account, org = login
         if not account:
             return 0
-        # THE GUARD `_carry_history_pointers` ALREADY DOCUMENTS, and shipping
-        # without it was a real defect: restamping a pointer to a login that
-        # does not own the bridge hands Claude Code a bridge it cannot use, and
-        # the server answers 500. Losing a history is survivable; that is not.
-        # The pin's org is on disk and free to read, and a pin naming another
-        # org is sufficient evidence the bridge will not match this login.
-        try:
-            pin = load_pin(Path(self._certdir).parent)
-        except Exception:  # noqa: BLE001 — unreadable pin, assume unsafe
-            return 0
-        if pin and pin[1] and pin[1] != org:
-            return 0
+        # NO PIN-ORG GUARD HERE, and that is deliberate. The launch-path carry
+        # refuses when the pin's org differs from the login's; copying that
+        # here made this a no-op in the NORMAL case, because a pin account that
+        # differs from the active account is not an anomaly — it is the entire
+        # point of the pin. Refusing there refuses the state the feature exists
+        # to serve.
+        #
+        # The server side is already handled and not by this stamp:
+        # `/api/oauth/validate` is a pinned route, so when Claude Code asks who
+        # the current credential belongs to, the answer comes back as the
+        # PINNED account and CC re-baselines instead of tearing the bridge
+        # down. This stamp only has to make the LOCAL comparison agree so a
+        # reattach is attempted at all.
         home = _config_home_for_policy()
         carried = 0
         for job in _live_job_ids():
@@ -9461,6 +9462,60 @@ class PinProxy:
                 f"carried {carried} running session(s) bridge pointer onto the "
                 f"current login")
         return carried
+
+    def clear_dead_bridge_records(self, connected: "set[str] | None") -> int:
+        """Let a live session mint a new bridge when its own is a corpse.
+
+        MEASURED across fourteen live sessions on one host — same active
+        account, same pin, same restart second. Thirteen had a job record
+        naming a DIFFERENT bridge than their transcript's last one: they had
+        minted a replacement and moved on. One did not. Both of its stores
+        named the same id, and that bridge had no worker and no event since the
+        session started. It was the only session on the machine refused Remote
+        Control, and every machine-wide explanation tried before this one —
+        policy file, credential, org, pointer owner — was identical across all
+        fourteen.
+
+        Claude Code reads the job record for a background session, so that one
+        kept trying to reattach to something that is gone. `clearBridgeSession`
+        is CC's own way of writing "this conversation has no bridge", and a
+        conversation with no bridge MINTS one — which is precisely what the
+        other thirteen did.
+
+        ``connected`` is the set of bridge ids the server reports as connected.
+        ``None`` means the listing could not be taken and NOTHING is cleared:
+        every id looks dead through a failed read, and acting on that would
+        wipe the bridge of every live session at once — the worst outcome here,
+        from the most ordinary failure.
+        """
+        if connected is None:
+            return 0
+        home = _config_home_for_policy()
+        cleared = 0
+        for job in _live_job_ids():
+            path = home / "jobs" / job / "state.json"
+            rec = _read_json(path)
+            if not isinstance(rec, dict):
+                continue
+            bid = rec.get("bridgeSessionId")
+            if not bid or str(bid).replace("session_", "cse_") in connected:
+                continue
+            fresh = _read_json(path)      # re-read: their writes win on the rest
+            if not isinstance(fresh, dict) or fresh.get("bridgeSessionId") != bid:
+                continue
+            fresh["bridgeSessionId"] = ""
+            tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
+            try:
+                tmp.write_text(json.dumps(fresh), encoding="utf-8")
+                tmp.replace(path)
+            except OSError:
+                continue
+            cleared += 1
+        if cleared:
+            _log_lifecycle(
+                f"cleared {cleared} job record(s) naming a bridge the server no "
+                f"longer has, so those sessions can mint a live one")
+        return cleared
 
     def sweep_policy_once(self) -> bool:
         """Put the ACTIVE account's real policy answer in CC's cache file.
@@ -9556,6 +9611,15 @@ class PinProxy:
         # decided from the same rows — a second listing would buy nothing but
         # a second chance for the account to have moved underneath us.
         self.revive_archived_bridges(sessions, token)
+        # ON THE SAME LISTING. `connected` is what the server says is attached
+        # right now; a live session's job record naming anything else is
+        # pointing at a corpse and can never reattach. Passing the set built
+        # HERE keeps the "could not ask" case honest — `_list_bridges` already
+        # returned above when it was None, so this is never a failed read
+        # masquerading as an empty one.
+        self.clear_dead_bridge_records({
+            r.get("id") for r in sessions
+            if r.get("connection_status") == "connected" and r.get("id")})
         return self._restore_bridge_titles(sessions, token)
 
     def release_listener(self, hand_down: bool = False) -> "int | None":
