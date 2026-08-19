@@ -468,25 +468,37 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
 
 
 # --- the provenance stamp every lifecycle line carries -----------------------
-# Two proxies on this fleet write drain lines, so a line that does not name its
-# writer has no provenance. Two tests assert that, and both hardcoded a strict
-# semver -- which made the whole suite RED for anyone running it the way this
-# repo documents.
+# Two proxies on this fleet write drain lines, so a line that does not name
+# its writer has no provenance. Two tests assert that.
 #
-# `cswap_pin.__init__._derive_version` reads the INSTALLED distribution's
-# metadata, and its own docstring names the fallback case exactly:
+# THE EXPECTATION DEPENDS ON THE ENVIRONMENT, and accepting both spellings
+# unconditionally was wrong. `_derive_version` reads the INSTALLED
+# distribution's metadata and falls back to `0+unknown` only when there is no
+# distribution -- so which one is CORRECT is decided by whether one is
+# installed, and a test that accepts either checks nothing:
 #
-#     "The fallback is for a source checkout with no distribution installed
-#      (this repo's own test run, `PYTHONPATH=src`)"
+#   uv run ...        (README, ci.yml, publish.yml)   -> a real semver
+#   PYTHONPATH=src    (ambient interpreter)           -> 0+unknown
 #
-# So `0+unknown` is not a broken version, it is the DESIGNED value for the
-# supported way to run these tests. A test that refuses it contradicts the
-# contract the production code documents, and fails on a healthy tree.
+# Nothing else in this repo asserts the version's VALUE. `test_packaging`
+# asserts the MECHANISM (that `__version__` is not a literal) and
+# publish.yml prints it without asserting, so this is the only place a
+# regression in the pipeline would be caught -- and it would be caught on
+# CI, where a distribution IS installed and `0+unknown` would mean a wheel
+# about to ship with versionless provenance. A PyPI version cannot be
+# re-uploaded.
 #
-# What the line must actually guarantee is unchanged and still asserted: the
-# component NAME, a version token that is not empty, and the pid. ONE
-# definition, because the two copies had to agree and nothing made them.
-PIN_STAMP = r"\] cswap-pin/(?:\d+\.\d+\.\d+|0\+unknown) pid=\d+ "
+# The lookup here is deliberately INDEPENDENT of `_derive_version`, so this
+# cannot certify itself: a broken `_derive_version` still fails the assert.
+try:  # pragma: no cover - one branch per environment, both are real
+    from importlib.metadata import version as _dist_version
+
+    _dist_version("cswap-pin")
+    _PIN_VER = r"\d+\.\d+\.\d+"       # installed: demand the real version
+except Exception:  # noqa: BLE001 — no distribution is a supported way to run
+    _PIN_VER = r"0\+unknown"             # source checkout: that value only
+
+PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 
 # --- one pytest test per class, N cases inside -------------------------------
 # The suite's cases are cheap (54 ms each, measured) and its per-case pytest
