@@ -3483,6 +3483,28 @@ def _read_json(path: Path):
     return out if isinstance(out, dict) else None
 
 
+def _live_session_ids() -> list[str]:
+    """Session ids of processes that are alive, from the registry."""
+    out: list[str] = []
+    try:
+        home = require("paths").get_claude_config_home()
+        for path in (home / "sessions").glob("*.json"):
+            rec = _read_json(path)
+            if not isinstance(rec, dict):
+                continue
+            pid, sid = rec.get("pid"), rec.get("sessionId")
+            if not pid or not sid:
+                continue
+            try:
+                os.kill(int(pid), 0)
+            except Exception:  # noqa: BLE001
+                continue
+            out.append(str(sid))
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
 def _live_job_ids() -> list[str]:
     """Job ids of sessions with a LIVE process, from the registry.
 
@@ -9373,6 +9395,18 @@ class PinProxy:
         account, org = login
         if not account:
             return 0
+        # THE GUARD `_carry_history_pointers` ALREADY DOCUMENTS, and shipping
+        # without it was a real defect: restamping a pointer to a login that
+        # does not own the bridge hands Claude Code a bridge it cannot use, and
+        # the server answers 500. Losing a history is survivable; that is not.
+        # The pin's org is on disk and free to read, and a pin naming another
+        # org is sufficient evidence the bridge will not match this login.
+        try:
+            pin = load_pin(Path(self._certdir).parent)
+        except Exception:  # noqa: BLE001 — unreadable pin, assume unsafe
+            return 0
+        if pin and pin[1] and pin[1] != org:
+            return 0
         home = _config_home_for_policy()
         carried = 0
         for job in _live_job_ids():
@@ -9392,6 +9426,33 @@ class PinProxy:
             try:
                 tmp.write_text(json.dumps(fresh), encoding="utf-8")
                 tmp.replace(path)
+            except OSError:
+                continue
+            carried += 1
+        # THE OTHER STORE, and leaving it out is why the first cut of this
+        # changed nothing for the session it was written for. `_carry_history_
+        # pointers` writes BOTH and says why: an interactive resume has no
+        # CLAUDE_JOB_DIR, so Claude Code reads the TRANSCRIPT. Its own comment
+        # names the very job measured here — three different accounts across
+        # the login, the job record and the transcript.
+        for sid in _live_session_ids():
+            found = _last_pointer(sid)
+            if not found:
+                continue
+            path, rec = found
+            out = _carry_pointer(rec, (account, org), _TRANSCRIPT_OWNER)
+            if out is None:
+                continue
+            try:
+                # O_APPEND and the newline check, exactly as the launch-path
+                # carry does it: a transcript truncated mid-write ends without
+                # one, and appending there would fuse two records into a line
+                # neither side can parse.
+                with path.open("a+b") as fh:
+                    fh.seek(-1, os.SEEK_END)
+                    if fh.read(1) != b"\n":
+                        fh.write(b"\n")
+                    fh.write(json.dumps(out).encode("utf-8") + b"\n")
             except OSError:
                 continue
             carried += 1
