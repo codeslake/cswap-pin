@@ -10409,7 +10409,18 @@ class PinProxy:
                         beat_draining(
                             self._certdir, owed=self.inflight_requests(),
                             live=self.live_replies(started),
-                            quiet=self.content_free_seconds())
+                            quiet=self.content_free_seconds(),
+                            # AND THE CHANNEL COUNT, EVERY TIME. The beat
+                            # REWRITES the marker, so a beat that omits this
+                            # erases the one field the reaper reads to know
+                            # this daemon is carrying a bridge. The first beat
+                            # wrote it and this one deleted it 15s later, so
+                            # the protection lasted one interval. Measured on
+                            # a live marker: 13 replies owed, no fifth line.
+                            # Re-read rather than reused: a channel can end
+                            # mid-drain and the marker must not overstate what
+                            # a reap would cost.
+                            streams=self.live_stream_count() + _PUMP.live_pairs())
                         beat_at = now
                     time.sleep(0.05)
         finally:
