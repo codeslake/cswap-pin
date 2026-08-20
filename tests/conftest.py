@@ -28,6 +28,7 @@ throws it away.
 """
 
 import json
+import re
 import pathlib
 import sys
 
@@ -491,12 +492,12 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
 # The lookup here is deliberately INDEPENDENT of `_derive_version`, so this
 # cannot certify itself: a broken `_derive_version` still fails the assert.
 try:  # pragma: no cover - one branch per environment, both are real
+    from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _dist_version
 
-    _dist_version("cswap-pin")
-    _PIN_VER = r"\d+\.\d+\.\d+"       # installed: demand the real version
-except Exception:  # noqa: BLE001 — no distribution is a supported way to run
-    _PIN_VER = r"0\+unknown"             # source checkout: that value only
+    _PIN_VER = re.escape(_dist_version("cswap-pin"))
+except PackageNotFoundError:
+    _PIN_VER = re.escape("0+unknown")
 
 PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 
