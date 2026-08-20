@@ -5366,6 +5366,45 @@ class TestDrainReportsWhatItCut:
         assert teardown_drain_budget(
             "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
+    def case_every_beat_keeps_the_channel_count(self, certdir):
+        """The beat REWRITES the marker, so a beat that omits the channel
+        count erases the reap protection.
+
+        The first beat wrote the fifth line and the periodic one, 15 seconds
+        later, wrote a four-line marker over it — so a daemon carrying a bridge
+        looked like a daemon carrying nothing to the sweep that decides what to
+        kill. The protection lasted one interval.
+
+        MEASURED ON A LIVE MARKER while this was shipped: pid draining with 13
+        replies owed, 13 live, and no fifth line.
+        """
+        import cswap_pin.proxy as pp
+
+        pid = 918273
+        pp.announce_draining(certdir, pid)
+        pp.beat_draining(certdir, pid, owed=3, live=3, quiet=1.0, streams=7)
+        assert pp.draining_streams(certdir, pid) == 7, (
+            "the marker does not carry the channel count at all")
+
+        # THE SECOND BEAT IS THE ONE THAT USED TO ERASE IT.
+        pp.beat_draining(certdir, pid, owed=3, live=2, quiet=2.0, streams=7)
+        assert pp.draining_streams(certdir, pid) == 7, (
+            "a later beat dropped the channel count, so the reaper reads zero "
+            "and takes the daemon carrying the bridge — the protection lasts "
+            "one beat interval")
+
+        # AND THE DRAIN'S OWN PERIODIC BEAT MUST PASS IT. Reaching that line
+        # needs a live daemon mid-drain, so read it out of the source, which is
+        # the convention this file uses for the exit paths.
+        import inspect
+
+        src = inspect.getsource(pp.PinProxy.await_inflight)
+        beats = src.count("beat_draining(")
+        passes = src.count("streams=")
+        assert beats > 0 and passes == beats, (
+            f"{beats} beat(s) in the drain but {passes} pass the channel "
+            "count; the ones that do not erase it on their next write")
+
     def case_the_pump_can_say_what_the_process_is_carrying(self, certdir):
         """The reaper needs the PROCESS's tunnel count, and only the marker
         can carry it — the sweep runs somewhere else.
