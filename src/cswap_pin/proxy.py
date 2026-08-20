@@ -2658,6 +2658,10 @@ _WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
 # `Connection: close` the way a reply does — it has to be closed.
 _EVENT_STREAM = re.compile(r"/worker/events/stream")
 
+# The session id inside a worker path, which is the bridge the call belongs
+# to. Same shape as the routes above, captured rather than merely matched.
+_BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
+
 
 def trace_target(certdir) -> "str | None":
     """Where to write the request trace, or None for off.
@@ -9710,6 +9714,11 @@ class PinProxy:
         # separately because the drain must treat them the other way round:
         # every other connection is waited for, these are let go.
         self._stream_conns: set = set()
+        # PER-BRIDGE, and initialised HERE or the accounting is dead in
+        # production while every test stays green: `_note_bridge_traffic`
+        # swallows its own errors by design, so a missing dict is a silent
+        # no-op rather than a failure anyone would see.
+        self._reset_bridge_traffic()
         # THE OBJECT THAT OWNS THE DESCRIPTOR. `wrap_socket` detaches the
         # socket it wraps, so the raw `conn` every other structure here keys
         # on has `fileno() == -1` and cannot be shut down or closed. Anything
@@ -10394,6 +10403,57 @@ class PinProxy:
         """
         with self._live_lock:
             return len(self._stream_conns & self._open_conns)
+
+    def _reset_bridge_traffic(self) -> None:
+        """Start the per-bridge accounting. Safe to call more than once."""
+        self._bridge_posts: dict = {}
+        self._bridge_streams: dict = {}
+
+    def _note_bridge_traffic(self, request_line: str, now=None) -> None:
+        """Record that a bridge spoke, and whether it opened its ear.
+
+        Never raises and never blocks: this sits on the request path, so a
+        failure here would cost a request rather than a statistic.
+        """
+        try:
+            m = _WORKER_SUBTREE.search(request_line) or _EVENT_STREAM.search(
+                request_line)
+            if not m:
+                return
+            bid = _BRIDGE_ID.search(request_line)
+            if not bid:
+                return
+            stamp = time.monotonic() if now is None else now
+            book = (self._bridge_streams if _EVENT_STREAM.search(request_line)
+                    else self._bridge_posts)
+            book[bid.group(1)] = stamp
+        except Exception:  # noqa: BLE001 — a statistic must not cost a request
+            pass
+
+    def deaf_bridges(self, window: float = 300.0, now=None) -> list:
+        """Bridge ids that POSTED inside ``window`` and hold no inbound stream.
+
+        THE PAIR, as everywhere else here. Posting alone is not the signal --
+        a healthy bridge posts too. A missing stream alone is not either -- a
+        session that has said nothing yet has none and is fine. Deaf is the
+        conjunction, and it is the state CC cannot leave on its own:
+        `close()` sets state="closed" and `connect()` then returns at once,
+        forever.
+
+        The window is what stops this naming every session that ever ran: an
+        ended one goes quiet and drops out on its own, with no bookkeeping to
+        get wrong.
+        """
+        stamp = time.monotonic() if now is None else now
+        posts = getattr(self, "_bridge_posts", None)
+        if not posts:
+            return []
+        streams = getattr(self, "_bridge_streams", {})
+        return sorted(
+            bid for bid, last in posts.items()
+            if stamp - last <= window
+            and stamp - streams.get(bid, float("-inf")) > window
+        )
 
     def await_inflight(self, budget: float) -> int:
         """Wait up to ``budget`` for open connections to finish, then cut them.
@@ -11998,6 +12058,10 @@ class PinProxy:
             if _EVENT_STREAM.search(request_line):
                 with self._live_lock:
                     self._stream_conns.add(conn)
+        # PER BRIDGE, not per connection. `_stream_conns` answers "is this
+        # SOCKET a stream", which is what the drain needs; this answers "does
+        # this SESSION hold one", which is what a deaf bridge fails.
+        self._note_bridge_traffic(request_line)
         return self._handle_one_request_inner(request_line, tls)
 
     def _handle_one_request_inner(self, request_line: str, tls: ssl.SSLSocket) -> bool:
