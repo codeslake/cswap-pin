@@ -4797,13 +4797,13 @@ class TestAutoViewPinBadge:
     def case_badge_is_on_the_pinned_row_only(self, tmp_path):
         from cswap_pin.proxy import save_pin
 
-        save_pin(tmp_path, "codeslake@gmail.com", "org-1")
+        save_pin(tmp_path, "pinned@example.com", "org-1")
         out = self._rows(
             tmp_path,
-            [self._acct(1, "codeslake@gmail.com"), self._acct(2, "j.lee8@samsung.com")],
+            [self._acct(1, "pinned@example.com"), self._acct(2, "other@example.com")],
         )
-        pinned_line = next(l for l in out.splitlines() if "codeslake@gmail.com" in l)
-        other_line = next(l for l in out.splitlines() if "j.lee8@samsung.com" in l)
+        pinned_line = next(l for l in out.splitlines() if "pinned@example.com" in l)
+        other_line = next(l for l in out.splitlines() if "other@example.com" in l)
         assert "○ cloud" in pinned_line
         assert "○ cloud" not in other_line
 
@@ -4812,8 +4812,8 @@ class TestAutoViewPinBadge:
         cannot be read, so the badge must not hang off a usage branch."""
         from cswap_pin.proxy import save_pin
 
-        save_pin(tmp_path, "codeslake@gmail.com", "org-1")
-        out = self._rows(tmp_path, [self._acct(1, "codeslake@gmail.com")])
+        save_pin(tmp_path, "pinned@example.com", "org-1")
+        out = self._rows(tmp_path, [self._acct(1, "pinned@example.com")])
         assert "usage unknown" in out and "○ cloud" in out
 
     def case_no_badge_without_a_pin(self, tmp_path):
@@ -4833,7 +4833,7 @@ class TestAutoViewPinBadge:
         from cswap_pin.proxy import save_pin
         from claude_swap.tui.autoview import AutoScreen
 
-        email = "codeslake@gmail.com"
+        email = "pinned@example.com"
         save_pin(tmp_path, email, "org-1")
 
         class _T:
@@ -15580,10 +15580,9 @@ class TestObservedBridgeOwners:
     """What the bridges on this machine ACTUALLY belong to, not what we pinned.
 
     `cswap pin` prints `load_pin()` — the value it wrote itself. Measured
-    2026-08-17 that read "codeslake@gmail.com" while the live bridge belonged
-    to j.lee8@samsung.com and the login was codeslake.canada@gmail.com: three
-    accounts, one confident status line, and a 500 that took the session down
-    before anyone noticed the disagreement.
+    once with the pinned account in slot 1, the live bridge owned by slot 2 and
+    the login on slot 3: three accounts, one confident status line, and a 500
+    that took the session down before anyone noticed the disagreement.
 
     The discriminator is local and free — the job record already carries
     `bridgeOwnerOrganizationUuid`. Nothing here reaches the network; proving
@@ -15648,3 +15647,4 @@ class TestObservedBridgeOwners:
         )
         P = self._wire(monkeypatch, home)
         assert P.observed_bridge_owners() == {"cse_a": None}
+
