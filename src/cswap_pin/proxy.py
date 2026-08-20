@@ -10604,8 +10604,11 @@ class PinProxy:
         now = time.monotonic()
         last = getattr(self, "_last_slow_report", None)
         if last is not None and now - last < _SLOW_REPORT_COOLDOWN_S:
+            self._slow_suppressed = getattr(self, "_slow_suppressed", 0) + 1
             return
         self._last_slow_report = now
+        suppressed = getattr(self, "_slow_suppressed", 0)
+        self._slow_suppressed = 0
         # THE ROUTE, NOT THE IDENTIFIERS. This log is read by people and
         # pasted into reports. The query string was the obvious carrier; the
         # WORKER routes put the bridge id in a path segment, and those are
@@ -10622,14 +10625,28 @@ class PinProxy:
         else:
             # WHAT IS LEFT IS OURS. Naming it rather than making the reader
             # subtract is the difference between a line you act on and a line
-            # you have to do arithmetic on at 2am.
+            # you do arithmetic on at 2am.
+            #
+            # AND THE WAIT IS NOT "THE SERVER". It runs from after the write
+            # to the status line, so it is the server AND the whole return
+            # path — every proxy hop and tunnel the answer comes back
+            # through. This line said "waiting for the server" for one
+            # release and that named one of those two; it was one report away
+            # from being repeated as a settled finding.
             ours = max(0.0, total_ms - pin_ms - wait_ms)
-            split = (f"{wait_ms:.0f}ms waiting for the server, {ours:.0f}ms "
-                     f"getting it out through the chain")
+            split = (f"{wait_ms:.0f}ms downstream of the write (the server "
+                     f"and the path back), {ours:.0f}ms getting it out")
+        more = ""
+        if suppressed:
+            # THE CADENCE IN THE LOG IS THIS COOLDOWN, NOT THE PHENOMENON.
+            # One line a minute is a ceiling of 60 an hour, so a machine
+            # reporting 34 could be having 300 — and the even spacing invites
+            # exactly the periodicity argument the data cannot support.
+            more = f"; {suppressed} more in the last minute"
         _log_lifecycle(
             f"a {method} to {route} took {total_ms:.0f}ms "
-            f"({pin_ms:.0f}ms of it inside the pin; {split}) — a live view "
-            f"times out on stalls like this"
+            f"({pin_ms:.0f}ms of it inside the pin; {split}{more}) — a live "
+            f"view times out on stalls like this"
         )
 
     def _report_deaf_bridges(self) -> None:
