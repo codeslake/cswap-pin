@@ -5366,35 +5366,33 @@ class TestDrainReportsWhatItCut:
         assert teardown_drain_budget(
             "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
-    def case_an_uncapped_drain_waits_for_a_live_tunnel(self, certdir):
-        """A recycle must not take Remote Control down with it.
+    def case_the_pump_can_say_what_the_process_is_carrying(self, certdir):
+        """The reaper needs the PROCESS's tunnel count, and only the marker
+        can carry it — the sweep runs somewhere else.
 
-        RC's inbound channel is an opaque tunnel. `_mitm` hands both sockets to
-        `_PumpLoop` at the 101 and gives the debt back — right for the drain's
-        original question ("is a REPLY outstanding") and wrong for this one. So
-        `await_inflight` returned at once, the departing daemon exited, and
-        every tunnel it was pumping died with the process. The client
-        reconnects and the page says the connection was lost.
+        A daemon whose only remaining job is a bridge WebSocket owes no reply,
+        so every cost the reaper weighs scored it as the cheapest thing on the
+        box and it was always the one taken. That is the reap no session can
+        recover from by itself.
 
-        Measured 2026-08-20: 18 serving-daemon replacements in a day, the
-        banner on screen for several, and NOTHING draining at the time — which
-        is what ruled out the `Connection: close` explanation.
-
-        Nothing waits on that exit. The listener is released and the successor
-        is already serving, so staying costs one idle process and leaving costs
-        every live session a reconnect.
+        THE COUNT IS PROCESS-WIDE, THE PROXY'S IS NOT. `_PUMP` drives every
+        tunnel in the process; folding it into `live_stream_count` made one
+        proxy report another's, measured on a single-process runner as 2 where
+        1 was expected. The proxy counts its own subscriptions; the marker adds
+        the pump's pairs, because the marker describes the process.
         """
         import socket
 
-        from cswap_pin.proxy import _PUMP
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import _PUMP, PinProxy
 
         a, b = socket.socketpair()
         try:
             before = _PUMP.live_pairs()
             _PUMP.add(a, b)
             assert _PUMP.live_pairs() == before + 1, (
-                "the pump cannot say how many tunnels it drives, so the drain "
-                "has no way to ask")
+                "the pump cannot say how many tunnels it drives, so the "
+                "marker cannot tell the reaper this daemon is carrying one")
         finally:
             for s_ in (a, b):
                 try:
@@ -5402,61 +5400,34 @@ class TestDrainReportsWhatItCut:
                 except OSError:
                     pass
 
-        # AND THE DRAIN MUST ASK. Reaching the wait needs a live daemon and a
-        # real 101, so read it out of the source — the same convention this
-        # file uses for the exit-path ceilings.
-        import inspect
-
-        import cswap_pin.proxy as pp
-
-        src = inspect.getsource(pp.PinProxy.await_inflight)
-        assert "_PUMP.live_pairs()" in src, (
-            "the drain does not wait for live tunnels, so a recycle drops "
-            "every Remote Control channel this daemon is pumping")
-        guard = src[:src.index("_PUMP.live_pairs()")]
-        assert "if budget > 0" not in guard, (
-            "the tunnel wait is not above the capped arm, so it is not "
-            "confined to the uncapped one. The signal arm has a supervisor "
-            "counting to `_DRAIN_SECONDS + 2`, so waiting past it buys a "
-            "harder kill; the held arm is holding the port dark")
-        assert 'budget == float("inf")' in guard, (
-            "nothing confines the tunnel wait to the uncapped arm")
-
-        # AND IT MUST END. `while live_pairs()` has no exit of its own: a
-        # wedged peer keeps its entry for ever, so the wait added above turns
-        # a recycle into a process that never leaves — the never-ending drain
-        # this file removed a wall clock to avoid. Measured by the mutation
-        # check, which HUNG instead of reporting.
-        #
-        # A hang is a bad guard, so run the drain on a thread and assert it
-        # joined: the bug fails this cleanly instead of wedging the suite.
-        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
-                            upstream=("127.0.0.1", 1))
+        # AND THE PROXY'S OWN COUNT STAYS ITS OWN.
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                         upstream=("127.0.0.1", 1))
         c, d = socket.socketpair()
-        done = []
-        ttl, beat = pp._DRAINING_MARKER_TTL, pp._DRAINING_BEAT_SECONDS
-        pp._DRAINING_MARKER_TTL, pp._DRAINING_BEAT_SECONDS = 0.4, 0.05
-        _PUMP.add(c, d)                          # live, and never moves a byte
         try:
-            t = threading.Thread(
-                target=lambda: done.append(proxy.await_inflight(float("inf"))),
-                daemon=True)
-            t.start()
-            t.join(15)
-            assert not t.is_alive(), (
-                "the uncapped drain never returns while a tunnel is open. A "
-                "tunnel whose peer wedged holds the departing daemon open for "
-                "ever, so the port keeps two owners and the recycle never "
-                "completes")
+            _PUMP.add(c, d)
+            assert proxy.live_stream_count() == 0, (
+                "a proxy with no subscriptions of its own reported the "
+                "process's tunnels, so one proxy speaks for another")
         finally:
-            pp._DRAINING_MARKER_TTL, pp._DRAINING_BEAT_SECONDS = ttl, beat
             for s_ in (c, d):
                 try:
                     s_.close()
                 except OSError:
                     pass
-        assert done == [0], f"the drain reported {done}, not a clean 0"
 
+        # AND THE DRAIN DOES NOT WAIT ON TUNNELS SEPARATELY. It waited out the
+        # marker's whole TTL on a tunnel it did not own; the session's
+        # held-open stream already keeps this daemon alive, and the tunnel
+        # rides along on that.
+        import inspect
+
+        src = inspect.getsource(pp.PinProxy.await_inflight)
+        # THE LOOP, not the call: the marker line reads the same number, and
+        # that reading is the whole point of counting it here.
+        assert "while _PUMP.live_pairs()" not in src, (
+            "the drain waits on the pump again, so every recycle pays up to "
+            "the marker TTL for a tunnel that is not this drain's to wait on")
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
         """The channel a session cannot reopen for itself must survive a recycle.
 
