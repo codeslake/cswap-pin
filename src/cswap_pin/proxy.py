@@ -12674,7 +12674,22 @@ class PinProxy:
                 # THE CALLER IS THE ONLY ONE THAT KNOWS THE PATH, and the
                 # relay is the only one that sees the status. Neither can
                 # report an attachment outcome alone.
-                on_status=lambda st: self._note_attachment(path, st),
+                #
+                # AND THE TRACE RIDES THE SAME HOOK. `_relay_response` writes
+                # its `<-` line to `_TRACE` only, which is opened once at
+                # import from an env var and so is off on a daemon that is
+                # already serving. The `trace-to` file switch — the only one
+                # reachable during an incident — showed every request and not
+                # one response. Measured: 25 requests, ZERO responses, which
+                # reads exactly like a server that has stopped answering.
+                # `_tunnel_trace` writes both targets and this method can
+                # reach it, so no new plumbing is needed.
+                on_status=lambda st: (
+                    self._note_attachment(path, st),
+                    self._tunnel_trace(
+                        f"    <- {st.decode('latin1', 'replace').strip()}"
+                        f"  {method} {path}"),
+                ),
                 # A HEAD response carries the headers of the GET it mirrors,
                 # Content-Length included, but no body — only the request
                 # method says so.
