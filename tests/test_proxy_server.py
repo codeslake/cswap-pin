@@ -5628,6 +5628,69 @@ class TestDrainReportsWhatItCut:
         srv._note_bridge_traffic(A, now=100002.0)
         assert "cse_AAA" in srv.deaf_bridges(window=60.0, now=100003.0)
 
+    def case_the_deaf_report_says_it_in_words_a_watcher_can_match(self):
+        """The two log lines are an INTERFACE, not prose.
+
+        The cswap session matches on them to raise a fleet alert, so a silent
+        reword breaks a watcher on three machines and the failure is silence —
+        the same failure the line exists to end. Pinned here so a change has to
+        be deliberate and gets noticed in the same commit.
+
+        Driven end to end with REAL request lines, split the way the caller
+        splits them, because every layer of this feature has been
+        correct-and-unreachable at some point: the regexes never matched, then
+        nothing called the check, then the log had no reader.
+
+        THE CONTROL IS THE THIRD ASSERTION. A reporter that logged "deaf" on
+        every call would satisfy the first two; only "no new line when nothing
+        changed" proves it reports TRANSITIONS, which is what keeps the file
+        readable enough to be worth watching.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            def wire(request_line, conn=None):
+                parts = request_line.split(" ")
+                srv._note_bridge_traffic(
+                    parts[1] if len(parts) > 1 else "/", conn=conn)
+
+            wire("POST /v1/code/sessions/cse_DEAF/worker/messages HTTP/1.1")
+            srv._report_deaf_bridges()
+            assert lines, (
+                "a bridge that posts and holds no stream produced no line, so "
+                "the fleet cannot self-report")
+            assert "post but hold no inbound stream" in lines[-1], lines[-1]
+            assert "cse_DEAF" in lines[-1], (
+                "the line names no bridge, so a reader cannot act on it")
+
+            conn = object()
+            wire("GET /v1/code/sessions/cse_DEAF/worker/events/stream HTTP/1.1",
+                 conn=conn)
+            srv._stream_conns.add(conn)
+            srv._open_conns.add(conn)
+            srv._report_deaf_bridges()
+            assert lines[-1] == "every posting bridge holds an inbound stream", (
+                f"the recovery line is not verbatim: {lines[-1]!r}")
+
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) == before, (
+                "it logged again with nothing changed; a line per sweep buries "
+                "the transition and trains a reader to skim the file")
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 
