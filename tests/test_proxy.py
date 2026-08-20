@@ -2804,6 +2804,85 @@ class _FakeSwitcher:
         self.persisted.append((num, email, credentials))
 
 
+class TestTheTraceCanBeArmedOnALiveDaemon:
+    """Turning the request trace on must not require rebuilding the daemon.
+
+    `CSWAP_PIN_DEBUG` is read at exec and the daemon outlives every session, so
+    arming it meant taking the lineage down and letting a process that carries
+    the env rebuild it. The only harness that does this SIGTERMs the daemon,
+    which takes the signal drain arm — 30 s — and cuts whatever is in flight.
+    Diagnosing an outage by causing one.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_file_in_the_certdir_arms_it(self, tmp_path, monkeypatch):
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.delenv("CSWAP_PIN_DEBUG", raising=False)
+        pin_proxy._TRACE_CACHE.clear()
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        assert pin_proxy.trace_target(certdir) is None, "off by default"
+
+        (certdir / pin_proxy._TRACE_SWITCH_FILE).write_text(
+            str(tmp_path / "t.log") + "\n")
+        pin_proxy._TRACE_CACHE.clear()          # skip the recheck window
+        assert pin_proxy.trace_target(certdir) == str(tmp_path / "t.log")
+
+        (certdir / pin_proxy._TRACE_SWITCH_FILE).unlink()
+        pin_proxy._TRACE_CACHE.clear()
+        assert pin_proxy.trace_target(certdir) is None, (
+            "removing the switch must turn it off — a trace nobody can stop "
+            "grows without a ceiling on a machine nobody is watching")
+
+    def case_the_env_still_wins(self, tmp_path, monkeypatch):
+        """An existing deployment must behave exactly as it did."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        (certdir / pin_proxy._TRACE_SWITCH_FILE).write_text("/from/file")
+        monkeypatch.setenv("CSWAP_PIN_DEBUG", "/from/env")
+        pin_proxy._TRACE_CACHE.clear()
+        assert pin_proxy.trace_target(certdir) == "/from/env"
+
+    def case_an_unreadable_switch_is_off_not_an_error(self, tmp_path,
+                                                     monkeypatch):
+        """This sits on the request path. A diagnostic that can break a request
+        is worse than no diagnostic."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.delenv("CSWAP_PIN_DEBUG", raising=False)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        # A DIRECTORY where a file is expected: read_text raises IsADirectory.
+        (certdir / pin_proxy._TRACE_SWITCH_FILE).mkdir()
+        pin_proxy._TRACE_CACHE.clear()
+        assert pin_proxy.trace_target(certdir) is None
+        assert pin_proxy.trace_target(None) is None
+
+    def case_the_request_path_asks_the_resolver(self):
+        """The resolver is right in isolation whether or not anything calls it,
+        so the assertions above cannot fail on the bug they describe. Read out
+        of the source: reaching the trace block needs a live MITM connection."""
+        import ast
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        calls = [n for n in ast.walk(ast.parse(inspect.getsource(pp)))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "trace_target"]
+        assert calls, (
+            "nothing on the request path asks where to trace, so the switch "
+            "file is inert and arming it still needs a daemon restart")
+
+
 class TestMakePinTokenProvider:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)

@@ -2655,6 +2655,35 @@ _PRESENCE = re.compile(r"^/v1/(code/)?sessions/[^/]+/client/presence(/|$|\\?)")
 _WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
 
 
+def trace_target(certdir) -> "str | None":
+    """Where to write the request trace, or None for off.
+
+    The env still wins, so an existing deployment behaves exactly as before.
+    Absent one, ``<certdir>/trace-to`` names the file — created and removed
+    while the daemon serves, which is the whole point: the alternative is
+    restarting the thing you are trying to observe.
+
+    An unreadable or empty switch is OFF, not an error: this is a diagnostic,
+    and a diagnostic that can break a request is worse than no diagnostic.
+    """
+    env = os.environ.get("CSWAP_PIN_DEBUG")
+    if env:
+        return env
+    if certdir is None:
+        return None
+    key = str(certdir)
+    seen, target = _TRACE_CACHE.get(key, (0.0, None))
+    now = time.time()
+    if now - seen < _TRACE_RECHECK_S:
+        return target
+    try:
+        target = (Path(certdir) / _TRACE_SWITCH_FILE).read_text().strip() or None
+    except OSError:
+        target = None
+    _TRACE_CACHE[key] = (now, target)
+    return target
+
+
 def is_pinned_route(path: str) -> bool:
     """Whether a request path's bearer must be swapped to the pinned account.
 
@@ -4926,6 +4955,14 @@ _HOLDER_MODULE_ARG = "--hold-port"
 _DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 
 _STATE_FILE = "proxy.json"
+# Turning the request trace on used to require the daemon to be REBUILT: the
+# env is read at exec and the daemon outlives every session. Writing this file
+# reaches a daemon that is already serving.
+_TRACE_SWITCH_FILE = "trace-to"
+# Re-read at most this often: the check sits on the request path, and a stat
+# per request buys nothing when the answer changes once a day at most.
+_TRACE_RECHECK_S = 2.0
+_TRACE_CACHE: dict = {}
 # How long `_spawn_daemon` waits for a successor to publish. 10s because a
 # FIRST run generates an RSA key pair before it can serve.
 _SPAWN_WAIT_S = 10.0
@@ -9494,8 +9531,10 @@ class PinProxy:
         # swapped). Off by default; used to diagnose routing end to end.
         # CAPPED, like `daemon.log`. This wrote one line per request into an
         # uncapped append; see `_append_capped`.
-        self._debug_path = os.environ.get("CSWAP_PIN_DEBUG")
         self._debug = None
+        # Which path `_debug` is open on, so a re-armed trace does not keep
+        # writing to the file it was armed on first.
+        self._debug_for = None
 
     def start(self) -> None:
         if self._handed_fd is not None:
@@ -11786,7 +11825,19 @@ class PinProxy:
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
-        if self._debug_path:
+        debug_path = trace_target(getattr(self, "_certdir", None))
+        # THE HANDLE IS CACHED AND THE TARGET IS NOT FIXED ANY MORE.
+        # `_append_capped` keeps a descriptor across calls and reopens only on
+        # rotation, so a trace re-armed at a different path kept writing to the
+        # first one — reachable now that arming does not restart the daemon.
+        if debug_path != self._debug_for:
+            try:
+                if self._debug is not None:
+                    self._debug.close()
+            except OSError:
+                pass
+            self._debug, self._debug_for = None, debug_path
+        if debug_path:
             hdrs = " | ".join(
                 f"{k}: {v[:60]}" for k, v in headers
                 if k.lower() in (
@@ -11795,7 +11846,7 @@ class PinProxy:
                 )
             )
             self._debug = _append_capped(
-                self._debug_path,
+                debug_path,
                 f"[c{getattr(self._local, 'cid', 0)}] "
                 f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n",
                 self._debug,
