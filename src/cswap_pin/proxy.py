@@ -10533,6 +10533,22 @@ class PinProxy:
             # the check permanently, which is the same silent-absence failure
             # as the empty denominator above, only quieter. Each draining
             # daemon publishes what it holds; this reads them.
+            # THE CHEAP ANSWER FIRST, AND USUALLY THE ONLY ONE NEEDED.
+            # This runs on every bridge CREATE, inside the request handler,
+            # and the enumeration below shells out to `ps -ww -axo` —
+            # measured at ~30ms against 565 processes. I put that on the hot
+            # path with the union and it did not belong there.
+            #
+            # It is also unnecessary, because the union can only ever REMOVE
+            # bridges from this list: a predecessor holding a stream makes a
+            # bridge NOT deaf. So an empty local answer cannot be changed by
+            # anything a predecessor holds, and there is nothing to ask.
+            if not self.deaf_bridges():
+                if [] == getattr(self, "_last_deaf", None):
+                    return
+                self._last_deaf = []
+                _log_lifecycle(f"{DEAF_REPORT_CLEAR} ({posted} posting)")
+                return
             certdir = getattr(self, "_certdir", None)
             elsewhere: set = set()
             mute = []
