@@ -15704,6 +15704,69 @@ class TestTheCredentialReadIsNotPaidPerRequest:
             provider()
         assert len(reads) == 1, f"{len(reads)} reads for 21 requests"
 
+    def case_an_unexpired_token_is_never_re_read(self, monkeypatch):
+        """NO TIME-BASED EXPIRY, because time is not what invalidates this.
+
+        An access token carries its own expiry. Another process rotating the
+        stored credential does not revoke the one already in hand — it stays
+        valid until it expires. So a TTL re-reads on a schedule to discover
+        something that cannot have happened yet, and the first version of this
+        cache had a 5s one for exactly that non-reason.
+
+        Expiry is the invalidation, and the code to re-read on it was already
+        there: the refresh path takes the lock and re-reads the store before
+        deciding, which is precisely when another process's rotation matters.
+        """
+        from cswap_pin import proxy as pin_proxy
+        reads = []
+        provider = self._provider(monkeypatch, reads)
+        # ADVANCE THE CLOCK, or this cannot fail. The first cut of this test
+        # made 51 calls in a tight loop, which all land inside any plausible
+        # TTL, so it passed against the very code it was written to reject.
+        now = [0.0]
+        monkeypatch.setattr(pin_proxy.time, "monotonic", lambda: now[0])
+        assert provider() == "tok"
+        for _ in range(50):
+            now[0] += 60.0            # an hour of wall time, in total
+            provider()
+        assert len(reads) == 1, (
+            f"{len(reads)} reads for 51 requests spread over 50 minutes — "
+            "something is re-reading an unexpired token on a timer")
+
+    def case_an_expired_token_re_reads_the_store(self, monkeypatch):
+        """The other half, and the one the TTL was standing in for: when the
+        held token IS expired, another process may have rotated it, so the
+        store is read again before anything is refreshed."""
+        from cswap_pin import proxy as pin_proxy
+        reads = []
+
+        class _Switcher:
+            backup_dir = pathlib.Path("/nonexistent")
+            expired = True
+
+            def resolve_account(self, key):
+                return "1", key, {}
+
+            def current_account_number(self):
+                return "9"
+
+            def read_account_credentials(self, num, mail):
+                reads.append((num, mail))
+                exp = 1 if self.expired else 9e12
+                return json.dumps({"claudeAiOauth": {
+                    "accessToken": "tok", "expiresAt": exp}})
+
+        sw = _Switcher()
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@example.com", "org"))
+        monkeypatch.setattr(pin_proxy, "resolve_pin_token",
+                            lambda creds, consume: (None, None))
+        provider = pin_proxy.make_pin_token_provider(sw, "1", "a@example.com")
+        provider()
+        before = len(reads)
+        provider()
+        assert len(reads) > before, "an expired token did not re-read the store"
+
     def case_a_repin_is_still_seen(self, monkeypatch):
         """The feature the cache must not eat. Re-pinning to another account
         has to reach a live session, so a cache entry belongs to the account

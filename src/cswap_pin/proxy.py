@@ -2675,13 +2675,6 @@ _SLOW_REPORT_COOLDOWN_S = 60.0
 _SLOW_RECHECK_S = 5.0
 _SLOW_CACHE: dict = {}
 
-# How long a pinned account's credential may be reused without re-reading the
-# store. Short on purpose: the key already covers a re-pin, so this only has
-# to bound the same account's credential being rotated underneath us by the
-# usage collector or the autoswitcher. Five seconds turns ~20ms per request on
-# a mac into ~20ms per five seconds while leaving a rotation invisible for
-# less time than a token refresh takes.
-_CRED_TTL_S = 5.0
 
 
 def slow_report_ms(certdir) -> "float | None":
@@ -4572,13 +4565,23 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # account. The email is the half that actually identifies who this
         # credential belongs to.
         ckey = (num, mail)
+        # EXPIRY IS THE INVALIDATION, NOT TIME. An access token carries its
+        # own expiry, and another process rotating the stored credential does
+        # not revoke the one already in hand -- it stays valid until it
+        # expires. A TTL would therefore re-read on a timer to discover
+        # something that cannot have happened yet, and the first cut of this
+        # cache had a 5s one for exactly that non-reason.
+        #
+        # The rotation case is handled where it matters: when the held token
+        # IS expired, the refresh path below takes the lock and re-reads the
+        # store before deciding. That re-read predates this cache.
         cached = _cred_cache.get(ckey)
-        if cached is not None and time.monotonic() - cached[0] < _CRED_TTL_S:
-            creds = cached[1]
+        if cached is not None:
+            creds = cached
         else:
             creds = switcher.read_account_credentials(num, mail)
             if creds:
-                _cred_cache[ckey] = (time.monotonic(), creds)
+                _cred_cache[ckey] = creds
         if not creds:
             return None
         token = _live_token(creds)
@@ -4588,6 +4591,9 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         with refresh_lock:
             # Someone may have rotated it while we waited — re-read and reuse.
             creds = switcher.read_account_credentials(num, mail) or creds
+            # REPLACE THE HELD COPY, or the cache keeps handing back the
+            # expired blob and every later request re-enters this lock.
+            _cred_cache[ckey] = creds
             token = _live_token(creds)
             if token:
                 return token
