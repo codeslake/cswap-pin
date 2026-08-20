@@ -2781,13 +2781,21 @@ class TestResolvePinToken:
 class _FakeSwitcher:
     """Duck-typed stand-in for ClaudeAccountSwitcher's provider-facing API."""
 
-    def __init__(self, active_num="1", backups=None):
+    def __init__(self, active_num="1", backups=None, roster_active=None):
         self.active_num = active_num
         self.backups = backups or {}
         self.persisted = []
+        # cswap's OWN record of the active slot. The pin never writes it,
+        # which is the whole reason the provider can trust it. None = absent.
+        self.roster_active = roster_active
 
     def current_account_number(self):
         return self.active_num
+
+    def _get_sequence_data(self):
+        if self.roster_active is None:
+            return {}
+        return {"activeAccountNumber": self.roster_active}
 
     def read_account_credentials(self, num, email):
         return self.backups.get(num, "")
@@ -2824,6 +2832,62 @@ class TestMakePinTokenProvider:
         provider = make_pin_token_provider(sw, "2", "pin@example.com")
         assert provider() is None
         assert provider.pin_is_noop() is True, "pin == active is a no-op, not a failure"
+
+    def case_our_own_splice_must_not_read_as_the_pin_being_active(self):
+        """THE ROOT CAUSE, and it is a loop: the pin disables its own swap.
+
+        `~/.claude.json`'s `oauthAccount` is rewritten to the PINNED identity
+        so a live Remote Control bridge survives an account rotation. The
+        provider then asks `current_account_number()`, which reads that same
+        field — so it asks our own forgery, is told "the pin is already
+        active", and swaps nothing. Every bridge afterwards goes out as the
+        rotated account, `pin_is_noop` calls that correct, and no check
+        anywhere disagrees.
+
+        Measured live: oauthAccount said the pinned address while the roster
+        said slot 4. The daemon only got the right answer because the host
+        happened to carry an un-splice helper — code in another repo, on a
+        branch that is not merged. The pin's own swap must not depend on that.
+        """
+        import json
+        from cswap_pin.proxy import make_pin_token_provider
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-live", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        # A host with no un-splice: the spliced config makes it answer "2".
+        sw = _FakeSwitcher(active_num="2", backups={"2": creds},
+                           roster_active="4")
+        provider = make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() == "pin-live", (
+            "the provider believed our own splice and swapped nothing — that "
+            "is every bridge going out as the rotated account, silently")
+        assert provider.pin_is_noop() is False, (
+            "a swap that did not happen was reported as nothing-to-do")
+
+    def case_a_genuine_login_as_the_pin_is_still_a_no_op(self):
+        """Control, and it is the case the guard must not break. When the
+        person really is logged in as the pinned account the roster says so
+        too, the live bearer already belongs to it, and swapping would put a
+        backup copy over a credential the client owns."""
+        import json
+        from cswap_pin.proxy import make_pin_token_provider
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-live", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        sw = _FakeSwitcher(active_num="2", backups={"2": creds},
+                           roster_active="2")
+        provider = make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() is None
+        assert provider.pin_is_noop() is True
+
+    def case_an_absent_roster_falls_back_to_the_host(self):
+        """A store with no recorded active slot must not turn every no-op into
+        a swap. Absent is not disagreement."""
+        from cswap_pin.proxy import make_pin_token_provider
+        sw = _FakeSwitcher(active_num="2", roster_active=None)
+        provider = make_pin_token_provider(sw, "2", "pin@example.com")
+        assert provider() is None
+        assert provider.pin_is_noop() is True
 
     def case_an_unreadable_store_is_still_a_failure(self):
         """The split must not swallow the case the warning exists for."""
