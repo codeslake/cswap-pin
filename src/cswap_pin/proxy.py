@@ -2669,6 +2669,14 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 # someone clicks the wrong one) and far above the cost of a listing.
 _BRIDGE_SWEEP_COOLDOWN_S = 600.0
 
+# When a request through this proxy is worth a line of its own, and how rarely.
+# 1.5s is well above a healthy round trip here (p50 310ms, p90 345ms measured
+# over 340 samples) and well below the multi-second stalls a live claude.ai
+# view times out on. The cooldown is because a genuinely slow endpoint would
+# otherwise fill the log with what the first line already said.
+_SLOW_REQUEST_MS = 1500.0
+_SLOW_REPORT_COOLDOWN_S = 60.0
+
 
 # THE TWO LINES `_report_deaf_bridges` writes, as symbols rather than prose.
 # A peer watcher greps the daemon log for these; exported so it can assert at
@@ -10491,6 +10499,42 @@ class PinProxy:
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
+    def _note_slow_request(self, method: str, path: str,
+                           total_ms: float, pin_ms: float) -> None:
+        """Record a request that took seconds, because nothing else does.
+
+        `daemon.log` carries lifecycle events, so a slow request leaves no
+        trace in the one file a later reader has. Measured on a mac: three
+        round trips of 2419/2491/2681ms out of 340 through this proxy, and
+        not a line in the log for the window they happened in. A stall is
+        precisely what a live claude.ai view times out on, so the thing that
+        has to be visible was the one thing that was not.
+
+        `pin_ms` is everything this proxy did BEFORE the request went
+        upstream — resolving the pinned credential, the bridge bookkeeping,
+        the bounded wait for a token. It is broken out because the two halves
+        have opposite fixes and neither can be inferred from the total: the
+        pin's own work is ours to make cheaper (the credential read alone is
+        0.02ms on linux and 19.8ms on a mac, where it goes through the
+        keychain), the remainder belongs to the chain below us.
+
+        Never raises: this runs on the request path.
+        """
+        if total_ms < _SLOW_REQUEST_MS:
+            return
+        now = time.monotonic()
+        last = getattr(self, "_last_slow_report", None)
+        if last is not None and now - last < _SLOW_REPORT_COOLDOWN_S:
+            return
+        self._last_slow_report = now
+        # THE ROUTE, NOT THE QUERY STRING. This log is read by people and
+        # pasted into reports, and the parameters carry session ids.
+        _log_lifecycle(
+            f"a {method} to {path.split('?', 1)[0]} took {total_ms:.0f}ms "
+            f"({pin_ms:.0f}ms of it inside the pin) — a live view times out "
+            f"on stalls like this"
+        )
+
     def _report_deaf_bridges(self) -> None:
         """Say which bridges post but hold no inbound stream, on CHANGE.
 
@@ -12339,6 +12383,9 @@ class PinProxy:
         body = _read_body(tls, headers)
 
         pinned = is_pinned_route(path)
+        # TWO CLOCKS, because the total alone cannot say who was slow — see
+        # `_note_slow_request`. `_t_pin` closes where the request leaves us.
+        _t_req = _t_pin = time.monotonic()
         # OUTSIDE THE BEARER GATE, deliberately. Sweeping superseded bridges is
         # our own bookkeeping and has nothing to do with whose token a request
         # carries. Inside `if pinned:` the presence trigger was UNREACHABLE,
@@ -12460,6 +12507,11 @@ class PinProxy:
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
+        # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
+        # inside `_forward`'s status hook, and it takes no arguments from
+        # here. One MITM connection is one thread, so there is no sharing.
+        self._local.pin_ms = (time.monotonic() - _t_pin) * 1000
+        self._local.t_req = _t_req
         debug_path = trace_target(getattr(self, "_certdir", None))
         # THE HANDLE IS CACHED AND THE TARGET IS NOT FIXED ANY MORE.
         # `_append_capped` keeps a descriptor across calls and reopens only on
@@ -12684,11 +12736,23 @@ class PinProxy:
                 # reads exactly like a server that has stopped answering.
                 # `_tunnel_trace` writes both targets and this method can
                 # reach it, so no new plumbing is needed.
+                #
+                # THE STATUS LINE IS ALSO WHERE A STALL ENDS, and it is the
+                # only place it can be timed. A response body here can be an
+                # SSE stream held open for hours — one drained for 5735.9s —
+                # so timing the whole relay would report a healthy stream's
+                # lifetime as a stall. Time to the first byte is the number
+                # that means the same thing for both.
                 on_status=lambda st: (
                     self._note_attachment(path, st),
                     self._tunnel_trace(
                         f"    <- {st.decode('latin1', 'replace').strip()}"
                         f"  {method} {path}"),
+                    self._note_slow_request(
+                        method, path,
+                        (time.monotonic() - getattr(
+                            self._local, "t_req", time.monotonic())) * 1000,
+                        getattr(self._local, "pin_ms", 0.0)),
                 ),
                 # A HEAD response carries the headers of the GET it mirrors,
                 # Content-Length included, but no body — only the request
