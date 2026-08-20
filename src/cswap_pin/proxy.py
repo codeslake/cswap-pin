@@ -10263,20 +10263,18 @@ class PinProxy:
     def live_stream_count(self) -> int:
         """Long-lived channels that would die with this process.
 
-        TWO KINDS, and counting one of them was the bug. Remote Control
-        RECEIVES over a WebSocket to the ingress host the `/bridge` response
-        names — not api.anthropic.com — so it is an opaque tunnel driven by
-        `_PUMP`. `/worker/events/stream` is the other: a held-open GET through
-        the MITM, tracked in `_stream_conns`. A daemon carrying only the
-        WebSocket counted zero and stayed the cheapest thing to reap.
+        THIS PROXY'S, not the process's. `_PUMP` is a module global driving
+        every tunnel in the process, and folding it in here made one proxy
+        report another's — measured on a single-process runner as 2 where 1
+        was expected. The reaper wants the process-wide number and reads it
+        from the marker, which is written once per process.
 
-        The stream set is intersected with the live one: a socket object
-        outlives its descriptor and the NUMBER gets reused, so the set alone
-        can name a connection that is no longer ours.
+        Intersected with the live set: a socket object outlives its descriptor
+        and the NUMBER gets reused, so the stream set alone can name a
+        connection that is no longer ours.
         """
         with self._live_lock:
-            streams = len(self._stream_conns & self._open_conns)
-        return streams + _PUMP.live_pairs()
+            return len(self._stream_conns & self._open_conns)
 
     def await_inflight(self, budget: float) -> int:
         """Wait up to ``budget`` for open connections to finish, then cut them.
@@ -10372,7 +10370,9 @@ class PinProxy:
         # against a copy of every count taken here; `_content_at` answers the
         # same question directly, so the copy and the second dict it copied
         # both go. One structure fewer to keep popped at three call sites.
-        streams = self.live_stream_count()
+        # THE PROCESS'S NUMBER, not this proxy's: the marker describes the
+        # process the reaper would kill, and `_PUMP` drives every tunnel in it.
+        streams = self.live_stream_count() + _PUMP.live_pairs()
         if streams:
             _log_lifecycle(
                 f"draining with {streams} long-lived channel(s) still open — "
@@ -10383,36 +10383,15 @@ class PinProxy:
                       streams=streams)
         beat_at = started
         try:
-            # AND THE TUNNELS, on the uncapped path only. A tunnel owes no
-            # REPLY, so `_owed_still_moving` is right to ignore it — and it is
-            # still a live Remote Control channel that dies with this process.
-            # Nothing waits on this exit: the listener is released and the
-            # successor is serving, so staying costs one idle process and
-            # leaving costs every live session a reconnect. That reconnect is
-            # the "Connection lost" the page shows, measured with NOTHING
-            # draining, which is what ruled out the `Connection: close` story.
-            #
-            # Uncapped only. The signal arm has a supervisor counting to
-            # `_DRAIN_SECONDS + 2`, and the held arm is holding the port dark.
-            if budget == float("inf"):
-                # AND IT ENDS ON SILENCE. `live_pairs()` alone has no exit:
-                # a wedged peer keeps its entry for ever and the departing
-                # process never leaves, which is the never-ending drain this
-                # file removed a wall clock to avoid. A tunnel quiet for the
-                # marker's own TTL cannot be told from a dead one, and that is
-                # the same discriminator the reply wait already uses.
-                while _PUMP.live_pairs() and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL:
-                    beat_draining(self._certdir,
-                                  owed=self.inflight_requests(),
-                                  live=_PUMP.live_pairs(),
-                                  quiet=_PUMP.quiet_for(),
-                                  streams=self.live_stream_count())
-                    time.sleep(_DRAINING_BEAT_SECONDS)
-                if _PUMP.live_pairs():
-                    _log_lifecycle(
-                        f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
-                        f"{int(_PUMP.quiet_for())}s rather than holding on a "
-                        f"wedged peer")
+            # NO SEPARATE WAIT FOR THE TUNNELS, and that is not an
+            # oversight. Remote Control receives over a WebSocket to the
+            # ingress host the `/bridge` response names, so it is an opaque
+            # tunnel `_PUMP` drives rather than a reply anyone is owed. The
+            # same session's held-open `/worker/events/stream` DOES owe this
+            # daemon an answer for the life of the session, so the daemon
+            # stays anyway and the tunnel rides along on that. A wait of its
+            # own only delayed the exit — measured at the full marker TTL on
+            # a tunnel the drain did not own.
             if budget > 0:
                 deadline = started + budget
                 while time.monotonic() < deadline:
@@ -13303,9 +13282,6 @@ class _PumpLoop:
     """
 
     def __init__(self):
-        # When any tunnel last moved a byte. The drain reads it to tell a
-        # tunnel carrying a session from one whose peer has wedged.
-        self._last_move = 0.0
         self._sel = selectors.DefaultSelector()
         self._peer: dict = {}
         # Bytes accepted from one side that the other has not taken yet.
@@ -13339,17 +13315,6 @@ class _PumpLoop:
         """
         return callable(getattr(sock, "setblocking", None))
 
-    def quiet_for(self) -> float:
-        """Seconds since any tunnel last moved a byte, 0.0 if none ever has.
-
-        SILENCE, not age. A tunnel still carrying bytes is a live session and
-        the drain should wait however long it runs; one that has carried
-        nothing for a while cannot be told from a tunnel whose peer wedged.
-        """
-        with self._lock:
-            last = self._last_move
-        return (time.monotonic() - last) if last else 0.0
-
     def live_pairs(self) -> int:
         """How many tunnels this selector is driving.
 
@@ -13367,7 +13332,6 @@ class _PumpLoop:
         teardown goes, because the caller no longer has a thread to run it on.
         """
         with self._lock:
-            self._last_move = time.monotonic()
             self._peer[a] = (b, on_close)
             self._peer[b] = (a, on_close)
             for s in (a, b):
@@ -13495,12 +13459,6 @@ class _PumpLoop:
                 # writable. A blocking `sendall` here reintroduced the exact
                 # coupling this class removed.
                 with self._lock:
-                    # A BYTE MOVED. Stamped HERE and not at the top of the
-                    # loop: the wake pipe fires on membership churn, and a
-                    # stamp there would refresh itself on this daemon's own
-                    # bookkeeping — a heartbeat the drain would read as
-                    # traffic, so its wait would never end.
-                    self._last_move = time.monotonic()
                     self._pending[dst] = self._pending.get(dst, b"") + data
                 self._flush(dst, on_close)
 
