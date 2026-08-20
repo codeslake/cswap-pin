@@ -147,37 +147,6 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
 _CA_CACHE: list = []
 
 
-def _drop_ca_cache():
-    """Remove the session's cached CA dir when the process ends.
-
-    IT NEVER CLEANED UP AND NOBODY COULD SEE IT. `mkdtemp` below is reached once
-    per PROCESS, and xdist gives every worker its own — so a run leaks one dir
-    per worker, and a loop of runs leaks a pile. Counted on host-a before this
-    landed: 1,619 dirs under /tmp/cswap-test-ca-*, 32 MB, all from a single
-    hour of repeated whole-suite runs while chasing a flake.
-
-    Nothing FAILS from it, which is the whole reason it survived: the number is
-    invisible until somebody goes looking, and no test asserts on /tmp.
-
-    `atexit` rather than a fixture, because the cache is deliberately
-    process-scoped — a session fixture would tie it to a pytest session and the
-    cache outlives collection order by design. `ignore_errors` because a
-    cleanup that raises during interpreter shutdown turns a tidy-up into a
-    failure nobody can act on.
-    """
-    import atexit
-    import shutil
-
-    def _sweep():
-        for d in _CA_CACHE:
-            shutil.rmtree(d, ignore_errors=True)
-        _CA_CACHE.clear()
-
-    atexit.register(_sweep)
-    return _sweep
-
-
-_SWEEP_CA_CACHE = _drop_ca_cache()
 
 
 def _make_certdir(tmp_path):
@@ -194,7 +163,24 @@ def _make_certdir(tmp_path):
     from cswap_pin.proxy import ensure_ca
 
     if not _CA_CACHE:
-        src = pathlib.Path(tempfile.mkdtemp(prefix="cswap-test-ca-"))
+        # NOTHING FAILS FROM A LEAK HERE, which is why the old one survived:
+        # `mkdtemp` is reached once per PROCESS and xdist gives every worker
+        # its own, so a loop of runs piles them up and no test asserts on
+        # /tmp. Counted 1,619 in one hour of repeated runs when it was found,
+        # and 1,627 twelve days after the "fix".
+        #
+        # UNDER PYTEST'S OWN TREE, not a fresh mkdtemp. `atexit` was the old
+        # cleanup and it does not run on the exits this suite takes: a daemon
+        # teardown ends in `os._exit(0)`, which skips handlers by definition,
+        # and a killed xdist worker runs nothing. Measured — the sweep landed
+        # 2026-08-06 and the newest orphan was dated 2026-08-18, 1,627 of them.
+        #
+        # `tmp_path` is `<basetemp>/<run>/<case>`, so its parent is the run
+        # directory, and pytest reaps all but the last three runs itself. Same
+        # mechanism that already removes every `tmp_path`, on every exit path
+        # including the ones that execute no Python.
+        src = pathlib.Path(tmp_path).parent / "ca-cache"
+        src.mkdir(parents=True, exist_ok=True)
         ensure_ca(src, "api.anthropic.com")
         _CA_CACHE.append(src)
     for f in ("ca.pem", "ca.key", "leaf.pem", "leaf.key"):
