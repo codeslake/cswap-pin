@@ -5536,9 +5536,28 @@ class TestDrainReportsWhatItCut:
         srv._stream_conns = set()
         srv._open_conns = set()
 
-        A = "/v1/code/sessions/cse_AAA/worker/messages"
-        A_STREAM = "/v1/code/sessions/cse_AAA/worker/events/stream"
-        B = "/v1/code/sessions/cse_BBB/worker/messages"
+        # WHAT PRODUCTION ACTUALLY HANDS OVER. `_handle_one_request` holds a
+        # raw request line and must split it, because every route pattern is
+        # `^`-anchored to a path. Feeding bare paths here is what let the
+        # accounting record NOTHING on every machine while this stayed green,
+        # so the line is split the way the caller splits it.
+        def _path(request_line):
+            parts = request_line.split(" ")
+            return parts[1] if len(parts) > 1 else "/"
+
+        A = _path("POST /v1/code/sessions/cse_AAA/worker/messages HTTP/1.1")
+        A_STREAM = _path(
+            "GET /v1/code/sessions/cse_AAA/worker/events/stream HTTP/1.1")
+        B = _path("POST /v1/code/sessions/cse_BBB/worker/messages HTTP/1.1")
+        assert A.startswith("/v1/"), "the split did not produce a path"
+
+        # AND THE CALLER MUST DO THAT SPLIT. The bug was never in this
+        # function; it was one level up, handing over the whole line.
+        import inspect
+        caller = inspect.getsource(pp.PinProxy._handle_one_request)
+        assert "_note_bridge_traffic(request_line" not in caller, (
+            "the caller passes the raw request line, which matches no route "
+            "pattern — the accounting records nothing on every machine")
 
         # A posts and HOLDS a stream. B posts and never opens one.
         # The stream is a connection that stays open, not an event that
@@ -5591,6 +5610,19 @@ class TestDrainReportsWhatItCut:
             "stream was opened before the window — the stream is issued once "
             "and kept, so it never falls inside a recent window")
 
+        # AND SOMETHING MUST ASK. `deaf_bridges` answered correctly and had
+        # NO CALLER in either repo for three releases — one definition, no CLI,
+        # and a method on the daemon's own instance, so no other process could
+        # reach it. A check nothing invokes is not a check, and the suite could
+        # not tell the difference.
+        import inspect
+        wired = inspect.getsource(pp.PinProxy._report_deaf_bridges)
+        assert "self.deaf_bridges()" in wired
+        caller = inspect.getsource(pp.PinProxy._handle_one_request_inner)
+        assert "_report_deaf_bridges()" in caller, (
+            "nothing on a machine invokes the deaf check, so the fleet cannot "
+            "self-report and this test proves only that the maths is right")
+
         # AND A CLOSED CONNECTION IS NOT A HELD STREAM.
         srv._open_conns.discard(conn_a)
         srv._note_bridge_traffic(A, now=100002.0)
@@ -5620,6 +5652,8 @@ class TestDrainReportsWhatItCut:
         WITHOUT waking a quiet daemon -- which is the objection the create-only
         design was built on. A cooldown keeps it from listing on every post.
         """
+        import ast
+
         import cswap_pin.proxy as pp
 
         srv = pp.PinProxy.__new__(pp.PinProxy)
@@ -5629,6 +5663,32 @@ class TestDrainReportsWhatItCut:
 
         PRESENCE = "/v1/code/sessions/cse_AAA/client/presence"
         CREATE = "/v1/code/sessions"
+
+        # REACHABILITY FIRST. Presence is deliberately NOT a pinned route, so
+        # a sweep call placed inside `if pinned:` can never see it — the
+        # trigger, its cooldown and its timestamp are all dead and this test
+        # would still pass, because it calls the predicate directly.
+        assert pp.is_pinned_route(PRESENCE) is False, (
+            "presence became a pinned route; the reasoning below needs "
+            "rechecking")
+        import inspect
+        import textwrap
+        body = inspect.getsource(pp.PinProxy._handle_one_request_inner)
+        tree = ast.parse(textwrap.dedent(body))
+        guarded = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            if not (isinstance(node.test, ast.Name) and node.test.id == "pinned"):
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "_should_sweep_bridges"):
+                    guarded = True
+        assert not guarded, (
+            "the sweep decision sits inside `if pinned:`, and presence is not "
+            "a pinned route — so the second trigger can never fire")
 
         # The create event still sweeps, every time — unchanged behaviour.
         assert srv._should_sweep_bridges("POST", CREATE, now=100.0) is True
