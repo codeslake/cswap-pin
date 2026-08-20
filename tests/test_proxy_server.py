@@ -5804,6 +5804,36 @@ class TestDrainReportsWhatItCut:
             "no sentinel, so a falsy test would re-fetch whenever the "
             "provider legitimately answers None")
 
+    def case_a_slow_request_is_timed_at_the_status_line(self, certdir):
+        """NOT around the relay, because the relay can be an SSE stream.
+
+        A response body here is held open for as long as the stream lives —
+        one drained for 5735.9s on this fleet — so a timer that closes when
+        `_forward` returns reports a perfectly healthy inbound channel as a
+        multi-hour stall, every time one ends. Time to the first byte is the
+        number that means the same thing for a JSON reply and a stream.
+
+        Read from the SOURCE: the alternative is standing up a MITM
+        connection and an SSE server to watch a timer not fire.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        # THE CALL, NOT THE NAME. The first cut of this asserted the bare
+        # name and failed on its own doc comment in the outer method — the
+        # same way the sibling above caught its author's prose.
+        call = "self._note_slow_request("
+        fwd = inspect.getsource(pp.PinProxy._forward)
+        assert call in fwd, (
+            "the round trip is not timed where it ends — a stall is only "
+            "visible at the status line, and a stream never reaches the end "
+            "of the relay")
+        outer = inspect.getsource(pp.PinProxy._handle_one_request_inner)
+        assert call not in outer, (
+            "timed around the relay instead: an SSE stream that lived for "
+            "hours would be reported as a stall of that length")
+
     def case_nothing_deaf_locally_costs_no_process_spawn(self, certdir):
         """THE HOT PATH. `_report_deaf_bridges` runs on every bridge CREATE,
         and the union I added made it shell out to `ps -ww -axo` there —

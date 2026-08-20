@@ -15648,3 +15648,66 @@ class TestObservedBridgeOwners:
         P = self._wire(monkeypatch, home)
         assert P.observed_bridge_owners() == {"cse_a": None}
 
+
+
+class TestASlowRequestSaysSo:
+    """A request that took seconds through this proxy left no trace anywhere.
+
+    Measured on a mac: three round trips of 2419/2491/2681ms out of 340, and
+    `daemon.log` had not a single line in the window they happened in. The log
+    carries lifecycle events, so a stall is invisible in the one file a later
+    reader has — and a stall is exactly what a live claude.ai view times out
+    on. Three candidate causes were killed by hand before this existed
+    (the code fingerprint at 4ms, a cold upstream dial at 370ms, the keychain
+    read bounded at 108ms), each of which a self-reporting request would have
+    ruled out from the log alone.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _proxy(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle",
+                            lambda msg, *a, **k: lines.append(msg))
+        P = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        return P, lines
+
+    def case_a_quick_request_says_nothing(self, monkeypatch):
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("GET", "/v1/code/sessions", 310.0, 20.0)
+        assert lines == []
+
+    def case_a_slow_request_names_its_cost(self, monkeypatch):
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("GET", "/v1/code/sessions", 2681.0, 20.0)
+        assert len(lines) == 1
+        assert "2681" in lines[0]
+        assert "/v1/code/sessions" in lines[0]
+
+    def case_the_credential_share_is_broken_out(self, monkeypatch):
+        """Which HALF was slow decides where to look, and the two have
+        opposite fixes: the pin's own credential resolve is ours to make
+        cheaper, everything else is the chain below us."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/code/sessions", 2400.0, 1900.0)
+        assert "1900" in lines[0]
+
+    def case_a_second_stall_inside_the_cooldown_is_silent(self, monkeypatch):
+        """A genuinely slow endpoint would otherwise fill the log with what
+        the first line already said."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("GET", "/v1/code/sessions", 2681.0, 20.0)
+        P._note_slow_request("GET", "/v1/code/sessions", 2700.0, 20.0)
+        assert len(lines) == 1
+
+    def case_the_query_string_never_reaches_the_log(self, monkeypatch):
+        """daemon.log is read by people and pasted into reports, and a query
+        string carries ids. The route is what locates the stall; the
+        parameters add nothing and cannot be taken back."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request(
+            "GET", "/v1/code/sessions?after=cse_0128abc&limit=1", 2681.0, 0.0)
+        assert "cse_0128abc" not in lines[0]
+        assert "?" not in lines[0]
