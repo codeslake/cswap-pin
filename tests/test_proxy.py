@@ -15650,6 +15650,74 @@ class TestObservedBridgeOwners:
 
 
 
+class TestTheCredentialReadIsNotPaidPerRequest:
+    """MEASURED, and it is ours: `read_account_credentials` costs 0.02ms on
+    linux and 19.77ms on a mac, where it shells out to the keychain — and the
+    provider called it on EVERY pinned request. A Remote Control session posts
+    `/worker/events` continuously, so that is 20ms added to the channel whose
+    latency is the whole of requirement 6.
+
+    It is not what makes a request take 1.7s; a peer's controls put that in
+    the tunnel's return path. It is still latency this package adds, and "not
+    the biggest cause" is not a reason to keep paying it.
+
+    THE PROPERTY THAT MUST SURVIVE: the pin is re-read from disk per request
+    so `cswap pin <other>` takes effect under a live session without a
+    restart. A cache that outlives a re-pin trades a real feature for
+    milliseconds, so the cache is keyed on the account it was read FOR and is
+    short enough that a re-pin is not noticed.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _provider(self, monkeypatch, reads):
+        from cswap_pin import proxy as pin_proxy
+
+        class _Switcher:
+            backup_dir = pathlib.Path("/nonexistent")
+
+            def resolve_account(self, key):
+                # FAITHFUL, because a stub that maps every pin to one slot
+                # cannot fail the re-pin case for the right reason. cswap
+                # resolves the pinned EMAIL to its own slot.
+                return ("1" if key == "a@example.com" else "2"), key, {}
+
+            def current_account_number(self):
+                return "9"                     # never the pinned one
+
+            def read_account_credentials(self, num, mail):
+                reads.append((num, mail))
+                return json.dumps({"claudeAiOauth": {
+                    "accessToken": "tok", "expiresAt": 9e12}})
+
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@example.com", "org"))
+        return pin_proxy.make_pin_token_provider(_Switcher(), "1",
+                                                 "a@example.com")
+
+    def case_repeated_requests_do_not_reread_the_store(self, monkeypatch):
+        reads = []
+        provider = self._provider(monkeypatch, reads)
+        assert provider() == "tok"
+        for _ in range(20):
+            provider()
+        assert len(reads) == 1, f"{len(reads)} reads for 21 requests"
+
+    def case_a_repin_is_still_seen(self, monkeypatch):
+        """The feature the cache must not eat. Re-pinning to another account
+        has to reach a live session, so a cache entry belongs to the account
+        it was read for and a different one is a miss, not a stale hit."""
+        from cswap_pin import proxy as pin_proxy
+        reads = []
+        provider = self._provider(monkeypatch, reads)
+        provider()
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("b@example.com", "org"))
+        provider()
+        assert len(reads) == 2, "the re-pin did not reach the provider"
+
+
 class TestASlowRequestSaysSo:
     """A request that took seconds through this proxy left no trace anywhere.
 

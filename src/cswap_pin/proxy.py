@@ -2675,6 +2675,14 @@ _SLOW_REPORT_COOLDOWN_S = 60.0
 _SLOW_RECHECK_S = 5.0
 _SLOW_CACHE: dict = {}
 
+# How long a pinned account's credential may be reused without re-reading the
+# store. Short on purpose: the key already covers a re-pin, so this only has
+# to bound the same account's credential being rotated underneath us by the
+# usage collector or the autoswitcher. Five seconds turns ~20ms per request on
+# a mac into ~20ms per five seconds while leaving a rotation invisible for
+# less time than a token refresh takes.
+_CRED_TTL_S = 5.0
+
 
 def slow_report_ms(certdir) -> "float | None":
     """Milliseconds above which a request takes a log line, or None for off.
@@ -4441,6 +4449,9 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     keeps N threads off the file lock.
     """
     refresh_lock = threading.Lock()
+    # {account_num: (read_at, credential_json)}. Per provider, so it dies with
+    # the daemon and no state outlives a recycle.
+    _cred_cache: dict = {}
 
     def _consume(creds: str, num: str, mail: str) -> "oauth.RefreshOutcome":
         """Refresh through the host's interprocess gate, direct POST as
@@ -4541,7 +4552,33 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         num, mail = target
         if _pin_is_the_live_login(num):
             return None
-        creds = switcher.read_account_credentials(num, mail)
+        # THE READ IS NOT FREE ON EVERY PLATFORM. It costs 0.02ms on linux and
+        # 19.77ms on a mac, where it shells out to the keychain — and a Remote
+        # Control session posts `/worker/events` continuously, so that was
+        # ~20ms added to the one channel whose latency is what a live
+        # claude.ai view times out on.
+        #
+        # KEYED ON THE ACCOUNT, which is what keeps `cswap pin <other>`
+        # working under a live session. The pin is still re-read from disk
+        # every request; only the CREDENTIAL for an account already resolved
+        # is held, so a re-pin is a different key and therefore a miss. The
+        # TTL then bounds the one case the key cannot see: the same account's
+        # credential rotated underneath us by the usage collector or the
+        # autoswitcher.
+        # KEYED ON (slot, email), NOT the slot alone. A slot is stable while
+        # the identity in it is not — `cswap move` renumbers, and a stub that
+        # returned one number for two emails proved the point in the suite:
+        # the re-pin case failed because the cache answered for the previous
+        # account. The email is the half that actually identifies who this
+        # credential belongs to.
+        ckey = (num, mail)
+        cached = _cred_cache.get(ckey)
+        if cached is not None and time.monotonic() - cached[0] < _CRED_TTL_S:
+            creds = cached[1]
+        else:
+            creds = switcher.read_account_credentials(num, mail)
+            if creds:
+                _cred_cache[ckey] = (time.monotonic(), creds)
         if not creds:
             return None
         token = _live_token(creds)
