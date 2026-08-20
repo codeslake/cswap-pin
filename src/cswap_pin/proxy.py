@@ -6768,7 +6768,7 @@ class PortHolder:
                 # untouched.
                 if not squat_checked and time.monotonic() >= deadline:
                     squat_checked = True
-                    if not _port_accepts(port):
+                    if not _port_answers(port, timeout=1.0):
                         if _retire_stale_standbys(self._certdir):
                             _log_lifecycle(
                                 f"port {port} was held by a standby that had "
@@ -8516,21 +8516,6 @@ _STANDBY_ANSWERED_POLL_S = 2.0
 _STANDBY_PROBE_TIMEOUT_S = 0.25
 
 
-def _port_accepts(port: int, timeout: float = 1.0) -> bool:
-    """Does a loopback connect to ``port`` actually complete?
-
-    Separate from "is anything bound to it". A socket can be LISTENing with a
-    full backlog and no acceptor, which is bound-but-refusing — the state a
-    stale standby leaves. Anything that reads only one of those two facts
-    reports that state as its opposite.
-    """
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
 def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
     """SIGHUP every standby for this certdir except the one we just placed.
 
@@ -9001,13 +8986,24 @@ def _handed_down_listener(will_serve: bool = False) -> "socket.socket | None":
 
 
 def _port_answers(port: int, timeout: float = 0.5) -> bool:
-    """Whether something accepts on ``port`` right now, on loopback.
+    """Whether something ACCEPTS on ``port`` right now, on loopback.
 
     A connect, not a request: the question is whether a session dialling this
     address would be refused, and that is answered by the accept alone. Kept
     short because it runs on a teardown path — a pin must never make an exit
     slow — and treated as "nobody" on any error, since a port we cannot reach
     is one a session cannot reach either.
+
+    SEPARATE FROM "IS ANYTHING BOUND TO IT", and the holder's squat recovery
+    turns on the two disagreeing. A socket can be LISTENing with a full
+    backlog and no acceptor: bound AND refusing, which is what a standby left
+    by a killed holder looks like. A check that reads only one of those facts
+    reports that state as its opposite.
+
+    A SECOND COPY OF THIS EXISTED for three releases, 484 lines below, added
+    without noticing this one — differing only in its default timeout, which
+    is precisely the drift the host's sibling docstring warns about. Pass a
+    timeout; do not write another.
     """
     try:
         with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
