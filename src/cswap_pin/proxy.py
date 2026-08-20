@@ -9543,6 +9543,11 @@ class PinProxy:
         # separately because the drain must treat them the other way round:
         # every other connection is waited for, these are let go.
         self._stream_conns: set = set()
+        # THE OBJECT THAT OWNS THE DESCRIPTOR. `wrap_socket` detaches the
+        # socket it wraps, so the raw `conn` every other structure here keys
+        # on has `fileno() == -1` and cannot be shut down or closed. Anything
+        # that means to END a connection has to reach the TLS object.
+        self._tls_for: dict = {}
 
     def start(self) -> None:
         if self._handed_fd is not None:
@@ -10208,6 +10213,25 @@ class PinProxy:
             self._srv = None
         return None
 
+    def _end_connection(self, conn) -> None:
+        """Shut down and close a client connection, write end first.
+
+        THROUGH THE TLS OBJECT WHEN THERE IS ONE. `wrap_socket` detaches the
+        socket it wraps, so the raw `conn` — the key every structure here uses
+        — has `fileno() == -1`: `shutdown` raises EBADF and `close` is a
+        no-op. Measured with a control: closing the raw socket leaves the peer
+        reading TIMEOUT (still open), closing the TLS object gives it EOF.
+        """
+        sock = self._tls_for.get(conn, conn)
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
     def release_subscriptions(self) -> int:
         """Close the connections holding a subscription. Returns how many.
 
@@ -10226,14 +10250,7 @@ class PinProxy:
             conns = [c for c in self._stream_conns if c in self._open_conns]
             self._stream_conns = set()
         for conn in conns:
-            try:
-                conn.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-            try:
-                conn.close()
-            except OSError:
-                pass
+            self._end_connection(conn)
             # NO LONGER OWED. The drain counts what it is waiting for, and a
             # socket that is closed is not something anyone can still answer.
             self._owe_answer(conn, False)
@@ -10477,6 +10494,19 @@ class PinProxy:
         with self._live_lock:
             conns, self._open_conns = list(self._open_conns), set()
         for conn in conns:
+            # THE RAW SOCKET, DELIBERATELY, EVEN THOUGH IT IS DETACHED.
+            # `wrap_socket` detached it, so this shutdown/close pair is a
+            # no-op for every MITM'd connection and the FIN-not-RST table
+            # above describes something that has not happened since the MITM
+            # landed. Routing it through `_end_connection` — which reaches the
+            # TLS object — was tried and CUT LIVE REPLIES: two tests that
+            # encode the 2026-08-18 incident ("the reply was CUT mid-stream by
+            # a recycle") went red at once. The no-op is load-bearing here:
+            # this runs at the END of every drain, including a clean one, and
+            # a reply finishing just after the budget still completes today.
+            # Left as-is on purpose; fixing it needs the drain to stop calling
+            # this on the clean path, which is a separate change with its own
+            # evidence.
             try:
                 conn.shutdown(socket.SHUT_WR)
             except OSError:
@@ -10710,6 +10740,7 @@ class PinProxy:
                 # Or the set grows for the life of the daemon, holding a
                 # socket object per finished subscription.
                 self._stream_conns.discard(conn)
+                self._tls_for.pop(conn, None)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
                 self._content_at.pop(conn, None)
@@ -11716,6 +11747,8 @@ class PinProxy:
         # the two stay in step.
         self._local.conn = conn
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
+        with self._live_lock:
+            self._tls_for[conn] = tls
         self._local.detached = False
         served_one = False
         try:
@@ -11745,6 +11778,13 @@ class PinProxy:
                 if served_one:
                     self._note_reply_finished(conn)
                     self._owe_answer(conn, False)
+                    # AND THE SUBSCRIPTION MARK ENDS WITH IT. A stream request
+                    # that answered with a Content-Length (a refused auth) is
+                    # a finished reply on a reusable connection; leaving the
+                    # mark lets a later drain claim it and un-owe a reply that
+                    # is still being written, uncounted.
+                    with self._live_lock:
+                        self._stream_conns.discard(conn)
                 got_one = self._handle_one_request(tls, conn)
                 served_one = True
                 if not got_one:
