@@ -15666,13 +15666,40 @@ class TestASlowRequestSaysSo:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def _proxy(self, monkeypatch):
+    def _proxy(self, monkeypatch, armed=True):
         from cswap_pin import proxy as pin_proxy
         lines = []
         monkeypatch.setattr(pin_proxy, "_log_lifecycle",
                             lambda msg, *a, **k: lines.append(msg))
+        monkeypatch.setattr(pin_proxy, "slow_report_ms",
+                            lambda certdir: 1500.0 if armed else None)
         P = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         return P, lines
+
+    def case_it_is_OFF_until_someone_arms_it(self, monkeypatch):
+        """A DIAGNOSTIC THAT NOBODY ASKED FOR IS GARBAGE IN SOMEONE'S LOG.
+        Measured on this fleet: ~38 lines an hour, which is ~900 a day, into
+        the one file a person reads to find out why the daemon died. This is
+        a released package on other people's machines, so it stays silent
+        until a file switch names a threshold — armable and removable while
+        the daemon serves, the same shape as `trace-to`."""
+        P, lines = self._proxy(monkeypatch, armed=False)
+        P._note_slow_request("POST", "/v1/code/sessions/x/worker/events",
+                             9000.0, 0.0, wait_ms=8000.0)
+        assert lines == []
+
+    def case_the_switch_sets_the_threshold_too(self, monkeypatch):
+        """One file, one number: arming it and choosing what counts as slow
+        are the same decision, so they are not two knobs."""
+        from cswap_pin import proxy as pin_proxy
+        P, lines = self._proxy(monkeypatch)
+        monkeypatch.setattr(pin_proxy, "slow_report_ms", lambda certdir: 8000.0)
+        P._note_slow_request("GET", "/v1/code/sessions", 5000.0, 0.0,
+                             wait_ms=4000.0)
+        assert lines == []
+        P._note_slow_request("GET", "/v1/code/sessions", 9000.0, 0.0,
+                             wait_ms=8000.0)
+        assert len(lines) == 1
 
     def case_a_quick_request_says_nothing(self, monkeypatch):
         P, lines = self._proxy(monkeypatch)

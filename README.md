@@ -320,6 +320,22 @@ CSWAP_PIN_DEBUG=/tmp/pin.log     # one line per request
 CSWAP_PIN_SHAPE=/tmp/shape.log   # the message-array shape of each request body
 ```
 
+And an opt-in slow-request report, off unless you name a threshold in
+milliseconds. It writes to `daemon.log`, so it stays silent until asked —
+always-on it produced about 38 lines an hour on one fleet, which is noise in
+the file people read to find out why a daemon died:
+
+```bash
+CSWAP_PIN_SLOW_MS=1500                # or, without restarting a live daemon:
+echo 1500 > <certdir>/slow-ms         # arm it
+rm <certdir>/slow-ms                  # silent again
+```
+
+Each line splits the round trip three ways — inside the pin, waiting for the
+server, and getting the request out through the chain — because the total
+alone cannot say whose problem a stall is. The route is logged without its
+query string or session id.
+
 `CSWAP_PIN_LISTEN_FD` and `CSWAP_PIN_LISTEN_FROM` also appear in a daemon's
 environment. They are how a process hands its listening socket to the next
 one, written by the parent at spawn — not settings, and setting them by hand
