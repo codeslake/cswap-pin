@@ -5748,6 +5748,55 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_nothing_deaf_locally_costs_no_process_spawn(self, certdir):
+        """THE HOT PATH. `_report_deaf_bridges` runs on every bridge CREATE,
+        and the union I added made it shell out to `ps -ww -axo` there —
+        measured at ~30ms against 565 processes, inside the request handler.
+
+        It is also unnecessary. The union can only ever REMOVE bridges from
+        the deaf list: a predecessor holding a stream makes a bridge NOT deaf.
+        So when the local answer is already empty there is nothing a
+        predecessor could change, and the enumeration must not run at all.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        calls = []
+        real_log = pp._log_lifecycle
+        real_pids = pp._pin_daemon_pids
+        pp._log_lifecycle = lambda *_a: None
+
+        def counting(certdir_arg):
+            calls.append(1)
+            return real_pids(certdir_arg)
+
+        pp._pin_daemon_pids = counting
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._certdir = certdir
+
+            conn = object()
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_OK/worker/messages", conn=conn)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_OK/worker/events/stream", conn=conn)
+            srv._stream_conns.add(conn)
+            srv._open_conns.add(conn)
+
+            srv._report_deaf_bridges()
+            assert calls == [], (
+                "it enumerated daemons with `ps` although nothing was deaf "
+                "locally — that runs on every bridge create, in the request "
+                "handler")
+        finally:
+            pp._log_lifecycle = real_log
+            pp._pin_daemon_pids = real_pids
+
     def case_a_draining_predecessor_hides_the_streams_from_this_one(self, certdir):
         """A successor cannot answer this question, and must not guess at it.
 
