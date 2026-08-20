@@ -10422,27 +10422,61 @@ class PinProxy:
         # deaf. What is asked is whether one is HELD, which is live state.
         self._stream_owner: dict = {}
 
-    def _note_bridge_traffic(self, request_line: str, now=None,
-                             conn=None) -> None:
+    def _note_bridge_traffic(self, path: str, now=None, conn=None) -> None:
         """Record that a bridge spoke, and whether it opened its ear.
+
+        A PATH, not a request line. `_WORKER_SUBTREE` and `_BRIDGE_ID` are
+        `^`-anchored to a path, so handing them "POST /v1/... HTTP/1.1" matches
+        NOTHING. An earlier cut did exactly that: every dict stayed empty and
+        `deaf_bridges()` answered [] on every machine, while the tests passed
+        bare paths and stayed green.
 
         Never raises and never blocks: this sits on the request path, so a
         failure here would cost a request rather than a statistic.
         """
         try:
-            m = _WORKER_SUBTREE.search(request_line) or _EVENT_STREAM.search(
-                request_line)
-            if not m:
+            if not (_WORKER_SUBTREE.search(path) or _EVENT_STREAM.search(path)):
                 return
-            bid = _BRIDGE_ID.search(request_line)
+            bid = _BRIDGE_ID.search(path)
             if not bid:
                 return
             stamp = time.monotonic() if now is None else now
-            if _EVENT_STREAM.search(request_line):
+            if _EVENT_STREAM.search(path):
                 if conn is not None:
                     self._stream_owner[conn] = bid.group(1)
             else:
                 self._bridge_posts[bid.group(1)] = stamp
+        except Exception:  # noqa: BLE001 — a statistic must not cost a request
+            pass
+
+    def _report_deaf_bridges(self) -> None:
+        """Say which bridges post but hold no inbound stream, on CHANGE.
+
+        `deaf_bridges` answered correctly and nothing ever asked it: no caller
+        in either repo, no CLI, and a method on the daemon's own instance, so
+        no other process could. It shipped dormant in three releases. A check
+        nothing reaches is not a check.
+
+        THE DAEMON LOG, because the state lives in this process and that file
+        is what every monitor on this fleet already reads. Transitions only --
+        a line per sweep would bury it, and the event is the set changing.
+
+        Never raises: this is a statistic on the request path.
+        """
+        try:
+            now = sorted(self.deaf_bridges())
+            if now == getattr(self, "_last_deaf", None):
+                return
+            self._last_deaf = now
+            if now:
+                _log_lifecycle(
+                    f"{len(now)} bridge(s) post but hold no inbound stream — "
+                    "claude.ai can see them and messages reach the server, "
+                    "but the session never receives them; only a NEW PROCESS "
+                    f"clears it: {' '.join(now)}"
+                )
+            else:
+                _log_lifecycle("every posting bridge holds an inbound stream")
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
@@ -12116,7 +12150,11 @@ class PinProxy:
         # PER BRIDGE, not per connection. `_stream_conns` answers "is this
         # SOCKET a stream", which is what the drain needs; this answers "does
         # this SESSION hold one", which is what a deaf bridge fails.
-        self._note_bridge_traffic(request_line, conn=conn)
+        # THE PATH, split the way `_handle_one_request_inner` splits it. The
+        # route patterns are `^`-anchored, so a request line matches none of
+        # them and the accounting silently records nothing.
+        _p = request_line.split(" ")
+        self._note_bridge_traffic(_p[1] if len(_p) > 1 else "/", conn=conn)
         return self._handle_one_request_inner(request_line, tls)
 
     def _handle_one_request_inner(self, request_line: str, tls: ssl.SSLSocket) -> bool:
@@ -12133,6 +12171,20 @@ class PinProxy:
         body = _read_body(tls, headers)
 
         pinned = is_pinned_route(path)
+        # OUTSIDE THE BEARER GATE, deliberately. Sweeping superseded bridges is
+        # our own bookkeeping and has nothing to do with whose token a request
+        # carries. Inside `if pinned:` the presence trigger was UNREACHABLE,
+        # because presence is deliberately not a pinned route — so the second
+        # trigger, its cooldown and its timestamp were all dead and the
+        # archived-later case 0.1.139 set out to cover stayed uncovered.
+        #
+        # The cooldown gates the token fetch too, so an unpinned route costs
+        # nothing beyond one regex.
+        if self._should_sweep_bridges(method, path):
+            self._report_deaf_bridges()
+            _tok = self._pin_token_provider()
+            if _tok:
+                self._sweep_bridges_after_connect(_tok)
         swapped = False
         original_headers = list(headers)
         if pinned:
@@ -12176,8 +12228,7 @@ class PinProxy:
                 # later. Fired on the request rather than the response: the
                 # sweep re-lists from the server anyway, so a create that
                 # fails simply finds nothing new to supersede.
-                if self._should_sweep_bridges(method, path):
-                    self._sweep_bridges_after_connect(token)
+
                 # THE ONE MOMENT A DENIED SESSION BECOMES UN-DENIED, and the
                 # only evidence of it. Claude Code caches the policy answer per
                 # process and its `/remote-control` pre-fetch returns early
@@ -12411,6 +12462,11 @@ class PinProxy:
                         # after the release said it had freed it.
                         with self._live_lock:
                             self._stream_conns.discard(_c)
+                        # PRUNED WITH IT. `_stream_owner` keyed on the same
+                        # connection object; leaving it holds a strong
+                        # reference to every stream socket the daemon has ever
+                        # seen and grows without bound.
+                        self._stream_owner.pop(_c, None)
                     release = getattr(self._local, "release", None)
 
                     def _release_tunnel():
