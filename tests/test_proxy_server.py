@@ -5502,49 +5502,72 @@ class TestDrainReportsWhatItCut:
             "emailAddress": "keep"}
 
 
+    def case_the_accept_probe_and_the_bind_probe_disagree(self, certdir):
+        """`_port_accepts` must answer about ACCEPTING, not about BOUND.
+
+        The whole recovery keys on those two facts disagreeing, so a probe
+        that conflates them makes the branch unreachable. Both directions,
+        against real sockets:
+
+            bound, not listening -> nobody accepts   -> False
+            bound and listening  -> the kernel does  -> True
+
+        The second is the control. A probe that always said False would pass
+        the first alone and would then retire a HEALTHY handover's standby,
+        opening the gap that standby exists to close.
+        """
+        import socket
+
+        import cswap_pin.proxy as pp
+
+        quiet = socket.socket()
+        quiet.bind(("127.0.0.1", 0))
+        try:
+            assert pp._port_accepts(quiet.getsockname()[1], timeout=0.5) is False
+        finally:
+            quiet.close()
+
+        live = socket.socket()
+        live.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        live.bind(("127.0.0.1", 0))
+        live.listen(4)
+        try:
+            assert pp._port_accepts(live.getsockname()[1], timeout=1.0) is True
+        finally:
+            live.close()
+
     def case_a_squatting_standby_is_retired_so_the_holder_can_bind(
-            self, certdir, tmp_path, monkeypatch):
-        """A stale standby holding LISTEN and never accepting deadlocked the
+            self, certdir, monkeypatch):
+        """A stale standby holding the port and never accepting deadlocked a
         machine for 3.4 hours, and the recovery for it was gated behind the
         very bind it prevented.
 
         `_retire_stale_standbys` runs after a holder places its OWN standby,
-        which requires the holder to already own the port. A standby left by a
-        holder that was KILLED rather than released owns the port and sleeps:
-        it never calls accept, so the backlog fills (129 queued, measured),
-        every new connect gets ECONNREFUSED, and every new holder's bind gets
-        EADDRINUSE. The holder then refuses to move -- correctly, because
-        sessions are wired to that number -- and retries forever.
+        which requires already owning the port. A standby left by a holder
+        that was KILLED rather than released owns it and sleeps: the backlog
+        fills (129 queued, measured), every connect is refused, every new
+        holder's bind is EADDRINUSE, and the holder refuses to move -- rightly,
+        since live sessions have that port baked into their environment. 50
+        retries, 63 sessions, ended by a person sending SIGHUP by hand.
 
-        THE DISCRIMINATOR IS THE PAIR, and neither half works alone. "Does the
-        port answer" says dead. "Can I bind it" says taken. A healthy handover
-        answers yes/taken; this deadlock answers no/taken. So the escalation
-        fires only on the combination, and a handover's standby -- which is
-        holding the address open on purpose -- is left alone.
-
-        Recovery is by SIGHUP, the standby's own release signal; it ignores
-        TERM and INT deliberately.
+        THE DISCRIMINATOR IS INJECTED HERE, ON PURPOSE. Reproducing the field
+        shape needs a FULL listen backlog, and that is where the portability
+        lies: macOS treats `listen(0)` as a floor, so connects still complete
+        and the branch never runs -- CI went red on a fix that works. A socket
+        bound WITHOUT listen is portable but useless, because SO_REUSEADDR
+        lets the holder bind straight past it. So the sibling case above
+        proves `_port_accepts` tells the two apart against real sockets, and
+        this one proves the holder ACTS on that answer.
         """
         import socket
+
         import cswap_pin.proxy as pp
 
-        # A squatter: bound and listening, never accepting.
         squat = socket.socket()
         squat.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         squat.bind(("127.0.0.1", 0))
-        squat.listen(0)
+        squat.listen(4)
         port = squat.getsockname()[1]
-        # Fill the backlog so a connect is refused rather than queued -- that
-        # refusal is the signal the fix keys on.
-        fillers = []
-        for _ in range(8):
-            c = socket.socket()
-            c.settimeout(0.2)
-            try:
-                c.connect(("127.0.0.1", port))
-                fillers.append(c)
-            except OSError:
-                break
 
         retired = []
 
@@ -5554,6 +5577,7 @@ class TestDrainReportsWhatItCut:
             return 1
 
         monkeypatch.setattr(pp, "_retire_stale_standbys", _fake_retire)
+        monkeypatch.setattr(pp, "_port_accepts", lambda *_a, **_k: False)
         monkeypatch.setattr(pp, "wanted_port", lambda _cd: port)
         monkeypatch.setattr(pp, "_HOLD_BIND_WAIT_S", 0.2)
 
@@ -5573,8 +5597,47 @@ class TestDrainReportsWhatItCut:
                 f"session wired to {port} is stranded")
         finally:
             holder.stop()
-            for c in fillers:
-                c.close()
+            squat.close()
+
+    def case_a_healthy_handover_standby_is_left_alone(self, certdir,
+                                                      monkeypatch):
+        """The other half, and the reason the escalation is not unconditional.
+
+        During a handover the predecessor's standby holds the address open on
+        purpose. It IS unbindable -- and it ANSWERS. Retiring it would open
+        exactly the gap it exists to close, so the pair must be required, not
+        either half.
+        """
+        import socket
+
+        import cswap_pin.proxy as pp
+
+        live = socket.socket()
+        live.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        live.bind(("127.0.0.1", 0))
+        live.listen(4)
+        port = live.getsockname()[1]
+
+        retired = []
+        monkeypatch.setattr(
+            pp, "_retire_stale_standbys",
+            lambda cd, keep_pid=None: retired.append(cd) or 1)
+        monkeypatch.setattr(pp, "_port_accepts", lambda *_a, **_k: True)
+        monkeypatch.setattr(pp, "wanted_port", lambda _cd: port)
+        monkeypatch.setattr(pp, "_HOLD_BIND_WAIT_S", 0.2)
+
+        try:
+            try:
+                pp.PortHolder(certdir, "1", "a@example.com")
+            except OSError:
+                pass          # refusing is correct here
+            assert not retired, (
+                "a standby that is ANSWERING was retired; during a handover "
+                "that is the one holding the address open, and killing it "
+                "opens the gap")
+        finally:
+            live.close()
+
 
     def case_the_armed_trace_can_see_the_tunnel(self, certdir):
         """An armed trace was blind to the one path that fails.
