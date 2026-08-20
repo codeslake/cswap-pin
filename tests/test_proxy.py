@@ -15757,6 +15757,32 @@ class TestASlowRequestSaysSo:
         P._note_slow_request("GET", "/v1/code/sessions", 2700.0, 20.0)
         assert len(lines) == 1
 
+    def case_the_suppressed_ones_are_counted(self, monkeypatch):
+        """THE CADENCE IN THE LOG IS THE COOLDOWN, NOT THE PHENOMENON.
+
+        One line a minute is a ceiling of 60 an hour, and a machine reporting
+        34 could as easily be having 300. Reading the ~60s spacing as
+        periodicity is my rate limiter drawing a straight line through
+        whatever is actually there, and a peer nearly built a timing argument
+        on it. So the line that DOES get written says how many it stands for.
+        """
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/a", 5000.0, 0.0, wait_ms=4900.0)
+        for _ in range(4):
+            P._note_slow_request("POST", "/a", 5000.0, 0.0, wait_ms=4900.0)
+        P._last_slow_report = None            # the cooldown expires
+        P._note_slow_request("POST", "/a", 5000.0, 0.0, wait_ms=4900.0)
+        assert "4 more" in lines[1], lines[1]
+
+    def case_the_wait_is_not_blamed_on_the_server(self, monkeypatch):
+        """The clock runs from after the write to the status line, so it is
+        the server AND the whole return path. Calling it "waiting for the
+        server" named one of those and I nearly reported it as settled."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/a", 5000.0, 0.0, wait_ms=4900.0)
+        assert "for the server" not in lines[0], lines[0]
+        assert "downstream" in lines[0], lines[0]
+
     def case_the_line_says_who_was_slow(self, monkeypatch):
         """THE QUESTION THE TOTAL CANNOT ANSWER, and the one that decides
         whose problem this is: were the seconds spent getting the request OUT
