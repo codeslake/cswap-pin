@@ -2840,6 +2840,124 @@ class TestTheTraceCanBeArmedOnALiveDaemon:
             "removing the switch must turn it off — a trace nobody can stop "
             "grows without a ceiling on a machine nobody is watching")
 
+    def case_a_re_armed_trace_stops_writing_to_the_first_file(
+            self, tmp_path, monkeypatch):
+        """Arm, read, disarm, re-arm somewhere else — and the lines must move.
+
+        `_append_capped` keeps a descriptor across calls and reopens only on
+        rotation, so a trace re-armed at a second path kept writing to the
+        first. Unreachable while arming meant restarting the daemon; this
+        change is what makes arm/disarm/re-arm the normal workflow.
+
+        THE HANDLE IS DROPPED, NOT CLOSED. `_debug` and `_debug_for` are
+        touched from every connection thread with no lock, so closing here can
+        pull the file out from under a thread already inside `_append_capped`
+        past its `fh.closed` check — and `write` on a closed file raises
+        ValueError, which lands in the request.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.delenv("CSWAP_PIN_DEBUG", raising=False)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        first, second = tmp_path / "one.log", tmp_path / "two.log"
+
+        proxy = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        proxy._debug, proxy._debug_for = None, None
+        proxy._debug = pin_proxy._append_capped(str(first), "a\n", None)
+        proxy._debug_for = str(first)
+        assert first.read_text() == "a\n"
+
+        # THE SHIPPED CONDITION, READ OUT OF THE SOURCE. Re-deciding it here
+        # asserts against the test's own copy and passes whatever the relay
+        # does — the reimplementation this file has been bitten by before.
+        # Reaching the real block needs a live MITM connection.
+        import inspect
+
+        src = inspect.getsource(pin_proxy)
+        i = src.find("debug_path = trace_target(")
+        assert i != -1, "the resolver call moved; this guard is blind"
+        window = src[i:i + 900]
+        assert "if debug_path != self._debug_for:" in window, (
+            "nothing compares the resolved target against the one the handle "
+            "is open on, so a trace re-armed at a second path keeps writing "
+            "to the first — which is the whole arm/read/disarm workflow")
+        assert ".close()" not in window.split(
+            "if debug_path != self._debug_for:")[1][:300], (
+            "the old handle is CLOSED here. These fields are unsynchronised "
+            "across connection threads, so that can pull the file out from "
+            "under a writer and raise ValueError into the request; dropping "
+            "the reference lets refcounting do it safely")
+
+        # And the write still lands where it was re-armed.
+        proxy._debug, proxy._debug_for = None, str(second)
+        proxy._debug = pin_proxy._append_capped(
+            proxy._debug_for, "b\n", proxy._debug)
+        assert second.read_text() == "b\n"
+        assert first.read_text() == "a\n", "a line landed in the old file"
+
+    def case_a_handle_another_thread_let_go_of_does_not_reach_the_request(
+            self, tmp_path):
+        """`_append_capped` caught OSError only. A handle dropped by another
+        thread and then garbage-collected raises ValueError on `write`, not
+        OSError, so it escaped into the relay — on the one path this feature
+        exists to make safe to use while serving."""
+        from cswap_pin import proxy as pin_proxy
+
+        path = tmp_path / "t.log"
+
+        class _ClosedUnderUs:
+            """Open when checked, closed by the time it is written.
+
+            That is the race in one object: `_append_capped` tests
+            `fh.closed` and only then writes, and another thread can let the
+            file go in between. Passing an already-closed handle does NOT
+            reproduce it — the helper simply reopens.
+            """
+            closed = False
+
+            def write(self, _):
+                raise ValueError("I/O operation on closed file")
+
+            def tell(self):
+                return 0
+
+        assert pin_proxy._append_capped(
+            str(path), "x\n", _ClosedUnderUs()) is None, (
+            "a handle that went away mid-write raised out of the trace and "
+            "into the relay — a diagnostic that can break a request is worse "
+            "than no diagnostic, and this one sits on the request path")
+
+    def case_an_unreadable_host_is_not_an_absent_one(self, tmp_path,
+                                                     monkeypatch):
+        """The own-tree branch says UNREADABLE IS NOT UNCHANGED and returns a
+        distinct value; the host branch used to swallow and return the digest
+        of a machine with no claude_swap at all. A walk that races a host
+        redeploy would then read "unchanged" through the one window where the
+        host is certainly changing."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_host_package_dir", lambda: None)
+        absent = pin_proxy.daemon_fingerprint()
+
+        # ONLY THE HOST WALK. Patching `_tree_digest_input` wholesale makes the
+        # OWN tree raise as well, and then both branches produce the same bytes
+        # whatever the guard does — a case that cannot fail.
+        real = pin_proxy._tree_digest_input
+
+        def _boom(root):
+            if str(root) == str(tmp_path):
+                raise OSError("host tree vanished mid-walk")
+            return real(root)
+
+        monkeypatch.setattr(pin_proxy, "_host_package_dir", lambda: tmp_path)
+        monkeypatch.setattr(pin_proxy, "_tree_digest_input", _boom)
+        unreadable = pin_proxy.daemon_fingerprint()
+        assert unreadable != absent, (
+            "an unreadable host hashes the same as no host at all, so the "
+            "daemon cannot tell a redeploy in progress from a machine that "
+            "never had the package")
+
     def case_the_env_still_wins(self, tmp_path, monkeypatch):
         """An existing deployment must behave exactly as it did."""
         from cswap_pin import proxy as pin_proxy
