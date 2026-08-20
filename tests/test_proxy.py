@@ -12233,10 +12233,17 @@ class TestTheRecycleCannotBecomeTheOutage:
         srv.bind(("127.0.0.1", 0))
         srv.listen(8)
         port = srv.getsockname()[1]
-        threading.Thread(
-            target=lambda: [srv.accept()[0].close() for _ in iter(int, 1)],
-            daemon=True,
-        ).start()
+        def _accept_until_closed():
+            """Accept, close, and stop when the listener goes — rather than
+            raising out of a daemon thread at teardown."""
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                conn.close()
+
+        threading.Thread(target=_accept_until_closed, daemon=True).start()
         st = {"pid": os.getpid(), "port": port,
               "fingerprint": fp if fp is not None else "an-old-release"}
         if unpinnable:
