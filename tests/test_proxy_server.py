@@ -5321,6 +5321,56 @@ class TestDrainReportsWhatItCut:
         assert teardown_drain_budget(
             "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
+    def case_a_drain_lets_the_subscription_go_instead_of_holding_it(self, certdir):
+        """A subscription cannot migrate on `Connection: close`, so it pins the
+        departing daemon open — and while that daemon drains, EVERY reply it
+        writes carries `Connection: close`.
+
+        Measured on this host after the drain ceiling was uncapped: 2017.2 s
+        and 2005.6 s drains, two predecessors draining at once, and claude.ai
+        showing "Connection lost … check your internet connection, VPN, or
+        proxy". That window used to be 30 s only because the process was killed
+        at the ceiling; uncapping saved the replies and made the window
+        unbounded. The subscription has to be released, not waited for.
+        """
+        import socket
+
+        from cswap_pin.proxy import PinProxy, _EVENT_STREAM
+
+        assert _EVENT_STREAM.search(
+            "GET /v1/code/sessions/cse_x/worker/events/stream HTTP/1.1"), (
+            "the one request that never completes is not recognised, so "
+            "nothing is ever released and the drain waits forever")
+        assert not _EVENT_STREAM.search(
+            "POST /v1/code/sessions/cse_x/worker/events HTTP/1.1"), (
+            "the ordinary event POST was taken for a subscription — releasing "
+            "those closes replies that were about to finish")
+
+        proxy = PinProxy.__new__(PinProxy)
+        import threading
+        proxy._live_lock = threading.Lock()
+        proxy._stream_conns = set()
+        # The real bookkeeping: `_owed` maps a connection to when its debt
+        # began, and the sibling maps are popped with it.
+        proxy._owed, proxy._delivered = {}, {}
+        proxy._content_at, proxy._gap = {}, {}
+        a, b = socket.socketpair()
+        try:
+            proxy._stream_conns.add(a)
+            proxy._owed[a] = 0.0
+            assert proxy.release_subscriptions() == 1
+            assert proxy._stream_conns == set(), "released twice on a re-drain"
+            assert a not in proxy._owed, (
+                "a closed socket was left in the owed set, so the drain waits "
+                "for an answer nobody can send — the 2017 s drain")
+            assert b.recv(1) == b"", "the client never saw the stream end"
+        finally:
+            for s_ in (a, b):
+                try:
+                    s_.close()
+                except OSError:
+                    pass
+
     def case_a_successor_on_the_port_means_nobody_waits_for_us(self, certdir):
         """`handed_over` asks "did I hand over"; the budget needs "is anyone
         waiting for me to be gone". Those differ for a daemon superseded from
