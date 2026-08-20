@@ -578,11 +578,52 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             failures.append(f"--- {name} ---\n{traceback.format_exc()}")
         finally:
             mp.undo()
+            # A MODULE GLOBAL IS OUTSIDE MONKEYPATCH'S REACH, and this one
+            # decides how the relay frames replies. `this_process_is_draining`
+            # matches the marker BASENAME — the pid — so a drain announced
+            # under one case's certdir answers yes for every later case in this
+            # worker, and the relay then marks their keep-alive replies
+            # `Connection: close`.
+            import cswap_pin.proxy as _pp
+
+            with _pp._DRAINING_LOCK:
+                _pp._DRAINING_DEPTH.clear()
     if failures:
         raise AssertionError(
             f"{len(failures)} of {len(work)} cases failed:\n\n" + "\n".join(failures)
         )
 
+
+
+def test_a_case_cannot_leave_the_process_marked_draining(request, tmp_path_factory):
+    """A drain one case announces must not answer yes for the next one.
+
+    `_DRAINING_DEPTH` is a module global, so `mp.undo()` does not reach it, and
+    `this_process_is_draining` matches the marker BASENAME — the pid — which is
+    exactly right for a daemon that owns one certdir and wrong for a worker
+    that runs dozens. The relay reads it and puts `Connection: close` on every
+    keep-alive reply it writes, so an unrelated later case sees a closed
+    connection and a second request that was never served.
+
+    Measured on HEAD: `TestResponseFramingIsParseable` failing 2 of 8 cases in
+    roughly one full-suite run in four, always those two.
+    """
+    import cswap_pin.proxy as pin_proxy
+
+    class Holder:
+        def case_a_announces_and_never_releases(self, tmp_path):
+            pin_proxy.announce_draining(tmp_path)
+
+        def case_b_must_not_inherit_it(self, tmp_path):
+            assert not pin_proxy.this_process_is_draining(), (
+                "a previous case's drain marks this one's replies "
+                "`Connection: close`")
+
+    try:
+        run_cases(Holder(), request, tmp_path_factory)
+    finally:
+        with pin_proxy._DRAINING_LOCK:
+            pin_proxy._DRAINING_DEPTH.clear()
 
 
 def test_every_case_has_a_driver():
