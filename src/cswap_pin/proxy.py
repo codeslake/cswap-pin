@@ -10218,7 +10218,13 @@ class PinProxy:
         the listener was released before this.
         """
         with self._live_lock:
-            conns, self._stream_conns = list(self._stream_conns), set()
+            # INTERSECTED WITH THE LIVE SET, not taken whole. A socket object
+            # outlives its descriptor, and the NUMBER gets reused — so closing
+            # a connection this set still remembers closes whatever now owns
+            # that fd. `_open_conns` is maintained by the connection lifecycle,
+            # so this cannot reach anything that is not still ours.
+            conns = [c for c in self._stream_conns if c in self._open_conns]
+            self._stream_conns = set()
         for conn in conns:
             try:
                 conn.shutdown(socket.SHUT_WR)
@@ -10701,6 +10707,9 @@ class PinProxy:
         def _release():
             with self._live_lock:
                 self._open_conns.discard(conn)
+                # Or the set grows for the life of the daemon, holding a
+                # socket object per finished subscription.
+                self._stream_conns.discard(conn)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
                 self._content_at.pop(conn, None)
