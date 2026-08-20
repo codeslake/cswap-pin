@@ -10627,15 +10627,16 @@ class PinProxy:
             # subtract is the difference between a line you act on and a line
             # you do arithmetic on at 2am.
             #
-            # AND THE WAIT IS NOT "THE SERVER". It runs from after the write
-            # to the status line, so it is the server AND the whole return
-            # path — every proxy hop and tunnel the answer comes back
-            # through. This line said "waiting for the server" for one
-            # release and that named one of those two; it was one report away
-            # from being repeated as a settled finding.
+            # NAME NOTHING. This ran from after the write to the status
+            # line, so it covers the server AND every hop the answer returns
+            # through, and it cannot separate them. It said "waiting for the
+            # server" for one release, which is an attribution wearing a
+            # measurement's clothes — and a peer's direct control has since
+            # shown the server was fine while that field read 1.7s. What
+            # separates them lives outside this proxy.
             ours = max(0.0, total_ms - pin_ms - wait_ms)
-            split = (f"{wait_ms:.0f}ms downstream of the write (the server "
-                     f"and the path back), {ours:.0f}ms getting it out")
+            split = (f"{wait_ms:.0f}ms waiting for the answer, "
+                     f"{ours:.0f}ms getting it out")
         more = ""
         if suppressed:
             # THE CADENCE IN THE LOG IS THIS COOLDOWN, NOT THE PHENOMENON.
