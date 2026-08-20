@@ -5321,6 +5321,75 @@ class TestDrainReportsWhatItCut:
         assert teardown_drain_budget(
             "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
+    def case_a_successor_on_the_port_means_nobody_waits_for_us(self, certdir):
+        """`handed_over` asks "did I hand over"; the budget needs "is anyone
+        waiting for me to be gone". Those differ for a daemon superseded from
+        OUTSIDE, and that daemon is the one that pays.
+
+        Measured: a holder took the replace signal and spawned a successor,
+        which served the same port from 01:44:13Z. The predecessor had
+        announced no drain of its own, so `this_process_is_draining()` was
+        False, the held arm fired, and its refcount teardown at 01:47:19Z cut
+        13 mid-response replies on a 30s ceiling while the successor was three
+        minutes into serving. The uncapped refcount arm below it is
+        unreachable for a held daemon, so nothing else could have caught this.
+        """
+        import os
+        import subprocess
+
+        from cswap_pin.proxy import _superseded_on_the_port, write_daemon_state
+
+        assert _superseded_on_the_port(certdir) is False, (
+            "no record at all read as a successor")
+
+        write_daemon_state(certdir, 40404, os.getpid(), "fp")
+        assert _superseded_on_the_port(certdir) is False, (
+            "the record naming US read as a successor — every teardown would "
+            "take the uncapped ceiling with nothing behind the port")
+
+        live = subprocess.Popen(["sleep", "30"])
+        try:
+            write_daemon_state(certdir, 40404, live.pid, "fp")
+            assert _superseded_on_the_port(certdir) is True, (
+                "a live successor on the record read as absent — the held arm "
+                "fires and cuts whatever this daemon still owes")
+        finally:
+            live.kill()
+            live.wait()
+
+        write_daemon_state(certdir, 40404, live.pid, "fp")
+        assert _superseded_on_the_port(certdir) is False, (
+            "a reaped pid on the record read as a live successor — that is an "
+            "uncapped drain with nothing serving the port")
+
+        # AND THE TEARDOWN MUST ACTUALLY ASK IT. The predicate above is right
+        # in isolation whether or not anything calls it, so the assertions so
+        # far cannot fail on the bug they describe. Read out of the source
+        # because `_teardown` is a closure inside `daemon_main` and reaching it
+        # needs a live daemon, its sockets and its state file — a harness that
+        # reconstructs those can be wrong in its own right.
+        import ast
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        asked = None
+        for node in ast.walk(ast.parse(inspect.getsource(pp))):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "teardown_drain_budget"):
+                for kw in node.keywords:
+                    if kw.arg == "handed_over":
+                        asked = {n.func.id for n in ast.walk(kw.value)
+                                 if isinstance(n, ast.Call)
+                                 and isinstance(n.func, ast.Name)}
+        assert asked == {"this_process_is_draining", "_superseded_on_the_port"}, (
+            "the teardown no longer asks both ways a daemon can owe nothing. "
+            "Its own marker covers the handover it announced; a successor the "
+            "holder started leaves nothing announced here at all, and the "
+            "held arm then cuts every reply still in flight. Got: " + str(asked)
+        )
+
     def case_each_exit_path_drains_on_the_ceiling_that_fits_it(self, certdir):
         """THREE DRAINS, TWO SITUATIONS — and they were collapsed into one number.
 

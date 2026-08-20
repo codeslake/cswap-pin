@@ -6149,10 +6149,43 @@ def read_daemon_state(certdir: Path) -> dict | None:
     return data
 
 
+def _tree_digest_input(root: Path) -> bytes:
+    """Every ``.py`` under ``root``, name and bytes, in a stable order.
+
+    WALKED, NOT LISTED, and recursively: a list omits the module somebody adds
+    next, and a non-recursive glob is a list in disguise the moment a
+    subpackage appears. The name is in the digest so a rename is visible,
+    which pure bytes miss; the sort keeps it independent of directory order.
+    """
+    return b"".join(
+        f.relative_to(root).as_posix().encode() + b"\0" + f.read_bytes()
+        for f in sorted(root.rglob("*.py"),
+                        key=lambda f: f.relative_to(root).as_posix())
+    )
+
+
+def _host_package_dir() -> "Path | None":
+    """Where claude_swap's source lives, or None.
+
+    RESOLVED WITHOUT IMPORTING IT. This is called at module import to take
+    `_OWN_FINGERPRINT`, and claude_swap imports cswap_pin back — an import
+    here would be circular. `find_spec` runs the finders only.
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("claude_swap")
+    except Exception:  # noqa: BLE001 — a broken host must not kill the daemon
+        return None
+    origin = getattr(spec, "origin", None)
+    return Path(origin).parent if origin else None
+
+
 def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
-    """Identity of the daemon's CODE, so a redeploy of this module makes a
-    running daemon stale and the launcher recycles it — mirrors the fingerprint
-    staleness a sibling proxy's ensure step uses.
+    """Identity of the code the daemon RUNS — this package and the host
+    package it borrows from — so a redeploy of either makes a running daemon
+    stale and the launcher recycles it; mirrors the fingerprint staleness a
+    sibling proxy's ensure step uses.
 
     IT NAMED `pin_proxy.py` UNTIL 0.1.104, which is where this code lived
     before the pin became its own package. A reader following that name looks
@@ -6205,37 +6238,26 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     # Reading the file costs one stat + one read per check (the watchdog polls
     # on an interval, not per request), against a mistake that costs an outage.
     try:
-        # EVERY MODULE THE PACKAGE SHIPS, not just this one. The daemon
-        # imports `cswap_pin._host`, so a change confined to that file moved
-        # nothing here: the watchdog saw no disagreement, the daemon kept
-        # running old code, and every check reported it current — including
-        # the holder-current one written the same day.
-        #
-        # A peer hit the identical defect from the other side: their relay
-        # lives outside the trees their fingerprints hash, and three machines
-        # reported "already on this code" while running the old relay. It is
-        # only ever visible when the changed file is the one being shipped,
-        # which is exactly when it matters.
-        #
-        # Sorted, so the digest does not depend on directory order.
-        # RECURSIVE, AND THE NAME IS PART OF THE DIGEST. A peer asked the
-        # sharper version of this question after we both fixed the shallow
-        # case: does it NAME the files or WALK them? A list is the defect —
-        # they added their relay one day and left its own import uncovered the
-        # next — and a non-recursive glob is a list in disguise the moment a
-        # subpackage appears. Hashing the name too makes a rename visible,
-        # which pure bytes would miss.
-        here = Path(__file__).parent
-        code = b"".join(
-            f.relative_to(here).as_posix().encode() + b"\0" + f.read_bytes()
-            for f in sorted(here.rglob("*.py"),
-                            key=lambda f: f.relative_to(here).as_posix())
-        )
+        code = _tree_digest_input(Path(__file__).parent)
     except OSError:
         # UNREADABLE IS NOT UNCHANGED. Return something stable-but-distinct so
         # a daemon does not read "no fingerprint" as "same as mine" and serve
         # stale code forever; the next successful read re-establishes it.
         code = b""
+    # AND THE HOST PACKAGE, because the daemon runs its code too. Every
+    # request asks `switcher.current_account_number()` through the `_host`
+    # seam, so a claude_swap fix deployed under a live daemon changes nothing
+    # it executes — the fingerprint does not move, no recycle happens, and
+    # every check reports the daemon current while it serves the old copy.
+    #
+    # An unresolvable host contributes nothing rather than a distinct value:
+    # a pin installed without its host would otherwise recycle itself forever.
+    host = _host_package_dir()
+    if host is not None:
+        try:
+            code += b"claude_swap\0" + _tree_digest_input(host)
+        except OSError:
+            pass
     return hashlib.sha256(code).hexdigest()[:16]
 
 
@@ -7569,6 +7591,23 @@ def _clear_handover_mark(certdir: Path) -> bool:
         return False
 
 
+def _superseded_on_the_port(certdir: Path) -> bool:
+    """Whether ``proxy.json`` names a LIVE daemon that is not us.
+
+    "Is anyone waiting for me to be gone", which is the question the held
+    drain ceiling means to ask. `this_process_is_draining()` answers the
+    narrower "did I hand over myself", and the two part company for a daemon
+    superseded from outside: a holder that takes the replace signal spawns the
+    successor without the predecessor announcing anything.
+    """
+    try:
+        st = read_daemon_state(certdir)
+        pid = int(st["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return pid != os.getpid() and _pid_alive(pid)
+
+
 def _release_daemon_state(certdir: Path) -> bool:
     """Drop ``proxy.json`` if it still names us. True when it names SOMEONE
     ELSE — i.e. we were superseded and must touch nothing further.
@@ -8825,15 +8864,16 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # under a holder is a RECYCLE, and the holder cannot put the successor
         # on the socket until we are gone. Draining the full ceiling there is
         # time with the port bound and nobody behind it.
-        # ALREADY DRAINING == ALREADY HANDED OVER. Every path into a drain
-        # announces first, and the only one that runs concurrently with this
-        # teardown is the code watchdog's post-ask wait — which reaches
-        # `await_inflight` only after the successor is confirmed serving. So
-        # this predicate is the cheapest true answer to "is anything actually
-        # blocked on our exit", and it is read HERE rather than inside
-        # `teardown_drain_budget` so that function stays pure and testable.
+        # TWO WAYS TO OWE NOTHING, and our own marker only covers one. We
+        # announced a drain (the watchdog's post-ask wait), or somebody else
+        # is already serving this port — which is what a holder taking the
+        # replace signal leaves behind, with nothing announced here at all.
+        # Read HERE rather than inside `teardown_drain_budget` so that
+        # function stays pure and testable.
         cut = proxy.stop(drain=teardown_drain_budget(
-            reason, held_by_a_holder(), handed_over=this_process_is_draining()))
+            reason, held_by_a_holder(),
+            handed_over=this_process_is_draining()
+            or _superseded_on_the_port(certdir)))
         # THE NUMBER FROM BEFORE THE CUT. Reading it back off the proxy here
         # returns 0 always — `await_inflight` empties the set it counts.
         _log_lifecycle(f"drained, {cut} client(s) still open")
