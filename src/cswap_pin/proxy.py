@@ -2672,6 +2672,8 @@ _BRIDGE_SWEEP_COOLDOWN_S = 600.0
 # How rarely a slow request may take a line. A genuinely slow endpoint would
 # otherwise fill the log with what the first line already said.
 _SLOW_REPORT_COOLDOWN_S = 60.0
+# Same ceiling, same reason: one line per request would bury the count.
+_BUSY_REPORT_COOLDOWN_S = 60.0
 _SLOW_RECHECK_S = 5.0
 _SLOW_CACHE: dict = {}
 
@@ -4469,7 +4471,37 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # which it reads as "this daemon cannot pin" and records permanently.
         if getattr(outcome, "error", None) == "consume-busy":
             _deferred.add(1)
+            _note_busy_slot()
         return outcome
+
+    # A deferral is benign and it was also completely silent: the outcome
+    # went into `_deferred`, which only `pin_is_noop` reads, so "is this slot
+    # actually contended?" had no answer anywhere. The two possible answers
+    # have very different consequences -- a handful an hour is the race the
+    # design anticipates, while a steady stream means requests keep going out
+    # on the active account's bearer, and for a bridge-creating route that is
+    # permanent and cannot be transferred afterwards.
+    #
+    # Rate-limited for the same reason the slow-request line is: a contended
+    # slot would otherwise write one line per request. The count of the ones
+    # it stands for is what makes the number readable.
+    _busy = {"last": None, "since": 0}
+
+    def _note_busy_slot() -> None:
+        now = time.monotonic()
+        last = _busy["last"]
+        if last is not None and now - last < _BUSY_REPORT_COOLDOWN_S:
+            _busy["since"] += 1
+            return
+        _busy["last"] = now
+        more = f"; {_busy['since']} more" if _busy["since"] else ""
+        _busy["since"] = 0
+        _log_lifecycle(
+            "a pinned request went out unpinned because another process held "
+            f"the slot's refresh lock{more} -- benign as a race, but a steady "
+            "stream of these means bridges are being created on the wrong "
+            "account"
+        )
 
     def _live_token(creds: str) -> str | None:
         data = oauth.extract_oauth_data(creds)
