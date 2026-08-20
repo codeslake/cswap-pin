@@ -5748,6 +5748,32 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_an_armed_trace_shows_responses_not_just_requests(self, certdir):
+        """The file-armed trace could not show what the server ANSWERED.
+
+        `_relay_response` writes its `<- HTTP/1.1 NNN` line to `_TRACE` only,
+        and `_TRACE` is opened once at import from an env var — so it is off
+        on a daemon that is already serving. The `trace-to` file switch, the
+        only one reachable during an incident, never saw a single response.
+
+        Measured while chasing a live stall: 25 requests captured, ZERO
+        responses. I read that as "the server is not answering" for a moment
+        before checking the instrument, which is the same shape as
+        `bdf10c6` — that commit fixed this trace's other blind spot.
+
+        No new plumbing: the `on_status` hook already carries the status back
+        to a method that CAN reach the file target.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        src = inspect.getsource(pp.PinProxy._forward)
+        assert "on_status=" in src, "the status hook is gone"
+        assert "_tunnel_trace" in src, (
+            "the status never reaches the two-target trace, so an armed "
+            "`trace-to` still shows requests and no responses")
+
     def case_the_token_is_fetched_once_per_request(self, certdir):
         """A PINNED route that also sweeps fetched the same token TWICE.
 
