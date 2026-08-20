@@ -5528,16 +5528,27 @@ class TestDrainReportsWhatItCut:
         """
         import cswap_pin.proxy as pp
 
+        import threading
+
         srv = pp.PinProxy.__new__(pp.PinProxy)
         srv._reset_bridge_traffic()
+        srv._live_lock = threading.Lock()
+        srv._stream_conns = set()
+        srv._open_conns = set()
 
         A = "/v1/code/sessions/cse_AAA/worker/messages"
         A_STREAM = "/v1/code/sessions/cse_AAA/worker/events/stream"
         B = "/v1/code/sessions/cse_BBB/worker/messages"
 
-        # A posts and opens its stream. B posts and never does.
+        # A posts and HOLDS a stream. B posts and never opens one.
+        # The stream is a connection that stays open, not an event that
+        # recurs — asking when it was last opened is what made an earlier cut
+        # call every long-lived session deaf.
+        conn_a = object()
         srv._note_bridge_traffic(A, now=100.0)
-        srv._note_bridge_traffic(A_STREAM, now=100.5)
+        srv._note_bridge_traffic(A_STREAM, now=100.5, conn=conn_a)
+        srv._stream_conns.add(conn_a)
+        srv._open_conns.add(conn_a)
         srv._note_bridge_traffic(B, now=101.0)
 
         deaf = srv.deaf_bridges(window=60.0, now=110.0)
@@ -5564,9 +5575,26 @@ class TestDrainReportsWhatItCut:
         # AND A STREAM ARRIVING LATE CLEARS IT. The transport can reconnect
         # while state is still `reconnecting`; a verdict that never revises
         # would tell the user to restart a session that just healed.
+        conn_b = object()
         srv._note_bridge_traffic("/v1/code/sessions/cse_BBB/worker/events/stream",
-                                 now=111.0)
+                                 now=111.0, conn=conn_b)
+        srv._stream_conns.add(conn_b)
+        srv._open_conns.add(conn_b)
         assert srv.deaf_bridges(window=60.0, now=112.0) == []
+
+        # THE REGRESSION THIS SHAPE EXISTS FOR: A's stream was opened long
+        # before the window and has never been re-issued, because it is held.
+        # A recency test calls A deaf here; a held test does not.
+        srv._note_bridge_traffic(A, now=100000.0)
+        assert srv.deaf_bridges(window=60.0, now=100001.0) == [], (
+            "a session HOLDING its inbound stream was called deaf because the "
+            "stream was opened before the window — the stream is issued once "
+            "and kept, so it never falls inside a recent window")
+
+        # AND A CLOSED CONNECTION IS NOT A HELD STREAM.
+        srv._open_conns.discard(conn_a)
+        srv._note_bridge_traffic(A, now=100002.0)
+        assert "cse_AAA" in srv.deaf_bridges(window=60.0, now=100003.0)
 
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.

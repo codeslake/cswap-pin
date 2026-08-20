@@ -10415,9 +10415,15 @@ class PinProxy:
     def _reset_bridge_traffic(self) -> None:
         """Start the per-bridge accounting. Safe to call more than once."""
         self._bridge_posts: dict = {}
-        self._bridge_streams: dict = {}
+        # conn -> bridge id, for connections carrying that bridge's inbound
+        # stream. NOT "when a stream was last opened": the stream is issued
+        # once and held for the life of the session, so a recency stamp ages
+        # out while the stream is still there and calls a healthy session
+        # deaf. What is asked is whether one is HELD, which is live state.
+        self._stream_owner: dict = {}
 
-    def _note_bridge_traffic(self, request_line: str, now=None) -> None:
+    def _note_bridge_traffic(self, request_line: str, now=None,
+                             conn=None) -> None:
         """Record that a bridge spoke, and whether it opened its ear.
 
         Never raises and never blocks: this sits on the request path, so a
@@ -10432,9 +10438,11 @@ class PinProxy:
             if not bid:
                 return
             stamp = time.monotonic() if now is None else now
-            book = (self._bridge_streams if _EVENT_STREAM.search(request_line)
-                    else self._bridge_posts)
-            book[bid.group(1)] = stamp
+            if _EVENT_STREAM.search(request_line):
+                if conn is not None:
+                    self._stream_owner[conn] = bid.group(1)
+            else:
+                self._bridge_posts[bid.group(1)] = stamp
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
@@ -10451,16 +10459,25 @@ class PinProxy:
         The window is what stops this naming every session that ever ran: an
         ended one goes quiet and drops out on its own, with no bookkeeping to
         get wrong.
+
+        HELD, NOT RECENTLY OPENED. The stream is issued once and kept for the
+        life of the session, so a recency test ages out while the stream is
+        still there. An earlier cut of this did exactly that and would have
+        called every long-lived session deaf; the external 45s capture has the
+        same defect and disagreed with itself three times in an hour on one
+        machine (6, 9, 1).
         """
         stamp = time.monotonic() if now is None else now
         posts = getattr(self, "_bridge_posts", None)
         if not posts:
             return []
-        streams = getattr(self, "_bridge_streams", {})
+        owner = getattr(self, "_stream_owner", {})
+        with self._live_lock:
+            live = set(self._stream_conns & self._open_conns)
+        holding = {owner[c] for c in live if c in owner}
         return sorted(
             bid for bid, last in posts.items()
-            if stamp - last <= window
-            and stamp - streams.get(bid, float("-inf")) > window
+            if stamp - last <= window and bid not in holding
         )
 
     def await_inflight(self, budget: float) -> int:
@@ -12099,7 +12116,7 @@ class PinProxy:
         # PER BRIDGE, not per connection. `_stream_conns` answers "is this
         # SOCKET a stream", which is what the drain needs; this answers "does
         # this SESSION hold one", which is what a deaf bridge fails.
-        self._note_bridge_traffic(request_line)
+        self._note_bridge_traffic(request_line, conn=conn)
         return self._handle_one_request_inner(request_line, tls)
 
     def _handle_one_request_inner(self, request_line: str, tls: ssl.SSLSocket) -> bool:
