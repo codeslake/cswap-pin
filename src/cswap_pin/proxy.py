@@ -2653,6 +2653,10 @@ _UPSTREAM_FILE = "upstream.json"
 _PRESENCE = re.compile(r"^/v1/(code/)?sessions/[^/]+/client/presence(/|$|\\?)")
 
 _WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
+# THE ONE REQUEST THAT NEVER COMPLETES. Remote Control's inbound channel is a
+# GET held open for the life of the session, so it cannot migrate on
+# `Connection: close` the way a reply does — it has to be closed.
+_EVENT_STREAM = re.compile(r"/worker/events/stream")
 
 
 def trace_target(certdir) -> "str | None":
@@ -9535,6 +9539,10 @@ class PinProxy:
         # Which path `_debug` is open on, so a re-armed trace does not keep
         # writing to the file it was armed on first.
         self._debug_for = None
+        # Connections carrying a subscription rather than a reply. Held
+        # separately because the drain must treat them the other way round:
+        # every other connection is waited for, these are let go.
+        self._stream_conns: set = set()
 
     def start(self) -> None:
         if self._handed_fd is not None:
@@ -10200,6 +10208,31 @@ class PinProxy:
             self._srv = None
         return None
 
+    def release_subscriptions(self) -> int:
+        """Close the connections holding a subscription. Returns how many.
+
+        Called at the start of a drain. These never complete, so waiting for
+        them is waiting forever, and every second of that wait puts
+        `Connection: close` on every OTHER reply this daemon writes. The client
+        reopens the stream on the successor — which is already serving, since
+        the listener was released before this.
+        """
+        with self._live_lock:
+            conns, self._stream_conns = list(self._stream_conns), set()
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+            # NO LONGER OWED. The drain counts what it is waiting for, and a
+            # socket that is closed is not something anyone can still answer.
+            self._owe_answer(conn, False)
+        return len(conns)
+
     def await_inflight(self, budget: float) -> int:
         """Wait up to ``budget`` for open connections to finish, then cut them.
 
@@ -10232,6 +10265,14 @@ class PinProxy:
         This is the only function that cuts, so it is the only place that can
         report every path, including ones written after today.
         """
+        # LET THE SUBSCRIPTIONS GO FIRST. They never complete, so waiting for them
+        # is waiting forever — and every second of that wait stamps `Connection:
+        # close` on every other reply this daemon writes, which is a reconnect
+        # storm on the one channel Remote Control cannot lose.
+        freed = self.release_subscriptions()
+        if freed:
+            _log_lifecycle(
+                f"released {freed} subscription(s) to the successor before draining")
         # WAIT ON REQUESTS, NOT ON CONNECTIONS. This loop asked
         # `live_client_count() == 0` and that zero is unreachable: Remote
         # Control's WebSocket is opaque after the 101, is pumped by the shared
@@ -11717,6 +11758,9 @@ class PinProxy:
         # so a streaming reply is owed for every second it streams.
         if conn is not None:
             self._owe_answer(conn, True)
+            if _EVENT_STREAM.search(request_line):
+                with self._live_lock:
+                    self._stream_conns.add(conn)
         return self._handle_one_request_inner(request_line, tls)
 
     def _handle_one_request_inner(self, request_line: str, tls: ssl.SSLSocket) -> bool:
