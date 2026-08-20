@@ -15702,6 +15702,27 @@ class TestASlowRequestSaysSo:
         P._note_slow_request("GET", "/v1/code/sessions", 2700.0, 20.0)
         assert len(lines) == 1
 
+    def case_inference_taking_seconds_is_not_a_stall(self, monkeypatch):
+        """/v1/messages IS the model answering, and seconds are its healthy
+        range. Measured on one mac inside four minutes: 4715, 6040, 2369 and
+        4200ms, every one of them normal.
+
+        They also buried the line that meant something. In the same window a
+        `/worker/heartbeat` took 5789ms on that machine — a heartbeat, which
+        has no reason to take any time at all. Four routine inference lines
+        around it is how a reader learns to skim this log.
+        """
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/messages", 6040.0, 0.0)
+        assert lines == []
+
+    def case_a_slow_token_count_is_still_a_stall(self, monkeypatch):
+        """The exemption is for the inference route itself, not everything
+        under it. Counting tokens does not call the model."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/messages/count_tokens", 2400.0, 0.0)
+        assert len(lines) == 1
+
     def case_a_bridge_id_in_the_PATH_never_reaches_the_log(self, monkeypatch):
         """The id is not always in the query string — on the worker routes it
         is a path segment, and those are the routes that actually stall.

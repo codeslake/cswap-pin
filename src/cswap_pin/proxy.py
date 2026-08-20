@@ -10522,6 +10522,14 @@ class PinProxy:
         """
         if total_ms < _SLOW_REQUEST_MS:
             return
+        # INFERENCE IS SUPPOSED TO TAKE SECONDS. `/v1/messages` is the model
+        # answering; 4715, 6040, 2369 and 4200ms were measured on one healthy
+        # mac inside four minutes. Reporting them buried the line that meant
+        # something — a `/worker/heartbeat` at 5789ms on the same machine in
+        # the same window. EXACT, not a prefix: `count_tokens` lives under
+        # this route and calls no model, so a slow one is still a stall.
+        if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
+            return
         now = time.monotonic()
         last = getattr(self, "_last_slow_report", None)
         if last is not None and now - last < _SLOW_REPORT_COOLDOWN_S:
