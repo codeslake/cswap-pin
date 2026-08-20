@@ -5617,7 +5617,14 @@ class TestDrainReportsWhatItCut:
         # not tell the difference.
         import inspect
         wired = inspect.getsource(pp.PinProxy._report_deaf_bridges)
-        assert "self.deaf_bridges()" in wired
+        # A PREFIX, because the reporter now passes the predecessors' held
+        # bridges in and an exact-match guard fails on its own fix.
+        assert "self.deaf_bridges(" in wired
+        # AND IT MUST STILL UNION. Dropping `elsewhere` would restore the
+        # local-only answer that called every pre-existing session deaf.
+        assert "elsewhere=" in wired, (
+            "the reporter asks only about streams this process holds, so a "
+            "handover makes it name every session that predates it")
         caller = inspect.getsource(pp.PinProxy._handle_one_request_inner)
         assert "_report_deaf_bridges()" in caller, (
             "nothing on a machine invokes the deaf check, so the fleet cannot "
@@ -5740,6 +5747,105 @@ class TestDrainReportsWhatItCut:
                 "the transition and trains a reader to skim the file")
         finally:
             pp._log_lifecycle = real_log
+
+    def case_a_draining_predecessor_hides_the_streams_from_this_one(self, certdir):
+        """A successor cannot answer this question, and must not guess at it.
+
+        `deaf_bridges` reads `_stream_conns & _open_conns`, which is
+        per-process in-memory state. A handover passes the LISTENING socket
+        down, so posts arrive at the successor immediately, while every
+        established inbound stream stays with the predecessor that accept()ed
+        it. For the width of a drain this process therefore sees every bridge
+        posting and none holding — and says so, about sessions that are fine.
+
+        Measured: a daemon four minutes into a handover logged "12 of 12
+        bridge(s) post but hold no inbound stream" while five daemons were
+        alive holding 98 connections between them. The predecessor's own line
+        named nine long-lived channels left intact and /proc showed it holding
+        exactly nine. Nothing was deaf; the reporter was blind.
+
+        Watchers on three machines match these lines to raise a fleet alert,
+        so a confident wrong one is worse than no line at all.
+
+        SUPPRESSING THE REPORT WHILE ANY PREDECESSOR DRAINS IS NOT THE FIX,
+        and this case pins that too. A predecessor is almost never absent
+        here: two were still serving at 93 and 134 minutes old, because they
+        stay until their channels close and a session can outlive a day of
+        recycles. That rule would silence the check permanently — the same
+        silent-absence failure as certifying health over an empty
+        denominator, only quieter. So a predecessor that CAN say what it
+        holds is asked, and only one that predates the record is refused.
+        """
+        import os
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        real_pids = pp._pin_daemon_pids
+        real_draining = pp.is_draining
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._certdir = certdir
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_LIVE/worker/messages")
+
+            # A PREDECESSOR IS STILL DRAINING, so the stream for cse_LIVE may
+            # be held by it. This process cannot see it either way.
+            pp._pin_daemon_pids = lambda _c: [os.getpid(), 4242]
+            pp.is_draining = lambda _c, pid: pid == 4242
+            srv._report_deaf_bridges()
+            assert lines, (
+                "it went silent; a reader cannot tell a suppressed report "
+                "from a check that never ran")
+            assert pp.DEAF_REPORT_MARK not in lines[-1], (
+                "it called a bridge deaf while a predecessor was holding the "
+                f"streams it cannot see: {lines[-1]!r}")
+            assert pp.DEAF_REPORT_BLIND in lines[-1], (
+                f"the refusal is not verbatim, so no watcher can match it: "
+                f"{lines[-1]!r}")
+            assert "4242" in lines[-1], (
+                "it does not name the predecessor, so a reader cannot check "
+                f"whether it is still there: {lines[-1]!r}")
+
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) == before, (
+                "it repeated the refusal with nothing changed; transitions "
+                "only, or the file stops being worth watching")
+
+            # AND NOW IT CAN BE ASKED. The predecessor publishes the bridge
+            # it is holding, so the union answers and the session is NOT
+            # deaf. This is the steady state — the refusal above lasts only
+            # until the last pre-record daemon leaves.
+            pp.draining_marker_path(certdir, 4242).write_text(
+                f"{time.time()}\n0\n0\n0.0\n1\ncse_LIVE")
+            srv._report_deaf_bridges()
+            assert pp.DEAF_REPORT_MARK not in lines[-1], (
+                "a bridge whose stream a predecessor is holding was called "
+                f"deaf; the union did not reach it: {lines[-1]!r}")
+            assert lines[-1].startswith(pp.DEAF_REPORT_CLEAR), (
+                f"the union produced no all-clear: {lines[-1]!r}")
+
+            # THE CONTROL. The same state with no predecessor MUST still
+            # report — a gate that suppressed everything would pass every
+            # assertion above and silence the check this feature exists for.
+            pp._pin_daemon_pids = lambda _c: [os.getpid()]
+            pp.draining_marker_path(certdir, 4242).unlink()
+            srv._report_deaf_bridges()
+            assert pp.DEAF_REPORT_MARK in lines[-1], (
+                "with no predecessor to hide the stream the bridge really is "
+                f"deaf, and the report stayed quiet: {lines[-1]!r}")
+        finally:
+            pp._log_lifecycle = real_log
+            pp._pin_daemon_pids = real_pids
+            pp.is_draining = real_draining
 
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.

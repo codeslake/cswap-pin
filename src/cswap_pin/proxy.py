@@ -2678,6 +2678,10 @@ _BRIDGE_SWEEP_COOLDOWN_S = 600.0
 # a healthy fleet. Same silent-absence shape as a check with no caller.
 DEAF_REPORT_MARK = "post but hold no inbound stream"
 DEAF_REPORT_CLEAR = "every posting bridge holds an inbound stream"
+# THE THIRD ANSWER, because two of them leak the case that actually happens.
+# A successor holds none of its predecessors' streams, so during a handover it
+# can only ever say "deaf" — about sessions that are fine.
+DEAF_REPORT_BLIND = "cannot say whether any bridge is deaf"
 
 
 def trace_target(certdir) -> "str | None":
@@ -5256,7 +5260,8 @@ def announce_draining(certdir: Path, pid: int | None = None):
 def beat_draining(certdir: Path, pid: int | None = None,
                   owed: int | None = None, live: int | None = None,
                   quiet: float | None = None,
-                  streams: int | None = None) -> None:
+                  streams: int | None = None,
+                  bridges: "set | None" = None) -> None:
     """Say the drain is still alive, so its marker does not go stale under it.
 
     A HANDOVER DRAIN HAS NO CEILING ANY MORE, so the marker cannot expire on
@@ -5305,6 +5310,16 @@ def beat_draining(certdir: Path, pid: int | None = None,
         tail = "" if quiet is None else f"\n{float(quiet):.1f}"
         if streams is not None:
             tail = f"{tail or chr(10) + '0.0'}\n{int(streams)}"
+        # SIXTH LINE IS WHICH BRIDGES THOSE CHANNELS BELONG TO, because the
+        # count above says how much a reap would cost and nothing says WHOSE.
+        # A successor holds none of its predecessors' streams, so asked from
+        # its own memory it calls every pre-existing session deaf. The union
+        # is the answerable question and this file is the only channel
+        # between the two processes.
+        if bridges is not None:
+            if streams is None:
+                tail = f"{tail or chr(10) + '0.0'}\n0"
+            tail = f"{tail}\n{' '.join(sorted(bridges))}"
         path.write_text(f"{start}\n{int(owed)}\n{live_n}{tail}")
     except (OSError, ValueError):
         pass
@@ -5377,6 +5392,22 @@ def draining_streams(certdir: Path, pid: int) -> int:
         return int(body[4].strip())
     except (OSError, ValueError, IndexError):
         return 0
+
+
+def draining_bridges(certdir: Path, pid: int) -> "tuple[set, bool]":
+    """Bridge ids whose inbound stream ``pid`` holds, and whether it said.
+
+    THE SECOND HALF IS THE POINT. A marker written before this line existed
+    is not a daemon holding nothing — it is a daemon that cannot be asked,
+    and the two must not read the same. Answering the empty set for both puts
+    every bridge a predecessor is carrying back into the deaf list, which is
+    the fault the sixth line exists to fix.
+    """
+    try:
+        body = draining_marker_path(certdir, pid).read_text().split("\n")
+        return set(body[5].split()), True
+    except (OSError, IndexError):
+        return set(), False
 
 
 def draining_owed(certdir: Path, pid: int) -> int:
@@ -10480,11 +10511,49 @@ class PinProxy:
             posted = len(getattr(self, "_bridge_posts", {}) or {})
             if not posted:
                 return
-            now = sorted(self.deaf_bridges())
+            # AND THE STREAMS THIS PROCESS NEVER accept()ED. A handover
+            # passes the LISTENING socket down, so posts arrive here at once
+            # while every established stream stays with the process that
+            # accepted it. Asked from local memory alone, a successor calls
+            # every pre-existing session deaf: "12 of 12" was logged four
+            # minutes into a handover while five daemons were alive holding 98
+            # connections between them, the predecessor holding exactly the
+            # nine its own line named as left intact. Nothing was deaf.
+            #
+            # THE UNION, NOT A REFUSAL. Suppressing the report while any
+            # predecessor drains was tried first and is worse: a predecessor
+            # is almost never absent here — two were still serving at 93 and
+            # 134 minutes old, because they stay until their channels close
+            # and a session can outlive a day of recycles. That rule silences
+            # the check permanently, which is the same silent-absence failure
+            # as the empty denominator above, only quieter. Each draining
+            # daemon publishes what it holds; this reads them.
+            certdir = getattr(self, "_certdir", None)
+            elsewhere: set = set()
+            mute = []
+            for p in (_pin_daemon_pids(certdir) if certdir else ()):
+                if p == os.getpid() or not is_draining(certdir, p):
+                    continue
+                ids, said = draining_bridges(certdir, p)
+                # A PREDECESSOR FROM BEFORE THE SIXTH LINE CANNOT BE ASKED,
+                # and that is not the same as one holding nothing. Refusing
+                # is right HERE and wrong as the general rule, because it
+                # lasts only until the last old daemon leaves.
+                (elsewhere.update(ids) if said else mute.append(p))
+            now = (("mute", tuple(sorted(mute))) if mute
+                   else sorted(self.deaf_bridges(elsewhere=elsewhere)))
             if now == getattr(self, "_last_deaf", None):
                 return
             self._last_deaf = now
-            if now:
+            if mute:
+                _log_lifecycle(
+                    f"{DEAF_REPORT_BLIND} — {len(mute)} draining predecessor(s) "
+                    "predate the held-bridge record, so what they are holding "
+                    "cannot be asked and a local answer would name every "
+                    "pre-existing session: pid "
+                    + " ".join(str(p) for p in mute)
+                )
+            elif now:
                 _log_lifecycle(
                     f"{len(now)} of {posted} bridge(s) {DEAF_REPORT_MARK} — "
                     "claude.ai can see them and messages reach the server, "
@@ -10496,7 +10565,8 @@ class PinProxy:
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
-    def deaf_bridges(self, window: float = 300.0, now=None) -> list:
+    def deaf_bridges(self, window: float = 300.0, now=None,
+                     elsewhere: "set | None" = None) -> list:
         """Bridge ids that POSTED inside ``window`` and hold no inbound stream.
 
         THE PAIR, as everywhere else here. Posting alone is not the signal --
@@ -10521,14 +10591,24 @@ class PinProxy:
         posts = getattr(self, "_bridge_posts", None)
         if not posts:
             return []
-        owner = getattr(self, "_stream_owner", {})
-        with self._live_lock:
-            live = set(self._stream_conns & self._open_conns)
-        holding = {owner[c] for c in live if c in owner}
+        holding = self.held_bridge_ids() | (elsewhere or set())
         return sorted(
             bid for bid, last in posts.items()
             if stamp - last <= window and bid not in holding
         )
+
+    def held_bridge_ids(self) -> set:
+        """Bridges whose inbound stream THIS process is holding open.
+
+        Its own answer only. A handover leaves every established stream with
+        the process that accept()ed it, so this is a partial view by
+        construction and callers that need the whole picture union it with
+        `draining_bridges` of each draining predecessor.
+        """
+        owner = getattr(self, "_stream_owner", {})
+        with self._live_lock:
+            live = set(self._stream_conns & self._open_conns)
+        return {owner[c] for c in live if c in owner}
 
     def await_inflight(self, budget: float) -> int:
         """Wait up to ``budget`` for open connections to finish, then cut them.
@@ -10634,7 +10714,7 @@ class PinProxy:
         beat_draining(self._certdir, owed=self.inflight_requests(),
                       live=self.live_replies(started),
                       quiet=self.content_free_seconds(),
-                      streams=streams)
+                      streams=streams, bridges=self.held_bridge_ids())
         beat_at = started
         try:
             # AND THE TUNNELS. Remote Control RECEIVES over a WebSocket to
@@ -10665,7 +10745,8 @@ class PinProxy:
                                   live=self.live_replies(started),
                                   quiet=self.content_free_seconds(),
                                   streams=self.live_stream_count()
-                                  + _PUMP.live_pairs())
+                                  + _PUMP.live_pairs(),
+                                  bridges=self.held_bridge_ids())
                     time.sleep(_DRAINING_BEAT_SECONDS)
                 if _PUMP.live_pairs():
                     _log_lifecycle(
@@ -10700,7 +10781,8 @@ class PinProxy:
                             # Re-read rather than reused: a channel can end
                             # mid-drain and the marker must not overstate what
                             # a reap would cost.
-                            streams=self.live_stream_count() + _PUMP.live_pairs())
+                            streams=self.live_stream_count() + _PUMP.live_pairs(),
+                            bridges=self.held_bridge_ids())
                         beat_at = now
                     time.sleep(0.05)
         finally:
