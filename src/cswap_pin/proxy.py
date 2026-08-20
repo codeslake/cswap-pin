@@ -6740,11 +6740,32 @@ class PortHolder:
         # every session whose HTTPS_PROXY names the old one. Measured: the
         # holder bound 35051 while 36311 was being reclaimed, one moment later.
         deadline = time.monotonic() + _HOLD_BIND_WAIT_S
+        squat_checked = False
         while port:
             try:
                 self._srv.bind(("127.0.0.1", port))
                 break
             except OSError:
+                # A STANDBY OF OURS MAY BE SQUATTING. One left behind by a
+                # holder that was KILLED rather than released keeps the
+                # listener and never accepts, so the port is unbindable AND
+                # unreachable at the same time. That pair is the signature:
+                # a live handover's standby is also unbindable but DOES
+                # answer, and retiring it would open the gap it exists to
+                # close. Checked once, and only when the wait has already
+                # run out, so the ordinary contended-handover path is
+                # untouched.
+                if not squat_checked and time.monotonic() >= deadline:
+                    squat_checked = True
+                    if not _port_accepts(port):
+                        if _retire_stale_standbys(self._certdir):
+                            _log_lifecycle(
+                                f"port {port} was held by a standby that had "
+                                "stopped accepting — released it and retrying "
+                                "the bind"
+                            )
+                            deadline = time.monotonic() + _HOLD_BIND_WAIT_S
+                            continue
                 if time.monotonic() >= deadline:
                     # REFUSE, do not serve somewhere else. A holder exists to
                     # keep ONE address answering; on any other port it is a
@@ -8473,6 +8494,21 @@ _STANDBY_ANSWERED_POLL_S = 2.0
 # time. A peer measured the identical change on their own component: first
 # request after the kill 3,899ms -> 694ms, steady state unchanged.
 _STANDBY_PROBE_TIMEOUT_S = 0.25
+
+
+def _port_accepts(port: int, timeout: float = 1.0) -> bool:
+    """Does a loopback connect to ``port`` actually complete?
+
+    Separate from "is anything bound to it". A socket can be LISTENing with a
+    full backlog and no acceptor, which is bound-but-refusing — the state a
+    stale standby leaves. Anything that reads only one of those two facts
+    reports that state as its opposite.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
