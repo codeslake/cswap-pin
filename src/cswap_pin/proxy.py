@@ -2670,6 +2670,16 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 _BRIDGE_SWEEP_COOLDOWN_S = 600.0
 
 
+# THE TWO LINES `_report_deaf_bridges` writes, as symbols rather than prose.
+# A peer watcher greps the daemon log for these; exported so it can assert at
+# runtime that the substrings it looks for are actually present HERE, in the
+# installed package. Without that, a rename does not break the watcher — it
+# turns it into a permanent "no verdict yet", which is indistinguishable from
+# a healthy fleet. Same silent-absence shape as a check with no caller.
+DEAF_REPORT_MARK = "post but hold no inbound stream"
+DEAF_REPORT_CLEAR = "every posting bridge holds an inbound stream"
+
+
 def trace_target(certdir) -> "str | None":
     """Where to write the request trace, or None for off.
 
@@ -10460,19 +10470,29 @@ class PinProxy:
         Never raises: this is a statistic on the request path.
         """
         try:
+            # THE DENOMINATOR DECIDES WHETHER THERE IS ANYTHING TO SAY. With
+            # nothing recorded, `deaf_bridges` returns [] — and turning that
+            # into "every posting bridge holds an inbound stream" asserts
+            # health over an EMPTY population. A monitor reads that as "the
+            # check ran and passed", so if the accounting breaks again (it has,
+            # twice) every machine would certify health forever. Silence is the
+            # honest answer to a question nothing has answered yet.
+            posted = len(getattr(self, "_bridge_posts", {}) or {})
+            if not posted:
+                return
             now = sorted(self.deaf_bridges())
             if now == getattr(self, "_last_deaf", None):
                 return
             self._last_deaf = now
             if now:
                 _log_lifecycle(
-                    f"{len(now)} bridge(s) post but hold no inbound stream — "
+                    f"{len(now)} of {posted} bridge(s) {DEAF_REPORT_MARK} — "
                     "claude.ai can see them and messages reach the server, "
                     "but the session never receives them; only a NEW PROCESS "
                     f"clears it: {' '.join(now)}"
                 )
             else:
-                _log_lifecycle("every posting bridge holds an inbound stream")
+                _log_lifecycle(f"{DEAF_REPORT_CLEAR} ({posted} posting)")
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
@@ -11076,6 +11096,14 @@ class PinProxy:
                 # Or the set grows for the life of the daemon, holding a
                 # socket object per finished subscription.
                 self._stream_conns.discard(conn)
+                # AND THE OWNER MAP WITH IT, for the reason the line above
+                # already carries: the set would otherwise grow for the life of
+                # the daemon, holding a socket object per finished
+                # subscription. An earlier cut popped this in the 101-upgrade
+                # branch instead — a path a real event stream never takes,
+                # because Remote Control's inbound arrives over a WebSocket to
+                # the ingress host and goes through `_blind_tunnel`, not here.
+                self._stream_owner.pop(conn, None)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
                 self._content_at.pop(conn, None)
@@ -12118,6 +12146,12 @@ class PinProxy:
                     # is still being written, uncounted.
                     with self._live_lock:
                         self._stream_conns.discard(conn)
+                        # AND THE OWNER MAP, and here it is not merely a
+                        # leak: the connection stays OPEN as keep-alive, so a
+                        # stale entry makes `deaf_bridges` read this session as
+                        # HOLDING a stream after its stream ended — a false
+                        # negative in the check, worse than the leak.
+                        self._stream_owner.pop(conn, None)
                 got_one = self._handle_one_request(tls, conn)
                 served_one = True
                 if not got_one:
@@ -12458,11 +12492,9 @@ class PinProxy:
                         # after the release said it had freed it.
                         with self._live_lock:
                             self._stream_conns.discard(_c)
-                        # PRUNED WITH IT. `_stream_owner` keyed on the same
-                        # connection object; leaving it holds a strong
-                        # reference to every stream socket the daemon has ever
-                        # seen and grows without bound.
-                        self._stream_owner.pop(_c, None)
+                            # AND THE OWNER MAP. Keyed on the same object; the
+                            # two are one fact and must be dropped together.
+                            self._stream_owner.pop(_c, None)
                     release = getattr(self._local, "release", None)
 
                     def _release_tunnel():
