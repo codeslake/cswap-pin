@@ -5628,6 +5628,45 @@ class TestDrainReportsWhatItCut:
         srv._note_bridge_traffic(A, now=100002.0)
         assert "cse_AAA" in srv.deaf_bridges(window=60.0, now=100003.0)
 
+    def case_the_owner_map_is_pruned_wherever_the_stream_set_is(self):
+        """`_stream_owner` is keyed on the connection object, so it must be
+        dropped wherever `_stream_conns` is.
+
+        An earlier cut popped it in the 101-upgrade branch — a path a real
+        event stream NEVER takes, because Remote Control's inbound arrives over
+        a WebSocket to the ingress host and goes through `_blind_tunnel`, not
+        `_handle_one_request`. Measured then: after a full teardown
+        `_stream_conns` was empty and `_stream_owner` still held the entry, one
+        socket object pinned per finished subscription for the life of the
+        daemon. The whole suite stayed green, because nothing drives that
+        teardown.
+
+        STRUCTURAL, because behavioural coverage of `_serve_client`'s release
+        needs a real client and this is the property that actually matters: the
+        two are pruned TOGETHER. It also catches the next discard site added
+        without a pop, which is how this happened in the first place.
+        """
+        import inspect
+        import re
+
+        import cswap_pin.proxy as pp
+
+        src = inspect.getsource(pp)
+        lines = src.splitlines()
+        discards = [i for i, ln in enumerate(lines)
+                    if re.search(r"_stream_conns\.discard\(", ln)]
+        assert discards, "no discard site found — this guard is watching nothing"
+
+        missing = []
+        for i in discards:
+            window = "\n".join(lines[max(0, i - 2):i + 12])
+            if "_stream_owner.pop(" not in window:
+                missing.append(lines[i].strip())
+        assert not missing, (
+            "a connection leaves `_stream_conns` without leaving "
+            "`_stream_owner`, so its socket object is pinned for the life of "
+            f"the daemon: {missing}")
+
     def case_the_deaf_report_says_it_in_words_a_watcher_can_match(self):
         """The two log lines are an INTERFACE, not prose.
 
@@ -5665,12 +5704,21 @@ class TestDrainReportsWhatItCut:
                 srv._note_bridge_traffic(
                     parts[1] if len(parts) > 1 else "/", conn=conn)
 
+            # NOTHING RECORDED YET: no claim either way. Logging the
+            # all-clear here asserts health over an EMPTY population, which a
+            # monitor reads as "the check ran and passed".
+            srv._report_deaf_bridges()
+            assert lines == [], (
+                f"it certified health before any bridge had posted: {lines}")
+
             wire("POST /v1/code/sessions/cse_DEAF/worker/messages HTTP/1.1")
             srv._report_deaf_bridges()
             assert lines, (
                 "a bridge that posts and holds no stream produced no line, so "
                 "the fleet cannot self-report")
-            assert "post but hold no inbound stream" in lines[-1], lines[-1]
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+            assert "1 of 1 bridge(s)" in lines[-1], (
+                f"the deaf line carries no denominator: {lines[-1]!r}")
             assert "cse_DEAF" in lines[-1], (
                 "the line names no bridge, so a reader cannot act on it")
 
@@ -5680,8 +5728,10 @@ class TestDrainReportsWhatItCut:
             srv._stream_conns.add(conn)
             srv._open_conns.add(conn)
             srv._report_deaf_bridges()
-            assert lines[-1] == "every posting bridge holds an inbound stream", (
+            assert lines[-1].startswith(pp.DEAF_REPORT_CLEAR), (
                 f"the recovery line is not verbatim: {lines[-1]!r}")
+            # A DENOMINATOR, or "0 of 0" and "0 of 13" print the same sentence.
+            assert "(1 posting)" in lines[-1], lines[-1]
 
             before = len(lines)
             srv._report_deaf_bridges()
