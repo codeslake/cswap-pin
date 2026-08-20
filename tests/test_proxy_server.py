@@ -2311,9 +2311,24 @@ class TestChainRediscovery:
         sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sink.bind(("127.0.0.1", 0))
         sink.listen(4)
-        threading.Thread(
-            target=lambda: [sink.accept() for _ in iter(int, 1)], daemon=True
-        ).start()
+        def _accept_until_closed():
+            """Accept and CLOSE, and stop when the listener goes.
+
+            The comprehension this replaces held every accepted socket for the
+            life of the session and raised out of the thread at teardown. A
+            leaked descriptor per connection is affordable on a laptop and is
+            not on a CI runner running four workers against a much smaller
+            limit — and the way that failure arrives is a dead worker and an
+            INTERNALERROR that names no test.
+            """
+            while True:
+                try:
+                    conn, _ = sink.accept()
+                except OSError:
+                    return  # the listener closed at test end; that is the exit
+                conn.close()
+
+        threading.Thread(target=_accept_until_closed, daemon=True).start()
 
         def _egress_line(candidates):
             relay = pin_proxy.PinProxy(certdir, lambda: "tok")
