@@ -4297,6 +4297,38 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         except (AccountNotFoundError, ConfigError, Exception):
             return account_num, email
 
+    def _pin_is_the_live_login(num: str) -> bool:
+        """Whether slot ``num`` really holds the live login.
+
+        NOT `current_account_number()` alone. That resolves the identity in
+        `~/.claude.json`'s `oauthAccount`, and THIS PIN OVERWRITES that field
+        with the pinned identity so a live Remote Control bridge survives an
+        account rotation. Asking it is asking our own forgery: it answers "the
+        pin is already active", the provider swaps nothing on every request
+        afterwards, and `pin_is_noop` calls that the correct answer — so a
+        dead swap looks exactly like a healthy one, everywhere.
+
+        The roster's `activeAccountNumber` is cswap's own record and the pin
+        never writes it, so it is what separates our splice from a person
+        genuinely logged in as the pinned account.
+
+        THE PIN OWNS THIS, not the host. The host has an un-splice of its own,
+        and while it is there the two agree — but it lives on a branch that is
+        not merged, and the pin's own bearer swap must not be one rebase away
+        from silence.
+        """
+        if switcher.current_account_number() != num:
+            return False
+        # It claims to be us. Was that our splice?
+        try:
+            recorded = (switcher._get_sequence_data() or {}).get(
+                "activeAccountNumber")
+        except Exception:  # noqa: BLE001 — an unreadable roster is not a verdict
+            return True
+        if recorded is None:
+            return True
+        return str(recorded) == str(num)
+
     # A one-shot flag for the pass currently running: set when the refresh was
     # DEFERRED rather than failed, so pin_is_noop can say "no token, but do not
     # condemn this daemon". A set is used only for its atomic add/discard.
@@ -4308,7 +4340,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         if target is None:
             return None
         num, mail = target
-        if switcher.current_account_number() == num:
+        if _pin_is_the_live_login(num):
             return None
         creds = switcher.read_account_credentials(num, mail)
         if not creds:
@@ -4366,7 +4398,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         target = _current_target()
         if target is None:
             return True  # pin cleared: leaving every bearer alone IS the job
-        return switcher.current_account_number() == target[0]
+        return _pin_is_the_live_login(target[0])
 
     provider.pin_is_noop = pin_is_noop
     return provider
