@@ -160,38 +160,12 @@ def _clear_wiring_locked(switcher, path, *, write_json=None) -> bool:
     return _clear_ledger(path)
 
 
-def _config_lock_is_free(budget: float) -> bool:
-    """Can the config lock be taken within ``budget`` seconds?
+# `_config_lock_is_free` is NOT here. It belongs beside `wire_launch_env`, which
+# stayed in the host — and a second copy of one rule is a copy that drifts:
+# two tests disagreed about which name the launch path calls, because both
+# existed and only one ran.
 
-    A probe, not a hold — the caller re-locks immediately after. That race is
-    deliberate: losing it costs one skipped unwire (the next launch heals it),
-    while the alternative is the launch itself waiting on the package's own
-    5-second lock timeout, which it has no way to shorten.
 
-    BOTH CONFIGS, because the operation this gates acts on both. It probed
-    `get_global_config_path()` alone, and `clear_wiring` says why that is not
-    the same question: with `CLAUDE_CONFIG_DIR` set the two paths diverge, so
-    a free session config and a HELD `~/.claude.json` — a Claude Code
-    credential refresh, say — passed the probe. `unwire_if_dead` then blocked
-    on the package's own `claude_config_lock(timeout=5)`: a 5.3 s launch
-    stall, ten times the `_LAUNCH_LOCK_BUDGET_S` this guard exists to enforce,
-    reached THROUGH the guard.
-
-    The budget is per config rather than shared. Two configs is the maximum,
-    they are the same path whenever `CLAUDE_CONFIG_DIR` is unset (so the
-    common case pays once), and splitting a sub-second budget in half makes
-    each probe more likely to lose a race it would otherwise have won.
-    """
-    proper_lockfile = require("claude_locks").proper_lockfile
-
-    for path in _each_config():
-        try:
-            with proper_lockfile(
-                    path.parent / (path.name + ".lock"), timeout=budget):
-                continue
-        except Exception:  # noqa: BLE001
-            return False
-    return True
 
 
 def _dead_wired_configs(_switcher, connect_timeout: float = 2.0, *,
@@ -300,29 +274,6 @@ def _each_config(level: int = logging.DEBUG):
         yield path
 
 
-def _install_hint() -> str:
-    """How to install the extra, in a form that reaches THIS install.
-
-    Not a constant, because `pip install` is wrong for the install method most
-    users have. Under a uv tool install, pip puts a second copy in whatever pip
-    is on PATH and the extra never reaches the tool's environment — the user
-    follows the instruction, it succeeds, and the pin is still missing.
-    `cswap upgrade` already solves this; reuse its detector rather than
-    re-deriving it.
-
-    THE ONE PLACE THAT DECIDES THE COMMAND, which is why the mapping is inline
-    rather than in a helper of its own: a second hardcoded `uv tool install`
-    once survived beside the derived hint and diverged from it on a pipx
-    machine — one screen apart, both wrong for someone.
-    `test_one_place_decides_the_install_command` enforces that by name.
-    """
-    _detect_install_method = require("update_check")._detect_install_method
-
-    how = {
-        "uv": "uv tool install 'claude-swap[pin]'",
-        "pipx": "pipx install 'claude-swap[pin]'",
-    }.get(_detect_install_method() or "", "pip install 'claude-swap[pin]'")
-    return f"The cloud pin requires 'cswap-pin'. Install with: {how}"
 
 
 def _ledger_path(config_path):
@@ -770,124 +721,3 @@ def clear_wiring(switcher, timeout: float | None = None, only=None, *,
     return changed
 
 
-def wire_launch_env(switcher, env: dict[str, str], *, backup_root=None,
-                    write_json=None) -> dict[str, str]:
-    """Route a child Claude Code through the pin proxy, if one is pinned.
-
-    Returns ``env`` unchanged when there is no pin, when the extra is not
-    installed, or when the proxy cannot be started: an optional feature must
-    never be able to block a launch.
-    """
-    # ONE guard around everything, including _impl(). A split try leaves the
-    # resolution step uncovered, so anything raised there — a broken
-    # cryptography, a corrupt install — kills the launch instead of starting
-    # it unpinned.
-    try:
-        pin = _impl()
-    except Exception:  # noqa: BLE001 — never block the launch
-        # No pin this launch, whatever the reason: not installed, or installed
-        # and broken. A wiring a previous install left behind would otherwise
-        # outlive it and point every session at a dead port — see clear_wiring.
-        #
-        # ASK FIRST, LOCK ONLY IF THERE IS WORK. The budget is per PATH and
-        # clear_wiring takes one lock per config, so a user who never installed
-        # the pin — the case this budget exists for — would pay it twice
-        # (1.37-1.64s with Claude Code holding the lock, against a 0.5s cap).
-        # `_wiring_present` is lock-free, answers in ~1.5ms, and for that user
-        # the answer is always "nothing to remove".
-        #
-        # AND NOT SERVING. `_impl()` raising says nothing about the daemon: a
-        # broken cryptography, a half-finished reinstall, an import error in a
-        # new release all land here while the proxy on the port keeps answering
-        # every session already wired to it. Unwiring on presence alone strips
-        # the env block from a healthy pin.
-        #
-        # The probe is bounded well under the launch budget rather than given
-        # the default 2s: a black-holed port must not turn a launch-path guard
-        # into the stall it was written to avoid.
-        #
-        # `clear_wiring` logs at most twice per LAUNCH here (its getter WARNING
-        # and its lock WARNING), because the gate goes false only when the
-        # removal succeeds. At human launch cadence that is negligible, which
-        # is why the churn arithmetic lives at the statusline call site.
-        #
-        # THE DEAD CONFIGS, NOT "THE WIRING" — the correction `heal` carries,
-        # on the third of its three call sites. All three ask a MACHINE-WIDE
-        # verdict, and answering it with a machine-wide ACT strips a live
-        # session config wired to a serving port because the OTHER config
-        # names a dead one. `_dead_wired_configs` keeps the verdict identical
-        # (the list IS the staleness verdict, one bool wide) and narrows
-        # only what gets removed.
-        try:
-            dead = _dead_wired_configs(switcher, connect_timeout=_LAUNCH_PROBE_S,
-                                        backup_root=backup_root)
-            if dead:
-                clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S, only=dead,
-                             backup_root=backup_root, write_json=write_json)
-        except Exception:  # noqa: BLE001
-            pass
-        return env
-    try:
-        pinned = pin.ensure_proxy(switcher)
-        if pinned:
-            port, ca_path = pinned
-            # A COPY, so the peer can only scribble on a throwaway. The
-            # validation below covers what `wire_env` RETURNS; a version that
-            # also WRITES would leave a half-wired env in the object the
-            # caller keeps — `session.py` passes the dict it goes on to use —
-            # and in the one this function falls back to returning, which
-            # reaches `os.execvpe` OUTSIDE the launch's try. There a wrong
-            # shape is not a caught exception, it is the launch.
-            #
-            # Today's 0.1.68 opens with `out = dict(env)` and does not write.
-            # But this module's stated threat model is a peer on an
-            # independent release schedule: `heal` already refuses to trust
-            # its return value, and trusting it not to WRITE while validating
-            # what it returns was the missing half. One `dict()` here covers
-            # the caller's object and the fallback path together.
-            wired = pin.wire_env(dict(env), port, ca_path)
-            # VALIDATED, NOT TRUSTED. This is the one value from the peer that
-            # reaches `os.execvpe`, and execvpe sits OUTSIDE the launch's try —
-            # so a wrong shape here is not a caught exception, it is the
-            # launch. Both failure modes were measured:
-            #
-            #   None            execvpe(argv, None) does NOT fail. It hands the
-            #                   child the PARENT's environ, dropping
-            #                   CLAUDE_CONFIG_DIR — so the session launches
-            #                   against the default login instead of the
-            #                   selected account, silently. An account-isolation
-            #                   break with no error anywhere.
-            #   {"K": 41234}    execvpe raises TypeError out of the launch.
-            #
-            # The module's standing rule is that the peer may be wrong: `heal`
-            # re-reads state rather than believing a return value. Same rule
-            # here — anything that is not a str->str mapping degrades to an
-            # UNPINNED launch, which is the failure mode the rest of this file
-            # is built to tolerate.
-            if isinstance(wired, dict) and all(
-                isinstance(k, str) and isinstance(v, str) for k, v in wired.items()
-            ):
-                return wired
-    except Exception:  # noqa: BLE001 — never block the launch
-        pass
-    # No proxy this launch, whether ensure_proxy said so or died saying it.
-    # .claude.json's env block is applied at boot, so a wiring a previous
-    # launch left behind would send this child at a port nothing answers.
-    # ONE tail, not one per branch: duplicating it runs the unwire twice when
-    # the None path's own unwire raises.
-    #
-    # BOUNDED, like the no-package branch above. `unwire_if_dead` takes no
-    # timeout and uses the package's own claude_config_lock(timeout=5), so a
-    # held .claude.json.lock costs every `cswap run` 5.3s before it returns the
-    # env unchanged — and Claude Code holds that lock routinely while
-    # refreshing credentials.
-    #
-    # If the lock is not free right now, SKIP: the wiring is stale but the next
-    # launch heals it, and a launch that blocks is worse than a launch that is
-    # briefly unpinned — the whole reason this path fails open.
-    try:
-        if _config_lock_is_free(_LAUNCH_LOCK_BUDGET_S):
-            pin.unwire_if_dead(_certdir(backup_root))
-    except Exception:  # noqa: BLE001
-        pass
-    return env
