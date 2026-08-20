@@ -15774,14 +15774,20 @@ class TestASlowRequestSaysSo:
         P._note_slow_request("POST", "/a", 5000.0, 0.0, wait_ms=4900.0)
         assert "4 more" in lines[1], lines[1]
 
-    def case_the_wait_is_not_blamed_on_the_server(self, monkeypatch):
-        """The clock runs from after the write to the status line, so it is
-        the server AND the whole return path. Calling it "waiting for the
-        server" named one of those and I nearly reported it as settled."""
+    def case_the_wait_attributes_nothing(self, monkeypatch):
+        """The clock runs from after the write to the status line, so it
+        covers the server AND every hop the answer returns through, and it
+        cannot separate them.
+
+        It said "waiting for the server" for one release. A peer's DIRECT
+        control has since read 0.229s across 59 samples in the same minutes
+        this field read 1.7s — so the server was fine and the field was
+        naming it anyway. An attribution the measurement cannot support does
+        not belong in the measurement's own words."""
         P, lines = self._proxy(monkeypatch)
         P._note_slow_request("POST", "/a", 5000.0, 0.0, wait_ms=4900.0)
-        assert "for the server" not in lines[0], lines[0]
-        assert "downstream" in lines[0], lines[0]
+        assert "server" not in lines[0], lines[0]
+        assert "waiting for the answer" in lines[0], lines[0]
 
     def case_the_line_says_who_was_slow(self, monkeypatch):
         """THE QUESTION THE TOTAL CANNOT ANSWER, and the one that decides
