@@ -15097,6 +15097,9 @@ class TestAHolderDoesNotOutliveItsLauncher:
     remains the portable floor, and macOS has no equivalent.
     """
 
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
     def case_the_holder_arms_a_parent_death_signal(self, tmp_path):
         """Source-level, because the runtime effect needs a real fork.
 
