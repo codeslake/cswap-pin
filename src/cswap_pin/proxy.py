@@ -3898,9 +3898,9 @@ def observed_bridge_owners() -> dict[str, str | None]:
     OBSERVED, not configured. `load_pin` returns what we WROTE; this returns
     what the machine actually has. Measured 2026-08-17, all three at once:
 
-        cswap pin says       codeslake@gmail.com          (pinned, acct 1)
-        the live bridge is   org da3631be…                (acct 2)
-        the login is         org b7e54904…                (acct 3)
+        cswap pin says       the pinned account           (slot 1)
+        the live bridge is   a different org              (slot 2)
+        the login is         a third org                  (slot 3)
 
     `cswap pin` reported the first and nothing compared it to the second, so a
     session ran on a bridge its login did not own until the server answered
