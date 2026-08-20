@@ -7586,7 +7586,16 @@ def holder_main(account_num: str, email: str, certdir: Path,
         # The bind fails for two opposite reasons and NEITHER wants a second
         # daemon: if a healthy pin holds the port we are redundant, and if the
         # port is held by something not serving, another port does not help.
-        # So exit. Every caller already handles "no successor came up", and the
+        # So exit.
+        #
+        # THE SECOND REASON IS NOW RECOVERED FROM RATHER THAN ACCEPTED, one
+        # level down. `PortHolder.__init__` asks, when its bind budget runs
+        # out, whether the port is bound-but-not-accepting — the signature of
+        # a standby left by a holder that was killed — and SIGHUPs it before
+        # giving up. This sentence used to be the whole disposition, and it
+        # cost 3.4 hours of total outage: 50 retries, 63 sessions refused, and
+        # a person sending the signal by hand. Reaching here now means the
+        # port really is somebody else's. Every caller already handles "no successor came up", and the
         # incumbent is by definition still there.
         _log_lifecycle(
             f"holder could not take the port ({exc}) — exiting rather than "
