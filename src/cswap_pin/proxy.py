@@ -4159,7 +4159,8 @@ def titles_to_restore(
     return out
 
 
-def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
+def apply_pin(switcher, email: str | None, org_uuid: str | None,
+              identity: dict | None = None) -> bool:
     """Set (or clear, with ``email=None``) the pin AND bring the world in line.
 
     Storing the pin is only half the job: hand-launched sessions read the
@@ -4217,7 +4218,61 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None) -> bool:
         ensure_proxy_secret(certdir)
     except OSError:
         pass  # unwritable cert dir: serve unauthenticated rather than not at all
+    # AND THE CONFIG MUST NAME THE PIN, which is the half that was missing.
+    # Best-effort by design: the record is written and the proxy is serving by
+    # the time we get here, so a config that cannot be written is a worse pin,
+    # not a failed command — and raising would roll back a pin that works.
+    try:
+        splice_config_identity(identity)
+    except Exception:  # noqa: BLE001 — the pin is already live
+        _log_lifecycle("could not name the pin in the live config — "
+                       "bridges will be minted under the active account "
+                       "until the next switch")
     return ensure_proxy(switcher) is not None
+
+
+def splice_config_identity(identity: dict | None) -> bool:
+    """Make the live config name ``identity``. True when it changed anything.
+
+    ONLY ``oauthAccount``. Everything else in that file belongs to Claude Code,
+    and cswap's switch says the same thing in its own comment: this field is
+    identity, not authority. Inference keeps following the active account
+    through the credential store, which is what makes a pin usable at all.
+
+    Idempotent, because every live Claude Code watches this file and a rewrite
+    that changes nothing is a wake-up for all of them.
+
+    A config this cannot parse is left alone. `.get` on a list raises, and a
+    file we do not understand is one we must not rewrite — the same rule the
+    backup repair had to learn when `null` and `[]` escaped its guard.
+    """
+    if not identity:
+        return False
+    # THROUGH `require`, like every other reader of this path in this file.
+    # The host package is resolved at call time, never imported at module
+    # scope: this package is the optional extra and must not make cswap's
+    # layout a hard dependency.
+    cfg = require("paths").get_global_config_path()
+    try:
+        data = json.loads(cfg.read_text())
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(data, dict) or data.get("oauthAccount") == identity:
+        return False
+    data["oauthAccount"] = identity
+    # ATOMIC. A torn write here is read by every live session, and is worse
+    # than an unspliced pin.
+    tmp = cfg.with_suffix(cfg.suffix + f".pin-{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, cfg)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
 
 
 # Set by the last apply_pin: how many live clients that call's arming cut off,

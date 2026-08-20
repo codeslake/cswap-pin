@@ -5369,6 +5369,83 @@ class TestDrainReportsWhatItCut:
         assert teardown_drain_budget(
             "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
+    def case_a_pin_names_itself_in_the_live_config(self, certdir, tmp_path,
+                                                   monkeypatch):
+        """A pin that does not SPLICE does nothing until the next switch.
+
+        `apply_pin` saved the record, wired the proxy env and started the
+        daemon, and never wrote `oauthAccount` — the field Claude Code reads to
+        decide who OWNS a bridge. The only writer was cswap's switch, so a pin
+        set while another account was active left the config naming THAT
+        account, and every bridge minted afterwards belonged to it.
+
+        MEASURED on a live machine before this: pin=slot 1,
+        `~/.claude.json`=slot 4, and cswap's own bridge-owner check reporting
+        "all 13 live bridge pointers match the current login" — the current
+        login, not the pin. Re-running `cswap pin` did not move it.
+
+        THE RULE IS HERE, THE LOOKUP IS NOT. Which identity to write means
+        reading cswap's backup store, whose layout this package must not know,
+        so it arrives as an argument.
+        """
+        import json
+
+        import cswap_pin.proxy as pp
+
+        cfg = tmp_path / "claude.json"
+        cfg.write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "active@example.com",
+                             "organizationUuid": "org-ACTIVE"},
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:1"},
+        }))
+        # PATCH THE SEAM, not a name this module does not own: the path is
+        # fetched through `require("paths")` at call time.
+        import types
+        monkeypatch.setattr(
+            pp, "require",
+            lambda name, _r=pp.require: (
+                types.SimpleNamespace(get_global_config_path=lambda: cfg)
+                if name == "paths" else _r(name)))
+
+        want = {"emailAddress": "pinned@example.com",
+                "organizationUuid": "org-PIN", "accountUuid": "uuid-PIN"}
+        assert pp.splice_config_identity(want) is True, (
+            "setting a pin did not name it in the live config, so Claude Code "
+            "keeps minting bridges under the ACTIVE account and the pin is "
+            "inert until the next switch")
+        after = json.loads(cfg.read_text())
+        assert after["oauthAccount"] == want
+        assert after["env"] == {"HTTPS_PROXY": "http://127.0.0.1:1"}, (
+            "the splice rewrote a field that belongs to Claude Code; only "
+            "oauthAccount is ours to touch")
+
+        # IDEMPOTENT. Every live session watches this file, so a rewrite that
+        # changes nothing is a wake-up for all of them.
+        assert pp.splice_config_identity(want) is False
+
+        # NOTHING TO WRITE IS NOT AN ERROR — no pin, or a lookup that failed.
+        assert pp.splice_config_identity(None) is False
+
+        # AND A CONFIG WE CANNOT PARSE IS LEFT FOR ITS OWNER.
+        for bad in ("[]", "null", '"a string"', "{torn"):
+            cfg.write_text(bad)
+            assert pp.splice_config_identity(want) is False, (
+                f"a {bad!r} config was rewritten; a file we do not understand "
+                "is one we must not touch")
+            assert cfg.read_text() == bad
+
+        # AND apply_pin IS THE PATH THAT CARRIES IT. Reaching a real apply_pin
+        # needs a switcher and a daemon, so read the wiring out of the source.
+        import inspect
+
+        src = inspect.getsource(pp.apply_pin)
+        assert "splice_config_identity(identity)" in src, (
+            "apply_pin does not name the pin in the config, so the rule exists "
+            "and nothing calls it")
+        assert "identity" in inspect.signature(pp.apply_pin).parameters, (
+            "apply_pin cannot be handed an identity, so cswap has no way to "
+            "pass the one it looked up")
+
     def case_the_armed_trace_can_see_the_tunnel(self, certdir):
         """An armed trace was blind to the one path that fails.
 
