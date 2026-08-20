@@ -15676,6 +15676,34 @@ class TestASlowRequestSaysSo:
         P = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         return P, lines
 
+    def case_the_switch_lives_where_the_pin_already_is(self, tmp_path,
+                                                       monkeypatch):
+        """ONE PLACE, AND ONE THE OWNER ALREADY KNOWS.
+
+        The pin had grown five diagnostic switches — two environment
+        variables, a `trace-to` file, a `slow-ms` file, and a third variable
+        for the body shape. Nobody remembers a path spelled `<certdir>/...`,
+        and `certdir` is itself jargon for a directory whose name never
+        appears in anything a person reads.
+
+        `settings.json` is the file `cswap pin <email>` already writes and
+        the pin already reads, in the same `remoteControl` section. So the
+        switch goes there and there is nothing new to remember.
+        """
+        from cswap_pin import proxy as pin_proxy
+        (tmp_path / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "a@example.com",
+                               "debugSlowMs": 900}}))
+        assert pin_proxy.slow_report_ms(tmp_path / "pin-proxy") == 900.0
+
+    def case_no_setting_means_silent(self, tmp_path, monkeypatch):
+        """The default for a released package, and the reason the file switch
+        was not enough: absent must be OFF, not a default threshold."""
+        from cswap_pin import proxy as pin_proxy
+        (tmp_path / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "a@example.com"}}))
+        assert pin_proxy.slow_report_ms(tmp_path / "pin-proxy") is None
+
     def case_it_is_OFF_until_someone_arms_it(self, monkeypatch):
         """A DIAGNOSTIC THAT NOBODY ASKED FOR IS GARBAGE IN SOMEONE'S LOG.
         Measured on this fleet: ~38 lines an hour, which is ~900 a day, into
