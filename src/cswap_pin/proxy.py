@@ -10383,15 +10383,41 @@ class PinProxy:
                       streams=streams)
         beat_at = started
         try:
-            # NO SEPARATE WAIT FOR THE TUNNELS, and that is not an
-            # oversight. Remote Control receives over a WebSocket to the
-            # ingress host the `/bridge` response names, so it is an opaque
-            # tunnel `_PUMP` drives rather than a reply anyone is owed. The
-            # same session's held-open `/worker/events/stream` DOES owe this
-            # daemon an answer for the life of the session, so the daemon
-            # stays anyway and the tunnel rides along on that. A wait of its
-            # own only delayed the exit — measured at the full marker TTL on
-            # a tunnel the drain did not own.
+            # AND THE TUNNELS. Remote Control RECEIVES over a WebSocket to
+            # the ingress host the `/bridge` response names, so it is an
+            # opaque tunnel `_PUMP` drives rather than a reply anyone is owed
+            # — `_mitm` hands the debt back at the 101, correctly, because a
+            # tunnel owes no ANSWER. It is still a live channel that dies with
+            # this process.
+            #
+            # A HELD-OPEN STREAM DOES NOT COVER IT. That was the reasoning for
+            # dropping this wait, and the fleet disproved it the same hour:
+            # pid 423760 owed nothing, left at once, and took four open
+            # connections with it, while pid 1452400 — which did owe — stayed
+            # and kept fourteen.
+            #
+            # ENDS ON SILENCE. `live_pairs()` alone has no exit: a wedged peer
+            # keeps its entry for ever. A tunnel quiet for the marker's own
+            # TTL cannot be told from a dead one, which is the same
+            # discriminator the reply wait uses.
+            #
+            # Uncapped arm only. The signal arm has a supervisor counting to
+            # `_DRAIN_SECONDS + 2`, and the held arm is holding the port dark.
+            if budget == float("inf"):
+                while (_PUMP.live_pairs()
+                       and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
+                    beat_draining(self._certdir,
+                                  owed=self.inflight_requests(),
+                                  live=self.live_replies(started),
+                                  quiet=self.content_free_seconds(),
+                                  streams=self.live_stream_count()
+                                  + _PUMP.live_pairs())
+                    time.sleep(_DRAINING_BEAT_SECONDS)
+                if _PUMP.live_pairs():
+                    _log_lifecycle(
+                        f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
+                        f"{int(_PUMP.quiet_for())}s rather than holding this "
+                        f"process open on a wedged peer")
             if budget > 0:
                 deadline = started + budget
                 while time.monotonic() < deadline:
@@ -13293,6 +13319,9 @@ class _PumpLoop:
     """
 
     def __init__(self):
+        # When any tunnel last moved a byte. The drain reads it to tell a
+        # tunnel carrying a session from one whose peer has wedged.
+        self._last_move = 0.0
         self._sel = selectors.DefaultSelector()
         self._peer: dict = {}
         # Bytes accepted from one side that the other has not taken yet.
@@ -13326,6 +13355,26 @@ class _PumpLoop:
         """
         return callable(getattr(sock, "setblocking", None))
 
+    def quiet_for(self) -> float:
+        """Seconds since any tunnel last moved a byte, 0.0 if none ever has."""
+        with self._lock:
+            last = self._last_move
+        return (time.monotonic() - last) if last else 0.0
+
+    def reset_for_tests(self) -> None:
+        """Forget every tunnel. TEST ISOLATION ONLY.
+
+        This object is a module global, so in a single-process test run one
+        case's leftover pairs are visible to the next — measured on the macOS
+        runner as one proxy reporting another's tunnels, and as a drain waiting
+        out the marker TTL on a tunnel it did not own. A daemon has exactly one
+        `_PUMP` and never wants this.
+        """
+        with self._lock:
+            self._peer.clear()
+            self._pending.clear()
+            self._last_move = 0.0
+
     def live_pairs(self) -> int:
         """How many tunnels this selector is driving.
 
@@ -13343,6 +13392,7 @@ class _PumpLoop:
         teardown goes, because the caller no longer has a thread to run it on.
         """
         with self._lock:
+            self._last_move = time.monotonic()
             self._peer[a] = (b, on_close)
             self._peer[b] = (a, on_close)
             for s in (a, b):
@@ -13470,6 +13520,11 @@ class _PumpLoop:
                 # writable. A blocking `sendall` here reintroduced the exact
                 # coupling this class removed.
                 with self._lock:
+                    # A BYTE MOVED. Stamped where bytes are CONFIRMED and not
+                    # at the top of the select loop: the wake pipe fires on
+                    # this daemon's own bookkeeping, and a stamp there is a
+                    # heartbeat the drain would read as traffic.
+                    self._last_move = time.monotonic()
                     self._pending[dst] = self._pending.get(dst, b"") + data
                 self._flush(dst, on_close)
 

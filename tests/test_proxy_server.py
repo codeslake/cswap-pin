@@ -5455,18 +5455,38 @@ class TestDrainReportsWhatItCut:
                 except OSError:
                     pass
 
-        # AND THE DRAIN DOES NOT WAIT ON TUNNELS SEPARATELY. It waited out the
-        # marker's whole TTL on a tunnel it did not own; the session's
-        # held-open stream already keeps this daemon alive, and the tunnel
-        # rides along on that.
+        # AND THE DRAIN MUST WAIT FOR THEM. A daemon whose tunnels are its
+        # only remaining work owes nothing — `_mitm` hands a tunnel's debt back
+        # at the 101 — so without this it leaves at once and the tunnels die
+        # with the process. Measured on the fleet: pid 423760 owed nothing,
+        # drained "clean" in 0.0s and took four open connections with it, while
+        # pid 1452400 owed a stream, stayed, and kept fourteen channels.
+        #
+        # AND IT MUST END. `live_pairs()` alone has no exit — a wedged peer
+        # keeps its entry for ever — so it is bounded on SILENCE, the same
+        # discriminator the reply wait uses.
         import inspect
 
         src = inspect.getsource(pp.PinProxy.await_inflight)
-        # THE LOOP, not the call: the marker line reads the same number, and
-        # that reading is the whole point of counting it here.
-        assert "while _PUMP.live_pairs()" not in src, (
-            "the drain waits on the pump again, so every recycle pays up to "
-            "the marker TTL for a tunnel that is not this drain's to wait on")
+        assert "while (_PUMP.live_pairs()" in src, (
+            "the drain does not wait for live tunnels, so a recycle drops "
+            "every Remote Control channel this daemon is pumping")
+        i = src.index("while (_PUMP.live_pairs()")
+        assert "_PUMP.quiet_for() <= _DRAINING_MARKER_TTL" in src[i:i + 200], (
+            "the tunnel wait has no exit: a tunnel whose peer wedged holds "
+            "this process open for ever, which is the never-ending drain the "
+            "removed wall clock used to bound")
+        assert 'budget == float("inf")' in src[:i], (
+            "the tunnel wait is not confined to the uncapped arm. The signal "
+            "arm has a supervisor counting to `_DRAIN_SECONDS + 2`, so waiting "
+            "past it buys a harder kill; the held arm holds the port dark")
+
+        # AND THE PUMP CAN BE ISOLATED, or this suite measures leftovers. The
+        # macOS runner is single-process, so without a per-case reset one
+        # case's tunnels are counted by the next one's proxy.
+        assert hasattr(_PUMP, "reset_for_tests"), (
+            "nothing can clear the shared pump between cases, so a leftover "
+            "tunnel makes one case fail about another case's state")
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
         """The channel a session cannot reopen for itself must survive a recycle.
 

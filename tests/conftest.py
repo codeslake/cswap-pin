@@ -592,6 +592,14 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
 
             with _pp._DRAINING_LOCK:
                 _pp._DRAINING_DEPTH.clear()
+            # AND THE SHARED PUMP. `_PUMP` is a module global driving every
+            # tunnel in the process, so in a single-process run (macOS, which
+            # sets WORKERS=0) one case's leftover pairs are visible to the
+            # next. Measured on that runner: a proxy reported ANOTHER case's
+            # tunnels in its own count, and a drain waited out the marker TTL
+            # on a tunnel it did not own — two failures that read as
+            # production defects and were neither.
+            _pp._PUMP.reset_for_tests()
     if failures:
         raise AssertionError(
             f"{len(failures)} of {len(work)} cases failed:\n\n" + "\n".join(failures)
