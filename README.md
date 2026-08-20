@@ -323,13 +323,19 @@ CSWAP_PIN_SHAPE=/tmp/shape.log   # the message-array shape of each request body
 And an opt-in slow-request report, off unless you name a threshold in
 milliseconds. It writes to `daemon.log`, so it stays silent until asked —
 always-on it produced about 38 lines an hour on one fleet, which is noise in
-the file people read to find out why a daemon died:
+the file people read to find out why a daemon died.
 
-```bash
-CSWAP_PIN_SLOW_MS=1500                # or, without restarting a live daemon:
-echo 1500 > <certdir>/slow-ms         # arm it
-rm <certdir>/slow-ms                  # silent again
+It goes in the same `settings.json` section `cswap pin <email>` already
+writes, so there is no new path to remember:
+
+```json
+"remoteControl": { "pinnedEmail": "you@example.com", "debugSlowMs": 1500 }
 ```
+
+Edit it while the daemon serves; it is re-read within seconds. Restarting the
+daemon is the one act guaranteed to hide an intermittent stall, so a switch
+that needed a restart would be useless for this. `CSWAP_PIN_SLOW_MS` wins for
+a deployment that would rather set it in the environment.
 
 Each line splits the round trip three ways — inside the pin, waiting for the
 server, and getting the request out through the chain — because the total

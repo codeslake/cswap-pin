@@ -2672,7 +2672,6 @@ _BRIDGE_SWEEP_COOLDOWN_S = 600.0
 # How rarely a slow request may take a line. A genuinely slow endpoint would
 # otherwise fill the log with what the first line already said.
 _SLOW_REPORT_COOLDOWN_S = 60.0
-_SLOW_SWITCH_FILE = "slow-ms"
 _SLOW_RECHECK_S = 5.0
 _SLOW_CACHE: dict = {}
 
@@ -2680,26 +2679,31 @@ _SLOW_CACHE: dict = {}
 def slow_report_ms(certdir) -> "float | None":
     """Milliseconds above which a request takes a log line, or None for off.
 
-    OFF UNTIL SOMEONE ASKS. This is a diagnostic, and it writes into
+    OFF UNTIL SOMEONE ASKS. This is a diagnostic and it writes into
     `daemon.log` — the one file a person reads to find out why the daemon
-    died. Left always-on it produced ~38 lines an hour on this fleet, about
-    900 a day, in a package installed on other people's machines. A diagnostic
-    nobody armed is just noise in somebody else's incident.
+    died. Always-on it produced ~38 lines an hour on one fleet, about 900 a
+    day, in a package installed on other people's machines. A diagnostic
+    nobody armed is noise in somebody else's incident.
 
-    ARM IT WHILE THE DAEMON SERVES, the same shape as `trace-to`:
+    IT LIVES WHERE THE PIN ALREADY LIVES, and that is the whole point of
+    putting it here rather than behind a switch of its own::
 
-        echo 1500 > <certdir>/slow-ms     # report anything over 1.5s
-        rm <certdir>/slow-ms              # silent again
+        "remoteControl": { "pinnedEmail": "...", "debugSlowMs": 1500 }
 
-    No restart, which is the point — restarting the daemon is the one thing
-    guaranteed to hide an intermittent stall.
+    `settings.json` is the file `cswap pin <email>` already writes and this
+    module already reads, in the same section. The alternative this replaced
+    was `<certdir>/slow-ms`, and it failed the only test that matters for a
+    switch: nobody remembers it. `certdir` is jargon for a directory whose
+    name appears in nothing a person reads, so the instruction had to carry
+    an explanation with it every time.
 
-    ONE FILE, ONE NUMBER: arming it and choosing what counts as slow are the
-    same decision, so they are not two knobs. `CSWAP_PIN_SLOW_MS` wins for a
-    deployment that would rather set it in the environment.
+    Editable while the daemon serves, re-read on a short interval, because
+    restarting the daemon is the one act guaranteed to hide an intermittent
+    stall.
 
-    Unreadable, empty or not a number is OFF, never an error: a diagnostic
-    that can break a request is worse than no diagnostic.
+    `CSWAP_PIN_SLOW_MS` still wins for a deployment that would rather set it
+    in the environment. Unreadable, absent or not a number is OFF, never an
+    error: a diagnostic that can break a request is worse than none.
     """
     env = os.environ.get("CSWAP_PIN_SLOW_MS")
     if env:
@@ -2714,9 +2718,15 @@ def slow_report_ms(certdir) -> "float | None":
     now = time.time()
     if now - seen < _SLOW_RECHECK_S:
         return value
+    value = None
     try:
-        value = float((Path(certdir) / _SLOW_SWITCH_FILE).read_text().strip())
-    except (OSError, ValueError):
+        _settings = require("settings")
+        raw = _settings._read_raw(
+            _settings.settings_path(Path(certdir).parent))
+        section = raw.get("remoteControl")
+        if isinstance(section, dict):
+            value = float(section["debugSlowMs"])
+    except Exception:  # noqa: BLE001 — a diagnostic must not cost a request
         value = None
     _SLOW_CACHE[key] = (now, value)
     return value
