@@ -1849,6 +1849,51 @@ class TestRepinIsLive:
         finally:
             pin_proxy.__file__ = _real_file
 
+    def case_the_fingerprint_covers_the_host_package_too(self, tmp_path,
+                                                         monkeypatch):
+        """The daemon runs claude_swap's code as well as its own.
+
+        Hashing only `cswap_pin` answers "did MY package change", and the
+        daemon's behaviour is decided by both: `make_pin_token_provider` asks
+        `switcher.current_account_number()` on every request. A fix to that
+        module, deployed under a live daemon, left the daemon on the old copy
+        for hours with every health check green and the bearer swap dead.
+        """
+        import pathlib
+        import shutil
+
+        import claude_swap
+
+        from cswap_pin import proxy as pin_proxy
+
+        # THE RESOLVER, ASKED OF THE REAL INSTALL. The copy below exercises
+        # the hashing half only — a `_host_package_dir` naming the wrong tree
+        # would pass every assertion after this one.
+        host = pathlib.Path(claude_swap.__file__).parent
+        assert pin_proxy._host_package_dir() == host, (
+            "the fingerprint hashes a tree the daemon does not import"
+        )
+
+        # ON A COPY, for the reason the case above states at length: mutating
+        # the shipped file manufactures a torn read for the other xdist
+        # workers.
+        copy = tmp_path / host.name
+        shutil.copytree(host, copy, ignore=shutil.ignore_patterns("__pycache__"))
+        monkeypatch.setattr(pin_proxy, "_host_package_dir", lambda: copy)
+
+        before = pin_proxy.daemon_fingerprint()
+        victim = copy / "switcher.py"
+        victim.write_bytes(victim.read_bytes() + b"\n# redeployed\n")
+        assert pin_proxy.daemon_fingerprint() != before, (
+            "a change to the host package read as unchanged — the daemon "
+            "keeps running the old switcher and every check reports it current"
+        )
+
+        # AN ABSENT HOST IS STABLE, not a fresh digest per call: a pin whose
+        # host cannot be resolved must not recycle itself forever.
+        monkeypatch.setattr(pin_proxy, "_host_package_dir", lambda: None)
+        assert pin_proxy.daemon_fingerprint() == pin_proxy.daemon_fingerprint()
+
 
 class TestASuccessorThatCannotStart:
     """The port stays BOUND and stops ANSWERING, which is the worst shape.
