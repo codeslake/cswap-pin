@@ -5354,18 +5354,62 @@ class TestDrainReportsWhatItCut:
         # began, and the sibling maps are popped with it.
         proxy._owed, proxy._delivered = {}, {}
         proxy._content_at, proxy._gap = {}, {}
+        proxy._open_conns = set()
         a, b = socket.socketpair()
+        c, d = socket.socketpair()
         try:
+            # A SUBSCRIPTION THAT ALREADY FINISHED, still remembered. Its
+            # descriptor is gone and the NUMBER has been handed to something
+            # else, so releasing it closes a stranger's fd. Measured: on the
+            # macOS runner that was pytest-xdist's control pipe, and the run
+            # ended in 73 INTERNALERROR lines instead of a test failure.
+            c.close()
+            d.close()
+            proxy._stream_conns.add(c)
+
             proxy._stream_conns.add(a)
+            proxy._open_conns.add(a)
             proxy._owed[a] = 0.0
-            assert proxy.release_subscriptions() == 1
+            assert proxy.release_subscriptions() == 1, (
+                "released something the proxy no longer holds — that is a "
+                "close() on whatever inherited the file descriptor")
             assert proxy._stream_conns == set(), "released twice on a re-drain"
             assert a not in proxy._owed, (
                 "a closed socket was left in the owed set, so the drain waits "
                 "for an answer nobody can send — the 2017 s drain")
             assert b.recv(1) == b"", "the client never saw the stream end"
+
+            # AND THE TWO SITES THE ASSERTIONS ABOVE CANNOT REACH. Both need a
+            # real connection lifecycle — an accept loop, a socket, a thread —
+            # and a harness that rebuilds those can be wrong in its own right.
+            # Read out of the source instead, which is what this file already
+            # does for the exit paths.
+            import ast
+            import inspect
+
+            import cswap_pin.proxy as pp
+
+            tree = ast.parse(inspect.getsource(pp))
+
+            drains = [n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef)
+                      and n.name == "await_inflight"]
+            assert drains and any(
+                isinstance(c.func, ast.Attribute)
+                and c.func.attr == "release_subscriptions"
+                for d in drains for c in ast.walk(d)
+                if isinstance(c, ast.Call)), (
+                "the drain no longer releases subscriptions, so a departing "
+                "daemon holds the bridge again and marks every other reply "
+                "`Connection: close` for as long as it does")
+
+            src = inspect.getsource(pp)
+            assert "self._stream_conns.discard(conn)" in src, (
+                "a finished subscription is never forgotten, so the set grows "
+                "for the life of the daemon and fills with sockets whose file "
+                "descriptors have been reused")
         finally:
-            for s_ in (a, b):
+            for s_ in (a, b, c, d):
                 try:
                     s_.close()
                 except OSError:
