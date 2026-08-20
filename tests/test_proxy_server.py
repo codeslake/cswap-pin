@@ -4584,7 +4584,7 @@ class TestDrainReportsWhatItCut:
                 pp._DRAINING_DEPTH.clear()
                 pp._DRAINING_DEPTH.update(before)
 
-    def case_the_opt_in_trace_files_are_capped_like_the_daemon_log(self):
+    def case_the_opt_in_trace_files_are_capped_like_the_daemon_log(self, tmp_path):
         """THE CAP WAS ON THE FILE NOBODY ENABLES.
 
         `daemon.log` is bounded — 64 KiB, rotated through `.1` and `.2`, so a
@@ -4603,11 +4603,14 @@ class TestDrainReportsWhatItCut:
         it.
         """
         import os
-        import tempfile
 
         import cswap_pin.proxy as pp
 
-        d = tempfile.mkdtemp()
+        # UNDER PYTEST'S OWN TREE, not a bare mkdtemp: pytest reaps this on
+        # every exit path, and a plain /tmp dir outlives the run. A peer
+        # counted 297 of ours left on this box.
+        d = str(tmp_path / "cap-probe")
+        os.makedirs(d, exist_ok=True)
         for env, writer in (
             ("CSWAP_PIN_DEBUG", "debug"),
             ("CSWAP_PIN_SHAPE", "shape"),

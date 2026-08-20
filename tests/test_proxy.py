@@ -5828,7 +5828,7 @@ class TestDaemonPortStability:
             "every daemon it starts falls back to the old gap forever"
         )
 
-    def case_the_fingerprint_covers_every_file_the_daemon_runs(self):
+    def case_the_fingerprint_covers_every_file_the_daemon_runs(self, tmp_path):
         """A file outside the hash ships SILENTLY, and nothing says so.
 
         The fingerprint is what makes a redeploy land: the watchdog compares it
@@ -5874,9 +5874,10 @@ class TestDaemonPortStability:
         import shutil
         import subprocess
         import sys
-        import tempfile
 
-        work = pathlib.Path(tempfile.mkdtemp())
+        # UNDER PYTEST'S OWN TREE — see the sibling in test_proxy_server.py.
+        work = tmp_path / "pkg-copy"
+        work.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copytree(pkg, work / "cswap_pin")
 
