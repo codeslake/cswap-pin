@@ -5365,6 +5365,7 @@ class TestDrainReportsWhatItCut:
         import threading
         proxy._live_lock = threading.Lock()
         proxy._stream_conns = set()
+        proxy._tls_for = {}
         # The real bookkeeping: `_owed` maps a connection to when its debt
         # began, and the sibling maps are popped with it.
         proxy._owed, proxy._delivered = {}, {}
@@ -5394,6 +5395,33 @@ class TestDrainReportsWhatItCut:
                 "for an answer nobody can send — the 2017 s drain")
             assert b.recv(1) == b"", "the client never saw the stream end"
 
+            # THE SHAPE THAT CAN ACTUALLY FAIL. A socketpair is never
+            # detached, so the assertion above passes against a release that
+            # closes nothing. `ssl.wrap_socket` DETACHES what it wraps:
+            # `fileno()` becomes -1, `shutdown` raises EBADF and `close` is a
+            # no-op, so a release reaching for the raw socket leaves the peer
+            # reading TIMEOUT where a real close gives EOF. Measured with that
+            # control before this case existed.
+            e, f = socket.socketpair()
+            detached = socket.socket(fileno=e.detach())
+            proxy._tls_for = {}
+            proxy._stream_conns = {detached}
+            proxy._open_conns = {detached}
+            proxy._owed = {detached: 0.0}
+            proxy._tls_for[detached] = f      # f owns a live descriptor
+            try:
+                assert proxy.release_subscriptions() == 1
+                assert f.fileno() == -1, (
+                    "release reached for the raw socket, which wrap_socket "
+                    "detached — it closed nothing, and the subscription stays "
+                    "on the departing daemon until the process exits")
+            finally:
+                for s_ in (e, f, detached):
+                    try:
+                        s_.close()
+                    except OSError:
+                        pass
+
             # AND THE TWO SITES THE ASSERTIONS ABOVE CANNOT REACH. Both need a
             # real connection lifecycle — an accept loop, a socket, a thread —
             # and a harness that rebuilds those can be wrong in its own right.
@@ -5419,6 +5447,29 @@ class TestDrainReportsWhatItCut:
                 "`Connection: close` for as long as it does")
 
             src = inspect.getsource(pp)
+            # THE MARK MUST END WITH THE REPLY THAT EARNED IT. A stream
+            # request answered with a Content-Length (a refused auth) leaves
+            # the keep-alive reusable and still marked, so a later drain
+            # claims it and un-owes a reply that is still being written —
+            # abandoned, and absent from the `cut N in-flight` line. Read out
+            # of the source: reaching that branch needs a real MITM loop.
+            # AND THE MAP MUST BE FILLED WHERE THE WRAP HAPPENS. The case
+            # above sets `_tls_for` by hand, so it proves the LOOKUP and not
+            # the registration; without the registration the lookup falls back
+            # to the detached raw socket and closes nothing, which is the bug
+            # this whole guard exists for.
+            wrapped = src.find("self._server_ctx.wrap_socket(conn, server_side=True)")
+            assert wrapped != -1, "the wrap moved; this guard is blind"
+            assert "self._tls_for[conn] = tls" in src[wrapped:wrapped + 300], (
+                "nothing records the object that owns the descriptor, so the "
+                "release falls back to the detached socket and is a no-op")
+
+            paid = src.find("self._note_reply_finished(conn)")
+            assert paid != -1, "the debt boundary moved; this guard is blind"
+            assert "self._stream_conns.discard(conn)" in src[paid:paid + 700], (
+                "the subscription mark outlives the reply that set it, so a "
+                "drain can abandon a live reply on that connection uncounted")
+
             assert "self._stream_conns.discard(conn)" in src, (
                 "a finished subscription is never forgotten, so the set grows "
                 "for the life of the daemon and fills with sockets whose file "
