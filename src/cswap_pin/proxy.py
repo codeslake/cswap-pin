@@ -10500,7 +10500,8 @@ class PinProxy:
             pass
 
     def _note_slow_request(self, method: str, path: str,
-                           total_ms: float, pin_ms: float) -> None:
+                           total_ms: float, pin_ms: float,
+                           wait_ms: float | None = None) -> None:
         """Record a request that took seconds, because nothing else does.
 
         `daemon.log` carries lifecycle events, so a slow request leaves no
@@ -10517,6 +10518,21 @@ class PinProxy:
         pin's own work is ours to make cheaper (the credential read alone is
         0.02ms on linux and 19.8ms on a mac, where it goes through the
         keychain), the remainder belongs to the chain below us.
+
+        `wait_ms` SPLITS THAT REMAINDER, and it is the number that decides
+        whose problem this is. It runs from the moment the whole request was
+        written upstream to the moment the status line came back, so it is
+        time the server had the request and had not answered. What is left
+        (total - pin - wait) is our chain getting the bytes out: dialling the
+        upstream, the proxy hops, the TLS.
+
+        Without it "0ms inside the pin" is where the diagnosis stops, and it
+        stopped there for hours across three sessions — ~38 slow requests an
+        hour on two machines, every one of them saying only that the pin was
+        not to blame. `None` when the send instant was never stamped (the
+        upgrade and take-back paths do not take the normal write), and it
+        prints as "unknown" rather than 0: a zero here would read as "the
+        server answered instantly", which is the opposite of not knowing.
 
         Never raises: this runs on the request path.
         """
@@ -10546,10 +10562,19 @@ class PinProxy:
         seen = _BRIDGE_ID.match(route)
         if seen:
             route = route[:seen.start(1)] + "<id>" + route[seen.end(1):]
+        if wait_ms is None:
+            split = "the send instant was not stamped, so the wait is unknown"
+        else:
+            # WHAT IS LEFT IS OURS. Naming it rather than making the reader
+            # subtract is the difference between a line you act on and a line
+            # you have to do arithmetic on at 2am.
+            ours = max(0.0, total_ms - pin_ms - wait_ms)
+            split = (f"{wait_ms:.0f}ms waiting for the server, {ours:.0f}ms "
+                     f"getting it out through the chain")
         _log_lifecycle(
             f"a {method} to {route} took {total_ms:.0f}ms "
-            f"({pin_ms:.0f}ms of it inside the pin) — a live view times out "
-            f"on stalls like this"
+            f"({pin_ms:.0f}ms of it inside the pin; {split}) — a live view "
+            f"times out on stalls like this"
         )
 
     def _report_deaf_bridges(self) -> None:
@@ -12529,6 +12554,11 @@ class PinProxy:
         # here. One MITM connection is one thread, so there is no sharing.
         self._local.pin_ms = (time.monotonic() - _t_pin) * 1000
         self._local.t_req = _t_req
+        # CLEARED PER REQUEST. One MITM connection serves many requests on the
+        # same thread, so a stale stamp would time this request's wait from
+        # the PREVIOUS request's send and report a wait longer than the
+        # request itself.
+        self._local.t_sent = None
         debug_path = trace_target(getattr(self, "_certdir", None))
         # THE HANDLE IS CACHED AND THE TARGET IS NOT FIXED ANY MORE.
         # `_append_capped` keeps a descriptor across calls and reopens only on
@@ -12672,6 +12702,11 @@ class PinProxy:
             if not sent_host:
                 out.append(f"Host: {UPSTREAM_HOST}".encode("latin1"))
             up.sendall(b"\r\n".join(out) + b"\r\n\r\n" + (body or b""))
+            # THE INSTANT THE SERVER OWNS IT. Everything after this and before
+            # the status line is the server's; everything before it is ours.
+            # Cleared first so a request that takes the retry path cannot be
+            # timed against the previous attempt's send.
+            self._local.t_sent = time.monotonic()
             self._trace_upgrade = upgrading
             if upgrading:
                 # 101 turns the connection into an opaque byte stream (RC's
@@ -12769,7 +12804,11 @@ class PinProxy:
                         method, path,
                         (time.monotonic() - getattr(
                             self._local, "t_req", time.monotonic())) * 1000,
-                        getattr(self._local, "pin_ms", 0.0)),
+                        getattr(self._local, "pin_ms", 0.0),
+                        wait_ms=(
+                            (time.monotonic() - self._local.t_sent) * 1000
+                            if getattr(self._local, "t_sent", None) is not None
+                            else None)),
                 ),
                 # A HEAD response carries the headers of the GET it mirrors,
                 # Content-Length included, but no body — only the request

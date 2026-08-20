@@ -15702,6 +15702,34 @@ class TestASlowRequestSaysSo:
         P._note_slow_request("GET", "/v1/code/sessions", 2700.0, 20.0)
         assert len(lines) == 1
 
+    def case_the_line_says_who_was_slow(self, monkeypatch):
+        """THE QUESTION THE TOTAL CANNOT ANSWER, and the one that decides
+        whose problem this is: were the seconds spent getting the request OUT
+        through our chain, or waiting for the server to answer one we had
+        already sent?
+
+        The proxy is the only place both instants exist. Measured before this
+        split existed: ~38 slow requests an hour on two machines, every one
+        reporting 0ms inside the pin — which narrows the cause to "not the
+        pin" and stops exactly there. Three sessions then spent hours probing
+        transport because nothing said it was transport.
+        """
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/code/sessions/x/worker/events",
+                             5000.0, 12.0, wait_ms=4900.0)
+        assert "4900" in lines[0], lines[0]
+
+    def case_an_unstamped_request_says_unknown_not_zero(self, monkeypatch):
+        """A request whose send instant was never recorded must not report a
+        0ms wait — that reads as "the server answered instantly", which is the
+        opposite of not knowing. The upgrade and take-back paths do not pass
+        through the normal write."""
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request("POST", "/v1/code/sessions/x/worker/events",
+                             5000.0, 12.0, wait_ms=None)
+        assert "0ms waiting" not in lines[0], lines[0]
+        assert "unknown" in lines[0], lines[0]
+
     def case_inference_taking_seconds_is_not_a_stall(self, monkeypatch):
         """/v1/messages IS the model answering, and seconds are its healthy
         range. Measured on one mac inside four minutes: 4715, 6040, 2369 and
