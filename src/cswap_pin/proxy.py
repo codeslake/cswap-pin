@@ -11178,13 +11178,13 @@ class PinProxy:
                 # Or the set grows for the life of the daemon, holding a
                 # socket object per finished subscription.
                 self._stream_conns.discard(conn)
-                # AND THE OWNER MAP WITH IT, for the reason the line above
-                # already carries: the set would otherwise grow for the life of
-                # the daemon, holding a socket object per finished
-                # subscription. An earlier cut popped this in the 101-upgrade
-                # branch instead — a path a real event stream never takes,
-                # because Remote Control's inbound arrives over a WebSocket to
-                # the ingress host and goes through `_blind_tunnel`, not here.
+                # AND THE OWNER MAP WITH IT, or the set grows for the life of
+                # the daemon. It belongs HERE and not in the 101-upgrade
+                # branch: Remote Control's inbound is a held GET, built from
+                # the API base the pin MITMs, so it arrives decrypted and ends
+                # on this teardown. (An older comment here said it was a
+                # blind-tunnelled WebSocket to a separate ingress host, which
+                # contradicted `_EVENT_STREAM` and is not what CC does.)
                 self._stream_owner.pop(conn, None)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
