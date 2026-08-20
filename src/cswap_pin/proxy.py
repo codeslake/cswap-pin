@@ -2662,6 +2662,13 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 # to. Same shape as the routes above, captured rather than merely matched.
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
+# How rarely presence may trigger a superseded-bridge sweep. Presence is posted
+# by every attached session on the server's poll interval, so without a floor
+# this would list the account several times a second on a busy machine. Ten
+# minutes is far below the time a stale duplicate costs anything (it sits until
+# someone clicks the wrong one) and far above the cost of a listing.
+_BRIDGE_SWEEP_COOLDOWN_S = 600.0
+
 
 def trace_target(certdir) -> "str | None":
     """Where to write the request trace, or None for off.
@@ -9623,6 +9630,7 @@ class PinProxy:
         # One bridge sweep at a time. A session opening fires several calls in
         # a burst; without this each would start its own listing.
         self._bridge_sweeping = False
+        self._last_bridge_sweep: float | None = None
         self._sweep_lock = threading.Lock()
         # The connections themselves, not just a count. `stop()` has to CLOSE
         # them before the process exits — see the note there on why a drained
@@ -10824,6 +10832,36 @@ class PinProxy:
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
             ).start()
+
+    def _should_sweep_bridges(self, method: str, path: str, now=None) -> bool:
+        """Is this request a moment worth re-listing the account on?
+
+        TWO EVENTS, because a title becomes ambiguous two ways and the create
+        event only covers one:
+
+          1. `POST /v1/code/sessions` — a NEW bridge opens beside an older
+             connected one. Always sweeps; this is the original trigger.
+          2. presence — an attached session checking in. Covers the case a
+             create CANNOT: an older bridge ARCHIVED after the newer one
+             already opened. Archiving is server-side and later, so nothing on
+             the create path can ever see it.
+
+        Rate-limited, and only case 2 needs it: presence recurs, a create does
+        not. Still not a timer — a machine with no attached session posts no
+        presence and this never fires.
+        """
+        if method != "POST":
+            return False
+        if path == "/v1/code/sessions":
+            return True
+        if not _PRESENCE.search(path):
+            return False
+        stamp = time.monotonic() if now is None else now
+        last = getattr(self, "_last_bridge_sweep", None)
+        if last is not None and stamp - last < _BRIDGE_SWEEP_COOLDOWN_S:
+            return False
+        self._last_bridge_sweep = stamp
+        return True
 
     def _sweep_bridges_after_connect(self, token: str) -> None:
         """Sweep superseded bridges, right after this session opened one.
@@ -12109,16 +12147,19 @@ class PinProxy:
                     for k, v in headers
                 ]
                 swapped = True
-                # A SESSION WAS JUST OPENED — the one moment a duplicate can
-                # appear. `POST /v1/code/sessions` is how a bridge is created,
-                # so an older bridge of the same name becoming ambiguous
-                # happens here and nowhere else. Sweeping on THIS instead of a
+                # TWO MOMENTS, not one. A create is when a NEW bridge opens
+                # beside an older connected one. The other is an older bridge
+                # being ARCHIVED while still connected, which happens
+                # server-side AFTER the newer one opened — so no create can
+                # ever see it, and this comment used to say it could. Measured
+                # here: a 0.3h archived+connected bridge sharing a title with
+                # the 0.0h live one, sitting indefinitely. Sweeping on THIS instead of a
                 # timer means a quiet daemon never wakes to find nothing, and
                 # the fix lands when it is needed rather than up to an hour
                 # later. Fired on the request rather than the response: the
                 # sweep re-lists from the server anyway, so a create that
                 # fails simply finds nothing new to supersede.
-                if method == "POST" and path == "/v1/code/sessions":
+                if self._should_sweep_bridges(method, path):
                     self._sweep_bridges_after_connect(token)
                 # THE ONE MOMENT A DENIED SESSION BECOMES UN-DENIED, and the
                 # only evidence of it. Claude Code caches the policy answer per

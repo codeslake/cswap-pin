@@ -5568,6 +5568,57 @@ class TestDrainReportsWhatItCut:
                                  now=111.0)
         assert srv.deaf_bridges(window=60.0, now=112.0) == []
 
+    def case_a_bridge_archived_later_is_still_swept(self, certdir):
+        """The superseded sweep fired on ONE event and missed half the cases.
+
+        `_sweep_bridges_after_connect` runs only on `POST /v1/code/sessions`,
+        and its comment claims an older bridge "becoming ambiguous happens
+        here and nowhere else". Measured counter-example on this machine:
+
+            keep     0.0h  active                'cswap_pin_artifacts'
+            DELETE   0.3h  archived  connected   'cswap_pin_artifacts'
+
+        Two ways a title becomes a coin flip, not one:
+          1. a NEW bridge opens while an older one is connected  -> caught
+          2. an OLDER bridge is ARCHIVED while still connected, AFTER the
+             newer one already opened                            -> never
+
+        The sweep requires `archived`, and archiving is a server-side event
+        that happens later and that the pin never sees. So case 2 cannot be
+        covered by the create event, however the comment reads.
+
+        PRESENCE IS THE TRIGGER THAT ALREADY EXISTS. It is posted by an
+        attached session on the server's own poll interval, so it recurs
+        WITHOUT waking a quiet daemon -- which is the objection the create-only
+        design was built on. A cooldown keeps it from listing on every post.
+        """
+        import cswap_pin.proxy as pp
+
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._last_bridge_sweep = 0.0
+        calls = []
+        srv._sweep_bridges_after_connect = lambda tok: calls.append(tok)
+
+        PRESENCE = "/v1/code/sessions/cse_AAA/client/presence"
+        CREATE = "/v1/code/sessions"
+
+        # The create event still sweeps, every time — unchanged behaviour.
+        assert srv._should_sweep_bridges("POST", CREATE, now=100.0) is True
+        assert srv._should_sweep_bridges("POST", CREATE, now=101.0) is True
+
+        # Presence sweeps too, but at most once per cooldown.
+        assert srv._should_sweep_bridges("POST", PRESENCE, now=1000.0) is True
+        assert srv._should_sweep_bridges("POST", PRESENCE, now=1001.0) is False, (
+            "presence swept on every post; with 13 attached sessions that is a "
+            "server listing several times a second")
+        assert srv._should_sweep_bridges(
+            "POST", PRESENCE, now=1000.0 + pp._BRIDGE_SWEEP_COOLDOWN_S + 1) is True
+
+        # THE CONTROL: an unrelated route must not sweep at all, or the
+        # cooldown is the only thing standing between this and every request.
+        assert srv._should_sweep_bridges("POST", "/v1/messages", now=9e9) is False
+        assert srv._should_sweep_bridges("GET", CREATE, now=9e9) is False
+
     def case_the_accept_probe_and_the_bind_probe_disagree(self, certdir):
         """`_port_accepts` must answer about ACCEPTING, not about BOUND.
 
