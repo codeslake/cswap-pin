@@ -5446,6 +5446,61 @@ class TestDrainReportsWhatItCut:
             "apply_pin cannot be handed an identity, so cswap has no way to "
             "pass the one it looked up")
 
+    def case_clearing_a_pin_stops_naming_it(self, certdir, tmp_path,
+                                            monkeypatch):
+        """`--clear` left the ex-pin in the live config.
+
+        `apply_pin(email=None)` returns from its own branch, above the splice,
+        so clearing unwired the proxy and dropped the record while
+        `~/.claude.json` still named the account that had been pinned. Claude
+        Code reads that field as the OWNER of every bridge it mints, so an
+        unpinned machine kept minting under the ex-pin until the next switch
+        happened to rewrite it -- and nothing says so.
+
+        The identity comes from the CALLER, as it does when setting: only
+        cswap can look up an account in its own backup store, and teaching the
+        package that layout is the dependency inversion this seam exists to
+        prevent.
+        """
+        import json
+        import types
+
+        import cswap_pin.proxy as pp
+
+        cfg = tmp_path / "claude-clear.json"
+        cfg.write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "expin@example.com",
+                             "organizationUuid": "org-EXPIN"},
+        }))
+        monkeypatch.setattr(
+            pp, "require",
+            lambda name, _r=pp.require: (
+                types.SimpleNamespace(get_global_config_path=lambda: cfg)
+                if name == "paths" else _r(name)))
+        monkeypatch.setattr(pp, "save_pin", lambda *a, **k: None)
+        monkeypatch.setattr(pp, "wire_global_config", lambda *a, **k: None)
+
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+        live = {"emailAddress": "active@example.com",
+                "organizationUuid": "org-ACTIVE", "accountUuid": "uuid-ACTIVE"}
+
+        assert pp.apply_pin(sw, None, None, identity=live) is False, (
+            "clearing still reports whether a proxy serves, which is False"
+        )
+        assert json.loads(cfg.read_text())["oauthAccount"] == live, (
+            "the cleared pin is still named in the live config, so every "
+            "bridge minted afterwards is owned by an account nothing is "
+            "pinned to"
+        )
+
+        # NO IDENTITY IS NOT AN ERASURE. A caller that could not look one up
+        # passes None, and leaving the field alone is the safe half: cswap's
+        # own switch rewrites it on the next rotation.
+        cfg.write_text(json.dumps({"oauthAccount": {"emailAddress": "keep"}}))
+        assert pp.apply_pin(sw, None, None) is False
+        assert json.loads(cfg.read_text())["oauthAccount"] == {
+            "emailAddress": "keep"}
+
     def case_the_armed_trace_can_see_the_tunnel(self, certdir):
         """An armed trace was blind to the one path that fails.
 

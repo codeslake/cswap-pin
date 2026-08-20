@@ -4175,6 +4175,19 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     save_pin(switcher.backup_dir, email, org_uuid)
     if not email:
         wire_global_config(None, None)
+        # AND STOP NAMING THE EX-PIN. This branch returns below, above the
+        # splice the setting path performs, so clearing used to unwire the
+        # proxy and drop the record while `~/.claude.json` still named the
+        # account that had been pinned — and that field is what Claude Code
+        # takes as the OWNER of every bridge it mints. An unpinned machine
+        # kept minting under the ex-pin until some later switch happened to
+        # rewrite it.
+        #
+        # `identity` is the caller's to supply here exactly as it is when
+        # setting: only cswap can resolve an account in its own backup store.
+        # None therefore means "could not look one up", and the splice leaves
+        # the field alone rather than erasing it — cswap's own switch rewrites
+        # it on the next rotation, and a blank owner is worse than a stale one.
         # DISARM. The gate is only meaningful while a pin exists, and leaving
         # the secret behind means "I turned the pin off" and "the proxy still
         # demands a credential" are both true at once — a state no user has a
@@ -4190,6 +4203,12 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # `False`, and the caller's next decision — including the next `cswap
         # pin` re-arming against sessions wired in the meantime — is made on
         # that return value, not on a log line nobody is required to read.
+        try:
+            splice_config_identity(identity)
+        except Exception:  # noqa: BLE001 — the clear must work regardless
+            _log_lifecycle("could not un-name the cleared pin in the live "
+                           "config — bridges keep its owner until the next "
+                           "switch")
         try:
             proxy_secret_path(switcher.backup_dir / "pin-proxy").unlink()
         except FileNotFoundError:
