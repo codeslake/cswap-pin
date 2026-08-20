@@ -5347,7 +5347,9 @@ def _append_capped(path, line: str, fh=None):
     through the proxy's own path.
 
     Never raises. A trace that cannot be written is a diagnostic that is
-    missing, not a proxy that stops relaying.
+    missing, not a proxy that stops relaying. ValueError as well as OSError:
+    a handle another thread let go of raises the first, not the second, and
+    this sits on the request path.
     """
     try:
         if fh is None or fh.closed:
@@ -5361,7 +5363,7 @@ def _append_capped(path, line: str, fh=None):
             fh = open(path, "a", buffering=1, encoding="utf-8",
                       errors="replace")
         return fh
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
@@ -6330,7 +6332,13 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
         try:
             code += b"claude_swap\0" + _tree_digest_input(host)
         except OSError:
-            pass
+            # UNREADABLE IS NOT ABSENT, the same rule the own-tree branch
+            # above states — and this said the opposite. A walk that races a
+            # host redeploy (files replaced under `rglob`) collapsed to the
+            # digest of a machine with no claude_swap at all, so a daemon
+            # would read "unchanged" through the one window where the host is
+            # certainly changing.
+            code += b"claude_swap\0<unreadable>"
     return hashlib.sha256(code).hexdigest()[:16]
 
 
@@ -11924,11 +11932,14 @@ class PinProxy:
         # rotation, so a trace re-armed at a different path kept writing to the
         # first one — reachable now that arming does not restart the daemon.
         if debug_path != self._debug_for:
-            try:
-                if self._debug is not None:
-                    self._debug.close()
-            except OSError:
-                pass
+            # LET GO, DO NOT CLOSE. These two fields are read and written from
+            # every connection thread with no lock, so closing here can pull
+            # the file out from under a thread already inside `_append_capped`
+            # past its `fh.closed` check — and `write`/`tell` on a closed file
+            # raises ValueError, which that helper does not catch, so it lands
+            # in the request. Dropping the reference lets refcounting close it
+            # when the last writer is done, and nothing writes to a handle
+            # nobody holds.
             self._debug, self._debug_for = None, debug_path
         if debug_path:
             hdrs = " | ".join(
