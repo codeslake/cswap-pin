@@ -4810,7 +4810,8 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
         # sweep exists for. Killing it is how a handover that cut nothing
         # became a TERM one second later that cut 13 mid-response replies.
         if is_draining(certdir, pid):
-            draining.append((draining_live(certdir, pid),
+            draining.append((draining_streams(certdir, pid),
+                             draining_live(certdir, pid),
                              draining_owed(certdir, pid),
                              draining_since(certdir, pid), pid))
             continue
@@ -4840,10 +4841,25 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
     # but keepalives. At the limit that made the reaper prefer to kill the
     # predecessor still doing real work. `live_replies` counts answers rather
     # than debts, by SSE event name rather than by any threshold.
+    # AND A DAEMON CARRYING A BRIDGE IS NOT PART OF THE PILE. This limit
+    # bounds predecessors that will not finish; one still carrying a live
+    # channel is a SESSION, and it ends when that session does.
+    # Ordering alone was not enough: a daemon whose only remaining job is that
+    # stream has zero live replies, so it sorted CHEAPEST and was always the
+    # one taken — the reap the fleet chose first was the one no session can
+    # recover from by itself.
+    reapable = [d for d in draining if d[0] == 0]
     excess = len(draining) - _MAX_DRAINING_PREDECESSORS
-    if excess > 0:
-        draining.sort()  # fewest LIVE replies, then fewest owed, then oldest
-        for live, owed, since, pid in draining[:excess]:
+    if excess > 0 and not reapable:
+        _log_lifecycle(
+            f"{len(draining)} draining predecessors, over the "
+            f"{_MAX_DRAINING_PREDECESSORS} this fleet can produce — taking "
+            "NONE: every one is still carrying a live channel, and cutting "
+            "one costs a session something it cannot reopen. They exit when "
+            "their sessions do")
+    if excess > 0 and reapable:
+        reapable.sort()  # fewest live replies, then fewest owed, then oldest
+        for streams, live, owed, since, pid in reapable[:excess]:
             _log_lifecycle(
                 f"{len(draining)} draining predecessors, over the "
                 f"{_MAX_DRAINING_PREDECESSORS} this fleet can produce — "
@@ -5144,7 +5160,8 @@ def announce_draining(certdir: Path, pid: int | None = None):
 
 def beat_draining(certdir: Path, pid: int | None = None,
                   owed: int | None = None, live: int | None = None,
-                  quiet: float | None = None) -> None:
+                  quiet: float | None = None,
+                  streams: int | None = None) -> None:
     """Say the drain is still alive, so its marker does not go stale under it.
 
     A HANDOVER DRAIN HAS NO CEILING ANY MORE, so the marker cannot expire on
@@ -5185,7 +5202,14 @@ def beat_draining(certdir: Path, pid: int | None = None,
         # lines 2 and 3 by position, and a reader from a version that predates
         # this one takes the first three and ignores the rest. See
         # `draining_quiet` for the other half of the skew.
+        # FIFTH LINE IS HOW MANY LONG-LIVED CHANNELS WOULD DIE WITH US,
+        # and it outranks every other cost in the reap order: a reply can be
+        # retried, and a session whose bridge stream is cut cannot reopen it
+        # for itself. Appended, never inserted, for the same reason as the
+        # fourth.
         tail = "" if quiet is None else f"\n{float(quiet):.1f}"
+        if streams is not None:
+            tail = f"{tail or chr(10) + '0.0'}\n{int(streams)}"
         path.write_text(f"{start}\n{int(owed)}\n{live_n}{tail}")
     except (OSError, ValueError):
         pass
@@ -5242,6 +5266,22 @@ def draining_quiet(certdir: Path, pid: int) -> "float | None":
         return float(body[3].strip())
     except (OSError, ValueError, IndexError):
         return None
+
+
+def draining_streams(certdir: Path, pid: int) -> int:
+    """Long-lived channels ``pid`` would take with it if reaped.
+
+    Fifth line of the marker. A marker without one was written by a version
+    that did not record it, and that answers 0 — not "expensive" like
+    `draining_owed`, because the alternative is that every predecessor from an
+    older release becomes unreapable and the pile this limit exists to bound
+    stops being bounded at all.
+    """
+    try:
+        body = draining_marker_path(certdir, pid).read_text().split("\n")
+        return int(body[4].strip())
+    except (OSError, ValueError, IndexError):
+        return 0
 
 
 def draining_owed(certdir: Path, pid: int) -> int:
@@ -9555,7 +9595,6 @@ class PinProxy:
         # socket it wraps, so the raw `conn` every other structure here keys
         # on has `fileno() == -1` and cannot be shut down or closed. Anything
         # that means to END a connection has to reach the TLS object.
-        self._tls_for: dict = {}
 
     def start(self) -> None:
         if self._handed_fd is not None:
@@ -10221,48 +10260,23 @@ class PinProxy:
             self._srv = None
         return None
 
-    def _end_connection(self, conn) -> None:
-        """Shut down and close a client connection, write end first.
+    def live_stream_count(self) -> int:
+        """Long-lived channels that would die with this process.
 
-        THROUGH THE TLS OBJECT WHEN THERE IS ONE. `wrap_socket` detaches the
-        socket it wraps, so the raw `conn` — the key every structure here uses
-        — has `fileno() == -1`: `shutdown` raises EBADF and `close` is a
-        no-op. Measured with a control: closing the raw socket leaves the peer
-        reading TIMEOUT (still open), closing the TLS object gives it EOF.
-        """
-        sock = self._tls_for.get(conn, conn)
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-        try:
-            sock.close()
-        except OSError:
-            pass
+        TWO KINDS, and counting one of them was the bug. Remote Control
+        RECEIVES over a WebSocket to the ingress host the `/bridge` response
+        names — not api.anthropic.com — so it is an opaque tunnel driven by
+        `_PUMP`. `/worker/events/stream` is the other: a held-open GET through
+        the MITM, tracked in `_stream_conns`. A daemon carrying only the
+        WebSocket counted zero and stayed the cheapest thing to reap.
 
-    def release_subscriptions(self) -> int:
-        """Close the connections holding a subscription. Returns how many.
-
-        Called at the start of a drain. These never complete, so waiting for
-        them is waiting forever, and every second of that wait puts
-        `Connection: close` on every OTHER reply this daemon writes. The client
-        reopens the stream on the successor — which is already serving, since
-        the listener was released before this.
+        The stream set is intersected with the live one: a socket object
+        outlives its descriptor and the NUMBER gets reused, so the set alone
+        can name a connection that is no longer ours.
         """
         with self._live_lock:
-            # INTERSECTED WITH THE LIVE SET, not taken whole. A socket object
-            # outlives its descriptor, and the NUMBER gets reused — so closing
-            # a connection this set still remembers closes whatever now owns
-            # that fd. `_open_conns` is maintained by the connection lifecycle,
-            # so this cannot reach anything that is not still ours.
-            conns = [c for c in self._stream_conns if c in self._open_conns]
-            self._stream_conns = set()
-        for conn in conns:
-            self._end_connection(conn)
-            # NO LONGER OWED. The drain counts what it is waiting for, and a
-            # socket that is closed is not something anyone can still answer.
-            self._owe_answer(conn, False)
-        return len(conns)
+            streams = len(self._stream_conns & self._open_conns)
+        return streams + _PUMP.live_pairs()
 
     def await_inflight(self, budget: float) -> int:
         """Wait up to ``budget`` for open connections to finish, then cut them.
@@ -10296,14 +10310,15 @@ class PinProxy:
         This is the only function that cuts, so it is the only place that can
         report every path, including ones written after today.
         """
-        # LET THE SUBSCRIPTIONS GO FIRST. They never complete, so waiting for them
-        # is waiting forever — and every second of that wait stamps `Connection:
-        # close` on every other reply this daemon writes, which is a reconnect
-        # storm on the one channel Remote Control cannot lose.
-        freed = self.release_subscriptions()
-        if freed:
-            _log_lifecycle(
-                f"released {freed} subscription(s) to the successor before draining")
+        # THE SUBSCRIPTIONS ARE NOT CUT HERE, and that is deliberate. A drain
+        # used to close them on the grounds that holding one stamps
+        # `Connection: close` on every other reply — but a departing daemon
+        # has already released its listener, so the only replies left are on
+        # keep-alives that migrate after one each, and the banner this was
+        # meant to fix was measured with nothing draining at all. What the cut
+        # did buy was a hard disconnect of the bridge's inbound stream, which
+        # a session cannot reopen for itself. The tunnel wait below is the
+        # other answer, and it does not cost that.
         # WAIT ON REQUESTS, NOT ON CONNECTIONS. This loop asked
         # `live_client_count() == 0` and that zero is unreachable: Remote
         # Control's WebSocket is opaque after the 101, is pumped by the shared
@@ -10357,11 +10372,47 @@ class PinProxy:
         # against a copy of every count taken here; `_content_at` answers the
         # same question directly, so the copy and the second dict it copied
         # both go. One structure fewer to keep popped at three call sites.
+        streams = self.live_stream_count()
+        if streams:
+            _log_lifecycle(
+                f"draining with {streams} long-lived channel(s) still open — "
+                f"left intact, and this process stays until they end")
         beat_draining(self._certdir, owed=self.inflight_requests(),
                       live=self.live_replies(started),
-                      quiet=self.content_free_seconds())
+                      quiet=self.content_free_seconds(),
+                      streams=streams)
         beat_at = started
         try:
+            # AND THE TUNNELS, on the uncapped path only. A tunnel owes no
+            # REPLY, so `_owed_still_moving` is right to ignore it — and it is
+            # still a live Remote Control channel that dies with this process.
+            # Nothing waits on this exit: the listener is released and the
+            # successor is serving, so staying costs one idle process and
+            # leaving costs every live session a reconnect. That reconnect is
+            # the "Connection lost" the page shows, measured with NOTHING
+            # draining, which is what ruled out the `Connection: close` story.
+            #
+            # Uncapped only. The signal arm has a supervisor counting to
+            # `_DRAIN_SECONDS + 2`, and the held arm is holding the port dark.
+            if budget == float("inf"):
+                # AND IT ENDS ON SILENCE. `live_pairs()` alone has no exit:
+                # a wedged peer keeps its entry for ever and the departing
+                # process never leaves, which is the never-ending drain this
+                # file removed a wall clock to avoid. A tunnel quiet for the
+                # marker's own TTL cannot be told from a dead one, and that is
+                # the same discriminator the reply wait already uses.
+                while _PUMP.live_pairs() and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL:
+                    beat_draining(self._certdir,
+                                  owed=self.inflight_requests(),
+                                  live=_PUMP.live_pairs(),
+                                  quiet=_PUMP.quiet_for(),
+                                  streams=self.live_stream_count())
+                    time.sleep(_DRAINING_BEAT_SECONDS)
+                if _PUMP.live_pairs():
+                    _log_lifecycle(
+                        f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
+                        f"{int(_PUMP.quiet_for())}s rather than holding on a "
+                        f"wedged peer")
             if budget > 0:
                 deadline = started + budget
                 while time.monotonic() < deadline:
@@ -10506,15 +10557,12 @@ class PinProxy:
             # `wrap_socket` detached it, so this shutdown/close pair is a
             # no-op for every MITM'd connection and the FIN-not-RST table
             # above describes something that has not happened since the MITM
-            # landed. Routing it through `_end_connection` — which reaches the
-            # TLS object — was tried and CUT LIVE REPLIES: two tests that
+            # landed. Reaching the TLS object instead — which really does end
+            # the connection — was tried and CUT LIVE REPLIES: two tests that
             # encode the 2026-08-18 incident ("the reply was CUT mid-stream by
-            # a recycle") went red at once. The no-op is load-bearing here:
-            # this runs at the END of every drain, including a clean one, and
-            # a reply finishing just after the budget still completes today.
-            # Left as-is on purpose; fixing it needs the drain to stop calling
-            # this on the clean path, which is a separate change with its own
-            # evidence.
+            # a recycle") went red at once. The no-op is load-bearing: this
+            # runs at the END of every drain, including a clean one, and a
+            # reply finishing just after the budget still completes today.
             try:
                 conn.shutdown(socket.SHUT_WR)
             except OSError:
@@ -10748,7 +10796,6 @@ class PinProxy:
                 # Or the set grows for the life of the daemon, holding a
                 # socket object per finished subscription.
                 self._stream_conns.discard(conn)
-                self._tls_for.pop(conn, None)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
                 self._content_at.pop(conn, None)
@@ -11755,8 +11802,6 @@ class PinProxy:
         # the two stay in step.
         self._local.conn = conn
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
-        with self._live_lock:
-            self._tls_for[conn] = tls
         self._local.detached = False
         served_one = False
         try:
@@ -13258,6 +13303,9 @@ class _PumpLoop:
     """
 
     def __init__(self):
+        # When any tunnel last moved a byte. The drain reads it to tell a
+        # tunnel carrying a session from one whose peer has wedged.
+        self._last_move = 0.0
         self._sel = selectors.DefaultSelector()
         self._peer: dict = {}
         # Bytes accepted from one side that the other has not taken yet.
@@ -13291,6 +13339,27 @@ class _PumpLoop:
         """
         return callable(getattr(sock, "setblocking", None))
 
+    def quiet_for(self) -> float:
+        """Seconds since any tunnel last moved a byte, 0.0 if none ever has.
+
+        SILENCE, not age. A tunnel still carrying bytes is a live session and
+        the drain should wait however long it runs; one that has carried
+        nothing for a while cannot be told from a tunnel whose peer wedged.
+        """
+        with self._lock:
+            last = self._last_move
+        return (time.monotonic() - last) if last else 0.0
+
+    def live_pairs(self) -> int:
+        """How many tunnels this selector is driving.
+
+        The drain asks. A tunnel is deliberately un-owed — it is not a reply
+        anybody is waiting for — but it IS a live Remote Control channel, and
+        a process that exits while pumping one takes it down.
+        """
+        with self._lock:
+            return len(self._peer) // 2
+
     def add(self, a, b, on_close=None) -> None:
         """Take over a pair of sockets. Returns AT ONCE.
 
@@ -13298,6 +13367,7 @@ class _PumpLoop:
         teardown goes, because the caller no longer has a thread to run it on.
         """
         with self._lock:
+            self._last_move = time.monotonic()
             self._peer[a] = (b, on_close)
             self._peer[b] = (a, on_close)
             for s in (a, b):
@@ -13425,6 +13495,12 @@ class _PumpLoop:
                 # writable. A blocking `sendall` here reintroduced the exact
                 # coupling this class removed.
                 with self._lock:
+                    # A BYTE MOVED. Stamped HERE and not at the top of the
+                    # loop: the wake pipe fires on membership churn, and a
+                    # stamp there would refresh itself on this daemon's own
+                    # bookkeeping — a heartbeat the drain would read as
+                    # traffic, so its wait would never end.
+                    self._last_move = time.monotonic()
                     self._pending[dst] = self._pending.get(dst, b"") + data
                 self._flush(dst, on_close)
 

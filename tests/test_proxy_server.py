@@ -3989,9 +3989,9 @@ class TestDrainReportsWhatItCut:
             monkeypatch.setattr(pp, "_DRAINING_BEAT_SECONDS", 0.05)
             monkeypatch.setattr(
                 pp, "beat_draining",
-                lambda cd, pid=None, owed=None, live=None, quiet=None: (
-                    beats.append(owed),
-                    real_beat(cd, pid, owed, live, quiet))[1])
+                lambda cd, pid=None, owed=None, live=None, quiet=None,
+                **k: (beats.append(owed),
+                      real_beat(cd, pid, owed, live, quiet, **k))[1])
 
             threading.Thread(target=_stream, daemon=True).start()
             t0 = time.monotonic()
@@ -4233,9 +4233,9 @@ class TestDrainReportsWhatItCut:
         real_beat = pp.beat_draining
         monkeypatch.setattr(
             pp, "beat_draining",
-            lambda cd, pid=None, owed=None, live=None, quiet=None: (
+            lambda cd, pid=None, owed=None, live=None, quiet=None, **k: (
                 seen.append((owed, live)),
-                real_beat(cd, pid, owed, live, quiet))[1])
+                real_beat(cd, pid, owed, live, quiet, **k))[1])
 
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
                             upstream=("127.0.0.1", 1))
@@ -5040,6 +5040,50 @@ class TestDrainReportsWhatItCut:
             assert live.exists(), (
                 "the sweep collected a marker that is still being beaten — "
                 "that is a live drainer losing its protection mid-reply")
+
+            # --- AND A PREDECESSOR CARRYING A BRIDGE IS NOT PART OF THE PILE.
+            # It has zero live replies — its remaining job is a held-open
+            # subscription, not an answer — so every rule above scored it as
+            # the CHEAPEST thing on the box and it was always the one taken.
+            # That is the one cut a session cannot recover from by itself:
+            # claude.ai pushes through that stream, and the client does not
+            # get it back without reconnecting.
+            killed.clear()
+            pids = _fake_pids(8000, pp._MAX_DRAINING_PREDECESSORS + 2)
+            pp._pin_daemon_pids = lambda certdir: list(pids)
+            for i, pid in enumerate(pids):
+                pp.announce_draining(certdir, pid)
+                # EVERY ONE CHEAP BY THE OLD RULES, so only the subscription
+                # count can produce the expected answer. The two WITHOUT one
+                # are the youngest, so age cannot pick them either.
+                pp.beat_draining(certdir, pid, owed=0, live=0, quiet=0.0,
+                                 streams=0 if i >= len(pids) - 2 else 3)
+                path = pp.draining_marker_path(certdir, pid)
+                body = path.read_text().split("\n")
+                body[0] = str(time.time() - 1000 - i)
+                path.write_text("\n".join(body))
+
+            pp._sweep_orphan_daemons(certdir, keep_pid=999)
+
+            assert sorted(killed) == sorted(pids[-2:]), (
+                "the sweep took a predecessor still delivering a held-open "
+                "subscription while stream-less ones were available. Every "
+                "other cost here can be retried; that one cannot be reopened "
+                f"by the session that lost it. killed={killed}")
+
+            # AND WHEN THERE IS NOTHING CHEAP TO TAKE, IT TAKES NOTHING. A
+            # reaper with no safe choice must say so, not pick the least-bad
+            # session to cut.
+            killed.clear()
+            for pid in pids:
+                pp.beat_draining(certdir, pid, owed=0, live=0, quiet=0.0,
+                                 streams=2)
+
+            pp._sweep_orphan_daemons(certdir, keep_pid=999)
+
+            assert killed == [], (
+                "over the limit with every predecessor carrying a bridge, the "
+                f"sweep still cut one. killed={killed}")
         finally:
             pp._kill_daemon = real_kill
             pp._pin_daemon_pids = real_pids
@@ -5322,156 +5366,225 @@ class TestDrainReportsWhatItCut:
         assert teardown_drain_budget(
             "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
-    def case_a_drain_lets_the_subscription_go_instead_of_holding_it(self, certdir):
-        """A subscription cannot migrate on `Connection: close`, so it pins the
-        departing daemon open — and while that daemon drains, EVERY reply it
-        writes carries `Connection: close`.
+    def case_an_uncapped_drain_waits_for_a_live_tunnel(self, certdir):
+        """A recycle must not take Remote Control down with it.
 
-        Measured on this host after the drain ceiling was uncapped: 2017.2 s
-        and 2005.6 s drains, two predecessors draining at once, and claude.ai
-        showing "Connection lost … check your internet connection, VPN, or
-        proxy". That window used to be 30 s only because the process was killed
-        at the ceiling; uncapping saved the replies and made the window
-        unbounded. The subscription has to be released, not waited for.
+        RC's inbound channel is an opaque tunnel. `_mitm` hands both sockets to
+        `_PumpLoop` at the 101 and gives the debt back — right for the drain's
+        original question ("is a REPLY outstanding") and wrong for this one. So
+        `await_inflight` returned at once, the departing daemon exited, and
+        every tunnel it was pumping died with the process. The client
+        reconnects and the page says the connection was lost.
+
+        Measured 2026-08-20: 18 serving-daemon replacements in a day, the
+        banner on screen for several, and NOTHING draining at the time — which
+        is what ruled out the `Connection: close` explanation.
+
+        Nothing waits on that exit. The listener is released and the successor
+        is already serving, so staying costs one idle process and leaving costs
+        every live session a reconnect.
         """
         import socket
+
+        from cswap_pin.proxy import _PUMP
+
+        a, b = socket.socketpair()
+        try:
+            before = _PUMP.live_pairs()
+            _PUMP.add(a, b)
+            assert _PUMP.live_pairs() == before + 1, (
+                "the pump cannot say how many tunnels it drives, so the drain "
+                "has no way to ask")
+        finally:
+            for s_ in (a, b):
+                try:
+                    s_.close()
+                except OSError:
+                    pass
+
+        # AND THE DRAIN MUST ASK. Reaching the wait needs a live daemon and a
+        # real 101, so read it out of the source — the same convention this
+        # file uses for the exit-path ceilings.
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        src = inspect.getsource(pp.PinProxy.await_inflight)
+        assert "_PUMP.live_pairs()" in src, (
+            "the drain does not wait for live tunnels, so a recycle drops "
+            "every Remote Control channel this daemon is pumping")
+        guard = src[:src.index("_PUMP.live_pairs()")]
+        assert "if budget > 0" not in guard, (
+            "the tunnel wait is not above the capped arm, so it is not "
+            "confined to the uncapped one. The signal arm has a supervisor "
+            "counting to `_DRAIN_SECONDS + 2`, so waiting past it buys a "
+            "harder kill; the held arm is holding the port dark")
+        assert 'budget == float("inf")' in guard, (
+            "nothing confines the tunnel wait to the uncapped arm")
+
+        # AND IT MUST END. `while live_pairs()` has no exit of its own: a
+        # wedged peer keeps its entry for ever, so the wait added above turns
+        # a recycle into a process that never leaves — the never-ending drain
+        # this file removed a wall clock to avoid. Measured by the mutation
+        # check, which HUNG instead of reporting.
+        #
+        # A hang is a bad guard, so run the drain on a thread and assert it
+        # joined: the bug fails this cleanly instead of wedging the suite.
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        c, d = socket.socketpair()
+        done = []
+        ttl, beat = pp._DRAINING_MARKER_TTL, pp._DRAINING_BEAT_SECONDS
+        pp._DRAINING_MARKER_TTL, pp._DRAINING_BEAT_SECONDS = 0.4, 0.05
+        _PUMP.add(c, d)                          # live, and never moves a byte
+        try:
+            t = threading.Thread(
+                target=lambda: done.append(proxy.await_inflight(float("inf"))),
+                daemon=True)
+            t.start()
+            t.join(15)
+            assert not t.is_alive(), (
+                "the uncapped drain never returns while a tunnel is open. A "
+                "tunnel whose peer wedged holds the departing daemon open for "
+                "ever, so the port keeps two owners and the recycle never "
+                "completes")
+        finally:
+            pp._DRAINING_MARKER_TTL, pp._DRAINING_BEAT_SECONDS = ttl, beat
+            for s_ in (c, d):
+                try:
+                    s_.close()
+                except OSError:
+                    pass
+        assert done == [0], f"the drain reported {done}, not a clean 0"
+
+    def case_a_drain_does_not_cut_the_subscription(self, certdir):
+        """The channel a session cannot reopen for itself must survive a recycle.
+
+        A drain used to close every held-open `/worker/events/stream` on the
+        grounds that it never completes, so waiting for it waits for ever. The
+        premise behind the harm — that holding one stamps `Connection: close`
+        on enough other replies to matter — did not survive measurement: the
+        banner was observed with NOTHING draining, and a departing daemon has
+        released its listener, so the only replies left are on keep-alives that
+        migrate after one each.
+
+        What the cut did buy was a hard disconnect of the bridge's inbound
+        stream. A DRAINING DAEMON STILL SERVES WHAT IT ALREADY HOLDS — it gave
+        up the listener, not its connections — so leaving the stream alone
+        keeps the session working on the departing process for as long as it
+        lasts. That is what shipped before 0.1.125 and it is what this guards.
+
+        The cost is a process that lingers. That is the session still working,
+        not a leak, and `live_stream_count` is how the drain line says so.
+        """
+        import socket
+        import threading
 
         from cswap_pin.proxy import PinProxy, _EVENT_STREAM
 
         assert _EVENT_STREAM.search(
             "GET /v1/code/sessions/cse_x/worker/events/stream HTTP/1.1"), (
-            "the one request that never completes is not recognised, so "
-            "nothing is ever released and the drain waits forever")
+            "the one request that never completes is not recognised, so the "
+            "drain line cannot say what is holding it")
         assert not _EVENT_STREAM.search(
             "POST /v1/code/sessions/cse_x/worker/events HTTP/1.1"), (
-            "the ordinary event POST was taken for a subscription — releasing "
-            "those closes replies that were about to finish")
+            "the ordinary event POST was taken for a subscription")
 
         proxy = PinProxy.__new__(PinProxy)
-        import threading
         proxy._live_lock = threading.Lock()
-        proxy._stream_conns = set()
-        proxy._tls_for = {}
-        # The real bookkeeping: `_owed` maps a connection to when its debt
-        # began, and the sibling maps are popped with it.
-        proxy._owed, proxy._delivered = {}, {}
-        proxy._content_at, proxy._gap = {}, {}
-        proxy._open_conns = set()
+        proxy._stream_conns, proxy._open_conns = set(), set()
         a, b = socket.socketpair()
         c, d = socket.socketpair()
         try:
             # A SUBSCRIPTION THAT ALREADY FINISHED, still remembered. Its
             # descriptor is gone and the NUMBER has been handed to something
-            # else, so releasing it closes a stranger's fd. Measured: on the
-            # macOS runner that was pytest-xdist's control pipe, and the run
-            # ended in 73 INTERNALERROR lines instead of a test failure.
+            # else, so counting it names a connection that is not ours.
             c.close()
             d.close()
             proxy._stream_conns.add(c)
-
             proxy._stream_conns.add(a)
             proxy._open_conns.add(a)
-            proxy._owed[a] = 0.0
-            assert proxy.release_subscriptions() == 1, (
-                "released something the proxy no longer holds — that is a "
-                "close() on whatever inherited the file descriptor")
-            assert proxy._stream_conns == set(), "released twice on a re-drain"
-            assert a not in proxy._owed, (
-                "a closed socket was left in the owed set, so the drain waits "
-                "for an answer nobody can send — the 2017 s drain")
-            assert b.recv(1) == b"", "the client never saw the stream end"
+            assert proxy.live_stream_count() == 1, (
+                "the count is taken from the stream set alone, so it reports a "
+                "connection whose descriptor has been reused")
 
-            # THE MAP MUST BE CONSULTED, not the key. In production
-            # `wrap_socket` DETACHES the socket every structure here keys on —
-            # `fileno()` -1, `shutdown` EBADF, `close` a no-op — so a release
-            # reaching for the key closes nothing.
-            #
-            # THIS CASE DOES NOT REPRODUCE THAT SHAPE, and the comment used to
-            # claim it did: `socket.socket(fileno=e.detach())` RE-ATTACHES the
-            # descriptor to a new object, so the stand-in is a perfectly live
-            # socket. What it does prove is the property that fixes the bug —
-            # the release closes what `_tls_for` names and not the key it was
-            # given. The end-to-end shape is covered by the streaming-relay
-            # harness in this file.
+            # AND THE PEER MUST NOT SEE EOF WHEN A REAL DRAIN RUNS. Asserting
+            # on names — no `release_subscriptions`, no `_end_connection` —
+            # only holds until somebody writes the cut under a third name.
+            # This asks the property instead: run the drain, then read the far
+            # end. A cut gives EOF; an intact stream gives a timeout.
+            real = PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+            # THE FINAL CATCH-ALL IS A NO-OP IN PRODUCTION, so it is one here.
+            # `_close_open_connections` shuts down every open connection as
+            # the drain's last act, and for a MITM'd connection it reaches the
+            # RAW socket that `wrap_socket` detached — `fileno()` is -1 and
+            # the close does nothing. That no-op is load-bearing and its own
+            # guard covers it. A plain socketpair is NOT detached, so leaving
+            # the call in makes this case measure a cut that cannot happen on
+            # the real object. The question here is the DELIBERATE cut.
+            real._close_open_connections = lambda: None
             e, f = socket.socketpair()
-            detached = socket.socket(fileno=e.detach())
-            proxy._tls_for = {}
-            proxy._stream_conns = {detached}
-            proxy._open_conns = {detached}
-            proxy._owed = {detached: 0.0}
-            proxy._tls_for[detached] = f      # f owns a live descriptor
+            with real._live_lock:
+                real._open_conns.add(e)
+                real._stream_conns.add(e)
             try:
-                assert proxy.release_subscriptions() == 1
-                assert f.fileno() == -1, (
-                    "release reached for the raw socket, which wrap_socket "
-                    "detached — it closed nothing, and the subscription stays "
-                    "on the departing daemon until the process exits")
+                real.await_inflight(0.0)
+                f.settimeout(1.0)
+                try:
+                    got = f.recv(1)
+                except (TimeoutError, OSError):
+                    got = None            # still open — nothing cut it
+                assert got is None, (
+                    "the drain closed a held-open subscription. That is the "
+                    "channel claude.ai pushes through, and the session cannot "
+                    "reopen it for itself")
             finally:
-                for s_ in (e, f, detached):
+                for s_ in (e, f):
                     try:
                         s_.close()
                     except OSError:
                         pass
 
-            # AND THE TWO SITES THE ASSERTIONS ABOVE CANNOT REACH. Both need a
-            # real connection lifecycle — an accept loop, a socket, a thread —
-            # and a harness that rebuilds those can be wrong in its own right.
-            # Read out of the source instead, which is what this file already
-            # does for the exit paths.
+            # AND NOTHING CLOSES IT. Reaching a real drain needs a live daemon,
+            # so read it out of the source — the convention this file already
+            # uses for the exit paths.
             import ast
             import inspect
 
             import cswap_pin.proxy as pp
 
-            tree = ast.parse(inspect.getsource(pp))
-
+            src = inspect.getsource(pp)
+            assert "_end_connection" not in src, (
+                "the apparatus that made the cut real is back. Closing the "
+                "TLS object really does end the connection, and the one it "
+                "ends is the bridge's inbound stream")
+            tree = ast.parse(src)
             drains = [n for n in ast.walk(tree)
                       if isinstance(n, ast.FunctionDef)
                       and n.name == "await_inflight"]
-            assert drains and any(
-                isinstance(c.func, ast.Attribute)
-                and c.func.attr == "release_subscriptions"
-                for d in drains for c in ast.walk(d)
-                if isinstance(c, ast.Call)), (
-                "the drain no longer releases subscriptions, so a departing "
-                "daemon holds the bridge again and marks every other reply "
-                "`Connection: close` for as long as it does")
+            assert drains, "await_inflight moved; this guard is blind"
+            closers = {c_.func.attr for d_ in drains for c_ in ast.walk(d_)
+                       if isinstance(c_, ast.Call)
+                       and isinstance(c_.func, ast.Attribute)}
+            assert "release_subscriptions" not in closers, (
+                "the drain cuts subscriptions again, so every recycle drops "
+                "the channel claude.ai pushes through and the session stops "
+                "receiving until it reconnects")
 
-            src = inspect.getsource(pp)
-            # THE MARK MUST END WITH THE REPLY THAT EARNED IT. A stream
-            # request answered with a Content-Length (a refused auth) leaves
-            # the keep-alive reusable and still marked, so a later drain
-            # claims it and un-owes a reply that is still being written —
-            # abandoned, and absent from the `cut N in-flight` line. Read out
-            # of the source: reaching that branch needs a real MITM loop.
-            # AND THE MAP MUST BE FILLED WHERE THE WRAP HAPPENS. The case
-            # above sets `_tls_for` by hand, so it proves the LOOKUP and not
-            # the registration; without the registration the lookup falls back
-            # to the detached raw socket and closes nothing, which is the bug
-            # this whole guard exists for.
-            wrapped = src.find("self._server_ctx.wrap_socket(conn, server_side=True)")
-            assert wrapped != -1, "the wrap moved; this guard is blind"
-            assert "self._tls_for[conn] = tls" in src[wrapped:wrapped + 300], (
-                "nothing records the object that owns the descriptor, so the "
-                "release falls back to the detached socket and is a no-op")
-
+            # AND THE MARK IS FORGOTTEN WHEN THE REPLY THAT SET IT ENDS,
+            # or the set grows for the life of the daemon and fills with
+            # sockets whose descriptors have been reused.
             paid = src.find("self._note_reply_finished(conn)")
             assert paid != -1, "the debt boundary moved; this guard is blind"
             assert "self._stream_conns.discard(conn)" in src[paid:paid + 700], (
-                "the subscription mark outlives the reply that set it, so a "
-                "drain can abandon a live reply on that connection uncounted")
-
-            assert "self._stream_conns.discard(conn)" in src, (
-                "a finished subscription is never forgotten, so the set grows "
-                "for the life of the daemon and fills with sockets whose file "
-                "descriptors have been reused")
+                "the subscription mark outlives the reply that set it")
         finally:
             for s_ in (a, b, c, d):
                 try:
                     s_.close()
                 except OSError:
                     pass
-
     def case_a_successor_on_the_port_means_nobody_waits_for_us(self, certdir):
         """`handed_over` asks "did I hand over"; the budget needs "is anyone
         waiting for me to be gone". Those differ for a daemon superseded from
