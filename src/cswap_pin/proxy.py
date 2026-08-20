@@ -2669,13 +2669,57 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 # someone clicks the wrong one) and far above the cost of a listing.
 _BRIDGE_SWEEP_COOLDOWN_S = 600.0
 
-# When a request through this proxy is worth a line of its own, and how rarely.
-# 1.5s is well above a healthy round trip here (p50 310ms, p90 345ms measured
-# over 340 samples) and well below the multi-second stalls a live claude.ai
-# view times out on. The cooldown is because a genuinely slow endpoint would
+# How rarely a slow request may take a line. A genuinely slow endpoint would
 # otherwise fill the log with what the first line already said.
-_SLOW_REQUEST_MS = 1500.0
 _SLOW_REPORT_COOLDOWN_S = 60.0
+_SLOW_SWITCH_FILE = "slow-ms"
+_SLOW_RECHECK_S = 5.0
+_SLOW_CACHE: dict = {}
+
+
+def slow_report_ms(certdir) -> "float | None":
+    """Milliseconds above which a request takes a log line, or None for off.
+
+    OFF UNTIL SOMEONE ASKS. This is a diagnostic, and it writes into
+    `daemon.log` — the one file a person reads to find out why the daemon
+    died. Left always-on it produced ~38 lines an hour on this fleet, about
+    900 a day, in a package installed on other people's machines. A diagnostic
+    nobody armed is just noise in somebody else's incident.
+
+    ARM IT WHILE THE DAEMON SERVES, the same shape as `trace-to`:
+
+        echo 1500 > <certdir>/slow-ms     # report anything over 1.5s
+        rm <certdir>/slow-ms              # silent again
+
+    No restart, which is the point — restarting the daemon is the one thing
+    guaranteed to hide an intermittent stall.
+
+    ONE FILE, ONE NUMBER: arming it and choosing what counts as slow are the
+    same decision, so they are not two knobs. `CSWAP_PIN_SLOW_MS` wins for a
+    deployment that would rather set it in the environment.
+
+    Unreadable, empty or not a number is OFF, never an error: a diagnostic
+    that can break a request is worse than no diagnostic.
+    """
+    env = os.environ.get("CSWAP_PIN_SLOW_MS")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            return None
+    if certdir is None:
+        return None
+    key = str(certdir)
+    seen, value = _SLOW_CACHE.get(key, (0.0, None))
+    now = time.time()
+    if now - seen < _SLOW_RECHECK_S:
+        return value
+    try:
+        value = float((Path(certdir) / _SLOW_SWITCH_FILE).read_text().strip())
+    except (OSError, ValueError):
+        value = None
+    _SLOW_CACHE[key] = (now, value)
+    return value
 
 
 # THE TWO LINES `_report_deaf_bridges` writes, as symbols rather than prose.
@@ -10142,7 +10186,7 @@ class PinProxy:
 
         A background session is built to be replaced: its job record carries
         `resumeSessionId` and `respawnFlags` and its transcript is on disk, so
-        a fresh worker resumes the same conversation. MEASURED on lambda-docker
+        a fresh worker resumes the same conversation. MEASURED on the linux host
         2026-08-19: SIGTERM to a session that had refused for over two hours, a
         new worker 12s later, Remote Control connected with no user action and
         the conversation intact.
@@ -10536,7 +10580,8 @@ class PinProxy:
 
         Never raises: this runs on the request path.
         """
-        if total_ms < _SLOW_REQUEST_MS:
+        floor = slow_report_ms(getattr(self, "_certdir", None))
+        if floor is None or total_ms < floor:
             return
         # INFERENCE IS SUPPOSED TO TAKE SECONDS. `/v1/messages` is the model
         # answering; 4715, 6040, 2369 and 4200ms were measured on one healthy
