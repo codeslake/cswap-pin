@@ -5395,13 +5395,18 @@ class TestDrainReportsWhatItCut:
                 "for an answer nobody can send — the 2017 s drain")
             assert b.recv(1) == b"", "the client never saw the stream end"
 
-            # THE SHAPE THAT CAN ACTUALLY FAIL. A socketpair is never
-            # detached, so the assertion above passes against a release that
-            # closes nothing. `ssl.wrap_socket` DETACHES what it wraps:
-            # `fileno()` becomes -1, `shutdown` raises EBADF and `close` is a
-            # no-op, so a release reaching for the raw socket leaves the peer
-            # reading TIMEOUT where a real close gives EOF. Measured with that
-            # control before this case existed.
+            # THE MAP MUST BE CONSULTED, not the key. In production
+            # `wrap_socket` DETACHES the socket every structure here keys on —
+            # `fileno()` -1, `shutdown` EBADF, `close` a no-op — so a release
+            # reaching for the key closes nothing.
+            #
+            # THIS CASE DOES NOT REPRODUCE THAT SHAPE, and the comment used to
+            # claim it did: `socket.socket(fileno=e.detach())` RE-ATTACHES the
+            # descriptor to a new object, so the stand-in is a perfectly live
+            # socket. What it does prove is the property that fixes the bug —
+            # the release closes what `_tls_for` names and not the key it was
+            # given. The end-to-end shape is covered by the streaming-relay
+            # harness in this file.
             e, f = socket.socketpair()
             detached = socket.socket(fileno=e.detach())
             proxy._tls_for = {}

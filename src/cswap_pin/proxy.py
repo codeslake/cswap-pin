@@ -12087,6 +12087,17 @@ class PinProxy:
                     _c = getattr(self._local, "conn", None)
                     if _c is not None:
                         self._owe_answer(_c, False)
+                        # AND IT IS NO LONGER OURS TO CLOSE. The mark is set
+                        # from the request LINE and the upgrade is decided by
+                        # the client's `Upgrade:` header, so both can be true
+                        # at once — and from here the socket belongs to the
+                        # pump. A drain closing it makes epoll drop the fd
+                        # silently: no event, `_close_pair` never runs, and
+                        # the connection stays in every map for the life of
+                        # the daemon. Measured: OPEN 1, TLSFOR 1, six seconds
+                        # after the release said it had freed it.
+                        with self._live_lock:
+                            self._stream_conns.discard(_c)
                     release = getattr(self._local, "release", None)
 
                     def _release_tunnel():
