@@ -2683,6 +2683,11 @@ DEAF_REPORT_CLEAR = "every posting bridge holds an inbound stream"
 # can only ever say "deaf" — about sessions that are fine.
 DEAF_REPORT_BLIND = "cannot say whether any bridge is deaf"
 
+# THE TWO LINES `_note_attachment` writes. Same contract as the deaf pair:
+# a watcher matches them, so a reword is a fleet-wide silent break.
+ATTACH_REPORT_OK = "claude.ai attachment downloaded as the pinned account"
+ATTACH_REPORT_FAIL = "claude.ai attachment could NOT be downloaded"
+
 
 def trace_target(certdir) -> "str | None":
     """Where to write the request trace, or None for off.
@@ -10597,6 +10602,41 @@ class PinProxy:
             if stamp - last <= window and bid not in holding
         )
 
+    def _note_attachment(self, path: str, status_line: bytes) -> None:
+        """Say whether a claude.ai attachment actually downloaded, on CHANGE.
+
+        `/api/oauth/files/` is pinned because the file belongs to the pinned
+        account, and Claude Code renders any non-200 as "could not be
+        downloaded" — a message the user sees and nothing records. So the swap
+        was verified in code and never in traffic, and no machine could answer
+        whether an attachment had ever worked.
+
+        THE STATUS IS CARRIED, because 403 (the swap was refused) and 404 (the
+        file is not this account's) are different bugs with the same symptom.
+
+        Never raises: a statistic must not cost a request.
+        """
+        try:
+            if not path.startswith("/api/oauth/files/"):
+                return
+            parts = status_line.split(b" ")
+            code = parts[1].decode("latin1", "replace") if len(parts) > 1 else "?"
+            ok = code.startswith("2")
+            # KEYED ON THE CODE, not on ok/not-ok: a 403 turning into a 404 is
+            # a different fault and must not be swallowed as "still failing".
+            state = "ok" if ok else code
+            if state == getattr(self, "_last_attach", None):
+                return
+            self._last_attach = state
+            if ok:
+                _log_lifecycle(ATTACH_REPORT_OK)
+            else:
+                _log_lifecycle(
+                    f"{ATTACH_REPORT_FAIL} — upstream answered {code}; the "
+                    "user sees only 'could not be downloaded'")
+        except Exception:  # noqa: BLE001 — a statistic must not cost a request
+            pass
+
     def held_bridge_ids(self) -> set:
         """Bridges whose inbound stream THIS process is holding open.
 
@@ -12602,6 +12642,10 @@ class PinProxy:
                 on_headers=(
                     lambda n, c: self._note_response_started(_conn, n, c))
                 if _conn is not None else None,
+                # THE CALLER IS THE ONLY ONE THAT KNOWS THE PATH, and the
+                # relay is the only one that sees the status. Neither can
+                # report an attachment outcome alone.
+                on_status=lambda st: self._note_attachment(path, st),
                 # A HEAD response carries the headers of the GET it mirrors,
                 # Content-Length included, but no body — only the request
                 # method says so.
@@ -13463,6 +13507,7 @@ def _relay_response(
     reject_on_auth_error: bool = False,
     method: str | None = None,
     on_headers=None,
+    on_status=None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -13532,6 +13577,14 @@ def _relay_response(
             f"{status_line.decode('latin1', 'replace')}\n"
         )
         _TRACE.flush()
+    # AFTER THE TAKE-BACK, deliberately. A swap the upstream refused returns
+    # above and is retried unswapped, so reporting here would name a failure
+    # the user never saw. This is the status that reaches the client.
+    if on_status is not None:
+        try:
+            on_status(status_line)
+        except Exception:  # noqa: BLE001 — never let a statistic break a reply
+            pass
     out = [status_line]
     length: int | None = None
     chunked = False

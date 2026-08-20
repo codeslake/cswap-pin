@@ -5847,6 +5847,79 @@ class TestDrainReportsWhatItCut:
             pp._pin_daemon_pids = real_pids
             pp.is_draining = real_draining
 
+    def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
+        """Nothing recorded whether a claude.ai attachment ever downloaded.
+
+        `/api/oauth/files/` is a pinned route because the file belongs to the
+        pinned account, and Claude Code renders any non-200 as "could not be
+        downloaded" — a message the user sees and no machine records. So the
+        requirement "read claude.ai image attachments from the CLI" had no
+        instrument at all: not a check that passed, a question nobody could
+        ask. That is the same gap the deaf report had, and it shipped for the
+        same reason — the swap was verified in code and never in traffic.
+
+        ON CHANGE, like every other report in this file. An attachment fetch
+        per keystroke would bury the one that failed.
+
+        THE FAILURE IS THE POINT, so it carries the status. "It did not work"
+        is not actionable; 403 says the swap was refused and 404 says the file
+        is not the pinned account's, which are different bugs.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._live_lock = threading.Lock()
+            P = "/api/oauth/files/8f14e45f-ea/content"
+
+            srv._note_attachment(P, b"HTTP/1.1 200 OK")
+            assert lines, (
+                "a successful attachment fetch left no record, so the one "
+                "requirement it serves cannot be certified from any machine")
+            assert pp.ATTACH_REPORT_OK in lines[-1], lines[-1]
+
+            before = len(lines)
+            srv._note_attachment(P, b"HTTP/1.1 200 OK")
+            assert len(lines) == before, (
+                "it logged again with nothing changed; one line per fetch "
+                "buries the one that failed")
+
+            srv._note_attachment(P, b"HTTP/1.1 403 Forbidden")
+            assert pp.ATTACH_REPORT_FAIL in lines[-1], lines[-1]
+            assert "403" in lines[-1], (
+                "the failure does not carry its status, so a reader cannot "
+                f"tell a refused swap from a missing file: {lines[-1]!r}")
+
+            # AND BACK, or a machine that recovers keeps reading as broken.
+            srv._note_attachment(P, b"HTTP/1.1 200 OK")
+            assert pp.ATTACH_REPORT_OK in lines[-1], lines[-1]
+
+            # A ROUTE THAT IS NOT AN ATTACHMENT SAYS NOTHING. Without this the
+            # notifier would report on every response it was ever handed.
+            before = len(lines)
+            srv._note_attachment("/v1/messages", b"HTTP/1.1 200 OK")
+            assert len(lines) == before, (
+                f"it reported about a non-attachment route: {lines[-1]!r}")
+
+            # AND SOMETHING MUST ASK. `deaf_bridges` was correct and unreached
+            # for three releases; this is the same shape one file over.
+            import inspect
+            wired = inspect.getsource(pp.PinProxy._forward)
+            assert "_note_attachment" in wired, (
+                "nothing calls the attachment notifier, so it can only ever "
+                "prove that the maths is right")
+            relay = inspect.getsource(pp._relay_response)
+            assert "on_status" in relay, (
+                "`_relay_response` does not hand the status back, so the "
+                "caller that knows the path can never learn the outcome")
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 
