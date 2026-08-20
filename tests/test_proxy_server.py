@@ -5708,7 +5708,7 @@ class TestDrainReportsWhatItCut:
         assert srv._should_sweep_bridges("GET", CREATE, now=9e9) is False
 
     def case_the_accept_probe_and_the_bind_probe_disagree(self, certdir):
-        """`_port_accepts` must answer about ACCEPTING, not about BOUND.
+        """`_port_answers` must answer about ACCEPTING, not about BOUND.
 
         The whole recovery keys on those two facts disagreeing, so a probe
         that conflates them makes the branch unreachable. Both directions,
@@ -5728,7 +5728,7 @@ class TestDrainReportsWhatItCut:
         quiet = socket.socket()
         quiet.bind(("127.0.0.1", 0))
         try:
-            assert pp._port_accepts(quiet.getsockname()[1], timeout=0.5) is False
+            assert pp._port_answers(quiet.getsockname()[1], timeout=0.5) is False
         finally:
             quiet.close()
 
@@ -5737,7 +5737,7 @@ class TestDrainReportsWhatItCut:
         live.bind(("127.0.0.1", 0))
         live.listen(4)
         try:
-            assert pp._port_accepts(live.getsockname()[1], timeout=1.0) is True
+            assert pp._port_answers(live.getsockname()[1], timeout=1.0) is True
         finally:
             live.close()
 
@@ -5761,7 +5761,7 @@ class TestDrainReportsWhatItCut:
         and the branch never runs -- CI went red on a fix that works. A socket
         bound WITHOUT listen is portable but useless, because SO_REUSEADDR
         lets the holder bind straight past it. So the sibling case above
-        proves `_port_accepts` tells the two apart against real sockets, and
+        proves `_port_answers` tells the two apart against real sockets, and
         this one proves the holder ACTS on that answer.
         """
         import socket
@@ -5782,7 +5782,7 @@ class TestDrainReportsWhatItCut:
             return 1
 
         monkeypatch.setattr(pp, "_retire_stale_standbys", _fake_retire)
-        monkeypatch.setattr(pp, "_port_accepts", lambda *_a, **_k: False)
+        monkeypatch.setattr(pp, "_port_answers", lambda *_a, **_k: False)
         monkeypatch.setattr(pp, "wanted_port", lambda _cd: port)
         monkeypatch.setattr(pp, "_HOLD_BIND_WAIT_S", 0.2)
 
@@ -5827,7 +5827,7 @@ class TestDrainReportsWhatItCut:
         monkeypatch.setattr(
             pp, "_retire_stale_standbys",
             lambda cd, keep_pid=None: retired.append(cd) or 1)
-        monkeypatch.setattr(pp, "_port_accepts", lambda *_a, **_k: True)
+        monkeypatch.setattr(pp, "_port_answers", lambda *_a, **_k: True)
         monkeypatch.setattr(pp, "wanted_port", lambda _cd: port)
         monkeypatch.setattr(pp, "_HOLD_BIND_WAIT_S", 0.2)
 
