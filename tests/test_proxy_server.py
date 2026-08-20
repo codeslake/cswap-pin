@@ -5501,6 +5501,81 @@ class TestDrainReportsWhatItCut:
         assert json.loads(cfg.read_text())["oauthAccount"] == {
             "emailAddress": "keep"}
 
+
+    def case_a_squatting_standby_is_retired_so_the_holder_can_bind(
+            self, certdir, tmp_path, monkeypatch):
+        """A stale standby holding LISTEN and never accepting deadlocked the
+        machine for 3.4 hours, and the recovery for it was gated behind the
+        very bind it prevented.
+
+        `_retire_stale_standbys` runs after a holder places its OWN standby,
+        which requires the holder to already own the port. A standby left by a
+        holder that was KILLED rather than released owns the port and sleeps:
+        it never calls accept, so the backlog fills (129 queued, measured),
+        every new connect gets ECONNREFUSED, and every new holder's bind gets
+        EADDRINUSE. The holder then refuses to move -- correctly, because
+        sessions are wired to that number -- and retries forever.
+
+        THE DISCRIMINATOR IS THE PAIR, and neither half works alone. "Does the
+        port answer" says dead. "Can I bind it" says taken. A healthy handover
+        answers yes/taken; this deadlock answers no/taken. So the escalation
+        fires only on the combination, and a handover's standby -- which is
+        holding the address open on purpose -- is left alone.
+
+        Recovery is by SIGHUP, the standby's own release signal; it ignores
+        TERM and INT deliberately.
+        """
+        import socket
+        import cswap_pin.proxy as pp
+
+        # A squatter: bound and listening, never accepting.
+        squat = socket.socket()
+        squat.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squat.bind(("127.0.0.1", 0))
+        squat.listen(0)
+        port = squat.getsockname()[1]
+        # Fill the backlog so a connect is refused rather than queued -- that
+        # refusal is the signal the fix keys on.
+        fillers = []
+        for _ in range(8):
+            c = socket.socket()
+            c.settimeout(0.2)
+            try:
+                c.connect(("127.0.0.1", port))
+                fillers.append(c)
+            except OSError:
+                break
+
+        retired = []
+
+        def _fake_retire(cd, keep_pid=None):
+            retired.append((str(cd), keep_pid))
+            squat.close()          # what a SIGHUP to the standby achieves
+            return 1
+
+        monkeypatch.setattr(pp, "_retire_stale_standbys", _fake_retire)
+        monkeypatch.setattr(pp, "wanted_port", lambda _cd: port)
+        monkeypatch.setattr(pp, "_HOLD_BIND_WAIT_S", 0.2)
+
+        try:
+            holder = pp.PortHolder(certdir, "1", "a@example.com")
+        except OSError as exc:
+            raise AssertionError(
+                "the holder gave up on a port a squatting standby was sitting "
+                f"on, which is the deadlock it can recover from: {exc}"
+            ) from exc
+        try:
+            assert retired, (
+                "the holder refused the port without ever asking whether one "
+                "of OUR OWN standbys was squatting on it")
+            assert holder.port == port, (
+                f"the holder escaped to another port ({holder.port}) — every "
+                f"session wired to {port} is stranded")
+        finally:
+            holder.stop()
+            for c in fillers:
+                c.close()
+
     def case_the_armed_trace_can_see_the_tunnel(self, certdir):
         """An armed trace was blind to the one path that fails.
 
