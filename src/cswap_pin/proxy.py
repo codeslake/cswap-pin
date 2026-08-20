@@ -12630,6 +12630,32 @@ class PinProxy:
         except (OSError, ValueError):
             return None
 
+    def _tunnel_trace(self, line: str) -> None:
+        """Write one tunnel line to whichever traces are on.
+
+        TWO TARGETS, DELIBERATELY. `_TRACE` is opened once at import from
+        `CSWAP_PIN_DEBUG` and cannot be turned on afterwards; the `trace-to`
+        file can be armed on a daemon that is already serving. Only the second
+        is reachable during an incident, and it was the one this path did not
+        write to — so an armed trace showed every route CC sends and nothing
+        about the channel it receives on.
+        """
+        text = f"[c{getattr(self._local, 'cid', 0)}] {line}\n"
+        if _TRACE is not None:
+            try:
+                _TRACE.write(text)
+                _TRACE.flush()
+            except (OSError, ValueError):
+                pass
+        debug_path = trace_target(getattr(self, "_certdir", None))
+        if debug_path:
+            # SAME HANDLE DISCIPLINE as the request path: let go rather than
+            # close on a re-arm, because these fields are touched from every
+            # connection thread without a lock.
+            if debug_path != self._debug_for:
+                self._debug, self._debug_for = None, debug_path
+            self._debug = _append_capped(debug_path, text, self._debug)
+
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
@@ -12639,12 +12665,8 @@ class PinProxy:
         # inbound channel look identical to a healthy one: the routes CC sends
         # (worker/events, heartbeat) were all 200 in the trace while the
         # channel CC *receives* on left no line at all.
-        if _TRACE is not None:
-            _TRACE.write(
-                f"[c{getattr(self._local, 'cid', 0)}] CONNECT {target} "
-                f"tunnelled (no pin: bearer never seen)\n"
-            )
-            _TRACE.flush()
+        self._tunnel_trace(
+            f"CONNECT {target} tunnelled (no pin: bearer never seen)")
         up = None
         # EVERY HOP, not just the first. This path used to read one hop and
         # fall straight to a direct dial, so the fall-through the MITM path
@@ -12676,12 +12698,9 @@ class PinProxy:
                     # Refused BY this hop (not a transport failure). Try the
                     # hop behind it; a direct dial is what happens only when
                     # none of them will carry it.
-                    if _TRACE is not None:
-                        _TRACE.write(
-                            f"[c{getattr(self._local, 'cid', 0)}] chain refused "
-                            f"{target} ({(status or '').strip()}) — next hop\n"
-                        )
-                        _TRACE.flush()
+                    self._tunnel_trace(
+                        f"chain refused {target} "
+                        f"({(status or '').strip()}) — next hop")
                     up.close()
                     up = None
                     continue
@@ -12698,12 +12717,9 @@ class PinProxy:
             # Trusting the status alone made Remote Control silently deaf —
             # everything Claude Code SENDS still went through the MITM path at
             # 200 while the receive channel was a dead socket.
-            if _TRACE is not None:
-                _TRACE.write(
-                    f"[c{getattr(self._local, 'cid', 0)}] chain answered 200 but "
-                    f"the tunnel to {target} was already EOF — dialling direct\n"
-                )
-                _TRACE.flush()
+            self._tunnel_trace(
+                f"chain answered 200 but the tunnel to {target} was already "
+                f"EOF — dialling direct")
             up.close()
             up = None
         elif up is not None:

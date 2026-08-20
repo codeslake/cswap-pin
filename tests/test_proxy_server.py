@@ -5366,6 +5366,46 @@ class TestDrainReportsWhatItCut:
         assert teardown_drain_budget(
             "signal TERM", True, handed_over=True) == _DRAIN_SECONDS
 
+    def case_the_armed_trace_can_see_the_tunnel(self, certdir):
+        """An armed trace was blind to the one path that fails.
+
+        `trace-to` arms `self._debug`, which only the MITM request path wrote.
+        `_blind_tunnel` wrote to `_TRACE`, a module global opened once at
+        import from `CSWAP_PIN_DEBUG` and unreachable afterwards. So a trace
+        armed on a running daemon recorded every route Claude Code SENDS and
+        nothing about the channel it RECEIVES on — which is the outage the
+        comment at that very site describes.
+
+        MEASURED WITH A CONTROL before the fix: a real CONNECT driven through
+        a live pin produced ZERO lines in an armed trace. The zero was the
+        instrument.
+        """
+        import cswap_pin.proxy as pp
+
+        out = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(out))
+        pp._TRACE_CACHE.clear()
+
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        proxy._tunnel_trace("CONNECT example:443 tunnelled")
+        assert out.exists() and "CONNECT example:443" in out.read_text(), (
+            "the tunnel path does not write to the armable trace, so an "
+            "incident can only be traced by restarting the daemon — which "
+            "ends the very connections being investigated")
+
+        # AND ALL THREE TUNNEL SITES GO THROUGH IT, not just the one above.
+        # Reaching them needs a real chain, so read it out of the source.
+        import inspect
+
+        src = inspect.getsource(pp.PinProxy._blind_tunnel)
+        assert "_TRACE.write" not in src, (
+            "a tunnel line still writes straight to the import-time global, "
+            "so that line is invisible to a trace armed during an incident")
+        assert src.count("self._tunnel_trace(") >= 3, (
+            f"only {src.count('self._tunnel_trace(')} tunnel site(s) use the "
+            "shared writer; the others are blind to an armed trace")
+
     def case_every_beat_keeps_the_channel_count(self, certdir):
         """The beat REWRITES the marker, so a beat that omits the channel
         count erases the reap protection.
