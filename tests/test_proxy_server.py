@@ -5502,6 +5502,72 @@ class TestDrainReportsWhatItCut:
             "emailAddress": "keep"}
 
 
+    def case_a_bridge_that_posts_but_never_listens_is_named(self, certdir):
+        """Remote Control's inbound channel dies silently, and only the pin
+        can see it.
+
+        Claude Code 2.1.220, in the binary:
+
+            async connect(){ if(this.state!=="idle"&&this.state!=="reconnecting"){return} }
+            close(){ ... this.state="closed" ... }
+
+        Once closed, `connect()` returns immediately, forever. Outbound is a
+        separate path, so the session keeps POSTing, keeps heartbeating, and
+        reports `connection_status: connected` while receiving NOTHING. Every
+        external check says healthy; the one that matters is invisible.
+
+        Measured on this fleet: 6 of 13 live sessions in that state at once,
+        found only by a 45-second opt-in trace capture nobody runs. The pin is
+        the single point that sees BOTH directions, so it can answer the
+        question directly instead of leaving it to an errand.
+
+        THE PAIR AGAIN, as with the squatting standby: posting alone is not
+        the signal (a healthy bridge posts too) and a missing stream alone is
+        not either (a session that has said nothing yet has no stream and is
+        fine). Deaf means posted RECENTLY and holds no stream.
+        """
+        import cswap_pin.proxy as pp
+
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._reset_bridge_traffic()
+
+        A = "/v1/code/sessions/cse_AAA/worker/messages"
+        A_STREAM = "/v1/code/sessions/cse_AAA/worker/events/stream"
+        B = "/v1/code/sessions/cse_BBB/worker/messages"
+
+        # A posts and opens its stream. B posts and never does.
+        srv._note_bridge_traffic(A, now=100.0)
+        srv._note_bridge_traffic(A_STREAM, now=100.5)
+        srv._note_bridge_traffic(B, now=101.0)
+
+        deaf = srv.deaf_bridges(window=60.0, now=110.0)
+        assert deaf == ["cse_BBB"], (
+            f"the pin could not name the bridge that posts and never listens: "
+            f"{deaf}")
+
+        # THE CONTROL, and it is what stops this reporting the whole fleet:
+        # a bridge that has not posted inside the window is silent, not deaf.
+        assert srv.deaf_bridges(window=60.0, now=1000.0) == [], (
+            "a bridge that stopped posting long ago was reported deaf; every "
+            "ended session would be flagged forever")
+
+        # THE REAL CONSTRUCTOR MUST DO THIS, or the accounting is dead in
+        # production and green here. `_note_bridge_traffic` swallows its own
+        # errors on purpose (it sits on the request path), so a dict that was
+        # never created is a silent no-op nobody would ever see.
+        import inspect
+        src = inspect.getsource(pp.PinProxy.__init__)
+        assert "_reset_bridge_traffic()" in src, (
+            "the proxy never starts the per-bridge accounting, so "
+            "deaf_bridges() answers [] forever on a real machine")
+
+        # AND A STREAM ARRIVING LATE CLEARS IT. The transport can reconnect
+        # while state is still `reconnecting`; a verdict that never revises
+        # would tell the user to restart a session that just healed.
+        srv._note_bridge_traffic("/v1/code/sessions/cse_BBB/worker/events/stream",
+                                 now=111.0)
+        assert srv.deaf_bridges(window=60.0, now=112.0) == []
+
     def case_the_accept_probe_and_the_bind_probe_disagree(self, certdir):
         """`_port_accepts` must answer about ACCEPTING, not about BOUND.
 
