@@ -10527,10 +10527,19 @@ class PinProxy:
         if last is not None and now - last < _SLOW_REPORT_COOLDOWN_S:
             return
         self._last_slow_report = now
-        # THE ROUTE, NOT THE QUERY STRING. This log is read by people and
-        # pasted into reports, and the parameters carry session ids.
+        # THE ROUTE, NOT THE IDENTIFIERS. This log is read by people and
+        # pasted into reports. The query string was the obvious carrier; the
+        # WORKER routes put the bridge id in a path segment, and those are
+        # the ones that actually stall — the first line this ever wrote was
+        # `/v1/code/sessions/cse_01A7…/worker/events`. The segment is
+        # replaced rather than truncated, because which channel stalled is
+        # the whole value of the line.
+        route = path.split("?", 1)[0]
+        seen = _BRIDGE_ID.match(route)
+        if seen:
+            route = route[:seen.start(1)] + "<id>" + route[seen.end(1):]
         _log_lifecycle(
-            f"a {method} to {path.split('?', 1)[0]} took {total_ms:.0f}ms "
+            f"a {method} to {route} took {total_ms:.0f}ms "
             f"({pin_ms:.0f}ms of it inside the pin) — a live view times out "
             f"on stalls like this"
         )

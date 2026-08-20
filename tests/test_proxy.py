@@ -15702,6 +15702,24 @@ class TestASlowRequestSaysSo:
         P._note_slow_request("GET", "/v1/code/sessions", 2700.0, 20.0)
         assert len(lines) == 1
 
+    def case_a_bridge_id_in_the_PATH_never_reaches_the_log(self, monkeypatch):
+        """The id is not always in the query string — on the worker routes it
+        is a path segment, and those are the routes that actually stall.
+
+        Measured two minutes after this shipped, on the first line it ever
+        wrote: `a POST to /v1/code/sessions/cse_01A7.../worker/events took
+        2724ms`. Stripping the query string was the case I thought of; this
+        is the one the log immediately produced.
+        """
+        P, lines = self._proxy(monkeypatch)
+        P._note_slow_request(
+            "POST", "/v1/code/sessions/cse_01A7K9s3ZsKcTtJE5PceLWJL"
+                    "/worker/events", 2724.0, 0.0)
+        assert "cse_01A7K9s3ZsKcTtJE5PceLWJL" not in lines[0], lines[0]
+        # AND THE ROUTE MUST SURVIVE IT. Redacting the whole path would take
+        # the one fact that says WHICH channel stalled.
+        assert "/worker/events" in lines[0], lines[0]
+
     def case_the_query_string_never_reaches_the_log(self, monkeypatch):
         """daemon.log is read by people and pasted into reports, and a query
         string carries ids. The route is what locates the stall; the
