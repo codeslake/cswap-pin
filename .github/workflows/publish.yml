@@ -58,11 +58,23 @@ jobs:
           # `-n 4`, and a pytest without xdist refuses the flag outright
           # ("error: unrecognized arguments: -n") rather than ignoring it, so
           # the suite would not run at all. Measured on a clean venv.
+          # ONE PROCESS ON macOS. Three runs there ended in
+          # `INTERNALERROR> BrokenPipeError` from xdist's controller AFTER every
+          # test had passed — a worker gone at teardown, naming no test. It does
+          # not reproduce on real macOS hardware: measured at this commit and at
+          # the last commit CI passed, single-process and with `-n 4`, 116
+          # passed every time. Four workers on a runner with far fewer cores is
+          # the variable. `-n 0` distributes nothing and deselects nothing, so
+          # coverage is unchanged — and a test that really does take a worker
+          # down becomes a named failure instead of a silent one.
+          WORKERS=4
+          [ "$(uname -s)" = "Darwin" ] && WORKERS=0
           S="$(mktemp -d)"
           HOME="$S" XDG_DATA_HOME="$S/.local/share" \
             uv run --with pytest --with pytest-xdist --with cryptography \
             --with claude-swap \
             python -m pytest tests/ -q -p no:randomly \
+            -n "$WORKERS" \
             -m "not needs_host_seam"
       - run: uv build
       # The wheel is what users install; a build that produces an importable
