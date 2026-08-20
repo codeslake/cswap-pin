@@ -5748,6 +5748,36 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_the_token_is_fetched_once_per_request(self, certdir):
+        """A PINNED route that also sweeps fetched the same token TWICE.
+
+        Moving the sweep out of the bearer gate was right, but it carried its
+        own `_pin_token_provider()` call with it while the `if pinned:` block
+        kept its own. That provider re-reads the pin and the credential from
+        disk on every call, takes a cross-process lock, and on expiry POSTs a
+        refresh — so the doubling is not a spare dict lookup, it is real work
+        in front of the client on the request path.
+
+        Read from the SOURCE, because the alternative is standing up a full
+        MITM request just to count one call, and this reads the same fact.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        body = inspect.getsource(pp.PinProxy._handle_one_request_inner)
+        # THE SHAPE, NOT A COUNT. A count of the call text caught my own
+        # COMMENT and the legitimate retry — three "calls" of which one was
+        # prose. The invariant is that the pinned block REUSES the sweep's
+        # fetch instead of making its own; that is one line, and reverting it
+        # is what brings the double fetch back.
+        assert "token = _tok if _tok_fetched else self._pin_token_provider()" in body, (
+            "the pinned block fetches its own token again instead of reusing "
+            "the sweep's — a pinned route that also sweeps pays twice")
+        assert "_tok_fetched" in body, (
+            "no sentinel, so a falsy test would re-fetch whenever the "
+            "provider legitimately answers None")
+
     def case_nothing_deaf_locally_costs_no_process_spawn(self, certdir):
         """THE HOT PATH. `_report_deaf_bridges` runs on every bridge CREATE,
         and the union I added made it shell out to `ps -ww -axo` there —

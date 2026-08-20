@@ -12348,15 +12348,28 @@ class PinProxy:
         #
         # The cooldown gates the token fetch too, so an unpinned route costs
         # nothing beyond one regex.
+        # ONE TOKEN PER REQUEST, AND THIS IS WHY. Moving the sweep out of the
+        # bearer gate above was right, but it brought its own
+        # `_pin_token_provider()` call with it — so a PINNED route that also
+        # triggers a sweep fetched the same token TWICE. That provider re-reads
+        # the pin and the credential from disk on every call, takes a
+        # cross-process lock, and on expiry POSTs a refresh. Twice, in front of
+        # the client, on the request path.
+        #
+        # Fetched once here and shared. `None` is a real answer (the pin is
+        # the active account, or no usable token), so it is cached in a
+        # sentinel rather than re-fetched by a falsy test.
+        _tok_fetched = False
+        _tok = None
         if self._should_sweep_bridges(method, path):
             self._report_deaf_bridges()
-            _tok = self._pin_token_provider()
+            _tok, _tok_fetched = self._pin_token_provider(), True
             if _tok:
                 self._sweep_bridges_after_connect(_tok)
         swapped = False
         original_headers = list(headers)
         if pinned:
-            token = self._pin_token_provider()
+            token = _tok if _tok_fetched else self._pin_token_provider()
             # ONE REQUEST IS WORTH A RETRY, and only one. Everywhere else a
             # missing token costs a single request billed elsewhere; here it
             # gives the session away permanently, because the server fixes the
