@@ -15781,6 +15781,79 @@ class TestTheCredentialReadIsNotPaidPerRequest:
         assert len(reads) == 2, "the re-pin did not reach the provider"
 
 
+class TestADeferredRefreshIsCounted:
+    """`consume-busy` means another process held the slot's refresh lock, so
+    this request went out unpinned and the next one retries. It is benign by
+    design and it is also completely silent: the outcome lands in a set that
+    only `pin_is_noop` reads, and nothing records that it happened.
+
+    That silence is why "is the lock actually contended?" has been sitting
+    unmeasured. Two answers have very different consequences and no way to
+    tell them apart from outside: a handful an hour is the race the design
+    anticipates, and a steady stream means requests are regularly going out
+    on the wrong account's bearer -- which for a bridge-creating route is
+    permanent.
+
+    Rate-limited like the slow-request line, and for the same reason: a
+    contended slot would otherwise write one line per request.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _provider(self, monkeypatch, lines, outcomes):
+        from cswap_pin import proxy as pin_proxy
+
+        class _Outcome:
+            def __init__(self, error):
+                self.error = error
+                self.credentials = None
+
+        class _Switcher:
+            backup_dir = pathlib.Path("/nonexistent")
+
+            def resolve_account(self, key):
+                return "1", key, {}
+
+            def current_account_number(self):
+                return "9"
+
+            def read_account_credentials(self, num, mail):
+                return json.dumps({"claudeAiOauth": {
+                    "accessToken": "old", "expiresAt": 1}})
+
+            def consume_backup_grant(self, num, mail, snapshot):
+                return _Outcome(outcomes.pop(0) if outcomes else "consume-busy")
+
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle",
+                            lambda msg, *a, **k: lines.append(msg))
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@example.com", "org"))
+        monkeypatch.setattr(pin_proxy, "resolve_pin_token",
+                            lambda creds, consume: (None, consume(creds)))
+        return pin_proxy.make_pin_token_provider(_Switcher(), "1",
+                                                 "a@example.com")
+
+    def case_a_busy_slot_is_recorded(self, monkeypatch):
+        lines = []
+        provider = self._provider(monkeypatch, lines, [])
+        provider()
+        assert any("another process held" in ln for ln in lines), lines
+
+    def case_it_does_not_write_a_line_per_request(self, monkeypatch):
+        """A contended slot must not turn daemon.log into one line per
+        request — the same ceiling the slow-request report needed."""
+        from cswap_pin import proxy as pin_proxy
+        lines = []
+        provider = self._provider(monkeypatch, lines, [])
+        now = [0.0]
+        monkeypatch.setattr(pin_proxy.time, "monotonic", lambda: now[0])
+        for _ in range(20):
+            now[0] += 1.0
+            provider()
+        assert len(lines) == 1, f"{len(lines)} lines for 20 busy refreshes"
+
+
 class TestASlowRequestSaysSo:
     """A request that took seconds through this proxy left no trace anywhere.
 
