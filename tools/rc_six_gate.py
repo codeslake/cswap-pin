@@ -659,11 +659,23 @@ def check_reconnect_possible(binary: pathlib.Path | None) -> None:
     # Control with none of them coming back still printed PASS.
     backs = _rc_watch_count("back")
     discos = _rc_watch_count("disco")
+    # NOT A RATE, AND THE TWO FILES SAY SO THEMSELVES. rc_watch anchors them
+    # on different events on purpose ("Two questions, two anchors"): `.back`
+    # follows ANY disconnect, including a person toggling /remote-control off
+    # and on -- which is the only way the recovery path gets tested by hand,
+    # and is exactly this requirement's subject. `.disco` is narrower: only
+    # the account-change teardown. So printing "N reconnects (M disconnects
+    # seen)" reads as N-of-M recovered and is not. Measured here: 6 discos and
+    # 5 backs, of which 4 share a key, 2 discos have no matching back, and 1
+    # back belongs to a disconnect `.disco` does not contain at all.
     if backs:
         row("3 재연결", "PASS",
             f"the reset path is present in {binary.name} and rc_watch has "
             f"recorded {backs} reconnect(s) — a session that was torn off got "
-            f"a bridge again in the same process ({discos} disconnect(s) seen)")
+            f"a bridge again in the same process. Separately, {discos} "
+            f"account-change teardown(s) are on record — a NARROWER event "
+            f"than the reconnects above are counted from, so the two are not "
+            f"a recovery rate")
     elif discos:
         row("3 재연결", "WARN",
             f"{discos} session(s) were torn off Remote Control and rc_watch "
