@@ -974,7 +974,6 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
     return r.stdout[len(_ORACLE_SENTINEL):].startswith(b"OK")
 
 
-
 def _armor_decodes(body: bytes) -> bool:
     """Whether openssl will read this non-certificate block's armor.
 
@@ -1794,7 +1793,7 @@ def unwire_if_dead(certdir: Path) -> bool:
     # unpinned, silently, until someone notices. That is what a live machine
     # was found in that night: the pin healthy and serving on 36301, `env`
     # empty, and nothing in any log able to say which of two implementations
-    # with identical clear- semantics had done it. So ask again, spaced past a
+    # with identical clear-semantics had done it. So ask again, spaced past a
     # handover rather than inside one. The cost of being slow here is a launch
     # waiting a couple of seconds for a pin that really is dead; the cost of
     # being fast is unpinning the machine.
@@ -2456,7 +2455,6 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
 
-
 def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
                      body: "bytes | None" = None) -> None:
     """Record a SHA of each user text leaving in a `/worker/events` POST.
@@ -2501,18 +2499,6 @@ def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
             _log_lifecycle(f"worker events POST carried user text {marks}")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 # How rarely presence may trigger a superseded-bridge sweep. Presence is posted
 # by every attached session on the server's poll interval, so without a floor
 # this would list the account several times a second on a busy machine. Ten
@@ -2527,7 +2513,6 @@ _SLOW_REPORT_COOLDOWN_S = 60.0
 _BUSY_REPORT_COOLDOWN_S = 60.0
 _SLOW_RECHECK_S = 5.0
 _SLOW_CACHE: dict = {}
-
 
 
 def slow_report_ms(certdir) -> "float | None":
@@ -5597,7 +5582,7 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 #
 # NOT ON THE OTHER TWO. The held path exits so a HOLDER can respawn, and
 # `_teardown` under a signal has a supervisor doing `proc.wait(_DRAIN_SECONDS +
-# 2)` before SIGKILL. There the clock is load- bearing and raising it past the
+# 2)` before SIGKILL. There the clock is load-bearing and raising it past the
 # supervisor's patience only trades a logged cut for an unlogged one.
 _HANDOVER_DRAIN_SECONDS = float("inf")
 
@@ -11489,7 +11474,7 @@ class PinProxy:
                 # population it could refuse is the same-user processes that
                 # can read the 0600 secret anyway. What it actually cost: every
                 # host that is NOT api.anthropic.com takes this path — git,
-                # pip, npm, the auto- updater.
+                # pip, npm, the auto-updater.
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
                     return self._blind_tunnel(target, conn)
@@ -13666,7 +13651,6 @@ def _pump_detached(a: socket.socket, b: socket.socket, on_close=None) -> None:
                     pass
         return
     _PUMP.add(a, b, on_close)
-
 
 
 if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
