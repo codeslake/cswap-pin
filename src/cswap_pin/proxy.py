@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
+import urllib.error
 import urllib.request
 from urllib.parse import quote, unquote, urlsplit
 
@@ -2838,15 +2839,52 @@ def replay_lost_turns(bridge: str, oauth_token: "str | None") -> None:
         return
     sent = 0
     for text in missing[:20]:
-        payload = {
-            "event_type": "user",
-            "payload": {"isSynthetic": True,
-                        "message": {"content": text, "role": "user"},
-                        "parent_tool_use_id": None,
-                        "session_id": bridge,
-                        "timestamp": time.strftime(
-                            "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())},
-        }
+        ok, why = _post_one_turn(bridge, auth, text)
+        if ok:
+            sent += 1
+            continue
+        # THE SERVER'S OWN WORDS, not just the status. The first cut logged
+        # `<HTTPError 400: 'Bad Request'>` and nothing else, which says only
+        # that something is wrong with a body I chose -- and a 400 after a 403
+        # is progress worth reading, because it means the CREDENTIAL is now
+        # right and the envelope is what is left. The body names the field.
+        _log_lifecycle(
+            f"a queued turn could not be replayed to the bridge: {why} — the "
+            "CLI took it and never posted it, so claude.ai will not show it")
+        break
+    if sent:
+        _log_lifecycle(
+            f"replayed {sent} of {len(missing)} turn(s) the CLI took while busy "
+            "and never posted; without this they exist only in the transcript")
+
+
+#: Envelopes to try for one replayed turn, in order, until the server takes one.
+#:
+#: A LIST BECAUSE THE ALTERNATIVE IS A DEPLOY PER GUESS. The shape is not
+#: documented anywhere we can read, the CLI's own POST bodies are not in the
+#: trace, and the worker JWT that would let this be probed from outside lives
+#: only in the daemon's memory. Four candidates and a log line naming the
+#: winner converges in one release; when the winner is known this collapses to
+#: it alone.
+def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
+    body = {"isSynthetic": True,
+            "message": {"content": text, "role": "user"},
+            "parent_tool_use_id": None,
+            "session_id": bridge,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+    return [
+        {"events": [{"event_type": "user", "payload": body}]},
+        {"event_type": "user", "payload": body},
+        {"events": [body]},
+        body,
+    ]
+
+
+def _post_one_turn(bridge: str, auth: str, text: str) -> "tuple[bool, str]":
+    """`(True, which)` on the first envelope the server accepts, else the last
+    refusal WITH ITS BODY -- the status alone cannot say which field is wrong."""
+    last = "no envelope attempted"
+    for i, payload in enumerate(_turn_envelopes(bridge, text)):
         try:
             req = urllib.request.Request(
                 f"https://api.anthropic.com/v1/code/sessions/{bridge}/worker/events",
@@ -2857,17 +2895,17 @@ def replay_lost_turns(bridge: str, oauth_token: "str | None") -> None:
             with urllib.request.urlopen(
                     req, timeout=15, context=_verifying_context()) as resp:
                 if 200 <= resp.status < 300:
-                    sent += 1
+                    return True, f"envelope {i}"
+                last = f"envelope {i}: HTTP {resp.status}"
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode(errors="replace")[:200]
+            except Exception:  # noqa: BLE001
+                detail = "(body unreadable)"
+            last = f"envelope {i}: HTTP {exc.code} {detail}"
         except Exception as exc:  # noqa: BLE001
-            _log_lifecycle(
-                f"a queued turn could not be replayed to the bridge: {exc!r} — "
-                "the CLI took it and never posted it, so claude.ai will not "
-                "show it")
-            break
-    if sent:
-        _log_lifecycle(
-            f"replayed {sent} of {len(missing)} turn(s) the CLI took while busy "
-            "and never posted; without this they exist only in the transcript")
+            return False, f"envelope {i}: {exc!r}"
+    return False, last
 
 
 # How rarely presence may trigger a superseded-bridge sweep. Presence is posted
