@@ -20,6 +20,7 @@ import base64
 import contextlib
 import datetime as _dt
 import glob
+import hashlib
 import itertools
 import json
 import os
@@ -2720,6 +2721,29 @@ def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
         return
     if "worker_epoch" in doc:
         _WORKER_EPOCH[bridge] = doc["worker_epoch"]
+    # WAS IT EVEN SENT? That is the one question that separates a CLI that
+    # never emits a queued turn from one that emits it and loses it downstream,
+    # and only the pin can see it -- the text exists in no other request.
+    #
+    # SHA of each user event's text, never the text. Twelve hex is plenty to
+    # match against a queue record and carries nothing back.
+    events = doc.get("events")
+    if isinstance(events, list):
+        marks = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            msg = ((ev.get("payload") or {}).get("message") or {})
+            if msg.get("role") != "user":
+                continue
+            c = msg.get("content")
+            txt = c if isinstance(c, str) else " ".join(
+                b.get("text") or "" for b in (c or []) if isinstance(b, dict))
+            if txt.strip():
+                marks.append(hashlib.sha256(
+                    txt.strip()[:40].encode()).hexdigest()[:12])
+        if marks:
+            _log_lifecycle(f"worker events POST carried user text {marks}")
     if not _SHAPE_LOGGED:
         events = doc.get("events")
         if isinstance(events, list) and events and isinstance(events[0], dict):
