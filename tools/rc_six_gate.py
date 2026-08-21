@@ -2022,6 +2022,50 @@ def queued_arrivals(lo: str, hi: str) -> "tuple[list, str]":
     return out, ""
 
 
+def queued_images(lo: str, hi: str) -> "tuple[list, str]":
+    """Timestamps of images PASTED into the CLI while a turn was running.
+
+    THE IMAGE HALF OF THE SAME BLINDNESS. Requirement 9's local arm read
+    `type: "user"` rows, and a mid-turn paste is not one — it is queued, and
+    the transcript records it as an ATTACHMENT:
+
+        {"type":"attachment",
+         "attachment":{"type":"queued_command",
+                       "prompt":[{"type":"text",...},{"type":"image",...}]}}
+
+    So the arm saw nothing, reported "no image entered this CLI", and passed on
+    the exemption for an event that had happened twice. Measured: two pastes at
+    05:56:48 and 05:57:04, both present here, neither on the server.
+
+    `queue-operation` carries text only, which is why requirement 8's arm could
+    not be reused — the image lives in this record and nowhere else.
+    """
+    path, why = _transcript_path()
+    if why:
+        return [], why
+    out = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if '"queued_command"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            att = rec.get("attachment") or {}
+            if att.get("type") != "queued_command":
+                continue
+            ts = (rec.get("timestamp") or "")[:19]
+            if not (lo <= ts <= hi):
+                continue
+            prompt = att.get("prompt")
+            if not isinstance(prompt, list):
+                continue
+            if any(isinstance(b, dict) and b.get("type") == "image" for b in prompt):
+                out.append(ts)
+    return out, ""
+
+
 def _cli_entered_turns(lo: str, hi: str, client: list) -> "tuple[list, str]":
     """Timestamps of turns that ENTERED at the CLI in `[lo, hi]`, or `([], why)`.
 
@@ -2165,6 +2209,12 @@ def check_outbound_image(port: int) -> None:
               if r.get("source") == "worker" and "image" in _event_blocks(r)]
     span = sorted(r.get("created_at") or "" for r in rows)
     pasted, why_local = _cli_pasted_images(span[0][:19], span[-1][:19], inbound)
+    # BOTH SHAPES, because a paste lands in one or the other depending only on
+    # whether a turn happened to be running: a `type:"user"` row when the
+    # session was idle, a `queued_command` attachment when it was not. Reading
+    # one of them made this row exempt itself on a window that held two pastes.
+    queued, _why_qi = queued_images(span[0][:19], span[-1][:19])
+    pasted = sorted(set(pasted) | set(queued))
 
     if why_local:
         row("9 CLI→ai이미지", "UNPROVEN",
