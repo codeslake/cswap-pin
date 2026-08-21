@@ -5680,7 +5680,7 @@ class TestDaemonPortStability:
 
         So on macOS the guard raised for a perfectly good socket, the
         handdown was refused, and the successor bound a FRESH port. Measured
-        on wmac in the deploy that found this:
+        on host-b in the deploy that found this:
 
             pid=60620 ignoring the handed-down fd 3: [Errno 42] ...
             pid=60620 serving on port 58062        <- not the wired 53749
@@ -6231,7 +6231,7 @@ class TestDaemonPortStability:
         What it cannot cover is its own death: the descriptor is closed by the
         kernel when the holder exits, and a session's HTTPS_PROXY was fixed at
         exec, so `cswap` fully off strands every wired session permanently.
-        Measured: 198 of 199 ConnectionRefused. wmac carries 4 sessions on 53749
+        Measured: 198 of 199 ConnectionRefused. host-b carries 4 sessions on 53749
         in exactly that position.
 
         So a THIRD process holds the same descriptor and does nothing with it.
@@ -6750,7 +6750,7 @@ class TestDaemonPortStability:
         # `dup2(x, 3)` — which SILENTLY CLOSES whatever fd 3 already is.
         #
         # In a pytest-xdist worker fd 3 is execnet's channel to the controller
-        # (measured on wmac: fd 3 is a FIFO, and 0/1 are the inherited tty).
+        # (measured on host-b: fd 3 is a FIFO, and 0/1 are the inherited tty).
         # Its receiver thread reads that descriptor CONCURRENTLY, so swapping
         # fd 3 out breaks the channel mid-read — and saving and restoring it
         # does not help, because the damage happens inside the window, not at
@@ -8465,7 +8465,7 @@ class TestDaemonPortStability:
         attempt usually works — and it is silence for a child that can NEVER
         start, which is the state a bad deploy leaves behind.
 
-        MEASURED here, on wmac, caused by running the README's own install
+        MEASURED here, on host-b, caused by running the README's own install
         command against an editable install: it replaced the checkout with the
         PyPI release and took `cswap_pin` out of the tool env with it. The
         daemon already running kept serving (its code is in memory), while
@@ -8770,7 +8770,7 @@ class TestDaemonPortStability:
         the holder for good, and the next thing that went wrong stranded every
         session:
 
-          wmac  12:57  53749 -> served UNHELD on 54264
+          host-b  12:57  53749 -> served UNHELD on 54264
           host-a 13:03  36301 -> 45357, and .claude.json followed it there
 
         Documenting "upgrade carefully" was the first answer and it is not one:

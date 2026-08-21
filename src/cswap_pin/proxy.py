@@ -2729,9 +2729,9 @@ def is_pinned_route(path: str) -> bool:
     # Claude Code polls it hourly and feeds the answer into `setSessionCache`,
     # which `isPolicyAllowed("allow_remote_control")` reads. The same answer is
     # written to the machine-wide `policy-limits.json`, and the pre-fetch that
-    # `/remote-control` runs first (2.1.234) returns early when a document is
-    # already cached:  async function ...(){ try{
-    # if(getResponseFromCache()!==null) return }  so a denial that lands once
+    # `/remote-control` runs first returns early when a document is already
+    # cached — it opens `if (getResponseFromCache() !== null) return` — so a
+    # denial that lands once
     # is never re-asked for the life of the process. No restart, no recovery,
     # and no request on the wire to see. Same reasoning as
     # ``/api/oauth/validate`` above: both are QUESTIONS about who this session
@@ -3232,9 +3232,13 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     # the whole file, and the reasoning held only while this was the sole
     # writer. It is not. FOUR others write this same path, all through the
     # host's insertion-order writer (`json.dumps(data, indent=2)`, no
-    # sort_keys):  claude_swap settings.py  save_settings / set_setting /
-    # unset_setting claude_swap pin.py       _clear_pin_record  Each appends a
-    # NEW section at the end, because `raw[k] = v` on a fresh key does. Sorting
+    # sort_keys):
+    #
+    #     settings.py   save_settings / set_setting / unset_setting
+    #     pin.py        _clear_pin_record
+    #
+    # Each appends a NEW section at the end, because `raw[k] = v` on a fresh
+    # key does. Sorting
     # here then drags that key inward on the next pin — an order-only diff on a
     # tracked file, once per new section, forever. So the invariant that
     # matters on a SHARED file is agreeing with its other writers, not being
@@ -5653,14 +5657,13 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 
 # THE CEILING FOR A HANDOVER WHOSE SUCCESSOR IS ALREADY SERVING, and it is a
 # different number from `_DRAIN_SECONDS` because it buys a different thing.
-# With the `_blind_tunnel` debt fixed, three hosts departed and reported the
-# phase split:  host-a  cut 16   (16 mid-response, 0 before headers) wmac   cut
-# 3    ( 3 mid-response, 0 before headers) pmac   drained clean — 0 owed, 0
-# live bridges  ZERO "before headers" ON EVERY HOST. So the drain is not
-# malfunctioning and the count is not bookkeeping: those are replies that had
-# already begun streaming to a user and genuinely did not finish inside thirty
-# seconds. A pooled-idle-connection explanation was proposed and died on this
-# measurement. So the fault is the CEILING, and at these two call sites paying
+# ZERO CUTS BEFORE HEADERS, on every host measured. Every cut was
+# mid-response, so the drain is not malfunctioning and the count is not
+# bookkeeping: those are replies that had already begun streaming to a user
+# and genuinely did not finish inside thirty seconds. A pooled-idle-connection
+# explanation was proposed and died on that split.
+#
+# So the fault is the CEILING, and at these two call sites paying
 # it costs nothing. `release_listener()` has already handed the port on — site
 # 1's successor was spawned by the holder and is serving, site 3's took the
 # listening socket by fd — so this process accepts nothing and holds nothing
@@ -7610,8 +7613,10 @@ def _spawn_daemon(
     # in one day on live machines. An old daemon notices its code changed and
     # hands its listening socket to a successor — using the handover ITS OWN
     # VERSION implements. If that successor runs unheld, the port has left the
-    # holder for good: wmac  12:57  53749 -> served UNHELD on 54264 host-a
-    # 13:03  36301 -> 45357, and .claude.json followed it there A README saying
+    # holder for good — measured on two hosts the same day, each moving to a
+    # fresh port and `.claude.json` following it there.
+    #
+    # A README saying
     # "upgrade carefully" was the first answer and it is not one: a deploy is
     # not a procedure someone follows, it is whatever the running code does.
     # The holder here ADOPTS the socket it was handed rather than binding a
@@ -11465,7 +11470,7 @@ class PinProxy:
         "NO PROCESS ON THIS MACHINE" IS DELIBERATELY NOT A CONDITION. The pin
         exists so ONE account holds every machine's bridges, so this host sees
         the other machines' sessions and cannot check their pids. It would
-        have been destructive: ``pmac-inbound-demo`` and ``pinverify-pmac``
+        have been destructive: ``host-c-inbound-demo`` and ``pinverify-host-c``
         have no process here and were both LIVE on host-c when this
         was measured. Local liveness is used only as a NEGATIVE guard — never
         close something running here — never as evidence anything is dead.

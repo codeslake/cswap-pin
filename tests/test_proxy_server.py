@@ -6680,8 +6680,8 @@ class TestDrainReportsWhatItCut:
         Measured 2026-08-18, all three hosts, with the phase split live:
 
             host-a  cut 16   (16 mid-response, 0 before headers)
-            wmac   cut  3   ( 3 mid-response, 0 before headers)
-            pmac   drained clean
+            host-b   cut  3   ( 3 mid-response, 0 before headers)
+            host-c   drained clean
 
         Zero "before headers" anywhere, so those are replies that had already
         begun streaming to a user and did not finish inside thirty seconds. The
