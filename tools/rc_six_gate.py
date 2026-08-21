@@ -1544,12 +1544,25 @@ def selfsend(text: str) -> "tuple[bool, str]":
     receiver as its own sender. Nothing below wraps an envelope — this is a
     probe, not a peer message — and the daemon itself has no such rule.
 
-    It exists because requirement 8 had no event of its own to watch. Assistant
-    text is posted on the CLI's own schedule, so a verdict built on it can only
-    say "the CLI talks"; a turn that ENTERS here and then appears in the
-    server's copy is the round trip the requirement actually claims. Manufacture
-    the event rather than wait for one — an UNPROVEN whose cause is "nothing
-    happened to look at" is a gap in the instrument, not in the fleet.
+    IT DOES NOT PRODUCE A SERVER EVENT, and this docstring said it did — "at a
+    turn boundary" — before anyone checked. Measured: a token injected at 05:24
+    was still absent from the server half an hour and several COMPLETED turns
+    later. An injection that lands while a turn is running is absorbed into
+    that turn; it never becomes a user turn of its own, so nothing posts it.
+    The boundary story was a hypothesis written as a fact, and it reached the
+    standing cron prompt that way.
+
+    So this is a DELIVERY probe: it proves the daemon can put text in front of
+    this session. Requirement 8's evidence comes from real CLI turns instead —
+    cron prompts, task notifications, the user typing here — which do post,
+    with `source == "worker"`.
+
+    TEXT ONLY, and that is measured too rather than read off the caller.
+    Against the live daemon: `text` as a block list is refused outright
+    (`expected string, received array`), and an `image` field beside the text
+    is accepted with `ok:true` and then silently dropped — the arrival carries
+    the text alone. A 200 from this socket is not evidence that what you sent
+    was carried.
     """
     short = os.path.basename(os.environ.get("CLAUDE_JOB_DIR", ""))
     if not short:
