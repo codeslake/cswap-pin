@@ -1485,7 +1485,8 @@ def _resolve_pinned_slot(backup_root: Path, email: str) -> str | None:
         return None
 
 
-def heal(backup_root: Path, identity: dict | None = None) -> bool:
+def heal(backup_root: Path, identity: dict | None = None,
+         lock_timeout: float | None = None) -> bool:
     """Bring the pin back if it is pinned but not serving. True when it did.
 
     ``identity`` is the ``oauthAccount`` the live config should name while the
@@ -1493,6 +1494,12 @@ def heal(backup_root: Path, identity: dict | None = None) -> bool:
     keeps working unchanged; when it is absent this function's owner-field
     behaviour is exactly what it was. Passing it re-asserts the field on every
     launch, which is the half a single splice at switch time cannot cover.
+
+    ``lock_timeout`` is the caller's budget for the config lock. The host
+    budgets its OWN launch lock at half a second and had no way to say so
+    across this boundary, so the splice's default made a contended launch wait
+    ten times that -- twice, since `ensure_proxy` takes the same lock after.
+    Keyword-defaulted for the same reason as ``identity``.
 
     RECOVERY WITHOUT A SESSION RESTART. Everything else in this module reacts
     to a launch: ``ensure_proxy`` runs when a NEW session starts, so if the
@@ -1643,7 +1650,8 @@ def heal(backup_root: Path, identity: dict | None = None) -> bool:
             # BOTH KEYS, like the splice's own no-op test. Comparing the
             # account uuid alone calls a config healthy whose ORG has drifted,
             # and Claude Code's pointer comparison uses both.
-            wrote = splice_config_identity(identity)
+            wrote = splice_config_identity(identity,
+                                           lock_timeout=lock_timeout)
             _now = _login_identity()
             _want = tuple(identity.get(k) or None
                           for k in ("accountUuid", "organizationUuid"))
@@ -4161,7 +4169,13 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     return ensure_proxy(switcher) is not None
 
 
-def splice_config_identity(identity: dict | None) -> bool:
+#: The splice's own lock budget when the caller names none -- a hand-run
+#: `cswap pin`, where waiting is better than skipping the write.
+_SPLICE_LOCK_S = 5.0
+
+
+def splice_config_identity(identity: dict | None,
+                           lock_timeout: float | None = None) -> bool:
     """Make the live config name ``identity``. True when it changed anything.
 
     ONLY ``oauthAccount``. Everything else in that file belongs to Claude Code,
@@ -4196,7 +4210,9 @@ def splice_config_identity(identity: dict | None) -> bool:
     # drifted until the next launch, which is the fail-open this whole path
     # already has.
     try:
-        with require("claude_locks").claude_config_lock(timeout=5):
+        with require("claude_locks").claude_config_lock(
+                timeout=_SPLICE_LOCK_S if lock_timeout is None
+                else lock_timeout):
             return _splice_config_identity_locked(cfg, identity)
     except Exception:  # noqa: BLE001 — a launch must never fail on the pin
         return False

@@ -16366,6 +16366,53 @@ class TestTheSpliceHoldsTheConfigLock:
             "minted afterwards can reattach")
         assert after == full
 
+
+    def case_the_callers_lock_budget_reaches_the_lock(self, tmp_path,
+                                                      monkeypatch):
+        """THE HOST BUDGETS ITS LAUNCH LOCK AT HALF A SECOND and had no way to
+        say so across this boundary. The splice's own default made a contended
+        launch wait ten times that -- twice over, since `ensure_proxy` takes
+        the same lock afterwards.
+        """
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        asked = []
+
+        class _Lock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"oauthAccount": {"accountUuid": "OTHER"}}))
+
+        def _lock(**kw):
+            asked.append(kw.get("timeout"))
+            return _Lock()
+
+        real = pin_proxy.require
+        fakes = {
+            "claude_locks": types.SimpleNamespace(claude_config_lock=_lock),
+            "paths": types.SimpleNamespace(get_global_config_path=lambda: cfg),
+        }
+        monkeypatch.setattr(pin_proxy, "require",
+                            lambda name: fakes.get(name) or real(name))
+
+        pin_proxy.splice_config_identity(self.PIN, lock_timeout=0.5)
+        assert asked == [0.5], (
+            f"the launch budget did not reach the lock (asked {asked})")
+
+        # THE CONTROL: a caller that names none still gets a budget generous
+        # enough for a hand-run `cswap pin`, where waiting beats skipping.
+        asked.clear()
+        cfg.write_text(json.dumps({"oauthAccount": {"accountUuid": "OTHER"}}))
+        pin_proxy.splice_config_identity(self.PIN)
+        assert asked == [pin_proxy._SPLICE_LOCK_S]
+
     def case_CONTROL_a_matching_uuid_in_a_different_org_is_written(
         self, tmp_path, monkeypatch
     ):
