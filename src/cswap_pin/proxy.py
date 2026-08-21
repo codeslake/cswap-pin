@@ -2662,6 +2662,214 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 # to. Same shape as the routes above, captured rather than merely matched.
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
+#: Worker JWTs seen in flight, `{bridge: (authorization_value, monotonic)}`.
+#:
+#: THIS IS THE ONLY PLACE THE WORKER CREDENTIAL EXISTS OUTSIDE CLAUDE CODE. It
+#: is not on disk -- the session registry carries `bridgeSessionId`,
+#: `messagingSocketPath` and a dozen other fields and no token -- and it is not
+#: the OAuth bearer the rest of this file swaps: a POST to `/worker/events`
+#: carrying the pinned OAuth token is `403 permission_error`, measured across
+#: four different body shapes, which is the same 403 storm that put the
+#: `/worker` subtree outside `is_pinned_route` in the first place.
+#:
+#: Held in memory only, never written, and it expires: a JWT nobody has
+#: refreshed in ten minutes belongs to a session that has stopped talking.
+_WORKER_JWT: "dict[str, tuple[str, float]]" = {}
+_WORKER_JWT_TTL_S = 600.0
+
+
+def note_worker_auth(path: str, headers: "list[tuple[str, str]]") -> None:
+    """Remember the worker credential for the bridge this call belongs to."""
+    if not _WORKER_SUBTREE.search(path):
+        return
+    m = _BRIDGE_ID.match(path)
+    if not m:
+        return
+    for k, v in headers:
+        if k.lower() == "authorization" and v:
+            _WORKER_JWT[m.group(1)] = (v, time.monotonic())
+            return
+
+
+def worker_auth(bridge: str) -> "str | None":
+    """The remembered worker credential, or `None` once it is stale."""
+    got = _WORKER_JWT.get(bridge)
+    if not got:
+        return None
+    value, seen = got
+    if time.monotonic() - seen > _WORKER_JWT_TTL_S:
+        _WORKER_JWT.pop(bridge, None)
+        return None
+    return value
+
+
+#: How often one bridge may be reconciled. The read costs a listing and a
+#: transcript scan, and the loss it repairs is minutes old by definition.
+_REPLAY_COOLDOWN_S = 90.0
+_REPLAY_LAST: "dict[str, float]" = {}
+#: Younger than this and a turn may simply still be on its way.
+_REPLAY_MIN_AGE_S = 120.0
+
+
+def _session_for_bridge(bridge: str) -> "str | None":
+    """The local sessionId whose bridge this is, from the session registry.
+
+    The registry writes `session_<rest>` where every route uses `cse_<rest>`,
+    so the prefix is normalised before comparing -- joining the raw strings
+    misses every session at once, which reads as an empty fleet.
+    """
+    want = bridge.split("_", 1)[-1]
+    # `get_claude_config_home`, NOT `~/.claude`. The two are the same only when
+    # `CLAUDE_CONFIG_DIR` is unset, and every other reader in this file already
+    # goes through the resolver -- hardcoding the path would make this the one
+    # place that looks somewhere else on a machine that moved its config.
+    get_claude_config_home = require("paths").get_claude_config_home
+    try:
+        entries = sorted((get_claude_config_home() / "sessions").glob("*.json"))
+    except OSError:
+        return None
+    for p in entries:
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        got = rec.get("bridgeSessionId")
+        if isinstance(got, str) and got.split("_", 1)[-1] == want:
+            sid = rec.get("sessionId")
+            return sid if isinstance(sid, str) else None
+    return None
+
+
+def queued_texts(session_id: str, min_age_s: float = _REPLAY_MIN_AGE_S) -> "list[str]":
+    """Text that entered the CLI while a turn was running, oldest first.
+
+    INPUT TAKEN MID-TURN IS QUEUED, AND THE QUEUE IS WHERE IT STOPS. Claude
+    Code records it as `{"type":"queue-operation","operation":"enqueue",
+    "content":...}`, hands it to the model, and never posts it: measured on one
+    session, 34 of 44 turns present in the transcript and absent from the
+    server, while `POST /worker/events` went out and returned 200 throughout
+    carrying everything else. Nothing in any request body contains this text,
+    so the transcript is the only place it can be recovered from.
+    """
+    out: "list[str]" = []
+    get_claude_config_home = require("paths").get_claude_config_home
+    try:
+        paths = list(
+            (get_claude_config_home() / "projects").glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        return out
+    if not paths:
+        return out
+    cutoff = time.time() - min_age_s
+    try:
+        with open(max(paths, key=lambda p: p.stat().st_mtime), errors="replace") as fh:
+            for line in fh:
+                if '"queue-operation"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("operation") != "enqueue":
+                    continue
+                text = rec.get("content")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                stamp = rec.get("timestamp") or ""
+                try:
+                    when = _dt.datetime.strptime(
+                        stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                            tzinfo=_dt.timezone.utc).timestamp()
+                except (ValueError, TypeError):
+                    continue
+                if when <= cutoff:
+                    out.append(text)
+    # BROAD ON PURPOSE, because this runs on the request path in front of a
+    # live client. The first cut caught only OSError and used `calendar`, which
+    # this module does not import -- a NameError on the very first record with
+    # a timestamp, raised straight into the handler. It never shipped only
+    # because the test asked for the value instead of asking whether the
+    # function ran.
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def replay_lost_turns(bridge: str, oauth_token: "str | None") -> None:
+    """Post the turns this CLI took and never sent, so claude.ai can show them.
+
+    Two credentials, and they are not interchangeable. Reading the server's copy
+    is a pinned OAuth route; writing to `/worker/events` is the worker's own
+    JWT, and sending the OAuth token there is `403 permission_error` -- measured
+    against four candidate body shapes, all four identical, which is what says
+    the refusal is about the credential rather than the envelope.
+
+    Never raises: this runs on the request path in front of a live client.
+    """
+    if not oauth_token:
+        return
+    auth = worker_auth(bridge)
+    if not auth:
+        return
+    last = _REPLAY_LAST.get(bridge, 0.0)
+    if time.monotonic() - last < _REPLAY_COOLDOWN_S:
+        return
+    _REPLAY_LAST[bridge] = time.monotonic()
+
+    session_id = _session_for_bridge(bridge)
+    if not session_id:
+        return
+    queued = queued_texts(session_id)
+    if not queued:
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://api.anthropic.com/v1/code/sessions/{bridge}/events?limit=500",
+            headers={"Authorization": f"Bearer {oauth_token}",
+                     "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(
+                req, timeout=15, context=_verifying_context()) as resp:
+            held = resp.read().decode(errors="replace")
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return
+
+    missing = [t for t in queued if t.strip()[:40] and t.strip()[:40] not in held]
+    if not missing:
+        return
+    sent = 0
+    for text in missing[:20]:
+        payload = {
+            "event_type": "user",
+            "payload": {"isSynthetic": True,
+                        "message": {"content": text, "role": "user"},
+                        "parent_tool_use_id": None,
+                        "session_id": bridge,
+                        "timestamp": time.strftime(
+                            "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())},
+        }
+        try:
+            req = urllib.request.Request(
+                f"https://api.anthropic.com/v1/code/sessions/{bridge}/worker/events",
+                data=json.dumps(payload).encode(),
+                headers={"Authorization": auth,
+                         "Content-Type": "application/json",
+                         "anthropic-version": "2023-06-01"})
+            with urllib.request.urlopen(
+                    req, timeout=15, context=_verifying_context()) as resp:
+                if 200 <= resp.status < 300:
+                    sent += 1
+        except Exception as exc:  # noqa: BLE001
+            _log_lifecycle(
+                f"a queued turn could not be replayed to the bridge: {exc!r} — "
+                "the CLI took it and never posted it, so claude.ai will not "
+                "show it")
+            break
+    if sent:
+        _log_lifecycle(
+            f"replayed {sent} of {len(missing)} turn(s) the CLI took while busy "
+            "and never posted; without this they exist only in the transcript")
+
+
 # How rarely presence may trigger a superseded-bridge sweep. Presence is posted
 # by every attached session on the server's poll interval, so without a floor
 # this would list the account several times a second on a busy machine. Ten
@@ -2928,6 +3136,27 @@ def is_pinned_route(path: str) -> bool:
         or path.startswith("/api/frame/")
         or path.startswith("/v1/ultrareview/")
         or path.startswith("/api/oauth/files/")
+        # THE WRITE HALF OF THAT SAME PAIR, and leaving it out put every file
+        # this CLI sends on the wrong account. `/api/oauth/files/` covers the
+        # READ; the UPLOAD is `/api/oauth/file_upload`, which that prefix does
+        # not match -- no trailing slash, different word. So the bytes went up
+        # as the ACTIVE account and the browser, logged in as the PINNED one,
+        # asked its own org for a uuid that was never there.
+        #
+        # Measured 2026-08-21 with the live trace, one line settling it:
+        #   POST /api/oauth/file_upload pinned=False swapped=False -> 201
+        # The 201 excludes "the bytes never went up", which was the competing
+        # explanation and is indistinguishable from this one from the browser
+        # side. What the user saw was
+        #   GET /api/organizations/<org>/files/<uuid>  404, and its preview 404
+        # with that uuid verbatim, while `client/presence` returned 200 on the
+        # same browser profile -- the control that rules the route out.
+        #
+        # Exact match plus the query form, never a prefix: the neighbouring
+        # rows are exact for the same reason, and `startswith("/api/oauth/file")`
+        # would silently pin whatever is added beside it next.
+        or path == "/api/oauth/file_upload"
+        or path.startswith("/api/oauth/file_upload?")
     )
 
 
@@ -12604,6 +12833,10 @@ class PinProxy:
                 headers.append((k.strip(), v.strip()))
         body = _read_body(tls, headers)
 
+        # BEFORE ANY BEARER GATE. The worker credential is only ever visible in
+        # flight, and this is the one place it passes through.
+        note_worker_auth(path, headers)
+
         pinned = is_pinned_route(path)
         # TWO CLOCKS, because the total alone cannot say who was slow — see
         # `_note_slow_request`. `_t_pin` closes where the request leaves us.
@@ -12635,6 +12868,14 @@ class PinProxy:
             _tok, _tok_fetched = self._pin_token_provider(), True
             if _tok:
                 self._sweep_bridges_after_connect(_tok)
+        # SAME TRIGGER, because worker traffic is exactly when a session has
+        # been busy and may have swallowed a turn. Its own cooldown keeps this
+        # off the hot path.
+        _m_bridge = _BRIDGE_ID.match(path)
+        if _m_bridge and _WORKER_SUBTREE.search(path):
+            if not _tok_fetched:
+                _tok, _tok_fetched = self._pin_token_provider(), True
+            replay_lost_turns(_m_bridge.group(1), _tok)
         swapped = False
         original_headers = list(headers)
         if pinned:
