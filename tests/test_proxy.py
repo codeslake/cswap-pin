@@ -6012,7 +6012,7 @@ class TestDaemonPortStability:
     def case_a_standby_on_an_abandoned_port_does_not_rebuild_on_it(self, tmp_path):
         """The runaway. A standby must not resurrect a port nothing is wired to.
 
-        MEASURED ON LMD42 AND IT COMPOUNDS. Every deploy hands the daemon over
+        MEASURED ON THE LINUX HOST AND IT COMPOUNDS. Every deploy hands the daemon over
         to a new lineage, and the previous lineage's standby is left holding a
         socket that nobody serves and nobody dials. Silence is exactly what it
         is waiting for, so it arms, rebuilds a full holder+daemon+standby on
@@ -10887,6 +10887,91 @@ class TestHealRestoresWithoutRestart:
         cfg.write_text("{}")
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         return root, cfg
+
+    def case_the_owner_field_is_re_asserted_on_every_launch(
+        self, tmp_path, monkeypatch
+    ):
+        """A SINGLE SPLICE AT SWITCH TIME CANNOT HOLD THE FIELD.
+
+        `_perform_switch` writes the pin's identity into `oauthAccount` and
+        that is correct; something else rewrites it between switches.
+        Measured on one mac by sampling the field beside the roster's
+        `activeAccountNumber`, which the pin never writes: once the slot moved
+        and the field became the pin (the splice took), and once the slot did
+        NOT move and the field became a third account (nobody switched, so
+        something else owns it).
+
+        Claude Code compares each bridge pointer against this field on
+        relaunch, so a pointer stamped while it is wrong cannot reattach --
+        fresh bridge, server-invented title, history suppressed. `--ensure`
+        routes here immediately before a hand-launched `claude` mints one.
+        """
+        from cswap_pin import proxy as pin_proxy
+        root, cfg = self._root(tmp_path, monkeypatch)
+        cfg.write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "someone@else.com",
+                              "accountUuid": "uuid-other"}}))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 1)
+        pin = {"emailAddress": "a@example.com", "accountUuid": "uuid-pin"}
+        pin_proxy.heal(root, identity=pin)
+        assert json.loads(cfg.read_text())["oauthAccount"] == pin, (
+            "the launch left the config naming another account, so every "
+            "bridge minted by the claude that follows carries a pointer that "
+            "will not reattach")
+
+    def case_CONTROL_no_identity_leaves_the_field_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """An older host calls `heal(root)` with no identity. It must behave
+        exactly as it did before this argument existed -- an optional extra
+        cannot start rewriting a config because it was upgraded underneath a
+        host that never asked it to."""
+        from cswap_pin import proxy as pin_proxy
+        root, cfg = self._root(tmp_path, monkeypatch)
+        other = {"emailAddress": "someone@else.com", "accountUuid": "uuid-other"}
+        cfg.write_text(json.dumps({"oauthAccount": other}))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 1)
+        pin_proxy.heal(root)
+        # THE FIELD, NOT THE FILE. A first cut compared the whole text and
+        # failed: `heal` rewrites the config's ENV block on purpose, which is
+        # the wiring half of its job. Asserting byte-equality made this
+        # control fail for the one thing heal is supposed to do.
+        assert json.loads(cfg.read_text())["oauthAccount"] == other, (
+            "heal rewrote the owner field with no identity to write")
+
+    def case_a_dangling_pin_leaves_the_owner_field_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SAME GUARD THE SPAWN HAS. A pin naming an account the registry
+        no longer holds has nothing to serve, so it must not stamp that
+        account onto the live config either -- that would name an identity
+        with no credential behind it."""
+        from cswap_pin import proxy as pin_proxy
+        root, cfg = self._root(tmp_path, monkeypatch)
+        (root / "sequence.json").write_text(json.dumps({"accounts": {}}))
+        other = {"emailAddress": "someone@else.com", "accountUuid": "uuid-other"}
+        cfg.write_text(json.dumps({"oauthAccount": other}))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 1)
+        pin_proxy.heal(root, identity={"emailAddress": "a@example.com",
+                                       "accountUuid": "uuid-pin"})
+        assert json.loads(cfg.read_text())["oauthAccount"] == other, (
+            "a dangling pin stamped its dead identity onto the live config")
+
+    def case_a_config_that_cannot_be_written_does_not_fail_the_launch(
+        self, tmp_path, monkeypatch
+    ):
+        """The launch contract outranks the repair. Every path exits without
+        raising, or `cswap pin --ensure` takes the shell down with it."""
+        from cswap_pin import proxy as pin_proxy
+        root, _ = self._root(tmp_path, monkeypatch)
+
+        def _boom(_identity):
+            raise OSError("config is locked")
+
+        monkeypatch.setattr(pin_proxy, "splice_config_identity", _boom)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 1)
+        pin_proxy.heal(root, identity={"emailAddress": "a@example.com",
+                                       "accountUuid": "uuid-pin"})
 
     def case_a_dangling_pin_does_not_spawn(self, tmp_path, monkeypatch):
         """Pinned to a slot that no longer exists: nothing to serve."""

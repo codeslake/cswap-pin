@@ -1485,8 +1485,14 @@ def _resolve_pinned_slot(backup_root: Path, email: str) -> str | None:
         return None
 
 
-def heal(backup_root: Path) -> bool:
+def heal(backup_root: Path, identity: dict | None = None) -> bool:
     """Bring the pin back if it is pinned but not serving. True when it did.
+
+    ``identity`` is the ``oauthAccount`` the live config should name while the
+    pin is set. KEYWORD-DEFAULTED so an older host that calls ``heal(root)``
+    keeps working unchanged; when it is absent this function's owner-field
+    behaviour is exactly what it was. Passing it re-asserts the field on every
+    launch, which is the half a single splice at switch time cannot cover.
 
     RECOVERY WITHOUT A SESSION RESTART. Everything else in this module reacts
     to a launch: ``ensure_proxy`` runs when a NEW session starts, so if the
@@ -1589,6 +1595,45 @@ def heal(backup_root: Path) -> bool:
     # the slot up after left the wiring naming a port nobody serves — the
     # outage this recycle exists to prevent, caused by the recycle.
     account_num = _resolve_pinned_slot(backup_root, email)
+
+    # AND THE OWNER FIELD, WHICH ONE SPLICE CANNOT HOLD. `_perform_switch`
+    # writes the pin's identity into `~/.claude.json`'s `oauthAccount` on both
+    # of its config-write branches, and that is correct and it is not enough:
+    # something else rewrites the field between switches. Measured on one mac,
+    # sampling the field beside the roster's `activeAccountNumber` so a switch
+    # is separable from anything else --
+    #
+    #   slot 3 -> 5, field became the PIN     a switch ran and the splice took
+    #   slot 5 -> 5, field became a THIRD     nothing switched, so something
+    #                account                  else owns the field
+    #
+    # The second row is the one that matters: between switches the field drifts
+    # with nobody to put it back, and Claude Code compares each bridge pointer
+    # against it on relaunch. A pointer stamped while it is wrong makes the
+    # reattach fail -- fresh bridge, server-invented title, history suppressed.
+    #
+    # HERE BECAUSE THIS IS THE LAUNCH. `cswap pin --ensure` routes to this
+    # function immediately before a hand-launched `claude` mints its bridge,
+    # which is the moment the field has to be right. The same reason the carry
+    # below lives here.
+    #
+    # THE HOST HAS TO SUPPLY THE IDENTITY, and that is not fastidiousness. The
+    # value lives in cswap's per-slot config backup, whose layout is the
+    # package's business to stay out of -- and worse, that backup is POISONED
+    # under a pin: a switch archives the live config as the outgoing slot's
+    # backup, so it already names the pin and reading it back would be reading
+    # our own writing. `identity` comes through the seam or this does nothing.
+    #
+    # Idempotent, so the usual case writes nothing: `splice_config_identity`
+    # returns early when the field already matches, and every live Claude Code
+    # watches that file.
+    if identity and account_num:
+        try:
+            splice_config_identity(identity)
+        except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+            _log_lifecycle("could not re-assert the pin in the live config — "
+                           "bridges minted before the next switch keep a "
+                           "pointer that will not reattach")
 
     # THE ACTUAL PER-LAUNCH HOOK LANDS HERE, NOT IN `ensure_proxy`. The rc file
     # runs `cswap pin --ensure` before every hand-launched `claude`, and that
@@ -2692,9 +2737,26 @@ def is_pinned_route(path: str) -> bool:
     # nothing, so there is no ownership to get wrong. `== "/v1/sessions"` and a
     # query-string form only -- never a prefix, because `/v1/sessions/` already
     # has its own row above and a prefix here would say the same thing twice.
+    # BOTH COLLECTIONS TAKE THE QUERY FORM, and the `/v1/code/` one lost it
+    # for a commit. A paginated list is the same read as the bare one, so
+    # leaving `?limit=…` unswapped asks the ACTIVE account for the pinned
+    # account's sessions and gets 200 OK with the wrong contents — the exact
+    # failure the `/v1/sessions` row above was written for, arriving through
+    # the sibling spelling.
+    #
+    # THE ABSENCE THAT JUSTIFIED DROPPING IT CANNOT BE OBSERVED. It was
+    # removed on "no trace shows Claude Code emitting the query form", but the
+    # always-on instrument is `_note_slow_request`, and it does
+    # `path.split("?", 1)[0]` — it strips the query string by design, with a
+    # test asserting it does. An instrument that cannot show a thing reports
+    # its absence either way.
+    #
+    # A `?` cannot cross a path segment boundary, so this costs nothing
+    # against the guard two lines up that keeps `/v1/code/sessionsXYZ` out.
     return (
         path == "/v1/code/sessions"
         or path.startswith("/v1/code/sessions/")
+        or path.startswith("/v1/code/sessions?")
         or path.startswith("/v1/sessions/")
         or path == "/v1/sessions"
         or path.startswith("/v1/sessions?")
@@ -7234,7 +7296,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     # covers. They all then watch the same port, so a single silent window arms
     # ALL of them and each becomes a holder.
     #
-    # MEASURED ON LMD42, not reasoned about: three armed within a minute of
+    # MEASURED ON THE LINUX HOST, not reasoned about: three armed within a minute of
     # each other and produced four acceptors on 36301, which is precisely the
     # property the whole design exists to keep. The silent window that set them
     # off was an ordinary daemon handover. Non-blocking: a loser has nothing to
@@ -7278,7 +7340,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     # could not retire it, a supervisor could not stop it, and only SIGKILL
     # reached it.
     #
-    # MEASURED ON LMD42, and it is why that box needed a manual cleanup: three
+    # MEASURED ON THE LINUX HOST, and it is why that box needed a manual cleanup: three
     # armed standbys had each become a holder on port 36301 — four acceptors on
     # one socket, the single property this whole design exists to keep — and
     # SIGTERM to all three did nothing at all.
