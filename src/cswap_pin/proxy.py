@@ -2867,8 +2867,13 @@ def replay_lost_turns(bridge: str, oauth_token: "str | None") -> None:
 #: winner converges in one release; when the winner is known this collapses to
 #: it alone.
 def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
-    body = {"isSynthetic": True,
-            "message": {"content": text, "role": "user"},
+    # NO `isSynthetic`, and the server said so itself:
+    #   400 invalid_request_error "isSynthetic: Extra inputs are not permitted"
+    # It appears on every STORED worker event, which is where I copied it from
+    # -- and that is the trap: a field the server ADDS on the way in is not a
+    # field it ACCEPTS. Reading a record to infer its request body is the same
+    # mistake as reading a caller to infer what a receiver takes.
+    body = {"message": {"content": text, "role": "user"},
             "parent_tool_use_id": None,
             "session_id": bridge,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
@@ -2902,7 +2907,11 @@ def _post_one_turn(bridge: str, auth: str, text: str) -> "tuple[bool, str]":
                 detail = exc.read().decode(errors="replace")[:200]
             except Exception:  # noqa: BLE001
                 detail = "(body unreadable)"
-            last = f"envelope {i}: HTTP {exc.code} {detail}"
+            # EVERY refusal, not just the last. Only envelope 3's was logged
+            # before, so the other three were refused for reasons nobody saw --
+            # and if they differ, that difference is the next clue.
+            last = (last + " | " if last != "no envelope attempted" else "") \
+                + f"envelope {i}: HTTP {exc.code} {detail}"
         except Exception as exc:  # noqa: BLE001
             return False, f"envelope {i}: {exc!r}"
     return False, last
