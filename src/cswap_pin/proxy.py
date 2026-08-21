@@ -2877,11 +2877,26 @@ def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
             "parent_tool_use_id": None,
             "session_id": bridge,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+    # THE TOP LEVEL IS SETTLED: `{"events": [...]}`. The server said so itself,
+    # refusing a bare `event_type` with "Extra inputs are not permitted. Did
+    # you mean 'events'?".
+    #
+    # What is NOT settled is the event_type VALUE. `{"events":[{"event_type":
+    # "user", ...}]}` comes back `events[0]: event_type is required` with the
+    # field plainly present, which is what a discriminated union does when the
+    # value matches no variant -- it reports the discriminator as missing
+    # rather than as wrong.
+    #
+    # So the first entry is a deliberate miss whose only job is to make the
+    # server enumerate what it WILL take. Asking the receiver beats another
+    # round of guessing, and this file has already paid twice for inferring a
+    # contract instead of asking for it.
     return [
+        {"events": [{"event_type": "__enumerate__", "payload": body}]},
         {"events": [{"event_type": "user", "payload": body}]},
-        {"event_type": "user", "payload": body},
+        {"events": [{"event_type": "user", "message": body["message"],
+                     "session_id": bridge, "timestamp": body["timestamp"]}]},
         {"events": [body]},
-        body,
     ]
 
 
