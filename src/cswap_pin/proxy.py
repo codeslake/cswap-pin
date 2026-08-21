@@ -1624,16 +1624,32 @@ def heal(backup_root: Path, identity: dict | None = None) -> bool:
     # backup, so it already names the pin and reading it back would be reading
     # our own writing. `identity` comes through the seam or this does nothing.
     #
-    # Idempotent, so the usual case writes nothing: `splice_config_identity`
-    # returns early when the field already matches, and every live Claude Code
-    # watches that file.
+    # Idempotent, so the usual case writes nothing: the splice returns early
+    # when the field already names the pinned ACCOUNT, and every live Claude
+    # Code watches that file.
+    #
+    # BEFORE THE CARRY, AND THAT ORDER IS LOAD-BEARING. `_carry_history_pointers`
+    # reads `_login_identity()` — this same field — to decide whose pointers to
+    # restamp. Run after a drifted field it stamps every idle session with the
+    # wrong owner, which is the veto this whole block exists to prevent.
+    #
+    # THE VERDICT COMES FROM THE STATE, not from the call. The splice swallows
+    # every real failure itself and answers False for BOTH "could not write"
+    # and "already correct", so an `except` around it guards a case that
+    # cannot arrive. Re-read instead: a field that still does not name the pin
+    # after a splice that claimed nothing to do is a config we cannot write.
     if identity and account_num:
         try:
-            splice_config_identity(identity)
+            wrote = splice_config_identity(identity)
+            _now = _login_identity()
+            if not wrote and (not _now
+                              or _now[0] != identity.get("accountUuid")):
+                _log_lifecycle(
+                    "could not re-assert the pin in the live config — "
+                    "bridges minted before the next switch keep a pointer "
+                    "that will not reattach")
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
-            _log_lifecycle("could not re-assert the pin in the live config — "
-                           "bridges minted before the next switch keep a "
-                           "pointer that will not reattach")
+            pass
 
     # THE ACTUAL PER-LAUNCH HOOK LANDS HERE, NOT IN `ensure_proxy`. The rc file
     # runs `cswap pin --ensure` before every hand-launched `claude`, and that
@@ -4156,11 +4172,50 @@ def splice_config_identity(identity: dict | None) -> bool:
     # scope: this package is the optional extra and must not make cswap's
     # layout a hard dependency.
     cfg = require("paths").get_global_config_path()
+    # UNDER THE SAME LOCK EVERY OTHER WRITER OF THIS FILE TAKES, across read
+    # AND write. We replace the file whole, so a Claude Code write landing
+    # between our read and our rename is discarded along with the account,
+    # project history and settings it carried. `wire_global_config` in this
+    # module already holds it for exactly that reason; this writer did not,
+    # and was safe only while it ran from a human typing `cswap pin`. It now
+    # runs from the launch hook on a machine with live sessions, and the
+    # window is widest right after CC writes the very field we are repairing.
+    #
+    # A lock we cannot take is a SKIPPED write, never a raise: the field stays
+    # drifted until the next launch, which is the fail-open this whole path
+    # already has.
+    try:
+        with require("claude_locks").claude_config_lock(timeout=5):
+            return _splice_config_identity_locked(cfg, identity)
+    except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+        return False
+
+
+def _splice_config_identity_locked(cfg, identity: dict) -> bool:
+    """The read-modify-write half of :func:`splice_config_identity`.
+
+    Split out so the lock is held across BOTH halves rather than around a
+    call that re-reads afterwards.
+    """
     try:
         data = json.loads(cfg.read_text())
     except (OSError, ValueError, TypeError):
         return False
-    if not isinstance(data, dict) or data.get("oauthAccount") == identity:
+    if not isinstance(data, dict):
+        return False
+    # DECIDE ON THE ACCOUNT, NOT ON THE DICT. Comparing whole dicts can never
+    # be equal when the host hands over a roster SYNTHESIS — three keys, built
+    # when the machine has never switched into the pinned account so no stored
+    # config exists to copy. The rewrite then fires on every launch and strips
+    # the fields Claude Code owns (`displayName`, `organizationName`,
+    # `organizationRole`), which CC restores, which re-arms the next one. The
+    # host learned this on its own copy of this comparison and guards it the
+    # same way.
+    here = data.get("oauthAccount")
+    if isinstance(here, dict) and all(
+        here.get(k) == identity.get(k)
+        for k in ("accountUuid", "organizationUuid")
+    ):
         return False
     data["oauthAccount"] = identity
     # ATOMIC. A torn write here is read by every live session, and is worse
@@ -4439,7 +4494,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         was cleared outright.
 
         Without this split the fail-open warning cries wolf. Measured on
-        personal-mac: pinned account == active account, so the provider
+        host-c: pinned account == active account, so the provider
         correctly returned None on the very first request and the daemon
         logged "the pinned account token could not be read ... on macOS this
         is usually a daemon started outside the GUI session". Nothing was

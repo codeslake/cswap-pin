@@ -2326,6 +2326,14 @@ class TestIsPinnedRoute:
             # it does not mint.
             ("/v1/sessions", True, "the peer listing ListAgents reads"),
             ("/v1/sessions?limit=50", True, "same listing, paginated"),
+            # THE SIBLING SPELLING, and it has now made three round trips.
+            # A paginated list is the same read as the bare one, so leaving
+            # the query form unswapped asks the ACTIVE account for the pinned
+            # account's sessions and gets 200 OK with the wrong contents. It
+            # was dropped alongside a correct boundary fix and restored
+            # without a row, which is how it came back the second time.
+            ("/v1/code/sessions?limit=50", True,
+             "same listing, paginated — the `/v1/code/` spelling"),
             # THE UPLOAD, WHICH THE READ PREFIX DOES NOT COVER. Measured live:
             # `POST /api/oauth/file_upload pinned=False swapped=False -> 201`,
             # so every file this CLI sent landed on the ACTIVE account while
@@ -3066,7 +3074,7 @@ class TestMakePinTokenProvider:
         nothing to swap — the live bearer already belongs to it. The other None
         means the credential could not be read, which is the expensive one.
         Conflating them made the fail-open warning fire on a machine where
-        nothing was wrong (personal-mac: pin == active, keychain read fine at
+        nothing was wrong (host-c: pin == active, keychain read fine at
         rc=0/509 bytes) and cost the reader ten minutes chasing a keychain
         problem that did not exist.
         """
@@ -8964,7 +8972,7 @@ class TestAmbientProxyPrefersTheLauncherProxy:
     """cc-wrapper starts a per-session cache proxy (CCF) and points the
     session's HTTPS_PROXY at it; CCF chains to the machine-wide egress proxy
     (privoxy). An ssh shell has only the machine-wide one. Recording the
-    SHELL's value therefore drops CCF out of the chain — measured on work-mac,
+    SHELL's value therefore drops CCF out of the chain — measured on host-b,
     where a `cswap pin` run over ssh recorded privoxy:8118 while CCF on :9901
     stayed bypassed for every pinned session afterwards."""
 
@@ -9032,7 +9040,7 @@ class TestAmbientProxyPrefersTheLauncherProxy:
 class TestCaIsPublishedToTheTrustDir:
     """NODE_EXTRA_CA_CERTS names ONE file, so every MITM that writes it as an
     overwrite drops the others. Two components already do that for the same
-    host. Measured consequence on work-mac: a pinned session verified every
+    host. Measured consequence on host-b: a pinned session verified every
     request it SENDS while every Remote Control SSE reconnect failed with
     "unable to verify the first certificate" — 13 attempts, 0 connects, while
     worker/heartbeat and client/presence answered 200 in the same process.
@@ -9597,7 +9605,7 @@ class TestRecordedChainSurvivesARepin:
     A launcher starts a per-session cache proxy and points the SESSION at it;
     every shell on the machine, including the one a re-pin runs in, sees only
     the machine-wide egress proxy that cache proxy itself chains to. Taking the
-    shell's value silently shortens the chain. Measured on work-mac: chain went
+    shell's value silently shortens the chain. Measured on host-b: chain went
     127.0.0.1:9901 -> 127.0.0.1:8118 across a re-pin, i.e. the cache proxy was
     bypassed for every pinned session afterwards, with nothing failing.
 
@@ -9662,7 +9670,7 @@ class TestUnwireWhenDead:
     Claude Code applies .claude.json's env block at boot, so a wiring left
     behind by a daemon that died — or never started — makes every later
     session dial a dead port and retry forever, with the upstream proxies
-    healthy and unreachable behind it. Measured on work-mac: "Unable to
+    healthy and unreachable behind it. Measured on host-b: "Unable to
     connect to API (ConnectionRefused), attempt 14/300", cured only by a human
     re-pinning by hand. An optional feature must degrade to "no pin", never to
     "no Claude".
@@ -9682,7 +9690,7 @@ class TestUnwireWhenDead:
         return cfg, certdir
 
     def case_no_daemon_record_strips_the_wiring(self, tmp_path, monkeypatch):
-        # The work-mac shape: the daemon never started, so there is no record
+        # The host-b shape: the daemon never started, so there is no record
         # at all, but a previous run's wiring is still in the config.
         from cswap_pin.proxy import unwire_if_dead
         cfg, certdir = self._cfg(tmp_path, monkeypatch, {
@@ -9905,7 +9913,7 @@ def _recording_server(events):
 class TestTheDaemonWatchesItsOwnCode:
     """A daemon must notice its own code was replaced and hand over.
 
-    MEASURED, work-mac, the outage this exists for: a pin daemon ran for 22
+    MEASURED, host-b, the outage this exists for: a pin daemon ran for 22
     hours on code that had been replaced 19 hours earlier. Six releases landed
     on disk in that window and none reached the running process. The stale
     daemon dialled direct instead of chaining, so every claude.ai and
@@ -10868,7 +10876,7 @@ class TestHealRestoresWithoutRestart:
     ensure_proxy, which runs when a NEW session begins. So a daemon that dies
     under running sessions was never replaced — and once its stale wiring
     blocked every session, no new one could start to trigger the restart. That
-    deadlock is why work-mac needed a human to re-pin by hand.
+    deadlock is why host-b needed a human to re-pin by hand.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -11295,7 +11303,7 @@ class TestABlindDaemonIsNotReusedForever:
 
     Its own advice — "re-run `cswap pin` from a normal terminal" — could not
     work, because ensure_proxy reuses any daemon whose fingerprint matches.
-    Measured: `cswap pin 1` from a GUI tmux window on work-mac left pid 56790
+    Measured: `cswap pin 1` from a GUI tmux window on host-b left pid 56790
     (ssh-spawned, keychain-blind) serving unchanged. So the daemon records the
     fact and the reuse check honours it.
     """
@@ -15185,7 +15193,7 @@ class TestASalvageWriteFailureNeverCostsOurOwnCA:
 class TestTeardownAsksThePortBeforeUnwiring:
     """An unwire is only correct when nobody is serving the wired address.
 
-    MEASURED, work-mac, a live session retrying:
+    MEASURED, host-b, a live session retrying:
         19:16:35 pid=58845 unwired .claude.json — sessions fall back
         19:16:36 pid=60863 serving on port 53749
     One second apart. The departing daemon decided from the state files, which
@@ -16204,3 +16212,126 @@ class TestASlowRequestSaysSo:
 
 
 
+
+
+class TestTheSpliceHoldsTheConfigLock:
+    """WE REPLACE THIS FILE WHOLE, so a Claude Code write landing between our
+    read and our rename is discarded along with the account, project history
+    and settings it carried. `wire_global_config` in the same module already
+    holds `claude_config_lock` for exactly that reason; this writer did not.
+
+    It was survivable while the splice ran only from a human typing
+    `cswap pin`. It now runs from the launch hook on a machine with live
+    sessions, and the window is widest immediately after CC writes the very
+    field being repaired.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _wire(self, tmp_path, monkeypatch, here):
+        """Point the splice at a scratch config and record lock acquisition."""
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        taken = []
+
+        class _Lock:
+            def __enter__(self):
+                taken.append(True)
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"oauthAccount": here} if here else {}))
+        real = pin_proxy.require
+        fakes = {
+            "claude_locks": types.SimpleNamespace(
+                claude_config_lock=lambda **_kw: _Lock()),
+            "paths": types.SimpleNamespace(get_global_config_path=lambda: cfg),
+        }
+        monkeypatch.setattr(pin_proxy, "require",
+                            lambda name: fakes.get(name) or real(name))
+        return pin_proxy, cfg, taken
+
+    PIN = {"accountUuid": "PIN", "organizationUuid": "ORG",
+           "emailAddress": "pinned@example.com"}
+
+    def case_the_lock_is_taken_around_the_write(self, tmp_path, monkeypatch):
+        pin_proxy, cfg, taken = self._wire(
+            tmp_path, monkeypatch, {"accountUuid": "OTHER"})
+        assert pin_proxy.splice_config_identity(self.PIN) is True
+        assert taken, (
+            "the config was replaced whole with no lock, so a concurrent "
+            "Claude Code write is discarded with everything it carried")
+        assert json.loads(cfg.read_text())["oauthAccount"] == self.PIN
+
+    def case_a_lock_that_cannot_be_taken_skips_the_write(
+        self, tmp_path, monkeypatch
+    ):
+        """A launch must never fail on the pin. The field stays drifted until
+        the next one, which is the fail-open this path already has."""
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / ".claude.json"
+        before = json.dumps({"oauthAccount": {"accountUuid": "OTHER"}})
+        cfg.write_text(before)
+
+        def _refuses(**_kw):
+            raise TimeoutError("held by someone else")
+
+        real = pin_proxy.require
+        fakes = {
+            "claude_locks": types.SimpleNamespace(claude_config_lock=_refuses),
+            "paths": types.SimpleNamespace(get_global_config_path=lambda: cfg),
+        }
+        monkeypatch.setattr(pin_proxy, "require",
+                            lambda name: fakes.get(name) or real(name))
+        assert pin_proxy.splice_config_identity(self.PIN) is False
+        assert cfg.read_text() == before
+
+    def case_a_roster_synthesis_does_not_strip_what_CC_owns(
+        self, tmp_path, monkeypatch
+    ):
+        """DECIDE ON THE ACCOUNT, NOT ON THE DICT.
+
+        The host builds a three-key identity when the machine has never
+        switched into the pinned account, so no stored config exists to copy.
+        Comparing whole dicts can never call that equal, so the rewrite fired
+        on every launch and stripped the fields Claude Code owns -- which CC
+        restores, which re-arms the next one.
+        """
+        full = dict(self.PIN, displayName="Someone",
+                    organizationName="Org", organizationRole="admin")
+        pin_proxy, cfg, _ = self._wire(tmp_path, monkeypatch, full)
+        assert pin_proxy.splice_config_identity(self.PIN) is False, (
+            "the same account was rewritten from a three-key synthesis")
+        assert json.loads(cfg.read_text())["oauthAccount"] == full, (
+            "fields Claude Code owns were stripped by a no-op re-assert")
+
+    def case_CONTROL_a_different_account_is_still_written(
+        self, tmp_path, monkeypatch
+    ):
+        """Without this, comparing on fewer keys could become "never write",
+        which removes the repair entirely."""
+        pin_proxy, cfg, _ = self._wire(
+            tmp_path, monkeypatch,
+            {"accountUuid": "OTHER", "organizationUuid": "ORG",
+             "displayName": "Someone"})
+        assert pin_proxy.splice_config_identity(self.PIN) is True
+        assert json.loads(cfg.read_text())["oauthAccount"] == self.PIN
+
+    def case_CONTROL_a_matching_uuid_in_a_different_org_is_written(
+        self, tmp_path, monkeypatch
+    ):
+        """Both keys decide. One account can appear under two organizations,
+        and the pointer comparison Claude Code makes uses both."""
+        pin_proxy, cfg, _ = self._wire(
+            tmp_path, monkeypatch,
+            {"accountUuid": "PIN", "organizationUuid": "OTHER-ORG"})
+        assert pin_proxy.splice_config_identity(self.PIN) is True

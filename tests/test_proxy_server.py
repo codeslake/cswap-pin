@@ -3668,7 +3668,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
     refuse the CONNECT outright, and closing on that refusal made a session
     silently deaf: heartbeat and worker/events kept answering 200 through the
     MITM path, the pin still read as applied, and nothing sent from claude.ai
-    ever arrived. Measured on work-mac against a machine whose chain did let
+    ever arrived. Measured on host-b against a machine whose chain did let
     the host through, where the same session received normally."""
 
 
@@ -7122,7 +7122,7 @@ class TestTunnelIsOpen:
 class TestOptimisticConnectIsDetected:
     """A CONNECT 200 means the chain ACCEPTED the request, not that it reached
     the host. privoxy answers optimistically and dials afterwards, closing the
-    socket when that dial fails — measured on work-mac against the Remote
+    socket when that dial fails — measured on host-b against the Remote
     Control ingress: "200 Connection established" followed immediately by
     UNEXPECTED_EOF_WHILE_READING on the first TLS byte. Trusting the status
     made RC silently deaf: everything Claude Code SENDS kept going through the
@@ -7641,7 +7641,7 @@ class TestFailOpenIsNotSilent:
         When the pinned account IS the active one the provider correctly
         returns no token: the live bearer already belongs to it. Warning there
         sends whoever reads the log after a macOS keychain fault that is not
-        there. Measured on personal-mac after the 79a665a deploy: daemon.log
+        there. Measured on host-c after the 79a665a deploy: daemon.log
         carried "the pinned account token could not be read ... started
         outside the GUI session" while the keychain read was fine (rc=0, 509
         bytes), and it cost the reader ten minutes.
