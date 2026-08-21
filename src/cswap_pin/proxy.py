@@ -38,7 +38,6 @@ import time
 from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
-import urllib.error
 import urllib.request
 from urllib.parse import quote, unquote, urlsplit
 
@@ -944,7 +943,10 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
     # loopback connect through us while we are deciding what to trust. (That
     # filter also catches NODE_USE_ENV_PROXY, which node >= 24 honours.)  But
     # two more change what a successful handshake MEANS, and neither ends in
-    # `_proxy`. NODE_OPTIONS is the same class: it can carry --use-openssl-ca
+    # `_proxy`. NODE_TLS_REJECT_UNAUTHORIZED=0 makes the probe answer True for
+    # a bundle carrying NO CA at all — that is not "this bundle verifies our
+    # leaf", it is "this node was told not to check". NODE_OPTIONS is the same
+    # class: it can carry --use-openssl-ca
     # and friends, so the child would consult a different trust store than the
     # one under test. Raised by a peer implementation, whose probe had the
     # mirror-image gap: they cleared these two and not the proxy family.
@@ -1310,10 +1312,13 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # intact and costs someone else's. Do not add a cert-count floor
             # here.
             #
-            # ASK THE LOADER FIRST, PREDICT ONLY IF IT CANNOT BE ASKED. The
-            # session trusts nothing — not our CA, not a sibling proxy's, not
-            # the corporate roots — so every request fails to verify the proxy
-            # it is routed through. None from the oracle is NOT "unusable": it
+            # ASK THE LOADER FIRST, PREDICT ONLY IF IT CANNOT BE ASKED.
+            # `_bundle_is_usable` predicts from file SYNTAX what node's loader
+            # will accept, and it was wrong in the dangerous direction: it
+            # called a bundle usable that node reads as ZERO extra CAs. Believe
+            # that and the session trusts nothing — not our CA, not a sibling
+            # proxy's, not the corporate roots — so every request fails to
+            # verify the proxy it is routed through. None from the oracle is NOT "unusable": it
             # means the probe never ran (no node on PATH, which is normal here
             # — cswap is Python). Answering "unusable" there would drop a
             # healthy machine to its own CA and take every corporate root with
@@ -2450,43 +2455,25 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 # to. Same shape as the routes above, captured rather than merely matched.
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
-# : Worker JWTs seen in flight, `{bridge: (authorization_value, monotonic)}`. :
-# : THIS IS THE ONLY PLACE THE WORKER CREDENTIAL EXISTS OUTSIDE CLAUDE CODE.
-_WORKER_JWT: "dict[str, tuple[str, float]]" = {}
-_WORKER_JWT_TTL_S = 600.0
-
-
-#: `worker_epoch` seen on a real `/worker/events` POST, per bridge.
-#:
-#: REQUIRED, AND NOT GUESSABLE. Read out of 2.1.238: the client posts
-#: `{worker_epoch: this.workerEpoch, events: [...]}`. It is a per-worker
-#: counter held in the CLI's memory, so the only way to know it is to read one
-#: off a request going past -- the same reason the JWT is captured here.
-_WORKER_EPOCH: "dict[str, object]" = {}
-#: Whether the shape of a real events POST has been recorded yet, per daemon.
-_SHAPE_LOGGED = False
 
 
 def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
                      body: "bytes | None" = None) -> None:
-    """Remember the worker credential, and the epoch, for this call's bridge.
+    """Record a SHA of each user text leaving in a `/worker/events` POST.
 
-    The body is parsed for STRUCTURE only. It carries the user's own text and
-    none of that is logged: what comes out is `worker_epoch` (a counter) and,
-    once per daemon, the KEY NAMES of one event. That was enough to settle a
-    contract two releases of guessing had not.
+    NEVER THE TEXT, and never the credential. The hash answers one question
+    nothing else can -- was a turn the CLI took ever sent -- because the text
+    exists in no other request. Twelve hex digits match a queue record and
+    carry nothing back.
+
+    The authorization header used to be captured here too, for a replay that
+    posted on the session's behalf. That replay is gone, so holding another
+    party's JWT in this process buys nothing and is not done.
     """
-    global _SHAPE_LOGGED
     if not _WORKER_SUBTREE.search(path):
         return
-    m = _BRIDGE_ID.match(path)
-    if not m:
+    if not _BRIDGE_ID.match(path):
         return
-    bridge = m.group(1)
-    for k, v in headers:
-        if k.lower() == "authorization" and v:
-            _WORKER_JWT[bridge] = (v, time.monotonic())
-            break
     if not body or "/worker/events" not in path:
         return
     try:
@@ -2495,14 +2482,6 @@ def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
         return
     if not isinstance(doc, dict):
         return
-    if "worker_epoch" in doc:
-        _WORKER_EPOCH[bridge] = doc["worker_epoch"]
-    # WAS IT EVEN SENT? That is the one question that separates a CLI that
-    # never emits a queued turn from one that emits it and loses it downstream,
-    # and only the pin can see it -- the text exists in no other request.
-    #
-    # SHA of each user event's text, never the text. Twelve hex is plenty to
-    # match against a queue record and carries nothing back.
     events = doc.get("events")
     if isinstance(events, list):
         marks = []
@@ -2520,61 +2499,10 @@ def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
                     txt.strip()[:40].encode()).hexdigest()[:12])
         if marks:
             _log_lifecycle(f"worker events POST carried user text {marks}")
-    if not _SHAPE_LOGGED:
-        events = doc.get("events")
-        if isinstance(events, list) and events and isinstance(events[0], dict):
-            _SHAPE_LOGGED = True
-            _log_lifecycle(
-                "a real worker events POST carries top-level keys "
-                f"{sorted(doc)} and event keys {sorted(events[0])} — recorded "
-                "once so a replay can match the client's own contract instead "
-                "of a shape inferred from a stored record")
 
 
-def worker_auth(bridge: str) -> "str | None":
-    """The remembered worker credential, or `None` once it is stale."""
-    got = _WORKER_JWT.get(bridge)
-    if not got:
-        return None
-    value, seen = got
-    if time.monotonic() - seen > _WORKER_JWT_TTL_S:
-        _WORKER_JWT.pop(bridge, None)
-        return None
-    return value
 
 
-#: How often one bridge may be reconciled. The read costs a listing and a
-#: transcript scan, and the loss it repairs is minutes old by definition.
-#: Younger than this and a turn may simply still be on its way.
-
-
-def _session_for_bridge(bridge: str) -> "str | None":
-    """The local sessionId whose bridge this is, from the session registry.
-
-    The registry writes `session_<rest>` where every route uses `cse_<rest>`,
-    so the prefix is normalised before comparing -- joining the raw strings
-    misses every session at once, which reads as an empty fleet.
-    """
-    want = bridge.split("_", 1)[-1]
-    # `get_claude_config_home`, NOT `~/.claude`. The two are the same only when
-    # `CLAUDE_CONFIG_DIR` is unset, and every other reader in this file already
-    # goes through the resolver -- hardcoding the path would make this the one
-    # place that looks somewhere else on a machine that moved its config.
-    get_claude_config_home = require("paths").get_claude_config_home
-    try:
-        entries = sorted((get_claude_config_home() / "sessions").glob("*.json"))
-    except OSError:
-        return None
-    for p in entries:
-        try:
-            rec = json.loads(p.read_text())
-        except (OSError, ValueError):
-            continue
-        got = rec.get("bridgeSessionId")
-        if isinstance(got, str) and got.split("_", 1)[-1] == want:
-            sid = rec.get("sessionId")
-            return sid if isinstance(sid, str) else None
-    return None
 
 
 
@@ -2823,7 +2751,9 @@ def is_pinned_route(path: str) -> bool:
     # query-string form only -- never a prefix, because `/v1/sessions/` already
     # has its own row above and a prefix here would say the same thing twice.
     return (
-        path.startswith("/v1/code/sessions")
+        path == "/v1/code/sessions"
+        or path.startswith("/v1/code/sessions/")
+        or path.startswith("/v1/code/sessions?")
         or path.startswith("/v1/sessions/")
         or path == "/v1/sessions"
         or path.startswith("/v1/sessions?")
