@@ -2314,6 +2314,18 @@ class TestIsPinnedRoute:
             # disk account, the reconnect resolves there, and the pinned
             # account never sees it.
             ("/v1/sessions/cse_01ABC/unarchive", True, "RC reconnect unarchive"),
+            # THE ROUTE BEHIND ListAgents AND SendMessage ACROSS MACHINES.
+            # The lifecycle prefix above ends in a slash, which kept the bare
+            # collection out -- a side effect of how that prefix was written,
+            # never a decision that the list should answer as the active
+            # account. Traced live while calling ListAgents:
+            #     GET /v1/sessions pinned=False swapped=False -> 200 OK
+            # The active account owns none of the Remote Control sessions, so
+            # the peer list came back without them and cross-session messaging
+            # could not find a session on another machine. A read: it lists,
+            # it does not mint.
+            ("/v1/sessions", True, "the peer listing ListAgents reads"),
+            ("/v1/sessions?limit=50", True, "same listing, paginated"),
             # THE ROUTE THAT DECIDES WHETHER RC SURVIVES AN ACCOUNT SWITCH.
             # Read out of the 2.1.234 binary: when the identity file names an
             # account other than the bridge's owner, `confirmChanged()` does
@@ -2341,8 +2353,22 @@ class TestIsPinnedRoute:
              "answer is what keeps a live bridge alive across a swap"),
             ("/v1/messages", False,
              "inference must follow the swapped disk account, never the pin"),
-            ("/v1/sessions", False,
-             "a plain list must not be swept in by the unarchive rule"),
+            # SUPERSEDED, DELIBERATELY. This row asserted False, and its
+            # stated reason was "a plain list must not be swept in by the
+            # unarchive rule" -- a guard against the `/v1/sessions/` PREFIX
+            # over-reaching, not a decision that the list should answer as
+            # the active account. Nothing ever argued for the latter, and
+            # measurement showed it costs the whole feature: traced live
+            # while calling ListAgents,
+            #     GET /v1/sessions pinned=False swapped=False -> 200 OK
+            # so the enumeration behind ListAgents and cross-machine
+            # SendMessage asked the ACTIVE account, which owns none of the
+            # Remote Control sessions. The list came back without them.
+            #
+            # The prefix guard the old row cared about is kept below, as a
+            # neighbour that must still NOT match.
+            ("/v1/sessionsXYZ", False,
+             "the exact-match row must not become a prefix"),
             # THE NEIGHBOUR THAT MUST NOT BE SWEPT IN, and the reason the new
             # rule is an exact match rather than a `/api/oauth/` prefix.
             # Validation ASKS about a token; refresh MINTS one. A refresh

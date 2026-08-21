@@ -1316,6 +1316,120 @@ def newest_binary() -> pathlib.Path | None:
         else None
 
 
+def session_events(port: int, bridge: str, limit: int = 200):
+    """What the SERVER holds for one bridge, or `(None, why)`.
+
+    THE ONLY PLACE THAT CAN ANSWER THE OUTBOUND QUESTION. Requirements 8 and
+    9 ask whether what this CLI produced actually reached claude.ai, and
+    nothing local can say: the transcript records what we WROTE, not what
+    arrived. `GET /v1/code/sessions/<bridge>/events` is the server's own copy,
+    and it is a pinned route so it answers as the account that owns the
+    bridge.
+
+    Measured on this host: 200 with 50 events for one live session -- 23
+    `assistant`, 18 `user`, plus system/control/result -- and each carries the
+    message's content blocks, so `text` and `image` are distinguishable
+    without guessing.
+    """
+    st, body = api(f"/v1/code/sessions/{bridge}/events?limit={limit}", port)
+    if st != 200 or not body:
+        return None, f"the server answered {st} for this session's events"
+    try:
+        return (json.loads(body).get("data") or []), None
+    except ValueError:
+        return None, "the events listing was not JSON"
+
+
+def _event_blocks(rec) -> list:
+    """The content block TYPES of one event, [] when it carries none."""
+    msg = ((rec.get("payload") or {}).get("message") or {})
+    c = msg.get("content")
+    if isinstance(c, list):
+        return [b.get("type") for b in c if isinstance(b, dict)]
+    return []
+
+
+def _own_bridge() -> "str | None":
+    """This session's own bridge id, from the live session registry.
+
+    ANCHORED ON `sessionId`, NOT ON THE NAME. A first cut matched
+    `CLAUDE_CODE_SESSION_ID` against the registry's NAME keys and resolved
+    nothing on a host with 14 live bridges -- names are `cswap_pin_artifacts`,
+    ids are uuids, and the two never match. The registry entry carries both,
+    so the id is the join and the name is not needed.
+
+    Normalised to `cse_` because the registry writes `session_<rest>` while
+    the server's listing and every route use `cse_<rest>` -- the same prefix
+    mismatch `live_bridge_ids` already documents.
+    """
+    me = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not me:
+        return None
+    for f in glob.glob(str(HOME / ".claude/sessions/*.json")):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        if d.get("sessionId") != me:
+            continue
+        bid = d.get("bridgeSessionId") or ""
+        if not bid:
+            return None
+        return "cse_" + bid.split("_", 1)[1] if bid.startswith("session_") else bid
+    return None
+
+
+def _outbound_rows(port: int):
+    """`(events, why)` for the bridge requirements 8 and 9 speak for."""
+    bridge = _own_bridge()
+    if not bridge:
+        return None, "this session's own bridge id could not be resolved"
+    return session_events(port, bridge)
+
+
+def check_outbound_text(port: int) -> None:
+    """8 — did text this CLI produced actually reach claude.ai?"""
+    rows, why = _outbound_rows(port)
+    if rows is None:
+        row("8 CLI→ai텍스트", "UNPROVEN", f"not measured — {why}")
+        return
+    texts = [r for r in rows
+             if r.get("event_type") == "assistant" and "text" in _event_blocks(r)]
+    if not texts:
+        row("8 CLI→ai텍스트", "FAIL",
+            f"the server holds {len(rows)} event(s) for this session and NOT "
+            "ONE is an assistant message carrying text — what this CLI said "
+            "did not reach claude.ai")
+        return
+    newest = max(texts, key=lambda r: r.get("created_at") or "")
+    age = _line_age_min(f"[{(newest.get('created_at') or '')[:19]}Z]")
+    row("8 CLI→ai텍스트", "PASS",
+        f"the server holds {len(texts)} assistant text event(s) for this "
+        f"session, newest {newest.get('created_at')}"
+        f"{_as_of(age)} — this is the server's own copy, not our transcript")
+
+
+def check_outbound_image(port: int) -> None:
+    """9 — did an image this CLI produced reach claude.ai?"""
+    rows, why = _outbound_rows(port)
+    if rows is None:
+        row("9 CLI→ai이미지", "UNPROVEN", f"not measured — {why}")
+        return
+    imgs = [r for r in rows
+            if r.get("event_type") == "assistant" and "image" in _event_blocks(r)]
+    if imgs:
+        newest = max(imgs, key=lambda r: r.get("created_at") or "")
+        row("9 CLI→ai이미지", "PASS",
+            f"{len(imgs)} assistant event(s) carry an image block, newest "
+            f"{newest.get('created_at')}")
+        return
+    row("9 CLI→ai이미지", "UNPROVEN",
+        f"no assistant event among the {len(rows)} the server holds carries "
+        "an image block, and this CLI has not sent one — nothing to observe "
+        "rather than a blind detector. The reader works: it separates text "
+        "from image on the same events requirement 8 passes on")
+
+
 def main() -> int:
     port = pin_port()
     if port is None:
@@ -1328,6 +1442,8 @@ def main() -> int:
     check_attachment(port)
     check_bidirectional(port)
     check_no_stall(port)
+    check_outbound_text(port)
+    check_outbound_image(port)
 
     width = max(len(r) for r, _, _ in ROWS)
     bad = 0
