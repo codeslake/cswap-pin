@@ -24,7 +24,6 @@ from cswap_pin.proxy import (
     is_pinned_route,
     note_worker_auth,
     parse_upstream_proxy,
-    queued_texts,
     worker_auth,
 )
 
@@ -16148,36 +16147,3 @@ class TestTheWorkerCredentialIsRememberedFromTheWire:
         assert "cse_ccc" not in P._WORKER_JWT
 
 
-class TestQueuedTurnsAreReadFromTheTranscript:
-    """Input taken mid-turn is queued and never posted, and the queue record is
-    the only place its text survives — no request body carries it."""
-
-    def _write(self, rows):
-        # WRITE WHERE THE RESOLVER LOOKS, which is `get_claude_config_home()`
-        # and not `~/.claude`. A first cut set HOME and asserted on the value;
-        # conftest's sandbox already patches `Path.home`, so the reader looked
-        # at an empty directory, returned [], and the assertion failed for a
-        # reason that had nothing to do with the code under test.
-        from cswap_pin._host import require
-        home = require("paths").get_claude_config_home()
-        d = home / "projects" / "p"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "sid.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
-
-    def test_an_old_enqueue_is_returned_and_a_young_one_is_not(self):
-        from cswap_pin import proxy as P
-        old = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600))
-        young = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        self._write([
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": old + ".000Z", "content": "swallowed by a long turn"},
-            {"type": "queue-operation", "operation": "enqueue",
-             "timestamp": young + ".000Z", "content": "may still be on its way"},
-            {"type": "queue-operation", "operation": "dequeue",
-             "timestamp": old + ".000Z"},
-        ])
-        assert P.queued_texts("sid") == ["swallowed by a long turn"]
-
-    def test_a_session_with_no_transcript_is_empty_not_an_error(self):
-        from cswap_pin import proxy as P
-        assert P.queued_texts("nobody") == []

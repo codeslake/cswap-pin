@@ -212,14 +212,13 @@ def write_upstream_hint(
     # hop behind it; falling through to a direct dial is not "no proxy" on a
     # machine whose direct route is a TLS-inspecting corporate proxy.
     #
-    # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE". ``_probe_next_hop``
-    # returns None both when the hop reports no upstream AND when the hop is not
-    # answering — and the second case is exactly when the chain is about to be
-    # needed. Writing "" there erased the outer hop at the moment the inner one
-    # died, leaving a single-hop chain that falls straight to a direct dial.
-    #
-    # Keep what a previous launch confirmed; only a launch that positively
-    # reports a different hop replaces it.
+    # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE".
+    # ``_probe_next_hop`` returns None both when the hop reports no upstream
+    # AND when the hop is not answering — and the second case is exactly when
+    # the chain is about to be needed. Writing "" there erased the outer hop at
+    # the moment the inner one died, leaving a single-hop chain that falls
+    # straight to a direct dial. Keep what a previous launch confirmed; only a
+    # launch that positively reports a different hop replaces it.
     keep_next = next_hop or _read_upstream(certdir, "next") or ""
     if value:
         keep_proxy = value
@@ -229,8 +228,7 @@ def write_upstream_hint(
         # https scheme. And this is the NORMAL path — `cswap pin` from a plain
         # shell reports no proxy, and ensure_proxy re-stamps on every launch —
         # so an authenticated or TLS corporate proxy survived exactly until the
-        # next re-pin, then every pinned request 407'd. Measured:
-        #   https://bob:***@corp.proxy:8443 -> http://corp.proxy:8443
+        # next re-pin, then every pinned request 407'd.
         keep_proxy = _read_upstream(certdir, "proxy") or ""
     try:
         tmp.write_text(json.dumps(
@@ -444,17 +442,8 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     # THE THIRD DOOR. `_publish_ca` refuses an empty `ours` and so does
     # `_trust_file`'s salvage arm; this one gated on mtime and never on
     # content, then concatenated `ca_path.read_bytes()` regardless. An empty
-    # ca.pem satisfies every one of those conditions. Measured, with a control
-    # so a zero is not read as "this fixture never merges":
-    #
-    #   ours                blocks out   carries ours
-    #   real CA (control)        2           True
-    #   EMPTY                    1           False
-    #
-    # and the return value goes straight into the session's
-    # NODE_EXTRA_CA_CERTS — so the session would trust the UPSTREAM proxy's CA
-    # while unable to verify OUR proxy, the hop it is actually routed through.
-    # Returning `ca_path` is the same fallback every other error here takes.
+    # ca.pem satisfies every one of those conditions. Returning `ca_path` is
+    # the same fallback every other error here takes.
     if Path(other) == bundle and (
         not _read_or_empty(ca_path).strip()
         or _carries(_read_or_empty(bundle), ca_path)
@@ -463,25 +452,9 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
         # from our own env block). Returning ca_path here would UN-merge it and
         # lose the upstream proxy's CA on every later session.
         #
-        # GATED ON CONTENT, not on the path alone. This branch used to return
-        # `bundle` on a filename match without ever opening it — the only path
-        # in this function with neither a content nor a freshness check.
-        # Measured, control first:
-        #
-        #   bundle state           returned       exists  blocks  carries LIVE
-        #   CONTROL healthy        ca-bundle.pem   True     2       True
-        #   EMPTY                  ca-bundle.pem   True     0       False
-        #   STALE (dead CA only)   ca-bundle.pem   True     2       False
-        #   TORN                   ca-bundle.pem   True     0       False
-        #   ABSENT                 ca-bundle.pem   FALSE    -       n/a
-        #
-        # The stale row needs nobody to do anything wrong: `ensure_ca`
-        # regenerates the CA whenever `_certs_consistent` is False (expiry
-        # renews 30 days early, a partial cert-dir wipe, a mismatched pair),
-        # and `ca-bundle.pem` is not in the consistency set, so it survives
-        # carrying the RETIRED CA. Falling through rebuilds it from the live
-        # `ca.pem`, which is what the mtime check below would have done had it
-        # been reached.
+        # GATED ON CONTENT, not on the path alone. Falling through rebuilds it
+        # from the live `ca.pem`, which is what the mtime check below would
+        # have done had it been reached.
         #
         # EXCEPT WHEN WE HAVE NO CA AT ALL. An empty `ca.pem` means there is no
         # proxy of ours to verify, so "the bundle does not carry our CA" is
@@ -494,9 +467,8 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
         # AHEAD OF THE EMPTY-CA GUARD, deliberately. 0.1.20 put the guard first
         # and made this case strictly worse than 0.1.19: an empty ca.pem in a
         # nested launch returned ca.pem and wired ZERO CAs, while the good
-        # bundle sat on disk untouched. Measured — 0.1.19 wired 2, 0.1.20
-        # wired 0. Returning a merge we did not build from the empty file
-        # costs nothing and keeps every upstream root.
+        # bundle sat on disk untouched. Returning a merge we did not build from
+        # the empty file costs nothing and keeps every upstream root.
         return bundle
     try:
         if not ca_path.read_bytes().strip():
@@ -506,14 +478,15 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     other_path = Path(other)
     # Rebuild only when an input is newer than the output — the inputs are
     # immutable per launch, so the steady state is two stats instead of
-    # rewriting the bundle on every launch (the same trade a sibling proxy's ensure makes).
+    # rewriting the bundle on every launch (the same trade a sibling proxy's
+    # ensure makes).
     #
     # AND ON CONTENT, for the same reason the un-merge branch above needed it.
     # mtime answers "did an input change since we built this", which is not
     # "does this still carry our CA". A regenerated CA leaves a bundle that is
     # NEWER than both inputs — the salvage arm writes the same filename in the
     # same launch — so the freshness test passes while the file carries the
-    # retired CA. Measured: stale bundle, live ca.pem, rebuild SKIPPED.
+    # retired CA.
     try:
         if (
             not bundle.exists()
@@ -663,15 +636,11 @@ def _parseable_blocks(body: bytes) -> list[bytes]:
         stopped = False
         for label, head, _end, block in _pem_blocks(body[offset:]):
             if label is None:
-                # RESUME AT THE NEXT MARKER, not one byte past this one. A
-                # WELDED block's own BEGIN sits at `head`, so `head + 1` skips
-                # the very block salvage exists to recover — measured, the
-                # welded third-party CA was dropped again.
+                # RESUME AT THE NEXT MARKER, not one byte past this one.
+                #
                 # RESUME AT THE DAMAGED BLOCK'S OWN BEGIN, not past it. For a
                 # WELD that BEGIN sits at `head` itself, and restarting there
                 # makes it a clean line start — which is the whole repair.
-                # Measured: skipping past it dropped the third-party CA on the
-                # RIGHT of the weld, the defect this arm exists to fix.
                 if block == b"weld" and head:
                     offset += head        # its BEGIN is here: recoverable
                 else:
@@ -735,44 +704,20 @@ def _drop_unreadable_blocks(body: bytes) -> bytes:
     """
     # NO `else body` FALLBACK. 0.1.22 ended this `_join_pem(*kept) if kept else
     # body`, which returned the input verbatim whenever nothing parsed — the
-    # exact file this function exists to never emit. Measured:
-    #
-    #     input               kept  damaged  returned verbatim
-    #     healthy (CONTROL)     1    False       True
-    #     nothing parses        0    True        True   <-- the hole
-    #     empty / no markers    0    False       True
-    #
-    # The fallback was written for the last row, where handing the input back
-    # is right because there is no damage in it, and it silently covered the
-    # row that matters. `b""` is the honest answer when every block is
-    # unreadable: both callers write this to a bundle whose only purpose is to
-    # be loaded, and an empty file loads as zero extras instead of discarding
-    # every trust source the user configured.
+    # exact file this function exists to never emit. `b""` is the honest answer
+    # when every block is unreadable: both callers write this to a bundle whose
+    # only purpose is to be loaded, and an empty file loads as zero extras
+    # instead of discarding every trust source the user configured.
     #
     # AND ONLY WHEN THERE IS DAMAGE TO REMOVE. A file with no PEM markers at
     # all is not a torn bundle — it is something we do not understand, and
     # `_join_pem`'s rule applies: pass it through rather than silently narrow
     # what the caller asked to merge. Filtering unconditionally deleted the
     # whole file for any marker-free input, which is a different failure from
-    # the one this exists to prevent.
-    #
-    # KNOWN GAP, measured and deliberately left: when NOTHING parses, this
-    # returns the input unchanged — damage included. That is the one shape it
-    # does not repair:
-    #
-    #     input               kept  damaged  returned verbatim
-    #     healthy (CONTROL)     1    False       True
-    #     nothing parses        0    True        True   <-- the gap
-    #     empty / no markers    0    False       True
-    #
-    # Returning `b""` there closes it and costs more than it buys: an
-    # unterminated tail (a BEGIN with no END) reports the same way as a torn
-    # block, so the empty answer also fired on inputs that were merely shaped
-    # unusually — measured, it emptied both `wire_env`'s and
-    # `wire_global_config`'s merges and cost the session every CA in them.
-    # Separating "torn" from "shaped unusually" needs a distinction `_pem_blocks` does
-    # not currently make. Both cases still lose every CA in the file, so the
-    # gap is a failure to REPAIR, not a new failure introduced here.
+    # the one this exists to prevent. Separating "torn" from "shaped unusually"
+    # needs a distinction `_pem_blocks` does not currently make. Both cases
+    # still lose every CA in the file, so the gap is a failure to REPAIR, not a
+    # new failure introduced here.
     kept = _parseable_blocks(body)
     return _join_pem(*kept) if kept else body
 
@@ -854,35 +799,23 @@ CA_TRUST_FILE = "ca-trust.pem"
 
 # WHAT COUNTS AS THE START OF A PEM BLOCK. One pattern, because the predicate
 # and the salvage scanner are meant to be the same scan and drifted apart once
-# already.
-#
-# Three properties, each of which a naive version gets wrong:
-#
-#   1. A WELDED marker is still a block. This read `^-----BEGIN ...` and a
-#      publisher that wrote no trailing newline produces
-#      `-----END CERTIFICATE----------BEGIN CERTIFICATE-----`, where the second
-#      marker does not start a line. Both scanners were blind to it, so the
-#      predicate found nothing wrong and returned True while node — which does
-#      not require the anchor — could not decode the fused line and truncated
-#      there. Measured on 0.1.12 with node present: 3 blocks declared, 2 seen,
-#      both judges True, wired as-is, node loaded 1. With node ABSENT (the
-#      normal case here, cswap is Python) and OUR CA as the welded one, node
-#      loaded ZERO — the session could not verify the proxy it was routed
-#      through. `_join_pem` already guards this shape in what WE write; the
-#      readers were never taught to see it in what someone else wrote.
-#
-#   2. A marker QUOTED IN PROSE is not a block. Dropping the left anchor
-#      outright makes `# see -----BEGIN CERTIFICATE-----` a block — measured, 2
-#      found where there is 1 — which is the false ACCEPT the anchor was there
-#      for. So the left side is constrained to a line start or a welded
-#      `-----`, not to nothing.
-#
-#   3. CRLF still reads. `\r?` stays: a `$`-only anchor made every CRLF bundle
-#      invisible, which reads as "carries no CA" and drops the whole shared
-#      file — the false REJECT that costs every sibling component its trust.
-#
-# Verified against all four shapes (plain LF, CRLF, welded, prose) before it
-# replaced the anchored version.
+# already. Three properties, each of which a naive version gets wrong:  1. A
+# WELDED marker is still a block. This read `^-----BEGIN ...` and a publisher
+# that wrote no trailing newline produces `-----END CERTIFICATE----------BEGIN
+# CERTIFICATE-----`, where the second marker does not start a line. Both
+# scanners were blind to it, so the predicate found nothing wrong and returned
+# True while node — which does not require the anchor — could not decode the
+# fused line and truncated there. With node ABSENT (the normal case here, cswap
+# is Python) and OUR CA as the welded one, node loaded ZERO — the session could
+# not verify the proxy it was routed through. `_join_pem` already guards this
+# shape in what WE write; the readers were never taught to see it in what
+# someone else wrote.  2. A marker QUOTED IN PROSE is not a block. So the left
+# side is constrained to a line start or a welded `-----`, not to nothing.  3.
+# CRLF still reads. `\r?` stays: a `$`-only anchor made every CRLF bundle
+# invisible, which reads as "carries no CA" and drops the whole shared file —
+# the false REJECT that costs every sibling component its trust. Verified
+# against all four shapes (plain LF, CRLF, welded, prose) before it replaced
+# the anchored version.
 _BEGIN_MARKER = rb"(?:^|-----)-----BEGIN ([A-Z0-9 ]+)-----([ \t]*)(\r?\n|\Z|.)"
 
 def _find_end(body: bytes, label: bytes, start: int, limit: int) -> int:
@@ -982,11 +915,8 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
         # proves nothing about the CA in question. A SUBJECT-NAME comparison
         # cannot tell: `_make_ca` gives every cswap-pin CA the identical
         # subject `CN=cswap pin-proxy CA`, so a leaf from any OTHER cswap-pin
-        # certdir — a different key entirely — would pass a name check.
-        # Measured consequence: a certdir whose leaf is signed by a different
-        # CA, plus a bundle carrying only that foreign CA, yielded True and
-        # wired a session to a proxy it cannot verify. Verify the SIGNATURE
-        # instead, same shape as `_certs_consistent`.
+        # certdir — a different key entirely — would pass a name check. Verify
+        # the SIGNATURE instead, same shape as `_certs_consistent`.
         leaf = x509.load_pem_x509_certificate(leaf_pem.read_bytes())
         ca_cert = x509.load_pem_x509_certificate(Path(ca_path).read_bytes())
         ca_cert.public_key().verify(
@@ -1010,25 +940,14 @@ def _bundle_loads_in_node(bundle: Path, ca_path: Path) -> bool | None:
         "c.on('error',()=>{process.stdout.write('\\x02NO');s.close();});});"
     )
     # The child must not inherit anything that answers a DIFFERENT question.
-    #
     # `*_proxy` was already stripped: the child would otherwise route its own
     # loopback connect through us while we are deciding what to trust. (That
-    # filter also catches NODE_USE_ENV_PROXY, which node >= 24 honours.)
-    #
-    # But two more change what a successful handshake MEANS, and neither ends
-    # in `_proxy`. Measured against a bundle carrying NO CA at all:
-    #
-    #     NODE_TLS_REJECT_UNAUTHORIZED unset   verdict False   (correct)
-    #     NODE_TLS_REJECT_UNAUTHORIZED=0       verdict True    (a lie)
-    #
-    # A True from that state is not "this bundle verifies our leaf", it is
-    # "this node was told not to check" — and `_trust_file` then wires the
-    # shared file on a verdict about nothing. NODE_OPTIONS is the same class:
-    # it can carry --use-openssl-ca and friends, so the child would consult a
-    # different trust store than the one under test.
-    #
-    # Raised by a peer implementation, whose probe had the mirror-image gap: they
-    # cleared these two and not the proxy family.
+    # filter also catches NODE_USE_ENV_PROXY, which node >= 24 honours.)  But
+    # two more change what a successful handshake MEANS, and neither ends in
+    # `_proxy`. NODE_OPTIONS is the same class: it can carry --use-openssl-ca
+    # and friends, so the child would consult a different trust store than the
+    # one under test. Raised by a peer implementation, whose probe had the
+    # mirror-image gap: they cleared these two and not the proxy family.
     env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
     for leak in ("NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS"):
         env.pop(leak, None)
@@ -1085,10 +1004,9 @@ def _armor_decodes(body: bytes) -> bool:
     # THE BLANK-LAST-LINE RULE LIVES IN `_pem_blocks` NOW, not here. It was
     # added in this arm first, which is exactly why it missed: a CERTIFICATE
     # never reaches this function, and the real bundle is 132 CERTIFICATE
-    # blocks and nothing else. Measured, `_armor_decodes` was called ZERO
-    # times on the file this machine loads. Keeping a copy here would be dead
-    # code — `_pem_blocks` refuses the shape before yielding, verified — and a
-    # dead guard is worse than none: it reads as protection.
+    # blocks and nothing else. Keeping a copy here would be dead code —
+    # `_pem_blocks` refuses the shape before yielding, verified — and a dead
+    # guard is worse than none: it reads as protection.
     try:
         base64.b64decode(data, validate=True)
     except Exception:  # noqa: BLE001
@@ -1169,15 +1087,12 @@ def _pem_blocks(body: bytes):
             return
         # AND THE LINE BEFORE THE TERMINATOR MUST CARRY SOMETHING. openssl
         # refuses a blank-or-whitespace-only last line whatever the LABEL is,
-        # and this is the only place both labels and both readers pass
-        # through. It lived in `_armor_decodes` — the NON-certificate arm —
-        # so a CERTIFICATE went to `x509.load_pem_x509_certificate` instead,
-        # and cryptography parses the shape happily. Measured: the real
-        # bundle is 132 CERTIFICATE blocks and ZERO others, so
-        # `_armor_decodes` was called 0 times on the file this machine
-        # actually loads. A whitespace line before the first END gave
-        # predicate True and node extras=0 of 133 — the whole extras load
-        # dropped, so the session could not verify its own proxy.
+        # and this is the only place both labels and both readers pass through.
+        # It lived in `_armor_decodes` — the NON-certificate arm — so a
+        # CERTIFICATE went to `x509.load_pem_x509_certificate` instead, and
+        # cryptography parses the shape happily. A whitespace line before the
+        # first END gave predicate True and node extras=0 of 133 — the whole
+        # extras load dropped, so the session could not verify its own proxy.
         line = body[max(0, body.rfind(b"\n", 0, end - 1) + 1) : end - 1]
         if line.strip() == b"":
             yield None, head, -1, b""
@@ -1298,7 +1213,7 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
     # endings, and openssl loads those happily. A `$`-only anchor made every
     # CRLF bundle invisible to this scan — which reads as "carries no CA" and
     # drops the whole shared file, the false reject that costs every sibling
-    # component its trust. Measured: a CRLF copy of our own CA was refused.
+    # component its trust.
     carries_us = False
     seen_any = False
     for label, _head, _end, block in _pem_blocks(body):
@@ -1321,11 +1236,9 @@ def _bundle_is_usable(body: bytes, ours: bytes) -> bool:
             # that costs every sibling component its trust. A separator that
             # demands a bare LF therefore does not exist in those blocks:
             # `[-1]` returned the WHOLE block, `rsplit(b"-----END")` left
-            # `b""`, and empty base64 decodes fine, so the check was a no-op.
-            # Measured: `b'-----BEGIN X509 CRL-----\r\n!!!bad!!!\r\n---'` sliced
-            # to `b''`. A CERTIFICATE is saved by its x509 parse; a CRL or key
-            # block has only this, which is why a certificate-only test hides
-            # it.
+            # `b""`, and empty base64 decodes fine, so the check was a no-op. A
+            # CERTIFICATE is saved by its x509 parse; a CRL or key block has
+            # only this, which is why a certificate-only test hides it.
             body_only = block.split(b"-----", 2)[-1].rsplit(b"-----END", 1)[0]
             if not _armor_decodes(body_only):
                 return False
@@ -1358,29 +1271,12 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # `ours`, `_salvage_bundle` appends nothing — the append is gated
             # on `_bundle_is_usable(kept, ours)`, and that answers False here
             # by its own vacuity guard rather than because containment failed.
-            # Measured before this line existed:
-            #
-            #   salvage(peer, ours=b"")   1 block, ours ABSENT
-            #
-            # so the session trusted the peer's certificates and could not
-            # verify the proxy it was routed through — the exact failure
-            # `_bundle_is_usable` exists to prevent, arriving through the
-            # REPAIR path.
-            #
             # RETURN, NOT RAISE. 0.1.20 raised here and said in this comment
             # that it fell through to "our own path". It did not: the raise
             # landed in the blanket `except Exception: pass` below, and control
             # continued into the tail merge, which concatenates `ca_path`
             # unconditionally and produced the SAME bundle the guard was
-            # written to prevent. Measured with `existing` set — the shape
-            # every machine with `NODE_EXTRA_CA_CERTS` runs:
-            #
-            #   ours            returned         blocks  carries ours
-            #   real (CONTROL)  ca-bundle.pem    2       True
-            #   EMPTY           ca-bundle.pem    1       False
-            #
-            # Control flow by exception into a handler 90 lines away puts the
-            # landing site out of the author's sight. Say where it goes.
+            # written to prevent. Say where it goes.
             if not ours:
                 return Path(ca_path)
             body = shared.read_bytes()
@@ -1390,7 +1286,6 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # and it says so only in a stderr warning, so the session dies on
             # "unable to verify the first certificate" with no visible cause.
             # Checking that we are in there cannot see that; count the markers.
-            #
             # A bundle that is BALANCED and CONTAINS us but has silently lost
             # other roots is deliberately NOT guarded here, and not because we
             # lack the information: a reader is the wrong PLACE to decide it.
@@ -1398,45 +1293,33 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # a root was retired or a component uninstalled, and only the
             # builder knows which happened — so a reader acting on a shrink
             # would reject a correct bundle in exactly the cases the shrink was
-            # intended. Measured across the three machines this runs on, a
-            # legitimate bundle is 5 certs on one and 168 on another, so any
-            # ABSOLUTE size floor that catches narrowing on one host rejects a
-            # healthy bundle on the next. The builder keeps the last good
-            # bundle for this reason; that is where the decision belongs.
+            # intended. The builder keeps the last good bundle for this reason;
+            # that is where the decision belongs. This comment previously read
+            # "2 certs on one and 132 on another". The 132 was right for this
+            # host; the 2 was the COMPONENT COUNT (ca-trust.d holds one PEM per
+            # component, one certificate each), not a bundle size — two
+            # different quantities reported as one measurement. The conclusion
+            # survives and is in fact stronger, but it was not supported by the
+            # numbers cited. NOTE what this rules out and what it does not. It
+            # rules out an ABSOLUTE floor in a READER. It does not rule out a
+            # builder comparing its output against the inputs IT just read,
+            # which is a per-build quantity rather than a constant and does not
+            # need to hold across hosts. The two cases below are also a
+            # different severity class: both leave the session unable to verify
+            # its OWN proxy, so every request dies. Narrowing keeps our chain
+            # intact and costs someone else's. Do not add a cert-count floor
+            # here.
             #
-            # This comment previously read "2 certs on one and 132 on another".
-            # The 132 was right for this host; the 2 was the COMPONENT COUNT
-            # (ca-trust.d holds one PEM per component, one certificate
-            # each), not a bundle size — two different quantities reported as
-            # one measurement. The real spread, measured on all three by the
-            # peer after this claim was quoted at them. The conclusion survives and is in
-            # fact stronger, but it was not supported by the numbers cited.
-            #
-            # NOTE what this rules out and what it does not. It rules out an
-            # ABSOLUTE floor in a READER. It does not rule out a builder
-            # comparing its output against the inputs IT just read, which is a
-            # per-build quantity rather than a constant and does not need to
-            # hold across hosts.
-            # The two cases below are also a different severity class: both
-            # leave the session unable to verify its OWN proxy, so every
-            # request dies. Narrowing keeps our chain intact and costs someone
-            # else's. Do not add a cert-count floor here.
-            # ASK THE LOADER FIRST, PREDICT ONLY IF IT CANNOT BE ASKED.
-            #
-            # `_bundle_is_usable` predicts what node's loader will accept from
-            # file syntax, and measured against node's real loader it was wrong
-            # in the dangerous direction: it called a bundle usable that node
-            # reads as ZERO extra CAs, and we then hand that file to the
-            # session as NODE_EXTRA_CA_CERTS. The session trusts nothing —
-            # not our CA, not a sibling proxy's, not the corporate roots — so
-            # every request fails to verify the proxy it is routed through.
-            #
-            # None from the oracle is NOT "unusable": it means the probe never
-            # ran (no node on PATH, which is normal here — cswap is Python).
-            # Answering "unusable" there would drop a healthy machine to its
-            # own CA and take every corporate root with it, which is the exact
-            # damage this is meant to prevent. So fall back to the predicate,
-            # which is the only judge left, and say which arm decided.
+            # ASK THE LOADER FIRST, PREDICT ONLY IF IT CANNOT BE ASKED. The
+            # session trusts nothing — not our CA, not a sibling proxy's, not
+            # the corporate roots — so every request fails to verify the proxy
+            # it is routed through. None from the oracle is NOT "unusable": it
+            # means the probe never ran (no node on PATH, which is normal here
+            # — cswap is Python). Answering "unusable" there would drop a
+            # healthy machine to its own CA and take every corporate root with
+            # it, which is the exact damage this is meant to prevent. So fall
+            # back to the predicate, which is the only judge left, and say
+            # which arm decided.
             verdict = _bundle_loads_in_node(shared, Path(ca_path))
             if verdict is None:
                 verdict = _bundle_is_usable(body, ours)
@@ -1446,17 +1329,15 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
                 )
             elif verdict:
                 # THE ORACLE'S True IS A VETO'S ABSENCE, NOT AN APPROVAL. It
-                # only asked "will you verify our leaf", and node TRUNCATES
-                # the extras load at the first bad block rather than aborting
-                # it — so True survives even when every block after a tear,
+                # only asked "will you verify our leaf", and node TRUNCATES the
+                # extras load at the first bad block rather than aborting it —
+                # so True survives even when every block after a tear,
                 # including corporate roots placed after ours, was silently
-                # dropped. Measured on the real 132-cert bundle with a tear
-                # placed after our CA: 68 corporate roots lost while the
-                # oracle still answered True. AND it with the predicate,
-                # which inspects the WHOLE file: the oracle keeps its power to
-                # REFUSE a file the predicate wrongly approves (0.1.9's fix,
-                # must not regress), but loses the power to APPROVE a file
-                # the predicate says is torn.
+                # dropped. AND it with the predicate, which inspects the WHOLE
+                # file: the oracle keeps its power to REFUSE a file the
+                # predicate wrongly approves (0.1.9's fix, must not regress),
+                # but loses the power to APPROVE a file the predicate says is
+                # torn.
                 verdict = _bundle_is_usable(body, ours)
             if verdict:
                 return shared
@@ -1475,20 +1356,16 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             )
             return salvaged
     except Exception:
-        # A SALVAGE-WRITE FAILURE (disk full, a read-only cert dir) LANDS
-        # HERE TOO, same as a missing/corrupt shared bundle — and collapses
-        # into "no shared bundle" rather than into an error the caller sees.
-        # Measured whether that is still safe on every path that reaches it:
-        # with `ours` already confirmed non-empty above, every branch below
-        # this handler falls through to `return Path(ca_path)` — our own CA,
-        # already on disk and already read once — even when door four's
-        # write ALSO fails. The session never loses the ability to verify
-        # ITS OWN proxy. What it loses is the corporate roots the shared or
-        # merged bundle would have carried, which is the same "narrowing"
-        # this file already treats as a builder-owned, not a reader-owned,
-        # decision everywhere else (see `_bundle_is_usable`'s docstring and
-        # `TestNarrowingIsDeliberatelyUnguarded`) — not a new failure mode
-        # this `except` introduces.
+        # A SALVAGE-WRITE FAILURE (disk full, a read-only cert dir) LANDS HERE
+        # TOO, same as a missing/corrupt shared bundle — and collapses into "no
+        # shared bundle" rather than into an error the caller sees. The session
+        # never loses the ability to verify ITS OWN proxy. What it loses is the
+        # corporate roots the shared or merged bundle would have carried, which
+        # is the same "narrowing" this file already treats as a builder-owned,
+        # not a reader-owned, decision everywhere else (see
+        # `_bundle_is_usable`'s docstring and
+        # `TestNarrowingIsDeliberatelyUnguarded`) — not a new failure mode this
+        # `except` introduces.
         pass
     # No shared bundle: merge with what THIS env trusts. Deliberately not
     # _merged_ca, which also consults the ambient process environment and a
@@ -1658,22 +1535,19 @@ def heal(backup_root: Path) -> bool:
     if not pin:
         return False  # nothing pinned — not our business
     email = pin[0]
-    # THE CONFIG HALF OF THE SAME RULE the block below states for the DAEMON.
-    # A release that ADDS an env key kept the old key set in `.claude.json`
-    # until a full session launch: `--ensure` heals a broken daemon and clears
-    # DEAD configs, and a live wiring with a stale key set is neither.
-    # Measured on host-a — 0.1.86 -> 0.1.87 landed on all three
-    # machines, the daemon recycled onto the new code, and the new
-    # SSL_CERT_FILE never appeared. The deploy looked finished and was not.
+    # THE CONFIG HALF OF THE SAME RULE the block below states for the DAEMON. A
+    # release that ADDS an env key kept the old key set in `.claude.json` until
+    # a full session launch: `--ensure` heals a broken daemon and clears DEAD
+    # configs, and a live wiring with a stale key set is neither. The deploy
+    # looked finished and was not.
     #
     # HERE AND NOT IN THE HOST: `cswap pin --ensure` already reaches this
     # function on every launch, so the bridge package needs no new line to
-    # trigger it. Pin behaviour stays in the pin.
-    #
-    # The return value is deliberately untouched — the caller reads True as
-    # "the daemon was restarted" and renders "Restored the cloud pin", which a
-    # refreshed config is not. And it cannot raise: this runs from an rc hook
-    # before every launch.
+    # trigger it. Pin behaviour stays in the pin. The return value is
+    # deliberately untouched — the caller reads True as "the daemon was
+    # restarted" and renders "Restored the cloud pin", which a refreshed config
+    # is not. And it cannot raise: this runs from an rc hook before every
+    # launch.
     try:
         rewire_if_version_changed(certdir)
     except Exception:  # noqa: BLE001 — a launch must never fail on the pin
@@ -1681,80 +1555,51 @@ def heal(backup_root: Path) -> bool:
     # AN UPGRADE MUST NOT WAIT FOR A LAUNCH. `ensure_proxy` recycles a stale
     # daemon, but it only runs when a NEW session starts — so installing a fix
     # left every running daemon on the old code until someone happened to open
-    # a session. Measured: 0.1.3 landed on disk at 22:11 and the daemon was
-    # still the 20:04 process running 0.1.1 half an hour later, on a box where
-    # the whole point of the release was that upgrading no longer costs a
-    # session anything. The installer changes files; nothing told the daemon.
-    #
-    # This function runs before every hand-launched `claude` (the rc hook's
-    # `cswap pin --ensure`), which makes it the one caller positioned to
-    # notice. It just never asked: an earlier draft of this sentence said
-    # "every few seconds from the status line" — the third time that claim was
-    # written into this function, and wrong every time; the status line's
+    # a session. The installer changes files; nothing told the daemon. This
+    # function runs before every hand-launched `claude` (the rc hook's `cswap
+    # pin --ensure`), which makes it the one caller positioned to notice. It
+    # just never asked: an earlier draft of this sentence said "every few
+    # seconds from the status line" — the third time that claim was written
+    # into this function, and wrong every time; the status line's
     # `_try_heal_pin` was removed and nothing calls `heal` on a timer.
     # `_read_alive_port` without a fingerprint reads a stale daemon as healthy.
     # Ask WITH one, and an upgrade takes effect on its own, on the same port,
-    # with no session restarted and no command typed.
+    # with no session restarted and no command typed. Deliberately NOT reusing
+    # the ensure_proxy fast path: this must be the slow, locked path so the
+    # recycle is serialized against every other status line on the box.
     #
-    # Deliberately NOT reusing the ensure_proxy fast path: this must be the
-    # slow, locked path so the recycle is serialized against every other
-    # status line on the box.
-    # RESOLVE THE SLOT BEFORE KILLING ANYTHING. The recycle below used to run
-    # first, and the account lookup afterwards — so a DANGLING pin (the pinned
-    # email no longer in sequence.json: `cswap remove`, a slot rename, a
-    # restored registry) killed a perfectly healthy daemon and then returned at
-    # `if not account_num`, before the spawn AND before `unwire_if_dead`.
-    #
-    # Measured against a real process holding a real socket, with a real kill:
-    #   0.1.3  heal=False  killed=no   -> daemon kept serving
-    #   0.1.4  heal=False  killed=YES  -> port dead, .claude.json still naming it
-    # which is the ConnectionRefused outage this module documents twice, caused
-    # by the code meant to prevent it. A dangling pin must be a no-op, exactly
-    # as it was before the recycle existed.
+    # RESOLVE THE SLOT BEFORE KILLING ANYTHING. A dangling pin must be a no-op,
+    # exactly as it was before the recycle existed.
 
     fp = daemon_fingerprint()
     alive = _read_alive_port(certdir, fingerprint=fp)
     # `_read_alive_port` returns None for an `unpinnable` daemon REGARDLESS of
     # fingerprint, so "fingerprinted read failed but a bare read succeeded" is
     # true for a daemon running the NEWEST code that merely cannot read its
-    # credential (the macOS keychain rc=36 case). Recycling that daemon does
-    # not fix it: the successor re-marks itself unpinnable and the next tick
-    # recycles again — measured, 5 ticks 5 kills, no convergence, each one
-    # costing live sessions their in-flight requests.
+    # credential (the macOS keychain rc=36 case). Ask the record directly
+    # instead of inferring staleness from two probes that differ for more than
+    # one reason.
     #
-    # Ask the record directly instead of inferring staleness from two probes
-    # that differ for more than one reason.
     # RESOLVED BEFORE ANY KILL. A dangling pin (the account gone from the
     # registry) has nothing to spawn afterwards, so recycling first and looking
     # the slot up after left the wiring naming a port nobody serves — the
-    # outage this recycle exists to prevent, caused by the recycle. Measured
-    # with a real kill: 0.1.3 left the daemon alive; 0.1.4 killed it.
-    #
-    # It does NOT gate the serving-but-unwired re-wire below, which needs no
-    # registry: gating that made an unreadable sequence.json block a repair
-    # that would otherwise have worked (measured: serving daemon on 33967, the
-    # config left `{}`).
+    # outage this recycle exists to prevent, caused by the recycle.
     account_num = _resolve_pinned_slot(backup_root, email)
 
     # THE ACTUAL PER-LAUNCH HOOK LANDS HERE, NOT IN `ensure_proxy`. The rc file
     # runs `cswap pin --ensure` before every hand-launched `claude`, and that
-    # flag routes to THIS function — `ensure_proxy` is reached only from
-    # `cswap run` and a hand-typed `cswap pin <n>`. Hooking only there meant
-    # the carry never ran for the way sessions are actually started here.
-    #
-    # AFTER the slot resolve, so a dangling pin (account gone from the
-    # registry) stays the total no-op the rest of this function works to keep.
-    # And NOT on a timer. The status line used to spawn `cswap pin --heal`
-    # every 60s; `_try_heal_pin` is gone from `statusline/account.py` and only
-    # a comment remains. That is the whole evidence — an earlier draft here
-    # also cited a dotfiles test as asserting it, and that test asserts
-    # something else (no-spawn in the feature-ABSENT case) against a function
-    # that no longer exists. The placement is safe because of the code, not
-    # because of that test.
-    #
-    # The rc hook backgrounds this (`&!`), so it can lose the race against the
-    # launch it precedes. That costs the CURRENT launch, never correctness: a
-    # pointer this pass misses is fixed by the next launch on the machine, and
+    # flag routes to THIS function — `ensure_proxy` is reached only from `cswap
+    # run` and a hand-typed `cswap pin <n>`. Hooking only there meant the carry
+    # never ran for the way sessions are actually started here. AFTER the slot
+    # resolve, so a dangling pin (account gone from the registry) stays the
+    # total no-op the rest of this function works to keep. And NOT on a timer.
+    # That is the whole evidence — an earlier draft here also cited a dotfiles
+    # test as asserting it, and that test asserts something else (no-spawn in
+    # the feature-ABSENT case) against a function that no longer exists. The
+    # placement is safe because of the code, not because of that test. The rc
+    # hook backgrounds this (`&!`), so it can lose the race against the launch
+    # it precedes. That costs the CURRENT launch, never correctness: a pointer
+    # this pass misses is fixed by the next launch on the machine, and
     # `ensure_proxy` runs the same sweep synchronously before `execvpe`.
     if account_num:
         _carry_history_pointers(certdir)
@@ -1801,23 +1646,18 @@ def heal(backup_root: Path) -> bool:
                     # ENTERING this branch made a no-op recycle look like a
                     # real one: with no `ps` (the documented blind spot) the
                     # identity gate kills nothing, and heal then spawned a
-                    # successor over a daemon that is still serving. Measured:
-                    # killed=[] spawned=['1'].
+                    # successor over a daemon that is still serving.
                     recycled = True
         except Exception:  # noqa: BLE001 — a heal must never raise
             return False
         # Fall through to the spawn path below, which reclaims that port.
     if alive is not None:
-        # SERVING IS NOT THE SAME AS WIRED. A daemon can be up while
-        # ``.claude.json`` names nothing — `pin --clear` raced a respawn, a
-        # heal unwired it and the daemon came back, or (measured) an unwire ran
-        # against a live daemon. Returning False here left that state
-        # permanent: the proxy served on a port no session was told about, and
-        # only a hand-typed `cswap pin <n>` restored it.
-        #
-        # Re-wiring is the whole point of a heal. It costs one config read when
-        # the wiring is already correct, and it is what makes the pin come back
-        # BY ITSELF once the daemon is healthy again.
+        # SERVING IS NOT THE SAME AS WIRED. Returning False here left that
+        # state permanent: the proxy served on a port no session was told
+        # about, and only a hand-typed `cswap pin <n>` restored it. Re-wiring
+        # is the whole point of a heal. It costs one config read when the
+        # wiring is already correct, and it is what makes the pin come back BY
+        # ITSELF once the daemon is healthy again.
         if _wired_port() == alive:
             return False  # serving AND wired — genuinely nothing to do
         try:
@@ -1837,29 +1677,27 @@ def heal(backup_root: Path) -> bool:
             #
             # WITH THE FINGERPRINT. A bare liveness check re-reads the very
             # daemon the recycle above was for: its state file outlives a kill
-            # that did not complete (and, when a caller stubs the kill, always),
-            # so heal would bail here and the obsolete daemon would serve
-            # forever — the exact staleness this path exists to end. Asking for
-            # the current fingerprint means "someone spawned a daemon running
-            # the code we ship", which is the only thing that makes this a no-op.
-            # ANYTHING SERVING IS ENOUGH — unless we just recycled.
+            # that did not complete (and, when a caller stubs the kill,
+            # always), so heal would bail here and the obsolete daemon would
+            # serve forever — the exact staleness this path exists to end.
+            # Asking for the current fingerprint means "someone spawned a
+            # daemon running the code we ship", which is the only thing that
+            # makes this a no-op.
             #
-            # A fingerprinted check here loops forever on a daemon that runs
+            # ANYTHING SERVING IS ENOUGH — unless we just recycled. A
+            # fingerprinted check here loops forever on a daemon that runs
             # CURRENT code but is marked `unpinnable` (it cannot read the
             # credential — the macOS keychain rc=36 case). `_read_alive_port`
             # returns None for that daemon whatever the fingerprint, so a
             # fingerprinted guard reads "nothing is serving", spawns a
             # successor that re-marks itself unpinnable, and the next tick does
-            # it again. Measured: 5 ticks, 5 respawns, no convergence.
-            #
-            # heal's job is "make the pin serve". Something IS serving, so heal
-            # is done — the pin is fail-open and a respawn cannot fix a
-            # credential it also cannot read.
-            #
-            # The exception is the branch above: it killed the daemon whose
-            # record this would find, and a kill that did not complete leaves
-            # that record behind. There the fingerprint is the right question,
-            # because only a successor running OUR code means the work is done.
+            # it again. Something IS serving, so heal is done — the pin is
+            # fail-open and a respawn cannot fix a credential it also cannot
+            # read. The exception is the branch above: it killed the daemon
+            # whose record this would find, and a kill that did not complete
+            # leaves that record behind. There the fingerprint is the right
+            # question, because only a successor running OUR code means the
+            # work is done.
             probe = (
                 _read_alive_port(certdir, fingerprint=fp)
                 if recycled
@@ -1880,10 +1718,7 @@ def heal(backup_root: Path) -> bool:
 
 
 # How many times, and how far apart, `unwire_if_dead` asks before it strips a
-# wiring. Sized against a HANDOVER, not against a timeout: the measured gap on
-# host-a between "successor serving" and the second stage completing was under a
-# second each time, and the whole two-stage recycle spanned 70 s. Three probes
-# a second apart clear a single-stage blip outright.
+# wiring. Three probes a second apart clear a single-stage blip outright.
 #
 # WHAT IT COSTS A DEAD PIN, and it is not one number. A REFUSED connect — the
 # loopback case, and what "dead" normally looks like — returns at once, so the
@@ -1892,11 +1727,10 @@ def heal(backup_root: Path) -> bool:
 # each probe's full `timeout=1` as well: 3 x 1 s of connect plus 2 x 1 s of gap
 # is five. That second shape is exactly the state this function exists to clean
 # up, so it is the one to size against, and it lands on the interactive path of
-# every session start.
-#
-# Deliberately NOT sized to survive the full 70 s: a launch must never block
-# that long, and a pin that is dead for a minute SHOULD be unwired. The target
-# is the momentary gap, which is what was producing false positives.
+# every session start. Deliberately NOT sized to survive the full 70 s: a
+# launch must never block that long, and a pin that is dead for a minute SHOULD
+# be unwired. The target is the momentary gap, which is what was producing
+# false positives.
 _UNWIRE_PROBES = 3
 _UNWIRE_PROBE_GAP = 1.0
 
@@ -1945,24 +1779,20 @@ def unwire_if_dead(certdir: Path) -> bool:
     # check. (It fires on a code change, because ensure_proxy matches on a
     # FINGERPRINT: same daemon, new fingerprint, so it tries to replace one
     # that is fine, and the spawn fails on the port the healthy daemon holds.)
-    #
     # So ask the WIRING itself, which is the thing we are about to remove: if
     # the port it names still answers, something is serving on it and the
     # wiring is correct regardless of what any file says.
-    # ONE REFUSED CONNECT IS NOT DEATH, IT IS A MOMENT. A recycle can take the
-    # socket down and put it back within the same second, and a two-stage
-    # recycle does it twice — measured on host-a 2026-08-18, 70 seconds apart.
-    # A single 1 s probe landing in either gap reads "the pin is dead" and this
-    # function then strips the WHOLE env block, so every claude launched from
-    # then on runs unpinned, silently, until someone notices.
     #
-    # That is what a live machine was found in that night: the pin healthy and
-    # serving on 36301, `env` empty, and nothing in any log able to say which
-    # of two implementations with identical clear-semantics had done it.
-    #
-    # So ask again, spaced past a handover rather than inside one. The cost of
-    # being slow here is a launch waiting a couple of seconds for a pin that
-    # really is dead; the cost of being fast is unpinning the machine.
+    # ONE REFUSED CONNECT IS NOT DEATH, IT IS A MOMENT. A single 1 s probe
+    # landing in either gap reads "the pin is dead" and this function then
+    # strips the WHOLE env block, so every claude launched from then on runs
+    # unpinned, silently, until someone notices. That is what a live machine
+    # was found in that night: the pin healthy and serving on 36301, `env`
+    # empty, and nothing in any log able to say which of two implementations
+    # with identical clear- semantics had done it. So ask again, spaced past a
+    # handover rather than inside one. The cost of being slow here is a launch
+    # waiting a couple of seconds for a pin that really is dead; the cost of
+    # being fast is unpinning the machine.
     port = _wired_port()
     if port is not None:
         for attempt in range(_UNWIRE_PROBES):
@@ -2114,28 +1944,16 @@ def _wire_global_config_locked(
         node_ca = _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
         # PYTHON DOES NOT READ NODE_EXTRA_CA_CERTS, and cswap's usage poll is
         # plain urllib -- so it obeys the proxy vars above while trusting
-        # nothing that signs them. Measured with a control on the same host
-        # and proxy: without SSL_CERT_FILE, CERTIFICATE_VERIFY_FAILED; with
-        # it, HTTP 429 (i.e. the handshake completed and the server answered).
-        #
+        # nothing that signs them.
         wanted = {
             "HTTPS_PROXY": proxy,
             "https_proxy": proxy,
-            # A launcher that sets ALL_PROXY leaves it naming the proxy we
-            # chain THROUGH, so the session runs with two proxy vars pointing
-            # at different hops. curl resolves that in our favour — measured,
-            # https_proxy=A + ALL_PROXY=B dials A, and B only when A is unset
-            # — but the split is one a client is free to resolve the other
-            # way, and it is unreadable for anyone diagnosing a route. Claim
-            # it so every var names the same hop. Scoped to this file, which
-            # Claude Code applies to itself; the shell path deliberately does
-            # not create one (see wire_env).
+            # Claim it so every var names the same hop. Scoped to this file,
+            # which Claude Code applies to itself; the shell path deliberately
+            # does not create one (see wire_env).
             "ALL_PROXY": proxy,
             # Node takes exactly ONE file here, so replacing an existing CA
             # blinds the session to every host the proxy behind us re-signs.
-            # Measured: with only our CA, `downloads.claude.ai` (MITM'd by the
-            # upstream cache proxy) failed to verify and the session showed
-            # "Auto-update failed · Run claude doctor".
             "NODE_EXTRA_CA_CERTS": str(node_ca),
             # Self-loop marker. Claude Code applies this block into
             # process.env, which its Bash-tool children inherit — so a `cswap`
@@ -2144,33 +1962,26 @@ def _wire_global_config_locked(
             # and the daemon starts CONNECTing to itself.
             "CSWAP_PIN_PORT": str(port),
         }
-        # NO SSL_CERT_FILE. NOT "gated better" — NOT WRITTEN AT ALL.
+        # NO SSL_CERT_FILE. NOT "gated better" — NOT WRITTEN AT ALL. The gate
+        # was correct and still the wrong shape, for two reasons that only
+        # appeared once two independent implementations were compared:  A PROOF
+        # GOES STALE. It holds at the moment of writing. The store it proved
+        # against can be replaced by MDM, become unreadable, or simply change —
+        # and the variable stays behind naming a bundle that no longer subsumes
+        # anything. On a corporate laptop that is total: no system roots means
+        # no TLS to anywhere.
         #
-        # This used to write it behind a subsumption gate comparing certificate
-        # SETS — `_python_trust_file`, DELETED, so do not go looking for it.
-        # The gate was correct and still the wrong shape, for two reasons that
-        # only appeared once two independent implementations were compared:
-        #
-        #   A PROOF GOES STALE. It holds at the moment of writing. The store it
-        #   proved against can be replaced by MDM, become unreadable, or simply
-        #   change — and the variable stays behind naming a bundle that no
-        #   longer subsumes anything. On a corporate laptop that is total: no
-        #   system roots means no TLS to anywhere.
-        #
-        #   EVERY GATE GREW A DEFAULT-ALLOW ARM. This one passed on
-        #   host-a partly because the ambient store is a capath with no
-        #   cafile, which is "nothing to compare", not "proven superset". The
-        #   sibling implementation returned ok when the store was UNREADABLE,
-        #   on the same reasoning. Two authors, one hole: a property of the
-        #   approach, not a pair of bugs.
-        #
-        # The replacement cannot narrow anything and so needs no proof:
-        # `oauth._pin_aware_ssl_context()` builds `create_default_context()`
-        # and calls `load_verify_locations(pin CA)`. Python ADDS. Node ADDS via
-        # NODE_EXTRA_CA_CERTS, kept above. Nothing is left for a replace-class
-        # variable to do.
-        #
-        # Remember what we are about to displace, so unwiring is lossless.
+        # EVERY GATE GREW A DEFAULT-ALLOW ARM. This one passed on host-a partly
+        # because the ambient store is a capath with no cafile, which is
+        # "nothing to compare", not "proven superset". The sibling
+        # implementation returned ok when the store was UNREADABLE, on the same
+        # reasoning. Two authors, one hole: a property of the approach, not a
+        # pair of bugs. The replacement cannot narrow anything and so needs no
+        # proof: `oauth._pin_aware_ssl_context()` builds
+        # `create_default_context()` and calls `load_verify_locations(pin CA)`.
+        # Python ADDS. Node ADDS via NODE_EXTRA_CA_CERTS, kept above. Nothing
+        # is left for a replace-class variable to do. Remember what we are
+        # about to displace, so unwiring is lossless.
         displaced = {k: env[k] for k in wanted if k in env}
         env.update(wanted)
         ledger = {_WIRE_MARK: list(wanted),
@@ -2182,26 +1993,12 @@ def _wire_global_config_locked(
 
     if env == before and _WIRE_MARK not in raw and not ours:
         return False
-    # THE RECEIPT FIRST, AND IT MUST SUCCEED — see `_write_ledger`. This used
-    # to run after the config write, best-effort, on the reasoning that a lost
-    # receipt "degrades to the pre-existing behaviour: --clear still finds the
-    # wiring through the config keys an older pin left". That is false for
-    # this path, because the same function pops those keys three lines below.
-    #
-    # Measured, with the sidecar store made unwritable:
-    #   wire returned:            False
-    #   HTTPS_PROXY in config:    True
-    #   config keys mark:         None
-    #   _read_ledger mark:        None
-    #
-    # A wiring in NEITHER location is one nothing can remove: `--clear` reads
-    # the sidecar, falls through to the config keys, finds neither, and
-    # answers "not wired" — while `.claude.json` keeps sending every new
-    # session to a port that may be long gone. Only a hand edit fixes it,
-    # which is what `clear_wiring` exists to make unnecessary.
-    #
-    # So the CONFIG write is the one that becomes conditional. Unwired is a
-    # working session; wired-with-no-receipt is an outage nobody can clear.
+    # THE RECEIPT FIRST, AND IT MUST SUCCEED — see `_write_ledger`. That is
+    # false for this path, because the same function pops those keys three
+    # lines below. Only a hand edit fixes it, which is what `clear_wiring`
+    # exists to make unnecessary. So the CONFIG write is the one that becomes
+    # conditional. Unwired is a working session; wired-with-no-receipt is an
+    # outage nobody can clear.
     if not _write_ledger(path, ledger):
         _log_lifecycle(
             "could not record the wiring receipt — leaving .claude.json "
@@ -2222,8 +2019,7 @@ def _wire_global_config_locked(
         # A fixed name is two bugs: two processes wiring at once share it, and
         # O_CREAT's mode argument is IGNORED for a file that already exists —
         # so a leftover temp from an earlier crashed write dictates the final
-        # mode, and the rename makes it permanent. Measured: config 0600 +
-        # leftover tmp 0644 under umask 077 -> config 0644.
+        # mode, and the rename makes it permanent.
         tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
         # 0600 from creation, and never wider than what we are replacing.
         # ``.claude.json`` carries primaryApiKey, inline MCP credentials and
@@ -2231,7 +2027,6 @@ def _wire_global_config_locked(
         # write takes its mode from the umask, so a normal 022 would publish
         # all of that at 0644 — and because this is a rename, the mode
         # SURVIVES: wiring the pin permanently downgrades a 0600 config.
-        # Measured: 0600 in, 0644 out.
         mode = _mode_of(path, default=0o600)
         try:
             tmp.unlink()  # our own pid's leftover; O_EXCL would reject it
@@ -2313,21 +2108,13 @@ def _ambient_proxy(
     if parsed.host in _LOOPBACK and parsed.port == _self_port(src):
         return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
-    # behind. A launcher may start a per-session cache proxy and
-    # points HTTPS_PROXY at THAT; an ordinary shell, and every ssh shell, only
-    # has the machine-wide egress proxy the launcher itself chains to. Taking
-    # the shell's value then silently drops the launcher's proxy out of the
-    # chain: Measured: where `cswap pin` run over ssh recorded
-    # the machine-wide proxy while the per-session cache proxy (whose own
-    # upstream IS that same proxy) was left bypassed for every pinned session. Prefer the recorded one when it is
-    # still serving — it is the inner link, and it reaches this one anyway.
-    # Two places can name the inner proxy: what our env block displaced on a
-    # previous launch, and what a previous launch recorded as the chain. Try
-    # the displaced value first — it is the most direct evidence — then the
-    # recorded one, which is the only source on a machine where our block has
-    # never displaced anything (measured on a host where every shell exports
-    # the machine-wide proxy, so the displaced value is empty and re-pinning
-    # from any shell kept dropping the launcher's proxy out of the chain).
+    # behind. A launcher may start a per-session cache proxy and points
+    # HTTPS_PROXY at THAT; an ordinary shell, and every ssh shell, only has the
+    # machine-wide egress proxy the launcher itself chains to. Prefer the
+    # recorded one when it is still serving — it is the inner link, and it
+    # reaches this one anyway. Two places can name the inner proxy: what our
+    # env block displaced on a previous launch, and what a previous launch
+    # recorded as the chain.
     for prev in (_wired_over_proxy(), _recorded_upstream(certdir)):
         prev_parsed = parse_upstream_proxy(prev)
         if (
@@ -2570,11 +2357,10 @@ _HOP_CONNECT_BUDGET_S = 2.0
 _HOP_REPLY_BUDGET_S = 6.0
 
 # HOW LONG TO WAIT OUT A HOP THAT IS RESTARTING, before falling through to a
-# direct dial. Sized from the cache proxy's measured self-heal: ~1s to come
-# back under a new pid, refusing (not hanging) throughout. A little over twice
-# that leaves room for a slower box without turning a genuinely absent hop
-# into a stall — a host with no chain at all never enters this loop, because
-# an empty candidate list falls straight through.
+# direct dial. A little over twice that leaves room for a slower box without
+# turning a genuinely absent hop into a stall — a host with no chain at all
+# never enters this loop, because an empty candidate list falls straight
+# through.
 _CHAIN_HEAL_GRACE_S = 2.5
 # Refused dials are ~free, so poll often enough that the second the hop comes
 # back is the second we use it.
@@ -2664,18 +2450,8 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 # to. Same shape as the routes above, captured rather than merely matched.
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
-#: Worker JWTs seen in flight, `{bridge: (authorization_value, monotonic)}`.
-#:
-#: THIS IS THE ONLY PLACE THE WORKER CREDENTIAL EXISTS OUTSIDE CLAUDE CODE. It
-#: is not on disk -- the session registry carries `bridgeSessionId`,
-#: `messagingSocketPath` and a dozen other fields and no token -- and it is not
-#: the OAuth bearer the rest of this file swaps: a POST to `/worker/events`
-#: carrying the pinned OAuth token is `403 permission_error`, measured across
-#: four different body shapes, which is the same 403 storm that put the
-#: `/worker` subtree outside `is_pinned_route` in the first place.
-#:
-#: Held in memory only, never written, and it expires: a JWT nobody has
-#: refreshed in ten minutes belongs to a session that has stopped talking.
+# : Worker JWTs seen in flight, `{bridge: (authorization_value, monotonic)}`. :
+# : THIS IS THE ONLY PLACE THE WORKER CREDENTIAL EXISTS OUTSIDE CLAUDE CODE.
 _WORKER_JWT: "dict[str, tuple[str, float]]" = {}
 _WORKER_JWT_TTL_S = 600.0
 
@@ -2769,10 +2545,7 @@ def worker_auth(bridge: str) -> "str | None":
 
 #: How often one bridge may be reconciled. The read costs a listing and a
 #: transcript scan, and the loss it repairs is minutes old by definition.
-_REPLAY_COOLDOWN_S = 90.0
-_REPLAY_LAST: "dict[str, float]" = {}
 #: Younger than this and a turn may simply still be on its way.
-_REPLAY_MIN_AGE_S = 120.0
 
 
 def _session_for_bridge(bridge: str) -> "str | None":
@@ -2804,274 +2577,12 @@ def _session_for_bridge(bridge: str) -> "str | None":
     return None
 
 
-def queued_texts(session_id: str, min_age_s: float = _REPLAY_MIN_AGE_S) -> "list[str]":
-    """Text that entered the CLI while a turn was running, oldest first.
-
-    INPUT TAKEN MID-TURN IS QUEUED, AND THE QUEUE IS WHERE IT STOPS. Claude
-    Code records it as `{"type":"queue-operation","operation":"enqueue",
-    "content":...}`, hands it to the model, and never posts it: measured on one
-    session, 34 of 44 turns present in the transcript and absent from the
-    server, while `POST /worker/events` went out and returned 200 throughout
-    carrying everything else. Nothing in any request body contains this text,
-    so the transcript is the only place it can be recovered from.
-    """
-    out: "list[str]" = []
-    get_claude_config_home = require("paths").get_claude_config_home
-    try:
-        paths = list(
-            (get_claude_config_home() / "projects").glob(f"*/{session_id}.jsonl"))
-    except OSError:
-        return out
-    if not paths:
-        return out
-    cutoff = time.time() - min_age_s
-    try:
-        with open(max(paths, key=lambda p: p.stat().st_mtime), errors="replace") as fh:
-            for line in fh:
-                if '"queue-operation"' not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if rec.get("operation") != "enqueue":
-                    continue
-                text = rec.get("content")
-                if not isinstance(text, str) or not text.strip():
-                    continue
-                stamp = rec.get("timestamp") or ""
-                try:
-                    when = _dt.datetime.strptime(
-                        stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(
-                            tzinfo=_dt.timezone.utc).timestamp()
-                except (ValueError, TypeError):
-                    continue
-                if when <= cutoff:
-                    out.append(text)
-    # BROAD ON PURPOSE, because this runs on the request path in front of a
-    # live client. The first cut caught only OSError and used `calendar`, which
-    # this module does not import -- a NameError on the very first record with
-    # a timestamp, raised straight into the handler. It never shipped only
-    # because the test asked for the value instead of asking whether the
-    # function ran.
-    except Exception:  # noqa: BLE001
-        return []
-    return out
 
 
-def replay_lost_turns(bridge: str, oauth_token: "str | None") -> None:
-    """Post the turns this CLI took and never sent, so claude.ai can show them.
-
-    Two credentials, and they are not interchangeable. Reading the server's copy
-    is a pinned OAuth route; writing to `/worker/events` is the worker's own
-    JWT, and sending the OAuth token there is `403 permission_error` -- measured
-    against four candidate body shapes, all four identical, which is what says
-    the refusal is about the credential rather than the envelope.
-
-    Never raises: this runs on the request path in front of a live client.
-    """
-    # OFF. Turned off in 0.1.170 after it did real damage to a live
-    # conversation, and it stays off until the two defects below are fixed and
-    # tested rather than reasoned about.
-    #
-    # NO TIME WINDOW. `queued_texts` reads the WHOLE transcript, so the first
-    # time it worked it replayed every queued turn this session had ever taken
-    # -- weeks-old design discussion -- into the user's live claude.ai view.
-    # `_REPLAY_MIN_AGE_S` is a floor and there was no ceiling.
-    #
-    # AND A TIMESTAMP OF NOW. Each replay was stamped with the current time
-    # rather than the turn's own, so those old messages did not merely appear,
-    # they appeared as if the user had just typed them. The user saw four and
-    # asked what was happening to their session.
-    #
-    # The idea is still right: the text exists nowhere but the queue record,
-    # and without a replay it never reaches claude.ai. What was wrong is that
-    # a repair which WRITES to a live conversation shipped with no bound on
-    # what it would write, and I did not think about it until it worked.
-    return
-    if not oauth_token:
-        return
-    auth = worker_auth(bridge)
-    if not auth:
-        return
-    last = _REPLAY_LAST.get(bridge, 0.0)
-    if time.monotonic() - last < _REPLAY_COOLDOWN_S:
-        return
-    _REPLAY_LAST[bridge] = time.monotonic()
-
-    session_id = _session_for_bridge(bridge)
-    if not session_id:
-        return
-    queued = queued_texts(session_id)
-    if not queued:
-        return
-    try:
-        req = urllib.request.Request(
-            f"https://api.anthropic.com/v1/code/sessions/{bridge}/events?limit=500",
-            headers={"Authorization": f"Bearer {oauth_token}",
-                     "anthropic-version": "2023-06-01"})
-        with urllib.request.urlopen(
-                req, timeout=15, context=_verifying_context()) as resp:
-            held = resp.read().decode(errors="replace")
-    except Exception:  # noqa: BLE001 — never take the daemon down
-        return
-
-    missing = [t for t in queued if t.strip()[:40] and t.strip()[:40] not in held]
-    if not missing:
-        return
-    sent = 0
-    for text in missing[:20]:
-        ok, why = _post_one_turn(bridge, auth, text)
-        if ok:
-            sent += 1
-            continue
-        # THE SERVER'S OWN WORDS, not just the status. The first cut logged
-        # `<HTTPError 400: 'Bad Request'>` and nothing else, which says only
-        # that something is wrong with a body I chose -- and a 400 after a 403
-        # is progress worth reading, because it means the CREDENTIAL is now
-        # right and the envelope is what is left. The body names the field.
-        _log_lifecycle(
-            f"a queued turn could not be replayed to the bridge: {why} — the "
-            "CLI took it and never posted it, so claude.ai will not show it")
-        break
-    if sent:
-        _log_lifecycle(
-            f"replayed {sent} of {len(missing)} turn(s) the CLI took while busy "
-            "and never posted; without this they exist only in the transcript")
 
 
-#: Envelopes to try for one replayed turn, in order, until the server takes one.
-#:
-#: A LIST BECAUSE THE ALTERNATIVE IS A DEPLOY PER GUESS. The shape is not
-#: documented anywhere we can read, the CLI's own POST bodies are not in the
-#: trace, and the worker JWT that would let this be probed from outside lives
-#: only in the daemon's memory. Four candidates and a log line naming the
-#: winner converges in one release; when the winner is known this collapses to
-#: it alone.
-def _turn_envelopes(bridge: str, text: str,
-                    epoch_override: "object" = None) -> "list[dict]":
-    # NO `isSynthetic`, and the server said so itself:
-    #   400 invalid_request_error "isSynthetic: Extra inputs are not permitted"
-    # It appears on every STORED worker event, which is where I copied it from
-    # -- and that is the trap: a field the server ADDS on the way in is not a
-    # field it ACCEPTS. Reading a record to infer its request body is the same
-    # mistake as reading a caller to infer what a receiver takes.
-    body = {"message": {"content": text, "role": "user"},
-            "parent_tool_use_id": None,
-            "session_id": bridge,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
-    # THE TOP LEVEL IS SETTLED: `{"events": [...]}`. The server said so itself,
-    # refusing a bare `event_type` with "Extra inputs are not permitted. Did
-    # you mean 'events'?".
-    #
-    # What is NOT settled is the event_type VALUE. `{"events":[{"event_type":
-    # "user", ...}]}` comes back `events[0]: event_type is required` with the
-    # field plainly present, which is what a discriminated union does when the
-    # value matches no variant -- it reports the discriminator as missing
-    # rather than as wrong.
-    #
-    # So the first entry is a deliberate miss whose only job is to make the
-    # server enumerate what it WILL take. Asking the receiver beats another
-    # round of guessing, and this file has already paid twice for inferring a
-    # contract instead of asking for it.
-    epoch = epoch_override if epoch_override is not None \
-        else _WORKER_EPOCH.get(bridge)
-    # `worker_epoch` IS REQUIRED, read out of 2.1.238's own client:
-    #     this.request("post","/worker/events",
-    #                  {worker_epoch:this.workerEpoch, events:c}, …)
-    # Every envelope tried before this was missing it, which is why the server
-    # kept answering about `events[0]` — it was rejecting the request before
-    # ever agreeing what an event should look like. The value is a counter in
-    # the CLI's memory, so it is captured off a real POST rather than invented.
-    top = {"worker_epoch": epoch} if epoch is not None else {}
-    # `EVENT_TYPE_USER` FIRST, and the evidence is in the stored record itself:
-    # beside `event_type` sits
-    #     "device_attestation_status": "DEVICE_ATTESTATION_STATUS_UNSPECIFIED"
-    # which is the proto enum convention — SCREAMING_SNAKE prefixed with the
-    # enum's own type name. A proto JSON parser answers an UNKNOWN enum string
-    # by reporting the field as missing, which is exactly the reply four
-    # structurally different envelopes all got, including one carrying no
-    # `event_type` at all. So the stored `"user"` is how the value is RENDERED,
-    # not how it is accepted.
-    #
-    # THE REAL CONTRACT, read off a live POST rather than guessed:
-    #
-    #     top-level keys  ['events', 'worker_epoch']
-    #     event keys      ['ephemeral', 'payload']   (or just ['payload'])
-    #
-    # There is NO `event_type` in a request. Four releases put one there,
-    # including one deliberately invalid, and every reply was the same
-    # `events[0]: event_type is required` -- which was never about a value at
-    # all. The server DERIVES it from the payload, and the client's own SSE
-    # handler reads `payload.type` the same way (`n.type === "control_request"`
-    # in 2.1.238). So what was missing is `type` INSIDE the payload.
-    #
-    # Kept as a short list because only the first entry is measured; the rest
-    # are the previous best guesses, retained until a `replayed` line proves
-    # the first one and they can go.
-    return [
-        {**top, "events": [{"payload": dict(body, type="user")}]},
-        {**top, "events": [{"payload": body}]},
-        {**top, "events": [{"event_type": "user", "payload": body}]},
-    ]
 
 
-def _post_one_turn(bridge: str, auth: str, text: str,
-                   epoch_override: "object" = None) -> "tuple[bool, str]":
-    """`(True, which)` on the first envelope the server accepts, else the last
-    refusal WITH ITS BODY -- the status alone cannot say which field is wrong.
-
-    A 409 `epoch_conflict` is answered rather than reported: the body carries
-    `expected_epoch`, so the one value that could not be guessed is handed over
-    by the server itself. Retried ONCE, because a second conflict means the
-    epoch moved again under a live worker and this replay has lost the race --
-    which is the server's guard working, not something to hammer.
-    """
-    last = "no envelope attempted"
-    for i, payload in enumerate(_turn_envelopes(bridge, text, epoch_override)):
-        try:
-            req = urllib.request.Request(
-                f"https://api.anthropic.com/v1/code/sessions/{bridge}/worker/events",
-                data=json.dumps(payload).encode(),
-                headers={"Authorization": auth,
-                         "Content-Type": "application/json",
-                         "anthropic-version": "2023-06-01"})
-            with urllib.request.urlopen(
-                    req, timeout=15, context=_verifying_context()) as resp:
-                if 200 <= resp.status < 300:
-                    return True, f"envelope {i}"
-                last = f"envelope {i}: HTTP {resp.status}"
-        except urllib.error.HTTPError as exc:
-            try:
-                detail = exc.read().decode(errors="replace")[:200]
-            except Exception:  # noqa: BLE001
-                detail = "(body unreadable)"
-            # A 409 IS AN ANSWER, NOT A REFUSAL TO REPORT. It means the body
-            # was accepted and only the epoch is stale, and the body names the
-            # value: `{"expected_epoch":"11", "actual_epoch":"0", ...}`. Take
-            # it and retry once.
-            if exc.code == 409 and epoch_override is None:
-                want = None
-                try:
-                    want = (json.loads(detail).get("error") or {}).get(
-                        "expected_epoch")
-                except Exception:  # noqa: BLE001
-                    want = None
-                if want is not None:
-                    try:
-                        want = int(want)
-                    except (TypeError, ValueError):
-                        pass
-                    _WORKER_EPOCH[bridge] = want
-                    return _post_one_turn(bridge, auth, text, epoch_override=want)
-            # EVERY refusal, not just the last. Only envelope 3's was logged
-            # before, so the other three were refused for reasons nobody saw --
-            # and if they differ, that difference is the next clue.
-            last = (last + " | " if last != "no envelope attempted" else "") \
-                + f"envelope {i}: HTTP {exc.code} {detail}"
-        except Exception as exc:  # noqa: BLE001
-            return False, f"envelope {i}: {exc!r}"
-    return False, last
 
 
 # How rarely presence may trigger a superseded-bridge sweep. Presence is posted
@@ -3227,15 +2738,12 @@ def is_pinned_route(path: str) -> bool:
     """
     # ``client/presence`` is NOT ownership, it is REGISTRATION. It posts
     # {client_id, clear} and gets a poll interval back — it is how this CLI
-    # tells the server "I am attached to this session, send me things". Swapped,
-    # the server registers the PINNED account as the attached client while the
-    # process actually listening is the active one, so inbound has nobody to go
-    # to. Measured: presence was the only route being swapped in a live window
-    # (3 calls, all 200) while Remote Control received nothing.
-    #
-    # The pin is about who OWNS the claude.ai-side assets, not about who is
-    # sitting at the terminal. Registration must stay with the account whose
-    # process will do the receiving.
+    # tells the server "I am attached to this session, send me things".
+    # Swapped, the server registers the PINNED account as the attached client
+    # while the process actually listening is the active one, so inbound has
+    # nobody to go to. The pin is about who OWNS the claude.ai-side assets, not
+    # about who is sitting at the terminal. Registration must stay with the
+    # account whose process will do the receiving.
     if _PRESENCE.search(path):
         return False
     if _WORKER_SUBTREE.search(path):
@@ -3275,63 +2783,45 @@ def is_pinned_route(path: str) -> bool:
         return True
     # ``/api/claude_code/policy_limits`` IS THE ROUTE THAT DECIDES WHETHER
     # REMOTE CONTROL IS ALLOWED AT ALL, and a wrong answer here is permanent.
-    #
     # Claude Code polls it hourly and feeds the answer into `setSessionCache`,
     # which `isPolicyAllowed("allow_remote_control")` reads. The same answer is
     # written to the machine-wide `policy-limits.json`, and the pre-fetch that
     # `/remote-control` runs first (2.1.234) returns early when a document is
-    # already cached:
-    #
-    #     async function ...(){ try{ if(getResponseFromCache()!==null) return }
-    #
-    # so a denial that lands once is never re-asked for the life of the
-    # process. No restart, no recovery, and no request on the wire to see.
-    #
-    # MEASURED: an enterprise account whose document carries
-    # ``allow_remote_control: {"allowed": false}`` was made active. Every live
-    # session's poll went out under it and cached the denial; `/remote-control`
-    # answered "Remote Control is disabled by your organization's policy" for
-    # hours, while the PINNED account's own answer allowed it and the file on
-    # disk had already been repaired.
-    #
-    # Same reasoning as ``/api/oauth/validate`` above: both are QUESTIONS about
-    # who this session is, and its work travels as the pin — so the question
-    # must travel as the pin too. Asking under the active account applies one
-    # org's restrictions to another org's session, which is the exact thing
-    # the pin exists to prevent.
-    #
-    # EXACT MATCH, not an ``/api/claude_code/`` prefix, for the same reason
-    # validate is: nothing else known under that subtree is decided by
+    # already cached:  async function ...(){ try{
+    # if(getResponseFromCache()!==null) return }  so a denial that lands once
+    # is never re-asked for the life of the process. No restart, no recovery,
+    # and no request on the wire to see. Same reasoning as
+    # ``/api/oauth/validate`` above: both are QUESTIONS about who this session
+    # is, and its work travels as the pin — so the question must travel as the
+    # pin too. Asking under the active account applies one org's restrictions
+    # to another org's session, which is the exact thing the pin exists to
+    # prevent. EXACT MATCH, not an ``/api/claude_code/`` prefix, for the same
+    # reason validate is: nothing else known under that subtree is decided by
     # ownership, and a prefix would swap routes nobody has looked at.
     if path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits":
         return True
-    # Bridge attachments: CC fetches `/api/oauth/files/<uuid>/content` with
-    # the OAuth bearer and renders any non-200 as "could not be downloaded".
-    # The file belongs to the pinned account, so it must be asked for as the
-    # pin. Safe as a PREFIX because it only READS — it mints and creates
-    # nothing. Not `/api/oauth/`: that would sweep in `token`.
+    # Bridge attachments: CC fetches `/api/oauth/files/<uuid>/content` with the
+    # OAuth bearer and renders any non-200 as "could not be downloaded". The
+    # file belongs to the pinned account, so it must be asked for as the pin.
+    # Safe as a PREFIX because it only READS — it mints and creates nothing.
+    # Not `/api/oauth/`: that would sweep in `token`.
+    #
     # AND THE BARE COLLECTION, which the trailing slash above kept out. That
     # exclusion was a side effect of writing the lifecycle prefix, not a
     # decision: nothing here ever said the list should answer as the active
     # account, and answering that way is what breaks cross-session messaging.
-    #
     # `GET /v1/sessions` is how Claude Code enumerates your sessions on other
     # machines -- the listing behind ListAgents and SendMessage. Traced live
-    # while calling ListAgents on this host:
-    #
-    #     GET /v1/sessions pinned=False swapped=False  ->  200 OK
-    #
-    # so it asked the ACTIVE account, which owns none of the Remote Control
-    # sessions, and the peer list came back without them. The docs give one
-    # condition for a remote session to appear -- both ends running with
-    # Remote Control -- and say nothing about accounts, so a pin that leaves
-    # this route unswapped is the thing standing between the two.
-    #
-    # A READ, like `/api/oauth/files/`: listing creates nothing and mints
-    # nothing, so there is no ownership to get wrong. `== "/v1/sessions"` and
-    # a query-string form only -- never a prefix, because `/v1/sessions/`
-    # already has its own row above and a prefix here would say the same
-    # thing twice.
+    # while calling ListAgents on this host: GET /v1/sessions pinned=False
+    # swapped=False  ->  200 OK so it asked the ACTIVE account, which owns none
+    # of the Remote Control sessions, and the peer list came back without them.
+    # The docs give one condition for a remote session to appear -- both ends
+    # running with Remote Control -- and say nothing about accounts, so a pin
+    # that leaves this route unswapped is the thing standing between the two. A
+    # READ, like `/api/oauth/files/`: listing creates nothing and mints
+    # nothing, so there is no ownership to get wrong. `== "/v1/sessions"` and a
+    # query-string form only -- never a prefix, because `/v1/sessions/` already
+    # has its own row above and a prefix here would say the same thing twice.
     return (
         path.startswith("/v1/code/sessions")
         or path.startswith("/v1/sessions/")
@@ -3345,20 +2835,10 @@ def is_pinned_route(path: str) -> bool:
         # READ; the UPLOAD is `/api/oauth/file_upload`, which that prefix does
         # not match -- no trailing slash, different word. So the bytes went up
         # as the ACTIVE account and the browser, logged in as the PINNED one,
-        # asked its own org for a uuid that was never there.
-        #
-        # Measured 2026-08-21 with the live trace, one line settling it:
-        #   POST /api/oauth/file_upload pinned=False swapped=False -> 201
-        # The 201 excludes "the bytes never went up", which was the competing
-        # explanation and is indistinguishable from this one from the browser
-        # side. What the user saw was
-        #   GET /api/organizations/<org>/files/<uuid>  404, and its preview 404
-        # with that uuid verbatim, while `client/presence` returned 200 on the
-        # same browser profile -- the control that rules the route out.
-        #
-        # Exact match plus the query form, never a prefix: the neighbouring
-        # rows are exact for the same reason, and `startswith("/api/oauth/file")`
-        # would silently pin whatever is added beside it next.
+        # asked its own org for a uuid that was never there. Exact match plus
+        # the query form, never a prefix: the neighbouring rows are exact for
+        # the same reason, and `startswith("/api/oauth/file")` would silently
+        # pin whatever is added beside it next.
         or path == "/api/oauth/file_upload"
         or path.startswith("/api/oauth/file_upload?")
     )
@@ -3377,36 +2857,19 @@ class CertBundle:
     leaf_key_path: Path
 
 
-# TWO LIFETIMES, because the two certificates answer to different rules.
-#
-# The CA stays long. It is what the client trusts through NODE_EXTRA_CA_CERTS,
-# and rotating it invalidates every session already wired to it — so its life
-# should be as long as we can make it, not as short as the leaf's.
-#
-# The LEAF is capped by Apple. Security.framework rejects a TLS *server*
-# certificate whose lifetime exceeds 398 days, issued after September 2020,
-# with "certificate is not standards compliant" — and that is a rejection of
-# SHAPE, so no CA and no bundle repairs it. Measured 2026-08-18 on
-# host-c, same proxy and same certificate, three verifiers:
-#
-#     stdlib, default trust     CERTIFICATE_VERIFY_FAILED
-#     stdlib, our CA bundle     HTTP 401   <- TLS succeeded
-#     truststore (OS native)    "certificate is not standards compliant"
-#
-# cswap injects truststore, so the third row is the path that actually runs on
-# a Mac: every Python client in a pinned session was failing there while the
-# same certificate verified fine under OpenSSL.
-#
-# 396, NOT 397, and the difference is the whole margin. `_make_leaf` backdates
-# `not_valid_before` by a day, so the SPAN Apple measures is `_LEAF_DAYS + 1`.
-# 397 produced a 398-day certificate — exactly on the cap, with no room for a
-# clock skew either side. Measured on host-c by generating a cert and
-# reading its own dates back, which is also why the test asserts the span rather
-# than the constant.
-#
-# The previous single constant was justified as matching "the 10-year leaf a
-# sibling proxy issues" — an argument from another implementation rather than
-# from any client that has to verify ours.
+# TWO LIFETIMES, because the two certificates answer to different rules. The CA
+# stays long. It is what the client trusts through NODE_EXTRA_CA_CERTS, and
+# rotating it invalidates every session already wired to it — so its life
+# should be as long as we can make it, not as short as the leaf's. The LEAF is
+# capped by Apple. Security.framework rejects a TLS *server* certificate whose
+# lifetime exceeds 398 days, issued after September 2020, with "certificate is
+# not standards compliant" — and that is a rejection of SHAPE, so no CA and no
+# bundle repairs it. `_make_leaf` backdates `not_valid_before` by a day, so the
+# SPAN Apple measures is `_LEAF_DAYS + 1`. 397 produced a 398-day certificate —
+# exactly on the cap, with no room for a clock skew either side. The previous
+# single constant was justified as matching "the 10-year leaf a sibling proxy
+# issues" — an argument from another implementation rather than from any client
+# that has to verify ours.
 _CA_DAYS = 3650
 _LEAF_DAYS = 396
 
@@ -3432,28 +2895,18 @@ def ensure_ca(ca_dir: Path, host: str) -> CertBundle:
 
     # Serialized, because the CA test and the leaf test used to be independent
     # conditions over four separately-written files with nothing holding them
-    # together. Two sessions starting in the same second (first pin, or after
-    # a cert-dir wipe) could interleave so that ca.pem did not sign leaf.pem —
-    # measured on repeated trials — and since this function is idempotent it
-    # NEVER self-healed: every later launch reused the mismatched pair and
-    # Node reported "unable to verify the first certificate" until a human
-    # deleted the directory.
+    # together.
     with _spawn_lock(ca_dir, name=".ca.lock"):
         if not _certs_consistent(ca_pem, ca_key, leaf_pem, leaf_key, host):
-            # KEEP A CA THAT IS STILL GOOD, and re-issue only the leaf under it.
-            #
-            # This used to regenerate BOTH, justified as "keeping a CA whose
-            # leaf must be reissued would leave already-wired sessions trusting
-            # a root that no longer matches". That argues the REVERSE case: a CA
-            # being replaced cannot keep its leaf. A leaf can always be
-            # re-issued from a CA that is still valid, and doing so is what
-            # keeps the client's trusted root stable.
-            #
-            # It only became load-bearing when the leaf's life dropped from 3650
-            # days to 397 for Apple's cap. At 3650 the renewal fired once a
-            # decade and nobody noticed the CA going with it; at 397 it fires
-            # every year, and a new CA breaks every session already wired to the
-            # old one. That is the one thing the pin must never do.
+            # KEEP A CA THAT IS STILL GOOD, and re-issue only the leaf under
+            # it. That argues the REVERSE case: a CA being replaced cannot keep
+            # its leaf. A leaf can always be re-issued from a CA that is still
+            # valid, and doing so is what keeps the client's trusted root
+            # stable. It only became load-bearing when the leaf's life dropped
+            # from 3650 days to 397 for Apple's cap. At 3650 the renewal fired
+            # once a decade and nobody noticed the CA going with it; at 397 it
+            # fires every year, and a new CA breaks every session already wired
+            # to the old one. That is the one thing the pin must never do.
             reused = _load_ca_if_usable(ca_pem, ca_key)
             if reused is None:
                 ca_cert, ca_priv = _make_ca()
@@ -3525,15 +2978,12 @@ def _certs_consistent(
             return False
         ca = x509.load_pem_x509_certificate(ca_pem.read_bytes())
         leaf = x509.load_pem_x509_certificate(leaf_pem.read_bytes())
-        # `unsafe_skip_rsa_key_validation` skips OpenSSL's RSA_check_key, which
-        # costs 27ms per key — 55ms of every single launch, measured, spent
-        # re-proving the primality of a key THIS code generated and wrote 0600
-        # into its own dir. The check defends against an ATTACKER-supplied key
-        # (fault attacks on a key you did not make); it is not a corruption
-        # check. PEM framing, DER structure, and the algorithm are still parsed
-        # and still raise on a truncated or foreign file, which is the only
-        # failure this function is asking about. Landed in cryptography 39.0,
-        # well under the 42.0 floor above.
+        # The check defends against an ATTACKER-supplied key (fault attacks on
+        # a key you did not make); it is not a corruption check. PEM framing,
+        # DER structure, and the algorithm are still parsed and still raise on
+        # a truncated or foreign file, which is the only failure this function
+        # is asking about. Landed in cryptography 39.0, well under the 42.0
+        # floor above.
         serialization.load_pem_private_key(
             ca_key.read_bytes(), password=None, unsafe_skip_rsa_key_validation=True
         )
@@ -3548,22 +2998,18 @@ def _certs_consistent(
         if min(ca.not_valid_after_utc, leaf.not_valid_after_utc) <= soon:
             return False
         # AN OVER-LONG LEAF IS UNUSABLE, not merely unfashionable. Capping
-        # `_LEAF_DAYS` only affects a certificate that gets GENERATED, and every
-        # install already carrying a 3650-day leaf keeps it: it is unexpired,
-        # correctly signed, and has the right SAN, so every other test here
-        # passes for another decade. The cap would have shipped and changed
-        # nothing on the machines that actually fail — which is the entire
-        # reason it exists.
-        #
-        # Security.framework rejects it outright ("certificate is not standards
-        # compliant"), so for the verifier this proxy has to satisfy, a leaf
-        # this long is as broken as an expired one. Measured: 3651 days
-        # REJECTED, 397 days ACCEPTED, same CA, same probe.
-        #
-        # Only the leaf. The CA is the client's trusted root, the cap does not
-        # apply to it, and `ensure_ca` keeps a good one — so this rotates the
-        # certificate macOS objects to without disturbing the trust anyone is
-        # already wired to.
+        # `_LEAF_DAYS` only affects a certificate that gets GENERATED, and
+        # every install already carrying a 3650-day leaf keeps it: it is
+        # unexpired, correctly signed, and has the right SAN, so every other
+        # test here passes for another decade. The cap would have shipped and
+        # changed nothing on the machines that actually fail — which is the
+        # entire reason it exists. Security.framework rejects it outright
+        # ("certificate is not standards compliant"), so for the verifier this
+        # proxy has to satisfy, a leaf this long is as broken as an expired
+        # one. Only the leaf. The CA is the client's trusted root, the cap does
+        # not apply to it, and `ensure_ca` keeps a good one — so this rotates
+        # the certificate macOS objects to without disturbing the trust anyone
+        # is already wired to.
         if (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days > _LEAF_DAYS + 1:
             return False
         san = leaf.extensions.get_extension_for_class(
@@ -3579,13 +3025,15 @@ def _certs_consistent(
         )
         return True
     except AttributeError as exc:
-        # NOT the same as a cert failure. A MISSING API means the CODE is wrong
-        # for the cryptography that is installed — and "regenerate" is the
-        # worst possible response: it is deterministic, so it fires on EVERY
-        # launch and the daemon serves a leaf under a CA the session was never
-        # handed. That is how a floor of `cryptography>=41.0` turned into
-        # CERTIFICATE_VERIFY_FAILED on every request, silently, for anyone
-        # whose resolver picked 41.x (`not_valid_after_utc` landed in 42.0).
+        # NOT the same as a cert failure.
+        #
+        # A MISSING API means the CODE is wrong for the cryptography that is
+        # installed — and "regenerate" is the worst possible response: it is
+        # deterministic, so it fires on EVERY launch and the daemon serves a
+        # leaf under a CA the session was never handed. That is how a floor of
+        # `cryptography>=41.0` turned into CERTIFICATE_VERIFY_FAILED on every
+        # request, silently, for anyone whose resolver picked 41.x
+        # (`not_valid_after_utc` landed in 42.0).
         #
         # BUT ONLY FOR THE VERSION MISMATCH. The same AttributeError is raised
         # by a perfectly valid cert dir that simply is not RSA — this function
@@ -3594,10 +3042,9 @@ def _certs_consistent(
         # too. 0.1.3 returned False there and regenerated on the next launch;
         # propagating instead kills `PinProxy.__init__`, which does NOT fail
         # open, so the daemon dies at construction and can never repair a
-        # directory the previous release healed by itself.
-        #
-        # Name the API this code requires. Absent -> the library moved, be
-        # loud. Present -> the certs are simply of another kind, regenerate.
+        # directory the previous release healed by itself. Name the API this
+        # code requires. Absent -> the library moved, be loud. Present -> the
+        # certs are simply of another kind, regenerate.
         if not hasattr(x509.Certificate, "not_valid_after_utc"):
             raise
         return False
@@ -3822,26 +3269,18 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     # the end, so a clear+re-pin rewrote identical content in a different order
     # on a file symlinked into the dotfiles repo. 0.1.70 fixed that by sorting
     # the whole file, and the reasoning held only while this was the sole
-    # writer.
-    #
-    # It is not. FOUR others write this same path, all through the host's
-    # insertion-order writer (`json.dumps(data, indent=2)`, no sort_keys):
-    #
-    #   claude_swap settings.py  save_settings / set_setting / unset_setting
-    #   claude_swap pin.py       _clear_pin_record
-    #
-    # Each appends a NEW section at the end, because `raw[k] = v` on a fresh
-    # key does. Sorting here then drags that key inward on the next pin —
-    # an order-only diff on a tracked file, once per new section, forever.
-    # Measured on the file's own history: 9 commits in a month, and the ONLY
-    # key-order change was 0.1.70's normalisation; the two sections added in
-    # that window (`remoteControl`, `ui`) disturbed nothing.
-    #
-    # So the invariant that matters on a SHARED file is agreeing with its other
-    # writers, not being internally tidy. Preserving order costs one move of
-    # this key the first time a clear+re-pin happens after this change — a
-    # content-meaningful diff, since the key really was removed and re-added —
-    # and is byte-stable from then on, under BOTH pin cycles and new sections.
+    # writer. It is not. FOUR others write this same path, all through the
+    # host's insertion-order writer (`json.dumps(data, indent=2)`, no
+    # sort_keys):  claude_swap settings.py  save_settings / set_setting /
+    # unset_setting claude_swap pin.py       _clear_pin_record  Each appends a
+    # NEW section at the end, because `raw[k] = v` on a fresh key does. Sorting
+    # here then drags that key inward on the next pin — an order-only diff on a
+    # tracked file, once per new section, forever. So the invariant that
+    # matters on a SHARED file is agreeing with its other writers, not being
+    # internally tidy. Preserving order costs one move of this key the first
+    # time a clear+re-pin happens after this change — a content-meaningful
+    # diff, since the key really was removed and re-added — and is byte-stable
+    # from then on, under BOTH pin cycles and new sections.
     _settings.atomic_write_json(path, raw)
 
 
@@ -3916,11 +3355,9 @@ def _both_spellings(bridge: str) -> tuple[str, str]:
 # The same two facts under two spellings, because Claude Code keeps ONE bridge
 # pointer in TWO stores and picks by whether `CLAUDE_JOB_DIR` is set: `Ekw`
 # writes `~/.claude/jobs/<jobId>/state.json`, `Rsr` appends a `bridge-session`
-# record to the transcript. Measured here: 12 of 13 live RC sessions have a job
-# record, and where a transcript record also exists it is a leftover from before
-# — one of the twelve has none at all. A carry that knows only the transcript
-# reaches almost nobody; one that knows only the job record strands every
-# session resumed interactively, so both are needed.
+# record to the transcript. A carry that knows only the transcript reaches
+# almost nobody; one that knows only the job record strands every session
+# resumed interactively, so both are needed.
 _TRANSCRIPT_OWNER = ("ownerAccountUuid", "ownerOrganizationUuid")
 _JOB_OWNER = ("bridgeOwnerAccountUuid", "bridgeOwnerOrganizationUuid")
 # Keyed by VALUE, not identity. `owner_keys is _TRANSCRIPT_OWNER` looked
@@ -4071,13 +3508,9 @@ def _carry_pointer(record: dict, login: tuple[str, str],
     return out
 
 
-# How much of a transcript's tail to read looking for the pointer. Bridge
-# checkpoints are appended as the session runs, so the live one is near the
-# end — but "near" is the honest word: measured across twelve transcripts here,
-# one holds 38 records with the last 33 KB from EOF, one holds 1, and one holds
-# none at all. This is a BOUND on the launch path, not a search, and two of the
-# twelve have nothing in this window. Finding nothing is "skip", never "there
-# is no pointer".
+# How much of a transcript's tail to read looking for the pointer. This is a
+# BOUND on the launch path, not a search, and two of the twelve have nothing in
+# this window. Finding nothing is "skip", never "there is no pointer".
 _POINTER_TAIL_BYTES = 65536
 
 
@@ -4209,12 +3642,10 @@ def _carry_candidates() -> list[tuple[str, str | None]]:
         # THE RESUMED ID IS THE ONE WITH A LIVE TRANSCRIPT. `sessionId` is the
         # id the job was CREATED with and a resume never rewrites it — it puts
         # the new id in `resumeSessionId`, and that id has its OWN transcript
-        # file. Measured on job `bbc76cfa`: `sessionId`'s transcript is 5.8 MB
-        # last written in July, `resumeSessionId`'s is 316 MB written today.
-        # Keying the transcript half on the created id restamps a dead file and
-        # leaves the live one vetoed — the exact fault the both-stores fix
-        # exists to close, reintroduced through the id rather than the store.
-        # Both are offered; whichever has a pointer gets it.
+        # file. Keying the transcript half on the created id restamps a dead
+        # file and leaves the live one vetoed — the exact fault the both-stores
+        # fix exists to close, reintroduced through the id rather than the
+        # store. Both are offered; whichever has a pointer gets it.
         for sid in (st.get("resumeSessionId"), st.get("sessionId")):
             if not sid or job in live or str(sid) in live:
                 continue
@@ -4297,11 +3728,8 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     """
     get_claude_config_home = require("paths").get_claude_config_home
     found: list[tuple[Path, dict]] = []
-    # No guard on the glob: measured on this interpreter, a missing directory
-    # yields `[]` (it suppresses scan errors) and the `ValueError` it can raise
-    # needs a `**` component, which a session id cannot contain. A guard here
-    # would also make `_carry_history_pointers`' stated reason for its outer
-    # catch-all untrue.
+    # A guard here would also make `_carry_history_pointers`' stated reason for
+    # its outer catch-all untrue.
     for path in (get_claude_config_home() / "projects").glob(f"*/{session_id}.jsonl"):
         try:
             with path.open("rb") as fh:
@@ -4357,25 +3785,11 @@ def _carry_history_pointers(certdir: Path) -> int:
         login = _login_identity()
         if login is None:
             return 0  # no readable login: nothing to agree with
-        # A PIN ON ANOTHER ORG MEANS THE STAMP WOULD LIE, so do not stamp.
-        #
-        # `_carry_pointer`'s docstring reasons that "a wrong guess then costs a
-        # fresh mint, which is exactly today's behaviour — which is why nothing
-        # here has to prove who owns a bridge". Measured 2026-08-17, a wrong
-        # guess cost `API Error: 500 Internal server error`, twice, and the
-        # session was unusable until Remote Control was switched off:
-        #
-        #   15:07:18Z(08-15)  carry: restamped the bridge pointer for b0415c31
-        #   19:02:33(08-17)   cswap: Switched from account 2 to 3
-        #   23:15:12Z         history-suppression cause="migration"
-        #   23:15:12Z         bridge-session cse_01QBck… ownerOrg=da3631be (acct 2)
-        #   23:15:15Z         API Error: 500 Internal server error
-        #
-        # The stamp moves only what the LOCAL pointer claims; the bridge's owner
-        # on the server does not move. So restamping to a login that does not
-        # own it hands CC a bridge it cannot use — and the veto this sweep
-        # exists to defeat was the thing keeping that failure down to "lose the
-        # history". A lost history is survivable, a 500 is not.
+        # A PIN ON ANOTHER ORG MEANS THE STAMP WOULD LIE, so do not stamp. So
+        # restamping to a login that does not own it hands CC a bridge it
+        # cannot use — and the veto this sweep exists to defeat was the thing
+        # keeping that failure down to "lose the history". A lost history is
+        # survivable, a 500 is not.
         #
         # KEYED ON THE PIN, not on the bridge's owner, because the owner is the
         # thing this file deliberately never proves (see `_carry_pointer`: it
@@ -4387,15 +3801,9 @@ def _carry_history_pointers(certdir: Path) -> int:
         if pin and pin[1] and pin[1] != login[1]:
             return 0
         for sid, job in _carry_candidates():
-            # BOTH STORES, NOT WHICHEVER ONE ANSWERED FIRST. This used to skip
-            # the transcript whenever the job record was fixed — so in the
-            # normal case, where a rotation left BOTH stale, the transcript
-            # stayed wrong and the same session was vetoed the moment anyone
-            # resumed it interactively (`claude --resume`, no CLAUDE_JOB_DIR,
-            # so CC reads the transcript). Measured on job `15a12e92`: three
-            # different accounts across the login, the job record and the
-            # transcript. Writing both costs nothing — a record that already
-            # agrees returns None and is not rewritten.
+            # BOTH STORES, NOT WHICHEVER ONE ANSWERED FIRST. Writing both costs
+            # nothing — a record that already agrees returns None and is not
+            # rewritten.
             if job and _carry_job_record(job, login):
                 carried.append(f"{job}(job)")
             found = _last_pointer(sid)
@@ -4668,15 +4076,12 @@ def titles_to_restore(
     rewriting titles that already match would put one PUT per live session on
     the wire every time any one of them opens a bridge.
     """
-    # READ ONCE, AND ONLY IF SOMETHING ASKS. This walks every transcript on
-    # the machine — 11,584 files, 11 GB, measured — and it ran unconditionally
-    # on every Remote Control connect, above the two filters that reject
-    # almost everything. The set is consulted only for a session whose server
-    # title DIFFERS from its local name, which on a healthy machine is none of
-    # them, so the whole walk was being paid for an answer nobody read.
-    #
-    # Still once per call, not per item: the loop below runs over the entire
-    # listing, and that is what the original comment here was protecting.
+    # READ ONCE, AND ONLY IF SOMETHING ASKS. The set is consulted only for a
+    # session whose server title DIFFERS from its local name, which on a
+    # healthy machine is none of them, so the whole walk was being paid for an
+    # answer nobody read. Still once per call, not per item: the loop below
+    # runs over the entire listing, and that is what the original comment here
+    # was protecting.
     out: list[tuple[str, str]] = []
     for item in sessions:
         sid = item.get("id")
@@ -4688,9 +4093,9 @@ def titles_to_restore(
             continue
         # ANY DIFFERENCE, BECAUSE THE REGISTRY ALREADY PROVED OWNERSHIP.
         # `names` comes from this machine's own session registry, which pairs a
-        # name, a bridge id and a live pid in ONE record. A bridge is in it only
-        # because a session running HERE holds it and gave it that name, so a
-        # cloud title that differs is a title this side did not ask for.
+        # name, a bridge id and a live pid in ONE record. A bridge is in it
+        # only because a session running HERE holds it and gave it that name,
+        # so a cloud title that differs is a title this side did not ask for.
         #
         # THREE NARROWER RULES CAME AND WENT, AND EACH BROKE THE FEATURE. A
         # shape regex claimed names people had chosen. Reading only what Claude
@@ -4727,30 +4132,24 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     save_pin(switcher.backup_dir, email, org_uuid)
     if not email:
         wire_global_config(None, None)
-        # AND STOP NAMING THE EX-PIN. This branch returns below, above the
-        # splice the setting path performs, so clearing used to unwire the
-        # proxy and drop the record while `~/.claude.json` still named the
-        # account that had been pinned — and that field is what Claude Code
-        # takes as the OWNER of every bridge it mints. An unpinned machine
-        # kept minting under the ex-pin until some later switch happened to
-        # rewrite it.
-        #
-        # `identity` is the caller's to supply here exactly as it is when
-        # setting: only cswap can resolve an account in its own backup store.
-        # None therefore means "could not look one up", and the splice leaves
-        # the field alone rather than erasing it — cswap's own switch rewrites
-        # it on the next rotation, and a blank owner is worse than a stale one.
-        # DISARM. The gate is only meaningful while a pin exists, and leaving
-        # the secret behind means "I turned the pin off" and "the proxy still
-        # demands a credential" are both true at once — a state no user has a
-        # model for. Worse, the next `cswap pin` re-arms it against sessions
-        # wired in between, which is exactly the 407 storm this is fixed for.
+        # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
+        # the ex-pin until some later switch happened to rewrite it. `identity`
+        # is the caller's to supply here exactly as it is when setting: only
+        # cswap can resolve an account in its own backup store. None therefore
+        # means "could not look one up", and the splice leaves the field alone
+        # rather than erasing it — cswap's own switch rewrites it on the next
+        # rotation, and a blank owner is worse than a stale one. DISARM. The
+        # gate is only meaningful while a pin exists, and leaving the secret
+        # behind means "I turned the pin off" and "the proxy still demands a
+        # credential" are both true at once — a state no user has a model for.
+        # Worse, the next `cswap pin` re-arms it against sessions wired in
+        # between, which is exactly the 407 storm this is fixed for.
         #
         # ABSENT AND REFUSED ARE NOT THE SAME OSError. FileNotFoundError means
         # there was never anything armed — fine, `False` is correct. Any other
         # OSError (permission denied, a read-only mount) means the secret is
-        # STILL THERE and this function is about to return the exact `False`
-        # a successful disarm would, which every caller reads as "nothing is
+        # STILL THERE and this function is about to return the exact `False` a
+        # successful disarm would, which every caller reads as "nothing is
         # armed". RE-RAISE rather than log: logging still returns the false
         # `False`, and the caller's next decision — including the next `cswap
         # pin` re-arming against sessions wired in the meantime — is made on
@@ -5037,20 +4436,19 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # THE READ IS NOT FREE ON EVERY PLATFORM. It costs 0.02ms on linux and
         # 19.77ms on a mac, where it shells out to the keychain — and a Remote
         # Control session posts `/worker/events` continuously, so that was
-        # ~20ms added to the one channel whose latency is what a live
-        # claude.ai view times out on.
+        # ~20ms added to the one channel whose latency is what a live claude.ai
+        # view times out on.
         #
-        # KEYED ON THE ACCOUNT, which is what keeps `cswap pin <other>`
-        # working under a live session. The pin is still re-read from disk
-        # every request; only the CREDENTIAL for an account already resolved
-        # is held, so a re-pin is a different key and therefore a miss. The
-        # TTL then bounds the one case the key cannot see: the same account's
-        # credential rotated underneath us by the usage collector or the
-        # autoswitcher.
+        # KEYED ON THE ACCOUNT, which is what keeps `cswap pin <other>` working
+        # under a live session. The pin is still re-read from disk every
+        # request; only the CREDENTIAL for an account already resolved is held,
+        # so a re-pin is a different key and therefore a miss. The TTL then
+        # bounds the one case the key cannot see: the same account's credential
+        # rotated underneath us by the usage collector or the autoswitcher.
         # KEYED ON (slot, email), NOT the slot alone. A slot is stable while
         # the identity in it is not — `cswap move` renumbers, and a stub that
-        # returned one number for two emails proved the point in the suite:
-        # the re-pin case failed because the cache answered for the previous
+        # returned one number for two emails proved the point in the suite: the
+        # re-pin case failed because the cache answered for the previous
         # account. The email is the half that actually identifies who this
         # credential belongs to.
         ckey = (num, mail)
@@ -5252,10 +4650,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             if isinstance(stale.get("port"), int):
                 _write_port_hint(certdir, stale["port"])
             if _recycle_daemon(certdir, int(stale["pid"])):
-                # THE HOLDER OWNS THE REPLACEMENT. Spawning here would start a
-                # second holder for a port the first still holds; it cannot
-                # bind, falls back, and the wiring moves to an address no live
-                # session was given (measured: 44411 -> 41569).
+                # THE HOLDER OWNS THE REPLACEMENT.
                 for _ in range(int(_SPAWN_WAIT_S * 10)):
                     port = _read_alive_port(certdir)
                     if port is not None:
@@ -5338,12 +4733,9 @@ def _kill_daemon(pid: int) -> None:
 
     # A PID, NOT A GROUP. In ``kill(2)`` a pid of 0 addresses the CALLER'S OWN
     # process group and a negative pid addresses the group named by its
-    # absolute value — so a derived-but-wrong 0 arriving here does not fail,
-    # it SIGTERMs this daemon and whatever spawned it. Every caller today
-    # derives its pid from ``ps`` output and cannot produce one, but that is a
-    # property of the CALLERS, and a guard that lives in each of them is one
-    # new call site away from being missed. A peer landed exactly here with
-    # SIGKILL and took down its own test runner.
+    # absolute value — so a derived-but-wrong 0 arriving here does not fail, it
+    # SIGTERMs this daemon and whatever spawned it. A peer landed exactly here
+    # with SIGKILL and took down its own test runner.
     if pid <= 0:
         return
     try:
@@ -5462,8 +4854,7 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
         # The certdir must be the LAST argv token, not merely present. This
         # gate decides whether to SIGTERM-then-SIGKILL, and a substring match
         # also selects anything that happens to MENTION both — a shell whose
-        # command line quotes them, a wrapper, a grep. Measured: a probe shell
-        # matched alongside the daemon it was probing for.
+        # command line quotes them, a wrapper, a grep.
         head, _, rest = line.partition(" ")
         if not rest.rstrip().endswith(" " + target):
             continue
@@ -5473,17 +4864,13 @@ def _pin_daemon_pids(certdir: Path) -> list[int]:
         if f" {_HOLDER_MODULE_ARG} " in rest:
             continue
         # NOR THE STANDBY, for the same reason and with the same stakes. Its
-        # argv is the daemon's plus one flag too, so it passes both gates
-        # above — and it is the process whose death removes the port's last
-        # cover. It ignores SIGTERM by design, so being selected here does not
-        # merely stop it, it takes the SIGKILL escalation: no handler, no log,
-        # and nothing places a replacement.
-        #
-        # Measured on host-b, found in production rather than here: the
-        # standby was `<defunct>` within four minutes of every deploy, and the
-        # holder ran on believing it was covered. A zombie stays in the process
-        # table until reaped, so `ps`, `kill -0` and every check that asks the
-        # table instead of the STATE reported a standby that did not exist.
+        # argv is the daemon's plus one flag too, so it passes both gates above
+        # — and it is the process whose death removes the port's last cover. It
+        # ignores SIGTERM by design, so being selected here does not merely
+        # stop it, it takes the SIGKILL escalation: no handler, no log, and
+        # nothing places a replacement. A zombie stays in the process table
+        # until reaped, so `ps`, `kill -0` and every check that asks the table
+        # instead of the STATE reported a standby that did not exist.
         if f" {_STANDBY_MODULE_ARG} " in rest:
             continue
         try:
@@ -5516,36 +4903,23 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
         _kill_daemon(pid)
 
     # BUT A PILE OF THEM IS A LEAK, and this count is the only thing bounding
-    # it now that `_HANDOVER_DRAIN_SECONDS` is infinite. That is deliberate:
-    # one predecessor draining for hours because a reply has run for hours is
-    # correct, and a per-process clock scored it identically to a drain that
-    # will never end. The count tells them apart; the clock was cutting the
-    # first to catch the second.
-    #
-    # CHEAPEST FIRST, AND AGE IS ONLY THE TIEBREAK. The first version reaped
-    # the longest-running, on the reasoning that old means probably finished.
-    # Measured on host-a 2026-08-18 and it does not: a draining predecessor's
-    # connections carry a fixed 39-byte frame at ~1/s (GCD exact across 17
-    # samples, burstiness 1.57 — a keepalive, not a token stream), so every
-    # predecessor stays "moving" and age tracks how long a reply has been
-    # RUNNING rather than how close it is to done. Longest-first therefore
-    # took the stream with the most work already sunk and the worst retry
-    # odds. The count of replies owed is what a reap actually COSTS, so that
-    # is what orders it.
-    # AND 'CHEAPEST' MEANS LIVE ANSWERS, NOT DEBTS. Sorting on replies owed
-    # weighed twelve replies that stopped half an hour ago exactly as heavily
-    # as twelve still being written — measured on host-a 2026-08-18, where a
-    # daemon logged `12 mid-response` over twelve connections carrying nothing
-    # but keepalives. At the limit that made the reaper prefer to kill the
+    # it now that `_HANDOVER_DRAIN_SECONDS` is infinite. The count tells them
+    # apart; the clock was cutting the first to catch the second. CHEAPEST
+    # FIRST, AND AGE IS ONLY THE TIEBREAK. The first version reaped the
+    # longest-running, on the reasoning that old means probably finished.
+    # Longest-first therefore took the stream with the most work already sunk
+    # and the worst retry odds. The count of replies owed is what a reap
+    # actually COSTS, so that is what orders it. AND 'CHEAPEST' MEANS LIVE
+    # ANSWERS, NOT DEBTS. At the limit that made the reaper prefer to kill the
     # predecessor still doing real work. `live_replies` counts answers rather
     # than debts, by SSE event name rather than by any threshold.
-    # AND A DAEMON CARRYING A BRIDGE IS NOT PART OF THE PILE. This limit
-    # bounds predecessors that will not finish; one still carrying a live
-    # channel is a SESSION, and it ends when that session does.
-    # Ordering alone was not enough: a daemon whose only remaining job is that
-    # stream has zero live replies, so it sorted CHEAPEST and was always the
-    # one taken — the reap the fleet chose first was the one no session can
-    # recover from by itself.
+    #
+    # AND A DAEMON CARRYING A BRIDGE IS NOT PART OF THE PILE. This limit bounds
+    # predecessors that will not finish; one still carrying a live channel is a
+    # SESSION, and it ends when that session does. Ordering alone was not
+    # enough: a daemon whose only remaining job is that stream has zero live
+    # replies, so it sorted CHEAPEST and was always the one taken — the reap
+    # the fleet chose first was the one no session can recover from by itself.
     reapable = [d for d in draining if d[0] == 0]
     excess = len(draining) - _MAX_DRAINING_PREDECESSORS
     if excess > 0 and not reapable:
@@ -5633,17 +5007,12 @@ def _install_signal_teardown(cleanup) -> None:
             # A TERM IS A RECYCLE, NOT A RELEASE. Somebody wants this daemon
             # replaced — a redeploy, a repin, a fingerprint change — and under
             # a holder that means "put a successor on this socket", not "give
-            # the port back". Exiting 0 here made the holder release the port:
-            # measured, 186,206 refused connections across three SIGTERMs.
+            # the port back".
             #
             # THE HOLDER IS IDENTIFIED BY THE HAND-DOWN VARIABLES, not by
-            # LISTEN_PID. That was the first version and it was always false —
-            # the holder cannot know its child's pid before spawning, so it
-            # uses the predecessor protocol instead (fd by number, guarded by
-            # the parent's pid), and nothing ever set LISTEN_PID to ours.
-            #
-            # Only when a holder owns the socket: without one there is nothing
-            # to interpret the code, and 0 is what every existing caller reads.
+            # LISTEN_PID. Only when a holder owns the socket: without one there
+            # is nothing to interpret the code, and 0 is what every existing
+            # caller reads.
             os._exit(
                 _RESTART_ME_CODE
                 if held_by_a_holder()
@@ -5673,9 +5042,7 @@ _HOLDER_MODULE_ARG = "--hold-port"
 _DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 
 _STATE_FILE = "proxy.json"
-# Turning the request trace on used to require the daemon to be REBUILT: the
-# env is read at exec and the daemon outlives every session. Writing this file
-# reaches a daemon that is already serving.
+# Writing this file reaches a daemon that is already serving.
 _TRACE_SWITCH_FILE = "trace-to"
 # Re-read at most this often: the check sits on the request path, and a stat
 # per request buys nothing when the answer changes once a day at most.
@@ -5684,22 +5051,18 @@ _TRACE_CACHE: dict = {}
 # How long `_spawn_daemon` waits for a successor to publish. 10s because a
 # FIRST run generates an RSA key pair before it can serve.
 _SPAWN_WAIT_S = 10.0
-# The pin's OWN settings, in the pin's OWN directory. `CSWAP_PIN_PORT` used to
-# live in `~/.claude.json`'s env block, and it is the one entry there that
-# Claude Code never reads — HTTPS_PROXY, https_proxy, ALL_PROXY and
-# NODE_EXTRA_CA_CERTS are consumed by CC at boot; that number is consumed only
-# by us. Settings for an optional feature do not belong in another program's
-# exclusive file, and a user who wanted a fixed port had nowhere to say so.
+# The pin's OWN settings, in the pin's OWN directory. Settings for an optional
+# feature do not belong in another program's exclusive file, and a user who
+# wanted a fixed port had nowhere to say so.
 _SETTINGS_FILE = "settings.json"
 _FIFO_NAME = "refcount.fifo"
 _LOG_NAME = "daemon.log"
 # WHO WROTE THE LINE. Two proxies on this fleet emit drain lines — this one and
 # the cache-fix fork — and `drained clean` was a phrase neither owned, so a
-# reader handed one line could not say which produced it. That is a defect in
-# the line whether or not anything is pointed at a shared stream today.
+# reader handed one line could not say which produced it.
 #
-# INSERTED BEFORE `pid=`, never around the phrases. Peer readers match
-# `drained clean` and `cut .* in-flight` UNANCHORED (checked, not assumed:
+# INSERTED BEFORE `pid=`, never around the phrases. Peer readers match `drained
+# clean` and `cut .* in-flight` UNANCHORED (checked, not assumed:
 # `pin_cut_count` in the fleet tooling, and this file's own suite, whose only
 # positional assertion is `"pid=" in text`). Renaming or wrapping those tokens
 # would break every one of them; a token ahead of `pid=` cannot.
@@ -5818,11 +5181,7 @@ def announce_draining(certdir: Path, pid: int | None = None):
             path.write_text(str(time.time()))
         except OSError:
             # THE FILE IS ADVICE TO OTHER PROCESSES; THE DEPTH IS OUR OWN
-            # KNOWLEDGE. This used to roll the depth back and hand out a no-op
-            # releaser, which was harmless while nothing in-process read it —
-            # the sweep simply stayed as blind as it was before markers
-            # existed, which is this function's documented fail-open.
-            #
+            # KNOWLEDGE.
             # `teardown_drain_budget(handed_over=this_process_is_draining())`
             # reads it now, so the rollback broke the promise one paragraph up:
             # an ENOSPC or a read-only certdir made a daemon mid-handover
@@ -5889,23 +5248,17 @@ def beat_draining(certdir: Path, pid: int | None = None,
         # it would cost in debts. They differ exactly when a predecessor holds
         # replies that stopped: twelve owed, zero live.
         live_n = int(owed) if live is None else int(live)
-        # FOURTH LINE IS THE LONGEST SILENCE ANY OWED REPLY IS SITTING IN.
-        # Published here and not only in the drain line because the daemon
-        # this number exists to describe is the one that NEVER reaches a drain
-        # line — measured on host-a 2026-08-18, pid 609285 held twelve live
-        # sessions on keepalive-only traffic for 45 minutes and was still
-        # draining. An exit-time instrument says nothing about the case that
-        # does not exit.
-        #
+        # FOURTH LINE IS THE LONGEST SILENCE ANY OWED REPLY IS SITTING IN. An
+        # exit-time instrument says nothing about the case that does not exit.
         # APPENDED, never inserted: `draining_owed` and `draining_live` index
         # lines 2 and 3 by position, and a reader from a version that predates
         # this one takes the first three and ignores the rest. See
         # `draining_quiet` for the other half of the skew.
-        # FIFTH LINE IS HOW MANY LONG-LIVED CHANNELS WOULD DIE WITH US,
-        # and it outranks every other cost in the reap order: a reply can be
-        # retried, and a session whose bridge stream is cut cannot reopen it
-        # for itself. Appended, never inserted, for the same reason as the
-        # fourth.
+        #
+        # FIFTH LINE IS HOW MANY LONG-LIVED CHANNELS WOULD DIE WITH US, and it
+        # outranks every other cost in the reap order: a reply can be retried,
+        # and a session whose bridge stream is cut cannot reopen it for itself.
+        # Appended, never inserted, for the same reason as the fourth.
         tail = "" if quiet is None else f"\n{float(quiet):.1f}"
         if streams is not None:
             tail = f"{tail or chr(10) + '0.0'}\n{int(streams)}"
@@ -6164,30 +5517,20 @@ def _open_daemon_log(certdir: Path):
             # ROTATE, NEVER UNLINK. This runs at DAEMON START, which is the
             # instant a handover completes — so deleting here means the
             # INCOMING daemon destroys the OUTGOING daemon's teardown record.
-            # The lines that say whether a recycle cost anything ("drained,
-            # N", "cut N in-flight request(s)") are written by the process
-            # that is dying, and were being erased by the one replacing it.
-            #
-            # Measured 2026-08-18: three sessions took "API Error: Connection
-            # lost mid-response" during a two-stage recycle, and the log that
-            # covered it had been unlinked 8 seconds into the swap. The window
+            # The lines that say whether a recycle cost anything ("drained, N",
+            # "cut N in-flight request(s)") are written by the process that is
+            # dying, and were being erased by the one replacing it. The window
             # that would have named the cause was gone, and a second question
             # that hung on the same window — who emptied `.claude.json`'s env
-            # block — could not be settled either.
-            #
-            # An instrument destroyed by the event it exists to describe is
-            # worse than no instrument, because the empty file reads as "the
-            # daemon had nothing to say".
-            #
+            # block — could not be settled either. An instrument destroyed by
+            # the event it exists to describe is worse than no instrument,
+            # because the empty file reads as "the daemon had nothing to say".
             # TWO GENERATIONS, because one is destroyed by the same event.
             # `_open_daemon_log` runs in the SPAWNING process before the child
             # starts, so it renames the inode the OUTGOING daemon still holds
             # as stderr — its `cut N` / `drained clean` lines land in `.1`.
-            # A recycle is two-stage (measured 70 s apart), and if the second
-            # stage also finds the log over the cap it rotates again and
-            # overwrites `.1` with the first stage's teardown record still in
-            # it. That is the same "instrument destroyed by the event it
-            # describes" one generation further out.
+            # That is the same "instrument destroyed by the event it describes"
+            # one generation further out.
             try:
                 previous = path.with_suffix(path.suffix + ".1")
                 if previous.exists():
@@ -6255,71 +5598,47 @@ _DRAIN_SECONDS = 30.0
 # until this process is gone, so every second of drain here is a second with
 # the port bound and nobody behind it. The unheld path has the opposite shape:
 # it drains AFTER `_spawn_daemon` returned, with the successor already
-# accepting, so a 30s ceiling there costs nothing.
+# accepting, so a 30s ceiling there costs nothing. Nothing was REFUSED — the
+# holder's socket queues arrivals, which is what this design is for — but 30
+# requests timed out at 3s waiting for a reply nobody was there to write. The
+# ceiling is always paid in full on a real machine: a CONNECT tunnel is counted
+# for its whole life (deliberately — that is what stops an idle watcher cutting
+# a live session), and Remote Control's WebSocket lives as long as the session
+# does, so the count is never zero. Still a drain, not zero: a response mid-
+# stream must not be cut, which is the 34-connections-reset outage
+# `stop(drain=…)` exists to prevent.
 #
-# Measured on host-a, upgrading 0.1.44 -> 0.1.46 under load:
-#   16:24:08 code on disk changed — exiting for the holder to replace
-#   16:24:38 pid=2664753 serving on port 36301
-# Thirty seconds, exactly `_DRAIN_SECONDS`. Nothing was REFUSED — the holder's
-# socket queues arrivals, which is what this design is for — but 30 requests
-# timed out at 3s waiting for a reply nobody was there to write.
-#
-# The ceiling is always paid in full on a real machine: a CONNECT tunnel is
-# counted for its whole life (deliberately — that is what stops an idle
-# watcher cutting a live session), and Remote Control's WebSocket lives as
-# long as the session does, so the count is never zero.
-#
-# Still a drain, not zero: a response mid-stream must not be cut, which is the
-# 34-connections-reset outage `stop(drain=…)` exists to prevent.
-# THE 2 SECONDS THAT CUT THREE SESSIONS, and why the number is gone.
-#
-# The reasoning above is sound and its PREMISE was false. It says every second
-# of drain here is a second with the port bound and nobody behind it, so the
+# THE 2 SECONDS THAT CUT THREE SESSIONS, and why the number is gone. The
+# reasoning above is sound and its PREMISE was false. It says every second of
+# drain here is a second with the port bound and nobody behind it, so the
 # budget must be small. True — but only because the wait could never end early:
 # it polled the CONNECTION count, an RC WebSocket holds that above zero for the
 # life of the session, so the daemon sat here for the whole budget whether it
 # had work or not. A cap was the only defence against a wait that never
 # finished, and 2.0 was chosen to make the pointless wait cheap.
-#
 # `await_inflight` now waits on REQUESTS, which do reach zero. An idle daemon
 # returns from it in milliseconds — the thing the small cap was buying — so the
-# cap is no longer paying for anything except cutting real replies.
-#
-# Measured 2026-08-18 03:42, the incident this file now exists to prevent:
-#     03:42:04  stopping (refcount)
-#     03:42:06  drained
-# 2.0s on the nose, one second after a code handover began, with a reply
-# streaming. `os._exit()` then closed every fd — which is what actually cuts,
-# `_close_open_connections()` having handed its fds to the TLS wrappers long
-# before (measured: fileno() == -1 on the raw socket after wrap_socket).
-#
-# So both exit paths now get the same generous ceiling. The port is only held
-# while a reply is genuinely in flight, which is the one case where holding it
-# is correct.
+# cap is no longer paying for anything except cutting real replies. So both
+# exit paths now get the same generous ceiling. The port is only held while a
+# reply is genuinely in flight, which is the one case where holding it is
+# correct.
 _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 
 # THE CEILING FOR A HANDOVER WHOSE SUCCESSOR IS ALREADY SERVING, and it is a
 # different number from `_DRAIN_SECONDS` because it buys a different thing.
-#
-# MEASURED 2026-08-18, and this is the number that moved the problem. With the
-# `_blind_tunnel` debt fixed, three hosts departed and reported the phase split:
-#
-#     host-a  cut 16   (16 mid-response, 0 before headers)
-#     wmac   cut 3    ( 3 mid-response, 0 before headers)
-#     pmac   drained clean — 0 owed, 0 live bridges
-#
-# ZERO "before headers" ON EVERY HOST. So the drain is not malfunctioning and
-# the count is not bookkeeping: those are replies that had already begun
-# streaming to a user and genuinely did not finish inside thirty seconds. A
-# pooled-idle-connection explanation was proposed and died on this measurement.
-#
-# So the fault is the CEILING, and at these two call sites paying it costs
-# nothing. `release_listener()` has already handed the port on — site 1's
-# successor was spawned by the holder and is serving, site 3's took the
+# With the `_blind_tunnel` debt fixed, three hosts departed and reported the
+# phase split:  host-a  cut 16   (16 mid-response, 0 before headers) wmac   cut
+# 3    ( 3 mid-response, 0 before headers) pmac   drained clean — 0 owed, 0
+# live bridges  ZERO "before headers" ON EVERY HOST. So the drain is not
+# malfunctioning and the count is not bookkeeping: those are replies that had
+# already begun streaming to a user and genuinely did not finish inside thirty
+# seconds. A pooled-idle-connection explanation was proposed and died on this
+# measurement. So the fault is the CEILING, and at these two call sites paying
+# it costs nothing. `release_listener()` has already handed the port on — site
+# 1's successor was spawned by the holder and is serving, site 3's took the
 # listening socket by fd — so this process accepts nothing and holds nothing
 # anyone is waiting for. It is one idle process finishing the replies it
 # already owes, and `await_inflight` returns the instant it owes none.
-#
 # `_DRAIN_SECONDS` CANNOT SIMPLY BE RAISED. It is also the supervisor's
 # patience (`proc.wait(timeout=_DRAIN_SECONDS + 2)`, the SIGKILL escalation,
 # the stop poll), so raising it would make every teardown wait on a process
@@ -6333,39 +5652,38 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 # small ceiling and cutting there is the lesser evil; see
 # `_HELD_DRAIN_SECONDS`.
 #
-# AND THEN THERE IS NO RIGHT NUMBER, which is where this ended up. 1800 cuts
-# a 31-minute reply and 3600 cuts a 61-minute one; this box runs subagent
-# replies past an hour, and a single cut restarts the whole run from scratch.
-# Every value of this constant tonight was chosen against a population that
-# turned out to be wider than the one it was measured on — 30s, then 600s,
-# then 1800s, each cutting live replies until the next one was measured.
+# AND THEN THERE IS NO RIGHT NUMBER, which is where this ended up. 1800 cuts a
+# 31-minute reply and 3600 cuts a 61-minute one; this box runs subagent replies
+# past an hour, and a single cut restarts the whole run from scratch.
 #
-# THE QUANTITY IS WRONG, NOT THE VALUE. A clock cannot tell a slow reply from
-# a wedged one; `_owed_still_moving` can, and it is what ends every healthy
-# drain. On THESE TWO SITES ONLY, nothing waits on this process — the
-# successor is already serving, this one accepts nothing — so the clock was
-# never buying a faster handover. It was bounding a LEAK, and a per-process
-# clock cannot tell one predecessor legitimately finishing a three-hour reply
-# from a pile of them that will never finish. A COUNT can, so the leak bound
-# moved to `_MAX_DRAINING_PREDECESSORS` and this became infinite.
+# THE QUANTITY IS WRONG, NOT THE VALUE. A clock cannot tell a slow reply from a
+# wedged one; `_owed_still_moving` can, and it is what ends every healthy
+# drain. On THESE TWO SITES ONLY, nothing waits on this process — the successor
+# is already serving, this one accepts nothing — so the clock was never buying
+# a faster handover. It was bounding a LEAK, and a per-process clock cannot
+# tell one predecessor legitimately finishing a three-hour reply from a pile of
+# them that will never finish. A COUNT can, so the leak bound moved to
+# `_MAX_DRAINING_PREDECESSORS` and this became infinite.
 #
 # NOT ON THE OTHER TWO. The held path exits so a HOLDER can respawn, and
-# `_teardown` under a signal has a supervisor doing `proc.wait(_DRAIN_SECONDS
-# + 2)` before SIGKILL. There the clock is load-bearing and raising it past
-# the supervisor's patience only trades a logged cut for an unlogged one.
+# `_teardown` under a signal has a supervisor doing `proc.wait(_DRAIN_SECONDS +
+# 2)` before SIGKILL. There the clock is load- bearing and raising it past the
+# supervisor's patience only trades a logged cut for an unlogged one.
 _HANDOVER_DRAIN_SECONDS = float("inf")
 
 # A drainer's marker outlives its own longest wait plus the slack a supervisor
-# would allow, and no longer — a pid is reused freely, so a marker that outlived
-# its writer must never protect whoever inherits the number. Defined HERE rather
-# than beside `is_draining`, which reads it: it is derived from the ceiling above
-# and placing it 200 lines earlier made it a forward reference that broke the
-# import outright (caught by a suite that ran zero tests and said so).
-# NO BYTES FOR THIS LONG AND IT IS WEDGED, NOT SLOW. See
-# `_owed_still_moving`: this is what actually ends a drain now, and the budgets
-# above are backstops against a bug in that predicate. Ninety seconds is far
-# past any gap a live stream produces (SSE keep-alives are seconds apart) and
-# far short of the ten minutes that was cutting real replies.
+# would allow, and no longer — a pid is reused freely, so a marker that
+# outlived its writer must never protect whoever inherits the number. Defined
+# HERE rather than beside `is_draining`, which reads it: it is derived from the
+# ceiling above and placing it 200 lines earlier made it a forward reference
+# that broke the import outright (caught by a suite that ran zero tests and
+# said so).
+#
+# NO BYTES FOR THIS LONG AND IT IS WEDGED, NOT SLOW. See `_owed_still_moving`:
+# this is what actually ends a drain now, and the budgets above are backstops
+# against a bug in that predicate. Ninety seconds is far past any gap a live
+# stream produces (SSE keep-alives are seconds apart) and far short of the ten
+# minutes that was cutting real replies.
 _DRAIN_STALL_SECONDS = 90.0
 
 # STALE MEANS UNTOUCHED, NOT OLD. This was `_HANDOVER_DRAIN_SECONDS + 60`,
@@ -6384,13 +5702,12 @@ _DRAINING_BEAT_SECONDS = 15.0
 # recycle produces one predecessor, so eight is more back-to-back deploys than
 # this fleet has ever done inside one drain — and being wrong high costs idle
 # RAM while being wrong low costs a reply.
+#
 # AND IT IS A DEPLOY-RATE LIMIT, NOT A MEMORY KNOB — say so here or the next
 # reader tunes it as one. With a keepalive holding every drain open, the number
 # of live predecessors grows with how often the code is REDEPLOYED inside one
-# long client session, not with traffic. Measured 2026-08-18: two handovers 94s
-# apart, the one owing nothing drained clean in 33.9s and the one holding 24
-# connections was still alive twenty minutes later. Eight is "more back-to-back
-# deploys than this fleet has ever done inside one drain".
+# long client session, not with traffic. Eight is "more back-to-back deploys
+# than this fleet has ever done inside one drain".
 _MAX_DRAINING_PREDECESSORS = 8
 
 # The marker's name, in one place: `_collect_dead_markers` globs for what
@@ -6404,20 +5721,9 @@ _DRAINING_PREFIX = ".draining-"
 _OWED_UNKNOWN = 1 << 30
 
 # TWO TEARDOWNS CAN RUN AT ONCE IN ONE PROCESS, and the first version of this
-# marker did not survive that. Measured on host-a 2026-08-18, same pid, SAME
-# SECOND:
-#
-#     08:41:19Z pid=616877 stopping (refcount)
-#     08:41:19Z pid=616877 stopping (signal SIGTERM)
-#
-# Both terminators fired, so both ran `stop()`, so both drained — and each
-# drain announced. The one on the SHORT budget finishes first and used to
-# unlink the marker out from under the one still waiting on the long budget,
-# handing the sweep exactly the process this exists to protect, at exactly the
-# moment it is most exposed.
-#
-# Counted rather than flagged, and the LAST release removes it. A depth of one
-# is the ordinary case and costs a dict lookup.
+# marker did not survive that. Counted rather than flagged, and the LAST
+# release removes it. A depth of one is the ordinary case and costs a dict
+# lookup.
 _DRAINING_LOCK = threading.Lock()
 _DRAINING_DEPTH: dict[str, int] = {}
 
@@ -6502,11 +5808,6 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
         # exists here. A bare refcount watcher with no server (a test harness,
         # a helper thread) must never rewrite a user's config: it cannot honour
         # the port it would advertise.
-        #
-        # Measured: without this, a leaked watcher thread from one test kept
-        # running past its fixture and rewrote the NEXT test's config to a port
-        # nothing served — the same class of cross-contamination as writing to
-        # a live config, one scope up.
         if live_clients is None:
             return False
         # ONLY A DAEMON THE WIRING ONCE NAMED MAY RECLAIM IT. Without this the
@@ -6514,13 +5815,10 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
         # reaper outright: a daemon left behind by a crashed spawn — one the
         # config never named — would see a wiring it does not match, call it
         # "broken", and rewrite the user's config to point at ITSELF. It then
-        # counts as claimed forever and never times out. Measured: two reaper
-        # tests went red, and the shape they describe is a real leak, not a
-        # fixture artifact.
-        #
-        # Being wired at least once is what separates the two populations. The
-        # daemon this exists for was serving a wiring that named it and then
-        # lost it; an orphan never had one.
+        # counts as claimed forever and never times out. Being wired at least
+        # once is what separates the two populations. The daemon this exists
+        # for was serving a wiring that named it and then lost it; an orphan
+        # never had one.
         if not _was_wired_once(certdir, port):
             return False
         wired = _wired_port()
@@ -6600,14 +5898,11 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
         # answers that by tearing the daemon down, running
         # `wire_global_config(None, None)` and undoing the repair microseconds
         # after making it. The wiring was broken-but-pointing-somewhere before;
-        # afterwards there is no daemon and no pin at all.
-        #
-        # It is the LIKELY path on macOS, not a corner: the socket scan below
-        # reads /proc/net/tcp, which macs do not have, so only `live_clients()
-        # > 0` can save it — and a repair fires precisely when new sessions
-        # cannot reach the daemon, i.e. when that count is trending to zero.
-        # Measured through the real watch_refcount loop:
-        #     events: [('wire', 34209), ('TEARDOWN', None)]
+        # afterwards there is no daemon and no pin at all. It is the LIKELY
+        # path on macOS, not a corner: the socket scan below reads
+        # /proc/net/tcp, which macs do not have, so only `live_clients() > 0`
+        # can save it — and a repair fires precisely when new sessions cannot
+        # reach the daemon, i.e. when that count is trending to zero.
         if _repair_wiring_if_ours(certdir, port, live_clients):
             return True
         # Ask the daemon itself first. It is the only source that answers on
@@ -6625,8 +5920,7 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
         if live is None:
             # Unmeasurable, and the daemon's own count said zero (or was not
             # offered). Nothing established a claim; the caller's timeout
-            # decides. Distinct from a measured zero only in that we cannot
-            # corroborate it.
+            # decides.
             return False
         return bool(live)
     except Exception:
@@ -7052,31 +6346,22 @@ def daemon_fingerprint(account_num: str = "", email: str = "") -> str:
     """
     import hashlib
 
-    # THE CONTENT, NOT ITS mtime. mtime is a proxy for "is this the same code"
-    # and it is wrong in BOTH directions, measured:
+    # `rsync -a`, `cp -p`, `tar -p` and a restored backup all preserve it, so a
+    # real deploy through any of those left the old daemon serving — the stale
+    # daemon this fingerprint exists to end. same content + touched mtime   ->
+    # SPURIOUS. A no-op reinstall recycled a healthy daemon and cost a handover
+    # for nothing. A peer proxy in the same chain hit the mirror of this by
+    # comparing PATHS: it caught a relocated install and missed `git pull` in
+    # place, which is the commonest deploy there is. Both are the same mistake
+    # — answering a cheaper question than the one that matters.
     #
-    #   new content + PRESERVED mtime  -> MISSED. `rsync -a`, `cp -p`, `tar -p`
-    #       and a restored backup all preserve it, so a real deploy through any
-    #       of those left the old daemon serving — the stale daemon this
-    #       fingerprint exists to end.
-    #   same content + touched mtime   -> SPURIOUS. A no-op reinstall recycled
-    #       a healthy daemon and cost a handover for nothing.
-    #
-    # A peer proxy in the same chain hit the mirror of this by comparing PATHS:
-    # it caught a relocated install and missed `git pull` in place, which is the
-    # commonest deploy there is. Both are the same mistake — answering a
-    # cheaper question than the one that matters.
-    #
-    # NO TORN READ TO GUARD AGAINST, because this hashes the file it is
-    # ALREADY IMPORTING rather than a hash someone else publishes. An installer
-    # replaces it by rename — measured: `pip install --force-reinstall` changes
-    # the inode, so a reader either sees the whole old file or the whole new
-    # one. A design that writes a hash to a SIDE FILE does need temp+rename
-    # there, since a reader catching a partial write compares against a
-    # truncated hash and retires a healthy process.
-    #
-    # Reading the file costs one stat + one read per check (the watchdog polls
-    # on an interval, not per request), against a mistake that costs an outage.
+    # NO TORN READ TO GUARD AGAINST, because this hashes the file it is ALREADY
+    # IMPORTING rather than a hash someone else publishes. A design that writes
+    # a hash to a SIDE FILE does need temp+rename there, since a reader
+    # catching a partial write compares against a truncated hash and retires a
+    # healthy process. Reading the file costs one stat + one read per check
+    # (the watchdog polls on an interval, not per request), against a mistake
+    # that costs an outage.
     try:
         code = _tree_digest_input(Path(__file__).parent)
     except OSError:
@@ -7215,20 +6500,12 @@ def wanted_port(certdir: Path) -> "int | None":
 
 _SELF_HEAL_ENV = "CSWAP_PIN_SELF_HEAL"
 
-# OPT-IN, because a holder is MEANT to outlive the thing that started it.
-# Armed unconditionally it took the pin down on a normal launch: `cswap pin`
-# and a shell launcher both spawn the holder and exit, so the parent is gone
-# seconds later and PR_SET_PDEATHSIG fires. Measured on a production-shaped
-# launch — parent exits, then:
-#
-#     t+2s  DEAD (ConnectionRefusedError)   t+5s  DEAD   t+15s  DEAD
-#     holder log: "launcher already gone before the holder armed — exiting"
-#
-# The leak it was written for is a TEST-RUNNER problem (a SIGKILLed pytest
-# leaving holders behind: 151 processes, 9.17 GiB measured), so the fixture
-# asks for it and production never does. A peer component shipped the same
-# default and took its port down twice under a live session before reverting
-# to exactly this shape.
+# OPT-IN, because a holder is MEANT to outlive the thing that started it. Armed
+# unconditionally it took the pin down on a normal launch: `cswap pin` and a
+# shell launcher both spawn the holder and exit, so the parent is gone seconds
+# later and PR_SET_PDEATHSIG fires. A peer component shipped the same default
+# and took its port down twice under a live session before reverting to exactly
+# this shape.
 _EXIT_WITH_PARENT_ENV = "CSWAP_PIN_EXIT_WITH_PARENT"
 # "I am going, put a successor on this socket." A daemon serving on a holder's
 # socket exits with this instead of 0 when it was TERM'd rather than idle: the
@@ -7238,20 +6515,18 @@ _RESTART_ME_CODE = 75  # EX_TEMPFAIL, and nothing else in this file uses it
 # "REPLACE ME, I AM STILL SERVING." The exit codes above can only be said by
 # dying, which is why a redeploy under a holder costs a gap: the successor
 # cannot start until the predecessor is gone. This signal separates the ASK
-# from the LEAVING, so the two can overlap on one socket.
+# from the LEAVING, so the two can overlap on one socket. `getattr`, NOT
+# `signal.SIGUSR1`.
 #
-# `getattr`, NOT `signal.SIGUSR1`. THIS LINE RAN AT IMPORT AND WINDOWS HAS NO
-# SIGUSR1, so every Windows install of this package failed to import — not a
-# degraded feature, no import at all. It reached CI the moment claude-swap's
-# pin extra floored onto the release carrying it:
-#
-#     AttributeError: module 'signal' has no attribute 'SIGUSR1'
-#     .venv\Lib\site-packages\cswap_pin\proxy.py:4503
-#
-# None means "this platform cannot do it", and every user below reads it as
-# that rather than assuming a signal exists. The whole holder/daemon protocol
-# is POSIX; what must survive a POSIX-less platform is the IMPORT, because
-# `heal`, `load_pin` and `apply_pin` are what the host actually calls there.
+# THIS LINE RAN AT IMPORT AND WINDOWS HAS NO SIGUSR1, so every Windows install
+# of this package failed to import — not a degraded feature, no import at all.
+# It reached CI the moment claude-swap's pin extra floored onto the release
+# carrying it: AttributeError: module 'signal' has no attribute 'SIGUSR1'
+# .venv\Lib\site-packages\cswap_pin\proxy.py:4503 None means "this platform
+# cannot do it", and every user below reads it as that rather than assuming a
+# signal exists. The whole holder/daemon protocol is POSIX; what must survive a
+# POSIX-less platform is the IMPORT, because `heal`, `load_pin` and `apply_pin`
+# are what the host actually calls there.
 _REPLACE_ME_SIGNAL = getattr(signal, "SIGUSR1", None)
 # The same, for the retirement path. SIGHUP is equally absent on Windows.
 _STAND_DOWN_SIGNAL = getattr(signal, "SIGHUP", None)
@@ -7272,40 +6547,32 @@ _PIN_WAIT_S = 0.3
 # port it holds stays answering.
 _HOLD_RESTART_BASE_S = 0.25
 _HOLD_RESTART_MAX_S = 5.0
-# Consecutive failed spawns before the holder stops waiting for a successor
-# and serves the socket itself, unpinned.
+# Consecutive failed spawns before the holder stops waiting for a successor and
+# serves the socket itself, unpinned.
 #
-# THE FAILURE THIS CLOSES, measured on host-a 2026-08-15: the PyPI
-# release was installed over an editable checkout, which took `cswap_pin` out
-# of the tool env, and the daemon's own code watcher then asked for a successor
-# that could not import. Four spawns died on `ModuleNotFoundError` and the
-# holder kept the socket BOUND while it retried — so nothing was refused and
-# every session wired to that port hung instead. A refusal fails fast and
-# locally; a bound socket with no acceptor fails slowly, everywhere, at once.
-#
-# At the ladder's cap this is ~30s of unbroken failure, which separates "it
-# crashed, the next one will be fine" from "nothing this holder starts will
-# ever run". The first is what the ladder is for; the second is this.
+# THE FAILURE THIS CLOSES, measured on host-a 2026-08-15: the PyPI release was
+# installed over an editable checkout, which took `cswap_pin` out of the tool
+# env, and the daemon's own code watcher then asked for a successor that could
+# not import. Four spawns died on `ModuleNotFoundError` and the holder kept the
+# socket BOUND while it retried — so nothing was refused and every session
+# wired to that port hung instead. A refusal fails fast and locally; a bound
+# socket with no acceptor fails slowly, everywhere, at once. At the ladder's
+# cap this is ~30s of unbroken failure, which separates "it crashed, the next
+# one will be fine" from "nothing this holder starts will ever run". The first
+# is what the ladder is for; the second is this.
 _HOLD_DEGRADE_AT = 8
 
 # Consecutive failed respawns before the holder says the successor cannot
 # start. NOT a ceiling — it keeps retrying, because a machine that recovers on
 # attempt 20 should. It is the line between "it crashed, the next one will be
-# fine" and "nothing this holder starts will ever run", which look identical
-# on the ladder and need opposite responses.
-#
-# MEASURED here, caused by running the README's own install command against an
-# editable install: it replaced the checkout with the PyPI release and took
-# `cswap_pin` out of the tool env with it. The daemon already running kept
+# fine" and "nothing this holder starts will ever run", which look identical on
+# the ladder and need opposite responses. The daemon already running kept
 # serving — its code is in memory — while every successor died before reaching
-# any of its own code:
-#
-#   .../claude-swap/bin/python: Error while finding module specification for
-#   'cswap_pin.proxy' (ModuleNotFoundError: No module named 'cswap_pin')
-#
-# repeated in `daemon.log` with nothing saying the port was one death away
-# from being unrecoverable. The pin fails open by design, so this is exactly
-# the class of failure that stays invisible until it is an outage.
+# any of its own code:  .../claude-swap/bin/python: Error while finding module
+# specification for 'cswap_pin.proxy' (ModuleNotFoundError: No module named
+# 'cswap_pin')  repeated in `daemon.log` with nothing saying the port was one
+# death away from being unrecoverable. The pin fails open by design, so this is
+# exactly the class of failure that stays invisible until it is an outage.
 _HOLD_RESTART_REPORT_AT = 5
 # How long the holder waits for the port it was told to take. The predecessor
 # is usually mid-teardown, so this is a handoff, not a contest.
@@ -7356,16 +6623,14 @@ class PortHolder:
         # recycling passes its still-LISTENING socket down, and it has not let
         # go of the port — so a holder that tried to bind would lose the race
         # and fall back to an ephemeral one, taking the port out of the holder
-        # exactly when an upgrade is in flight. Measured on two live machines:
-        # 53749 -> 54264 and 36301 -> 45357, both stranding every session.
+        # exactly when an upgrade is in flight. Adopting has no race to lose:
+        # the descriptor is already bound and already listening, and the
+        # predecessor stopped accepting on it before passing it over.
         #
-        # Adopting has no race to lose: the descriptor is already bound and
-        # already listening, and the predecessor stopped accepting on it before
-        # passing it over.
         # AN ALREADY-ADOPTED SOCKET, for the standby. It consumed the handdown
-        # env to hold the descriptor, so asking `_handed_down_listener` a second
-        # time would find nothing and this holder would bind a fresh port —
-        # stranding the very sessions the standby stayed alive to keep.
+        # env to hold the descriptor, so asking `_handed_down_listener` a
+        # second time would find nothing and this holder would bind a fresh
+        # port — stranding the very sessions the standby stayed alive to keep.
         adopted = sock if sock is not None else _handed_down_listener()
         if adopted is not None:
             self._srv = adopted
@@ -7388,8 +6653,7 @@ class PortHolder:
         # WAIT FOR THE PORT WE WERE ASKED FOR. The predecessor may still be
         # letting go of it — this runs immediately after a daemon closed its
         # listener — and falling straight to an ephemeral port would strand
-        # every session whose HTTPS_PROXY names the old one. Measured: the
-        # holder bound 35051 while 36311 was being reclaimed, one moment later.
+        # every session whose HTTPS_PROXY names the old one.
         deadline = time.monotonic() + _HOLD_BIND_WAIT_S
         squat_checked = False
         while port:
@@ -7421,11 +6685,8 @@ class PortHolder:
                     # REFUSE, do not serve somewhere else. A holder exists to
                     # keep ONE address answering; on any other port it is a
                     # healthy-looking daemon that no session can reach, while
-                    # `.claude.json` still names the number they were given.
-                    # Measured on the personal Mac, doing exactly this: 29,999
-                    # refused connections with the pin reporting success.
-                    #
-                    # An ephemeral fallback IS right at a cold start (port 0
+                    # `.claude.json` still names the number they were given. An
+                    # ephemeral fallback IS right at a cold start (port 0
                     # below) — there nothing is wired yet and any port will do.
                     # It is wrong once we have been told which port to take,
                     # because that instruction came from the live sessions.
@@ -7580,12 +6841,9 @@ class PortHolder:
         import sys
 
         fd = self._srv.fileno()
-        # THE PREDECESSOR PROTOCOL, not the systemd one. `LISTEN_PID` has to
-        # name the CHILD, which cannot be known before it exists — and writing
-        # it from `preexec_fn` does nothing, because Popen has already captured
-        # the environment by then (measured: the child bound a fresh port every
-        # time). `_handed_down_listener` was built for exactly this: the fd is
-        # named by NUMBER and guarded by the PARENT's pid, which we do know.
+        # THE PREDECESSOR PROTOCOL, not the systemd one.
+        # `_handed_down_listener` was built for exactly this: the fd is named
+        # by NUMBER and guarded by the PARENT's pid, which we do know.
         env = {k: v for k, v in os.environ.items() if k != "LISTEN_PID"}
         env["LISTEN_FDS"] = "0"
         env[_HANDDOWN_FD_ENV] = str(fd)
@@ -7670,7 +6928,7 @@ class PortHolder:
         # — while still holding the descriptor. The address then ACCEPTS and
         # HANGS, which is strictly worse than the refusal it replaced, because
         # a refused client fails at once and a queued one waits out its own
-        # timeout. A peer measured that state at 15,010ms and then failure.
+        # timeout.
         env[_STANDBY_FROM_ENV] = str(os.getpid())
         log = _open_daemon_log(self._certdir)
         try:
@@ -7681,10 +6939,7 @@ class PortHolder:
                 pass_fds=(fd,),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                # A FILE, never a pipe. A detached child that never exits holds
-                # the write end for as long as it lives, so a parent waiting on
-                # a pipe's EOF waits forever — a peer measured a 30s hang in
-                # exactly this shape, on the parent's own `close`.
+                # A FILE, never a pipe.
                 stderr=log,
                 start_new_session=True,
             )
@@ -7788,9 +7043,7 @@ class PortHolder:
             # `poll()` and no timer. Reaping is the load-bearing half: an
             # unreaped child stays `<defunct>` in the process table forever,
             # and `ps`, `kill -0` and every check that asks the TABLE rather
-            # than the STATE then report a standby that is not there. Measured
-            # on host-b — a zombie standby read as alive to three
-            # separate checks, including one written that same day.
+            # than the STATE then report a standby that is not there.
             self._reap_standby()
             # A CLEAN EXIT IS A DECISION, NOT A FAILURE. The pin tears itself
             # down when the last refcount holder closes the FIFO — that is the
@@ -7825,25 +7078,15 @@ class PortHolder:
             if not self._self_heal_on():
                 # SAY WHAT HAPPENS, which is not what this used to claim. The
                 # old line promised "the port stays bound but nothing is
-                # serving it". Measured, isolated port, SELF_HEAL=off, daemon
-                # SIGKILLed:
-                #
-                #   before kill: holder alive=True   port listening=True
-                #   after  kill: holder alive=False  port listening=False
-                #   probe during the window: 394 of 395 ConnectionRefused
-                #
-                # Returning here ends the supervisor, the holder process exits,
-                # and the kernel closes the descriptor with it — so the address
-                # GOES. A human who set this switch to debug a daemon read
-                # "stays bound" and would expect their live sessions to hang
-                # rather than be refused; they are refused, immediately, all of
-                # them.
-                #
-                # The switch is still doing what it was built for — its own
-                # rationale is that a respawner fighting a human is "worse than
-                # a dead port", which accepts this cost out loud. Only the line
-                # describing it was wrong, and a wrong line in the one place a
-                # debugging session looks is worse than no line.
+                # serving it". A human who set this switch to debug a daemon
+                # read "stays bound" and would expect their live sessions to
+                # hang rather than be refused; they are refused, immediately,
+                # all of them. The switch is still doing what it was built for
+                # — its own rationale is that a respawner fighting a human is
+                # "worse than a dead port", which accepts this cost out loud.
+                # Only the line describing it was wrong, and a wrong line in
+                # the one place a debugging session looks is worse than no
+                # line.
                 _log_lifecycle(
                     f"daemon {self.daemon_pid} exited and {_SELF_HEAL_ENV}=off — "
                     f"NOT respawning, and this holder is exiting with it, so "
@@ -7911,16 +7154,8 @@ class PortHolder:
         # us on purpose, so the ordering trick that saves us from the daemon's
         # resurrection (see below) cannot reach it — by the time we are gone it
         # is still there, still holding the descriptor, and will arm the moment
-        # `getppid()` moves. That is a release that releases nothing: a peer on
-        # this design measured nine holders released and all nine back on the
-        # same ports within 23 seconds.
-        #
-        # SIGHUP, never SIGTERM. TERM is what a supervisor, a `systemctl stop`
-        # or a stray `pkill` sends, and the same peer measured their graceful
-        # path as MORE destructive than `kill -9` because their standby ended
-        # on it: a clean shutdown stranded every session while a SIGKILL
-        # carried them. Death must keep the address. Only being asked releases
-        # it.
+        # `getppid()` moves. SIGHUP, never SIGTERM. Death must keep the
+        # address. Only being asked releases it.
         standby = getattr(self, "_standby", None)
         if standby is not None and getattr(standby, "returncode", 0) is None:
             try:
@@ -7930,12 +7165,9 @@ class PortHolder:
         # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
         # is only meaningful while the Popen it came from is ours — and a pid
         # is reused freely, so signalling it after the child is gone aims at
-        # whatever inherited the number. Measured: with `_spawn` stubbed in a
-        # test, this SIGTERM'd the pytest-xdist worker running it, and the run
-        # died with "cannot send (already closed?)" rather than a failure.
-        #
-        # `Popen.terminate` cannot make that mistake: it signals the process
-        # object, and CPython refuses once it has been reaped.
+        # whatever inherited the number. `Popen.terminate` cannot make that
+        # mistake: it signals the process object, and CPython refuses once it
+        # has been reaped.
         proc = getattr(self, "_proc", None)
         if proc is not None and getattr(proc, "returncode", 0) is None:
             try:
@@ -8089,8 +7321,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     signal.signal(signal.SIGHUP, _release)
     # IGNORE, do not merely lack a handler. A supervisor stopping the machine,
     # or a stray `pkill -f cswap_pin`, sends TERM — and TERM is precisely when
-    # the sessions still need the address. A peer measured their graceful path
-    # as more destructive than `kill -9` for want of these two lines.
+    # the sessions still need the address.
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -8106,6 +7337,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         # THE TICK CHOOSES ITS OWN NEXT INTERVAL, because only it knows which
         # state we are in — and the three states want different rates. See
         # `_standby_tick`.
+        #
         # THE RECORDED DAEMON FIRST, and it costs nothing. Every window spent
         # proving nobody serves is a window in which nobody serves — the peer's
         # point, and it is right — so the cheapest evidence goes first. A live
@@ -8125,23 +7357,22 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
             pass
         return
 
-    # EXACTLY ONE STANDBY MAY ARM, and a lock is the only thing that can say so.
-    # Standbys accumulate legitimately: every holder that is KILLED rather than
-    # released leaves its own behind, by design — that is the row this covers.
-    # They all then watch the same port, so a single silent window arms ALL of
-    # them and each becomes a holder.
+    # EXACTLY ONE STANDBY MAY ARM, and a lock is the only thing that can say
+    # so. Standbys accumulate legitimately: every holder that is KILLED rather
+    # than released leaves its own behind, by design — that is the row this
+    # covers. They all then watch the same port, so a single silent window arms
+    # ALL of them and each becomes a holder.
     #
-    # MEASURED ON LMD42, not reasoned about: three armed within a minute of each
-    # other and produced four acceptors on 36301, which is precisely the
+    # MEASURED ON LMD42, not reasoned about: three armed within a minute of
+    # each other and produced four acceptors on 36301, which is precisely the
     # property the whole design exists to keep. The silent window that set them
-    # off was an ordinary daemon handover.
+    # off was an ordinary daemon handover. Non-blocking: a loser has nothing to
+    # wait for. The winner is putting a daemon back on the very socket the
+    # loser is holding, so the loser's job is finished either way.
     #
-    # Non-blocking: a loser has nothing to wait for. The winner is putting a
-    # daemon back on the very socket the loser is holding, so the loser's job is
-    # finished either way.
-    # THE PIN MUST STILL NAME THIS PORT. See `_standby_port_still_wanted`:
-    # a standby left on a superseded socket hears silence forever, and
-    # reviving it builds a lineage nothing can reach.
+    # THE PIN MUST STILL NAME THIS PORT. See `_standby_port_still_wanted`: a
+    # standby left on a superseded socket hears silence forever, and reviving
+    # it builds a lineage nothing can reach.
     if not _standby_port_still_wanted(certdir, port):
         _log_lifecycle(
             f"port {port} is no longer the pin's — letting it go rather than "
@@ -8171,10 +7402,10 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     # GIVE THE SIGNALS BACK BEFORE BECOMING A HOLDER. The SIG_IGN above is
     # right for a standby — TERM is when the sessions most need the address —
     # and WRONG the moment this process starts serving, because a handler
-    # installed once outlives the reason for it. An armed standby kept
-    # ignoring TERM and INT, so it could not be stopped by any ordinary means:
-    # `cswap` could not retire it, a supervisor could not stop it, and only
-    # SIGKILL reached it.
+    # installed once outlives the reason for it. An armed standby kept ignoring
+    # TERM and INT, so it could not be stopped by any ordinary means: `cswap`
+    # could not retire it, a supervisor could not stop it, and only SIGKILL
+    # reached it.
     #
     # MEASURED ON LMD42, and it is why that box needed a manual cleanup: three
     # armed standbys had each become a holder on port 36301 — four acceptors on
@@ -8206,8 +7437,8 @@ def holder_main(account_num: str, email: str, certdir: Path,
     #
     # A RACE THE KERNEL CANNOT CLOSE FOR US: if the parent died between our
     # fork and this call, the signal was already delivered to a process that
-    # had not armed it, so it never arrives. Check explicitly rather than
-    # trust the arming alone.
+    # had not armed it, so it never arrives. Check explicitly rather than trust
+    # the arming alone.
     if os.environ.get(_EXIT_WITH_PARENT_ENV) == "1":
         _arm_parent_death_signal()
         if os.getppid() == 1:
@@ -8224,29 +7455,17 @@ def holder_main(account_num: str, email: str, certdir: Path,
         # "reclaim the port when it frees". A daemon cannot move its port: the
         # address is fixed at bind, and every session's HTTPS_PROXY was fixed
         # at exec. So the fallback reclaimed nothing and served on an EPHEMERAL
-        # port nothing is wired to. Measured during an orphan recovery:
-        #
-        #   11:57:13 holder could not take the port (49927 is taken —
-        #            refusing to hold a different one) — serving unheld
-        #   11:57:13 serving on port 37001
-        #
-        # Two daemons then exist: the one on the wired port, and a second the
-        # sweep will not reap (its own state record is valid) that no session
-        # can reach.
-        #
-        # The bind fails for two opposite reasons and NEITHER wants a second
-        # daemon: if a healthy pin holds the port we are redundant, and if the
-        # port is held by something not serving, another port does not help.
-        # So exit.
+        # port nothing is wired to. The bind fails for two opposite reasons and
+        # NEITHER wants a second daemon: if a healthy pin holds the port we are
+        # redundant, and if the port is held by something not serving, another
+        # port does not help. So exit.
         #
         # THE SECOND REASON IS NOW RECOVERED FROM RATHER THAN ACCEPTED, one
         # level down. `PortHolder.__init__` asks, when its bind budget runs
-        # out, whether the port is bound-but-not-accepting — the signature of
-        # a standby left by a holder that was killed — and SIGHUPs it before
-        # giving up. This sentence used to be the whole disposition, and it
-        # cost 3.4 hours of total outage: 50 retries, 63 sessions refused, and
-        # a person sending the signal by hand. Reaching here now means the
-        # port really is somebody else's. Every caller already handles "no successor came up", and the
+        # out, whether the port is bound-but-not-accepting — the signature of a
+        # standby left by a holder that was killed — and SIGHUPs it before
+        # giving up. Reaching here now means the port really is somebody
+        # else's. Every caller already handles "no successor came up", and the
         # incumbent is by definition still there.
         _log_lifecycle(
             f"holder could not take the port ({exc}) — exiting rather than "
@@ -8291,7 +7510,6 @@ def _spawn_daemon(
     # files `wanted_port` reads — proxy.json is marked handover, proxy.port is
     # unlinked — so asking afterwards gives a different, wrong answer, and a
     # holder started with it binds an address no live session is dialling.
-    # Measured: holder on 46021 while 44733 was the port being reclaimed.
     want_port = wanted_port(certdir)
     if not (isinstance(want_port, int) and want_port > 0):
         want_port = 0
@@ -8350,35 +7568,28 @@ def _spawn_daemon(
            if k not in (_HANDDOWN_FD_ENV, _HANDDOWN_FROM_ENV)}
     pass_fds: tuple[int, ...] = ()
     if listen_fd is not None:
-        # NAME THE NUMBER. `Popen(pass_fds=...)` does not renumber — measured,
-        # a parent's fd 9 arrives as the child's fd 9 and its fd 3 is EBADF —
-        # so the systemd "first fd is 3" convention cannot express this and the
-        # successor is told which descriptor to look at. The origin pid is the
-        # guard: these variables reach every descendant but the fd does not, so
-        # a grandchild without it must not adopt whatever that number became.
+        # NAME THE NUMBER. The origin pid is the guard: these variables reach
+        # every descendant but the fd does not, so a grandchild without it must
+        # not adopt whatever that number became.
         env[_HANDDOWN_FD_ENV] = str(listen_fd)
         env[_HANDDOWN_FROM_ENV] = str(os.getpid())
         pass_fds = (listen_fd,)
-    # EVERY SPAWN LANDS UNDER A HOLDER, cold start and handover alike.
-    #
-    # The cold start needs one because nothing owns the address yet: the
-    # daemon would bind it itself and a `kill -9` would take the port down
-    # with it, stranding every session whose HTTPS_PROXY was fixed at exec.
+    # EVERY SPAWN LANDS UNDER A HOLDER, cold start and handover alike. The cold
+    # start needs one because nothing owns the address yet: the daemon would
+    # bind it itself and a `kill -9` would take the port down with it,
+    # stranding every session whose HTTPS_PROXY was fixed at exec.
     #
     # THE HANDOVER NEEDS ONE FOR A DIFFERENT REASON, learned by doing it twice
     # in one day on live machines. An old daemon notices its code changed and
     # hands its listening socket to a successor — using the handover ITS OWN
     # VERSION implements. If that successor runs unheld, the port has left the
-    # holder for good:
-    #
-    #     wmac  12:57  53749 -> served UNHELD on 54264
-    #     host-a 13:03  36301 -> 45357, and .claude.json followed it there
-    #
-    # A README saying "upgrade carefully" was the first answer and it is not
-    # one: a deploy is not a procedure someone follows, it is whatever the
-    # running code does. The holder here ADOPTS the socket it was handed
-    # rather than binding a fresh one, so it cannot lose the race that made
-    # the cold-start holder fall back — there is nothing to race for.
+    # holder for good: wmac  12:57  53749 -> served UNHELD on 54264 host-a
+    # 13:03  36301 -> 45357, and .claude.json followed it there A README saying
+    # "upgrade carefully" was the first answer and it is not one: a deploy is
+    # not a procedure someone follows, it is whatever the running code does.
+    # The holder here ADOPTS the socket it was handed rather than binding a
+    # fresh one, so it cannot lose the race that made the cold-start holder
+    # fall back — there is nothing to race for.
     argv = [sys.executable, "-m", _DAEMON_MODULE, _HOLDER_MODULE_ARG,
             str(want_port if want_port else 0), account_num, email,
             str(certdir)]
@@ -8528,12 +7739,8 @@ def _release_daemon_state(certdir: Path) -> bool:
 
 _CODE_WATCH_INTERVAL_S = 30.0
 # Consecutive failed handovers before the watchdog stops trying. A ceiling on
-# NEVER-SUCCEEDING, not on total recycles: a daemon that hands over cleanly
-# and later goes stale again starts from zero. Without one, a successor that
-# can never start (a broken deploy, a missing dependency) is retried forever
-# — and a peer measured exactly that shape at ~3.75 attempts/sec on the other
-# side of this seam, with the port held the whole time so nothing refused and
-# nobody noticed.
+# NEVER-SUCCEEDING, not on total recycles: a daemon that hands over cleanly and
+# later goes stale again starts from zero.
 _HANDOVER_ATTEMPTS = 5
 
 
@@ -8605,17 +7812,15 @@ def _watch_own_code(
     # thread at once instead of after a full interval.
     while not done.wait(interval):
         # ONE EXIT, TAKEN ON EVERY PATH. 0.1.27 had three exits and one of them
-        # took neither: `_spawn_daemon` RAISING (fork() EAGAIN under a
-        # post-deploy herd) landed in the guard below, which logged and
-        # returned with the server already stopped, nothing unwired, and `done`
-        # never set — so the process stayed alive serving nothing while
+        # took neither: `_spawn_daemon` RAISING (fork() EAGAIN under a post-
+        # deploy herd) landed in the guard below, which logged and returned
+        # with the server already stopped, nothing unwired, and `done` never
+        # set — so the process stayed alive serving nothing while
         # `.claude.json` named its port and `daemon_main` blocked on
-        # `done.wait()` forever. Measured: stop=yes teardown=no done=no.
-        #
-        # `handed_over` is the whole arbitration: True means a successor owns
-        # the wiring and we must NOT unwire; False after we have stopped means
-        # nobody is serving and we MUST. The `finally` applies that once,
-        # rather than each branch remembering to.
+        # `done.wait()` forever. `handed_over` is the whole arbitration: True
+        # means a successor owns the wiring and we must NOT unwire; False after
+        # we have stopped means nobody is serving and we MUST. The `finally`
+        # applies that once, rather than each branch remembering to.
         stopped = handed_over = False
         try:
             # LEARN THE HOP BEHIND OURS WHILE IT IS STILL ANSWERING. This is
@@ -8644,25 +7849,12 @@ def _watch_own_code(
             # your own" must not refuse a direct instruction.
             if os.environ.get(_SELF_HEAL_ENV, "").lower() in ("off", "0", "no"):
                 continue
-            # ORPHANED IS ALSO A REASON TO RECYCLE, not just stale code.
-            #
-            # A holder that dies without taking its daemon down leaves the port
+            # ORPHANED IS ALSO A REASON TO RECYCLE, not just stale code. A
+            # holder that dies without taking its daemon down leaves the port
             # bound — the daemon already holds the socket — but with NOTHING
-            # above it. Measured, isolated port 60759, SIGHUP to the holder:
-            #
-            #     before:       holder 1855196, daemon 1855252
-            #     after SIGHUP: daemon 1855252 ppid 1, port answers: True
-            #     HOLDERS REMAINING: 0   PORT ALIVE: True
-            #
-            # Nothing looks wrong from outside, which is what makes it worth
-            # a check: the invariant that makes a crash survivable — every
-            # spawn lands under a holder — is gone, so the NEXT death takes
-            # the port down for good, and a live session's HTTPS_PROXY was
-            # fixed at exec.
-            #
-            # `_orphaned` rather than `not held_by_a_holder()`: a daemon that
-            # was never held (a bare `daemon_main`, a test) has no holder to
-            # lose and must not recycle itself forever.
+            # above it. `_orphaned` rather than `not held_by_a_holder()`: a
+            # daemon that was never held (a bare `daemon_main`, a test) has no
+            # holder to lose and must not recycle itself forever.
             orphaned = _orphaned_from_its_holder()
             if daemon_fingerprint() == own and not orphaned:
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
@@ -8702,12 +7894,6 @@ def _watch_own_code(
             # release-spawn-drain dance below is not merely unnecessary — it
             # takes the port OUT of the holder, and the successor is then one
             # failed bind away from stranding every session.
-            #
-            # Measured on host-a, 76 minutes of broken pin reported as healthy:
-            #   10:13:07 handing over to a successor
-            #   10:13:15 successor holder: could not take 36301 — serving
-            #            UNHELD on 33349
-            #   10:18:15 33349: idle teardown — unwired .claude.json
             if held_by_a_holder():
                 # ASK WHILE STILL ACCEPTING, then leave. The socket is the
                 # holder's and cannot be handed down from here — that is what
@@ -8720,14 +7906,15 @@ def _watch_own_code(
                 # drain. The successor is already on the socket before we stop,
                 # so the drain overlaps a serving process instead of replacing
                 # one — which is also why it gets the FULL budget here.
+                #
                 # ANNOUNCED BEFORE THE ASK, NOT WHEN THE DRAIN STARTS. The
                 # holder spawns our successor as soon as it takes this signal,
                 # and the successor publishes `proxy.json` the instant it
-                # serves — so from that publish until we reach
-                # `await_inflight` a concurrent `ensure_proxy` sees us as "a
-                # daemon that is not keep_pid" with no marker written. That is
-                # the 08:21:19Z race one frame higher, and it is not narrow:
-                # `_ASK_SETTLE_SECONDS` sits inside the window on purpose.
+                # serves — so from that publish until we reach `await_inflight`
+                # a concurrent `ensure_proxy` sees us as "a daemon that is not
+                # keep_pid" with no marker written. That is the 08:21:19Z race
+                # one frame higher, and it is not narrow: `_ASK_SETTLE_SECONDS`
+                # sits inside the window on purpose.
                 #
                 # THE RELEASER IS KEPT, and the comment here used to say it was
                 # not needed because "every path out of this branch is
@@ -8736,8 +7923,8 @@ def _watch_own_code(
                 # the depth raised for the life of the process. Harmless while
                 # nothing read it; `teardown_drain_budget(handed_over=...)` now
                 # does, so a daemon that never handed over would take the
-                # uncapped ceiling on every later teardown and put
-                # `Connection: close` on every response it ever writes again.
+                # uncapped ceiling on every later teardown and put `Connection:
+                # close` on every response it ever writes again.
                 _asked_done = announce_draining(certdir)
                 holder = _holder_pid()
                 if holder:
@@ -8749,13 +7936,10 @@ def _watch_own_code(
                     # THE ASK IS NOT THE OUTCOME. `os.kill` returning says only
                     # that the pid existed when we called it — nothing about a
                     # successor. So verify the holder SURVIVED being asked: an
-                    # advertisement is written once at spawn and can be stale by
-                    # now, but whether that process is still there cannot be.
-                    #
-                    # A holder that dies here has started nobody, and releasing
-                    # into that leaves the socket with no listener at all — the
-                    # measured 30 s outage. Serving stale code beats serving
-                    # nothing, so we keep the port and say so.
+                    # advertisement is written once at spawn and can be stale
+                    # by now, but whether that process is still there cannot
+                    # be. Serving stale code beats serving nothing, so we keep
+                    # the port and say so.
                     time.sleep(_ASK_SETTLE_SECONDS)
                     if not _pid_alive(holder):
                         _log_lifecycle(
@@ -8792,10 +7976,7 @@ def _watch_own_code(
                 server.release_listener()
                 server.await_inflight(_HELD_DRAIN_SECONDS)
                 os._exit(_RESTART_ME_CODE)
-            # NAME THE REASON THAT APPLIES. Both paths hand over, but saying
-            # "code on disk changed" about an orphaning is a false line in the
-            # one log a later reader has — measured, an orphan recovery logged
-            # a code change that never happened.
+            # NAME THE REASON THAT APPLIES.
             if not orphaned:
                 _log_lifecycle(
                     "code on disk changed — handing over to a successor"
@@ -8813,31 +7994,22 @@ def _watch_own_code(
                     continue
                 # RELEASE THE PORT, THEN DRAIN — in that order, and with the
                 # successor started in between. `stop(drain=N)` closes the
-                # listener FIRST and only then waits up to N seconds for
-                # in-flight requests, so the port sat unbound for the whole
-                # drain and every new connection was refused. Measured on
-                # a live daemon: handover at T, successor serving at T+31 s, with
-                # a peer's request dying inside it.
-                #
-                # Dropping the listener without draining lets the successor
-                # bind immediately; the in-flight requests are still ours to
-                # finish, so the drain happens after, while the new daemon is
-                # already accepting. A supervisor-held port makes both moot —
-                # this is what the package does when it owns the socket itself.
+                # listener FIRST and only then waits up to N seconds for in-
+                # flight requests, so the port sat unbound for the whole drain
+                # and every new connection was refused. Dropping the listener
+                # without draining lets the successor bind immediately; the in-
+                # flight requests are still ours to finish, so the drain
+                # happens after, while the new daemon is already accepting. A
+                # supervisor-held port makes both moot — this is what the
+                # package does when it owns the socket itself.
                 #
                 # AND THE SOCKET GOES WITH IT, which is what makes the handover
-                # gapless rather than merely short. Releasing the port and
-                # letting the successor rebind it still costs the successor's
-                # start-up: measured on a live box, 6 refused requests over
-                # 0.27s, and no drain fix moved it, because a listening port
-                # cannot be co-bound (SO_REUSEADDR and SO_REUSEPORT both
-                # refused) and a fresh interpreter needs ~50ms to reach
-                # `bind()`. Passing the listening socket down leaves the port
-                # bound the whole time, so arrivals queue in the backlog
-                # instead: 0 refused. `release_listener` joins the accept loop
-                # first — two processes accepting on one socket split the
-                # connections, and the one that has stopped serving drops its
-                # share.
+                # gapless rather than merely short. Passing the listening
+                # socket down leaves the port bound the whole time, so arrivals
+                # queue in the backlog instead: 0 refused. `release_listener`
+                # joins the accept loop first — two processes accepting on one
+                # socket split the connections, and the one that has stopped
+                # serving drops its share.
                 handed_fd = server.release_listener(hand_down=True)
                 stopped = True
                 # SAME WINDOW, SAME REASON. `_spawn_daemon` blocks up to
@@ -8872,21 +8044,14 @@ def _watch_own_code(
                 _log_lifecycle("successor did not come up")
             # TRY AGAIN, BOUNDED. Returning here left the thread dead with the
             # code on disk still new, so the daemon served the stale code
-            # forever — the 22-hour outage this watchdog exists to end,
-            # reached one failed spawn later instead of by having no watchdog.
-            # The machine this is FOR is the one whose sessions never
-            # relaunch, so nothing else will ever try.
-            #
-            # And bounded rather than endless, for the failure a peer measured
-            # on the other side of this seam: an unbounded respawn against a
-            # child that can never start ran at ~3.75/sec with the port held
-            # the whole time, so callers waited out a 15s deadline instead of
-            # failing over in 0ms. A start failure is QUIETER once the port
-            # survives it, which is exactly why it needs a ceiling.
-            #
-            # The counter is on CONSECUTIVE failures, so a daemon that
-            # recycles cleanly years apart still gets its full budget each
-            # time — the ceiling is on never-succeeding, not on total tries.
+            # forever — the 22-hour outage this watchdog exists to end, reached
+            # one failed spawn later instead of by having no watchdog. The
+            # machine this is FOR is the one whose sessions never relaunch, so
+            # nothing else will ever try. A start failure is QUIETER once the
+            # port survives it, which is exactly why it needs a ceiling. The
+            # counter is on CONSECUTIVE failures, so a daemon that recycles
+            # cleanly years apart still gets its full budget each time — the
+            # ceiling is on never-succeeding, not on total tries.
             attempts += 1
             if attempts >= _HANDOVER_ATTEMPTS:
                 _log_lifecycle(
@@ -8906,10 +8071,7 @@ def _watch_own_code(
                 # KEEP SERVING THE OLD CODE RATHER THAN NOTHING. A recycle that
                 # cannot start a successor has no reason to end the pin: this
                 # process is intact, it merely stopped listening, and the code
-                # it runs is the code that was working a moment ago. Unwiring
-                # here left a machine unpinned until a human re-pinned it by
-                # hand — measured, hours — while the alternative costs only
-                # running one release behind until the next attempt.
+                # it runs is the code that was working a moment ago.
                 if _resume_serving(server):
                     _log_lifecycle(
                         "successor did not come up — resumed serving the old "
@@ -9054,17 +8216,13 @@ def _inherited_listener(will_serve: bool = False) -> "socket.socket | None":
             raise OSError("not a stream socket")
         # getsockname() answers on a bound socket; accept() would block, so the
         # listening state is proven by asking the socket itself.
-        # A PROBE THAT CANNOT ANSWER IS NOT A "NO". `SO_ACCEPTCONN` is
-        # readable on Linux and NOT on Darwin — measured, same call:
-        # linux 1, darwin OSError 42 "Protocol not available". Treating that
-        # raise as "not listening" refused every handover on macOS and the
-        # successor bound a FRESH port, which is the stranding this whole
-        # path exists to prevent (live sessions have the old port fixed at
-        # exec). Measured on wmac: "ignoring the handed-down fd 3: [Errno 42]"
-        # then "serving on port 58062" while the wiring named 53749.
         #
-        # `getsockname()` below still proves it is a bound TCP socket on both
-        # platforms, so only the redundant option is allowed to be absent.
+        # A PROBE THAT CANNOT ANSWER IS NOT A "NO". Treating that raise as "not
+        # listening" refused every handover on macOS and the successor bound a
+        # FRESH port, which is the stranding this whole path exists to prevent
+        # (live sessions have the old port fixed at exec). `getsockname()`
+        # below still proves it is a bound TCP socket on both platforms, so
+        # only the redundant option is allowed to be absent.
         try:
             listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
         except OSError:
@@ -9092,37 +8250,24 @@ _HANDDOWN_FROM_ENV = "CSWAP_PIN_LISTEN_FROM"
 # opposite things when this daemon is TERM'd.
 _HELD_BY_ENV = "CSWAP_PIN_HELD_BY"
 # Set by a holder that has ACTUALLY INSTALLED the replace handler, and only
-# then. A CAPABILITY IS THE RECEIVER'S TO CLAIM, never the sender's to assume:
+# then.
+#
+# A CAPABILITY IS THE RECEIVER'S TO CLAIM, never the sender's to assume:
 # `_REPLACE_ME_SIGNAL` is SIGUSR1, whose default disposition is TERMINATE, so
 # asking a holder that cannot hear it does not degrade — it kills the holder
-# and takes the listening socket with it.
-#
-# And the skew is not an edge case, it is THE case. `_watch_own_code` fires
-# exactly when the code on disk is newer than the code somebody loaded, which
-# is precisely when the holder above us is a long-lived process still running
-# the PREVIOUS release — with no handler, forever. Measured on host-a
-# upgrading to 0.1.74: the ask killed the holder, port 36301 went REFUSED for
-# 30 s, and only a standby noticing the free port restored service. The gap
-# this whole mechanism exists to remove is 2 s.
+# and takes the listening socket with it. And the skew is not an edge case, it
+# is THE case. `_watch_own_code` fires exactly when the code on disk is newer
+# than the code somebody loaded, which is precisely when the holder above us is
+# a long-lived process still running the PREVIOUS release — with no handler,
+# forever. The gap this whole mechanism exists to remove is 2 s.
 _HOLDER_REPLACE_ENV = "CSWAP_PIN_HOLDER_TAKES_REPLACE"
-# The bytes the HOLDER loaded, published into its child's environment.
-#
-# A DAEMON'S FRESHNESS SAYS NOTHING ABOUT THE HOLDER ABOVE IT. The holder execs
-# a fresh interpreter for every spawn, so a holder running months-old code
-# starts a perfectly current daemon — proxy.json's fingerprint reports the
-# child and there is no observable for the layer above. Measured 2026-08-06:
-# all three of our holders were twelve releases behind their daemons, and the
-# only way to find out was comparing `ps` start times against tag dates, which
-# is inference and which I got wrong once before getting it right.
-#
-# The CHILD'S environment rather than a file or a /health field, because it
-# needs no new writer, no new path, and no cooperation from the daemon — and
-# because it is readable on both platforms: /proc/<pid>/environ on Linux,
-# `ps -E -p <pid>` on macOS (measured, both, against a control).
-#
-# `_OWN_FINGERPRINT`, so it is what the holder IMPORTED. A fresh
-# `daemon_fingerprint()` here would publish the disk at spawn time, which is
-# exactly the lie this is meant to expose.
+# The bytes the HOLDER loaded, published into its child's environment. A
+# DAEMON'S FRESHNESS SAYS NOTHING ABOUT THE HOLDER ABOVE IT. The holder execs a
+# fresh interpreter for every spawn, so a holder running months-old code starts
+# a perfectly current daemon — proxy.json's fingerprint reports the child and
+# there is no observable for the layer above. `_OWN_FINGERPRINT`, so it is what
+# the holder IMPORTED. A fresh `daemon_fingerprint()` here would publish the
+# disk at spawn time, which is exactly the lie this is meant to expose.
 _HOLDER_SHA_ENV = "CSWAP_PIN_HOLDER_SHA"
 
 # WHICH PID THE STANDBY WAS BORN UNDER — see `PortHolder._spawn_standby`. The
@@ -9151,8 +8296,7 @@ _STANDBY_ANSWERED_POLL_S = 2.0
 # for a stalled event loop rather than a measurement — and two of them ran
 # serially, which is where 4,610ms of the recovery went. Three short windows
 # give MORE independent observations than two long ones and cost a fifth of the
-# time. A peer measured the identical change on their own component: first
-# request after the kill 3,899ms -> 694ms, steady state unchanged.
+# time.
 _STANDBY_PROBE_TIMEOUT_S = 0.25
 
 
@@ -9339,8 +8483,7 @@ def _standby_tick(born_of: int, silent: int, answered, getppid=os.getppid):
         # this branch never stops being taken. At the tight poll that is a dial
         # every ~250ms forever, because an answered probe returns in about a
         # millisecond. Nothing is converging here, so there is nothing to poll
-        # quickly for. A peer measured the same state and backed off to 2s;
-        # this matches them.
+        # quickly for.
         return 0, False, _STANDBY_ANSWERED_POLL_S
     silent += 1
     # Silence IS converging — each one is a step toward arming — so stay tight.
@@ -9423,21 +8566,12 @@ def teardown_drain_budget(reason: str, held: bool,
     # FALSE: `_watch_own_code` signals the holder, verifies it survived the
     # ask, and the successor is serving on the same socket while this process
     # drains. There is no unserved port time left to buy, so the short ceiling
-    # buys nothing and spends live replies.
-    #
-    # MEASURED ON host-b 2026-08-18, four replies:
-    #   20:01:32Z pid=96075 asked the holder to replace us while we keep serving
-    #   20:01:32Z pid=25445 serving on port 53749          <- successor UP
-    #   20:02:01Z pid=96075 stopping (refcount)            <- second drain
-    #   20:02:31Z pid=96075 cut 4 in-flight request(s) after 30.1s of a 30s
-    #             budget (4 mid-response, content-free 0/2/9 s)
-    # Every one still delivering — the content-free field is what says so;
-    # `mid-response` cannot separate a live stream from one that stopped. A
-    # second drain re-armed the very clock the first had removed.
+    # buys nothing and spends live replies. A second drain re-armed the very
+    # clock the first had removed.
     #
     # THE SIGNAL ROW STILL DOES NOT MOVE, handed over or not: the supervisor
-    # SIGKILLs at `_DRAIN_SECONDS + 2`, so a longer ceiling there buys a
-    # harder kill partway through a reply rather than a finished one.
+    # SIGKILLs at `_DRAIN_SECONDS + 2`, so a longer ceiling there buys a harder
+    # kill partway through a reply rather than a finished one.
     if held and not handed_over:
         return _HELD_DRAIN_SECONDS
     if reason == "refcount":
@@ -9595,17 +8729,12 @@ def _handed_down_listener(will_serve: bool = False) -> "socket.socket | None":
     try:
         if sock.type != socket.SOCK_STREAM:
             raise OSError("not a stream socket")
-        # A PROBE THAT CANNOT ANSWER IS NOT A "NO". `SO_ACCEPTCONN` is
-        # readable on Linux and NOT on Darwin — measured, same call:
-        # linux 1, darwin OSError 42 "Protocol not available". Treating that
-        # raise as "not listening" refused every handover on macOS and the
-        # successor bound a FRESH port, which is the stranding this whole
-        # path exists to prevent (live sessions have the old port fixed at
-        # exec). Measured on wmac: "ignoring the handed-down fd 3: [Errno 42]"
-        # then "serving on port 58062" while the wiring named 53749.
-        #
-        # `getsockname()` below still proves it is a bound TCP socket on both
-        # platforms, so only the redundant option is allowed to be absent.
+        # A PROBE THAT CANNOT ANSWER IS NOT A "NO". Treating that raise as "not
+        # listening" refused every handover on macOS and the successor bound a
+        # FRESH port, which is the stranding this whole path exists to prevent
+        # (live sessions have the old port fixed at exec). `getsockname()`
+        # below still proves it is a bound TCP socket on both platforms, so
+        # only the redundant option is allowed to be absent.
         try:
             listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
         except OSError:
@@ -9698,12 +8827,9 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # not be able to turn the gate on: a live session's HTTPS_PROXY is fixed at
     # exec time, so a session wired before the credential existed carries a URL
     # without one and would start getting 407 on its next request — the upgrade
-    # cutting off the very sessions it protects. Measured on linux before
-    # landing this: .claude.json wired "http://127.0.0.1:36301" (no userinfo)
-    # with pid 142172 live on it.
-    #
-    # ``apply_pin`` mints it instead, so the gate arms exactly when the wiring
-    # is rewritten to carry it. PinProxy only ever READS the value.
+    # cutting off the very sessions it protects. ``apply_pin`` mints it
+    # instead, so the gate arms exactly when the wiring is rewritten to carry
+    # it. PinProxy only ever READS the value.
     proxy = PinProxy(
         certdir=certdir,
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
@@ -9741,22 +8867,21 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         # and clean up our state so a launcher never reuses a dead record.
         _log_lifecycle(f"stopping ({reason})")
         # DRAIN, because this is the only place that decides whether an upgrade
-        # or a recycle costs sessions their in-flight requests. The signal path
-        # ends in os._exit(0), so anything still being served when this returns
-        # is cut mid-response — measured as ConnectionResetError at a client
-        # reading a streaming reply. An idle daemon returns from here at once.
+        # or a recycle costs sessions their in-flight requests. An idle daemon
+        # returns from here at once.
         #
         # SHORT WHEN A HOLDER IS WAITING TO RESPAWN, for the same reason the
         # code watchdog's held exit is (see `_HELD_DRAIN_SECONDS`): a TERM
         # under a holder is a RECYCLE, and the holder cannot put the successor
         # on the socket until we are gone. Draining the full ceiling there is
         # time with the port bound and nobody behind it.
+        #
         # TWO WAYS TO OWE NOTHING, and our own marker only covers one. We
-        # announced a drain (the watchdog's post-ask wait), or somebody else
-        # is already serving this port — which is what a holder taking the
-        # replace signal leaves behind, with nothing announced here at all.
-        # Read HERE rather than inside `teardown_drain_budget` so that
-        # function stays pure and testable.
+        # announced a drain (the watchdog's post-ask wait), or somebody else is
+        # already serving this port — which is what a holder taking the replace
+        # signal leaves behind, with nothing announced here at all. Read HERE
+        # rather than inside `teardown_drain_budget` so that function stays
+        # pure and testable.
         cut = proxy.stop(drain=teardown_drain_budget(
             reason, held_by_a_holder(),
             handed_over=this_process_is_draining()
@@ -9790,40 +8915,33 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             # came up while we were draining, or a supervisor holding the port
             # on our behalf. Unwiring then removes the config of a working pin,
             # and every session that dials during the gap gets
-            # ConnectionRefused. Measured: unwire at 19:16:35, the
-            # successor serving at 19:16:36, and a live session retrying.
-            #
-            # The state-file arbitration above cannot see this: a successor
-            # publishes its record and rewires only once it is serving, so
-            # between our decision and its publication the files say we are
-            # alone while the port says otherwise.
+            # ConnectionRefused. The state-file arbitration above cannot see
+            # this: a successor publishes its record and rewires only once it
+            # is serving, so between our decision and its publication the files
+            # say we are alone while the port says otherwise.
             if _successor_is_serving():
                 _log_lifecycle(
                     f"port {_wired_port()} is still served — leaving the "
                     f"wiring alone"
                 )
                 return
-            # Put ``.claude.json`` back the way we found it. Without this the env
-            # block keeps naming the port we just stopped serving, and Claude Code
-            # applies that block at boot — so EVERY session started afterwards
-            # dials a dead proxy and retries forever, with every proxy behind it
-            # healthy and unreachable behind it. Measured:
-            # "Unable to connect to API (ConnectionRefused), attempt 14/300", and
-            # the only cure was a human re-pinning by hand.
-            #
-            # An optional feature must not be able to take the required path down
-            # with it. wire_global_config(None, None) restores whatever proxy the
-            # user or their launcher had before we wrote ours, which is exactly
-            # what `pin --clear` already does — the call simply never ran on the
+            # Put ``.claude.json`` back the way we found it. Without this the
+            # env block keeps naming the port we just stopped serving, and
+            # Claude Code applies that block at boot — so EVERY session started
+            # afterwards dials a dead proxy and retries forever, with every
+            # proxy behind it healthy and unreachable behind it. An optional
+            # feature must not be able to take the required path down with it.
+            # wire_global_config(None, None) restores whatever proxy the user
+            # or their launcher had before we wrote ours, which is exactly what
+            # `pin --clear` already does — the call simply never ran on the
             # path where the daemon goes away by itself.
             try:
                 wire_global_config(None, None)
                 _log_lifecycle("unwired .claude.json — sessions fall back")
             except Exception as exc:  # noqa: BLE001
-                # NAME THE FAILURE. If the unwire does not happen, every session
-                # started afterwards dials a port nothing serves, and that is the
-                # outage this whole path exists to prevent. Silently swallowing it
-                # is what made one such outage unattributable for hours.
+                # NAME THE FAILURE. If the unwire does not happen, every
+                # session started afterwards dials a port nothing serves, and
+                # that is the outage this whole path exists to prevent.
                 _log_lifecycle(f"COULD NOT unwire .claude.json: {exc!r}")
         finally:
             done.set()
@@ -9850,27 +8968,20 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # bytecode. The kernel delivers to whichever thread has not blocked the
     # signal — its C handler there clears the pending bit and sets a flag, but
     # a main thread parked in an UNTIMED wait is never woken by a signal that
-    # went elsewhere, so the flag sits set and this daemon keeps serving.
-    #
-    # Measured on a daemon that had just ignored a TERM. Every reading says
-    # "healthy process that dropped the signal":
-    #
-    #     SigCgt 0x…4000 (SIGTERM caught)   SigPnd 0   ShdPnd 0
-    #     threads: _accept_loop in accept(), main here
-    #     SIGTERM -> a worker thread : still alive after 8s
-    #     SIGTERM -> the process     : exited after 0.10s
-    #
-    # In the suite this was an intermittent "no successor within 3.0s" — the
-    # holder never saw an exit because there was none. In production the TERM
-    # comes from `_kill_daemon` (a recycle, or the orphan sweep), and that one
-    # ESCALATES: 32s later — `_DRAIN_SECONDS` plus the 2s of slack — it sends
-    # SIGKILL. So the dropped signal does not leave the old daemon serving; it
-    # converts an orderly handover into a force-kill, with `stop(drain=…)`
-    # never entered and every in-flight request cut. That is precisely the
-    # guarantee `_kill_daemon` says this release makes, failing silently, and
-    # the escalation is what hides it: the daemon does die, on time, so the
-    # recycle reports success.
-    #
+    # went elsewhere, so the flag sits set and this daemon keeps serving. Every
+    # reading says "healthy process that dropped the signal":  SigCgt 0x…4000
+    # (SIGTERM caught)   SigPnd 0   ShdPnd 0 threads: _accept_loop in accept(),
+    # main here SIGTERM -> a worker thread : still alive after 8s SIGTERM ->
+    # the process     : exited after 0.10s  In the suite this was an
+    # intermittent "no successor within 3.0s" — the holder never saw an exit
+    # because there was none. In production the TERM comes from `_kill_daemon`
+    # (a recycle, or the orphan sweep), and that one ESCALATES: 32s later —
+    # `_DRAIN_SECONDS` plus the 2s of slack — it sends SIGKILL. So the dropped
+    # signal does not leave the old daemon serving; it converts an orderly
+    # handover into a force-kill, with `stop(drain=…)` never entered and every
+    # in-flight request cut. That is precisely the guarantee `_kill_daemon`
+    # says this release makes, failing silently, and the escalation is what
+    # hides it: the daemon does die, on time, so the recycle reports success.
     # 0.5 s rather than a wakeup fd: the cost is one loop iteration twice a
     # second in a process that is otherwise idle, against a selector and a
     # second teardown path to keep in step with this one.
@@ -9905,14 +9016,11 @@ def wire_env(
     proxy = _proxy_url(port, Path(ca_path).parent)
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
-    # Rewrite an ALL_PROXY the caller already had; never create one. It is a
-    # fallback consulted only when the scheme-specific vars are absent (curl,
-    # measured: https_proxy=A + ALL_PROXY=B dials A), and we always set those
-    # — so an absent one costs nothing, while a launcher's own would name the
-    # hop we chain through and read as a contradiction. Creating one here
-    # would be worse than useless: this env can be eval'd into the user's
-    # SHELL (pin-env), where an ALL_PROXY we invented would send that shell's
-    # git, uv and gh through an account-pinning MITM built for one client.
+    # Rewrite an ALL_PROXY the caller already had; never create one. Creating
+    # one here would be worse than useless: this env can be eval'd into the
+    # user's SHELL (pin-env), where an ALL_PROXY we invented would send that
+    # shell's git, uv and gh through an account-pinning MITM built for one
+    # client.
     for key in ("ALL_PROXY", "all_proxy"):
         if key in out:
             out[key] = proxy
@@ -9922,12 +9030,10 @@ def wire_env(
     out["NODE_EXTRA_CA_CERTS"] = str(
         _trust_file(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
     )
-    # Python does not read NODE_EXTRA_CA_CERTS. The failing caller measured on
-    # host-a is the statusline nudge -- usage.py `Popen([cswap,
-    # "list"])` inherits this env, dials the pin, and every non-active account
-    # poll dies CERTIFICATE_VERIFY_FAILED. Evenly across all seven accounts;
-    # only the disabled one shows it, because the engine's other path never
-    # re-polls it to reset the counter.
+    # Python does not read NODE_EXTRA_CA_CERTS. Evenly across all seven
+    # accounts; only the disabled one shows it, because the engine's other path
+    # never re-polls it to reset the counter.
+    #
     # NO SSL_CERT_FILE HERE EITHER — see the note in `wire_global_config`. The
     # python callers this was written for (the statusline nudge shelling out to
     # `cswap list`, the usage poll) are served by
@@ -10085,15 +9191,13 @@ def _refused_rc_since(session_id: str, since_ms: float) -> bool:
                         continue
                     try:
                         rec = json.loads(raw.decode("utf-8", "replace"))
-                        # THE RECORD KIND IS THE WHOLE PRECISION OF THIS
-                        # CHECK. Claude Code writes a local command's output as
-                        # a `system` record; a session that merely QUOTES the
+                        # THE RECORD KIND IS THE WHOLE PRECISION OF THIS CHECK.
+                        # Claude Code writes a local command's output as a
+                        # `system` record; a session that merely QUOTES the
                         # refusal — pasted by the user, echoed back by an agent
                         # — carries it inside a `user` or `assistant` message.
-                        # MEASURED: a dry run against this machine flagged the
-                        # session that was writing this repair, because the
-                        # refusal had been discussed in it. Substring alone
-                        # restarts sessions for talking about the bug.
+                        # Substring alone restarts sessions for talking about
+                        # the bug.
                         if rec.get("type") != "system":
                             continue
                         stamp = str(rec.get("timestamp") or "")
@@ -10179,12 +9283,10 @@ def policy_limits_for(token: "str | None") -> "dict | None":
                      "anthropic-client-platform": "cli"})
         # THROUGH THE PIN, WHICH RE-SIGNS THIS HOST. The daemon's own egress is
         # wired to the pin, so this request is MITM'd with a certificate signed
-        # by the pin's CA — which a default context does not trust. MEASURED in
-        # production: every fetch died CERTIFICATE_VERIFY_FAILED, the `except`
-        # below turned it into `None`, and `sweep_policy_once` read `None` as
-        # "could not ask" and did nothing. `grep 'refreshed the org-policy
-        # cache' daemon.log` returned 0 across every rotation on this host —
-        # the repair had never once run, and nothing said so.
+        # by the pin's CA — which a default context does not trust. `grep
+        # 'refreshed the org-policy cache' daemon.log` returned 0 across every
+        # rotation on this host — the repair had never once run, and nothing
+        # said so.
         with urllib.request.urlopen(
                 req, timeout=10, context=_verifying_context()) as resp:
             doc = json.loads(resp.read().decode())
@@ -10242,12 +9344,7 @@ class PinProxy:
         # instead of one per connection — see _note_hop_unusable.
         self._hop_fault: "tuple[tuple[str, int], str] | None" = None
         # The credential a client must present on CONNECT is re-read per
-        # connection, not cached here — ``_current_secret``. Caching it made
-        # the gate arm on the next RESPAWN rather than when the secret was
-        # written, which is the opposite of what the deploy needs (measured by
-        # the cswap owner: `cswap pin` minted the secret and rewired, but
-        # ensure_proxy reused the live daemon, so it kept serving with the
-        # None it had captured at construction).
+        # connection, not cached here — ``_current_secret``.
         self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
         self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._server_ctx.load_cert_chain(
@@ -10294,14 +9391,15 @@ class PinProxy:
         # what separates a reply still being written from one that stopped and
         # is only being kept warm — see `_is_only_keepalive`. Cleared with the
         # debt, like `_delivered`.
+        #
         # WHEN CONTENT LAST REACHED THIS CLIENT — the clock `_content` counts
         # against. `now - this` is the interval `await_inflight` names as the
         # one measurement its refused stall predicate is waiting on, and it
         # only means anything PER CONNECTION: a process-wide byte rate cannot
         # produce it, because twelve replies staggered ten seconds apart look
         # busy every ten seconds while each one is silent for two minutes.
-        # Seeded when the debt is taken so a reply that has sent nothing at
-        # all is timed from the moment somebody started waiting.
+        # Seeded when the debt is taken so a reply that has sent nothing at all
+        # is timed from the moment somebody started waiting.
         self._content_at: dict = {}
         # THE LONGEST SILENCE A REPLY SAT IN AND THEN FINISHED ANYWAY. High
         # water, not a snapshot, because the drain that matters most ends with
@@ -10347,9 +9445,8 @@ class PinProxy:
         self.port = 0
         # Opt-in request tracing: CSWAP_PIN_DEBUG=<path> logs one line per
         # request (method, path, whether it matched a pinned route and was
-        # swapped). Off by default; used to diagnose routing end to end.
-        # CAPPED, like `daemon.log`. This wrote one line per request into an
-        # uncapped append; see `_append_capped`.
+        # swapped). CAPPED, like `daemon.log`. This wrote one line per request
+        # into an uncapped append; see `_append_capped`.
         self._debug = None
         # Which path `_debug` is open on, so a re-armed trace does not keep
         # writing to the file it was armed on first.
@@ -10400,8 +9497,7 @@ class PinProxy:
             # that handed this over is on its way out, so the socket becomes
             # ours. A HOLDER is not: it is still there and will put a successor
             # on this very socket, so closing it on our way out unbinds the
-            # port the holder exists to keep. Measured: 201,909 refused
-            # connections across three planned restarts.
+            # port the holder exists to keep.
             self._inherited = held_by_a_holder()
             self.port = self._srv.getsockname()[1]
             self._start_accept_loop()
@@ -10425,23 +9521,18 @@ class PinProxy:
         self._inherited = False
         self._srv = socket.socket()
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Reclaim the port a previous daemon recorded, when it is free. A
-        # running session's HTTPS_PROXY is fixed at exec time, so coming back
-        # on a fresh port strands every live session on a dead one — and its
-        # requests then leave WITHOUT the pin instead of failing loudly
-        # (measured: an RC session created that way was owned by the active
-        # account while the pin still looked healthy).
-        # WHAT THE USER ASKED FOR WINS, ahead of every reclaim below. The
-        # reclaim order exists to keep LIVE sessions attached across a
-        # respawn; a configured port is a standing instruction about where
-        # this pin serves, and honouring it only when no record happened to
-        # survive would make `--set_port` do nothing on the machines that
-        # matter — the ones that have been running.
+        # Reclaim the port a previous daemon recorded, when it is free.
         #
-        # The cost is real and belongs to whoever sets it: moving the port
-        # strands sessions whose HTTPS_PROXY was fixed at exec, exactly as the
-        # note below describes. That is why nothing here CHANGES the port on
-        # its own; it changes only when a human says so.
+        # WHAT THE USER ASKED FOR WINS, ahead of every reclaim below. The
+        # reclaim order exists to keep LIVE sessions attached across a respawn;
+        # a configured port is a standing instruction about where this pin
+        # serves, and honouring it only when no record happened to survive
+        # would make `--set_port` do nothing on the machines that matter — the
+        # ones that have been running. The cost is real and belongs to whoever
+        # sets it: moving the port strands sessions whose HTTPS_PROXY was fixed
+        # at exec, exactly as the note below describes. That is why nothing
+        # here CHANGES the port on its own; it changes only when a human says
+        # so.
         want = wanted_port(self._certdir)
         for candidate in ([want] if isinstance(want, int) and want > 0 else []) + [0]:
             try:
@@ -10630,9 +9721,7 @@ class PinProxy:
         # THE OTHER STORE, and leaving it out is why the first cut of this
         # changed nothing for the session it was written for. `_carry_history_
         # pointers` writes BOTH and says why: an interactive resume has no
-        # CLAUDE_JOB_DIR, so Claude Code reads the TRANSCRIPT. Its own comment
-        # names the very job measured here — three different accounts across
-        # the login, the job record and the transcript.
+        # CLAUDE_JOB_DIR, so Claude Code reads the TRANSCRIPT.
         for sid in _live_session_ids():
             found = _last_pointer(sid)
             if not found:
@@ -10775,10 +9864,7 @@ class PinProxy:
             # the moment the network hiccups.
             if self._connected_bridges is None:
                 continue
-            # FROM THE JOB RECORD, not the registry one. The registry entry
-            # (`sessions/<pid>.json`) has no bridge field at all, so reading it
-            # there yields "" for every session and the guard never fires —
-            # measured, it recycled a session that already had its bridge back.
+            # FROM THE JOB RECORD, not the registry one.
             job_rec = _read_json(_config_home_for_policy() / "jobs" /
                                  str(rec.get("jobId") or "") / "state.json")
             bid = str((job_rec or {}).get("bridgeSessionId") or "")
@@ -10950,12 +10036,9 @@ class PinProxy:
         # connection away from the successor and drops it.
         t = getattr(self, "_accept_thread", None)
         if t is not None and t is not threading.current_thread():
-            # WAKE IT, do not wait out its poll. The loop uses a 0.5s accept
-            # timeout to notice `_stop`, so a bare join paid up to that on
-            # EVERY stop — measured at 502 ms, and the test suite alone stops
-            # ~50 servers, which was 25 s of pure waiting. One loopback
-            # connect makes accept() return at once; the loop sees `_stop` and
-            # ends. Harmless if it races the socket closing, hence the guard.
+            # WAKE IT, do not wait out its poll. One loopback connect makes
+            # accept() return at once; the loop sees `_stop` and ends. Harmless
+            # if it races the socket closing, hence the guard.
             if srv is not None:
                 try:
                     with socket.create_connection(
@@ -10972,19 +10055,11 @@ class PinProxy:
                 # restarts; handing its socket to a child we do not control
                 # would leave that child accepting on it after we are gone.
                 #
-                # UNLESS THE HOLDER IS GONE, which `_inherited` cannot know:
-                # it is decided once, in `start()`, and the holder can die
+                # UNLESS THE HOLDER IS GONE, which `_inherited` cannot know: it
+                # is decided once, in `start()`, and the holder can die
                 # afterwards. Refusing then answers about a holder that no
-                # longer exists — and the successor's own holder finds the
-                # port occupied by us. Measured, isolated port 49927:
-                #
-                #   11:57:10 the holder above this daemon is gone — handing over
-                #   11:57:13 holder could not take the port (49927 is taken)
-                #            — serving unheld
-                #   11:57:13 serving on port 37001
-                #
-                # The recycle fired correctly and still stranded every session
-                # whose HTTPS_PROXY was fixed at exec.
+                # longer exists — and the successor's own holder finds the port
+                # occupied by us.
                 self._srv = srv
                 return None
             fd = srv.detach()  # leave it LISTENING and open for the successor
@@ -10994,18 +10069,11 @@ class PinProxy:
         self._srv = srv
         if self._srv and self._inherited and not _orphaned_from_its_holder():
             # NOT OURS TO CLOSE — a supervisor holds this port precisely so it
-            # keeps answering across our restarts.
-            #
-            # And the same "unless it is gone" as the hand-down above: an
-            # orphan detaching here leaves the port BOUND with nobody
-            # accepting, which is worse than refused — the handshake completes
-            # and the client waits.
-            #
-            # DETACH, do not just drop the reference. Dropping it hands the
-            # socket to CPython's finalizer, which closes the fd — measured:
-            # fd 3 gone with errno 9 and the supervisor's port refusing
-            # immediately afterwards, which is the exact outage this branch
-            # exists to prevent. ``detach`` gives up the object and leaves the
+            # keeps answering across our restarts. And the same "unless it is
+            # gone" as the hand-down above: an orphan detaching here leaves the
+            # port BOUND with nobody accepting, which is worse than refused —
+            # the handshake completes and the client waits. DETACH, do not just
+            # drop the reference. ``detach`` gives up the object and leaves the
             # descriptor open, the same way _inherited_listener refuses a bad
             # fd without closing it.
             try:
@@ -11015,12 +10083,7 @@ class PinProxy:
             self._srv = None
             return None
         elif self._srv:
-            # SHUTDOWN BEFORE CLOSE. A thread blocked in ``accept()`` keeps the
-            # listening socket alive across a bare ``close()``: measured, the
-            # port stayed "Address already in use" while ``fileno()`` was
-            # already -1, so the successor could not reclaim the recorded port
-            # and came up on a fresh one — stranding every session whose
-            # HTTPS_PROXY was fixed at exec.
+            # SHUTDOWN BEFORE CLOSE.
             try:
                 self._srv.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -11125,12 +10188,10 @@ class PinProxy:
         floor = slow_report_ms(getattr(self, "_certdir", None))
         if floor is None or total_ms < floor:
             return
-        # INFERENCE IS SUPPOSED TO TAKE SECONDS. `/v1/messages` is the model
-        # answering; 4715, 6040, 2369 and 4200ms were measured on one healthy
-        # mac inside four minutes. Reporting them buried the line that meant
-        # something — a `/worker/heartbeat` at 5789ms on the same machine in
-        # the same window. EXACT, not a prefix: `count_tokens` lives under
-        # this route and calls no model, so a slow one is still a stall.
+        # INFERENCE IS SUPPOSED TO TAKE SECONDS. Reporting them buried the line
+        # that meant something — a `/worker/heartbeat` at 5789ms on the same
+        # machine in the same window. EXACT, not a prefix: `count_tokens` lives
+        # under this route and calls no model, so a slow one is still a stall.
         if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
             return
         now = time.monotonic()
@@ -11207,29 +10268,25 @@ class PinProxy:
             posted = len(getattr(self, "_bridge_posts", {}) or {})
             if not posted:
                 return
-            # AND THE STREAMS THIS PROCESS NEVER accept()ED. A handover
-            # passes the LISTENING socket down, so posts arrive here at once
-            # while every established stream stays with the process that
-            # accepted it. Asked from local memory alone, a successor calls
-            # every pre-existing session deaf: "12 of 12" was logged four
-            # minutes into a handover while five daemons were alive holding 98
-            # connections between them, the predecessor holding exactly the
-            # nine its own line named as left intact. Nothing was deaf.
+            # AND THE STREAMS THIS PROCESS NEVER accept()ED. A handover passes
+            # the LISTENING socket down, so posts arrive here at once while
+            # every established stream stays with the process that accepted it.
+            # Asked from local memory alone, a successor calls every pre-
+            # existing session deaf: "12 of 12" was logged four minutes into a
+            # handover while five daemons were alive holding 98 connections
+            # between them, the predecessor holding exactly the nine its own
+            # line named as left intact. Nothing was deaf. THE UNION, NOT A
+            # REFUSAL. Suppressing the report while any predecessor drains was
+            # tried first and is worse: a predecessor is almost never absent
+            # here — two were still serving at 93 and 134 minutes old, because
+            # they stay until their channels close and a session can outlive a
+            # day of recycles. That rule silences the check permanently, which
+            # is the same silent-absence failure as the empty denominator
+            # above, only quieter. Each draining daemon publishes what it
+            # holds; this reads them.
             #
-            # THE UNION, NOT A REFUSAL. Suppressing the report while any
-            # predecessor drains was tried first and is worse: a predecessor
-            # is almost never absent here — two were still serving at 93 and
-            # 134 minutes old, because they stay until their channels close
-            # and a session can outlive a day of recycles. That rule silences
-            # the check permanently, which is the same silent-absence failure
-            # as the empty denominator above, only quieter. Each draining
-            # daemon publishes what it holds; this reads them.
-            # THE CHEAP ANSWER FIRST, AND USUALLY THE ONLY ONE NEEDED.
-            # This runs on every bridge CREATE, inside the request handler,
-            # and the enumeration below shells out to `ps -ww -axo` —
-            # measured at ~30ms against 565 processes. I put that on the hot
-            # path with the union and it did not belong there.
-            #
+            # THE CHEAP ANSWER FIRST, AND USUALLY THE ONLY ONE NEEDED. I put
+            # that on the hot path with the union and it did not belong there.
             # It is also unnecessary, because the union can only ever REMOVE
             # bridges from this list: a predecessor holding a stream makes a
             # bridge NOT deaf. So an empty local answer cannot be changed by
@@ -11389,39 +10446,26 @@ class PinProxy:
         This is the only function that cuts, so it is the only place that can
         report every path, including ones written after today.
         """
-        # THE SUBSCRIPTIONS ARE NOT CUT HERE, and that is deliberate. A drain
-        # used to close them on the grounds that holding one stamps
-        # `Connection: close` on every other reply — but a departing daemon
-        # has already released its listener, so the only replies left are on
-        # keep-alives that migrate after one each, and the banner this was
-        # meant to fix was measured with nothing draining at all. What the cut
-        # did buy was a hard disconnect of the bridge's inbound stream, which
-        # a session cannot reopen for itself. The tunnel wait below is the
-        # other answer, and it does not cost that.
+        # THE SUBSCRIPTIONS ARE NOT CUT HERE, and that is deliberate. What the
+        # cut did buy was a hard disconnect of the bridge's inbound stream,
+        # which a session cannot reopen for itself. The tunnel wait below is
+        # the other answer, and it does not cost that.
+        #
         # WAIT ON REQUESTS, NOT ON CONNECTIONS. This loop asked
         # `live_client_count() == 0` and that zero is unreachable: Remote
         # Control's WebSocket is opaque after the 101, is pumped by the shared
         # selector rather than a request thread, and stays open for the whole
         # session. So the condition never held, the full budget was always
         # spent, and every recycle then cut everything open — including a
-        # `/v1/messages` reply that had started moments earlier.
-        #
-        # Measured on host-a 2026-08-18: one code change produced two complete
-        # swaps 70 s apart and three separate sessions took "API Error:
-        # Connection lost mid-response" inside that window.
-        #
-        # The premise was written down in this file long before the conclusion
-        # was: "Remote Control's WebSocket lives as long as the session does,
-        # so the count is never zero." It sat two constants above the loop that
-        # depended on the opposite.
+        # `/v1/messages` reply that had started moments earlier. The premise
+        # was written down in this file long before the conclusion was: "Remote
+        # Control's WebSocket lives as long as the session does, so the count
+        # is never zero." It sat two constants above the loop that depended on
+        # the opposite.
         started = time.monotonic()
-        # ANNOUNCED HERE, NOT AT THE CALL SITES, because there are four of them
-        # and tonight's entire bug list is fixes that landed on some paths and
-        # not the one that mattered. Every drain goes through this function by
-        # construction, so a fifth exit path added later is covered without
-        # anyone remembering to cover it.
-        #
-        # See `announce_draining`: without it the orphan sweep TERMs a
+        # Every drain goes through this function by construction, so a fifth
+        # exit path added later is covered without anyone remembering to cover
+        # it. See `announce_draining`: without it the orphan sweep TERMs a
         # predecessor that is patiently finishing its replies, one second after
         # the successor starts serving.
         done_draining = announce_draining(self._certdir)
@@ -11429,10 +10473,9 @@ class PinProxy:
         # sweep reads this to decide which predecessor is cheapest to reap, and
         # a recycle storm can arrive inside those fifteen seconds — a marker
         # that has not said its count yet reads as `_OWED_UNKNOWN`, which is
-        # the most expensive thing to be.
-        # SNAPSHOT FIRST. `live_replies` compares against this, because content
-        # delivered BEFORE the drain started says nothing about whether this
-        # reply is still being written.
+        # the most expensive thing to be. SNAPSHOT FIRST. `live_replies`
+        # compares against this, because content delivered BEFORE the drain
+        # started says nothing about whether this reply is still being written.
         #
         # AND THE DRAIN DOES NOT STOP WAITING ON A CONTENT-FREE REPLY, which
         # was asked for and refused. "No content since the drain began" is a
@@ -11442,17 +10485,13 @@ class PinProxy:
         # this whole ceiling was removed to protect. The content count decides
         # which predecessor is cheapest to REAP — a choice that is being made
         # anyway, where being wrong costs one of several — and not whether to
-        # keep waiting, where being wrong costs a live answer.
-        #
-        # It becomes decidable the day somebody measures the longest
-        # content-free interval a live reply produces. The cut line records the
-        # inputs for that now; nothing here guesses it.
-        # NO SNAPSHOT. `live_replies` used to compare a per-connection COUNT
-        # against a copy of every count taken here; `_content_at` answers the
-        # same question directly, so the copy and the second dict it copied
-        # both go. One structure fewer to keep popped at three call sites.
-        # THE PROCESS'S NUMBER, not this proxy's: the marker describes the
-        # process the reaper would kill, and `_PUMP` drives every tunnel in it.
+        # keep waiting, where being wrong costs a live answer. It becomes
+        # decidable the day somebody measures the longest content-free interval
+        # a live reply produces. The cut line records the inputs for that now;
+        # nothing here guesses it. NO SNAPSHOT. One structure fewer to keep
+        # popped at three call sites. THE PROCESS'S NUMBER, not this proxy's:
+        # the marker describes the process the reaper would kill, and `_PUMP`
+        # drives every tunnel in it.
         streams = self.live_stream_count() + _PUMP.live_pairs()
         if streams:
             _log_lifecycle(
@@ -11464,26 +10503,25 @@ class PinProxy:
                       streams=streams, bridges=self.held_bridge_ids())
         beat_at = started
         try:
-            # AND THE TUNNELS. Remote Control RECEIVES over a WebSocket to
-            # the ingress host the `/bridge` response names, so it is an
-            # opaque tunnel `_PUMP` drives rather than a reply anyone is owed
-            # — `_mitm` hands the debt back at the 101, correctly, because a
+            # AND THE TUNNELS. Remote Control RECEIVES over a WebSocket to the
+            # ingress host the `/bridge` response names, so it is an opaque
+            # tunnel `_PUMP` drives rather than a reply anyone is owed —
+            # `_mitm` hands the debt back at the 101, correctly, because a
             # tunnel owes no ANSWER. It is still a live channel that dies with
             # this process.
             #
             # A HELD-OPEN STREAM DOES NOT COVER IT. That was the reasoning for
-            # dropping this wait, and the fleet disproved it the same hour:
-            # pid 423760 owed nothing, left at once, and took four open
-            # connections with it, while pid 1452400 — which did owe — stayed
-            # and kept fourteen.
+            # dropping this wait, and the fleet disproved it the same hour: pid
+            # 423760 owed nothing, left at once, and took four open connections
+            # with it, while pid 1452400 — which did owe — stayed and kept
+            # fourteen.
             #
             # ENDS ON SILENCE. `live_pairs()` alone has no exit: a wedged peer
-            # keeps its entry for ever. A tunnel quiet for the marker's own
-            # TTL cannot be told from a dead one, which is the same
-            # discriminator the reply wait uses.
-            #
-            # Uncapped arm only. The signal arm has a supervisor counting to
-            # `_DRAIN_SECONDS + 2`, and the held arm is holding the port dark.
+            # keeps its entry for ever. A tunnel quiet for the marker's own TTL
+            # cannot be told from a dead one, which is the same discriminator
+            # the reply wait uses. Uncapped arm only. The signal arm has a
+            # supervisor counting to `_DRAIN_SECONDS + 2`, and the held arm is
+            # holding the port dark.
             if budget == float("inf"):
                 while (_PUMP.live_pairs()
                        and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
@@ -11505,10 +10543,7 @@ class PinProxy:
                 while time.monotonic() < deadline:
                     if not self._owed_still_moving(started):
                         break
-                    # SAY WE ARE STILL HERE. The marker used to be given a TTL
-                    # covering the longest possible drain, and the longest
-                    # possible drain is now unbounded — so the drain refreshes
-                    # it instead. Without this a wait past
+                    # SAY WE ARE STILL HERE. Without this a wait past
                     # `_DRAINING_MARKER_TTL` looks abandoned and the orphan
                     # sweep TERMs a daemon that is mid-reply, which is the
                     # 08:21:19Z line with the clock moved rather than removed.
@@ -11523,11 +10558,10 @@ class PinProxy:
                             # erases the one field the reaper reads to know
                             # this daemon is carrying a bridge. The first beat
                             # wrote it and this one deleted it 15s later, so
-                            # the protection lasted one interval. Measured on
-                            # a live marker: 13 replies owed, no fifth line.
-                            # Re-read rather than reused: a channel can end
-                            # mid-drain and the marker must not overstate what
-                            # a reap would cost.
+                            # the protection lasted one interval. Re-read
+                            # rather than reused: a channel can end mid-drain
+                            # and the marker must not overstate what a reap
+                            # would cost.
                             streams=self.live_stream_count() + _PUMP.live_pairs(),
                             bridges=self.held_bridge_ids())
                         beat_at = now
@@ -11538,10 +10572,7 @@ class PinProxy:
         # TWO NUMBERS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS AND THIS LINE
         # USED TO CONFLATE THEM. The loop waits on OWED ANSWERS; the message
         # reported `live_client_count()`, which counts every open socket
-        # including opaque tunnels that owe nobody anything. So "cut 14
-        # in-flight request(s)" was 14 sockets closed, an unknown subset of
-        # which had anybody waiting — and both numbers quoted to the user
-        # tonight (34, then 30) were sockets, not truncated replies.
+        # including opaque tunnels that owe nobody anything.
         cut = self.inflight_requests()
         mid = self.inflight_mid_response()
         delivered = self._delivered_summary()
@@ -11557,12 +10588,8 @@ class PinProxy:
         closed = self.live_client_count()
         self._close_open_connections()
         # ONE LINE PER DRAIN, ALWAYS — silence was the problem, not the noise.
-        # This used to log only `if cut`, on the reasoning that a clean drain
-        # must not train anyone to skim the log. The cost of that: "no line"
-        # meant BOTH "drained clean" and "this daemon never drained", and a
-        # peer reading the log tonight could not tell a healthy departure from
-        # one that never happened. A departure is a rare event — one line each
-        # is not noise, and it is the only record that a recycle cost nothing.
+        # A departure is a rare event — one line each is not noise, and it is
+        # the only record that a recycle cost nothing.
         #
         # AND THE TWO OUTCOMES READ DIFFERENTLY, because they are different
         # facts. `cut` is somebody's reply ending mid-stream. `closed` alone is
@@ -11653,15 +10680,9 @@ class PinProxy:
             conns, self._open_conns = list(self._open_conns), set()
         for conn in conns:
             # THE RAW SOCKET, DELIBERATELY, EVEN THOUGH IT IS DETACHED.
-            # `wrap_socket` detached it, so this shutdown/close pair is a
-            # no-op for every MITM'd connection and the FIN-not-RST table
-            # above describes something that has not happened since the MITM
-            # landed. Reaching the TLS object instead — which really does end
-            # the connection — was tried and CUT LIVE REPLIES: two tests that
-            # encode the 2026-08-18 incident ("the reply was CUT mid-stream by
-            # a recycle") went red at once. The no-op is load-bearing: this
-            # runs at the END of every drain, including a clean one, and a
-            # reply finishing just after the budget still completes today.
+            # `wrap_socket` detached it, so this shutdown/close pair is a no-op
+            # for every MITM'd connection and the FIN-not-RST table above
+            # describes something that has not happened since the MITM landed.
             try:
                 conn.shutdown(socket.SHUT_WR)
             except OSError:
@@ -11704,26 +10725,19 @@ class PinProxy:
             # accepts, which would then cut a quiet-but-healthy stream. The
             # wait above is about noticing shutdown, not about the client.
             conn.settimeout(None)
-            # COUNTED HERE, NOT IN THE THREAD. `_serve_client` used to do the
-            # registration itself, which left the connection invisible for as
-            # long as the thread took to start: `live_client_count()` read 0,
-            # so `await_inflight` returned believing there was nothing to wait
-            # for, and `_close_open_connections` had nothing to shut down. The
-            # exit then closed the fd with the client's request unread — which
-            # the kernel MUST answer with RST (see `_close_open_connections`).
-            #
-            # Microseconds when idle, wider under load, which is why it showed
-            # up as an intermittent "2 in-flight requests cut by a planned
-            # restart" — about 1 run in 6 on a loaded box and never on an idle
-            # one. Counting before the handoff closes the window entirely:
-            # accepted IS connected, whatever the scheduler does next.
+            # COUNTED HERE, NOT IN THE THREAD. The exit then closed the fd with
+            # the client's request unread — which the kernel MUST answer with
+            # RST (see `_close_open_connections`). Microseconds when idle,
+            # wider under load, which is why it showed up as an intermittent "2
+            # in-flight requests cut by a planned restart" — about 1 run in 6
+            # on a loaded box and never on an idle one. Counting before the
+            # handoff closes the window entirely: accepted IS connected,
+            # whatever the scheduler does next.
             with self._live_lock:
                 self._open_conns.add(conn)
             # OWED FROM ACCEPT. The request line may still be in the kernel
             # buffer, and a client that has connected is waiting on us whether
-            # or not its bytes have arrived. Counting only from the request
-            # line let a recycle drop exactly those — measured as "1 requests
-            # connected and were never answered".
+            # or not its bytes have arrived.
             self._owe_answer(conn, True)
             threading.Thread(
                 target=self._serve_client, args=(conn,), daemon=True
@@ -11809,10 +10823,7 @@ class PinProxy:
         threading.Thread(target=_run, daemon=True).start()
 
     # Bounded, and the bound is what keeps a quiet connect cheap: three
-    # listings at four seconds, then give up until the next one. Measured
-    # shape, not a guess at latency — the loop stops the moment nothing of
-    # ours is missing from the listing, so the common case (the bridge is
-    # already there) costs exactly one listing and no sleep at all.
+    # listings at four seconds, then give up until the next one.
     _RESTORE_ATTEMPTS = 3
     _RESTORE_DELAY = 4.0
 
@@ -11877,11 +10888,8 @@ class PinProxy:
                 # again — the same answer `sweep_superseded_bridges` gives one
                 # screen up. Retrying here waits on the wrong thing: this loop
                 # exists for a listing that SUCCEEDS and does not yet show our
-                # bridge, and an unreachable API is not that. Measured, and it
-                # is why this is written down: with the retry covering both,
-                # `TestAMisroutedSwapCannotKillASession` failed on two
-                # consecutive full runs and passed alone. That test drives a
-                # real `POST /v1/code/sessions` against a deliberately dead
+                # bridge, and an unreachable API is not that. That test drives
+                # a real `POST /v1/code/sessions` against a deliberately dead
                 # upstream, so every listing failed and this thread sat in
                 # `sleep` for 8s per request, inside the daemon's own sweep
                 # guard.
@@ -11890,18 +10898,12 @@ class PinProxy:
             # restores something has said nothing about the bridge this connect
             # is FOR: the listing is full of other sessions, and repairing one
             # of those is the most likely outcome of pass 0 precisely because
-            # those bridges have existed long enough to be listed.
-            #
-            # Returning there is what kept the original defect alive after the
-            # re-listing loop was built to fix it. Measured 2026-08-18 with the
-            # loop deployed: `ai-inter-session-peer1` still read
-            # `host-a-robust-dream`, and the daemon's restores were each
-            # fixing a PREVIOUS session — the exact trace of a first pass that
-            # succeeded and stopped.
-            #
-            # The stop condition below is the only one that answers the right
-            # question: is anything this machine holds still missing from the
-            # listing? Nothing else may short-circuit it.
+            # those bridges have existed long enough to be listed. Returning
+            # there is what kept the original defect alive after the re-listing
+            # loop was built to fix it. The stop condition below is the only
+            # one that answers the right question: is anything this machine
+            # holds still missing from the listing? Nothing else may short-
+            # circuit it.
             restored += self._restore_bridge_titles(sessions, token)
             listed = {item.get("id") for item in sessions}
             # `live_bridge_names` carries BOTH spellings and the listing only
@@ -11949,9 +10951,7 @@ class PinProxy:
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
         # the pump, which runs it at EOF — so the connection stays counted for
-        # its whole life without a thread sitting on it. Measured before this:
-        # 300 connections cost 304 threads, exactly 1:1, which is how a dead
-        # upstream reached 27,491.
+        # its whole life without a thread sitting on it.
         self._local.release = _release
         detached = False
         try:
@@ -12121,11 +11121,9 @@ class PinProxy:
             # A REPLY THAT DELIVERED NO CONTENT AT ALL COUNTS TOO, and that is
             # deliberate against a review finding that called it inflation. Its
             # `_content_at` is still the seed from `_owe_answer`, so a 204 or a
-            # 5xx after a 30s upstream stall banks 30s. The threshold this
-            # feeds is "cut a reply silent for longer than T", so a LARGER
-            # measured maximum makes T larger and cuts fewer live replies.
-            # Under-reporting is the direction that costs somebody an answer,
-            # and excluding these would under-report.
+            # 5xx after a 30s upstream stall banks 30s. Under-reporting is the
+            # direction that costs somebody an answer, and excluding these
+            # would under-report.
             self._quiet_peak = max(self._quiet_peak,
                                    self._gap.get(conn, 0.0),
                                    time.monotonic() - since)
@@ -12216,22 +11214,16 @@ class PinProxy:
                     # `_note_reply_finished` runs one frame after the last
                     # `sendall` — so it recorded the TRAILING gap, ~0 for every
                     # reply still streaming when it ends, and threw away the
-                    # long quiet in the middle that the field exists to find.
-                    # A reply that pings for two minutes of extended thinking
-                    # and then delivers scored zero.
+                    # long quiet in the middle that the field exists to find. A
+                    # reply that pings for two minutes of extended thinking and
+                    # then delivers scored zero.
                     #
                     # AND IT COULD REPORT LARGER, NOT ONLY SMALLER, which is
                     # the half that would have done damage. A reply with NO
                     # content write never moved `_content_at` off its
                     # `_owe_answer` seed, so it banked its whole REQUEST
-                    # DURATION. Measured on host-a: pid 1269189 started 19:31,
-                    # drained 2h06m, and printed 27s — larger than every
-                    # trustworthy value on the fleet at the time. Anyone still
-                    # reading those numbers would have concluded a 27-second
-                    # wait was proven survivable, off a field that had measured
-                    # no reply's silence at all. A wrong instrument is not
-                    # conservative just because its first few samples were
-                    # small.
+                    # DURATION. A wrong instrument is not conservative just
+                    # because its first few samples were small.
                     prev = self._content_at.get(conn)
                     if prev is not None:
                         self._gap[conn] = max(self._gap.get(conn, 0.0),
@@ -12461,21 +11453,13 @@ class PinProxy:
         # must treat as terminal. Leaving it unset let the retry read "the
         # sweep never ran" and dial its own listing — one extra API call per
         # connect on precisely the path where the last one just failed.
-        # Measured: with that call present,
-        # `case_a_403_on_a_swapped_route_is_retried_unswapped` saw
-        # `Bearer PIN-TOKEN` in place of the retry's own `Bearer disk-token`,
-        # on 3 of 5 full runs, while HEAD was green 6 of 6.
         self._sweep_listing = sessions
         if sessions is None:
             return 0  # could not ask — certainly not "delete everything"
 
         # HANDED TO THE RESTORE RETRY so it does not list again a millisecond
-        # later. Two listings back to back is not just waste: measured, the
-        # second one arrives after a test's assertion and overwrites what the
-        # fake upstream recorded — `case_a_403_on_a_swapped_route_is_retried_
-        # unswapped` saw `Bearer PIN-TOKEN` where the retry's own
-        # `Bearer disk-token` had been, on 3 of 5 full runs. In production the
-        # same shape is one extra API call per RC connect for nothing.
+        # later. In production the same shape is one extra API call per RC
+        # connect for nothing.
         self._sweep_listing = sessions
 
         # RESTORE NAMES FIRST, and not as a courtesy: the close pass below
@@ -12505,13 +11489,10 @@ class PinProxy:
                 continue
             if (item.get("last_event_at") or "") >= newest[title]:
                 continue  # the newest of its name — someone put this away
-            # THE SUPERSEDER MUST BE ONE OF OURS. Titles used to be unique by
-            # accident: a replacement bridge got a server-invented slug, so
-            # `newest[title]` had one member and nothing was ever closed — the
-            # 551-against-14 symptom. Restoring names makes titles MEANINGFUL,
-            # and meaningful names repeat: this machine alone runs two sessions
-            # called `rewake`, and a third on another host would look, from
-            # here, like a newer bridge superseding them. `live` is
+            # THE SUPERSEDER MUST BE ONE OF OURS. Restoring names makes titles
+            # MEANINGFUL, and meaningful names repeat: this machine alone runs
+            # two sessions called `rewake`, and a third on another host would
+            # look, from here, like a newer bridge superseding them. `live` is
             # machine-local by design, so without this the delete pass would
             # close another machine's archived conversation on the strength of
             # a name collision.
@@ -12554,48 +11535,31 @@ class PinProxy:
                     if ":" in h:
                         k, v = h.split(":", 1)
                         connect_headers.append((k.strip(), v.strip()))
-                # A PIN THAT IS SET IS A PIN THAT APPLIES.
-                #
-                # The gate this replaces demanded a credential carried in
-                # HTTPS_PROXY, which is fixed at exec. That made turning the
-                # pin on a destructive act (407 for every session that
-                # predated the credential — measured: 313 processes), and
-                # softening it to "serve them unpinned" only traded one
-                # failure for another: the pin silently did not apply to the
-                # sessions the user was looking at.
-                #
-                # Neither is what the feature is for. `cswap pin 1` means
-                # Remote Control and Artifacts belong to account 1, for every
-                # session on this machine, now — not for sessions launched
-                # afterwards.
+                # A PIN THAT IS SET IS A PIN THAT APPLIES. The gate this
+                # replaces demanded a credential carried in HTTPS_PROXY, which
+                # is fixed at exec. Neither is what the feature is for. `cswap
+                # pin 1` means Remote Control and Artifacts belong to account
+                # 1, for every session on this machine, now — not for sessions
+                # launched afterwards.
                 #
                 # WHAT THE CREDENTIAL BOUGHT, precisely: the proxy listens on
                 # loopback and the kernel does not check uid on a TCP connect,
                 # so any process that can reach the port could obtain a bearer
                 # for the pinned account. But the secret lives at 0600 in the
-                # cert dir, so every process running AS THIS USER can read it
-                # — the sandboxed tool, the npm postinstall — which is the
-                # threat the docstring named. It only ever excluded a
-                # DIFFERENT login on a shared host. These are single-user
-                # machines; there is no such login to exclude, and the cost
-                # was the feature not working.
+                # cert dir, so every process running AS THIS USER can read it —
+                # the sandboxed tool, the npm postinstall — which is the threat
+                # the docstring named. It only ever excluded a DIFFERENT login
+                # on a shared host. These are single-user machines; there is no
+                # such login to exclude, and the cost was the feature not
+                # working.
                 #
                 # THE BLIND TUNNEL IS NOT GATED EITHER, and keeping it gated
                 # was my error. "Do not be an open forward proxy" assumes the
                 # port is reachable; this one binds 127.0.0.1 only, so the
                 # population it could refuse is the same-user processes that
-                # can read the 0600 secret anyway.
-                #
-                # What it actually cost: every host that is NOT api.anthropic.com
-                # takes this path — git, pip, npm, the auto-updater. Measured
-                # with the pin on and a session wired before the credential:
-                #   api.anthropic.com  200
-                #   github.com         407
-                #   pypi.org           407
-                #   registry.npmjs.org 407
-                # So turning the pin on severed general internet for every live
-                # session while leaving Claude itself working, which reads as
-                # "the network broke" and not as "the pin did something".
+                # can read the 0600 secret anyway. What it actually cost: every
+                # host that is NOT api.anthropic.com takes this path — git,
+                # pip, npm, the auto- updater.
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
                     return self._blind_tunnel(target, conn)
@@ -12679,13 +11643,10 @@ class PinProxy:
         self._warned_unpinnable = True
         # RECORD IT, do not only say it. The advice this prints — "re-run
         # `cswap pin` from a normal terminal" — cannot work on its own:
-        # ensure_proxy reuses any daemon whose fingerprint matches, so the
-        # re-run finds this same blind daemon and returns it. Measured on
-        # macOS: `cswap pin 1` from a GUI tmux window left pid 56790 (spawned
-        # over ssh, keychain rc=36) serving, unchanged, still unpinnable.
-        #
-        # Written to the state file so the NEXT ensure_proxy can see what only
-        # this process could learn, and recycle instead of reusing.
+        # ensure_proxy reuses any daemon whose fingerprint matches, so the re-
+        # run finds this same blind daemon and returns it. Written to the state
+        # file so the NEXT ensure_proxy can see what only this process could
+        # learn, and recycle instead of reusing.
         try:
             mark_daemon_unpinnable(self._certdir)
         except Exception:  # noqa: BLE001 — advisory; never break a request
@@ -12757,15 +11718,11 @@ class PinProxy:
         # up. The swap fails open by design — a request whose token cannot be
         # minted still goes out, on the disk bearer — so a daemon that cannot
         # read its own credential store serves unpinned traffic while every
-        # visible signal stays green. Measured: a daemon started over ssh
-        # cannot reach the macOS keychain, and 13 of 13 pinned routes went out
-        # unswapped; the RC sessions born in that window are owned by the
-        # active account forever, and nothing said so.
-        #
-        # "No token" is not the same as "cannot mint one". With the pinned
-        # account already active there is deliberately nothing to swap, and
-        # reporting can_pin=false there tells a monitor the pin is broken on
-        # the one machine where it has nothing to do.
+        # visible signal stays green. "No token" is not the same as "cannot
+        # mint one". With the pinned account already active there is
+        # deliberately nothing to swap, and reporting can_pin=false there tells
+        # a monitor the pin is broken on the one machine where it has nothing
+        # to do.
         try:
             can_pin = bool(self._pin_token_provider()) or _pin_is_noop(
                 self._pin_token_provider
@@ -12775,19 +11732,14 @@ class PinProxy:
         # WHAT EGRESS IS ACTUALLY DOING, not what it is configured to do.
         # `chain` above reports the hop the relay WOULD use, so a daemon that
         # can reach no hop and is dialling DIRECT reported exactly what a
-        # healthy one did. Every field was green through two measured outages,
-        # here and on the peer's side.
-        #
-        # DIRECT is not "degraded but fine" on a corporate host: the direct
-        # route IS the TLS-inspecting proxy, and it answers 403. Owner's count
-        # on host-a for one day: 61 DIRECT transitions, 148 dial-failed,
-        # 89 accepted-but-did-not-tunnel, against 238 healthy. The pin
-        # detected all four outages and wrote all four to daemon.log; nobody
-        # read it any of the four times.
-        #
-        # `null` until the first dial: "we have not dialled yet" is not the
-        # same as "we are direct", and a monitor that cannot tell them apart
-        # alarms on every daemon start.
+        # healthy one did. DIRECT is not "degraded but fine" on a corporate
+        # host: the direct route IS the TLS-inspecting proxy, and it answers
+        # 403. Owner's count on host-a for one day: 61 DIRECT transitions, 148
+        # dial-failed, 89 accepted-but-did-not-tunnel, against 238 healthy. The
+        # pin detected all four outages and wrote all four to daemon.log;
+        # nobody read it any of the four times. `null` until the first dial:
+        # "we have not dialled yet" is not the same as "we are direct", and a
+        # monitor that cannot tell them apart alarms on every daemon start.
         if self._egress_hop is not None:
             egress = f"{self._egress_hop[0]}:{self._egress_hop[1]}"
         elif self._egress_direct:
@@ -12796,23 +11748,21 @@ class PinProxy:
             egress = None
         # `egress` is instantaneous; `direct_last` is the same fault in a tense
         # a later probe can still read. See :attr:`direct_last`.
+        #
         # WHO HOLDS THE ADDRESS — the one question argv cannot answer. A
         # standby that ARMS becomes the holder and its argv still says
         # `--standby` forever, because argv is fixed at exec; a peer read the
         # role off it and reported an intact triad as deviating. proxy.json
-        # records the DAEMON pid, which is a different process.
-        #
-        # COMPUTED HERE, NEVER STORED. A recorded holder goes stale in exactly
-        # the event this reports: holder dies, standby arms, and the record
-        # still names the dead one until the next respawn. `held_by_a_holder`
-        # compares the spawn-time marker against a LIVE `getppid()`, so the
-        # kernel owns the comparand — a reused pid cannot forge it without
-        # actually being our parent.
-        #
-        # `null` when nothing holds us, which is not the same as "unknown": it
-        # says this address dies with this process. Reporting a bare
-        # `getppid()` instead would name an unrelated process as the holder of
-        # a socket it has never heard of.
+        # records the DAEMON pid, which is a different process. COMPUTED HERE,
+        # NEVER STORED. A recorded holder goes stale in exactly the event this
+        # reports: holder dies, standby arms, and the record still names the
+        # dead one until the next respawn. `held_by_a_holder` compares the
+        # spawn-time marker against a LIVE `getppid()`, so the kernel owns the
+        # comparand — a reused pid cannot forge it without actually being our
+        # parent. `null` when nothing holds us, which is not the same as
+        # "unknown": it says this address dies with this process. Reporting a
+        # bare `getppid()` instead would name an unrelated process as the
+        # holder of a socket it has never heard of.
         holder_pid = os.getppid() if held_by_a_holder() else None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
@@ -12951,28 +11901,13 @@ class PinProxy:
         served_one = False
         try:
             while True:
-                # THE DEBT BOUNDARY. BETWEEN requests this connection is a
-                # keep-alive socket nobody is waiting on, so it must not hold
-                # a drain — that was the third unreachable zero, measured as
-                # `cut 1 in-flight request(s) after 30s` with the reply long
-                # since delivered. `_read_line` inside then blocks until the
+                # THE DEBT BOUNDARY. `_read_line` inside then blocks until the
                 # next request line arrives, and the debt is taken back up the
-                # moment one does.
-                #
-                # BETWEEN, NOT BEFORE THE FIRST. This ran on every iteration
-                # including the first, which is one frame after `accept` took
-                # the debt precisely so a client whose request line is still
-                # in the kernel buffer is not dropped ("1 requests connected
-                # and were never answered", measured). Clearing it here undid
-                # that for every MITM'd connection: CONNECT parsed, TLS up,
-                # request on the wire, and `inflight_requests()` reporting
-                # zero. The accept-time debt now survives until this
+                # moment one does. BETWEEN, NOT BEFORE THE FIRST. Clearing it
+                # here undid that for every MITM'd connection: CONNECT parsed,
+                # TLS up, request on the wire, and `inflight_requests()`
+                # reporting zero. The accept-time debt now survives until this
                 # connection has actually answered something.
-                #
-                # It cannot strand the drain either: a connection owed but
-                # never written to is measured from the drain's own start by
-                # `_owed_still_moving`, so a client that connects and says
-                # nothing drops out after the stall window.
                 if served_one:
                     self._note_reply_finished(conn)
                     self._owe_answer(conn, False)
@@ -13050,21 +11985,19 @@ class PinProxy:
         # carries. Inside `if pinned:` the presence trigger was UNREACHABLE,
         # because presence is deliberately not a pinned route — so the second
         # trigger, its cooldown and its timestamp were all dead and the
-        # archived-later case 0.1.139 set out to cover stayed uncovered.
-        #
-        # The cooldown gates the token fetch too, so an unpinned route costs
+        # archived-later case 0.1.139 set out to cover stayed uncovered. The
+        # cooldown gates the token fetch too, so an unpinned route costs
         # nothing beyond one regex.
+        #
         # ONE TOKEN PER REQUEST, AND THIS IS WHY. Moving the sweep out of the
         # bearer gate above was right, but it brought its own
         # `_pin_token_provider()` call with it — so a PINNED route that also
         # triggers a sweep fetched the same token TWICE. That provider re-reads
-        # the pin and the credential from disk on every call, takes a
-        # cross-process lock, and on expiry POSTs a refresh. Twice, in front of
-        # the client, on the request path.
-        #
-        # Fetched once here and shared. `None` is a real answer (the pin is
-        # the active account, or no usable token), so it is cached in a
-        # sentinel rather than re-fetched by a falsy test.
+        # the pin and the credential from disk on every call, takes a cross-
+        # process lock, and on expiry POSTs a refresh. Twice, in front of the
+        # client, on the request path. Fetched once here and shared. `None` is
+        # a real answer (the pin is the active account, or no usable token), so
+        # it is cached in a sentinel rather than re-fetched by a falsy test.
         _tok_fetched = False
         _tok = None
         if self._should_sweep_bridges(method, path):
@@ -13072,14 +12005,6 @@ class PinProxy:
             _tok, _tok_fetched = self._pin_token_provider(), True
             if _tok:
                 self._sweep_bridges_after_connect(_tok)
-        # SAME TRIGGER, because worker traffic is exactly when a session has
-        # been busy and may have swallowed a turn. Its own cooldown keeps this
-        # off the hot path.
-        _m_bridge = _BRIDGE_ID.match(path)
-        if _m_bridge and _WORKER_SUBTREE.search(path):
-            if not _tok_fetched:
-                _tok, _tok_fetched = self._pin_token_provider(), True
-            replay_lost_turns(_m_bridge.group(1), _tok)
         swapped = False
         original_headers = list(headers)
         if pinned:
@@ -13112,17 +12037,12 @@ class PinProxy:
                 ]
                 swapped = True
                 # TWO MOMENTS, not one. A create is when a NEW bridge opens
-                # beside an older connected one. The other is an older bridge
-                # being ARCHIVED while still connected, which happens
-                # server-side AFTER the newer one opened — so no create can
-                # ever see it, and this comment used to say it could. Measured
-                # here: a 0.3h archived+connected bridge sharing a title with
-                # the 0.0h live one, sitting indefinitely. Sweeping on THIS instead of a
+                # beside an older connected one. Sweeping on THIS instead of a
                 # timer means a quiet daemon never wakes to find nothing, and
                 # the fix lands when it is needed rather than up to an hour
                 # later. Fired on the request rather than the response: the
-                # sweep re-lists from the server anyway, so a create that
-                # fails simply finds nothing new to supersede.
+                # sweep re-lists from the server anyway, so a create that fails
+                # simply finds nothing new to supersede.
 
                 # THE ONE MOMENT A DENIED SESSION BECOMES UN-DENIED, and the
                 # only evidence of it. Claude Code caches the policy answer per
@@ -13133,18 +12053,18 @@ class PinProxy:
                 # only on a 200 — a failure or a 304 re-seeds the same
                 # document. Saying so here is the difference between "the fix
                 # will reach it" and having watched it arrive.
+                #
                 # THE ONE CALL THAT CAN SAVE A LIVE BRIDGE, and until now it
                 # was invisible. Claude Code asks this when the identity file
                 # names an account other than the bridge's owner; our answer
                 # names the PINNED account, which makes CC re-baseline rather
                 # than disconnect — and it REASSIGNS the owner to that answer,
-                # so every later rotation compares pin against pin.
-                #
-                # Its absence is the other half of the diagnosis: a bridge
-                # that died without this line never asked, and one that died
-                # after it asked is a different fault entirely. The
-                # `[bridge:owner-pin]` traces only exist under --debug, which
-                # no session here runs, so nothing else can tell those apart.
+                # so every later rotation compares pin against pin. Its absence
+                # is the other half of the diagnosis: a bridge that died
+                # without this line never asked, and one that died after it
+                # asked is a different fault entirely. The `[bridge:owner-pin]`
+                # traces only exist under --debug, which no session here runs,
+                # so nothing else can tell those apart.
                 if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
                     _log_lifecycle(
                         "a session asked who its credential belongs to — "
@@ -13157,19 +12077,13 @@ class PinProxy:
                         "pinned account, so a cached denial from another "
                         "account is replaced without a restart")
             else:
-                # Fail-open: the request still goes, on the disk bearer. That is
-                # deliberate — a pin that cannot resolve must never block work —
-                # but it is silent, and silence here is expensive. A Remote
-                # Control session created on this path is owned by the ACTIVE
-                # account permanently; the server fixes ownership at /bridge and
-                # there is no transfer. Measured: a daemon that could not reach
-                # the credential store served 13 pinned routes unswapped, and
-                # every RC session born in that window had to be recreated by
-                # hand. Say it once per daemon so the cause is on the record
-                # before the consequence shows up days later.
-                #
-                # ...unless None is the RIGHT answer. When the pinned account
-                # is the active one there is nothing to swap, and warning then
+                # Fail-open: the request still goes, on the disk bearer. That
+                # is deliberate — a pin that cannot resolve must never block
+                # work — but it is silent, and silence here is expensive. A
+                # Remote Control session created on this path is owned by the
+                # ACTIVE account permanently; the server fixes ownership at
+                # /bridge and there is no transfer. When the pinned account is
+                # the active one there is nothing to swap, and warning then
                 # trains the reader to disbelieve the warning (see
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
@@ -13253,21 +12167,16 @@ class PinProxy:
 
         keep = self._forward(method, path, headers, body, tls, swapped=swapped)
         if keep is _AUTH_REJECTED:
-            # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived.
-            #
-            # A 401/403/404 is terminal to the client — SSETransport treats
-            # those as permanent (M7y = new Set([401,403,404])), sets
-            # state="closed", and never reconnects, so one misrouted request
-            # kills Remote Control for the life of the process. Measured: a
-            # /worker-swap experiment produced 26 such responses and severed
-            # the inbound channel of four sessions that are still running
-            # hours later with bridgeSessionId gone.
-            #
-            # That makes route classification a single point of permanent
-            # failure, and no amount of care in the predicate removes the
-            # risk. Retrying without the swap turns "I guessed wrong about
-            # this route" into "this request went out unpinned", which is the
-            # failure mode the whole module is already built to tolerate.
+            # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
+            # 401/403/404 is terminal to the client — SSETransport treats those
+            # as permanent (M7y = new Set([401,403,404])), sets state="closed",
+            # and never reconnects, so one misrouted request kills Remote
+            # Control for the life of the process. That makes route
+            # classification a single point of permanent failure, and no amount
+            # of care in the predicate removes the risk. Retrying without the
+            # swap turns "I guessed wrong about this route" into "this request
+            # went out unpinned", which is the failure mode the whole module is
+            # already built to tolerate.
             self._drop_upstream()
             keep = self._forward(method, path, original_headers, body, tls)
         # A client that asked to close gets closed regardless of the upstream.
@@ -13354,6 +12263,7 @@ class PinProxy:
                     # and then cuts whatever else was open. It is still an OPEN
                     # connection and is still closed on teardown; it is simply
                     # not something to wait for.
+                    #
                     # A TUNNEL OWES NOTHING. Nobody is waiting on a reply here
                     # — two sockets are being copied into each other for the
                     # life of the session. This is the RC WebSocket, and it is
@@ -13366,10 +12276,9 @@ class PinProxy:
                         # the client's `Upgrade:` header, so both can be true
                         # at once — and from here the socket belongs to the
                         # pump. A drain closing it makes epoll drop the fd
-                        # silently: no event, `_close_pair` never runs, and
-                        # the connection stays in every map for the life of
-                        # the daemon. Measured: OPEN 1, TLSFOR 1, six seconds
-                        # after the release said it had freed it.
+                        # silently: no event, `_close_pair` never runs, and the
+                        # connection stays in every map for the life of the
+                        # daemon.
                         with self._live_lock:
                             self._stream_conns.discard(_c)
                             # AND THE OWNER MAP. Keyed on the same object; the
@@ -13400,26 +12309,21 @@ class PinProxy:
                 on_headers=(
                     lambda n, c: self._note_response_started(_conn, n, c))
                 if _conn is not None else None,
-                # THE CALLER IS THE ONLY ONE THAT KNOWS THE PATH, and the
-                # relay is the only one that sees the status. Neither can
-                # report an attachment outcome alone.
+                # THE CALLER IS THE ONLY ONE THAT KNOWS THE PATH, and the relay
+                # is the only one that sees the status. Neither can report an
+                # attachment outcome alone.
                 #
                 # AND THE TRACE RIDES THE SAME HOOK. `_relay_response` writes
                 # its `<-` line to `_TRACE` only, which is opened once at
                 # import from an env var and so is off on a daemon that is
                 # already serving. The `trace-to` file switch — the only one
                 # reachable during an incident — showed every request and not
-                # one response. Measured: 25 requests, ZERO responses, which
-                # reads exactly like a server that has stopped answering.
-                # `_tunnel_trace` writes both targets and this method can
-                # reach it, so no new plumbing is needed.
+                # one response. `_tunnel_trace` writes both targets and this
+                # method can reach it, so no new plumbing is needed.
                 #
                 # THE STATUS LINE IS ALSO WHERE A STALL ENDS, and it is the
-                # only place it can be timed. A response body here can be an
-                # SSE stream held open for hours — one drained for 5735.9s —
-                # so timing the whole relay would report a healthy stream's
-                # lifetime as a stall. Time to the first byte is the number
-                # that means the same thing for both.
+                # only place it can be timed. Time to the first byte is the
+                # number that means the same thing for both.
                 on_status=lambda st: (
                     self._note_attachment(path, st),
                     self._tunnel_trace(
@@ -13544,39 +12448,25 @@ class PinProxy:
         while heartbeats (which answer at once) kept succeeding — so the
         session looked healthy and was silently deaf.
         """
-        # A HOP THAT IS RESTARTING IS NOT A HOP THAT IS GONE. Measured by the
-        # cache proxy's own maintainer on the deployed build, hammering the
-        # port continuously across a `kill -9` of its holder:
-        #
-        #     refused=32   accepted-then-silent=0   served=159
-        #
-        # It comes back in ~1s under a new pid, and it REFUSES for that whole
-        # second rather than accepting and going quiet — the successor binds
-        # only when it is ready to relay. A refused dial costs this walk
-        # nothing, so waiting out that second is nearly free.
+        # A HOP THAT IS RESTARTING IS NOT A HOP THAT IS GONE. A refused dial
+        # costs this walk nothing, so waiting out that second is nearly free.
         #
         # WHY WAIT AT ALL, when there is already a DIRECT fallback: on the
-        # machine this outage happened to, DIRECT is the corporate
-        # TLS-inspecting proxy. Falling through to it saves one second and
-        # sends the request through an inspector for as long as the hop is
-        # away. Holding briefly keeps the chain the user configured.
+        # machine this outage happened to, DIRECT is the corporate TLS-
+        # inspecting proxy. Falling through to it saves one second and sends
+        # the request through an inspector for as long as the hop is away.
+        # Holding briefly keeps the chain the user configured. BOUNDED, and
+        # small. It is not a retry ladder — the hop's own restart is already
+        # bounded (its maintainer killed the holder three times in a row:
+        # process count unchanged, one replacement per death, no accumulation),
+        # so a ladder here would only add a busy loop neither side intended.
         #
-        # BOUNDED, and small. The window measured is ~1s; this allows a little
-        # over twice that and then falls through exactly as before. It is not
-        # a retry ladder — the hop's own restart is already bounded (its
-        # maintainer killed the holder three times in a row: process count
-        # unchanged, one replacement per death, no accumulation), so a ladder
-        # here would only add a busy loop neither side intended.
         # NOTHING TO WAIT FOR IF THERE IS NO HOP. The grace exists for a hop
         # that is RESTARTING; an empty candidate list means this host has no
         # chain at all, and `_walk_chain_once` returns None instantly forever.
-        # Entering the loop anyway cost 2.60s on EVERY upstream dial —
-        # measured, so every new MITM connection and every bridge-sweep call —
-        # on exactly the machines where the direct dial is the normal path.
-        #
-        # The constant's comment already claimed this ("a host with no chain
-        # at all never enters this loop"); the code did not implement it, and
-        # the comment was the half being believed.
+        # The constant's comment already claimed this ("a host with no chain at
+        # all never enters this loop"); the code did not implement it, and the
+        # comment was the half being believed.
         candidates = self._chain_candidates()
         if candidates:
             deadline = time.monotonic() + _CHAIN_HEAL_GRACE_S
@@ -13727,14 +12617,13 @@ class PinProxy:
                 "configured proxy chain"
             )
         else:
-            # DEGRADED IS STILL A FAULT, and until now it was the only one
-            # with no tense a later probe could read. `direct_last` exists
-            # because a chain flaps back within seconds and every probe after
-            # that reads green; a fall-through to a later hop does exactly the
-            # same and was left out only because the sticky record was built
-            # for DIRECT and never generalised. Measured on host-a:
-            # 9901 died at 06:18:09Z, 8118 carried, 9901 was back at 06:18:10Z.
-            # One second, and afterwards nothing on the box said it happened.
+            # DEGRADED IS STILL A FAULT, and until now it was the only one with
+            # no tense a later probe could read. `direct_last` exists because a
+            # chain flaps back within seconds and every probe after that reads
+            # green; a fall-through to a later hop does exactly the same and
+            # was left out only because the sticky record was built for DIRECT
+            # and never generalised. One second, and afterwards nothing on the
+            # box said it happened.
             if not preferred:
                 self._hop_degraded_last = time.time()
             where = f"{hop[0]}:{hop[1]}" if hop else "the proxy chain"
@@ -13781,13 +12670,9 @@ class PinProxy:
         # matters most.
         if not nxt or nxt == _read_upstream(self._certdir, "next"):
             return
-        # A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP. `_probe_next_hop`
-        # guards a hop naming ITSELF; this is the other direction, and it is
-        # what a peer measured on this box: a cache proxy launched from a
-        # shell that already exported the chain adopted the PIN as its
-        # upstream, so the path became 9901 -> 36301 -> 9901 and never reached
-        # privoxy. A looped proxy neither answers nor exits — it appears here
-        # as "accepted but did not tunnel: no reply".
+        # A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP. A looped proxy neither
+        # answers nor exits — it appears here as "accepted but did not tunnel:
+        # no reply".
         if self._is_me(nxt):
             _log_lifecycle(
                 f"{recorded} names this daemon as its upstream — refusing to "
@@ -13908,20 +12793,14 @@ class PinProxy:
         self._tunnel_trace(
             f"CONNECT {target} tunnelled (no pin: bearer never seen)")
         up = None
-        # EVERY HOP, not just the first. This path used to read one hop and
-        # fall straight to a direct dial, so the fall-through the MITM path
-        # walks did not exist here — on the path where a missed hop is least
-        # visible. Remote Control RECEIVES over a WebSocket to the ingress
-        # host the /bridge response names, which is not api.anthropic.com and
-        # therefore lands here: with the hop missed, the session keeps
-        # heartbeating and posting through the MITM at 200 while nothing sent
-        # from claude.ai arrives.
-        #
-        # Try each hop, but never let the chain be the only answer. A
-        # filtering proxy (per-domain forwards, a corporate MITM) may refuse
-        # the ingress host outright, and closing here made that refusal
-        # invisible. Measured where the same session on a machine whose chain
-        # let the host through received normally.
+        # EVERY HOP, not just the first. Remote Control RECEIVES over a
+        # WebSocket to the ingress host the /bridge response names, which is
+        # not api.anthropic.com and therefore lands here: with the hop missed,
+        # the session keeps heartbeating and posting through the MITM at 200
+        # while nothing sent from claude.ai arrives. Try each hop, but never
+        # let the chain be the only answer. A filtering proxy (per-domain
+        # forwards, a corporate MITM) may refuse the ingress host outright, and
+        # closing here made that refusal invisible.
         for chain in self._chain_candidates():
             try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
@@ -13949,11 +12828,9 @@ class PinProxy:
                 continue
             break
         if up is not None and (carrying := self._tunnel_is_open(up)) is None:
-            # A 200 is not proof the chain reached the host. a filtering proxy answers
-            # CONNECT optimistically and only then dials; when that dial fails
-            # it closes, so the tunnel is EOF the instant we look. Measured on
-            # against a remote-control ingress: "200 Connection established"
-            # followed by UNEXPECTED_EOF_WHILE_READING on the first TLS byte.
+            # A 200 is not proof the chain reached the host. a filtering proxy
+            # answers CONNECT optimistically and only then dials; when that
+            # dial fails it closes, so the tunnel is EOF the instant we look.
             # Trusting the status alone made Remote Control silently deaf —
             # everything Claude Code SENDS still went through the MITM path at
             # 200 while the receive channel was a dead socket.
@@ -13983,15 +12860,10 @@ class PinProxy:
         #
         # THE FIX LANDED ON THE OTHER PATH. `_mitm` clears the debt at its 101
         # handover, and that is where I put it. But this function's own
-        # docstring says where RC actually goes:
-        # "Remote Control receives over a WebSocket to the ingress host the
-        # /bridge response names — NOT api.anthropic.com — so it lands here,
-        # not in the MITM." The premise was written down twelve lines up from
-        # the code that needed it.
-        #
-        # Measured on host-a 2026-08-18: 0.1.93, 0.1.94 and 0.1.96 all produced
-        # `cut N in-flight request(s) after 30s` on departure — identical
-        # signature across three versions, because none of them cleared this.
+        # docstring says where RC actually goes: "Remote Control receives over
+        # a WebSocket to the ingress host the /bridge response names — NOT
+        # api.anthropic.com — so it lands here, not in the MITM." The premise
+        # was written down twelve lines up from the code that needed it.
         _c = getattr(self._local, "conn", None) or conn
         self._owe_answer(_c, False)
         release = getattr(self._local, "release", None)
@@ -14212,10 +13084,7 @@ class _Prefixed:
 
 # The SSE events that are KEEPALIVE rather than answer. Named, not sized: a
 # keepalive is a keepalive because the protocol calls it one, and no threshold,
-# rate or frame width has to be guessed. Measured on host-a 2026-08-18 — twelve
-# connections delivered nothing but a fixed 39-byte frame for thirty minutes
-# while reporting `mid-response`, because a keepalive is bytes and bytes read as
-# movement.
+# rate or frame width has to be guessed.
 #
 # FAILS SAFE BY CONSTRUCTION: the test is "is EVERY event in this chunk a
 # keepalive", so an event name we do not know counts as CONTENT and the drain
@@ -14275,13 +13144,8 @@ class _StampingWriter:
         # that gap matters — the drain would see the connection as stale for
         # the whole time it was busy delivering to it.
         #
-        # AND HOW MUCH, not only that something moved. A keepalive is bytes,
-        # so a timestamp alone cannot tell a live stream from one that stopped
-        # half an hour ago and is only being kept warm — measured on host-a
-        # 2026-08-18, twelve connections reported `mid-response` while every
-        # one of them had delivered nothing but a fixed 39-byte frame for
-        # thirty minutes. This count is what makes that distinction possible;
-        # nothing decides on it yet.
+        # AND HOW MUCH, not only that something moved. This count is what makes
+        # that distinction possible; nothing decides on it yet.
         self._note(len(data), not _is_only_keepalive(data))
         return self._sock.sendall(data)
 
@@ -14409,10 +13273,6 @@ def _relay_response(
         # A DEPARTING DAEMON STOPS TAKING NEW WORK, and until this line it did
         # not. `release_listener` stops accepting new CONNECTIONS; nothing
         # stopped accepting new REQUESTS on the keep-alives it already holds.
-        # So a predecessor shed arrivals and kept answering the mail
-        # indefinitely, and from the client's side nothing was wrong with the
-        # socket — measured on host-a 2026-08-18, eleven sessions whose ONLY
-        # path was a process that had stopped being the front door.
         #
         # NOTHING IS CUT. This reply completes normally; the header only says
         # "do not send me another". The client then opens a fresh connection,
