@@ -2846,6 +2846,25 @@ def replay_lost_turns(bridge: str, oauth_token: "str | None") -> None:
 
     Never raises: this runs on the request path in front of a live client.
     """
+    # OFF. Turned off in 0.1.170 after it did real damage to a live
+    # conversation, and it stays off until the two defects below are fixed and
+    # tested rather than reasoned about.
+    #
+    # NO TIME WINDOW. `queued_texts` reads the WHOLE transcript, so the first
+    # time it worked it replayed every queued turn this session had ever taken
+    # -- weeks-old design discussion -- into the user's live claude.ai view.
+    # `_REPLAY_MIN_AGE_S` is a floor and there was no ceiling.
+    #
+    # AND A TIMESTAMP OF NOW. Each replay was stamped with the current time
+    # rather than the turn's own, so those old messages did not merely appear,
+    # they appeared as if the user had just typed them. The user saw four and
+    # asked what was happening to their session.
+    #
+    # The idea is still right: the text exists nowhere but the queue record,
+    # and without a replay it never reaches claude.ai. What was wrong is that
+    # a repair which WRITES to a live conversation shipped with no bound on
+    # what it would write, and I did not think about it until it worked.
+    return
     if not oauth_token:
         return
     auth = worker_auth(bridge)
@@ -2905,7 +2924,8 @@ def replay_lost_turns(bridge: str, oauth_token: "str | None") -> None:
 #: only in the daemon's memory. Four candidates and a log line naming the
 #: winner converges in one release; when the winner is known this collapses to
 #: it alone.
-def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
+def _turn_envelopes(bridge: str, text: str,
+                    epoch_override: "object" = None) -> "list[dict]":
     # NO `isSynthetic`, and the server said so itself:
     #   400 invalid_request_error "isSynthetic: Extra inputs are not permitted"
     # It appears on every STORED worker event, which is where I copied it from
@@ -2930,7 +2950,8 @@ def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
     # server enumerate what it WILL take. Asking the receiver beats another
     # round of guessing, and this file has already paid twice for inferring a
     # contract instead of asking for it.
-    epoch = _WORKER_EPOCH.get(bridge)
+    epoch = epoch_override if epoch_override is not None \
+        else _WORKER_EPOCH.get(bridge)
     # `worker_epoch` IS REQUIRED, read out of 2.1.238's own client:
     #     this.request("post","/worker/events",
     #                  {worker_epoch:this.workerEpoch, events:c}, …)
@@ -2971,11 +2992,19 @@ def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
     ]
 
 
-def _post_one_turn(bridge: str, auth: str, text: str) -> "tuple[bool, str]":
+def _post_one_turn(bridge: str, auth: str, text: str,
+                   epoch_override: "object" = None) -> "tuple[bool, str]":
     """`(True, which)` on the first envelope the server accepts, else the last
-    refusal WITH ITS BODY -- the status alone cannot say which field is wrong."""
+    refusal WITH ITS BODY -- the status alone cannot say which field is wrong.
+
+    A 409 `epoch_conflict` is answered rather than reported: the body carries
+    `expected_epoch`, so the one value that could not be guessed is handed over
+    by the server itself. Retried ONCE, because a second conflict means the
+    epoch moved again under a live worker and this replay has lost the race --
+    which is the server's guard working, not something to hammer.
+    """
     last = "no envelope attempted"
-    for i, payload in enumerate(_turn_envelopes(bridge, text)):
+    for i, payload in enumerate(_turn_envelopes(bridge, text, epoch_override)):
         try:
             req = urllib.request.Request(
                 f"https://api.anthropic.com/v1/code/sessions/{bridge}/worker/events",
@@ -2993,6 +3022,24 @@ def _post_one_turn(bridge: str, auth: str, text: str) -> "tuple[bool, str]":
                 detail = exc.read().decode(errors="replace")[:200]
             except Exception:  # noqa: BLE001
                 detail = "(body unreadable)"
+            # A 409 IS AN ANSWER, NOT A REFUSAL TO REPORT. It means the body
+            # was accepted and only the epoch is stale, and the body names the
+            # value: `{"expected_epoch":"11", "actual_epoch":"0", ...}`. Take
+            # it and retry once.
+            if exc.code == 409 and epoch_override is None:
+                want = None
+                try:
+                    want = (json.loads(detail).get("error") or {}).get(
+                        "expected_epoch")
+                except Exception:  # noqa: BLE001
+                    want = None
+                if want is not None:
+                    try:
+                        want = int(want)
+                    except (TypeError, ValueError):
+                        pass
+                    _WORKER_EPOCH[bridge] = want
+                    return _post_one_turn(bridge, auth, text, epoch_override=want)
             # EVERY refusal, not just the last. Only envelope 3's was logged
             # before, so the other three were refused for reasons nobody saw --
             # and if they differ, that difference is the next clue.
