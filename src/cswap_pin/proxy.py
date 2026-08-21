@@ -2898,9 +2898,33 @@ def is_pinned_route(path: str) -> bool:
     # The file belongs to the pinned account, so it must be asked for as the
     # pin. Safe as a PREFIX because it only READS — it mints and creates
     # nothing. Not `/api/oauth/`: that would sweep in `token`.
+    # AND THE BARE COLLECTION, which the trailing slash above kept out. That
+    # exclusion was a side effect of writing the lifecycle prefix, not a
+    # decision: nothing here ever said the list should answer as the active
+    # account, and answering that way is what breaks cross-session messaging.
+    #
+    # `GET /v1/sessions` is how Claude Code enumerates your sessions on other
+    # machines -- the listing behind ListAgents and SendMessage. Traced live
+    # while calling ListAgents on this host:
+    #
+    #     GET /v1/sessions pinned=False swapped=False  ->  200 OK
+    #
+    # so it asked the ACTIVE account, which owns none of the Remote Control
+    # sessions, and the peer list came back without them. The docs give one
+    # condition for a remote session to appear -- both ends running with
+    # Remote Control -- and say nothing about accounts, so a pin that leaves
+    # this route unswapped is the thing standing between the two.
+    #
+    # A READ, like `/api/oauth/files/`: listing creates nothing and mints
+    # nothing, so there is no ownership to get wrong. `== "/v1/sessions"` and
+    # a query-string form only -- never a prefix, because `/v1/sessions/`
+    # already has its own row above and a prefix here would say the same
+    # thing twice.
     return (
         path.startswith("/v1/code/sessions")
         or path.startswith("/v1/sessions/")
+        or path == "/v1/sessions"
+        or path.startswith("/v1/sessions?")
         or path.startswith("/api/frame/")
         or path.startswith("/v1/ultrareview/")
         or path.startswith("/api/oauth/files/")
