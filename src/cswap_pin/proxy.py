@@ -2939,13 +2939,29 @@ def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
     # ever agreeing what an event should look like. The value is a counter in
     # the CLI's memory, so it is captured off a real POST rather than invented.
     top = {"worker_epoch": epoch} if epoch is not None else {}
+    # `EVENT_TYPE_USER` FIRST, and the evidence is in the stored record itself:
+    # beside `event_type` sits
+    #     "device_attestation_status": "DEVICE_ATTESTATION_STATUS_UNSPECIFIED"
+    # which is the proto enum convention — SCREAMING_SNAKE prefixed with the
+    # enum's own type name. A proto JSON parser answers an UNKNOWN enum string
+    # by reporting the field as missing, which is exactly the reply four
+    # structurally different envelopes all got, including one carrying no
+    # `event_type` at all. So the stored `"user"` is how the value is RENDERED,
+    # not how it is accepted.
+    #
+    # DEMOTED, because the binary does not support it: `EVENT_TYPE_` appears
+    # nowhere in 2.1.238, while six other `*_UNSPECIFIED` enum names and the
+    # prefix constant `"DEVICE_ATTESTATION_STATUS_"` do. So the convention is
+    # real in this API and the client does not spell EVENT_TYPE that way. The
+    # stored `"user"` leads; the enum form stays as a cheap second arm rather
+    # than as a belief.
     return [
         {**top, "events": [{"event_type": "user", "payload": body}]},
+        {**top, "events": [{"event_type": "EVENT_TYPE_USER", "payload": body}]},
         {**top, "events": [{"event_type": "__enumerate__", "payload": body}]},
         {**top, "events": [{"event_type": "user", "message": body["message"],
                             "session_id": bridge,
                             "timestamp": body["timestamp"]}]},
-        {**top, "events": [body]},
     ]
 
 
