@@ -20,7 +20,6 @@ import base64
 import contextlib
 import datetime as _dt
 import glob
-import hashlib
 import itertools
 import json
 import os
@@ -1317,9 +1316,10 @@ def _trust_file(ca_path: Path, existing: str | None) -> Path:
             # called a bundle usable that node reads as ZERO extra CAs. Believe
             # that and the session trusts nothing — not our CA, not a sibling
             # proxy's, not the corporate roots — so every request fails to
-            # verify the proxy it is routed through. None from the oracle is NOT "unusable": it
-            # means the probe never ran (no node on PATH, which is normal here
-            # — cswap is Python). Answering "unusable" there would drop a
+            # verify the proxy it is routed through. None from the oracle is
+            # NOT "unusable": it means the probe never ran (no node on PATH,
+            # which is normal here — cswap is Python). Answering "unusable"
+            # there would drop a
             # healthy machine to its own CA and take every corporate root with
             # it, which is the exact damage this is meant to prevent. So fall
             # back to the predicate, which is the only judge left, and say
@@ -2455,48 +2455,6 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
 
-def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
-                     body: "bytes | None" = None) -> None:
-    """Record a SHA of each user text leaving in a `/worker/events` POST.
-
-    NEVER THE TEXT, and never the credential. The hash answers one question
-    nothing else can -- was a turn the CLI took ever sent -- because the text
-    exists in no other request. Twelve hex digits match a queue record and
-    carry nothing back.
-
-    The authorization header used to be captured here too, for a replay that
-    posted on the session's behalf. That replay is gone, so holding another
-    party's JWT in this process buys nothing and is not done.
-    """
-    if not _WORKER_SUBTREE.search(path):
-        return
-    if not _BRIDGE_ID.match(path):
-        return
-    if not body or "/worker/events" not in path:
-        return
-    try:
-        doc = json.loads(body.decode(errors="replace"))
-    except Exception:  # noqa: BLE001
-        return
-    if not isinstance(doc, dict):
-        return
-    events = doc.get("events")
-    if isinstance(events, list):
-        marks = []
-        for ev in events:
-            if not isinstance(ev, dict):
-                continue
-            msg = ((ev.get("payload") or {}).get("message") or {})
-            if msg.get("role") != "user":
-                continue
-            c = msg.get("content")
-            txt = c if isinstance(c, str) else " ".join(
-                b.get("text") or "" for b in (c or []) if isinstance(b, dict))
-            if txt.strip():
-                marks.append(hashlib.sha256(
-                    txt.strip()[:40].encode()).hexdigest()[:12])
-        if marks:
-            _log_lifecycle(f"worker events POST carried user text {marks}")
 
 
 # How rarely presence may trigger a superseded-bridge sweep. Presence is posted
@@ -11889,7 +11847,6 @@ class PinProxy:
 
         # BEFORE ANY BEARER GATE. The worker credential is only ever visible in
         # flight, and this is the one place it passes through.
-        note_worker_auth(path, headers, body)
 
         pinned = is_pinned_route(path)
         # TWO CLOCKS, because the total alone cannot say who was slow — see

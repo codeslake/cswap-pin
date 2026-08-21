@@ -22,7 +22,6 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from cswap_pin.proxy import (
     ensure_ca,
     is_pinned_route,
-    note_worker_auth,
     parse_upstream_proxy,
 )
 
@@ -2378,6 +2377,18 @@ class TestIsPinnedRoute:
             # neighbour that must still NOT match.
             ("/v1/sessionsXYZ", False,
              "the exact-match row must not become a prefix"),
+            # THE SAME GUARD FOR THE `/v1/code/` SPELLING, which was the last
+            # unbounded prefix in the table -- `/v1/code/sessionsXYZ` and
+            # `/v1/code/sessions_archive` were both pinned, while its sibling
+            # two lines up already carried this row. A fix nothing tests has a
+            # one-release half-life: collapse the three-way OR back to one
+            # `startswith` and the suite stays green.
+            ("/v1/code/sessionsXYZ", False,
+             "the prefix must stop at the path boundary"),
+            ("/v1/code/sessions_archive", False,
+             "and must not sweep in a neighbour that merely starts the same"),
+            ("/v1/code/sessions/cse_1/bridge", True,
+             "CONTROL: the boundary must not break what lives UNDER it"),
             # THE NEIGHBOUR THAT MUST NOT BE SWEPT IN, and the reason the new
             # rule is an exact match rather than a `/api/oauth/` prefix.
             # Validation ASKS about a token; refresh MINTS one. A refresh
