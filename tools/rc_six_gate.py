@@ -1716,22 +1716,52 @@ def check_outbound_text(port: int) -> None:
     # turn, so a comparison between them stays meaningful when neither is
     # moving. A turn that entered here and never appeared on the server is the
     # failure, and only the deficit can show it.
-    newest_posted = max((r.get("created_at") or "" for r in turns), default="")
-    inflight = [t for t in entered if not newest_posted or t > newest_posted[:19]]
-    deficit = len(entered) - len(turns)
-    if deficit > len(inflight):
-        lost = deficit - len(inflight)
+    # IN FLIGHT IS AN AGE, NOT AN ORDERING, and getting that wrong made this row
+    # structurally incapable of failing. The first cut forgave every entered turn
+    # newer than the newest posted one -- but a LOST turn is always newer than the
+    # last one that got through, so the forgiveness landed on exactly the
+    # population it was meant to judge. Measured while the user was telling me
+    # this row was wrong: four turns written to the transcript at 06:05:12,
+    # none of them on the server, all four forgiven, PASS.
+    #
+    # The real lag is seconds. The control, a turn taken while the session was
+    # idle: transcript 05:48:30, server 05:48:34. So a turn the transcript has
+    # held for two minutes with no partner is not in flight, it is gone.
+    # QUEUED ARRIVALS ARE THE SUBJECT, and they are judged by CONTENT rather than
+    # by time: the queue holds the text, so a lost one can be named instead of
+    # counted. Ordinary user rows stay in the population for the case where the
+    # queue path is not involved at all.
+    queued, _why_q = queued_arrivals(span[0][:19], span[-1][:19])
+    posted_ts = sorted((r.get("created_at") or "")[:19] for r in turns)
+    posted_text = "\n".join(
+        (lambda c: c if isinstance(c, str) else json.dumps(c, ensure_ascii=False))(
+            ((r.get("payload") or {}).get("message") or {}).get("content"))
+        for r in turns)
+    lost = []
+    for t in entered:
+        if any(abs(_epoch(s) - _epoch(t)) <= 120 for s in posted_ts):
+            continue
+        if _line_age_min(f"[{t}Z]") is not None and _line_age_min(f"[{t}Z]") <= 2.0:
+            continue          # genuinely still in flight
+        lost.append(t)
+    for ts, text in queued:
+        if _line_age_min(f"[{ts}Z]") is not None and _line_age_min(f"[{ts}Z]") <= 2.0:
+            continue
+        probe = text.strip()[:40]
+        if probe and probe not in posted_text:
+            lost.append(ts)
+    if lost:
         row("8 CLI→ai텍스트", "FAIL",
-            f"{len(entered)} turn(s) entered this CLI in the window and only "
-            f"{len(turns)} reached the server — {lost} went missing with later "
-            f"turns getting through, so this is loss rather than lag. Assistant "
-            f"text is current ({age:.0f} min), which is why a row watching only "
-            "that side called this healthy")
+            f"{len(lost)} of {len(entered) + len(queued)} turn(s) that entered this CLI never "
+            f"reached the server (oldest {lost[0]}, newest {lost[-1]}) — the "
+            f"transcript holds them and the server does not, while assistant "
+            f"text is current ({age:.0f} min). A turn taken when the session is "
+            "idle posts within seconds; these were taken while a turn was "
+            "running and were never posted at all")
         return
     row("8 CLI→ai텍스트", "PASS",
         f"every turn that entered this CLI reached the server: {len(entered)} in, "
         f"{len(turns)} posted (source=worker)"
-        + (f", {len(inflight)} still in the running turn" if inflight else "")
         + f"; assistant output is current too ({len(texts)} text event(s), "
         f"newest{_as_of(age)}). The server's own copy, not our transcript. What "
         "it does NOT cover: whether the browser drew them — no field on the "
@@ -1948,6 +1978,48 @@ def _user_records(path: str, lo: str, hi: str) -> list:
                 continue
             out.append((ts, kinds, c))
     return out
+
+
+def queued_arrivals(lo: str, hi: str) -> "tuple[list, str]":
+    """`[(timestamp, text)]` for input that arrived while a turn was running.
+
+    THE ARM THAT MAKES REQUIREMENT 8 ABLE TO FAIL. Both of its previous arms read
+    `type: "user"` transcript rows, and input taken mid-turn is not one: it is
+    QUEUED, and the transcript records it as
+
+        {"type":"queue-operation","operation":"enqueue","content":"<the text>"}
+
+    with a `dequeue` when the turn swallows it. So the local arm went blind on
+    exactly the population the row exists to judge, the server arm never saw it
+    either, and a comparison of two readers with the same blind spot returned
+    zero every time. Measured: four messages the user typed, all four absent from
+    both arms while sitting in this session's context, verdict PASS.
+
+    The record carries the full text, which is what makes a fix possible at all --
+    nothing in any HTTP request contains it, so it could not have been recovered
+    from the wire.
+    """
+    path, why = _transcript_path()
+    if why:
+        return [], why
+    out = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if '"queue-operation"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("operation") != "enqueue":
+                continue
+            ts = (rec.get("timestamp") or "")[:19]
+            if not (lo <= ts <= hi):
+                continue
+            text = rec.get("content")
+            if isinstance(text, str) and text.strip():
+                out.append((ts, text))
+    return out, ""
 
 
 def _cli_entered_turns(lo: str, hi: str, client: list) -> "tuple[list, str]":
