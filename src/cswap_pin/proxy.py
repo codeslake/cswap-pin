@@ -2650,7 +2650,7 @@ def _connect_ok(status: "str | None") -> bool:
 _UPSTREAM_FILE = "upstream.json"
 
 # Registration of THIS client, not ownership of the session.
-_PRESENCE = re.compile(r"^/v1/(code/)?sessions/[^/]+/client/presence(/|$|\\?)")
+_PRESENCE = re.compile(r"^/v1/(code/)?sessions/[^/]+/client/presence(/|$|\?)")
 
 _WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
 # THE ONE REQUEST THAT NEVER COMPLETES. Remote Control's inbound channel is a
@@ -11284,16 +11284,24 @@ class PinProxy:
              create CANNOT: an older bridge ARCHIVED after the newer one
              already opened. Archiving is server-side and later, so nothing on
              the create path can ever see it.
+          3. worker traffic — the same session posting events or a heartbeat.
+             Same job as case 2, and the one that actually arrives. Presence
+             does NOT recur: measured over a live window of 2132 requests
+             across 13 attached sessions, this route saw 26 worker posts in
+             its first 45 seconds and ZERO presence posts in the whole window,
+             so case 2 alone left the deaf-bridge verdict only ever as fresh
+             as the last create. A fleet that starts no session never re-asked
+             at all.
 
-        Rate-limited, and only case 2 needs it: presence recurs, a create does
-        not. Still not a timer — a machine with no attached session posts no
-        presence and this never fires.
+        Rate-limited, and only cases 2 and 3 need it: a create does not recur.
+        Still not a timer — a machine with no attached session posts neither,
+        and this never fires.
         """
         if method != "POST":
             return False
         if path == "/v1/code/sessions":
             return True
-        if not _PRESENCE.search(path):
+        if not (_PRESENCE.search(path) or _WORKER_SUBTREE.search(path)):
             return False
         stamp = time.monotonic() if now is None else now
         last = getattr(self, "_last_bridge_sweep", None)
