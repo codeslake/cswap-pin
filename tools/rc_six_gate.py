@@ -2022,6 +2022,34 @@ def queued_arrivals(lo: str, hi: str) -> "tuple[list, str]":
     return out, ""
 
 
+def queued_command_count(lo: str, hi: str) -> int:
+    """How many queued arrivals of ANY kind the reader can see in the window.
+
+    THE CONTROL FOR THE IMAGE ARM. Requirement 9's row used to claim both arms
+    were live while quoting the server's inbound image count -- which was ZERO,
+    and a zero cannot demonstrate that a reader works. This one can: if the
+    reader finds queued arrivals and none of them carries an image, the absence
+    of images is a measurement. If it finds none at all, it has proved nothing.
+    """
+    path, why = _transcript_path()
+    if why:
+        return 0
+    n = 0
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if '"queued_command"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if (rec.get("attachment") or {}).get("type") != "queued_command":
+                continue
+            if lo <= (rec.get("timestamp") or "")[:19] <= hi:
+                n += 1
+    return n
+
+
 def queued_images(lo: str, hi: str) -> "tuple[list, str]":
     """Timestamps of images PASTED into the CLI while a turn was running.
 
@@ -2224,12 +2252,20 @@ def check_outbound_image(port: int) -> None:
             "was pasted and lost")
         return
     if not pasted:
-        row("9 CLI→ai이미지", "PASS",
+        # THE CONTROL IS THE QUEUED-ARRIVAL COUNT, not the server's inbound
+        # images. This row used to cite the latter and once cited it at ZERO,
+        # which demonstrates nothing about whether the reader can see anything.
+        seen = queued_command_count(span[0][:19], span[-1][:19])
+        verdict, note = ("PASS", f"the reader saw {seen} queued arrival(s) in "
+                         "the window and no image among them, so this is a "
+                         "measurement rather than a blind spot") if seen else (
+            "UNPROVEN", "and the reader saw NO queued arrival of any kind, so "
+            "it cannot tell an empty window from a reader that finds nothing")
+        row("9 CLI→ai이미지", verdict,
             f"no image entered this CLI in the window — nothing was sent to "
-            f"observe, which is not a fault. The instrument is live on both "
-            f"arms: the server shows {len(inbound)} image(s) arriving FROM "
-            f"claude.ai over the same window, and the transcript reader pairs "
-            "every one of them, so a CLI paste would have stood out unpaired")
+            f"observe, which is not a fault. {note}. The server holds "
+            f"{len(inbound)} image(s) arriving FROM claude.ai over the same "
+            "window, which is context and not the control")
         return
     if not posted:
         row("9 CLI→ai이미지", "FAIL",
