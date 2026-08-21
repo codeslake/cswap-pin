@@ -2456,7 +2456,6 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
 
 
-
 # How rarely presence may trigger a superseded-bridge sweep. Presence is posted
 # by every attached session on the server's poll interval, so without a floor
 # this would list the account several times a second on a busy machine. Ten
@@ -2591,7 +2590,7 @@ def is_pinned_route(path: str) -> bool:
     unarchive`` (measured). It MUST swap too: if unarchive keeps the disk
     bearer while the bridge is swapped, the session's ownership splits and the
     reconnect resolves on the disk account, so the pinned account never sees
-    it. The trailing ``/`` keeps a bare ``/v1/sessions`` list out.
+    it. The trailing ``/`` is the boundary; the bare ``/v1/sessions`` list has its own row below.
 
     **The ``/worker`` subtree is deliberately excluded.** Those calls do not
     carry the OAuth token at all: the worker authenticates with a session JWT
@@ -2696,7 +2695,6 @@ def is_pinned_route(path: str) -> bool:
     return (
         path == "/v1/code/sessions"
         or path.startswith("/v1/code/sessions/")
-        or path.startswith("/v1/code/sessions?")
         or path.startswith("/v1/sessions/")
         or path == "/v1/sessions"
         or path.startswith("/v1/sessions?")
@@ -11844,9 +11842,6 @@ class PinProxy:
                 k, v = h.split(":", 1)
                 headers.append((k.strip(), v.strip()))
         body = _read_body(tls, headers)
-
-        # BEFORE ANY BEARER GATE. The worker credential is only ever visible in
-        # flight, and this is the one place it passes through.
 
         pinned = is_pinned_route(path)
         # TWO CLOCKS, because the total alone cannot say who was slow — see
