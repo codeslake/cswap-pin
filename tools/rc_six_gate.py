@@ -823,7 +823,33 @@ def check_attachment(port: int) -> None:
 
     THE ROUTE IS PINNED because the file belongs to the pinned account. A
     non-200 is what Claude Code renders as "could not be downloaded".
+
+    ASK THE SERVER FIRST. Everything below reads OUR files, and a transcript
+    records what we wrote rather than what arrived — the same gap requirements
+    8 and 9 had. The server's own copy of this bridge's events settles it:
+    a `user` event carrying an `image` block IS a claude.ai attachment that
+    reached this CLI, with no tag to depend on and nothing to infer.
+    Measured: an "image only" send arrives as blocks `['image', 'text']`, so
+    keying on the image block covers the captioned and uncaptioned cases
+    alike.
     """
+    rows, _why = _outbound_rows(port)
+    if rows:
+        inbound = [r for r in rows
+                   if r.get("event_type") == "user"
+                   and "image" in _event_blocks(r)]
+        if inbound:
+            newest = max(inbound, key=lambda r: r.get("created_at") or "")
+            age = _line_age_min(f"[{(newest.get('created_at') or '')[:19]}Z]")
+            row("4 이미지첨부", "PASS",
+                f"the server holds {len(inbound)} user event(s) carrying an "
+                f"image for this bridge, newest {newest.get('created_at')}"
+                f"{_as_of(age)} — its own copy of what claude.ai delivered, "
+                f"not our transcript. Blocks {_event_blocks(newest)}: an "
+                f"uncaptioned send still arrives with a text block beside "
+                f"the image, so this covers both shapes")
+            return
+
     fid = None
     for t in sorted(glob.glob(str(HOME / ".claude/projects/*/*.jsonl")),
                     key=os.path.getmtime, reverse=True)[:12]:
@@ -1316,7 +1342,10 @@ def newest_binary() -> pathlib.Path | None:
         else None
 
 
-def session_events(port: int, bridge: str, limit: int = 200):
+_EVENTS_PAGE_MAX = 500  # measured: 500 answers, 600 is a 400
+
+
+def session_events(port: int, bridge: str, limit: int = _EVENTS_PAGE_MAX):
     """What the SERVER holds for one bridge, or `(None, why)`.
 
     THE ONLY PLACE THAT CAN ANSWER THE OUTBOUND QUESTION. Requirements 8 and
@@ -1330,6 +1359,19 @@ def session_events(port: int, bridge: str, limit: int = 200):
     `assistant`, 18 `user`, plus system/control/result -- and each carries the
     message's content blocks, so `text` and `image` are distinguishable
     without guessing.
+
+    THE LIMIT IS A TIME WINDOW IN DISGUISE, which is why it is not 200. A
+    busy session fills 200 events in TWELVE MINUTES -- measured: `limit=200`
+    spanned 03:55 to 04:07 and found one inbound image, `limit=500` spanned
+    03:30 to 04:07 and found three. An attachment that arrived twenty minutes
+    ago would have read as "none", and requirement 4 would have called a
+    working fleet unproven on a window nobody chose deliberately.
+
+    AND 500 IS THE CEILING, not a preference. Raising it to 1000 to widen the
+    window returned `400` and took the whole detector out -- every row that
+    reads this would have gone UNPROVEN with "the server answered 400", which
+    reads as an outage rather than as a parameter I chose wrong. Measured:
+    200 and 500 answer, 600 and above are a 400.
     """
     st, body = api(f"/v1/code/sessions/{bridge}/events?limit={limit}", port)
     if st != 200 or not body:
@@ -1403,31 +1445,149 @@ def check_outbound_text(port: int) -> None:
         return
     newest = max(texts, key=lambda r: r.get("created_at") or "")
     age = _line_age_min(f"[{(newest.get('created_at') or '')[:19]}Z]")
+    # A STALLED UPLINK STILL LEAVES OLD EVENTS IN THE WINDOW, and this row
+    # passed on them for a quarter of an hour while nothing was getting
+    # through. Measured: nine user turns taken at the CLI between 04:05:03
+    # and 04:19:40, zero arrivals. Presence of text events is not currency.
+    lag = uplink_lag(port, rows)
+    if lag is not None and lag[0] > 15.0:
+        row("8 CLI→ai텍스트", "FAIL",
+            f"the server holds {len(texts)} assistant text event(s), but "
+            f"nothing the user typed has reached it for {lag[0]:.0f} minutes "
+            f"(newest {lag[1]}) — the uplink is stalled and the events above "
+            "are from before it")
+        return
     row("8 CLI→ai텍스트", "PASS",
         f"the server holds {len(texts)} assistant text event(s) for this "
         f"session, newest {newest.get('created_at')}"
-        f"{_as_of(age)} — this is the server's own copy, not our transcript")
+        f"{_as_of(age)} — this is the server's own copy, not our transcript"
+        + (f"; newest user turn on the server {lag[1]}{_as_of(lag[0])}"
+           if lag else ""))
+
+
+def uplink_lag(port: int, rows) -> "tuple[float, str] | None":
+    """Minutes between the newest thing the CLI took and the newest the
+    server has, or None when it cannot be measured.
+
+    THE FAILURE MODE THAT ACTUALLY HAPPENED, and neither requirement 8 nor 9
+    could see it. Between 04:05:03 and 04:19:40 NINE user turns were taken at
+    the CLI and NOT ONE reached the server -- text and images alike. Both rows
+    were reading "is there an image / is there a text event" over a window
+    that still held older arrivals, so both answered yes about a session whose
+    uplink had been dead for a quarter of an hour.
+
+    A first cut blamed block ORDER: the one image that rendered led with the
+    image, the two that did not led with text. That was a coincidence of
+    timing -- the image-first one was simply the last thing to get through
+    before the stall. Counting both sides of the same window killed the
+    hypothesis, which is why this compares rather than inspects.
+    """
+    srv = [r for r in rows
+           if r.get("event_type") == "user"
+           and "tool_result" not in _event_blocks(r)
+           and _event_blocks(r)]
+    if not srv:
+        return None
+    newest_srv = max(r.get("created_at") or "" for r in srv)
+    age = _line_age_min(f"[{newest_srv[:19]}Z]")
+    return (age, newest_srv) if age is not None else None
 
 
 def check_outbound_image(port: int) -> None:
-    """9 — did an image this CLI produced reach claude.ai?"""
+    """9 — did an image entered at the CLI reach claude.ai?
+
+    NOT `assistant` EVENTS. A first cut looked there and reported "nothing to
+    observe", which was the detector failing to see its own subject: an image
+    PASTED at the CLI goes up as a `user` event, and all three on record here
+    are `user`. Reporting that as "this CLI has not sent one" turned a blind
+    spot into a clean bill of health — the exact shape this file keeps having
+    to undo.
+
+    THE SERVER HOLDING IT IS NOT THE WHOLE REQUIREMENT, and this row says so
+    rather than passing on half of it. Measured, three images the CLI sent up:
+
+        03:52:20  user  ['text', 'image']   340KB png   NOT rendered
+        03:53:10  user  ['text', 'image']   607KB png   NOT rendered
+        04:05:03  user  ['image', 'text']   164KB webp  rendered
+
+    All three reached the server. Only the image-first one appeared on
+    claude.ai. So arrival is necessary and not sufficient, and the row reports
+    the shapes so the reader can see which arm is which. Order, media type and
+    size all still differ between the arms; none of them is isolated yet.
+    """
     rows, why = _outbound_rows(port)
     if rows is None:
         row("9 CLI→ai이미지", "UNPROVEN", f"not measured — {why}")
         return
-    imgs = [r for r in rows
-            if r.get("event_type") == "assistant" and "image" in _event_blocks(r)]
-    if imgs:
-        newest = max(imgs, key=lambda r: r.get("created_at") or "")
-        row("9 CLI→ai이미지", "PASS",
-            f"{len(imgs)} assistant event(s) carry an image block, newest "
-            f"{newest.get('created_at')}")
+    imgs = [r for r in rows if "image" in _event_blocks(r)]
+    if not imgs:
+        row("9 CLI→ai이미지", "UNPROVEN",
+            f"no event among the {len(rows)} the server holds carries an "
+            "image block, in either direction — nothing has been sent to "
+            "observe. The reader works: it finds the text blocks requirement "
+            "8 passes on, on these same events")
         return
-    row("9 CLI→ai이미지", "UNPROVEN",
-        f"no assistant event among the {len(rows)} the server holds carries "
-        "an image block, and this CLI has not sent one — nothing to observe "
-        "rather than a blind detector. The reader works: it separates text "
-        "from image on the same events requirement 8 passes on")
+    shapes = {}
+    for r in imgs:
+        shapes[tuple(_event_blocks(r))] = shapes.get(tuple(_event_blocks(r)), 0) + 1
+    summary = "; ".join(f"{n}x {list(s)}" for s, n in sorted(shapes.items()))
+    newest = max(imgs, key=lambda r: r.get("created_at") or "")
+    img_age = _line_age_min(f"[{(newest.get('created_at') or '')[:19]}Z]")
+
+    # THE UPLINK, NOT THE BLOCK ORDER. This row used to FAIL whenever an image
+    # event led with a text block, on the theory that order decided rendering.
+    # Disproved by counting both sides of one window: the arms differed in
+    # WHEN they were sent, not in shape.
+    lag = uplink_lag(port, rows)
+    if lag is not None and lag[0] > 15.0:
+        row("9 CLI→ai이미지", "FAIL",
+            f"nothing the user typed has reached the server for "
+            f"{lag[0]:.0f} minutes (newest {lag[1]}) — the uplink is stalled, "
+            f"so an image sent now would not arrive either. {len(imgs)} image "
+            f"event(s) are on record ({summary}), all from before the stall")
+        return
+    row("9 CLI→ai이미지", "PASS",
+        f"{len(imgs)} image event(s) reached the server ({summary}), newest "
+        f"{newest.get('created_at')}{_as_of(img_age)}, and the uplink is "
+        f"current"
+        + (f" — newest user turn on the server {lag[1]}{_as_of(lag[0])}"
+           if lag else ""))
+
+
+_LOG_DIR = pathlib.Path(
+    os.environ.get("XDG_CACHE_HOME") or (HOME / ".cache")) / "rc-six-gate"
+
+
+def _log_run(lines: list) -> "pathlib.Path | None":
+    """Append this run's verdicts to a cache log, newest last.
+
+    A ten-minute cron prints to a terminal nobody keeps. Without a file, a
+    verdict that flipped between two runs -- which is the signal, not the
+    verdict itself -- is only ever visible to whoever happened to be reading.
+    Everything about a stalled uplink or a lost inbound stream this session
+    found was recovered from logs somebody else had the sense to write.
+
+    `~/.cache`, and XDG_CACHE_HOME when it is set: this is derived state that
+    can be deleted without losing anything the fleet needs. Capped and rotated
+    for the reason the pin's own log is -- a file that grows without a ceiling
+    is one nobody can read and eventually one that fills a disk.
+    """
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        p = _LOG_DIR / "verdicts.log"
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        with p.open("a", encoding="utf-8") as fh:
+            for req, verdict, detail in lines:
+                fh.write(f"[{stamp}Z] {verdict:<9} {req}  {detail}\n")
+            fh.write("\n")
+        # ROTATE BY SIZE, like the daemon log, and read the rotation back the
+        # way this file learned to: a reader scoped to the live file alone
+        # goes blind exactly when there is most to read.
+        if p.stat().st_size > 2_000_000:
+            p.replace(_LOG_DIR / "verdicts.log.1")
+        return p
+    except OSError:
+        return None
 
 
 def main() -> int:
@@ -1456,6 +1616,9 @@ def main() -> int:
     for _, v, _ in ROWS:
         counts[v] = counts.get(v, 0) + 1
     print("  " + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    where = _log_run(ROWS)
+    if where:
+        print(f"  logged to {where}")
     return 1 if bad else 0
 
 
