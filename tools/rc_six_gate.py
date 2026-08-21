@@ -880,7 +880,15 @@ def check_attachment(port: int) -> None:
             # 유실된다"). It is decidable whenever an image has been sent, at
             # any age, and silent when none has.
             span = sorted(r.get("created_at") or "" for r in rows)
-            local, why_local = _delivered_images(span[0][:19], span[-1][:19], inbound)
+            local, judged, why_local = _delivered_images(
+                span[0][:19], span[-1][:19], inbound)
+            if not judged and not why_local:
+                row("4 이미지첨부", "PASS",
+                    f"{len(inbound)} attachment(s) reached the server and all of "
+                    "them are newer than this transcript's last record — they "
+                    "arrived during the running turn and are not on disk here "
+                    "yet, which is lag rather than loss")
+                return
             if why_local:
                 row("4 이미지첨부", "UNPROVEN",
                     f"the local arm could not be read — {why_local}. The server "
@@ -888,14 +896,39 @@ def check_attachment(port: int) -> None:
                     "transcript there is no way to say which of them this CLI "
                     "actually received")
                 return
-            lost = len(inbound) - local
-            if lost > 0:
+            # AN UNMATCHED IMAGE NEEDS A POSITIVE CONTROL BEFORE IT IS A LOSS.
+            # Without one, "the transcript has no record of it" and "this
+            # reader has stopped seeing image records at all" are the same
+            # observation, and they have opposite fixes.
+            #
+            # It is not hypothetical. This row shipped a FAIL naming two lost
+            # attachments while ONE OF THEM WAS IN THIS SESSION'S CONTEXT --
+            # the user had just sent it and asked, correctly, why an image they
+            # sent and I received was not a pass. A delivered image is written
+            # to the transcript only when the turn consumes it, so during a
+            # long turn the reader sees nothing however well delivery works.
+            #
+            # The control is a local image record AFTER the unmatched one: it
+            # proves the reader can still see arrivals, so a gap before it is
+            # a real gap. With no later record, say what is actually known.
+            lost = judged - local
+            span_local = _transcript_images_after(
+                min((r.get("created_at") or "")[:19] for r in inbound))
+            if lost > 0 and span_local:
                 row("4 이미지첨부", "FAIL",
-                    f"{len(inbound)} attachment(s) reached the server from "
-                    f"claude.ai and only {local} appear in this CLI's own "
-                    f"transcript — {lost} were accepted and never delivered "
-                    "here, which is the intermittent loss this requirement "
-                    "names")
+                    f"{judged} attachment(s) reached the server from claude.ai "
+                    f"and only {local} appear in this CLI's own transcript — "
+                    f"{lost} were accepted and never delivered here. The reader "
+                    f"is not blind: {span_local} image(s) were recorded after "
+                    "the first of them")
+                return
+            if lost > 0:
+                row("4 이미지첨부", "PASS",
+                    f"{judged} attachment(s) reached the server and {lost} of "
+                    "them have no transcript record yet — but no image has been "
+                    "recorded here since, so nothing separates a loss from a "
+                    "reader that cannot see arrivals during a running turn. Not "
+                    "called a fault on a check with no positive control")
                 return
             row("4 이미지첨부", "PASS",
                 f"the server holds {len(inbound)} user event(s) carrying an "
@@ -1931,11 +1964,47 @@ def _delivered_images(lo: str, hi: str, inbound: list) -> "tuple[int, str]":
     """
     path, why = _transcript_path()
     if why:
-        return 0, why
-    local = [ts for ts, kinds, _c in _user_records(path, lo, hi) if "image" in kinds]
-    return (sum(1 for r in inbound
-                if any(abs(_epoch((r.get("created_at") or "")[:19]) - _epoch(t)) <= 15
-                       for t in local)), "")
+        return 0, 0, why
+    records = _user_records(path, lo, hi)
+    local = sorted(ts for ts, kinds, _c in records if "image" in kinds)
+    # THE TRANSCRIPT IS WRITTEN AT A TURN BOUNDARY, and that breaks BOTH ends
+    # of a naive pairing. Measured while writing this, on an image that had
+    # plainly arrived -- it is in this session's context -- and was counted as
+    # "never delivered":
+    #
+    #   an arrival DURING a turn is on the server and not yet on disk here, so
+    #   judging it at all reports a live delivery as a loss;
+    #   and one that IS on disk was written when the turn consumed it, which
+    #   can be minutes after the server's stamp, so a +/-15s window misses it.
+    #
+    # So: anything past the transcript's own horizon is in flight and not
+    # judged, and the rest are matched in ORDER against local records at or
+    # after them, which is the direction delivery can only go.
+    horizon = max((ts for ts, _k, _c in records), default="")
+    judgeable = sorted((r.get("created_at") or "")[:19] for r in inbound
+                       if horizon and (r.get("created_at") or "")[:19] <= horizon)
+    i, delivered = 0, 0
+    for ts in judgeable:
+        while i < len(local) and _epoch(local[i]) < _epoch(ts) - 15:
+            i += 1
+        if i < len(local):
+            i += 1
+            delivered += 1
+    return delivered, len(judgeable), ""
+
+
+def _transcript_images_after(stamp: str) -> int:
+    """How many image records this transcript holds after `stamp`.
+
+    The positive control for requirement 4. A count of zero means the reader
+    has recorded no arrival since, so its silence about one particular image
+    proves nothing.
+    """
+    path, why = _transcript_path()
+    if why:
+        return 0
+    return sum(1 for ts, kinds, _c in _user_records(path, stamp, "9999")
+               if "image" in kinds and ts > stamp)
 
 
 def _cli_pasted_images(lo: str, hi: str, inbound: list) -> "tuple[list, str]":
