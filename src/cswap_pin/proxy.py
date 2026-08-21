@@ -1640,10 +1640,14 @@ def heal(backup_root: Path, identity: dict | None = None) -> bool:
     # after a splice that claimed nothing to do is a config we cannot write.
     if identity and account_num:
         try:
+            # BOTH KEYS, like the splice's own no-op test. Comparing the
+            # account uuid alone calls a config healthy whose ORG has drifted,
+            # and Claude Code's pointer comparison uses both.
             wrote = splice_config_identity(identity)
             _now = _login_identity()
-            if not wrote and (not _now
-                              or _now[0] != identity.get("accountUuid")):
+            _want = tuple(identity.get(k) or None
+                          for k in ("accountUuid", "organizationUuid"))
+            if not wrote and (not _now or tuple(_now) != _want):
                 _log_lifecycle(
                     "could not re-assert the pin in the live config — "
                     "bridges minted before the next switch keep a pointer "
@@ -4141,12 +4145,19 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # Best-effort by design: the record is written and the proxy is serving by
     # the time we get here, so a config that cannot be written is a worse pin,
     # not a failed command — and raising would roll back a pin that works.
+    # THE VERDICT COMES FROM THE STATE. `splice_config_identity` swallows every
+    # real failure itself and answers False for both "could not write" and
+    # "already correct", so an `except` around it guards a case that cannot
+    # arrive -- a lock timeout, which this path can now hit, was silent here.
     try:
-        splice_config_identity(identity)
+        if not splice_config_identity(identity):
+            now = _login_identity()
+            if not now or now[0] != (identity or {}).get("accountUuid"):
+                _log_lifecycle("could not name the pin in the live config — "
+                               "bridges will be minted under the active "
+                               "account until the next switch")
     except Exception:  # noqa: BLE001 — the pin is already live
-        _log_lifecycle("could not name the pin in the live config — "
-                       "bridges will be minted under the active account "
-                       "until the next switch")
+        pass
     return ensure_proxy(switcher) is not None
 
 
@@ -4211,10 +4222,22 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
     # `organizationRole`), which CC restores, which re-arms the next one. The
     # host learned this on its own copy of this comparison and guards it the
     # same way.
+    # ONLY THE KEYS THE IDENTITY ACTUALLY ASSERTS. The host's synthesis fills
+    # a missing org with `or ""`, so comparing that empty string against a
+    # config Claude Code has filled in is never equal -- the rewrite fires and
+    # DOWNGRADES a real `organizationUuid` to "". CC's pointer comparison needs
+    # both uuids, so every bridge minted afterwards cannot reattach: the repair
+    # causing the failure it exists to prevent, which is worse than the
+    # whole-dict comparison it replaced.
+    #
+    # An empty value is "I do not know", not "it is empty". `accountUuid` is
+    # present on both host paths, so `keys` is never empty in practice and an
+    # identity asserting nothing falls through to the write rather than
+    # matching everything.
     here = data.get("oauthAccount")
-    if isinstance(here, dict) and all(
-        here.get(k) == identity.get(k)
-        for k in ("accountUuid", "organizationUuid")
+    keys = [k for k in ("accountUuid", "organizationUuid") if identity.get(k)]
+    if isinstance(here, dict) and keys and all(
+        here.get(k) == identity[k] for k in keys
     ):
         return False
     data["oauthAccount"] = identity

@@ -16238,11 +16238,19 @@ class TestTheSpliceHoldsTheConfigLock:
         taken = []
 
         class _Lock:
+            # OBSERVE THE FILE, NOT JUST THE ENTRY. Recording that a context
+            # manager was entered leaves the whole claim untested: releasing
+            # the lock BEFORE the read-modify-write keeps `taken` true and the
+            # write still lands, so the regression this guards -- a Claude Code
+            # write arriving between our read and our rename -- reappears
+            # invisibly. Snapshotting inside proves the write happened while
+            # the lock was held.
             def __enter__(self):
-                taken.append(True)
+                taken.append(cfg.read_text())
                 return self
 
             def __exit__(self, *a):
+                taken.append(cfg.read_text())
                 return False
 
         cfg = tmp_path / ".claude.json"
@@ -16267,6 +16275,9 @@ class TestTheSpliceHoldsTheConfigLock:
         assert taken, (
             "the config was replaced whole with no lock, so a concurrent "
             "Claude Code write is discarded with everything it carried")
+        assert taken[0] != taken[1], (
+            "the file was unchanged for the whole time the lock was held, so "
+            "the read-modify-write happened outside it")
         assert json.loads(cfg.read_text())["oauthAccount"] == self.PIN
 
     def case_a_lock_that_cannot_be_taken_skips_the_write(
@@ -16325,6 +16336,35 @@ class TestTheSpliceHoldsTheConfigLock:
              "displayName": "Someone"})
         assert pin_proxy.splice_config_identity(self.PIN) is True
         assert json.loads(cfg.read_text())["oauthAccount"] == self.PIN
+
+
+    def case_an_unasserted_org_does_not_downgrade_a_real_one(
+        self, tmp_path, monkeypatch
+    ):
+        """THE REPAIR CAUSING THE FAILURE IT PREVENTS.
+
+        The host's synthesis fills a missing org with `or ""`. Comparing that
+        empty string against a config Claude Code has filled in is never equal,
+        so the rewrite fires and replaces a REAL `organizationUuid` with "".
+        Claude Code's pointer comparison needs both uuids, so every bridge
+        minted afterwards cannot reattach -- which is the whole thing this
+        splice exists to keep working.
+
+        An empty value means "I do not know", not "it is empty".
+        """
+        full = {"accountUuid": "PIN", "organizationUuid": "ORG-REAL",
+                "emailAddress": "pinned@example.com",
+                "displayName": "Someone"}
+        pin_proxy, cfg, _ = self._wire(tmp_path, monkeypatch, full)
+        synthesis = {"accountUuid": "PIN", "organizationUuid": "",
+                     "emailAddress": "pinned@example.com"}
+        assert pin_proxy.splice_config_identity(synthesis) is False, (
+            "a synthesis that asserts no org rewrote a config that has one")
+        after = json.loads(cfg.read_text())["oauthAccount"]
+        assert after["organizationUuid"] == "ORG-REAL", (
+            "a real organizationUuid was downgraded to empty, so no bridge "
+            "minted afterwards can reattach")
+        assert after == full
 
     def case_CONTROL_a_matching_uuid_in_a_different_org_is_written(
         self, tmp_path, monkeypatch
