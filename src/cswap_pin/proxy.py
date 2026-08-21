@@ -2679,17 +2679,56 @@ _WORKER_JWT: "dict[str, tuple[str, float]]" = {}
 _WORKER_JWT_TTL_S = 600.0
 
 
-def note_worker_auth(path: str, headers: "list[tuple[str, str]]") -> None:
-    """Remember the worker credential for the bridge this call belongs to."""
+#: `worker_epoch` seen on a real `/worker/events` POST, per bridge.
+#:
+#: REQUIRED, AND NOT GUESSABLE. Read out of 2.1.238: the client posts
+#: `{worker_epoch: this.workerEpoch, events: [...]}`. It is a per-worker
+#: counter held in the CLI's memory, so the only way to know it is to read one
+#: off a request going past -- the same reason the JWT is captured here.
+_WORKER_EPOCH: "dict[str, object]" = {}
+#: Whether the shape of a real events POST has been recorded yet, per daemon.
+_SHAPE_LOGGED = False
+
+
+def note_worker_auth(path: str, headers: "list[tuple[str, str]]",
+                     body: "bytes | None" = None) -> None:
+    """Remember the worker credential, and the epoch, for this call's bridge.
+
+    The body is parsed for STRUCTURE only. It carries the user's own text and
+    none of that is logged: what comes out is `worker_epoch` (a counter) and,
+    once per daemon, the KEY NAMES of one event. That was enough to settle a
+    contract two releases of guessing had not.
+    """
+    global _SHAPE_LOGGED
     if not _WORKER_SUBTREE.search(path):
         return
     m = _BRIDGE_ID.match(path)
     if not m:
         return
+    bridge = m.group(1)
     for k, v in headers:
         if k.lower() == "authorization" and v:
-            _WORKER_JWT[m.group(1)] = (v, time.monotonic())
-            return
+            _WORKER_JWT[bridge] = (v, time.monotonic())
+            break
+    if not body or "/worker/events" not in path:
+        return
+    try:
+        doc = json.loads(body.decode(errors="replace"))
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(doc, dict):
+        return
+    if "worker_epoch" in doc:
+        _WORKER_EPOCH[bridge] = doc["worker_epoch"]
+    if not _SHAPE_LOGGED:
+        events = doc.get("events")
+        if isinstance(events, list) and events and isinstance(events[0], dict):
+            _SHAPE_LOGGED = True
+            _log_lifecycle(
+                "a real worker events POST carries top-level keys "
+                f"{sorted(doc)} and event keys {sorted(events[0])} — recorded "
+                "once so a replay can match the client's own contract instead "
+                "of a shape inferred from a stored record")
 
 
 def worker_auth(bridge: str) -> "str | None":
@@ -2891,12 +2930,22 @@ def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
     # server enumerate what it WILL take. Asking the receiver beats another
     # round of guessing, and this file has already paid twice for inferring a
     # contract instead of asking for it.
+    epoch = _WORKER_EPOCH.get(bridge)
+    # `worker_epoch` IS REQUIRED, read out of 2.1.238's own client:
+    #     this.request("post","/worker/events",
+    #                  {worker_epoch:this.workerEpoch, events:c}, …)
+    # Every envelope tried before this was missing it, which is why the server
+    # kept answering about `events[0]` — it was rejecting the request before
+    # ever agreeing what an event should look like. The value is a counter in
+    # the CLI's memory, so it is captured off a real POST rather than invented.
+    top = {"worker_epoch": epoch} if epoch is not None else {}
     return [
-        {"events": [{"event_type": "__enumerate__", "payload": body}]},
-        {"events": [{"event_type": "user", "payload": body}]},
-        {"events": [{"event_type": "user", "message": body["message"],
-                     "session_id": bridge, "timestamp": body["timestamp"]}]},
-        {"events": [body]},
+        {**top, "events": [{"event_type": "user", "payload": body}]},
+        {**top, "events": [{"event_type": "__enumerate__", "payload": body}]},
+        {**top, "events": [{"event_type": "user", "message": body["message"],
+                            "session_id": bridge,
+                            "timestamp": body["timestamp"]}]},
+        {**top, "events": [body]},
     ]
 
 
@@ -12897,7 +12946,7 @@ class PinProxy:
 
         # BEFORE ANY BEARER GATE. The worker credential is only ever visible in
         # flight, and this is the one place it passes through.
-        note_worker_auth(path, headers)
+        note_worker_auth(path, headers, body)
 
         pinned = is_pinned_route(path)
         # TWO CLOCKS, because the total alone cannot say who was slow — see
