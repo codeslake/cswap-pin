@@ -22,7 +22,10 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from cswap_pin.proxy import (
     ensure_ca,
     is_pinned_route,
+    note_worker_auth,
     parse_upstream_proxy,
+    queued_texts,
+    worker_auth,
 )
 
 from conftest import PIN_STAMP, run_cases
@@ -2326,6 +2329,14 @@ class TestIsPinnedRoute:
             # it does not mint.
             ("/v1/sessions", True, "the peer listing ListAgents reads"),
             ("/v1/sessions?limit=50", True, "same listing, paginated"),
+            # THE UPLOAD, WHICH THE READ PREFIX DOES NOT COVER. Measured live:
+            # `POST /api/oauth/file_upload pinned=False swapped=False -> 201`,
+            # so every file this CLI sent landed on the ACTIVE account while
+            # the browser asked the PINNED account's org for it and got 404.
+            # `/api/oauth/files/` is the read and does not match this path.
+            ("/api/oauth/file_upload", True, "the write half of the file pair"),
+            ("/api/oauth/file_uploads_elsewhere", False,
+             "the exact-match row must not become a prefix"),
             # THE ROUTE THAT DECIDES WHETHER RC SURVIVES AN ACCOUNT SWITCH.
             # Read out of the 2.1.234 binary: when the identity file names an
             # account other than the bridge's owner, `confirmChanged()` does
@@ -16095,3 +16106,78 @@ class TestASlowRequestSaysSo:
             "GET", "/v1/code/sessions?after=cse_0128abc&limit=1", 2681.0, 0.0)
         assert "cse_0128abc" not in lines[0]
         assert "?" not in lines[0]
+
+
+class TestTheWorkerCredentialIsRememberedFromTheWire:
+    """`/worker` writes need a JWT that exists nowhere else.
+
+    The session registry carries `bridgeSessionId`, `messagingSocketPath` and a
+    dozen other fields and no token, and the pinned OAuth bearer is refused
+    there outright — `403 permission_error`, measured against four candidate
+    body shapes, all four identical, which is what says the refusal is about
+    the credential rather than the envelope. In flight through the pin is the
+    only place it can be seen.
+    """
+
+    def test_a_worker_call_leaves_its_credential_behind(self):
+        from cswap_pin import proxy as P
+        P._WORKER_JWT.clear()
+        P.note_worker_auth("/v1/code/sessions/cse_aaa/worker/events",
+                           [("Content-Type", "application/json"),
+                            ("Authorization", "Bearer jwt-aaa")])
+        assert P.worker_auth("cse_aaa") == "Bearer jwt-aaa"
+
+    def test_a_non_worker_call_leaves_nothing(self):
+        # The OAuth bearer rides on these. Remembering it as a worker
+        # credential would send the one token that route refuses, which is
+        # this cache's own failure mode inverted.
+        from cswap_pin import proxy as P
+        P._WORKER_JWT.clear()
+        P.note_worker_auth("/v1/code/sessions/cse_bbb/events",
+                           [("Authorization", "Bearer oauth-bbb")])
+        assert P.worker_auth("cse_bbb") is None
+
+    def test_a_stale_credential_is_forgotten(self):
+        from cswap_pin import proxy as P
+        P._WORKER_JWT.clear()
+        P.note_worker_auth("/v1/code/sessions/cse_ccc/worker/heartbeat",
+                           [("Authorization", "Bearer jwt-ccc")])
+        value, seen = P._WORKER_JWT["cse_ccc"]
+        P._WORKER_JWT["cse_ccc"] = (value, seen - P._WORKER_JWT_TTL_S - 1)
+        assert P.worker_auth("cse_ccc") is None
+        assert "cse_ccc" not in P._WORKER_JWT
+
+
+class TestQueuedTurnsAreReadFromTheTranscript:
+    """Input taken mid-turn is queued and never posted, and the queue record is
+    the only place its text survives — no request body carries it."""
+
+    def _write(self, rows):
+        # WRITE WHERE THE RESOLVER LOOKS, which is `get_claude_config_home()`
+        # and not `~/.claude`. A first cut set HOME and asserted on the value;
+        # conftest's sandbox already patches `Path.home`, so the reader looked
+        # at an empty directory, returned [], and the assertion failed for a
+        # reason that had nothing to do with the code under test.
+        from cswap_pin._host import require
+        home = require("paths").get_claude_config_home()
+        d = home / "projects" / "p"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "sid.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+
+    def test_an_old_enqueue_is_returned_and_a_young_one_is_not(self):
+        from cswap_pin import proxy as P
+        old = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600))
+        young = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        self._write([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": old + ".000Z", "content": "swallowed by a long turn"},
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": young + ".000Z", "content": "may still be on its way"},
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": old + ".000Z"},
+        ])
+        assert P.queued_texts("sid") == ["swallowed by a long turn"]
+
+    def test_a_session_with_no_transcript_is_empty_not_an_error(self):
+        from cswap_pin import proxy as P
+        assert P.queued_texts("nobody") == []
