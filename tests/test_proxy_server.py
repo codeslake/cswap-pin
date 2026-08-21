@@ -12,6 +12,7 @@ import http.client
 import io
 import json
 import pathlib
+import re
 import socket
 import ssl
 import tempfile
@@ -6885,7 +6886,17 @@ class TestDrainReportsWhatItCut:
             assert "drained clean" in line, (
                 "a departure that cost nothing must still say so — silence "
                 "reads the same as a daemon that never drained: " + line)
-            assert "in 0.0s" in line, (
+            # NOT A FIXED VALUE. A slower box genuinely drains in 0.1s and
+            # the line correctly says so, which turned this red on CI while
+            # the code was right. What the case is for is that the elapsed
+            # field is a MEASUREMENT and not the ceiling copied into it, so
+            # bound it by the budget: the mutation this exists to catch puts
+            # 20 there, and anything a real drain takes is far below it.
+            waited = re.search(r"drained clean in ([\d.]+)s of a 20s budget",
+                               line)
+            assert waited, (
+                "the drain line did not report an elapsed time at all: " + line)
+            assert float(waited.group(1)) < 20.0, (
                 "the line quotes its budget rather than what it waited: " + line)
             assert "20s budget" in line, (
                 "and it must still name the ceiling it did not need: " + line)
