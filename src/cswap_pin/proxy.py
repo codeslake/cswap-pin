@@ -2949,19 +2949,25 @@ def _turn_envelopes(bridge: str, text: str) -> "list[dict]":
     # `event_type` at all. So the stored `"user"` is how the value is RENDERED,
     # not how it is accepted.
     #
-    # DEMOTED, because the binary does not support it: `EVENT_TYPE_` appears
-    # nowhere in 2.1.238, while six other `*_UNSPECIFIED` enum names and the
-    # prefix constant `"DEVICE_ATTESTATION_STATUS_"` do. So the convention is
-    # real in this API and the client does not spell EVENT_TYPE that way. The
-    # stored `"user"` leads; the enum form stays as a cheap second arm rather
-    # than as a belief.
+    # THE REAL CONTRACT, read off a live POST rather than guessed:
+    #
+    #     top-level keys  ['events', 'worker_epoch']
+    #     event keys      ['ephemeral', 'payload']   (or just ['payload'])
+    #
+    # There is NO `event_type` in a request. Four releases put one there,
+    # including one deliberately invalid, and every reply was the same
+    # `events[0]: event_type is required` -- which was never about a value at
+    # all. The server DERIVES it from the payload, and the client's own SSE
+    # handler reads `payload.type` the same way (`n.type === "control_request"`
+    # in 2.1.238). So what was missing is `type` INSIDE the payload.
+    #
+    # Kept as a short list because only the first entry is measured; the rest
+    # are the previous best guesses, retained until a `replayed` line proves
+    # the first one and they can go.
     return [
+        {**top, "events": [{"payload": dict(body, type="user")}]},
+        {**top, "events": [{"payload": body}]},
         {**top, "events": [{"event_type": "user", "payload": body}]},
-        {**top, "events": [{"event_type": "EVENT_TYPE_USER", "payload": body}]},
-        {**top, "events": [{"event_type": "__enumerate__", "payload": body}]},
-        {**top, "events": [{"event_type": "user", "message": body["message"],
-                            "session_id": bridge,
-                            "timestamp": body["timestamp"]}]},
     ]
 
 
