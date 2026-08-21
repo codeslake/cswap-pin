@@ -1449,20 +1449,31 @@ def check_outbound_text(port: int) -> None:
     # passed on them for a quarter of an hour while nothing was getting
     # through. Measured: nine user turns taken at the CLI between 04:05:03
     # and 04:19:40, zero arrivals. Presence of text events is not currency.
-    lag = uplink_lag(port, rows)
-    if lag is not None and lag[0] > 15.0:
+    # THE ASSISTANT SIDE, because that is whose text this row is about. A
+    # first cut gated staleness on `uplink_lag`, which measures the USER
+    # direction -- the wrong end entirely. Caught by the user: the newest
+    # assistant text was 6 SECONDS old and the row said PASS while the answer
+    # containing it was not on their screen.
+    if age is not None and age > 15.0:
         row("8 CLI→ai텍스트", "FAIL",
-            f"the server holds {len(texts)} assistant text event(s), but "
-            f"nothing the user typed has reached it for {lag[0]:.0f} minutes "
-            f"(newest {lag[1]}) — the uplink is stalled and the events above "
-            "are from before it")
+            f"the server's newest assistant text event is {age:.0f} minutes "
+            f"old ({newest.get('created_at')}) — what this CLI has said since "
+            "is not reaching claude.ai")
         return
-    row("8 CLI→ai텍스트", "PASS",
-        f"the server holds {len(texts)} assistant text event(s) for this "
-        f"session, newest {newest.get('created_at')}"
-        f"{_as_of(age)} — this is the server's own copy, not our transcript"
-        + (f"; newest user turn on the server {lag[1]}{_as_of(lag[0])}"
-           if lag else ""))
+    # NOT A PASS, AND THAT IS THE POINT. The requirement is "the text shows on
+    # claude.ai". Delivery to the server is one step short of that, and the
+    # gap is not theoretical: measured with the newest assistant event SIX
+    # SECONDS old and the answer still absent from the browser, twice. A row
+    # that says PASS on the near side of a gap it cannot see across is the
+    # false-PASS shape this file has had to undo in four other requirements
+    # tonight. Only a person looking at claude.ai closes this one.
+    row("8 CLI→ai텍스트", "UNPROVEN",
+        f"reached the server: {len(texts)} assistant text event(s), newest "
+        f"{newest.get('created_at')}{_as_of(age)}, its own copy rather than "
+        f"our transcript. NOT rendering — nothing local can see the browser "
+        f"draw it, and it has been observed missing there with the newest "
+        f"event 6s old. Delivery is necessary and not sufficient; a person "
+        f"reading claude.ai is the only instrument for the rest")
 
 
 def uplink_lag(port: int, rows) -> "tuple[float, str] | None":
@@ -1546,12 +1557,17 @@ def check_outbound_image(port: int) -> None:
             f"so an image sent now would not arrive either. {len(imgs)} image "
             f"event(s) are on record ({summary}), all from before the stall")
         return
-    row("9 CLI→ai이미지", "PASS",
-        f"{len(imgs)} image event(s) reached the server ({summary}), newest "
-        f"{newest.get('created_at')}{_as_of(img_age)}, and the uplink is "
-        f"current"
-        + (f" — newest user turn on the server {lag[1]}{_as_of(lag[0])}"
-           if lag else ""))
+    # SAME CEILING AS REQUIREMENT 8. Reaching the server is measurable here;
+    # claude.ai drawing the image is not, and the two have been observed to
+    # disagree. Reported as what it is rather than rounded up to a PASS.
+    row("9 CLI→ai이미지", "UNPROVEN",
+        f"reached the server: {len(imgs)} image event(s) ({summary}), newest "
+        f"{newest.get('created_at')}{_as_of(img_age)}, uplink current"
+        + (f" — newest user turn {lag[1]}{_as_of(lag[0])}" if lag else "")
+        + ". NOT rendering: nothing local can see the browser draw it, and "
+          "it has been reported missing there while these events were "
+          "seconds old. A person reading claude.ai is the only instrument "
+          "for that half")
 
 
 _LOG_DIR = pathlib.Path(
