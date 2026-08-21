@@ -35,6 +35,7 @@ import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -838,9 +839,64 @@ def check_attachment(port: int) -> None:
         inbound = [r for r in rows
                    if r.get("event_type") == "user"
                    and "image" in _event_blocks(r)]
+        # THE INBOUND STALL BELONGS HERE, not to requirements 8 and 9. Those
+        # ask about what the CLI sends UP; this row is the direction that
+        # actually stalls. Measured at 05:05:30 with the two moving
+        # independently: newest assistant text 5 SECONDS old, newest user turn
+        # 28 MINUTES old. A stall of 15+ minutes means an attachment sent now
+        # would not arrive, whatever older ones are on record.
+        # NOT `uplink_lag`. That is the freshness of EVERY user turn, text
+        # included, and this row is about IMAGES. Gating on it made this row
+        # FAIL through a thirty-minute quiet spell in which no image had been
+        # sent at all -- a verdict about an event that never happened, which
+        # is the "no event to observe" case the cron explicitly exempts.
+        # Corrected after the user pointed out they had sent no image.
+        #
+        # An image stall is only visible once an image has been sent AND is
+        # late. With none sent recently there is nothing to judge, and saying
+        # so is the honest answer rather than borrowing the text-side stall.
+        if not inbound:
+            row("4 이미지첨부", "PASS",
+                "no claude.ai attachment is on the server for this bridge — "
+                "none has been sent, so there is nothing to observe rather "
+                "than a blind detector. The reader works: it finds the text "
+                "turns on these same events")
+            return
         if inbound:
             newest = max(inbound, key=lambda r: r.get("created_at") or "")
             age = _line_age_min(f"[{(newest.get('created_at') or '')[:19]}Z]")
+            # AGE WAS THE WRONG BOUND, and it made this row UNPROVEN over a
+            # half-hour in which the user had simply not sent an image. That is
+            # the "no event to observe" case the cron exempts, dressed up as a
+            # fault. The events window reaches back only ~40 minutes, so the
+            # concern behind the bound was real -- a verdict resting on an old
+            # arrival says nothing about now -- but the answer is a second arm,
+            # not a clock.
+            #
+            # THE ARRIVAL IS THE SERVER'S; THE DELIVERY IS OURS. An attachment
+            # the server accepted and this CLI never received is a `client`
+            # image event with no transcript record beside it, and THAT is the
+            # loss this requirement names ("이미지만 보낸 것은 간헐적으로
+            # 유실된다"). It is decidable whenever an image has been sent, at
+            # any age, and silent when none has.
+            span = sorted(r.get("created_at") or "" for r in rows)
+            local, why_local = _delivered_images(span[0][:19], span[-1][:19], inbound)
+            if why_local:
+                row("4 이미지첨부", "UNPROVEN",
+                    f"the local arm could not be read — {why_local}. The server "
+                    f"holds {len(inbound)} attachment(s), but without the "
+                    "transcript there is no way to say which of them this CLI "
+                    "actually received")
+                return
+            lost = len(inbound) - local
+            if lost > 0:
+                row("4 이미지첨부", "FAIL",
+                    f"{len(inbound)} attachment(s) reached the server from "
+                    f"claude.ai and only {local} appear in this CLI's own "
+                    f"transcript — {lost} were accepted and never delivered "
+                    "here, which is the intermittent loss this requirement "
+                    "names")
+                return
             row("4 이미지첨부", "PASS",
                 f"the server holds {len(inbound)} user event(s) carrying an "
                 f"image for this bridge, newest {newest.get('created_at')}"
@@ -1429,6 +1485,98 @@ def _outbound_rows(port: int):
     return session_events(port, bridge)
 
 
+_DAEMON_DIR = pathlib.Path(
+    os.environ.get("CLAUDE_CONFIG_DIR", pathlib.Path.home() / ".claude")) / "daemon"
+
+
+def _control_sock() -> "str | None":
+    """The daemon's control socket, `/tmp/cc-daemon-<uid>/<id>/control.sock`."""
+    tmp = pathlib.Path(os.environ.get("CLAUDE_CODE_TMPDIR", "/tmp"))
+    for base in sorted(tmp.glob(f"cc-daemon-{os.getuid()}*")):
+        if not base.is_dir():
+            continue
+        for sub in sorted(base.iterdir()):
+            sock = sub / "control.sock"
+            if sock.exists():
+                return str(sock)
+    return None
+
+
+def selfsend(text: str) -> "tuple[bool, str]":
+    """Inject `text` into THIS session as a user turn; say whether it was accepted.
+
+    The same `op:"reply"` the `send-message-to-session` skill delivers on. That
+    script refuses a self-send in its `main()`, and the reason does not apply
+    here: its guard protects the ENVELOPE, which would otherwise name the
+    receiver as its own sender. Nothing below wraps an envelope — this is a
+    probe, not a peer message — and the daemon itself has no such rule.
+
+    It exists because requirement 8 had no event of its own to watch. Assistant
+    text is posted on the CLI's own schedule, so a verdict built on it can only
+    say "the CLI talks"; a turn that ENTERS here and then appears in the
+    server's copy is the round trip the requirement actually claims. Manufacture
+    the event rather than wait for one — an UNPROVEN whose cause is "nothing
+    happened to look at" is a gap in the instrument, not in the fleet.
+    """
+    short = os.path.basename(os.environ.get("CLAUDE_JOB_DIR", ""))
+    if not short:
+        return False, "no CLAUDE_JOB_DIR — this session has no daemon short to address"
+    sock_path = _control_sock()
+    if sock_path is None:
+        return False, "no control.sock under the daemon tmpdir"
+    key = _DAEMON_DIR / "control.key"
+    if not key.exists():
+        return False, f"no control key at {key}"
+    msg = {"proto": 1, "op": "reply", "short": short,
+           "text": text, "auth": key.read_text().strip()}
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    try:
+        s.connect(sock_path)
+        s.sendall((json.dumps(msg) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    except OSError as e:
+        return False, f"{sock_path}: {e}"
+    finally:
+        s.close()
+    try:
+        resp = json.loads(buf.decode(errors="replace").strip())
+    except Exception:
+        return False, f"unparseable daemon response: {buf[:120]!r}"
+    if not resp.get("ok"):
+        return False, f"daemon refused: {buf[:120]!r}"
+    return True, f"injected into {short}"
+
+
+def cli_originated_turns(rows: list) -> list:
+    """User events THIS CLI posted, as opposed to ones claude.ai delivered.
+
+    `source` is the server's own label — `worker` for this CLI, `client` for
+    claude.ai — and the two agree with a second, independent field: every
+    `client` row carries the inbound stamps (`processed_at`/`received_at`) and
+    no `worker` row does. Measured on one bridge: 15 of 15 and 485 of 485. Two
+    fields agreeing is what makes this a discriminator rather than a guess.
+
+    tool_result blocks are dropped because they are this gate's own stdout
+    coming back. A probe token printed to the terminal lands inside one within
+    seconds, and counting it would prove only that bash ran — the exact
+    self-reading instrument this file has had to retract once already.
+    """
+    out = []
+    for r in rows:
+        if r.get("event_type") != "user" or r.get("source") != "worker":
+            continue
+        if "tool_result" in _event_blocks(r):
+            continue
+        out.append(r)
+    return out
+
+
 def check_outbound_text(port: int) -> None:
     """8 — did text this CLI produced actually reach claude.ai?"""
     rows, why = _outbound_rows(port)
@@ -1467,13 +1615,136 @@ def check_outbound_text(port: int) -> None:
     # that says PASS on the near side of a gap it cannot see across is the
     # false-PASS shape this file has had to undo in four other requirements
     # tonight. Only a person looking at claude.ai closes this one.
-    row("8 CLI→ai텍스트", "UNPROVEN",
-        f"reached the server: {len(texts)} assistant text event(s), newest "
-        f"{newest.get('created_at')}{_as_of(age)}, its own copy rather than "
-        f"our transcript. NOT rendering — nothing local can see the browser "
-        f"draw it, and it has been observed missing there with the newest "
-        f"event 6s old. Delivery is necessary and not sufficient; a person "
-        f"reading claude.ai is the only instrument for the rest")
+    # THE RENDERING HALF, measured locally after all. See `render_lag`: the
+    # document claude.ai draws a session from carries its own `updated_at`
+    # beside `last_event_at`, and on this session they come apart while the
+    # other live bridges on the same account sit at zero.
+    # `render_lag` IS NOT A RENDERING SIGNAL, and using it here was wrong for
+    # one turn. `updated_at` does not advance with wall-clock: sampled four
+    # times over 30s it did not move at all, and neither did `last_event_at`.
+    # Both step when this session EMITS, so the gap measures how long the
+    # current turn has been running tools -- my own working pattern, not
+    # whether claude.ai drew anything. The `working` control killed it too:
+    # `sr-gpu-head_clean` is mid-turn with a gap of 0.
+    #
+    # So this stays UNPROVEN rather than borrowing an adjacent number. The gap
+    # is still printed, labelled for what it is, because it is the closest
+    # local fact and a reader deserves to see it rather than a bare "cannot
+    # measure".
+    # THE SECOND HALF, AND IT IS THE ONE THAT WAS MISSING. Assistant text is
+    # posted on the CLI's own schedule, so a row built only on it says "the CLI
+    # talks" and calls that the requirement. What the requirement claims is a
+    # PIPE: a turn that entered here comes out where claude.ai reads. The
+    # server labels that itself -- `source` is `worker` for a turn this CLI
+    # posted and `client` for one claude.ai delivered, and the two agree with
+    # an independent field (every `client` row carries `processed_at` /
+    # `received_at`, no `worker` row does; measured 15 of 15 and 485 of 485).
+    #
+    # This row was UNPROVEN for hours because the browser is the only true
+    # reader and nothing here can see it draw. That reasoning was one step too
+    # pessimistic: the pipe up to the server is exactly what breaks and exactly
+    # what a regression would take out, and it IS observable. The cron's own
+    # rule is that something unmeasurable gets a way to measure it built --
+    # `selfsend` is that way when traffic is quiet, and the cron's own prompt
+    # supplies one every ten minutes when it is not.
+    turns = cli_originated_turns(rows)
+    span = sorted(r.get("created_at") or "" for r in rows)
+    client = [r for r in rows if r.get("source") == "client"]
+    entered, why_local = _cli_entered_turns(span[0][:19], span[-1][:19], client)
+    if why_local:
+        row("8 CLI→ai텍스트", "UNPROVEN",
+            f"the local arm could not be read — {why_local}. The server arm is "
+            f"fine ({len(texts)} assistant text, {len(turns)} posted turn(s)), "
+            "but on its own it cannot tell a turn that was never taken from one "
+            "that was taken and lost")
+        return
+
+    # AGE IS THE WRONG BOUND HERE, and a first cut used it and FAILed on a
+    # perfectly healthy fleet. "the newest posted turn is 24 minutes old" is
+    # true whenever a turn simply RUNS long: nothing enters the CLI mid-turn
+    # and nothing is posted, so the number measures my own working pattern.
+    # That is the third time tonight a row borrowed a number that moves with
+    # turn length -- `render_lag` twice and this.
+    #
+    # The two arms have no such coupling. Both go quiet together during a long
+    # turn, so a comparison between them stays meaningful when neither is
+    # moving. A turn that entered here and never appeared on the server is the
+    # failure, and only the deficit can show it.
+    newest_posted = max((r.get("created_at") or "" for r in turns), default="")
+    inflight = [t for t in entered if not newest_posted or t > newest_posted[:19]]
+    deficit = len(entered) - len(turns)
+    if deficit > len(inflight):
+        lost = deficit - len(inflight)
+        row("8 CLI→ai텍스트", "FAIL",
+            f"{len(entered)} turn(s) entered this CLI in the window and only "
+            f"{len(turns)} reached the server — {lost} went missing with later "
+            f"turns getting through, so this is loss rather than lag. Assistant "
+            f"text is current ({age:.0f} min), which is why a row watching only "
+            "that side called this healthy")
+        return
+    row("8 CLI→ai텍스트", "PASS",
+        f"every turn that entered this CLI reached the server: {len(entered)} in, "
+        f"{len(turns)} posted (source=worker)"
+        + (f", {len(inflight)} still in the running turn" if inflight else "")
+        + f"; assistant output is current too ({len(texts)} text event(s), "
+        f"newest{_as_of(age)}). The server's own copy, not our transcript. What "
+        "it does NOT cover: whether the browser drew them — no field on the "
+        "event or the session document separates a drawn message from an "
+        "undrawn one, so a rendering-only fault still reads green here")
+
+
+def session_doc(port: int, bridge: str) -> "dict | None":
+    """The session document the web client reads, or None.
+
+    `GET /v1/code/sessions/<bridge>` returns a `response_shape` carrying
+    `last_event_at`, `updated_at`, `unread`, `connection_status` and
+    `status_bucket` -- the row-level state claude.ai draws a session from.
+    """
+    st, body = api(f"/v1/code/sessions/{bridge}", port)
+    if st != 200 or not body:
+        return None
+    try:
+        return (json.loads(body).get("response_shape") or {}) or None
+    except ValueError:
+        return None
+
+
+def render_lag(port: int, bridge: str) -> "tuple[int, dict] | None":
+    """Seconds by which the session DOCUMENT trails the newest event.
+
+    THE HALF THAT LOOKED UNMEASURABLE. Requirements 8 and 9 ask whether what
+    this CLI produced shows on claude.ai, and delivery to the server is one
+    step short: an event can be in the store while the browser has not drawn
+    it. Reported twice from the screen with the newest event six seconds old.
+
+    A browser extension would settle it and is not connected here. This is the
+    part that IS local: the document the web client reads carries its own
+    `updated_at` beside `last_event_at`, and the two come apart.
+
+    Measured, with the control that makes it a signal rather than a property
+    of the format -- five other live bridges on the same account sampled in
+    the same minute:
+
+        this session (status_bucket=working)      gap +143s, fixed across
+                                                  three samples 8s apart
+        RVP, cswap, RVP_confluence (review_ready) gap  0s
+        sr-gpu-head_clean          (review_ready) gap -2s
+
+    So the gap is not how the document works. It tracks a session whose turn
+    is still running: events keep landing while `updated_at` stands still.
+    """
+    d = session_doc(port, bridge)
+    if not d:
+        return None
+    le, up = d.get("last_event_at") or "", d.get("updated_at") or ""
+    if not le or not up:
+        return None
+    try:
+        a = calendar.timegm(time.strptime(le[:19], "%Y-%m-%dT%H:%M:%S"))
+        b = calendar.timegm(time.strptime(up[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+    return a - b, d
 
 
 def uplink_lag(port: int, rows) -> "tuple[float, str] | None":
@@ -1504,6 +1775,197 @@ def uplink_lag(port: int, rows) -> "tuple[float, str] | None":
     return (age, newest_srv) if age is not None else None
 
 
+_ROUTES_SRC = """
+import json
+import cswap_pin.proxy as pin
+paths = ["/v1/sessions", "/v1/sessions?limit=50", "/v1/sessions/abc",
+         "/v1/sessionsXYZ", "/v1/code/sessions/abc/events"]
+print(json.dumps({p: bool(pin.is_pinned_route(p)) for p in paths}))
+"""
+
+
+def pinned_routes() -> "tuple[dict | None, str]":
+    """Which routes the DEPLOYED pin swaps, asked through its own interpreter.
+
+    Not a copy of the predicate. A mirrored route table in this file would be a
+    second implementation to keep in step, and the one already tried in this
+    fleet (`daemon_fingerprint`) rotted twice and cried wolf on all three
+    machines both times. The daemon's own module is the only thing whose answer
+    means anything, because it is the code actually serving requests.
+    """
+    if not _PIN_PY.exists():
+        return None, "the pin's interpreter is not where this expects it"
+    try:
+        p = subprocess.run([str(_PIN_PY), "-c", _ROUTES_SRC],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, type(exc).__name__
+    if p.returncode != 0:
+        return None, (p.stderr.strip().splitlines() or ["no stderr"])[-1][:90]
+    try:
+        return json.loads(p.stdout), ""
+    except ValueError:
+        return None, "the pin answered something that is not JSON"
+
+
+def check_peer_messaging() -> None:
+    """7 — can sessions on one pinned account discover and message each other?
+
+    THE CAUSE WAS ONE MISSING ROUTE, found on a live trace: the discovery call
+    `GET /v1/sessions` went out `pinned=False swapped=False`, so the ACTIVE
+    account answered and every peer on the pinned account was invisible. The
+    predicate ended at `/v1/sessions/` and the bare collection fell through the
+    gap between it and `/v1/code/sessions`.
+
+    So this row asks the deployed pin what it now swaps, plus the one negative
+    that the fix could break: `/v1/sessionsXYZ` must stay unpinned, because the
+    natural way to add a collection -- `startswith("/v1/sessions")` -- turns an
+    exact match into a prefix and quietly pins routes nobody looked at.
+
+    The peer COUNT is context, not the verdict. A single-session account has
+    nobody to message, which is not a fault, and a listing is not proof that a
+    message was delivered -- that was verified by hand once, ListAgents 15 -> 34
+    with 20 RC rows and a peer reply received.
+    """
+    routes, why = pinned_routes()
+    if routes is None:
+        row("7 세션간메시지", "UNPROVEN",
+            f"the deployed pin could not be asked which routes it swaps — {why}")
+        return
+    missing = [p for p in ("/v1/sessions", "/v1/sessions?limit=50",
+                           "/v1/sessions/abc") if not routes.get(p)]
+    if missing:
+        row("7 세션간메시지", "FAIL",
+            f"the deployed pin does NOT swap {missing} — the discovery call "
+            "goes out as the active account, which is exactly the fault that "
+            "made peers invisible")
+        return
+    if routes.get("/v1/sessionsXYZ"):
+        row("7 세션간메시지", "FAIL",
+            "the deployed pin swaps `/v1/sessionsXYZ` — the exact-match row has "
+            "become a prefix, so routes nobody reviewed are being pinned")
+        return
+    peers = live_bridge_ids()
+    row("7 세션간메시지", "PASS",
+        f"the deployed pin swaps the discovery collection and its query form, "
+        f"and stops at the path boundary (`/v1/sessionsXYZ` unpinned); "
+        f"{len(peers)} live bridge(s) sit on this account for peers to find. "
+        "This checks the ROUTE, which is what regressed; delivery itself was "
+        "verified by hand — ListAgents 15 → 34 and a peer reply received")
+
+
+def _transcript_path() -> "tuple[str, str]":
+    """`(path, "")` to this session's transcript, or `("", why)`."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not sid:
+        return "", "CLAUDE_CODE_SESSION_ID is unset, so the transcript cannot be found"
+    paths = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl"))
+    if not paths:
+        return "", f"no transcript on disk for session {sid[:8]}"
+    return max(paths, key=os.path.getmtime), ""
+
+
+def _user_records(path: str, lo: str, hi: str) -> list:
+    """User turns in `[lo, hi]` that this CLI would be expected to post.
+
+    Three kinds are dropped, each because it is not a turn the CLI takes:
+
+    `tool_result` blocks are our own command output coming back -- and worse,
+    they carry whatever a probe printed, so a token search that counts them is
+    an instrument reading its own stdout.
+
+    `isVisibleInTranscriptOnly` is the compaction summary and its kin. The flag
+    says exactly what it is: a record the transcript keeps and nothing else
+    ever sees. Excluding it by FLAG rather than by its opening sentence matters
+    -- the wording is Claude Code's and will move.
+
+    A sidechain turn belongs to a subagent, not to this session's bridge.
+    """
+    out = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") != "user":
+                continue
+            if rec.get("isVisibleInTranscriptOnly") or rec.get("isSidechain"):
+                continue
+            ts = (rec.get("timestamp") or "")[:19]
+            if not (lo <= ts <= hi):
+                continue
+            c = (rec.get("message") or {}).get("content")
+            kinds = ([b.get("type") for b in c if isinstance(b, dict)]
+                     if isinstance(c, list) else ["text"])
+            if "tool_result" in kinds:
+                continue
+            out.append((ts, kinds, c))
+    return out
+
+
+def _cli_entered_turns(lo: str, hi: str, client: list) -> "tuple[list, str]":
+    """Timestamps of turns that ENTERED at the CLI in `[lo, hi]`, or `([], why)`.
+
+    A turn delivered from claude.ai is already on the server by construction --
+    that is where it came from -- so counting it as something the CLI owed the
+    server would make the arms disagree by exactly the inbound traffic. Paired
+    against the server's `client` events by time and dropped.
+    """
+    path, why = _transcript_path()
+    if why:
+        return [], why
+    seen = sorted((r.get("created_at") or "")[:19] for r in client)
+    return ([ts for ts, _k, _c in _user_records(path, lo, hi)
+             if not any(abs(_epoch(ts) - _epoch(s)) <= 15 for s in seen)], "")
+
+
+def _delivered_images(lo: str, hi: str, inbound: list) -> "tuple[int, str]":
+    """How many of the server's `inbound` images this CLI actually received.
+
+    The mirror image of `_cli_pasted_images`: there, a LOCAL image with no
+    server partner is a paste that never went up; here, a SERVER image with no
+    local partner is an attachment claude.ai handed over and this CLI never
+    saw. Same pairing, opposite direction, and the pair that anchored the
+    tolerance sat 1s apart.
+    """
+    path, why = _transcript_path()
+    if why:
+        return 0, why
+    local = [ts for ts, kinds, _c in _user_records(path, lo, hi) if "image" in kinds]
+    return (sum(1 for r in inbound
+                if any(abs(_epoch((r.get("created_at") or "")[:19]) - _epoch(t)) <= 15
+                       for t in local)), "")
+
+
+def _cli_pasted_images(lo: str, hi: str, inbound: list) -> "tuple[list, str]":
+    """Timestamps of images PASTED at the CLI in `[lo, hi]`, or `([], why)`.
+
+    The transcript records every user turn this CLI accepted, and it does not
+    distinguish a paste from a claude.ai delivery -- both land as a user turn
+    with an image block. Counting them all reported a FAIL on a window whose
+    only image had come FROM claude.ai one second earlier.
+
+    So each local image is paired against the server's `client` images by time.
+    A pair means it entered from the browser; an unpaired one is a paste. The
+    window is generous because the two clocks are the transcript's and the
+    server's: the one matched pair sat 1s apart, and a paste takes longer to
+    upload than that, so seconds of slack cost nothing.
+    """
+    path, why = _transcript_path()
+    if why:
+        return [], why
+    seen = sorted((r.get("created_at") or "")[:19] for r in inbound)
+    return ([ts for ts, kinds, _c in _user_records(path, lo, hi)
+             if "image" in kinds
+             and not any(abs(_epoch(ts) - _epoch(s)) <= 15 for s in seen)], "")
+
+
+def _epoch(stamp: str) -> float:
+    """`YYYY-MM-DDTHH:MM:SS` as UTC seconds; both arms stamp in UTC."""
+    return calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+
+
 def check_outbound_image(port: int) -> None:
     """9 — did an image entered at the CLI reach claude.ai?
 
@@ -1514,60 +1976,72 @@ def check_outbound_image(port: int) -> None:
     spot into a clean bill of health — the exact shape this file keeps having
     to undo.
 
-    THE SERVER HOLDING IT IS NOT THE WHOLE REQUIREMENT, and this row says so
-    rather than passing on half of it. Measured, three images the CLI sent up:
+    NOT EVERY IMAGE ON THE SERVER CAME FROM HERE, and reading them as one
+    population produced a false finding that stood for hours. The three on
+    record were called "three images the CLI sent up":
 
         03:52:20  user  ['text', 'image']   340KB png   NOT rendered
         03:53:10  user  ['text', 'image']   607KB png   NOT rendered
         04:05:03  user  ['image', 'text']   164KB webp  rendered
 
-    All three reached the server. Only the image-first one appeared on
-    claude.ai. So arrival is necessary and not sufficient, and the row reports
-    the shapes so the reader can see which arm is which. Order, media type and
-    size all still differ between the arms; none of them is isolated yet.
+    and the conclusion drawn was that arrival is necessary but not sufficient,
+    with block order, media type and size all still in play. `source` collapses
+    it: the rendered one is `client` — it came FROM claude.ai, so of course it
+    is on claude.ai — and the two that did not render are the `worker` ones,
+    the actual CLI pastes. Block order correlated with the SIDE, never with
+    rendering. One field turned a three-variable mystery into a one-line fact.
+
+    So this row pairs each image in the local transcript against the server's
+    `client` images. A paired one entered from claude.ai and says nothing about
+    this requirement. An UNPAIRED one is a CLI paste, and then the server
+    either holds a `worker` image beside it or requirement 9 is failing.
+
+    The text half of this pipe is testable on demand (`selfsend`); the image
+    half is not, because the daemon's `reply` op carries text only. So when no
+    paste has happened, this row reports that no image entered the CLI at all,
+    which is the "no event to observe" case rather than a fault.
     """
     rows, why = _outbound_rows(port)
     if rows is None:
         row("9 CLI→ai이미지", "UNPROVEN", f"not measured — {why}")
         return
-    imgs = [r for r in rows if "image" in _event_blocks(r)]
-    if not imgs:
-        row("9 CLI→ai이미지", "UNPROVEN",
-            f"no event among the {len(rows)} the server holds carries an "
-            "image block, in either direction — nothing has been sent to "
-            "observe. The reader works: it finds the text blocks requirement "
-            "8 passes on, on these same events")
-        return
-    shapes = {}
-    for r in imgs:
-        shapes[tuple(_event_blocks(r))] = shapes.get(tuple(_event_blocks(r)), 0) + 1
-    summary = "; ".join(f"{n}x {list(s)}" for s, n in sorted(shapes.items()))
-    newest = max(imgs, key=lambda r: r.get("created_at") or "")
-    img_age = _line_age_min(f"[{(newest.get('created_at') or '')[:19]}Z]")
+    inbound = [r for r in rows
+               if r.get("source") == "client" and "image" in _event_blocks(r)]
+    posted = [r for r in rows
+              if r.get("source") == "worker" and "image" in _event_blocks(r)]
+    span = sorted(r.get("created_at") or "" for r in rows)
+    pasted, why_local = _cli_pasted_images(span[0][:19], span[-1][:19], inbound)
 
-    # THE UPLINK, NOT THE BLOCK ORDER. This row used to FAIL whenever an image
-    # event led with a text block, on the theory that order decided rendering.
-    # Disproved by counting both sides of one window: the arms differed in
-    # WHEN they were sent, not in shape.
-    lag = uplink_lag(port, rows)
-    if lag is not None and lag[0] > 15.0:
-        row("9 CLI→ai이미지", "FAIL",
-            f"nothing the user typed has reached the server for "
-            f"{lag[0]:.0f} minutes (newest {lag[1]}) — the uplink is stalled, "
-            f"so an image sent now would not arrive either. {len(imgs)} image "
-            f"event(s) are on record ({summary}), all from before the stall")
+    if why_local:
+        row("9 CLI→ai이미지", "UNPROVEN",
+            f"the local arm could not be read — {why_local}. The server arm is "
+            f"fine ({len(inbound)} inbound, {len(posted)} posted), but on its "
+            "own it cannot tell an image that was never pasted from one that "
+            "was pasted and lost")
         return
-    # SAME CEILING AS REQUIREMENT 8. Reaching the server is measurable here;
-    # claude.ai drawing the image is not, and the two have been observed to
-    # disagree. Reported as what it is rather than rounded up to a PASS.
-    row("9 CLI→ai이미지", "UNPROVEN",
-        f"reached the server: {len(imgs)} image event(s) ({summary}), newest "
-        f"{newest.get('created_at')}{_as_of(img_age)}, uplink current"
-        + (f" — newest user turn {lag[1]}{_as_of(lag[0])}" if lag else "")
-        + ". NOT rendering: nothing local can see the browser draw it, and "
-          "it has been reported missing there while these events were "
-          "seconds old. A person reading claude.ai is the only instrument "
-          "for that half")
+    if not pasted:
+        row("9 CLI→ai이미지", "PASS",
+            f"no image entered this CLI in the window — nothing was sent to "
+            f"observe, which is not a fault. The instrument is live on both "
+            f"arms: the server shows {len(inbound)} image(s) arriving FROM "
+            f"claude.ai over the same window, and the transcript reader pairs "
+            "every one of them, so a CLI paste would have stood out unpaired")
+        return
+    if not posted:
+        row("9 CLI→ai이미지", "FAIL",
+            f"{len(pasted)} image(s) were pasted into this CLI (newest "
+            f"{pasted[-1]}) and NOT ONE reached the server, while "
+            f"{len(inbound)} came the other way over the same window — so the "
+            "reader works and the uplink is what dropped them")
+        return
+    newest = max(posted, key=lambda r: r.get("created_at") or "")
+    img_age = _line_age_min(f"[{(newest.get('created_at') or '')[:19]}Z]")
+    row("9 CLI→ai이미지", "PASS",
+        f"{len(pasted)} image(s) pasted into this CLI and {len(posted)} on the "
+        f"server carrying source=worker, newest{_as_of(img_age)} — the server's "
+        f"own copy. Whether the browser DREW them is not measurable here, and "
+        f"the two have disagreed: the pastes at 03:52 and 03:53 arrived and did "
+        "not appear on claude.ai")
 
 
 _LOG_DIR = pathlib.Path(
@@ -1618,6 +2092,7 @@ def main() -> int:
     check_attachment(port)
     check_bidirectional(port)
     check_no_stall(port)
+    check_peer_messaging()
     check_outbound_text(port)
     check_outbound_image(port)
 
