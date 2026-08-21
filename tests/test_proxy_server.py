@@ -6074,10 +6074,14 @@ class TestDrainReportsWhatItCut:
         that happens later and that the pin never sees. So case 2 cannot be
         covered by the create event, however the comment reads.
 
-        PRESENCE IS THE TRIGGER THAT ALREADY EXISTS. It is posted by an
-        attached session on the server's own poll interval, so it recurs
-        WITHOUT waking a quiet daemon -- which is the objection the create-only
-        design was built on. A cooldown keeps it from listing on every post.
+        PRESENCE WAS THE TRIGGER THAT ALREADY EXISTED, chosen because it was
+        believed to recur on the server's poll interval WITHOUT waking a quiet
+        daemon -- the objection the create-only design was built on. It does
+        not recur: a live trace of 2132 requests across 13 attached sessions
+        caught ZERO presence posts and 26 worker posts in its first 45
+        seconds. So worker traffic carries case 2, presence stays because it
+        costs nothing, and the cooldown is what keeps either from listing on
+        every post.
         """
         import ast
 
@@ -6129,10 +6133,51 @@ class TestDrainReportsWhatItCut:
         assert srv._should_sweep_bridges(
             "POST", PRESENCE, now=1000.0 + pp._BRIDGE_SWEEP_COOLDOWN_S + 1) is True
 
+        # WORKER TRAFFIC SWEEPS TOO, and it is the trigger that actually
+        # arrives. Without it the verdict is only ever as fresh as the last
+        # create, so a fleet that starts no session never re-asks at all.
+        WORKER = "/v1/code/sessions/cse_AAA/worker/events"
+        srv._last_bridge_sweep = None
+        assert srv._should_sweep_bridges("POST", WORKER, now=2000.0) is True
+        assert srv._should_sweep_bridges("POST", WORKER, now=2001.0) is False, (
+            "worker posts arrive several times a second across the fleet; "
+            "without the cooldown this lists the account on every one")
+        assert srv._should_sweep_bridges(
+            "POST", WORKER, now=2000.0 + pp._BRIDGE_SWEEP_COOLDOWN_S + 1) is True
+        # The inbound stream is a GET held open for the session's life, so it
+        # is never a trigger however well its path matches.
+        assert srv._should_sweep_bridges(
+            "GET", "/v1/code/sessions/cse_AAA/worker/events/stream",
+            now=9e9) is False
+
         # THE CONTROL: an unrelated route must not sweep at all, or the
         # cooldown is the only thing standing between this and every request.
         assert srv._should_sweep_bridges("POST", "/v1/messages", now=9e9) is False
         assert srv._should_sweep_bridges("GET", CREATE, now=9e9) is False
+
+    def case_presence_stops_at_a_path_boundary(self, certdir):
+        """The boundary group was `(/|$|\\\\?)` inside a RAW string.
+
+        That is an optional LITERAL BACKSLASH, and zero-or-one matches the
+        empty string -- so the whole group was vacuous and the pattern
+        accepted any suffix. `_PRESENCE` has two readers with opposite jobs
+        (the never-swap rule and the sweep trigger), and a route classifier
+        that does not stop at a path boundary is wrong for both.
+        """
+        import cswap_pin.proxy as pp
+
+        base = "/v1/code/sessions/cse_AAA/client/presence"
+        # The three real shapes, unchanged.
+        assert pp._PRESENCE.search(base)
+        assert pp._PRESENCE.search(base + "?x=1")
+        assert pp._PRESENCE.search(base + "/sub")
+        assert not pp._PRESENCE.search(base + "EVIL"), (
+            "the boundary group still matches the empty string")
+        # THE CONTROL: the sibling classifier written correctly, so a failure
+        # above is this pattern and not the assertion style.
+        assert pp._WORKER_SUBTREE.search("/v1/code/sessions/cse_AAA/worker")
+        assert not pp._WORKER_SUBTREE.search(
+            "/v1/code/sessions/cse_AAA/workerEVIL")
 
     def case_the_accept_probe_and_the_bind_probe_disagree(self, certdir):
         """`_port_answers` must answer about ACCEPTING, not about BOUND.
