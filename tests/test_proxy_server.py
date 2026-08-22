@@ -6668,9 +6668,19 @@ class TestDrainReportsWhatItCut:
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import _PUMP, PinProxy
 
+        # A BASELINE OFF A SHARED GLOBAL IS NOT A BASELINE. `_PUMP` is a
+        # module global and the macOS job runs single-process, so a pair
+        # another case left behind can be torn down BETWEEN the two reads
+        # below and the count drops out from under the assertion.
+        # `reset_for_tests` exists for exactly this and had no caller
+        # anywhere; the flake it was written to prevent reddened main once.
+        _PUMP.reset_for_tests()
         a, b = socket.socketpair()
         try:
             before = _PUMP.live_pairs()
+            assert before == 0, (
+                "the reset left tunnels behind, so this case is measuring "
+                f"another one's: {before}")
             _PUMP.add(a, b)
             assert _PUMP.live_pairs() == before + 1, (
                 "the pump cannot say how many tunnels it drives, so the "
