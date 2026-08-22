@@ -9930,6 +9930,16 @@ class PinProxy:
             bid = str((job_rec or {}).get("bridgeSessionId") or "")
             if bid and bid.replace("session_", "cse_") in \
                     self._connected_bridges:
+                # AND THE MARK COMES OFF, because the once-per-daemon rule was
+                # written to stop a LOOP -- a session recycled into the same
+                # denial, forever -- and a session sitting on a live bridge is
+                # the proof that loop is not what happened. Keeping the mark
+                # past a recovery spends a daemon's whole lifetime of repairs
+                # on first faults: this daemon had used all of its by the time
+                # a later, unrelated break arrived, and nothing could act.
+                # A session that never recovers never reaches here, so it is
+                # still recycled exactly once and the loop guard holds.
+                self._recycled.discard(sid)
                 continue               # it already has its bridge back
             self._recycled.add(sid)    # once per session per daemon, always
             if _signal_worker(pid):
@@ -10303,6 +10313,20 @@ class PinProxy:
             f"view times out on stalls like this"
         )
 
+    def _posting_now(self) -> int:
+        """Bridges that posted inside the judging window.
+
+        NOT `len(self._bridge_posts)`, which is every bridge this daemon has
+        EVER seen and is never pruned. `deaf_bridges` filters by the window,
+        so pairing its count with the cumulative total gives a ratio whose two
+        halves describe different populations -- it drifts apart for the life
+        of the process and reads as the fleet improving while nothing changes.
+        """
+        posts = getattr(self, "_bridge_posts", None) or {}
+        stamp = time.monotonic()
+        return sum(1 for last in posts.values()
+                   if stamp - last <= _DEAF_WINDOW_S)
+
     def _deaf_clear_line(self, posted: int, prev) -> str:
         """The all-clear, and what it does NOT cover.
 
@@ -10349,9 +10373,9 @@ class PinProxy:
             # check ran and passed", so if the accounting breaks again (it has,
             # twice) every machine would certify health forever. Silence is the
             # honest answer to a question nothing has answered yet.
-            posted = len(getattr(self, "_bridge_posts", {}) or {})
-            if not posted:
-                return
+            if not (getattr(self, "_bridge_posts", None) or {}):
+                return          # nothing has ever posted: no claim either way
+            posted = self._posting_now()
             # AND THE STREAMS THIS PROCESS NEVER accept()ED. A handover passes
             # the LISTENING socket down, so posts arrive here at once while
             # every established stream stays with the process that accepted it.

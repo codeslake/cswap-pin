@@ -5762,6 +5762,87 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_session_that_recovered_can_be_repaired_again(self, certdir):
+        """THE ONCE-PER-DAEMON MARK IS A LOOP GUARD, NOT A QUOTA.
+
+        `_recycled` exists so a session recycled into the same denial is not
+        recycled forever. A session found sitting on a LIVE bridge is proof
+        that loop did not happen, so the mark has done its job and must come
+        off -- otherwise a long-lived daemon spends its whole lifetime of
+        repairs on first faults and can do nothing about a later, unrelated
+        break. Measured on a mac: a daemon 20 hours old had marked eleven
+        sessions, and none of them could be helped again.
+
+        The loop guard still holds, because a session that never recovers
+        never reaches the branch that clears the mark.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._recycled = {"S-RECOVERED", "S-STILL-BROKEN"}
+        srv._connected_bridges = {"cse_BACK"}
+
+        src = inspect.getsource(pp.PinProxy.recycle_denied_sessions)
+        assert "_recycled.discard" in src, (
+            "nothing takes the mark off, so a repaired session is unrepairable "
+            "for the life of the daemon")
+        # AND IT IS ON THE RECOVERY BRANCH, not somewhere the loop guard needs
+        # it: the discard must sit under the connected-bridge test, above the
+        # `add`, or it either never fires or undoes the guard.
+        before_add = src.split("self._recycled.add(")[0]
+        assert "_recycled.discard" in before_add, (
+            "the mark is cleared after the recycle rather than on recovery")
+        assert "_connected_bridges" in before_add.split(
+            "_recycled.discard")[0], (
+            "the mark is cleared without first proving the bridge is back")
+
+    def case_the_denominator_is_the_population_the_verdict_judges(
+            self, certdir):
+        """TWO HALVES OF ONE RATIO MUST COUNT THE SAME THING.
+
+        `deaf_bridges` filters by the window; the denominator was
+        `len(_bridge_posts)`, which is every bridge this daemon has EVER seen
+        and is never pruned. The two drift apart for the life of the process,
+        so "8 of 47" was 8 deaf now against 47 seen since boot -- a ratio that
+        shrinks on its own and reads as the fleet improving.
+
+        Measured on a mac: 47 in the denominator while the daemon held nine
+        upstream connections, which cannot serve 47 streams.
+        """
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lambda m: lines.append(m)
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = __import__("threading").Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            def wire(request_line, conn=None):
+                parts = request_line.split(" ")
+                srv._note_bridge_traffic(
+                    parts[1] if len(parts) > 1 else "/", conn=conn)
+
+            # Two bridges long gone, one posting now.
+            for old in ("cse_OLD1", "cse_OLD2"):
+                wire(f"POST /v1/code/sessions/{old}/worker/messages HTTP/1.1")
+            for old in ("cse_OLD1", "cse_OLD2"):
+                srv._bridge_posts[old] -= pp._DEAF_WINDOW_S + 1
+            wire("POST /v1/code/sessions/cse_NOW/worker/messages HTTP/1.1")
+
+            srv._report_deaf_bridges()
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+            assert "1 of 1 bridge(s)" in lines[-1], (
+                "the denominator counted bridges the verdict never judged: "
+                + lines[-1])
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_a_bridge_that_went_quiet_is_not_reported_as_recovered(
             self, certdir):
         """THE THIRD STATE THE CLEAR LINE USED TO SWALLOW.
