@@ -5724,6 +5724,10 @@ class TestDrainReportsWhatItCut:
                 parts = request_line.split(" ")
                 srv._note_bridge_traffic(
                     parts[1] if len(parts) > 1 else "/", conn=conn)
+                # THE SERVER HOLDS WHAT THIS CASE POSTS. `deaf_bridges` only
+                # judges bridges claude.ai is attached to, so a case that
+                # posts without saying so is asserting about an empty scope.
+                srv._connected_bridges = set(srv._bridge_posts)
 
             # NOTHING RECORDED YET: no claim either way. Logging the
             # all-clear here asserts health over an EMPTY population, which a
@@ -5761,6 +5765,57 @@ class TestDrainReportsWhatItCut:
                 "the transition and trains a reader to skim the file")
         finally:
             pp._log_lifecycle = real_log
+
+    def case_deaf_means_the_server_holds_it_and_we_do_not(self, certdir):
+        """POSTING WITHOUT A STREAM HAS TWO READINGS and only one is a fault.
+
+        A background job posts worker events whether or not anybody is
+        listening; claude.ai is not attached to it and no popup follows. A
+        bridge the SERVER calls connected while no stream reaches it is the
+        real thing this verdict is for.
+
+        Measured on a mac: 8 of 8 bridges reported deaf were absent from the
+        server's connected set while that set was non-empty -- the entire
+        population was the harmless kind, and the host running more background
+        jobs looked worse than the one running fewer for that reason alone.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._reset_bridge_traffic()
+        srv._live_lock = threading.Lock()
+        srv._stream_conns = set()
+        srv._open_conns = set()
+
+        def wire(path):
+            srv._note_bridge_traffic(path)
+
+        wire("/v1/code/sessions/cse_WATCHED/worker/messages")
+        wire("/v1/code/sessions/cse_NOBODY/worker/messages")
+
+        srv._connected_bridges = {"cse_WATCHED"}
+        assert srv.deaf_bridges() == ["cse_WATCHED"], (
+            "a bridge nobody is attached to was reported as a lost ear: "
+            + repr(srv.deaf_bridges()))
+
+        # CONTROL 1: the scope must not empty the verdict. With the server
+        # holding both, both are deaf.
+        srv._connected_bridges = {"cse_WATCHED", "cse_NOBODY"}
+        assert srv.deaf_bridges() == ["cse_NOBODY", "cse_WATCHED"], (
+            "the scope swallowed a real loss: " + repr(srv.deaf_bridges()))
+
+        # CONTROL 2: UNKNOWN IS NOT "CONNECTED TO NOTHING". A failed listing
+        # must not silently empty the verdict -- that would hide a real loss
+        # for as long as the listing keeps failing, which is exactly when a
+        # loss is most likely. So the scope simply does not apply, and the
+        # reporter's own blind/predecessor machinery is what speaks.
+        srv._connected_bridges = None
+        assert srv.deaf_bridges() == ["cse_NOBODY", "cse_WATCHED"], (
+            "an unknown connected set was read as an empty one, so a real "
+            "loss would go unreported while the listing is failing: "
+            + repr(srv.deaf_bridges()))
 
     def case_a_session_that_recovered_can_be_repaired_again(self, certdir):
         """THE ONCE-PER-DAEMON MARK IS A LOOP GUARD, NOT A QUOTA.
@@ -5827,6 +5882,10 @@ class TestDrainReportsWhatItCut:
                 parts = request_line.split(" ")
                 srv._note_bridge_traffic(
                     parts[1] if len(parts) > 1 else "/", conn=conn)
+                # THE SERVER HOLDS WHAT THIS CASE POSTS. `deaf_bridges` only
+                # judges bridges claude.ai is attached to, so a case that
+                # posts without saying so is asserting about an empty scope.
+                srv._connected_bridges = set(srv._bridge_posts)
 
             # Two bridges long gone, one posting now.
             for old in ("cse_OLD1", "cse_OLD2"):
@@ -5875,6 +5934,10 @@ class TestDrainReportsWhatItCut:
                 parts = request_line.split(" ")
                 srv._note_bridge_traffic(
                     parts[1] if len(parts) > 1 else "/", conn=conn)
+                # THE SERVER HOLDS WHAT THIS CASE POSTS. `deaf_bridges` only
+                # judges bridges claude.ai is attached to, so a case that
+                # posts without saying so is asserting about an empty scope.
+                srv._connected_bridges = set(srv._bridge_posts)
 
             wire("POST /v1/code/sessions/cse_QUIET/worker/messages HTTP/1.1")
             srv._report_deaf_bridges()
@@ -5916,6 +5979,10 @@ class TestDrainReportsWhatItCut:
                 parts = request_line.split(" ")
                 srv._note_bridge_traffic(
                     parts[1] if len(parts) > 1 else "/", conn=conn)
+                # THE SERVER HOLDS WHAT THIS CASE POSTS. `deaf_bridges` only
+                # judges bridges claude.ai is attached to, so a case that
+                # posts without saying so is asserting about an empty scope.
+                srv._connected_bridges = set(srv._bridge_posts)
 
             wire("POST /v1/code/sessions/cse_OK/worker/messages HTTP/1.1")
             srv._report_deaf_bridges()
@@ -6115,6 +6182,7 @@ class TestDrainReportsWhatItCut:
             srv._certdir = certdir
             srv._note_bridge_traffic(
                 "/v1/code/sessions/cse_LIVE/worker/messages")
+            srv._connected_bridges = {"cse_LIVE"}
 
             # A PREDECESSOR IS STILL DRAINING, so the stream for cse_LIVE may
             # be held by it. This process cannot see it either way.

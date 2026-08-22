@@ -10471,10 +10471,27 @@ class PinProxy:
         if not posts:
             return []
         holding = self.held_bridge_ids() | (elsewhere or set())
-        return sorted(
-            bid for bid, last in posts.items()
-            if stamp - last <= window and bid not in holding
-        )
+        out = [bid for bid, last in posts.items()
+               if stamp - last <= window and bid not in holding]
+        # AND THE SERVER MUST BE HOLDING IT. Posting without a stream has two
+        # readings and our own sockets cannot separate them: a bridge that
+        # LOST its ear, and one claude.ai is not attached to at all -- a
+        # background job posts worker events whether or not anybody is
+        # listening, and no popup follows for a bridge nobody is watching.
+        # Only the first is this verdict's subject.
+        #
+        # Measured: 8 of 8 bridges called deaf on one host were absent from
+        # the server's connected set, while that set was non-empty, so the
+        # whole population was the second kind. It also explains why a host
+        # running more background jobs looked worse than one running fewer.
+        #
+        # `None` is UNKNOWN, never "connected to nothing" -- the same rule the
+        # recycle path already follows. Judging under it would call every
+        # bridge on the host deaf the moment a listing fails.
+        known = getattr(self, "_connected_bridges", None)
+        if known is not None:
+            out = [bid for bid in out if bid in known]
+        return sorted(out)
 
     def _note_attachment(self, path: str, status_line: bytes) -> None:
         """Say whether a claude.ai attachment actually downloaded, on CHANGE.
