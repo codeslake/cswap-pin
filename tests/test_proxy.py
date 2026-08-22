@@ -16413,6 +16413,46 @@ class TestTheSpliceHoldsTheConfigLock:
         pin_proxy.splice_config_identity(self.PIN)
         assert asked == [pin_proxy._SPLICE_LOCK_S]
 
+
+    def case_the_splice_says_who_it_replaced(self, tmp_path, monkeypatch):
+        """THE FIELD HAS A WRITER OUTSIDE THIS PACKAGE. It was established by
+        sampling the field beside the roster's `activeAccountNumber`, which
+        the pin never touches -- it changed with no switch at all. That writer
+        still has no name, because neither side left a trace and the
+        reconstruction had to be done from bridge-owner stamps afterwards.
+
+        One line here is what makes the next drift attributable rather than
+        merely visible, so it is asserted rather than left to survive on
+        goodwill.
+        """
+        import contextlib
+        import io
+
+        from cswap_pin import proxy as pin_proxy
+        pin_proxy, cfg, _ = self._wire(
+            tmp_path, monkeypatch, {"accountUuid": "OTHERUUID0000"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pin_proxy.splice_config_identity(self.PIN) is True
+        line = err.getvalue()
+        assert "splicing the pin into the live config" in line, (
+            "the splice rewrote the owner field and left no trace: " + line)
+        assert "OTHERUUID000" in line, "it does not say what it replaced"
+        assert "PIN" in line, "it does not say what it wrote"
+
+    def case_CONTROL_a_no_op_splice_is_silent(self, tmp_path, monkeypatch):
+        """A line per launch on a healthy machine is noise, and this runs from
+        the launch hook. Only an actual rewrite speaks."""
+        import contextlib
+        import io
+
+        from cswap_pin import proxy as pin_proxy
+        pin_proxy, cfg, _ = self._wire(tmp_path, monkeypatch, dict(self.PIN))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pin_proxy.splice_config_identity(self.PIN) is False
+        assert "splicing the pin" not in err.getvalue()
+
     def case_CONTROL_a_matching_uuid_in_a_different_org_is_written(
         self, tmp_path, monkeypatch
     ):

@@ -4260,6 +4260,20 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
         here.get(k) == identity[k] for k in keys
     ):
         return False
+    # SAY WHO IT WAS AND WHAT IT REPLACED. The field has a writer outside this
+    # package -- established by sampling it beside the roster's
+    # `activeAccountNumber`, which the pin never touches: it changed with no
+    # switch at all. That writer still has no name, because neither side
+    # leaves a trace and the reconstruction has to be done from bridge-owner
+    # stamps after the fact. One line here is what makes the next drift
+    # attributable instead of merely visible.
+    #
+    # ACCOUNT UUIDs, NOT ADDRESSES, and truncated: this log ships on other
+    # people's machines.
+    _log_lifecycle(
+        "splicing the pin into the live config: "
+        f"{str((here or {}).get('accountUuid'))[:12]} -> "
+        f"{str(identity.get('accountUuid'))[:12]}")
     data["oauthAccount"] = identity
     # ATOMIC. A torn write here is read by every live session, and is worse
     # than an unspliced pin.
