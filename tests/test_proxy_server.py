@@ -5435,6 +5435,19 @@ class TestDrainReportsWhatItCut:
                 "is one we must not touch")
             assert cfg.read_text() == bad
 
+        # A MALFORMED oauthAccount IS STILL OURS TO REPAIR, and the diagnostic
+        # that names what it replaced must not be what stops it. `null` and
+        # `[]` are falsy, so a `(here or {})` guard covers them and reads as
+        # complete; a truthy non-dict walks straight into `.get` and the
+        # blanket except turns the whole splice into a silent no-op, leaving
+        # the field wrong on every future launch.
+        for broken in ("somebody", ["x"], 7):
+            cfg.write_text(json.dumps({"oauthAccount": broken}))
+            assert pp.splice_config_identity(want) is True, (
+                f"an oauthAccount of {broken!r} was left as it was; the pin "
+                "cannot repair a config it fails to describe")
+            assert json.loads(cfg.read_text())["oauthAccount"] == want
+
         # AND apply_pin IS THE PATH THAT CARRIES IT. Reaching a real apply_pin
         # needs a switcher and a daemon, so read the wiring out of the source.
         import inspect
@@ -6896,7 +6909,11 @@ class TestDrainReportsWhatItCut:
                                line)
             assert waited, (
                 "the drain line did not report an elapsed time at all: " + line)
-            assert float(waited.group(1)) < 20.0, (
+            # A TENTH OF THE BUDGET, NOT THE BUDGET. Bounding it by 20 admits
+            # a drain that burned 19 of its 20 seconds owing nothing, which is
+            # a broken value wearing a passing test. One second is still ten
+            # times the slowest real drain a loaded runner has produced.
+            assert float(waited.group(1)) < 1.0, (
                 "the line quotes its budget rather than what it waited: " + line)
             assert "20s budget" in line, (
                 "and it must still name the ceiling it did not need: " + line)

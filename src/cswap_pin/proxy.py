@@ -1738,7 +1738,8 @@ def heal(backup_root: Path, identity: dict | None = None,
         if _wired_port() == alive:
             return False  # serving AND wired — genuinely nothing to do
         try:
-            wire_global_config(alive, certdir / "ca.pem")
+            wire_global_config(alive, certdir / "ca.pem",
+                               lock_timeout=lock_timeout)
             return True
         except Exception:  # noqa: BLE001 — a heal must never raise
             return False
@@ -1786,9 +1787,10 @@ def heal(backup_root: Path, identity: dict | None = None,
         if port is None:
             # Could not start. Make sure a stale wiring is not left behind to
             # block sessions; better unpinned than unusable.
-            unwire_if_dead(certdir)
+            unwire_if_dead(certdir, lock_timeout=lock_timeout)
             return False
-        wire_global_config(port, certdir / "ca.pem")
+        wire_global_config(port, certdir / "ca.pem",
+                           lock_timeout=lock_timeout)
         return True
     except Exception:
         return False
@@ -1812,7 +1814,8 @@ _UNWIRE_PROBES = 3
 _UNWIRE_PROBE_GAP = 1.0
 
 
-def unwire_if_dead(certdir: Path) -> bool:
+def unwire_if_dead(certdir: Path,
+                   lock_timeout: float | None = None) -> bool:
     """Strip a pin wiring whose daemon is gone. True when it removed one.
 
     The teardown path restores ``.claude.json`` itself, but it only runs when
@@ -1881,7 +1884,7 @@ def unwire_if_dead(certdir: Path) -> bool:
                     time.sleep(_UNWIRE_PROBE_GAP)
 
     try:
-        return wire_global_config(None, None)
+        return wire_global_config(None, None, lock_timeout=lock_timeout)
     except Exception:
         return False
 
@@ -1905,7 +1908,8 @@ def _wired_port() -> int | None:
         return None
 
 
-def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
+def wire_global_config(port: int | None, ca_path: Path | None,
+                       lock_timeout: float | None = None) -> bool:
     """Route hand-launched ``claude`` sessions through the pin proxy.
 
     Claude Code applies the ``env`` block of its global config into
@@ -1937,7 +1941,12 @@ def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
     # with the account, project history and settings it carried. Hold the same
     # lock every other writer in this codebase takes, across read AND write.
     try:
-        with claude_config_lock(timeout=5):
+        # THE CALLER'S BUDGET, NOT OURS. A launch that can afford half a second
+        # reaches this through `heal`, and a hardcoded five put the stall back
+        # on the path the budget exists to bound.
+        with claude_config_lock(
+                timeout=_SPLICE_LOCK_S if lock_timeout is None
+                else lock_timeout):
             return _wire_global_config_locked(path, port, ca_path)
     except Exception:
         # A lock we cannot take is a reason to skip the write, not to fail a
@@ -2724,25 +2733,26 @@ def is_pinned_route(path: str) -> bool:
     # ruled out pinning ``oauthAccount`` itself.
     if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
         return True
-    # ``/api/oauth/profile`` IS THE THIRD SIBLING, and leaving it out is what
-    # lets Claude Code overwrite the pin in the config we just spliced.
+    # ``/api/oauth/profile`` STAYS OUT, and it is the sibling that looks most
+    # like it belongs. Claude Code merges this answer into ``oauthAccount``
+    # including ``accountUuid`` with no guard, so pinning it would stop the
+    # owner field drifting to the active account.
     #
-    # The profile fetch sits behind a 24-hour freshness gate; when it falls
-    # through, the answer is merged into ``oauthAccount`` INCLUDING
-    # ``accountUuid``, with no guard. Unpinned, it asks with the credential CC
-    # holds -- the ACTIVE account, because the pin swaps bearers here and not
-    # in the credential store -- so the server names the active account and
-    # that uuid lands on top of the pin. Measured drift on the owner field
-    # always came back as the active account, which is this.
+    # IT IS ALSO THE HOST'S IDENTITY ORACLE, and that is decisive. cswap's
+    # ``fetch_oauth_profile`` asks this exact route to answer "whose token is
+    # this", over plain urllib -- so it obeys the proxy variables the pinned
+    # session exports to its children. Swapping the bearer here makes every
+    # credential resolve to the pin, and the guard that refuses to store one
+    # account's credential under another's slot agrees with anything.
     #
-    # SAME CLASS AS THE TWO ABOVE: a question about who this session is, and
-    # its work travels as the pin, so the question must too. The neighbouring
-    # comment names ``token`` as the sibling to keep OUT and stops there,
-    # which is how this one stayed unlisted -- ``token`` is a REFRESH and
-    # swapping it mints one account's credential for another; ``profile`` only
-    # READS, so it carries none of that objection.
-    if path.split("?", 1)[0].rstrip("/") == "/api/oauth/profile":
-        return True
+    # And the answer is a whole profile document, not one field: billing type,
+    # seat tier, subscription type and rate-limit tier describe the account
+    # that is NOT paying for the inference. Two measured harms against a
+    # mechanism nobody has caught firing.
+    #
+    # THE FIELD IS REPAIRED WHERE IT IS READ. The launch hook re-asserts it,
+    # and the only thing that reads it is the restart-time reattach check --
+    # which happens after that launch, never before it.
     # ``/api/claude_code/policy_limits`` IS THE ROUTE THAT DECIDES WHETHER
     # REMOTE CONTROL IS ALLOWED AT ALL, and a wrong answer here is permanent.
     # Claude Code polls it hourly and feeds the answer into `setSessionCache`,
@@ -4291,7 +4301,7 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
     # people's machines.
     _log_lifecycle(
         "splicing the pin into the live config: "
-        f"{str((here or {}).get('accountUuid'))[:12]} -> "
+        f"{str((here if isinstance(here, dict) else {}).get('accountUuid'))[:12]} -> "
         f"{str(identity.get('accountUuid'))[:12]}")
     data["oauthAccount"] = identity
     # ATOMIC. A torn write here is read by every live session, and is worse

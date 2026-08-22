@@ -2328,8 +2328,8 @@ class TestIsPinnedRoute:
             # with the ACTIVE credential, the server names the active account,
             # and that uuid is merged over the pin in `oauthAccount` -- the
             # drift the splice then has to undo on the next launch.
-            ("/api/oauth/profile", True, "who this session is, asked as the pin"),
-            ("/api/oauth/profile?x=1", True, "same question, query form"),
+            ("/api/oauth/profile", False, "the host's own identity oracle"),
+            ("/api/oauth/profile?x=1", False, "query form, same oracle"),
             ("/api/oauth/profiles", False, "the prefix must stop at the name"),
             ("/api/oauth/profile/extra", False, "and not walk into a subtree"),
             # NOT `token`: that mints a credential for whoever's refresh_token
@@ -16425,6 +16425,56 @@ class TestTheSpliceHoldsTheConfigLock:
         pin_proxy.splice_config_identity(self.PIN)
         assert asked == [pin_proxy._SPLICE_LOCK_S]
 
+
+    def case_the_budget_reaches_the_lock_THROUGH_heal(self, tmp_path,
+                                                      monkeypatch):
+        """THE SEAM THE HOST FEATURE-DETECTS, so a dropped pass-through is
+        invisible from both sides: the host stops offering the budget and the
+        package stops asking for it, and nothing on either end says so. The
+        case above proves the splice's own plumbing and never reaches `heal`.
+
+        Every lock `heal` takes is checked, not just the splice's -- the wiring
+        and unwiring on its repair path take the same lock, and a launch that
+        budgeted half a second was still able to block on those.
+        """
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        asked = []
+
+        class _Lock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"oauthAccount": {"accountUuid": "OTHER"}}))
+
+        def _lock(**kw):
+            asked.append(kw.get("timeout"))
+            return _Lock()
+
+        real = pin_proxy.require
+        fakes = {
+            "claude_locks": types.SimpleNamespace(claude_config_lock=_lock),
+            "paths": types.SimpleNamespace(get_global_config_path=lambda: cfg),
+        }
+        monkeypatch.setattr(pin_proxy, "require",
+                            lambda name: fakes.get(name) or real(name))
+        monkeypatch.setattr(pin_proxy, "claude_config_lock", _lock,
+                            raising=False)
+        monkeypatch.setattr(pin_proxy, "_resolve_pinned_slot",
+                            lambda *a, **kw: 1)
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda *a, **kw: ("pinned@example.com", None))
+
+        pin_proxy.heal(tmp_path, identity=self.PIN, lock_timeout=0.5)
+        assert asked, "heal took no config lock at all, so this proves nothing"
+        assert set(asked) == {0.5}, (
+            f"heal charged a lock a budget its caller did not name: {asked}")
 
     def case_the_splice_says_who_it_replaced(self, tmp_path, monkeypatch):
         """THE FIELD HAS A WRITER OUTSIDE THIS PACKAGE. It was established by

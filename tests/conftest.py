@@ -340,7 +340,7 @@ def signal_if_still_ours(pid: int, certdir, sig: int) -> bool:
     # whatever ps returned. Linux has no /private prefix; the two are equal
     # there and the bug is invisible.
     #
-    # Measured on wmac: mkdtemp /var/folders/l5/.../T/tmpuuwqddva
+    # Measured on a mac: mkdtemp /var/folders/l5/.../T/tmpuuwqddva
     #                   resolve /private/var/folders/l5/.../T/tmpuuwqddva
     _cd = pathlib.Path(certdir)
     targets = {str(_cd), str(_cd.resolve())}
@@ -396,7 +396,7 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
     # whatever ps returned. Linux has no /private prefix; the two are equal
     # there and the bug is invisible.
     #
-    # Measured on wmac: mkdtemp /var/folders/l5/.../T/tmpuuwqddva
+    # Measured on a mac: mkdtemp /var/folders/l5/.../T/tmpuuwqddva
     #                   resolve /private/var/folders/l5/.../T/tmpuuwqddva
     _cd = pathlib.Path(certdir)
     targets = {str(_cd), str(_cd.resolve())}
