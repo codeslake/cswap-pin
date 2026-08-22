@@ -2724,6 +2724,25 @@ def is_pinned_route(path: str) -> bool:
     # ruled out pinning ``oauthAccount`` itself.
     if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
         return True
+    # ``/api/oauth/profile`` IS THE THIRD SIBLING, and leaving it out is what
+    # lets Claude Code overwrite the pin in the config we just spliced.
+    #
+    # The profile fetch sits behind a 24-hour freshness gate; when it falls
+    # through, the answer is merged into ``oauthAccount`` INCLUDING
+    # ``accountUuid``, with no guard. Unpinned, it asks with the credential CC
+    # holds -- the ACTIVE account, because the pin swaps bearers here and not
+    # in the credential store -- so the server names the active account and
+    # that uuid lands on top of the pin. Measured drift on the owner field
+    # always came back as the active account, which is this.
+    #
+    # SAME CLASS AS THE TWO ABOVE: a question about who this session is, and
+    # its work travels as the pin, so the question must too. The neighbouring
+    # comment names ``token`` as the sibling to keep OUT and stops there,
+    # which is how this one stayed unlisted -- ``token`` is a REFRESH and
+    # swapping it mints one account's credential for another; ``profile`` only
+    # READS, so it carries none of that objection.
+    if path.split("?", 1)[0].rstrip("/") == "/api/oauth/profile":
+        return True
     # ``/api/claude_code/policy_limits`` IS THE ROUTE THAT DECIDES WHETHER
     # REMOTE CONTROL IS ALLOWED AT ALL, and a wrong answer here is permanent.
     # Claude Code polls it hourly and feeds the answer into `setSessionCache`,

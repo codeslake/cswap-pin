@@ -2324,6 +2324,18 @@ class TestIsPinnedRoute:
             # the peer list came back without them and cross-session messaging
             # could not find a session on another machine. A read: it lists,
             # it does not mint.
+            # THE THIRD SIBLING OF validate/policy_limits. Unpinned it asks
+            # with the ACTIVE credential, the server names the active account,
+            # and that uuid is merged over the pin in `oauthAccount` -- the
+            # drift the splice then has to undo on the next launch.
+            ("/api/oauth/profile", True, "who this session is, asked as the pin"),
+            ("/api/oauth/profile?x=1", True, "same question, query form"),
+            ("/api/oauth/profiles", False, "the prefix must stop at the name"),
+            ("/api/oauth/profile/extra", False, "and not walk into a subtree"),
+            # NOT `token`: that mints a credential for whoever's refresh_token
+            # was sent, so swapping its bearer hands one account's credential
+            # to another.
+            ("/api/oauth/token", False, "a refresh, never swapped"),
             ("/v1/sessions", True, "the peer listing ListAgents reads"),
             ("/v1/sessions?limit=50", True, "same listing, paginated"),
             # THE SIBLING SPELLING, and it has now made three round trips.
