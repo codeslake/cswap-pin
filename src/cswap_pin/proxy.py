@@ -11957,6 +11957,12 @@ class PinProxy:
         holder_pid = os.getppid() if held_by_a_holder() else None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
+             # THE VERSION THE LIVE PROCESS IS RUNNING, which is not what the
+             # installed package reports: a daemon survives the install that
+             # replaced it, so anything reading a version off disk answers
+             # about code that may not be serving. Readers deciding whether a
+             # behaviour is present need this one.
+             "version": _own_version(),
              "can_pin": can_pin, "egress": egress,
              "holder_pid": holder_pid,
              "direct_last": _iso_utc(self._egress_direct_last),
