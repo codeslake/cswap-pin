@@ -16280,6 +16280,66 @@ class TestTheSpliceHoldsTheConfigLock:
     PIN = {"accountUuid": "PIN", "organizationUuid": "ORG",
            "emailAddress": "pinned@example.com"}
 
+    def case_the_daemon_re_asserts_the_remembered_pin_on_a_create(
+            self, tmp_path, monkeypatch):
+        """A bridge minted outside the launch path must still name the pin.
+
+        The launch re-assert cannot cover a restart that skips the launch, and
+        Claude Code re-merges its profile answer into the field within minutes,
+        so the create is the last moment before the owner is stamped.
+        """
+        import types as _t
+
+        pin_proxy, cfg, _taken = self._wire(
+            tmp_path, monkeypatch, {"accountUuid": "DRIFTED"})
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.remember_pin_identity(certdir, self.PIN)
+
+        pin_proxy.PinProxy._reassert_pin_identity(
+            _t.SimpleNamespace(_certdir=certdir))
+
+        got = json.loads(cfg.read_text()).get("oauthAccount") or {}
+        assert got.get("accountUuid") == "PIN", (
+            "a bridge created after a launch-bypassing restart was stamped "
+            "under " + repr(got.get("accountUuid")) + " instead of the pin")
+
+    def case_CONTROL_nothing_remembered_leaves_the_config_alone(
+            self, tmp_path, monkeypatch):
+        """The control that gives the case above its power.
+
+        With no cached identity the re-assert must be a no-op, not a write of
+        whatever it last read — otherwise the assertion above would pass on a
+        function that always wrote ``PIN``.
+        """
+        import types as _t
+
+        pin_proxy, cfg, _taken = self._wire(
+            tmp_path, monkeypatch, {"accountUuid": "DRIFTED"})
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        pin_proxy.PinProxy._reassert_pin_identity(
+            _t.SimpleNamespace(_certdir=certdir))
+
+        got = json.loads(cfg.read_text()).get("oauthAccount") or {}
+        assert got.get("accountUuid") == "DRIFTED", (
+            "the re-assert wrote an identity nobody had remembered")
+
+    def case_clearing_the_pin_forgets_the_identity(self, tmp_path,
+                                                   monkeypatch):
+        """Otherwise a cleared pin keeps re-stamping the config forever."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.remember_pin_identity(certdir, self.PIN)
+        assert pin_proxy.remembered_pin_identity(certdir) is not None
+        pin_proxy.remember_pin_identity(certdir, None)
+        assert pin_proxy.remembered_pin_identity(certdir) is None, (
+            "the cleared pin's identity survived, so the daemon keeps naming "
+            "an account that is no longer pinned")
+
     def case_the_lock_is_taken_around_the_write(self, tmp_path, monkeypatch):
         pin_proxy, cfg, taken = self._wire(
             tmp_path, monkeypatch, {"accountUuid": "OTHER"})

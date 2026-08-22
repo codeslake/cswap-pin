@@ -1667,6 +1667,12 @@ def heal(backup_root: Path, identity: dict | None = None,
                     "that will not reattach")
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
             pass
+        # AND CACHE IT FOR THE DAEMON, which has no caller to hand it one. A
+        # pin armed before this existed has nothing cached, so without a write
+        # on the launch path the re-assert on the create stays dormant until
+        # the next `cswap pin`. Inside this branch on purpose: `identity` is
+        # truthy here, and the no-identity call is the one that FORGETS.
+        remember_pin_identity(backup_root / "pin-proxy", identity)
 
     # THE ACTUAL PER-LAUNCH HOOK LANDS HERE, NOT IN `ensure_proxy`. The rc file
     # runs `cswap pin --ensure` before every hand-launched `claude`, and that
@@ -4148,6 +4154,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             _log_lifecycle("could not un-name the cleared pin in the live "
                            "config — bridges keep its owner until the next "
                            "switch")
+        remember_pin_identity(switcher.backup_dir / "pin-proxy", None)
         try:
             proxy_secret_path(switcher.backup_dir / "pin-proxy").unlink()
         except FileNotFoundError:
@@ -4193,8 +4200,42 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                                "account until the next switch")
     except Exception:  # noqa: BLE001 — the pin is already live
         pass
+    remember_pin_identity(certdir, identity)
     return ensure_proxy(switcher) is not None
 
+
+
+_PIN_IDENTITY_NAME = "pin-identity.json"
+
+
+def remember_pin_identity(certdir, identity: dict | None) -> None:
+    """Leave the pinned ``oauthAccount`` where the daemon can re-apply it.
+
+    THE PACKAGE NEVER DERIVES THIS. ``identity_for_config`` lives host-side on
+    purpose — it reads cswap's own backup store, whose layout this package has
+    no business knowing — so every splice here is handed its identity by a
+    caller. The daemon has no caller: it is still serving requests long after
+    the launch that knew the answer exited. Arming has the answer and writes it
+    once; the host still computes, the package only stores.
+    """
+    try:
+        p = Path(certdir) / _PIN_IDENTITY_NAME
+        if identity:
+            p.write_text(json.dumps(identity), encoding="utf-8")
+        else:
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass  # a pin that cannot cache its identity still pins
+
+
+def remembered_pin_identity(certdir) -> dict | None:
+    """What :func:`remember_pin_identity` last wrote, or None."""
+    try:
+        d = json.loads(
+            (Path(certdir) / _PIN_IDENTITY_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and d.get("accountUuid") else None
 
 
 def splice_config_identity(identity: dict | None,
@@ -10908,6 +10949,29 @@ class PinProxy:
         self._last_bridge_sweep = stamp
         return True
 
+    def _reassert_pin_identity(self) -> None:
+        """Re-name the pin in the live config before a bridge is minted.
+
+        THE LAUNCH RE-ASSERT DOES NOT COVER A RESTART THAT SKIPS THE LAUNCH.
+        Claude Code merges ``/api/oauth/profile`` into ``oauthAccount`` with no
+        guard, so while the active account differs from the pin that field
+        names the active one again within minutes. Every bridge minted in the
+        gap carries an owner the reattach then vetoes — measured after a forced
+        update restarted the daemon outside the launch path: 12 of 13 bridges
+        came back under the wrong account.
+
+        ON THE CREATE, WHICH IS WHEN THE OWNER IS STAMPED and which does not
+        recur, so this costs one read-modify-write per bridge and nothing on
+        the steady-state path.
+        """
+        ident = remembered_pin_identity(self._certdir)
+        if not ident:
+            return
+        try:
+            splice_config_identity(ident)
+        except Exception:  # noqa: BLE001 — a bridge must never fail on the pin
+            pass
+
     def _sweep_bridges_after_connect(self, token: str) -> None:
         """Sweep superseded bridges, right after this session opened one.
 
@@ -12124,6 +12188,12 @@ class PinProxy:
         _tok_fetched = False
         _tok = None
         if self._should_sweep_bridges(method, path):
+            # BEFORE THE SWEEP, AND THAT ORDER IS LOAD-BEARING: the carry reads
+            # this same config field to decide whose pointers to restamp, so a
+            # sweep run against a drifted field stamps the wrong owner — the
+            # veto this exists to prevent. Same ordering as `heal`.
+            if path == "/v1/code/sessions":
+                self._reassert_pin_identity()
             self._report_deaf_bridges()
             _tok, _tok_fetched = self._pin_token_provider(), True
             if _tok:
