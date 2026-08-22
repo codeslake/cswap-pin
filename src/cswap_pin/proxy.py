@@ -2619,10 +2619,8 @@ def slow_report_ms(certdir) -> "float | None":
 # installed package. Without that, a rename does not break the watcher — it
 # turns it into a permanent "no verdict yet", which is indistinguishable from
 # a healthy fleet. Same silent-absence shape as a check with no caller.
-#: How recently a bridge must have posted to be judged at all. ONE
-#: definition: `_deaf_clear_line` decides what a clear leaves out by
-#: the same window `deaf_bridges` decides membership by, and two
-#: literals is how those two populations quietly stop agreeing.
+#: How recently a bridge must have posted to be judged. ONE definition: the
+#: clear line and `deaf_bridges` must reason about the same population.
 _DEAF_WINDOW_S = 300.0
 
 DEAF_REPORT_MARK = "post but hold no inbound stream"
@@ -10309,19 +10307,12 @@ class PinProxy:
         """The all-clear, and what it does NOT cover.
 
         A CLEAR IS NOT A RECOVERY FOR A BRIDGE THAT WENT QUIET. `deaf_bridges`
-        only judges bridges that posted inside its window, so one reported
-        deaf drops out of the population by falling silent -- and the line
-        that follows says every posting bridge holds a stream, which is true
-        and says nothing about it. Deafness is the one state CC cannot leave
-        on its own, so reading that as repaired inverts the fact.
-
-        Measured on a mac: the same bridge deaf, cleared ten minutes later,
-        and deaf again six hours after that. The clear in the middle was read
-        as a recovery by a gate downstream, which then reported the fleet
-        quiet for the whole interval.
-
-        Says only what is known. Whether a silent bridge recovered cannot be
-        answered from here at all -- naming it is the point, not guessing.
+        judges only bridges that posted inside its window, so a deaf one
+        leaves by falling silent and this line is then true of everything
+        still posting and silent about it. Deafness is the one state CC
+        cannot leave on its own, so a reader taking that as repaired inverts
+        the fact. Whether a silent bridge recovered cannot be answered here;
+        naming it is the point, not guessing it.
         """
         line = f"{DEAF_REPORT_CLEAR} ({posted} posting)"
         if not isinstance(prev, list) or not prev:
