@@ -16477,21 +16477,13 @@ class TestTheSpliceHoldsTheConfigLock:
             f"heal charged a lock a budget its caller did not name: {asked}")
 
     def case_the_splice_says_who_it_replaced(self, tmp_path, monkeypatch):
-        """THE FIELD HAS A WRITER OUTSIDE THIS PACKAGE. It was established by
-        sampling the field beside the roster's `activeAccountNumber`, which
-        the pin never touches -- it changed with no switch at all. That writer
-        still has no name, because neither side left a trace and the
-        reconstruction had to be done from bridge-owner stamps afterwards.
-
-        One line here is what makes the next drift attributable rather than
-        merely visible, so it is asserted rather than left to survive on
-        goodwill.
+        """The field has a writer outside this package and leaves no trace,
+        so the line naming what it replaced is asserted, not left to goodwill.
         """
         import contextlib
         import io
 
-        from cswap_pin import proxy as pin_proxy
-        pin_proxy, cfg, _ = self._wire(
+        pin_proxy, _cfg, _ = self._wire(
             tmp_path, monkeypatch, {"accountUuid": "OTHERUUID0000"})
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -16508,8 +16500,7 @@ class TestTheSpliceHoldsTheConfigLock:
         import contextlib
         import io
 
-        from cswap_pin import proxy as pin_proxy
-        pin_proxy, cfg, _ = self._wire(tmp_path, monkeypatch, dict(self.PIN))
+        pin_proxy, _cfg, _ = self._wire(tmp_path, monkeypatch, dict(self.PIN))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             assert pin_proxy.splice_config_identity(self.PIN) is False

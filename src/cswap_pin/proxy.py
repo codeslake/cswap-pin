@@ -1485,8 +1485,13 @@ def _resolve_pinned_slot(backup_root: Path, email: str) -> str | None:
         return None
 
 
+#: The splice's own lock budget when the caller names none -- a hand-run
+#: `cswap pin`, where waiting is better than skipping the write.
+_SPLICE_LOCK_S = 5.0
+
+
 def heal(backup_root: Path, identity: dict | None = None,
-         lock_timeout: float | None = None) -> bool:
+         lock_timeout: float = _SPLICE_LOCK_S) -> bool:
     """Bring the pin back if it is pinned but not serving. True when it did.
 
     ``identity`` is the ``oauthAccount`` the live config should name while the
@@ -1815,7 +1820,7 @@ _UNWIRE_PROBE_GAP = 1.0
 
 
 def unwire_if_dead(certdir: Path,
-                   lock_timeout: float | None = None) -> bool:
+                   lock_timeout: float = _SPLICE_LOCK_S) -> bool:
     """Strip a pin wiring whose daemon is gone. True when it removed one.
 
     The teardown path restores ``.claude.json`` itself, but it only runs when
@@ -1909,7 +1914,7 @@ def _wired_port() -> int | None:
 
 
 def wire_global_config(port: int | None, ca_path: Path | None,
-                       lock_timeout: float | None = None) -> bool:
+                       lock_timeout: float = _SPLICE_LOCK_S) -> bool:
     """Route hand-launched ``claude`` sessions through the pin proxy.
 
     Claude Code applies the ``env`` block of its global config into
@@ -1944,9 +1949,7 @@ def wire_global_config(port: int | None, ca_path: Path | None,
         # THE CALLER'S BUDGET, NOT OURS. A launch that can afford half a second
         # reaches this through `heal`, and a hardcoded five put the stall back
         # on the path the budget exists to bound.
-        with claude_config_lock(
-                timeout=_SPLICE_LOCK_S if lock_timeout is None
-                else lock_timeout):
+        with claude_config_lock(timeout=lock_timeout):
             return _wire_global_config_locked(path, port, ca_path)
     except Exception:
         # A lock we cannot take is a reason to skip the write, not to fail a
@@ -2733,26 +2736,13 @@ def is_pinned_route(path: str) -> bool:
     # ruled out pinning ``oauthAccount`` itself.
     if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
         return True
-    # ``/api/oauth/profile`` STAYS OUT, and it is the sibling that looks most
-    # like it belongs. Claude Code merges this answer into ``oauthAccount``
-    # including ``accountUuid`` with no guard, so pinning it would stop the
-    # owner field drifting to the active account.
-    #
-    # IT IS ALSO THE HOST'S IDENTITY ORACLE, and that is decisive. cswap's
-    # ``fetch_oauth_profile`` asks this exact route to answer "whose token is
-    # this", over plain urllib -- so it obeys the proxy variables the pinned
-    # session exports to its children. Swapping the bearer here makes every
-    # credential resolve to the pin, and the guard that refuses to store one
-    # account's credential under another's slot agrees with anything.
-    #
-    # And the answer is a whole profile document, not one field: billing type,
-    # seat tier, subscription type and rate-limit tier describe the account
-    # that is NOT paying for the inference. Two measured harms against a
-    # mechanism nobody has caught firing.
-    #
-    # THE FIELD IS REPAIRED WHERE IT IS READ. The launch hook re-asserts it,
-    # and the only thing that reads it is the restart-time reattach check --
-    # which happens after that launch, never before it.
+    # ``/api/oauth/profile`` STAYS OUT even though Claude Code merges it into
+    # ``oauthAccount``: it is also cswap's identity oracle. Its
+    # ``fetch_oauth_profile`` asks this route over urllib, obeying the proxy
+    # vars a pinned session exports to its children, so swapping the bearer
+    # makes every credential resolve to the pin and the guard against storing
+    # a foreign credential under a slot agrees with anything. The launch hook
+    # repairs the field instead.
     # ``/api/claude_code/policy_limits`` IS THE ROUTE THAT DECIDES WHETHER
     # REMOTE CONTROL IS ALLOWED AT ALL, and a wrong answer here is permanent.
     # Claude Code polls it hourly and feeds the answer into `setSessionCache`,
@@ -4202,13 +4192,9 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     return ensure_proxy(switcher) is not None
 
 
-#: The splice's own lock budget when the caller names none -- a hand-run
-#: `cswap pin`, where waiting is better than skipping the write.
-_SPLICE_LOCK_S = 5.0
-
 
 def splice_config_identity(identity: dict | None,
-                           lock_timeout: float | None = None) -> bool:
+                           lock_timeout: float = _SPLICE_LOCK_S) -> bool:
     """Make the live config name ``identity``. True when it changed anything.
 
     ONLY ``oauthAccount``. Everything else in that file belongs to Claude Code,
@@ -4244,8 +4230,7 @@ def splice_config_identity(identity: dict | None,
     # already has.
     try:
         with require("claude_locks").claude_config_lock(
-                timeout=_SPLICE_LOCK_S if lock_timeout is None
-                else lock_timeout):
+                timeout=lock_timeout):
             return _splice_config_identity_locked(cfg, identity)
     except Exception:  # noqa: BLE001 — a launch must never fail on the pin
         return False
@@ -4289,20 +4274,7 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
         here.get(k) == identity[k] for k in keys
     ):
         return False
-    # SAY WHO IT WAS AND WHAT IT REPLACED. The field has a writer outside this
-    # package -- established by sampling it beside the roster's
-    # `activeAccountNumber`, which the pin never touches: it changed with no
-    # switch at all. That writer still has no name, because neither side
-    # leaves a trace and the reconstruction has to be done from bridge-owner
-    # stamps after the fact. One line here is what makes the next drift
-    # attributable instead of merely visible.
-    #
-    # ACCOUNT UUIDs, NOT ADDRESSES, and truncated: this log ships on other
-    # people's machines.
-    _log_lifecycle(
-        "splicing the pin into the live config: "
-        f"{str((here if isinstance(here, dict) else {}).get('accountUuid'))[:12]} -> "
-        f"{str(identity.get('accountUuid'))[:12]}")
+    was = here.get("accountUuid") if isinstance(here, dict) else here
     data["oauthAccount"] = identity
     # ATOMIC. A torn write here is read by every live session, and is worse
     # than an unspliced pin.
@@ -4316,6 +4288,15 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
         except OSError:
             pass
         return False
+    # SAY WHO IT REPLACED. The field has a writer outside this package and
+    # neither side leaves a trace, so this line is what makes the next drift
+    # attributable rather than merely visible. AFTER the write, or a failed
+    # `os.replace` records a splice that did not happen -- which is the one
+    # thing an attribution line must never do. Truncated uuids, never
+    # addresses: this log ships on other people's machines.
+    _log_lifecycle("splicing the pin into the live config: "
+                   f"{str(was)[:12]} -> "
+                   f"{str(identity.get('accountUuid'))[:12]}")
     return True
 
 
