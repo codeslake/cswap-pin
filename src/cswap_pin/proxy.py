@@ -12407,6 +12407,13 @@ class PinProxy:
             upgrading = any(
                 k.lower() == "upgrade" and v.strip() for k, v in headers
             )
+            # WHO IS ASKING, on the trace line. Two callers reach this proxy
+            # for the same routes -- Claude Code's own client and cswap's
+            # urllib fetch -- and a decision about answering one differently
+            # from the other cannot be made from a trace that records neither.
+            # Truncated: the value is for telling them apart, not for reading.
+            _ua = next((v.strip()[:40] for k, v in headers
+                        if k.lower() == "user-agent"), "-")
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
             # _read_body decoded a chunked body, and the transfer-coding
@@ -12527,7 +12534,7 @@ class PinProxy:
                     self._note_attachment(path, st),
                     self._tunnel_trace(
                         f"    <- {st.decode('latin1', 'replace').strip()}"
-                        f"  {method} {path}"),
+                        f"  {method} {path}  ua={_ua}"),
                     self._note_slow_request(
                         method, path,
                         (time.monotonic() - getattr(
