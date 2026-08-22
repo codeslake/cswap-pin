@@ -5762,6 +5762,96 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_bridge_that_went_quiet_is_not_reported_as_recovered(
+            self, certdir):
+        """THE THIRD STATE THE CLEAR LINE USED TO SWALLOW.
+
+        `deaf_bridges` only judges bridges that posted inside its window, so a
+        deaf one leaves the population by falling SILENT -- and the all-clear
+        that follows is true of everything still posting and says nothing
+        about it. Deafness is the one state CC cannot leave on its own, so a
+        reader taking that as a recovery inverts the fact.
+
+        Measured on a mac: one bridge deaf, clear ten minutes later, deaf
+        again six hours after that. A gate downstream read the middle line as
+        a recovery and reported the fleet quiet for the whole interval.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lambda m: lines.append(m)
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            def wire(request_line, conn=None):
+                parts = request_line.split(" ")
+                srv._note_bridge_traffic(
+                    parts[1] if len(parts) > 1 else "/", conn=conn)
+
+            wire("POST /v1/code/sessions/cse_QUIET/worker/messages HTTP/1.1")
+            srv._report_deaf_bridges()
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+
+            # IT NEVER GOT A STREAM. It simply stopped posting, which is what
+            # ages it out of the window -- no recovery happened.
+            srv._bridge_posts["cse_QUIET"] -= pp._DEAF_WINDOW_S + 1
+            srv._report_deaf_bridges()
+            assert lines[-1].startswith(pp.DEAF_REPORT_CLEAR), lines[-1]
+            assert "cse_QUIET" in lines[-1], (
+                "the all-clear silently absorbed a bridge that was deaf when "
+                "it was last seen: " + lines[-1])
+            assert "stopped posting" in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_CONTROL_a_bridge_that_really_recovered_is_a_plain_clear(
+            self, certdir):
+        """The control that keeps the fix from smearing a caveat over every
+        recovery. A bridge that got its stream while still posting IS
+        repaired, and the line must stay the verbatim all-clear a monitor
+        matches on."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lambda m: lines.append(m)
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            def wire(request_line, conn=None):
+                parts = request_line.split(" ")
+                srv._note_bridge_traffic(
+                    parts[1] if len(parts) > 1 else "/", conn=conn)
+
+            wire("POST /v1/code/sessions/cse_OK/worker/messages HTTP/1.1")
+            srv._report_deaf_bridges()
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+
+            conn = object()
+            wire("GET /v1/code/sessions/cse_OK/worker/events/stream HTTP/1.1",
+                 conn=conn)
+            srv._stream_conns.add(conn)
+            srv._open_conns.add(conn)
+            srv._report_deaf_bridges()
+            assert lines[-1] == f"{pp.DEAF_REPORT_CLEAR} (1 posting)", (
+                "a real recovery grew a caveat it has not earned: "
+                + lines[-1])
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_an_armed_trace_shows_responses_not_just_requests(self, certdir):
         """The file-armed trace could not show what the server ANSWERED.
 

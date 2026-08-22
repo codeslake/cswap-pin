@@ -2619,6 +2619,12 @@ def slow_report_ms(certdir) -> "float | None":
 # installed package. Without that, a rename does not break the watcher — it
 # turns it into a permanent "no verdict yet", which is indistinguishable from
 # a healthy fleet. Same silent-absence shape as a check with no caller.
+#: How recently a bridge must have posted to be judged at all. ONE
+#: definition: `_deaf_clear_line` decides what a clear leaves out by
+#: the same window `deaf_bridges` decides membership by, and two
+#: literals is how those two populations quietly stop agreeing.
+_DEAF_WINDOW_S = 300.0
+
 DEAF_REPORT_MARK = "post but hold no inbound stream"
 DEAF_REPORT_CLEAR = "every posting bridge holds an inbound stream"
 # THE THIRD ANSWER, because two of them leak the case that actually happens.
@@ -10299,6 +10305,37 @@ class PinProxy:
             f"view times out on stalls like this"
         )
 
+    def _deaf_clear_line(self, posted: int, prev) -> str:
+        """The all-clear, and what it does NOT cover.
+
+        A CLEAR IS NOT A RECOVERY FOR A BRIDGE THAT WENT QUIET. `deaf_bridges`
+        only judges bridges that posted inside its window, so one reported
+        deaf drops out of the population by falling silent -- and the line
+        that follows says every posting bridge holds a stream, which is true
+        and says nothing about it. Deafness is the one state CC cannot leave
+        on its own, so reading that as repaired inverts the fact.
+
+        Measured on a mac: the same bridge deaf, cleared ten minutes later,
+        and deaf again six hours after that. The clear in the middle was read
+        as a recovery by a gate downstream, which then reported the fleet
+        quiet for the whole interval.
+
+        Says only what is known. Whether a silent bridge recovered cannot be
+        answered from here at all -- naming it is the point, not guessing.
+        """
+        line = f"{DEAF_REPORT_CLEAR} ({posted} posting)"
+        if not isinstance(prev, list) or not prev:
+            return line
+        posts = getattr(self, "_bridge_posts", None) or {}
+        stamp = time.monotonic()
+        gone = [b for b in prev
+                if stamp - posts.get(b, -1e9) > _DEAF_WINDOW_S]
+        if not gone:
+            return line
+        return (line + f" — but {len(gone)} of them stopped posting instead of "
+                "recovering, so this line does not cover them and deafness is "
+                f"not a state a session leaves by itself: {' '.join(gone)}")
+
     def _report_deaf_bridges(self) -> None:
         """Say which bridges post but hold no inbound stream, on CHANGE.
 
@@ -10348,10 +10385,11 @@ class PinProxy:
             # bridge NOT deaf. So an empty local answer cannot be changed by
             # anything a predecessor holds, and there is nothing to ask.
             if not self.deaf_bridges():
-                if [] == getattr(self, "_last_deaf", None):
+                prev = getattr(self, "_last_deaf", None)
+                if [] == prev:
                     return
                 self._last_deaf = []
-                _log_lifecycle(f"{DEAF_REPORT_CLEAR} ({posted} posting)")
+                _log_lifecycle(self._deaf_clear_line(posted, prev))
                 return
             certdir = getattr(self, "_certdir", None)
             elsewhere: set = set()
@@ -10367,7 +10405,8 @@ class PinProxy:
                 (elsewhere.update(ids) if said else mute.append(p))
             now = (("mute", tuple(sorted(mute))) if mute
                    else sorted(self.deaf_bridges(elsewhere=elsewhere)))
-            if now == getattr(self, "_last_deaf", None):
+            prev = getattr(self, "_last_deaf", None)
+            if now == prev:
                 return
             self._last_deaf = now
             if mute:
@@ -10386,11 +10425,11 @@ class PinProxy:
                     f"clears it: {' '.join(now)}"
                 )
             else:
-                _log_lifecycle(f"{DEAF_REPORT_CLEAR} ({posted} posting)")
+                _log_lifecycle(self._deaf_clear_line(posted, prev))
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
-    def deaf_bridges(self, window: float = 300.0, now=None,
+    def deaf_bridges(self, window: float = _DEAF_WINDOW_S, now=None,
                      elsewhere: "set | None" = None) -> list:
         """Bridge ids that POSTED inside ``window`` and hold no inbound stream.
 
