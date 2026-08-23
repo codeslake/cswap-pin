@@ -9015,9 +9015,15 @@ def _retire_blind_holder(env=None) -> bool:
     somewhere that CAN read mints again" does not hold: the successor is born
     from the HOLDER, never from whoever ran the command.
 
-    Measured: a holder alive across three daemon respawns, every successor
-    can_pin false, `cswap pin <n>` printing success each time and changing
-    nothing.
+    THE OBSERVATION THAT MOTIVATED THIS DID NOT SUPPORT IT. A holder alive
+    across three daemon respawns with every successor can_pin false was read
+    as evidence for the inheritance above; the cause turned out to be
+    `invalid_grant` on the pinned slot — a dead refresh lineage that no
+    respawn, holder or context can fix. Read `usage.json`'s `lastError`
+    before reaching for this: `can_pin` is "can MINT", not "can read the
+    credential", and the two come apart exactly when the stored blob is fine.
+    The mechanism described above is still the right reason for this function
+    to exist; it has not been shown to have caused an outage yet.
 
     Same signal and same safety argument as :func:`_retire_stale_holder`.
     SIGHUP, which no holder version handles, and this caller does not release
