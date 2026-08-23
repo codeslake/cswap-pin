@@ -8974,6 +8974,12 @@ def _parent_is_a_holder(pid: int) -> bool:
 def _retire_blind_holder(env=None) -> bool:
     """Send this daemon's holder away when we cannot read the pinned credential.
 
+    NOT CALLED FROM THE REQUEST PATH ANY MORE -- see `_warn_unpinnable`. Firing
+    it there manufactured an orphan every tick and the orphan branch has no
+    backoff, so the triad rebuilt every 31 seconds without converging. Kept
+    because it is still the right action for a holder that IS the fault, and
+    it must only ever be reached from a caller that throttles it.
+
     THE LEVER NOTHING PULLED. A holder is spawned once and never again, and
     every daemon it places on the socket inherits its process context — on
     macOS that includes the audit session which decides whether the login
@@ -12083,14 +12089,13 @@ class PinProxy:
             mark_daemon_unpinnable(self._certdir)
         except Exception:  # noqa: BLE001 — advisory; never break a request
             pass
-        # AND RETIRE THE HOLDER, or the mark above is the only thing that
-        # happens and the next daemon is blind for the same reason this one is.
-        # Once per process, like the mark: this method is gated on
-        # `_warned_unpinnable`, so there is no signal storm.
-        try:
-            _retire_blind_holder()
-        except Exception:  # noqa: BLE001 — advisory; never break a request
-            pass
+        # THE HOLDER IS NOT RETIRED HERE, and the reason is measured. Doing
+        # that manufactures the orphan condition on the very next tick, and the
+        # orphan branch of the code watchdog has no backoff -- so a machine
+        # that cannot mint rebuilt its whole triad every 31 seconds, for ever.
+        # The self-heal in the watchdog already gets a fresh daemon from the
+        # holder, and IT is throttled; a second, unthrottled path to the same
+        # outcome is not redundancy, it is the loop.
         try:
             sys.stderr.write(
                 "cswap pin: the pinned account's token could not be read, so "

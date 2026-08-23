@@ -16824,35 +16824,41 @@ class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
         finally:
             srv.close()
 
-    def test_the_daemon_actually_calls_the_retirement(self, monkeypatch):
-        """THE WIRING, not the function. Both halves can be perfect and do
-        nothing if `_warn_unpinnable` never reaches the retirement -- and that
-        method is the only place in the process that learns it is blind.
+    def test_the_request_path_does_NOT_retire_the_holder(self, monkeypatch):
+        """INVERTED BY MEASUREMENT, not by convenience.
 
-        Asserted on the seam rather than by driving a request: the caller sits
-        behind a live MITM round trip, and reproducing one here would test
-        Textual-grade plumbing instead of the contract.
+        This asserted the opposite for one release, on the reasoning that a
+        successor inherits the holder's context so the holder must go. On a
+        live machine that produced a 31-second loop: retiring the holder makes
+        the next tick see `_orphaned_from_its_holder()`, and the orphan branch
+        of the code watchdog has no backoff, so it rebuilt the triad whose new
+        daemon was blind for the same reason and orphaned itself again.
+
+        The watchdog's own self-heal asks the holder for a successor and IS
+        throttled. One throttled path is the design; a second unthrottled one
+        reached from a request path is the loop.
         """
         from cswap_pin import proxy as pin_proxy
 
         called = []
         monkeypatch.setattr(pin_proxy, "_retire_blind_holder",
                             lambda: called.append("retire") or True)
+        marked = []
         monkeypatch.setattr(pin_proxy, "mark_daemon_unpinnable",
-                            lambda _cd: None)
+                            lambda _cd: marked.append("mark"))
 
         obj = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         obj._certdir = "/nowhere"
         obj._warn_unpinnable()
-        assert called == ["retire"], (
-            "the daemon marked itself blind and left its holder in place, so "
-            "the successor inherits the same unreadable context")
 
-        # ONCE PER PROCESS, like the mark beside it: this runs on a request
-        # path a pinned session hits continuously, and a signal each would be
-        # a storm aimed at the holder.
-        obj._warn_unpinnable()
-        assert called == ["retire"], "a second call signalled the holder again"
+        assert called == [], (
+            "the request path retired the holder, which orphans this daemon "
+            "and hands an unthrottled branch the same repair -- measured as a "
+            "rebuild every 31 seconds that never converged")
+        # CONTROL: the method still RAN, so the assertion above is about the
+        # retirement and not about a `_warn_unpinnable` that did nothing.
+        assert marked == ["mark"], (
+            "the daemon did not even record that it cannot mint")
 
     def test_a_bare_liveness_probe_does_not_ask(self, tmp_path):
         """`heal` uses the unfingerprinted form deliberately: something IS
