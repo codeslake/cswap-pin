@@ -4727,6 +4727,27 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         if port is not None:
             wire_global_config(port, ca)
             return port, ca
+        # A HANDOVER IN FLIGHT IS NOT "NOTHING IS SERVING". `_read_alive_port`
+        # returns None for it, correctly — the recorded daemon has stopped and
+        # its successor has not published — but that None means "wait", not
+        # "spawn". Taken as "spawn" it produces the mirror image of the bug
+        # this file spent a night on: `cswap pin <n>` reporting "no proxy is
+        # running, so nothing is pinned yet" while the successor published 16
+        # seconds later and the pin was fine. A false failure sends someone
+        # chasing a repair that is already happening.
+        #
+        # Same bounded wait and same loop as the recycle branch below, because
+        # it is the same question: the holder owns the replacement and we are
+        # waiting for it to appear.
+        settling = read_daemon_state(certdir)
+        if settling and settling.get("handover"):
+            for _ in range(int(_SPAWN_WAIT_S * 10)):
+                time.sleep(0.1)
+                port = _read_alive_port(certdir, fingerprint=fp)
+                if port is not None:
+                    wire_global_config(port, ca)
+                    return port, ca
+
         # A daemon exists but is stale (wrong account, or redeployed code) —
         # recycle it before spawning, so a redeploy/repin takes effect instead
         # of a stale daemon serving forever.

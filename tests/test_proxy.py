@@ -16770,3 +16770,105 @@ class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
             assert pin_proxy._read_alive_port(cd) == port
         finally:
             srv.close()
+
+
+class TestAHandoverIsNotAFailure:
+    """The mirror image of the blind-daemon bug: a false FAILURE.
+
+    Measured while repairing a machine by hand. `cswap pin 1` returned rc=1
+    with "no proxy is running, so nothing is pinned yet" at one moment, and
+    the successor published 16 seconds later with the pin perfectly healthy.
+    `_read_alive_port` returns None for a record marked `handover`, which is
+    right for the reuse question and wrong as an answer to "is anything
+    coming" -- taken as "spawn", it reports a repair that is already happening
+    as a repair that failed.
+    """
+
+    def _record(self, tmp_path, port, pid, fp, handover):
+        """Write the record where ensure_proxy will look: <backup>/pin-proxy."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        cd = tmp_path / "pin-proxy"
+        cd.mkdir(parents=True, exist_ok=True)
+        rec = {"port": port, "pid": pid, "fingerprint": fp}
+        if handover:
+            rec["handover"] = True
+        (cd / pin_proxy._STATE_FILE).write_text(json.dumps(rec))
+        return cd
+
+    def test_the_successor_is_waited_for_not_spawned_over(self, tmp_path,
+                                                          monkeypatch):
+        """The successor publishes while we wait; nothing is spawned."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._record(tmp_path, 41000, os.getpid(), "FP", handover=True)
+
+        seen = {"reads": 0}
+        spawned = []
+
+        def fake_read(cd, fingerprint=None):
+            seen["reads"] += 1
+            # the handover settles on the third look
+            return 41000 if seen["reads"] >= 3 else None
+
+        monkeypatch.setattr(pin_proxy, "_read_alive_port", fake_read)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *_a: spawned.append("spawn") or None)
+        got = self._drive(pin_proxy, monkeypatch, tmp_path)
+        assert got is not None, (
+            "a handover in flight was reported as nothing serving -- the "
+            "caller prints 'no proxy is running' over a pin that is fine")
+        assert spawned == [], "spawned over a successor that was already coming"
+
+    def test_a_record_with_no_handover_does_not_wait(self, tmp_path, monkeypatch):
+        """THE CONTROL. Without it the test above passes on any wait at all,
+        and an unconditional one would put `_SPAWN_WAIT_S` on every launch
+        that legitimately needs a spawn."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._record(tmp_path, 41000, os.getpid(), "FP", handover=False)
+
+        spawned = []
+        monkeypatch.setattr(pin_proxy, "_read_alive_port",
+                            lambda cd, fingerprint=None: None)
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda _cd: set())
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *_a: spawned.append("spawn") or 41000)
+        slept = []
+        monkeypatch.setattr(pin_proxy.time, "sleep", lambda s: slept.append(s))
+        self._drive(pin_proxy, monkeypatch, tmp_path)
+        assert spawned == ["spawn"], "did not spawn when nothing was coming"
+        assert slept == [], (
+            f"waited {len(slept)} tick(s) with no handover in the record -- "
+            f"that is _SPAWN_WAIT_S added to every launch that needs a spawn")
+
+    # -- harness -----------------------------------------------------------
+
+    def _drive(self, pin_proxy, monkeypatch, tmp_path):
+        """Call ensure_proxy with everything around the decision stubbed out.
+
+        Only the reuse/wait/spawn decision is under test; the CA, the chain
+        probe and the wiring are other tests' subjects.
+        """
+        class _SW:
+            backup_dir = tmp_path
+
+            def resolve_account(self, email):
+                return "1", email, None
+
+        monkeypatch.setattr(pin_proxy, "load_pin", lambda _bd: ("a@b.c", ""))
+        monkeypatch.setattr(pin_proxy, "_carry_history_pointers", lambda _cd: None)
+        monkeypatch.setattr(pin_proxy, "_ambient_chain",
+                            lambda certdir=None: (None, None))
+        monkeypatch.setattr(pin_proxy, "_probe_next_hop", lambda _a: None)
+        monkeypatch.setattr(pin_proxy, "write_upstream_hint",
+                            lambda *_a, **_k: None)
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *_a: "FP")
+        monkeypatch.setattr(pin_proxy, "ensure_ca", lambda *_a: None)
+        monkeypatch.setattr(pin_proxy, "publish_ca", lambda _p: None)
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *_a: None)
+        monkeypatch.setattr(pin_proxy, "unwire_if_dead", lambda _cd: None)
+        got = pin_proxy.ensure_proxy(_SW())
+        return got if got is None else got[0]
