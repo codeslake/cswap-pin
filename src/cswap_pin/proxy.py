@@ -4591,9 +4591,27 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             token = _live_token(creds)
             if token:
                 return token
-            token, rotated = resolve_pin_token(
-                creds, lambda c: _consume(c, num, mail)
-            )
+            # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error` already
+            # classifies this -- `invalid_grant` means the lineage is dead and
+            # only a person can fix it, `transient` means try again -- and it
+            # was being dropped on the floor. The warning then said "could not
+            # be read" for a credential that read perfectly, whose ACCESS token
+            # had merely expired and whose refresh the server had rejected.
+            # Those need opposite responses and looked identical in a log.
+            def _consume_recording(c):
+                out = _consume(c, num, mail)
+                err = getattr(out, "error", None)
+                if err:
+                    provider.blind_reason = (
+                        f"refresh {err} for slot {num} ({mail})")
+                return out
+
+            token, rotated = resolve_pin_token(creds, _consume_recording)
+            if token is None and not getattr(provider, "blind_reason", ""):
+                # The refresh reported no error and still produced nothing.
+                # Say that rather than nothing.
+                provider.blind_reason = (
+                    f"no token after refresh for slot {num} ({mail})")
             # The gate persists internally (under the slot lock, CAS on the
             # refresh-token fingerprint). Persisting again here would write
             # back OUTSIDE that lock and could clobber a racing writer's
