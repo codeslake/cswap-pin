@@ -16575,3 +16575,198 @@ class TestTheSpliceHoldsTheConfigLock:
             tmp_path, monkeypatch,
             {"accountUuid": "PIN", "organizationUuid": "OTHER-ORG"})
         assert pin_proxy.splice_config_identity(self.PIN) is True
+
+
+class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
+    """The two halves of one measured failure.
+
+    A holder is spawned once and never again, and every daemon it places on
+    the socket inherits its process context. A holder born where the login
+    keychain is unreachable therefore produces blind daemons for ever. The
+    mark that was supposed to stop them being reused is written once per
+    process and erased by the next successor's record, so `cswap pin <n>` ran
+    to completion, printed "Pinned the cloud account", left the pid unchanged
+    and can_pin false, and reported success.
+    """
+
+    # -- the holder half ---------------------------------------------------
+
+    def _held(self, monkeypatch, sent):
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        return pin_proxy
+
+    def test_a_blind_daemon_retires_the_holder_above_it(self, monkeypatch):
+        sent = []
+        p = self._held(monkeypatch, sent)
+        assert p._retire_blind_holder() is True
+        assert sent == [(os.getppid(), p._STAND_DOWN_SIGNAL)], (
+            "the holder was left in place, so the successor inherits the same "
+            "unreadable process context and the next daemon is blind too")
+
+    def test_it_is_not_gated_on_the_fingerprint(self, monkeypatch):
+        """The difference from `_retire_stale_holder`, and the whole point.
+
+        That one retires a holder running code we no longer ship. This holder
+        is running exactly our code; what is wrong is WHERE IT WAS BORN, which
+        no version comparison can see. Publish a matching sha and it must
+        still fire.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        self._held(monkeypatch, sent)
+        monkeypatch.setenv(pin_proxy._HOLDER_SHA_ENV, pin_proxy._OWN_FINGERPRINT)
+        assert pin_proxy._retire_blind_holder() is True
+        assert sent, "a same-version holder was spared — birth context is not a version"
+        # CONTROL: the sibling declines on exactly this input, so the test
+        # above is measuring the new behaviour and not a shared code path.
+        sent.clear()
+        assert pin_proxy._retire_stale_holder(pin_proxy._OWN_FINGERPRINT) is False
+        assert sent == []
+
+    def test_an_unheld_daemon_signals_nothing(self, monkeypatch):
+        """A bare daemon or a test harness also answers "no holder", and
+        signalling its parent would hit whatever launched it."""
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+        monkeypatch.delenv(pin_proxy._HELD_BY_ENV, raising=False)
+        assert pin_proxy._retire_blind_holder() is False
+        assert sent == []
+        # CONTROL: the only thing that differs is the marker.
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        assert pin_proxy._retire_blind_holder() is True
+
+    def test_no_signal_on_this_platform_is_a_decline_not_a_raise(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        self._held(monkeypatch, sent)
+        monkeypatch.setattr(pin_proxy, "_STAND_DOWN_SIGNAL", None)
+        assert pin_proxy._retire_blind_holder() is False
+        assert sent == [], "os.kill(pid, None) is a TypeError, not a retirement"
+
+    # -- the reuse half ----------------------------------------------------
+
+    def _health_server(self, body: bytes | None):
+        """A loopback listener answering /health, or accepting and saying
+        nothing when ``body`` is None."""
+        import socket as _s
+        import threading
+
+        srv = _s.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                with c:
+                    try:
+                        c.recv(4096)
+                        if body is not None:
+                            c.sendall(b"HTTP/1.0 200 OK\r\n\r\n" + body)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        return srv, srv.getsockname()[1]
+
+    def _record(self, tmp_path, port):
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        (tmp_path / pin_proxy._STATE_FILE).write_text(json.dumps(
+            {"port": port, "pid": os.getpid(), "fingerprint": "FP"}))
+        return tmp_path
+
+    def test_a_daemon_that_says_it_cannot_mint_is_not_reused(self, tmp_path):
+        """THE RECORD IS CLEAN — no `unpinnable` key, exactly as measured on
+        the machine where every repair path reported success."""
+        from cswap_pin import proxy as pin_proxy
+
+        srv, port = self._health_server(b'{"can_pin": false}')
+        try:
+            cd = self._record(tmp_path, port)
+            assert pin_proxy._read_alive_port(cd, fingerprint="FP") is None, (
+                "a daemon that mints nothing was handed back to the caller "
+                "that is trying to fix exactly that")
+        finally:
+            srv.close()
+
+    def test_a_healthy_daemon_is_still_reused(self, tmp_path):
+        """The control. Without it the test above passes on any refusal."""
+        from cswap_pin import proxy as pin_proxy
+
+        srv, port = self._health_server(b'{"can_pin": true}')
+        try:
+            cd = self._record(tmp_path, port)
+            assert pin_proxy._read_alive_port(cd, fingerprint="FP") == port
+        finally:
+            srv.close()
+
+    def test_a_daemon_that_will_not_answer_reads_as_healthy(self, tmp_path):
+        """None is "it would not say", and must not recycle on every launch.
+
+        A busy daemon missing the deadline is the common case; refusing it
+        would spawn a successor per launch and cut in-flight requests each
+        time — the non-convergence this file already records.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        srv, port = self._health_server(None)      # accepts, answers nothing
+        try:
+            cd = self._record(tmp_path, port)
+            assert pin_proxy._read_alive_port(cd, fingerprint="FP") == port
+        finally:
+            srv.close()
+
+    def test_the_daemon_actually_calls_the_retirement(self, monkeypatch):
+        """THE WIRING, not the function. Both halves can be perfect and do
+        nothing if `_warn_unpinnable` never reaches the retirement -- and that
+        method is the only place in the process that learns it is blind.
+
+        Asserted on the seam rather than by driving a request: the caller sits
+        behind a live MITM round trip, and reproducing one here would test
+        Textual-grade plumbing instead of the contract.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        called = []
+        monkeypatch.setattr(pin_proxy, "_retire_blind_holder",
+                            lambda: called.append("retire") or True)
+        monkeypatch.setattr(pin_proxy, "mark_daemon_unpinnable",
+                            lambda _cd: None)
+
+        obj = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        obj._certdir = "/nowhere"
+        obj._warn_unpinnable()
+        assert called == ["retire"], (
+            "the daemon marked itself blind and left its holder in place, so "
+            "the successor inherits the same unreadable context")
+
+        # ONCE PER PROCESS, like the mark beside it: this runs on a request
+        # path a pinned session hits continuously, and a signal each would be
+        # a storm aimed at the holder.
+        obj._warn_unpinnable()
+        assert called == ["retire"], "a second call signalled the holder again"
+
+    def test_a_bare_liveness_probe_does_not_ask(self, tmp_path):
+        """`heal` uses the unfingerprinted form deliberately: something IS
+        serving, and a respawn cannot fix a credential it also cannot read."""
+        from cswap_pin import proxy as pin_proxy
+
+        srv, port = self._health_server(b'{"can_pin": false}')
+        try:
+            cd = self._record(tmp_path, port)
+            assert pin_proxy._read_alive_port(cd) == port
+        finally:
+            srv.close()

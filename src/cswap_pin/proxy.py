@@ -6540,6 +6540,36 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
+    """What the daemon on ``port`` says about minting, or None if it will not say.
+
+    Measured, and the reason this exists rather than a record read: `cswap pin
+    <n>` run to completion returned rc=0, printed "Pinned the cloud account",
+    left the daemon pid unchanged and `can_pin` false throughout — because the
+    record it consulted had lost its `unpinnable` mark to a respawn.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sk:
+            sk.settimeout(timeout)
+            sk.sendall(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+            buf = b""
+            while len(buf) < 65536:
+                chunk = sk.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError:
+        return None
+    parts = buf.split(b"\r\n\r\n", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        val = json.loads(parts[1]).get("can_pin")
+    except ValueError:
+        return None
+    return val if isinstance(val, bool) else None
+
+
 def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | None:
     """Port of a live recorded daemon whose pid is alive, its port answers, and
     (when ``fingerprint`` is given) its fingerprint matches. Else None."""
@@ -6567,9 +6597,21 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
         return None
     try:
         with socket.create_connection(("127.0.0.1", int(st["port"])), timeout=1):
-            return int(st["port"])
+            pass
     except OSError:
         return None
+    # AND ASK THE DAEMON, because the field above is erasable. It is written
+    # once per process, and a successor publishes a fresh record without it —
+    # so between the respawn and the next unswapped request the record reads
+    # clean over a daemon that mints nothing, and this returns it. `/health`
+    # recomputes `can_pin` per call and cannot go stale that way.
+    # Only an explicit False refuses: None is "it would not say", which must
+    # read as healthy here for the same reason it does everywhere else in this
+    # file — a busy daemon that misses the deadline must not be recycled on
+    # every launch.
+    if fingerprint is not None and _serving_can_pin(int(st["port"])) is False:
+        return None
+    return int(st["port"])
 
 
 def wanted_port(certdir: Path) -> "int | None":
@@ -8770,6 +8812,45 @@ def _retire_stale_holder(own_fingerprint: str, env=None) -> bool:
         return False
     if not held_by_a_holder(env=env):
         return False  # the variable reached us through some other descendant
+    try:
+        os.kill(os.getppid(), _STAND_DOWN_SIGNAL)
+    except OSError:
+        return False
+    return True
+
+
+def _retire_blind_holder(env=None) -> bool:
+    """Send this daemon's holder away when we cannot read the pinned credential.
+
+    THE LEVER NOTHING PULLED. A holder is spawned once and never again, and
+    every daemon it places on the socket inherits its process context — on
+    macOS that includes the audit session which decides whether the login
+    keychain can be read. A holder born where it cannot read therefore produces
+    blind daemons for ever, each respawn re-inheriting the fault. That is what
+    `_heal` is describing when it says a respawn cannot fix a credential it
+    also cannot read, and why `repin_current`'s claim that "a successor born
+    somewhere that CAN read mints again" does not hold: the successor is born
+    from the HOLDER, never from whoever ran the command.
+
+    Measured: a holder alive across three daemon respawns, every successor
+    can_pin false, `cswap pin <n>` printing success each time and changing
+    nothing.
+
+    Same signal and same safety argument as :func:`_retire_stale_holder`.
+    SIGHUP, which no holder version handles, and this caller does not release
+    the socket — the descriptor stays bound here whatever the holder does.
+    The next `ensure_proxy` then finds no holder and builds a fresh triad IN
+    THE CALLING PROCESS, which is the point: that process is the user's shell.
+
+    NOT gated on a fingerprint, unlike its sibling. The holder here is running
+    exactly the code we ship; what is wrong with it is where it was born, and
+    no version comparison can see that.
+    """
+    if _STAND_DOWN_SIGNAL is None:
+        return False  # no SIGHUP here — see the constant
+    env = os.environ if env is None else env
+    if not held_by_a_holder(env=env):
+        return False
     try:
         os.kill(os.getppid(), _STAND_DOWN_SIGNAL)
     except OSError:
@@ -11840,6 +11921,14 @@ class PinProxy:
         # learn, and recycle instead of reusing.
         try:
             mark_daemon_unpinnable(self._certdir)
+        except Exception:  # noqa: BLE001 — advisory; never break a request
+            pass
+        # AND RETIRE THE HOLDER, or the mark above is the only thing that
+        # happens and the next daemon is blind for the same reason this one is.
+        # Once per process, like the mark: this method is gated on
+        # `_warned_unpinnable`, so there is no signal storm.
+        try:
+            _retire_blind_holder()
         except Exception:  # noqa: BLE001 — advisory; never break a request
             pass
         try:
