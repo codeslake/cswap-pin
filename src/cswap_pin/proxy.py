@@ -8840,6 +8840,34 @@ def _retire_stale_holder(own_fingerprint: str, env=None) -> bool:
     return True
 
 
+def _parent_is_a_holder(pid: int) -> bool:
+    """Whether ``pid``'s argv is actually a ``--hold-port`` holder.
+
+    `_HELD_BY_ENV` is set by whatever ran :class:`PortHolder`, which in
+    production is the holder process and in a test is the test runner. Signal
+    on the variable alone and a daemon spawned by a PortHolder living inside
+    another program sends SIGHUP to THAT program — default disposition, so it
+    dies. The variable says who spawned us; only the argv says what they are.
+
+    Unknown is not a holder: no ``ps``, an unreadable line, anything but a
+    clear match declines. A retirement that does not happen leaves the machine
+    as it was, which is the safe direction here.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    line = out.strip()
+    if not line or not any(m in line for m in _DAEMON_MODULE_NAMES):
+        return False
+    return f" {_HOLDER_MODULE_ARG} " in f" {line} "
+
+
 def _retire_blind_holder(env=None) -> bool:
     """Send this daemon's holder away when we cannot read the pinned credential.
 
@@ -8872,8 +8900,16 @@ def _retire_blind_holder(env=None) -> bool:
     env = os.environ if env is None else env
     if not held_by_a_holder(env=env):
         return False
+    # AND THE PARENT MUST LOOK LIKE ONE. `_HELD_BY_ENV` records who spawned
+    # us, which is the holder in production and the test runner under pytest.
+    # `_retire_stale_holder` gets away with the variable alone because a
+    # fingerprint mismatch is rare; this fires whenever the credential cannot
+    # be read, which is every daemon a test starts.
+    ppid = os.getppid()
+    if not _parent_is_a_holder(ppid):
+        return False
     try:
-        os.kill(os.getppid(), _STAND_DOWN_SIGNAL)
+        os.kill(ppid, _STAND_DOWN_SIGNAL)
     except OSError:
         return False
     return True

@@ -16592,10 +16592,14 @@ class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
     # -- the holder half ---------------------------------------------------
 
     def _held(self, monkeypatch, sent):
+        """Both halves of "we are held": the env marker AND a parent whose
+        argv is a holder. The argv check is stubbed here so these tests keep
+        asserting what they were written for; it has its own tests below."""
         from cswap_pin import proxy as pin_proxy
 
         monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
         monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setattr(pin_proxy, "_parent_is_a_holder", lambda _p: True)
         return pin_proxy
 
     def test_a_blind_daemon_retires_the_holder_above_it(self, monkeypatch):
@@ -16634,12 +16638,103 @@ class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
 
         sent = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+        monkeypatch.setattr(pin_proxy, "_parent_is_a_holder", lambda _p: True)
         monkeypatch.delenv(pin_proxy._HELD_BY_ENV, raising=False)
         assert pin_proxy._retire_blind_holder() is False
         assert sent == []
         # CONTROL: the only thing that differs is the marker.
         monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
         assert pin_proxy._retire_blind_holder() is True
+
+    def test_a_parent_that_is_not_a_holder_is_never_signalled(self, monkeypatch):
+        """THE ENV MARKER NAMES WHO SPAWNED US, NOT WHAT THEY ARE.
+
+        `PortHolder` sets `_HELD_BY_ENV` to its own pid, and a PortHolder
+        constructed inside another program -- a test runner, most obviously --
+        makes that program the "holder". SIGHUP's default disposition
+        terminates, so signalling on the variable alone can kill the process
+        running the suite. `_retire_stale_holder` survives the same shape only
+        because a fingerprint mismatch is rare; this fires whenever the
+        credential cannot be read, which is every daemon a test starts.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        sent = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setattr(pin_proxy, "_parent_is_a_holder", lambda _p: False)
+        assert pin_proxy._retire_blind_holder() is False
+        assert sent == [], (
+            "signalled a parent that is not a holder -- under pytest that is "
+            "the process running the suite")
+
+    def test_the_argv_check_reads_the_real_thing(self, monkeypatch):
+        """`_parent_is_a_holder` unstubbed, against known argv.
+
+        Controls both ways: our own pid is a python running pytest, which is
+        not a holder; a synthesised holder line is. Without the second the
+        function could return False unconditionally and every test above
+        would still pass on its stub.
+        """
+        import subprocess
+
+        from cswap_pin import proxy as pin_proxy
+
+        assert pin_proxy._parent_is_a_holder(os.getpid()) is False, (
+            "the suite's own process was read as a holder")
+
+        holder_line = (
+            f"/usr/bin/python3 -m {pin_proxy._DAEMON_MODULE} "
+            f"{pin_proxy._HOLDER_MODULE_ARG} 41000 1 a@b.c /tmp/cd\n")
+
+        class _R:
+            stdout = holder_line
+
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: _R())
+        assert pin_proxy._parent_is_a_holder(1234) is True
+
+        class _Plain:
+            stdout = (f"/usr/bin/python3 -m {pin_proxy._DAEMON_MODULE} "
+                      f"1 a@b.c /tmp/cd\n")
+
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: _Plain())
+        assert pin_proxy._parent_is_a_holder(1234) is False, (
+            "a plain daemon parent was read as a holder")
+
+    def test_an_unreadable_ps_is_not_a_holder(self, monkeypatch):
+        """FAIL CLOSED. The docstring promises "unknown is not a holder" and
+        nothing was checking it: flipping this branch to True left every other
+        test in this class green, which is how a fail-open guard ships.
+
+        The direction matters. Guessing "holder" on no evidence sends SIGHUP
+        to whatever spawned us; guessing "not a holder" leaves the machine
+        exactly as it was and the next daemon asks again.
+        """
+        import subprocess
+
+        from cswap_pin import proxy as pin_proxy
+
+        def _boom(*_a, **_k):
+            raise OSError("no ps on this platform")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert pin_proxy._parent_is_a_holder(1234) is False
+
+        class _Empty:
+            stdout = ""
+
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: _Empty())
+        assert pin_proxy._parent_is_a_holder(1234) is False, (
+            "an empty ps answer was read as a holder")
+
+        # AND THE WHOLE RETIREMENT DECLINES ON IT, not just the helper -- the
+        # caller is where the signal actually goes.
+        sent = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append((pid, sig)))
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setattr(subprocess, "run", _boom)
+        assert pin_proxy._retire_blind_holder() is False
+        assert sent == [], "signalled a parent it could not identify"
 
     def test_no_signal_on_this_platform_is_a_decline_not_a_raise(self, monkeypatch):
         from cswap_pin import proxy as pin_proxy
