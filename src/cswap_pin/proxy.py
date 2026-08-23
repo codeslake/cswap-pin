@@ -4570,7 +4570,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             if creds:
                 _cred_cache[ckey] = creds
         if not creds:
+            # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An empty
+            # read and a read of the WRONG slot are indistinguishable from the
+            # warning alone, and hours went into a machine where the second was
+            # never excluded. The provider is the only place that knows what it
+            # asked for.
+            provider.blind_reason = f"no credential for slot {num} ({mail})"
             return None
+        provider.blind_reason = ""
         token = _live_token(creds)
         if token:
             return token  # common path: no lock, no network
@@ -12096,9 +12103,15 @@ class PinProxy:
         # The self-heal in the watchdog already gets a fresh daemon from the
         # holder, and IT is throttled; a second, unthrottled path to the same
         # outcome is not redundancy, it is the loop.
+        # BOTH getattrs. A warning on a request path must never raise, and a
+        # PinProxy without a provider is reachable -- a bare construction, a
+        # test double. Saying less is the failure mode to prefer here.
+        why = getattr(getattr(self, "_pin_token_provider", None),
+                      "blind_reason", "") or "reason unrecorded"
         try:
             sys.stderr.write(
-                "cswap pin: the pinned account's token could not be read, so "
+                f"cswap pin [{why}]: "
+                "the pinned account's token could not be read, so "
                 "requests are going out UNPINNED. Remote Control sessions "
                 "created now will belong to the active account permanently. "
                 "On macOS this is usually a daemon started outside the GUI "
