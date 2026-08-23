@@ -4633,6 +4633,26 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     return provider
 
 
+def _can_mint(provider) -> "bool | None":
+    """Whether the pinned token can be minted RIGHT NOW, or None if unaskable.
+
+    The one reader of that fact. `/health` answers from it and so does the
+    self-heal watchdog, because two copies of this expression drift the day one
+    of them is corrected — and they would then disagree about whether a daemon
+    is applying the pin, which is the whole question.
+
+    None means there is nothing to ask (no provider at all — a stand-in server
+    in a test). Callers must treat it as "cannot tell" and act on `is False`,
+    never on falsiness: a bare `not _can_mint(...)` recycles every test server.
+    """
+    if provider is None:
+        return None
+    try:
+        return bool(provider()) or _pin_is_noop(provider)
+    except Exception:  # noqa: BLE001 — a health question is never fatal
+        return False
+
+
 def _pin_is_noop(provider) -> bool:
     """Ask a token provider whether None means "nothing to do" right now.
 
@@ -6389,6 +6409,62 @@ def mark_daemon_unpinnable(certdir: Path) -> None:
     os.replace(tmp, path)
 
 
+# HOW OFTEN A BLIND DAEMON MAY REPLACE ITSELF. First attempt is immediate --
+# the common case is transient and one gapless recycle ends it -- then doubling,
+# because a machine that cannot read at all would otherwise recycle on every
+# tick for ever. Never gives up: the interval is capped, not the attempts, so a
+# fault that clears an hour later is still repaired without anyone asking.
+_BLIND_RECYCLE_BASE_S = 60.0
+_BLIND_RECYCLE_MAX_S = 1800.0
+_BLIND_RECYCLE_FILE = "blind-recycle.json"
+
+
+def _blind_recycle_path(certdir: Path) -> Path:
+    """NOT `proxy.json`. `write_daemon_state` builds that record from scratch,
+    so every successor erases anything extra written into it -- the exact way
+    the `unpinnable` mark went missing and let a blind daemon be reused. State
+    that has to outlive a respawn cannot live in a file a respawn rewrites."""
+    return Path(certdir) / _BLIND_RECYCLE_FILE
+
+
+def blind_recycle_due(certdir: Path, now: float) -> bool:
+    """Whether enough time has passed to replace ourselves over blindness."""
+    import json
+
+    try:
+        rec = json.loads(_blind_recycle_path(certdir).read_text())
+        last, n = float(rec["at"]), int(rec["n"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return True  # never tried, or the note is unreadable: repair is due
+    wait = min(_BLIND_RECYCLE_BASE_S * (2 ** max(0, n - 1)), _BLIND_RECYCLE_MAX_S)
+    return (now - last) >= wait
+
+
+def note_blind_recycle(certdir: Path, now: float) -> None:
+    """Record that we are replacing ourselves, so the successor waits longer
+    if it turns out to be blind too."""
+    import json
+
+    try:
+        rec = json.loads(_blind_recycle_path(certdir).read_text())
+        n = int(rec["n"])
+    except (OSError, ValueError, KeyError, TypeError):
+        n = 0
+    try:
+        _blind_recycle_path(certdir).write_text(
+            json.dumps({"at": now, "n": n + 1}))
+    except OSError:
+        pass  # advisory; a recycle that cannot be recorded still happens
+
+
+def clear_blind_recycle(certdir: Path) -> None:
+    """A daemon that CAN mint ends the episode, so the next one starts fresh."""
+    try:
+        _blind_recycle_path(certdir).unlink()
+    except OSError:
+        pass
+
+
 def read_daemon_state(certdir: Path) -> dict | None:
     """The recorded daemon state (``{port, pid, fingerprint}``), or None if the
     file is absent or corrupt."""
@@ -8020,7 +8096,28 @@ def _watch_own_code(
             # daemon that was never held (a bare `daemon_main`, a test) has no
             # holder to lose and must not recycle itself forever.
             orphaned = _orphaned_from_its_holder()
-            if daemon_fingerprint() == own and not orphaned:
+            # THE THIRD REASON TO REPLACE OURSELVES, and the only one the
+            # daemon can act on entirely alone. A daemon that cannot mint the
+            # pinned token serves every request UNPINNED and fails open, so
+            # nothing downstream complains -- meanwhile every Remote Control
+            # bridge minted is owned by the wrong account permanently. Marking
+            # the record only helps a LAUNCH that may be hours away, and asking
+            # a human to run `cswap pin <n>` is not a repair, it is a chore.
+            #
+            # This is the same gapless sequence the code-changed branch uses:
+            # the holder puts a successor on the socket and it is already
+            # serving before we drain, so a repair costs no request.
+            #
+            # `is False`, never falsiness -- see `_can_mint`. And the interval
+            # guard is what stops a machine that genuinely cannot read from
+            # recycling on every tick.
+            blind = _can_mint(getattr(server, "_pin_token_provider", None)) is False
+            now = time.time()
+            if not blind:
+                clear_blind_recycle(certdir)
+            replace_for_blind = blind and blind_recycle_due(certdir, now)
+            if (daemon_fingerprint() == own and not orphaned
+                    and not replace_for_blind):
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
                 # where a machine sat after every deploy: the daemon re-execs
                 # and matches, so the loop went back to sleep, and the holder
@@ -8048,6 +8145,12 @@ def _watch_own_code(
                     "ship — asked it to stand down so a current one replaces it"
                 )
                 continue
+            if replace_for_blind:
+                note_blind_recycle(certdir, now)
+                _log_lifecycle(
+                    "cannot mint the pinned token — replacing ourselves so a "
+                    "successor can, while this one keeps serving"
+                )
             if orphaned:
                 _log_lifecycle(
                     "the holder above this daemon is gone — handing over so "
@@ -12060,12 +12163,7 @@ class PinProxy:
         # deliberately nothing to swap, and reporting can_pin=false there tells
         # a monitor the pin is broken on the one machine where it has nothing
         # to do.
-        try:
-            can_pin = bool(self._pin_token_provider()) or _pin_is_noop(
-                self._pin_token_provider
-            )
-        except Exception:
-            can_pin = False
+        can_pin = _can_mint(self._pin_token_provider) is not False
         # WHAT EGRESS IS ACTUALLY DOING, not what it is configured to do.
         # `chain` above reports the hop the relay WOULD use, so a daemon that
         # can reach no hop and is dialling DIRECT reported exactly what a

@@ -16967,3 +16967,199 @@ class TestAHandoverIsNotAFailure:
         monkeypatch.setattr(pin_proxy, "unwire_if_dead", lambda _cd: None)
         got = pin_proxy.ensure_proxy(_SW())
         return got if got is None else got[0]
+
+
+class TestABlindDaemonRepairsItself:
+    """The daemon must fix a pin it cannot apply, alone.
+
+    Marking the record only helps a LAUNCH, which on one machine averaged 6-11
+    hours apart, and telling someone to run `cswap pin <n>` is a chore, not a
+    repair. Meanwhile every Remote Control bridge minted while blind is owned
+    by the wrong account permanently and its name is lost.
+
+    The action is the gapless one the code-changed branch already uses: the
+    holder puts a successor on the socket and it is serving before this one
+    drains, so a repair costs no request.
+    """
+
+    class _Srv:
+        def __init__(self, provider):
+            self._pin_token_provider = provider
+
+        def release_listener(self, hand_down=False):
+            return 7 if hand_down else None
+
+        def await_inflight(self, budget):
+            pass
+
+        def learn_next_hop(self):
+            pass
+
+    class _Ticks:
+        """A `done` that ends the loop after N ticks.
+
+        The existing watchdog harnesses pass a never-set Event and rely on the
+        branch under test calling `os._exit`. That works only for cases that
+        DO act -- the control cases here act by design on nothing, so with a
+        never-set Event the loop spins for ever and the test hangs instead of
+        failing. Ending the loop is what lets "nothing happened" be an
+        assertable outcome.
+        """
+
+        def __init__(self, n=3):
+            self.left = n
+
+        def wait(self, _timeout=None):
+            self.left -= 1
+            return self.left <= 0
+
+        def is_set(self):
+            return self.left <= 0
+
+        def set(self):
+            self.left = 0
+
+    def _drive(self, monkeypatch, tmp_path, provider):
+        """Run a few watchdog ticks with the code CURRENT and a holder present,
+        so the only reason to act is blindness."""
+        from cswap_pin import proxy as pin_proxy
+
+        signalled, exited = [], []
+        # SIGUSR1's default disposition terminates, and `_HELD_BY_ENV` below
+        # names the real pytest parent -- unstubbed this kills the worker.
+        monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+        monkeypatch.setattr(os, "_exit",
+                            lambda code: exited.append(code) or (_ for _ in ()).throw(
+                                SystemExit(code)))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 1234)
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+        try:
+            pin_proxy._watch_own_code(
+                self._Srv(provider), "1", "a@b.c", tmp_path, self._Ticks(),
+                lambda *a: None, interval=0.01,
+                # CURRENT, so "the code changed" is NOT why anything happens.
+                _own_fingerprint=pin_proxy.daemon_fingerprint(),
+            )
+        except SystemExit:
+            pass
+        return signalled, exited
+
+    def test_a_daemon_that_cannot_mint_replaces_itself(self, monkeypatch, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        signalled, exited = self._drive(monkeypatch, tmp_path, lambda: None)
+        assert any(sig == pin_proxy._REPLACE_ME_SIGNAL for _p, sig in signalled), (
+            "a daemon that mints nothing kept serving unpinned and asked for "
+            f"no successor; signals seen: {signalled}")
+        assert exited == [0], (
+            "the successor is already on the socket, so this one must exit 0 "
+            "-- 75 would make the holder spawn a SECOND daemon")
+
+    def test_a_daemon_that_can_mint_is_left_alone(self, monkeypatch, tmp_path):
+        """THE CONTROL. Without it the test above passes on any recycle at all,
+        and recycling a healthy daemon on a timer is the outage this is meant
+        to prevent."""
+        signalled, exited = self._drive(monkeypatch, tmp_path, lambda: "a-token")
+        assert signalled == [] and exited == [], (
+            "a HEALTHY pin was recycled on a timer")
+
+    def test_a_server_with_no_provider_is_left_alone(self, monkeypatch, tmp_path):
+        """`_can_mint` answers None for a stand-in with no provider. Acting on
+        falsiness instead of `is False` recycles every test server, and every
+        bare `daemon_main`."""
+        signalled, exited = self._drive(monkeypatch, tmp_path, None)
+        assert signalled == [] and exited == []
+
+    # -- the backoff -------------------------------------------------------
+
+    def test_the_first_repair_is_immediate(self, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        assert pin_proxy.blind_recycle_due(tmp_path, 1000.0) is True, (
+            "the common case is transient and one recycle ends it; making the "
+            "first repair wait spends the whole interval blind for nothing")
+
+    def test_a_successor_that_is_also_blind_waits_longer(self, tmp_path):
+        """Doubling, so a machine that genuinely cannot read stops churning --
+        and CAPPED rather than abandoned, so a fault that clears an hour later
+        is still repaired with nobody asking."""
+        from cswap_pin import proxy as pin_proxy
+
+        t = 1000.0
+        pin_proxy.note_blind_recycle(tmp_path, t)
+        assert pin_proxy.blind_recycle_due(tmp_path, t + 59) is False
+        assert pin_proxy.blind_recycle_due(tmp_path, t + 61) is True
+
+        pin_proxy.note_blind_recycle(tmp_path, t)          # second attempt
+        assert pin_proxy.blind_recycle_due(tmp_path, t + 119) is False
+        assert pin_proxy.blind_recycle_due(tmp_path, t + 121) is True
+
+        for _ in range(20):                                 # far past the cap
+            pin_proxy.note_blind_recycle(tmp_path, t)
+        assert pin_proxy.blind_recycle_due(
+            tmp_path, t + pin_proxy._BLIND_RECYCLE_MAX_S + 1) is True, (
+            "the interval grew without a cap, so a fault that clears later is "
+            "never repaired")
+
+    def test_minting_again_ends_the_episode(self, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.note_blind_recycle(tmp_path, 1000.0)
+        assert pin_proxy.blind_recycle_due(tmp_path, 1001.0) is False
+        pin_proxy.clear_blind_recycle(tmp_path)
+        assert pin_proxy.blind_recycle_due(tmp_path, 1001.0) is True, (
+            "a daemon that recovered left the backoff behind, so the NEXT "
+            "episode starts throttled")
+
+    def test_the_watchdog_clears_the_note_when_it_can_mint(self, monkeypatch,
+                                                            tmp_path):
+        """THE WIRING, not the helper. `clear_blind_recycle` can be perfect and
+        never called, and then a machine that recovered carries the backoff
+        into its NEXT episode and waits half an hour to repair a fault it
+        would have fixed at once. Mutating the call away left every other test
+        in this class green.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.note_blind_recycle(tmp_path, 1000.0)
+        assert pin_proxy._blind_recycle_path(tmp_path).exists()
+
+        self._drive(monkeypatch, tmp_path, lambda: "a-token")
+
+        assert not pin_proxy._blind_recycle_path(tmp_path).exists(), (
+            "a daemon that can mint left the backoff behind")
+
+    def test_the_note_does_not_live_in_the_daemon_record(self, tmp_path):
+        """`write_daemon_state` builds proxy.json from scratch, so anything
+        extra written there is erased by the next successor -- exactly how the
+        `unpinnable` mark went missing and let a blind daemon be reused. This
+        state has to survive a respawn, so it must not be in that file."""
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.note_blind_recycle(tmp_path, 1000.0)
+        pin_proxy.write_daemon_state(tmp_path, 41000, os.getpid(), "FP")
+        assert pin_proxy.blind_recycle_due(tmp_path, 1001.0) is False, (
+            "the backoff was erased by a respawn writing the daemon record")
+
+    def test_an_unreadable_note_repairs_rather_than_stalls(self, tmp_path):
+        """Corrupt state must not be a reason to leave the pin broken."""
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy._blind_recycle_path(tmp_path).write_text("{not json")
+        assert pin_proxy.blind_recycle_due(tmp_path, 1000.0) is True
+
+    # -- the shared reader -------------------------------------------------
+
+    def test_can_mint_answers_the_three_cases(self):
+        from cswap_pin import proxy as pin_proxy
+
+        def _boom():
+            raise RuntimeError("the credential store is unreadable")
+
+        assert pin_proxy._can_mint(None) is None
+        assert pin_proxy._can_mint(lambda: "a-token") is True
+        assert pin_proxy._can_mint(_boom) is False
+        assert pin_proxy._can_mint(lambda: None) is False
