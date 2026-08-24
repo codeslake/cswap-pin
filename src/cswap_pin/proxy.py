@@ -10047,6 +10047,22 @@ class PinProxy:
             while waited < budget and not self._stop:
                 time.sleep(0.5)
                 waited += 0.5
+                # THE LOGIN CAN MOVE INSIDE THE BEAT. Claude Code watches
+                # ~/.claude.json and tears a bridge off the moment the account
+                # it names stops matching the pointer; this sweep is 300s
+                # behind it. Measured: a login changed, two LIVE sessions were
+                # torn off 3m18s later, and the beat that would have restamped
+                # them was still 1m42s away.
+                #
+                # Gated on the file's mtime so the ordinary tick costs a stat:
+                # the file is rewritten every 10-30s and the identity in it
+                # almost never moves, so the parse runs only when it might
+                # have. The carry itself skips records that already agree, so
+                # a spurious wake writes nothing.
+                try:
+                    self._carry_on_login_change()
+                except Exception:  # noqa: BLE001 — never take the sweep down
+                    pass
             if self._stop:
                 return
             try:
@@ -10081,6 +10097,34 @@ class PinProxy:
                 self.recycle_denied_sessions()
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
+
+    def _carry_on_login_change(self) -> bool:
+        """Carry immediately when the signed-in account moves, not on the beat.
+
+        Returns whether a carry ran, so a test can assert the trigger rather
+        than the schedule. Never raises: the caller is a sleep loop.
+        """
+        path = _config_home_for_policy().parent / ".claude.json"
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == getattr(self, "_login_seen_mtime", None):
+            return False
+        self._login_seen_mtime = mtime
+        login = _login_identity()
+        if login is None or login == getattr(self, "_login_seen", None):
+            return False
+        # FIRST OBSERVATION IS NOT A CHANGE. The sweep starts with nothing
+        # seen, and carrying on the first tick would restamp every pointer on
+        # daemon start for no reason -- which is a write to every live
+        # session's state file, on a machine where nothing moved.
+        first_time = not hasattr(self, "_login_seen")
+        self._login_seen = login
+        if first_time:
+            return False
+        self.carry_live_pointers(login)
+        return True
 
     def carry_live_pointers(self, login: "tuple[str, str]") -> int:
         """Point a RUNNING session's bridge record at the account now signed in.

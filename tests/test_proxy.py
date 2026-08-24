@@ -17293,3 +17293,88 @@ class TestTheUnpinnableMarkComesBackOff:
         assert healthy._warned_unpinnable is False, (
             "the once-per-process warn flag was not reset, so a SECOND "
             "episode would be silent")
+
+
+class TestTheCarryFollowsTheLoginNotTheClock:
+    """A live session must not wait out a 300s beat to keep its bridge.
+
+    Measured: the signed-in account changed, Claude Code's own watch on
+    ~/.claude.json tore two LIVE sessions off 3m18s later, and the sweep beat
+    that would have restamped their pointers was still 1m42s away. The carry
+    was correct and simply late, which from the user's seat is a disconnect.
+    """
+
+    def _proxy(self, tmp_path, monkeypatch, login):
+        from cswap_pin import proxy as pin_proxy
+
+        obj = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        carried = []
+        obj.carry_live_pointers = lambda lg: carried.append(lg) or 1
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                            lambda: tmp_path / ".claude")
+        monkeypatch.setattr(pin_proxy, "_login_identity", lambda: login[0])
+        (tmp_path / ".claude.json").write_text("{}")
+        return obj, carried
+
+    def test_the_first_look_is_not_a_change(self, tmp_path, monkeypatch):
+        """Starting the sweep must not restamp every pointer on this machine
+        just because nothing had been seen yet."""
+        obj, carried = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+        assert obj._carry_on_login_change() is False
+        assert carried == []
+
+    def test_a_changed_login_carries_at_once(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        box = [("A", "org")]
+        obj, carried = self._proxy(tmp_path, monkeypatch, box)
+        monkeypatch.setattr(pin_proxy, "_login_identity", lambda: box[0])
+        obj._carry_on_login_change()                    # first look, records A
+
+        box[0] = ("B", "org")
+        os.utime(tmp_path / ".claude.json", (1, 1))     # the file moved
+        assert obj._carry_on_login_change() is True
+        assert carried == [("B", "org")], (
+            "the login moved and the carry waited for the beat -- that window "
+            "is where a live session loses its bridge")
+
+    def test_an_unchanged_login_does_not_rewrite_anything(self, tmp_path,
+                                                          monkeypatch):
+        """CONTROL. The file is rewritten every 10-30s with the SAME identity;
+        carrying on each of those is a write to every live session's state for
+        nothing."""
+        from cswap_pin import proxy as pin_proxy
+
+        box = [("A", "org")]
+        obj, carried = self._proxy(tmp_path, monkeypatch, box)
+        monkeypatch.setattr(pin_proxy, "_login_identity", lambda: box[0])
+        obj._carry_on_login_change()
+        for i in range(5):
+            os.utime(tmp_path / ".claude.json", (i + 2, i + 2))
+            assert obj._carry_on_login_change() is False
+        assert carried == []
+
+    def test_an_unmoved_file_costs_only_a_stat(self, tmp_path, monkeypatch):
+        """The identity parse must not run on every 0.5s tick."""
+        from cswap_pin import proxy as pin_proxy
+
+        reads = []
+        box = [("A", "org")]
+        obj, _c = self._proxy(tmp_path, monkeypatch, box)
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: reads.append(1) or box[0])
+        obj._carry_on_login_change()          # mtime seen once, one read
+        before = len(reads)
+        for _ in range(10):
+            obj._carry_on_login_change()      # mtime unchanged
+        assert len(reads) == before, (
+            f"parsed the login {len(reads) - before} extra time(s) with the "
+            f"file unmoved -- this runs twice a second")
+
+    def test_an_unreadable_config_is_not_a_carry(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        obj, carried = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+        (tmp_path / ".claude.json").unlink()
+        assert obj._carry_on_login_change() is False
+        assert carried == []
