@@ -8,6 +8,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 from __future__ import annotations
 
 import json
+import types
 import os
 import pathlib
 import re
@@ -17378,3 +17379,41 @@ class TestTheCarryFollowsTheLoginNotTheClock:
         (tmp_path / ".claude.json").unlink()
         assert obj._carry_on_login_change() is False
         assert carried == []
+
+
+class TestADrainSaysWhichArmItIsOn:
+    """The two drain arms printed the SAME promise and only one could keep it.
+
+    "left intact, and this process stays until they end" is true on the
+    handover arm, whose budget is infinite. On the signal arm the budget is
+    capped and the TERM's sender SIGKILLs two seconds past the cap, so the
+    sentence is false by construction -- and both arms printed it.
+
+    Not cosmetic. Every clean drain on record was a handover, the sentence sat
+    on all of them, and "the handover is gapless by construction" went to a
+    peer in writing on that evidence -- hours before an external TERM racing a
+    handover cut 13 mid-response replies at exactly the cap, with the successor
+    already serving and the promise printed twice.
+    """
+
+    def test_a_CAPPED_drain_says_it_can_cut(self):
+        import cswap_pin.proxy as pin_proxy
+        out = pin_proxy.drain_fate(30.0)
+        assert "CAPPED at 30s" in out, out
+        assert "stays until they end" not in out, out
+
+    def test_the_HANDOVER_arm_still_promises_to_stay(self):
+        """THE CONTROL. The infinite arm's promise is TRUE and must survive,
+        or this trades one wrong sentence for another."""
+        import cswap_pin.proxy as pin_proxy
+        out = pin_proxy.drain_fate(pin_proxy._HANDOVER_DRAIN_SECONDS)
+        assert "stays until they end" in out, out
+        assert "CAPPED" not in out, out
+
+    def test_the_SIGNAL_arm_constant_really_is_capped(self):
+        """The case above uses a literal 30. If `_DRAIN_SECONDS` ever became
+        infinite, that literal would keep passing while the real signal arm
+        silently joined the gapless one."""
+        import cswap_pin.proxy as pin_proxy
+        assert pin_proxy._DRAIN_SECONDS != float("inf")
+        assert "CAPPED" in pin_proxy.drain_fate(pin_proxy._DRAIN_SECONDS)

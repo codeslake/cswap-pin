@@ -5836,6 +5836,30 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 # supervisor's patience only trades a logged cut for an unlogged one.
 _HANDOVER_DRAIN_SECONDS = float("inf")
 
+
+def drain_fate(budget: float) -> str:
+    """What a drain announcing itself may promise. Decided by its ceiling.
+
+    The two arms printed the SAME sentence and only one could keep it. On the
+    handover arm the budget is `_HANDOVER_DRAIN_SECONDS` and "stays until they
+    end" is true. On the signal arm it is capped and the TERM's sender SIGKILLs
+    two seconds past the cap, so the same words are false by construction.
+
+    Not cosmetic. Every clean drain on record was a handover and this sentence
+    sat on all of them, so "the handover is gapless by construction" was said
+    to a peer on that evidence -- hours before an external TERM racing a
+    handover cut 13 mid-response replies at exactly the cap, with the successor
+    already serving and the promise printed twice.
+
+    A drain that CAN cut has to say so BEFORE it cuts. The cut line is honest
+    and it arrives too late to inform anything read from the log.
+    """
+    if budget == float("inf"):
+        return "left intact, and this process stays until they end"
+    return (f"left intact for now — but this drain is CAPPED at {budget:.0f}s "
+            "and cuts whatever is still moving when it expires, so this is "
+            "not the gapless arm")
+
 # A drainer's marker outlives its own longest wait plus the slack a supervisor
 # would allow, and no longer — a pid is reused freely, so a marker that
 # outlived its writer must never protect whoever inherits the number. Defined
@@ -11058,9 +11082,27 @@ class PinProxy:
         # drives every tunnel in it.
         streams = self.live_stream_count() + _PUMP.live_pairs()
         if streams:
+            # NAME THE BUDGET THAT BINDS THIS DRAIN, NEVER THE PROMISE ALONE.
+            # "stays until they end" is true on the handover arm, whose budget
+            # is infinite, and FALSE BY CONSTRUCTION on the signal arm, which
+            # is capped and whose sender SIGKILLs two seconds past the cap.
+            # Both printed the same sentence.
+            #
+            # That is how the two arms became indistinguishable in the log, and
+            # the conflation reached a peer in writing: every clean drain on
+            # record was a handover, the sentence above sat on all of them, and
+            # "the handover is gapless by construction" was said on that
+            # evidence hours before an external TERM racing a handover cut 13
+            # mid-response replies at exactly the cap. The successor was
+            # already serving; the promise was printed twice; neither printing
+            # could keep it, because a capped clock was already running.
+            #
+            # A drain that CAN cut has to say so before it cuts. The cut line
+            # is honest and it is too late — by then the decision a reader
+            # would have made from the log has been made.
             _log_lifecycle(
                 f"draining with {streams} long-lived channel(s) still open — "
-                f"left intact, and this process stays until they end")
+                f"{drain_fate(budget)}")
         beat_draining(self._certdir, owed=self.inflight_requests(),
                       live=self.live_replies(started),
                       quiet=self.content_free_seconds(),
