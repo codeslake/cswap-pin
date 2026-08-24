@@ -1490,6 +1490,47 @@ def _resolve_pinned_slot(backup_root: Path, email: str) -> str | None:
 _SPLICE_LOCK_S = 5.0
 
 
+_HEAL_DEFER_FILE = ".heal-deferred"
+
+
+def _watchdog_had_its_turn(certdir: Path, pid: int, fingerprint) -> bool:
+    """True when this exact stale daemon was already seen once and left alone.
+
+    THE ONLY DAEMON `heal` CAN TERM IS ONE THAT IS ALIVE AND ANSWERING on code
+    we no longer ship — which is the code watchdog's own trigger, and the
+    watchdog retires it WITHOUT darkening the port. The two mechanisms do one
+    job and only one of them costs replies.
+
+    heal wins that race every time, because it runs at the instant of an
+    install and the watchdog on a tick. So the fix is not to narrow the branch
+    (the population is exactly the case it exists for) but to let the gapless
+    path go first. A second sighting of the SAME pid on the SAME stale
+    fingerprint, an interval later, has MEASURED that it did not act — a
+    daemon from a release predating the watchdog, which nothing else retires.
+
+    TWO INTERVALS: one tick to notice, one to act. Keyed on pid AND
+    fingerprint so a successor is a fresh subject rather than an inherited
+    sentence. The mtime is the clock; there is no second timestamp to disagree
+    with it.
+    """
+    path = Path(certdir) / _HEAL_DEFER_FILE
+    seen = _read_json(path) or {}
+    if seen.get("pid") == pid and seen.get("fingerprint") == fingerprint:
+        try:
+            return (time.time() - path.stat().st_mtime) >= _CODE_WATCH_INTERVAL_S * 2
+        except OSError:
+            return False
+    try:
+        path.write_text(json.dumps({"pid": pid, "fingerprint": fingerprint}))
+    except OSError:
+        # A SIGHTING WE CANNOT RECORD IS ONE WE CANNOT DEFER ON. Returning
+        # False here would defer forever on an unwritable certdir and make
+        # every stale daemon immortal — the failure this branch exists to
+        # prevent, reintroduced by its own guard.
+        return True
+    return False
+
+
 def heal(backup_root: Path, identity: dict | None = None,
          lock_timeout: float = _SPLICE_LOCK_S) -> bool:
     """Bring the pin back if it is pinned but not serving. True when it did.
@@ -1709,6 +1750,16 @@ def heal(backup_root: Path, identity: dict | None = None,
         # leave the wiring naming a port nobody serves — the outage this
         # recycle exists to prevent, caused by the recycle.
         if not account_num:
+            return False
+        # LET THE GAPLESS PATH GO FIRST. Every daemon reaching here is the code
+        # watchdog's own trigger, and the watchdog replaces it while it keeps
+        # serving. TERMing instead is what turns a deploy into a cut.
+        stale_pid = int((stale_st or {}).get("pid") or 0)
+        if stale_pid and not _watchdog_had_its_turn(certdir, stale_pid, stale_fp):
+            _log_lifecycle(
+                "a daemon on stale code is serving — leaving it to its own "
+                "code watchdog, which replaces it without darkening the port. "
+                "The next heal retires it if that did not happen")
             return False
         try:
             # BOUNDED, BECAUSE A DEPLOY CALLS THIS SYNCHRONOUSLY. The holder

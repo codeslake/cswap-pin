@@ -12134,9 +12134,97 @@ class TestAnUpgradeDoesNotWaitForALaunch:
 
         monkeypatch.setattr(proxy, "_spawn_daemon", _spawn)
         try:
+            # THE SECOND HEAL. The first defers to the daemon's own watchdog;
+            # this fixture has none, which is the daemon that would otherwise
+            # be immortal and is what this branch is left alive for.
+            assert proxy.heal(tmp_path) is False, "deferral skipped"
+            self._watchdog_missed_its_turn(certdir)
             assert proxy.heal(tmp_path) is True, "an obsolete daemon was left running"
             assert killed == [os.getpid()], "the stale daemon was not recycled"
             assert spawned, "nothing replaced it"
+        finally:
+            srv.close()
+
+    @staticmethod
+    def _watchdog_missed_its_turn(certdir):
+        """Age heal's deferral, so the next call is one that has MEASURED the
+        watchdog failing to act rather than assumed it.
+
+        Two heals is the real shape now. The first records the sighting and
+        leaves the daemon serving, because every daemon reaching that branch is
+        the code watchdog's own trigger and the watchdog replaces it without
+        darkening the port. These fixtures have no watchdog -- which is
+        precisely the daemon the second heal exists to retire.
+        """
+        from cswap_pin import proxy
+
+        f = Path(certdir) / proxy._HEAL_DEFER_FILE
+        assert f.exists(), (
+            "the first heal recorded no sighting, so nothing can later measure "
+            "that the watchdog missed its turn and the daemon is immortal")
+        old = time.time() - proxy._CODE_WATCH_INTERVAL_S * 3
+        os.utime(f, (old, old))
+
+    def case_the_FIRST_heal_leaves_a_stale_daemon_serving(
+        self, tmp_path, monkeypatch
+    ):
+        """THE DEPLOY CUT. heal runs at the instant of an install and the
+        watchdog on a tick, so heal won that race every time and the gapless
+        path never ran -- 13 mid-response replies on one deploy, 1 on another.
+
+        A no-op, not a half-recycle: a spawn without a kill starts a SECOND
+        holder for a port the first still holds, which is the outage
+        `_recycle_daemon` documents.
+        """
+        from cswap_pin import proxy
+
+        srv, _port, _cfg, certdir = self._serving_daemon(
+            tmp_path, monkeypatch, "an-old-release"
+        )
+        killed, spawned = [], []
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
+        monkeypatch.setattr(proxy, "_kill_daemon",
+                            lambda pid, certdir=None: killed.append(pid))
+        monkeypatch.setattr(proxy, "_spawn_daemon",
+                            lambda n, e, c, **k: spawned.append(n))
+        try:
+            assert proxy.heal(tmp_path) is False, (
+                "heal TERMed a serving daemon before its own watchdog had an "
+                "interval to replace it gaplessly")
+            assert (killed, spawned) == ([], []), (killed, spawned)
+        finally:
+            srv.close()
+
+    def case_a_SUCCESSOR_is_a_fresh_subject_not_an_inherited_sentence(
+        self, tmp_path, monkeypatch
+    ):
+        """The deferral is keyed on pid AND fingerprint for this reason.
+
+        Keyed on the certdir alone, a successor would inherit the sighting its
+        predecessor earned and be TERMed on the next heal -- the respawn loop
+        that killed an earlier attempt at this branch, rebuilt inside its fix.
+        """
+        from cswap_pin import proxy
+
+        srv, _port, _cfg, certdir = self._serving_daemon(
+            tmp_path, monkeypatch, "an-old-release"
+        )
+        killed = []
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
+        monkeypatch.setattr(proxy, "_kill_daemon",
+                            lambda pid, certdir=None: killed.append(pid))
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: 1)
+        try:
+            proxy.heal(tmp_path)
+            self._watchdog_missed_its_turn(certdir)
+            # A successor published a record of its own -- still stale (the
+            # fixture never moves the disk), but a different process.
+            st = proxy.read_daemon_state(certdir)
+            proxy.write_daemon_state(
+                certdir, st["port"], st["pid"], "another-old-release")
+            assert proxy.heal(tmp_path) is False, (
+                "a successor was TERMed on a sighting it did not earn")
+            assert killed == [], killed
         finally:
             srv.close()
 
@@ -12161,6 +12249,8 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         monkeypatch.setattr(proxy, "_kill_daemon", _kill)
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: port)
         try:
+            proxy.heal(tmp_path)          # defers, records the sighting
+            self._watchdog_missed_its_turn(certdir)
             proxy.heal(tmp_path)
             assert hint_at_kill.get("port") == port, (
                 "the port hint was not written before the kill — the successor "
