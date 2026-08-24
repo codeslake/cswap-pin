@@ -17676,3 +17676,55 @@ class TestHealGivesUpOnASpawnLockItCannotGet:
         certdir.mkdir(parents=True)
         with pin_proxy._spawn_lock(certdir):
             assert _lock_is_held(certdir / ".spawn.lock") is True
+
+
+class TestTheServingDaemonOwnsTheWiring:
+    """A daemon served a port nobody had been told about.
+
+    The departing daemon unwires `.claude.json` when it sees the port
+    unserved, guarded on exactly that. On a holder restart the guard is
+    satisfied for one instant -- the predecessor has released, the successor
+    has not bound -- so the wiring goes, and NOTHING put it back: only a launch
+    or a `heal` writes that block. Measured on a live box: env block empty
+    while a healthy daemon served the port, so every hand-launched session ran
+    unpinned until a heal was run by hand.
+    """
+
+    def _wire(self, monkeypatch, wired, port=36301):
+        import cswap_pin.proxy as p
+        wrote = []
+        monkeypatch.setattr(p, "_wired_port", lambda: wired)
+        monkeypatch.setattr(p, "wire_global_config",
+                            lambda po, ca, **k: wrote.append(po) or True)
+        monkeypatch.setattr(p, "_log_lifecycle", lambda _m: None)
+        rc = p.ensure_wired_to(port, "/nonexistent")
+        return rc, wrote
+
+    def test_a_config_naming_nothing_is_rewired(self, monkeypatch):
+        """THE BUG. `unwire_if_dead` leaves None behind."""
+        rc, wrote = self._wire(monkeypatch, wired=None)
+        assert rc is True and wrote == [36301], (rc, wrote)
+
+    def test_a_config_naming_ANOTHER_port_is_rewired(self, monkeypatch):
+        rc, wrote = self._wire(monkeypatch, wired=41111)
+        assert rc is True and wrote == [36301], (rc, wrote)
+
+    def test_CONTROL_a_correct_config_is_left_alone(self, monkeypatch):
+        """`.claude.json` is watched live by Claude Code. Rewriting it on every
+        daemon start would be churn on a file whose changes it reacts to, so
+        the no-op case must write NOTHING, not write the same value."""
+        rc, wrote = self._wire(monkeypatch, wired=36301)
+        assert rc is False and wrote == [], (rc, wrote)
+
+    def test_CONTROL_a_failure_to_wire_does_not_raise(self, monkeypatch):
+        """A daemon that is serving must not die because the config write
+        failed; the next launch or heal repairs it."""
+        import cswap_pin.proxy as p
+
+        def _boom(*a, **k):
+            raise OSError("read-only config home")
+
+        monkeypatch.setattr(p, "_wired_port", lambda: None)
+        monkeypatch.setattr(p, "wire_global_config", _boom)
+        monkeypatch.setattr(p, "_log_lifecycle", lambda _m: None)
+        assert p.ensure_wired_to(36301, "/nonexistent") is False

@@ -1743,6 +1743,13 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # identity gate kills nothing, and heal then spawned a
                     # successor over a daemon that is still serving.
                     recycled = True
+        except SpawnLockBusy as exc:
+            # NOT THE SAME FALSE AS "nothing to heal". Both reach the caller as
+            # a bare False and it prints "Nothing to heal" — the opposite of
+            # what happened. The return type cannot carry the difference, so
+            # the log does.
+            _log_lifecycle(f"heal gave up waiting for the spawn lock: {exc}")
+            return False
         except Exception:  # noqa: BLE001 — a heal must never raise
             return False
         # Fall through to the spawn path below, which reclaims that port.
@@ -1768,7 +1775,11 @@ def heal(backup_root: Path, identity: dict | None = None,
     if not account_num:
         return False  # dangling pin: its slot is gone, nothing to serve
     try:
-        with _spawn_lock(certdir):
+        # BOUNDED, LIKE THE FIRST ONE. heal takes this lock TWICE and only the
+        # recycle branch's acquisition was bounded, so heal could still hang
+        # here for the length of a session — the same defect, at the site the
+        # first fix did not look at.
+        with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
             # Re-check under the lock — another caller may have just spawned.
             #
             # WITH THE FINGERPRINT. A bare liveness check re-reads the very
@@ -1810,6 +1821,11 @@ def heal(backup_root: Path, identity: dict | None = None,
         wire_global_config(port, certdir / "ca.pem",
                            lock_timeout=lock_timeout)
         return True
+    except SpawnLockBusy as exc:
+        # Same reason as the recycle branch: a bare False reaches the caller as
+        # "Nothing to heal", which is the opposite of "could not get the lock".
+        _log_lifecycle(f"heal gave up waiting for the spawn lock: {exc}")
+        return False
     except Exception:
         return False
 
@@ -5891,6 +5907,35 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 _HANDOVER_DRAIN_SECONDS = float("inf")
 
 
+def ensure_wired_to(port: int, certdir: Path) -> bool:
+    """Point `.claude.json` at `port` when it names anything else. True if written.
+
+    THE SERVING DAEMON OWNS THE WIRING, because nothing else was putting it
+    back. A departing daemon unwires when it sees the port unserved, and that
+    check is right at the instant it runs — but on a holder restart the
+    predecessor has released and the successor has not bound yet, so the port
+    IS unserved for that instant and the wiring goes. Only a LAUNCH or a `heal`
+    wrote it, so it stayed gone: every hand-launched session afterwards ran
+    unpinned while a healthy daemon served the port nobody was told about.
+
+    NO-OP WHEN ALREADY CORRECT — one config read on a normal start, no write.
+    Never raises: a wiring failure must not stop a daemon that is otherwise
+    serving, and the next launch or heal still repairs it.
+    """
+    try:
+        if _wired_port() == port:
+            return False
+        wire_global_config(port, Path(certdir) / "ca.pem")
+        _log_lifecycle(
+            "rewired .claude.json to this port — it named something else, "
+            "which is what a departing daemon leaves behind when it unwires "
+            "into the gap before a successor binds")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log_lifecycle(f"could not rewire .claude.json: {exc!r}")
+        return False
+
+
 def drain_fate(budget: float) -> str:
     """What a drain announcing itself may promise. Decided by its ceiling.
 
@@ -9383,6 +9428,21 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # A start line means the log is never empty for a daemon that ran, so
     # "no teardown line" becomes evidence of a CRASH rather than of nothing.
     _log_lifecycle(f"serving on port {proxy.port} for account {account_num}")
+
+    # THE SERVING DAEMON OWNS THE WIRING, because nothing else was putting it
+    # back. A departing daemon unwires `.claude.json` when it sees the port
+    # unserved, and that check is right at the instant it runs — but on a
+    # holder restart the predecessor has released and the successor has not
+    # bound yet, so the port IS unserved for that instant and the wiring goes.
+    # Only a LAUNCH or a `heal` wrote it, so it stayed gone: every
+    # hand-launched session afterwards ran unpinned, with a healthy daemon
+    # serving the port nobody was told about.
+    #
+    # NO-OP WHEN ALREADY CORRECT, so this costs one config read on a normal
+    # start and writes nothing — the same guard `heal` uses to decide there is
+    # nothing to do. Never raises: a wiring failure must not stop a daemon that
+    # is otherwise serving, and the next launch or heal still repairs it.
+    ensure_wired_to(proxy.port, certdir)
 
     fifo = refcount_fifo_path(certdir)
     if not fifo.exists():
