@@ -17563,10 +17563,14 @@ class TestTheDrainDoesNotHoldTheSpawnLock:
         assert _lock_is_held(p) is False
 
     def test_the_lock_is_free_while_the_handover_drains(self, tmp_path):
-        """THE FIX. `await_inflight` must run with the lock released."""
+        """THE FIX. `await_inflight` must run with the lock released, and the
+        log must say so -- see the assertion below for why."""
+        import contextlib
+        import io
         import threading
         from cswap_pin import proxy as pin_proxy
 
+        err = io.StringIO()
         seen = []
 
         class _Srv:
@@ -17590,11 +17594,12 @@ class TestTheDrainDoesNotHoldTheSpawnLock:
         prev = {k: os.environ.pop(k, None)
                 for k in (pin_proxy._HELD_BY_ENV, pin_proxy._HOLDER_REPLACE_ENV)}
         try:
-            pin_proxy._watch_own_code(
-                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
-                lambda *a: None, interval=0.01,
-                _own_fingerprint="never-matches",
-            )
+            with contextlib.redirect_stderr(err):
+                pin_proxy._watch_own_code(
+                    _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                    lambda *a: None, interval=0.01,
+                    _own_fingerprint="never-matches",
+                )
         except SystemExit:
             pass
         finally:
@@ -17605,6 +17610,11 @@ class TestTheDrainDoesNotHoldTheSpawnLock:
                     os.environ[k] = v
 
         assert seen, "the handover never reached its drain, so this proves nothing"
+        # AND IT SAYS SO IN THE LOG. Moving the wait out of the lock changes no
+        # line and no ordering, so without this the fixed code is byte-identical
+        # to the code that froze every spawn -- and the only difference, a lock
+        # state, is exactly what an interval poll can miss entirely.
+        assert "spawn lock released" in err.getvalue(), err.getvalue()
         assert seen == [False] * len(seen), (
             "the spawn lock was held while draining — a drain that can run for "
             f"hours freezes every spawn behind it: {seen}")

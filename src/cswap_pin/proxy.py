@@ -8462,6 +8462,18 @@ def _watch_own_code(
             # with the drain. The lock was the fault, and the drain being
             # CORRECT is what made it unbounded.
             if spawned is not None:
+                # SAY THE LOCK IS GONE, or the fix has no durable witness.
+                # Moving the wait out of the lock changes no log line and no
+                # ordering, so a handover under the fixed code is byte-identical
+                # to one under the code that froze every spawn for the length of
+                # a session. The only difference is a lock state — and a watcher
+                # sampling /proc/locks on an interval can miss the whole window
+                # between one holder leaving and the next arriving. Measured: a
+                # 60s poll observed the before and the after and never a free
+                # lock. A line in the daemon log is a record, not a sample.
+                _log_lifecycle(
+                    "spawn lock released — draining outside it, so nothing "
+                    "waiting to spawn is blocked by however long this takes")
                 # THE PORT NEVER LEFT: the listening socket went down by fd,
                 # so arrivals queue in the backlog the whole time this waits.
                 server.await_inflight(_HANDOVER_DRAIN_SECONDS)
