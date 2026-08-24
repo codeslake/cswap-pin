@@ -69,7 +69,8 @@ class _FakeUpstream:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self._stop = False
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
 
     def _loop(self):
         while not self._stop:
@@ -123,7 +124,19 @@ class _FakeUpstream:
 
     def stop(self):
         self._stop = True
+        # WAKE IT, THEN JOIN. Closing a listening socket does NOT interrupt
+        # another thread blocked in `accept()`, so a plain join here pays its
+        # full timeout and the thread is still alive when the case ends. One
+        # loopback connect makes `accept()` return at once — the same trick
+        # `release_listener` uses in production, and for the same reason.
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
         self._srv.close()
+        self._thr.join(timeout=2.0)
 
 
 def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: str):
@@ -292,7 +305,8 @@ class _StreamingUpstream:
         self._srv.bind(("127.0.0.1", 0))
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
 
     def _loop(self):
         try:
@@ -316,7 +330,14 @@ class _StreamingUpstream:
             pass
 
     def stop(self):
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
         self._srv.close()
+        self._thr.join(timeout=2.0)
 
 
 class TestStreamingRelay:
@@ -592,7 +613,8 @@ class _FramingUpstream:
         self.port = self._srv.getsockname()[1]
         self._stop = False
         self._held = []
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
 
     def _loop(self):
         while not self._stop:
@@ -640,7 +662,14 @@ class _FramingUpstream:
                 t.close()
             except OSError:
                 pass
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
         self._srv.close()
+        self._thr.join(timeout=2.0)
 
 
 class TestResponseFramingIsParseable:
@@ -1080,7 +1109,8 @@ class _LoopbackConnectProxy:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self.connects = 0
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
 
     def _loop(self):
         try:
@@ -1106,7 +1136,14 @@ class _LoopbackConnectProxy:
             pass
 
     def stop(self):
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
         self._srv.close()
+        self._thr.join(timeout=2.0)
 
 
 class TestLoopbackChainTrust:
@@ -3368,7 +3405,8 @@ class _KeepAliveUpstream:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self._stop = False
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
 
     def _loop(self):
         while not self._stop:
@@ -3416,7 +3454,14 @@ class _KeepAliveUpstream:
 
     def stop(self):
         self._stop = True
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
         self._srv.close()
+        self._thr.join(timeout=2.0)
 
 
 class TestKeepAlive:
@@ -3490,7 +3535,8 @@ class _WebSocketUpstream:
         self._srv.listen(5)
         self.port = self._srv.getsockname()[1]
         self._stop = False
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
 
     def _loop(self):
         while not self._stop:
@@ -3529,7 +3575,14 @@ class _WebSocketUpstream:
 
     def stop(self):
         self._stop = True
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
         self._srv.close()
+        self._thr.join(timeout=2.0)
 
 
 class TestWebSocketUpgrade:
