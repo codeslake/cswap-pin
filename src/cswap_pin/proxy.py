@@ -10148,6 +10148,34 @@ class PinProxy:
         NO WRITE WHEN IT ALREADY AGREES: this runs on a beat, and rewriting a
         correct record every pass is contention on a file its owner is also
         writing, bought for nothing.
+
+        `bridgeOwnerAccountUuid` HAS TWO WRITERS THAT MEAN OPPOSITE THINGS, and
+        anything reading it has to say which one it wants. Claude Code writes
+        the bridge's true server-side owner while a session runs. This writes
+        the account now SIGNED IN, so CC's local comparison agrees and it
+        reattaches instead of minting. Neither is wrong; they answer different
+        questions.
+
+        So a reader must pick, and the two questions want opposite values:
+
+            reattach-or-mint    the LOGIN. CC compares the stored pointer to
+                                `~/.claude.json`'s `oauthAccount`, never to the
+                                pin, and mints on a mismatch.
+            who owns the bridge the PIN. The pin re-asserts its identity on the
+                                request that mints one, so that is who the
+                                bridge belongs to server-side.
+
+        Three separate readers have already taken the wrong one, which is what
+        makes this worth stating here rather than at any one of them: a
+        reattach path that compared against the pin, a disconnect path that
+        compared against the login, and an external gate that graded THIS
+        function's deliberate output as a veto risk. All three read a field
+        whose value was correct.
+
+        A fourth reader will arrive. If it asks "does this pointer match what
+        CC will compare it against", it wants the login and this function's
+        output is the answer. If it asks "whose bridge is this", it wants the
+        pin and must not read this field at all while a session is live.
         """
         account, org = login
         if not account:
