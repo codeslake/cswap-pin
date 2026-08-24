@@ -10080,6 +10080,9 @@ class PinProxy:
         # None again is never treated as "nothing is connected".
         self._connected_bridges: "set[str] | None" = None
         self._stop = False
+        # Wakes the title sweep out of its wait so a join costs nothing. Here
+        # rather than in `start()`: a caller can drive the loop without it.
+        self._sweep_wake = threading.Event()
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
         self._inherited = False
@@ -10269,7 +10272,10 @@ class PinProxy:
             budget = self._TITLE_SWEEP_FIRST_S if first else self._TITLE_SWEEP_S
             first = False
             while waited < budget and not self._stop:
-                time.sleep(0.5)
+                # WAKEABLE, not a bare sleep. `release_listener` joins this
+                # thread, and a poll-only wait makes that join pay up to half
+                # a second on the handover path for nothing.
+                self._sweep_wake.wait(0.5)
                 waited += 0.5
                 # THE LOGIN CAN MOVE INSIDE THE BEAT. Claude Code watches
                 # ~/.claude.json and tears a bridge off the moment the account
@@ -10780,6 +10786,13 @@ class PinProxy:
                     pass
             t.join(timeout=5.0)
         self._accept_thread = None
+        # AND THE TITLE SWEEP, which polls `_stop` every 0.5s. Best-effort:
+        # a sweep inside a request carries its own timeout, and returning
+        # with the thread still alive is what happens today anyway.
+        self._sweep_wake.set()
+        tt, self._title_thread = getattr(self, "_title_thread", None), None
+        if tt is not None and tt is not threading.current_thread():
+            tt.join(timeout=2.0)
         if srv is not None and hand_down:
             if self._inherited and not _orphaned_from_its_holder():
                 # NOT OURS TO PASS ON. A supervisor holds this port across our

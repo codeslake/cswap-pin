@@ -1664,10 +1664,15 @@ class TestLiveRemoteControlSessions:
         survived. Start where the daemon starts: the only thing that proves a
         loop runs is the code that launches it.
         """
+        import threading
+
         from cswap_pin import proxy as pin_proxy
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._stop = False
+        # Beside `_stop` for the same reason: `__init__` is bypassed, so the
+        # loop's own wait needs naming here too.
+        daemon._sweep_wake = threading.Event()
         daemon._accept_loop = lambda: None
         ticks: list[int] = []
         daemon.sweep_titles_once = lambda: ticks.append("titles")
@@ -10187,6 +10192,8 @@ class TestTheDaemonWatchesItsOwnCode:
         """
         import socket
 
+        import threading
+
         from cswap_pin import proxy as pin_proxy
 
         def _hand_down_under(holder_pid):
@@ -10204,6 +10211,10 @@ class TestTheDaemonWatchesItsOwnCode:
             proxy._accept_thread = None
             proxy._handed_fd = None
             proxy._inherited = True          # what start() recorded
+            # `__init__` is bypassed on purpose, so every attribute
+            # `release_listener` touches has to be named here.
+            proxy._sweep_wake = threading.Event()
+            proxy._title_thread = None
             os.environ[pin_proxy._HELD_BY_ENV] = str(holder_pid)
             try:
                 return proxy.release_listener(hand_down=True), srv
