@@ -10178,15 +10178,27 @@ class PinProxy:
         # reply can be waited for, and counting it would inflate this in the
         # direction that makes a longer wait look proven safe.
         self._quiet_peak = 0.0
+        # THE SAME HIGH WATER FOR BYTES. Banked only when a reply
+        # COMPLETES, for the same reason as `_quiet_peak`: a reply that
+        # died mid-silence proves nothing, and counting it inflates the
+        # number in the direction that makes a longer wait look safe.
+        self._byte_peak = 0.0
         # NEVER OBSERVED IS NOT MEASURED ZERO. A daemon that completed no reply
         # at all printed `survived 0s`, identical to one whose replies were
         # never silent — and the field exists to build a population a threshold
         # would be chosen from, so synthetic zeros drag it toward "short waits
         # are enough". Absent renders `n/a`.
         self._quiet_seen = False
+        self._byte_seen = False
         # THE LONGEST GAP BETWEEN CONTENT WRITES, per connection, accumulated
         # as they happen. Cleared with the debt like its siblings.
         self._gap: dict = {}
+        # THE GAP THE STALL PREDICATE ACTUALLY READS. `_gap` is between
+        # CONTENT writes; `_owed_still_moving` reads the last BYTE, and a
+        # keepalive is a byte. Without this the two get compared to each
+        # other, and a long content gap reads as evidence about a byte
+        # ceiling that it cannot speak to in either direction.
+        self._byte_gap: dict = {}
         # Sessions this daemon has already asked to restart. Per daemon, not
         # persisted: a recycle that did not help must not be repeated, and a
         # NEW daemon is entitled to try once — its predecessor may have died
@@ -11597,6 +11609,9 @@ class PinProxy:
                 f"— closed {closed} idle connection(s), none owed an answer; "
                 f"longest content-free wait a completed reply survived "
                 f"{f'{self._quiet_peak:.0f}s' if self._quiet_seen else 'n/a'}"
+                f"; longest BYTE-free wait one survived "
+                f"{f'{self._byte_peak:.0f}s' if self._byte_seen else 'n/a'}"
+                f" (this is the quantity `_owed_still_moving` reads)"
             )
         return cut
 
@@ -11946,6 +11961,7 @@ class PinProxy:
                 self._delivered.pop(conn, None)
                 self._content_at.pop(conn, None)
                 self._gap.pop(conn, None)
+                self._byte_gap.pop(conn, None)
 
         # HANDED OVER, NOT FINISHED. A handler that turns the connection into
         # an opaque tunnel gives its thread back and passes this teardown to
@@ -12137,6 +12153,10 @@ class PinProxy:
                                    self._gap.get(conn, 0.0),
                                    time.monotonic() - since)
             self._quiet_seen = True
+            bg = self._byte_gap.get(conn)
+            if bg:
+                self._byte_peak = max(self._byte_peak, bg)
+                self._byte_seen = True
 
     def inflight_mid_response(self) -> int:
         """Of the owed requests, how many have already sent the client bytes.
@@ -12215,7 +12235,12 @@ class PinProxy:
         """
         with self._live_lock:
             if conn in self._owed:
+                prev_byte = self._owed[conn]
                 self._owed[conn] = time.monotonic()
+                if prev_byte:
+                    self._byte_gap[conn] = max(
+                        self._byte_gap.get(conn, 0.0),
+                        self._owed[conn] - prev_byte)
                 self._delivered[conn] = self._delivered.get(conn, 0) + written
                 if content:
                     # BANK THE GAP BEFORE OVERWRITING THE STAMP. The first
@@ -12278,6 +12303,7 @@ class PinProxy:
                 self._delivered.pop(conn, None)
                 self._content_at.pop(conn, None)
                 self._gap.pop(conn, None)
+                self._byte_gap.pop(conn, None)
 
     def live_client_count(self) -> int:
         """How many clients are connected right now. Never None: this is a
