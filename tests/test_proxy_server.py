@@ -5210,12 +5210,17 @@ class TestDrainReportsWhatItCut:
         """
         import cswap_pin.proxy as pp
 
-        calls, released = [], []
+        calls, released, seeded = [], [], []
         real = pp.announce_draining
 
-        def _spy(certdir_arg, pid=None):
+        # `server=` IS PART OF THE CONTRACT, so the spy names it rather than
+        # swallowing it in `**kwargs`. A marker that cannot be read is one the
+        # successor reports as predating the held-bridge record, and the
+        # successor is spawned INSIDE the announce->beat window every time.
+        def _spy(certdir_arg, pid=None, server=None):
             calls.append(Path(certdir_arg))
-            done = real(certdir_arg, pid)
+            seeded.append(server)
+            done = real(certdir_arg, pid, server=server)
             return lambda: (released.append(True), done())[1]
 
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
@@ -5233,6 +5238,10 @@ class TestDrainReportsWhatItCut:
         assert calls[0] == Path(certdir), (
             f"announced against the wrong certdir: {calls[0]} != {certdir}. A "
             "marker under another daemon's directory protects nobody")
+        assert seeded and seeded[0] is proxy, (
+            "announced without the server, so the marker is one line long "
+            "until the first beat and the successor spawned in that window "
+            "reads this daemon as predating the held-bridge record")
         assert released, (
             "the marker was never removed. It expires on a TTL, so this is not "
             "a leak that lasts — but until it does, a genuinely orphaned pin "
@@ -8769,3 +8778,58 @@ class TestABeatIsNeverReadHalfWritten:
         assert not short, (
             "a reader saw a marker with no held-bridge line while a beat was "
             "in flight — that is the verdict reserved for an old release")
+
+
+class TestAMarkerIsAnswerableTheMomentItExists:
+    """`announce_draining` must not leave a file only line 0 long.
+
+    The announce deliberately precedes `_spawn_daemon`, which BLOCKS waiting
+    for the successor to publish -- so the process that reads the marker
+    during that window is the successor being spawned, every handover.
+    `draining_bridges` takes `body[5]`, and on a one-line file that is an
+    IndexError reported as "cannot be asked": the verdict reserved for a
+    release predating the held-bridge record. A current daemon then accuses
+    its own predecessor of being ancient and refuses to say whether any
+    bridge is deaf.
+    """
+
+    @staticmethod
+    def _proxy(tmp_path):
+        import cswap_pin.proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        return pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                           upstream=("127.0.0.1", 1)), certdir
+
+    def test_the_successor_can_ask_immediately(self, tmp_path):
+        import os
+
+        import cswap_pin.proxy as pp
+
+        proxy, certdir = self._proxy(tmp_path)
+        pid = os.getpid()
+        done = pp.announce_draining(certdir, pid, server=proxy)
+        try:
+            _ids, said = pp.draining_bridges(certdir, pid)
+            assert said is True, (
+                "a marker written by announce is unanswerable, so the "
+                "successor spawned during the announce->beat window reads "
+                "this daemon as predating the held-bridge record")
+        finally:
+            done()
+
+    def test_CONTROL_without_the_server_it_is_still_bare(self, tmp_path):
+        """What keeps the case above from passing for any reason at all. A
+        caller with nothing to ask still writes the one-line marker, and this
+        is the shape that produced the false 'predates the record' verdict."""
+        import os
+
+        import cswap_pin.proxy as pp
+
+        _proxy, certdir = self._proxy(tmp_path)
+        pid = os.getpid()
+        done = pp.announce_draining(certdir, pid)
+        try:
+            assert pp.draining_bridges(certdir, pid)[1] is False
+        finally:
+            done()

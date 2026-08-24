@@ -5454,7 +5454,7 @@ def draining_marker_path(certdir: Path, pid: int) -> Path:
     return Path(certdir) / f"{_DRAINING_PREFIX}{pid}"
 
 
-def announce_draining(certdir: Path, pid: int | None = None):
+def announce_draining(certdir: Path, pid: int | None = None, server=None):
     """Say "I am leaving on my own" so the orphan sweep does not TERM us.
 
     THE TWO FIXES THAT WERE EACH RIGHT ALONE AND OPPOSED TOGETHER. A handover
@@ -5508,6 +5508,29 @@ def announce_draining(certdir: Path, pid: int | None = None):
             # uncapped one, and cut the live mid-response replies that ceiling
             # was removed to save. A failed write must cost the SWEEP its
             # information, never cost us a reply.
+            pass
+
+    # ANSWERABLE FROM THE MOMENT IT EXISTS. Line 0 alone is a marker
+    # `draining_bridges` cannot read: it takes `body[5]`, gets IndexError, and
+    # reports "cannot be asked" -- the verdict reserved for a release predating
+    # the held-bridge record. That window is not a race lost occasionally. The
+    # announce deliberately precedes `_spawn_daemon`, which BLOCKS waiting for
+    # the successor to publish, so the process reading this one-line file is
+    # the successor being spawned, every time.
+    #
+    # THROUGH `beat_draining`, never by writing the layout here. A second place
+    # that knows which line holds what is a mirror, and the mirrors in this
+    # file have rotted twice.
+    if first and server is not None:
+        try:
+            beat_draining(certdir, pid,
+                          owed=server.inflight_requests(),
+                          live=0,
+                          quiet=server.content_free_seconds(),
+                          streams=(server.live_stream_count()
+                                   + _PUMP.live_pairs()),
+                          bridges=server.held_bridge_ids())
+        except Exception:  # noqa: BLE001 — a marker is advice, never a promise
             pass
 
     released = False
@@ -8491,7 +8514,7 @@ def _watch_own_code(
                 # does, so a daemon that never handed over would take the
                 # uncapped ceiling on every later teardown and put `Connection:
                 # close` on every response it ever writes again.
-                _asked_done = announce_draining(certdir)
+                _asked_done = announce_draining(certdir, server=server)
                 holder = _holder_pid()
                 if holder:
                     try:
@@ -8583,7 +8606,7 @@ def _watch_own_code(
                 # `_SPAWN_WAIT_S` waiting for the successor to publish, and the
                 # publish is what makes us sweepable. Announcing inside
                 # `await_inflight` — one line below — is one step too late.
-                done_draining = announce_draining(certdir)
+                done_draining = announce_draining(certdir, server=server)
                 spawned = _spawn_daemon(
                     account_num, email, certdir, listen_fd=handed_fd
                 )
@@ -11316,7 +11339,7 @@ class PinProxy:
         # it. See `announce_draining`: without it the orphan sweep TERMs a
         # predecessor that is patiently finishing its replies, one second after
         # the successor starts serving.
-        done_draining = announce_draining(self._certdir)
+        done_draining = announce_draining(self._certdir, server=self)
         # PUBLISHED IMMEDIATELY, not at the first beat fifteen seconds in. The
         # sweep reads this to decide which predecessor is cheapest to reap, and
         # a recycle storm can arrive inside those fifteen seconds — a marker
