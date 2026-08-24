@@ -17511,3 +17511,158 @@ class TestTheBudgetGuardWorksOnOneArmAndNotTheOther:
         case above fails, which is the notice."""
         import cswap_pin.proxy as p
         assert p._HELD_DRAIN_SECONDS == p._DRAIN_SECONDS
+
+
+def _lock_is_held(path):
+    """True when `.spawn.lock` at `path` cannot be taken right now.
+
+    An independent `open()` gets its own open file description, so flock
+    conflicts even inside one process -- which is what lets a test ask "is the
+    lock held" from the thread that is inside the code under test.
+    """
+    import fcntl
+    f = open(path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        f.close()
+
+
+class TestTheDrainDoesNotHoldTheSpawnLock:
+    """A correct, unbounded drain froze every future spawn for its whole life.
+
+    `.spawn.lock` serializes the SPAWN. The handover took it, spawned, and then
+    waited for its own connections to finish INSIDE the lock -- and that wait is
+    unbounded by design, because a Remote Control channel lives as long as its
+    session.
+
+    Measured live: a predecessor held it 72 minutes while legitimately serving
+    ONE channel, with the daemon then serving the port queued behind it and
+    `pin --heal` blocked with no output. `deploy.sh` calls heal synchronously,
+    so a deploy hitting that stalls silently. Nothing was wrong with the drain.
+    The drain being CORRECT is what made the hold unbounded.
+    """
+
+    def test_CONTROL_the_probe_can_see_a_held_lock(self, tmp_path):
+        """FIRST, because without it the real case passes on a probe that can
+        never say True -- and a lock test that cannot detect a lock certifies
+        nothing."""
+        import fcntl
+        p = tmp_path / ".spawn.lock"
+        holder = open(p, "w")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            assert _lock_is_held(p) is True
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        assert _lock_is_held(p) is False
+
+    def test_the_lock_is_free_while_the_handover_drains(self, tmp_path):
+        """THE FIX. `await_inflight` must run with the lock released."""
+        import threading
+        from cswap_pin import proxy as pin_proxy
+
+        seen = []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                return 7 if hand_down else None
+
+            def await_inflight(self, budget):
+                seen.append(_lock_is_held(tmp_path / ".spawn.lock"))
+
+        real_spawn, real_exit, real_kill = (
+            pin_proxy._spawn_daemon, os._exit, os.kill)
+        os.kill = lambda pid, sig: None
+        pin_proxy._spawn_daemon = lambda *a, **k: 1234
+        os._exit = lambda code: (_ for _ in ()).throw(SystemExit(code))
+        # NO HOLDER. `if held_by_a_holder():` is a SIBLING of the spawn-lock
+        # block and every path inside it ends in `os._exit`, so a test that
+        # sets those env vars takes the replace-ask branch and never reaches
+        # the subject. Measured: with them set, this case passed against a
+        # mutant that put the drain back inside the lock -- it was measuring a
+        # branch that never held it.
+        prev = {k: os.environ.pop(k, None)
+                for k in (pin_proxy._HELD_BY_ENV, pin_proxy._HOLDER_REPLACE_ENV)}
+        try:
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                lambda *a: None, interval=0.01,
+                _own_fingerprint="never-matches",
+            )
+        except SystemExit:
+            pass
+        finally:
+            pin_proxy._spawn_daemon = real_spawn
+            os._exit, os.kill = real_exit, real_kill
+            for k, v in prev.items():
+                if v is not None:
+                    os.environ[k] = v
+
+        assert seen, "the handover never reached its drain, so this proves nothing"
+        assert seen == [False] * len(seen), (
+            "the spawn lock was held while draining — a drain that can run for "
+            f"hours freezes every spawn behind it: {seen}")
+
+
+class TestHealGivesUpOnASpawnLockItCannotGet:
+    """`pin --heal` runs inside a deploy, synchronously, and used to block.
+
+    The holder can legitimately be a handover draining a Remote Control channel
+    for as long as its session lives. Blocking made heal hang with no output
+    and took the deploy with it. Saying "could not repair right now" is
+    recoverable; a hung deploy is not, and the next launch or heal does the
+    same work anyway.
+    """
+
+    def test_a_held_lock_makes_heal_return_instead_of_hanging(
+            self, tmp_path, monkeypatch):
+        import fcntl
+        import time
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        holder = open(certdir / ".spawn.lock", "w")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        monkeypatch.setattr(pin_proxy, "_HEAL_LOCK_WAIT_S", 0.3)
+        try:
+            t0 = time.monotonic()
+            with pytest.raises(pin_proxy.SpawnLockBusy):
+                with pin_proxy._spawn_lock(
+                        certdir, timeout=pin_proxy._HEAL_LOCK_WAIT_S):
+                    pass
+            waited = time.monotonic() - t0
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        assert 0.2 <= waited < 5.0, (
+            f"gave up after {waited:.2f}s, which is not the bounded wait")
+
+    def test_CONTROL_a_free_lock_is_still_taken_without_waiting(self, tmp_path):
+        """The bound must not become a refusal. A caller that CAN have the lock
+        still gets it, and immediately."""
+        import time
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        t0 = time.monotonic()
+        with pin_proxy._spawn_lock(certdir, timeout=5.0):
+            inside = True
+        assert inside
+        assert time.monotonic() - t0 < 1.0
+
+    def test_CONTROL_no_timeout_keeps_the_blocking_behaviour(self, tmp_path):
+        """Every existing caller passes no timeout and must be unchanged."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        with pin_proxy._spawn_lock(certdir):
+            assert _lock_is_held(certdir / ".spawn.lock") is True

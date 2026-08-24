@@ -1711,7 +1711,14 @@ def heal(backup_root: Path, identity: dict | None = None,
         if not account_num:
             return False
         try:
-            with _spawn_lock(certdir):
+            # BOUNDED, BECAUSE A DEPLOY CALLS THIS SYNCHRONOUSLY. The holder
+            # can be a handover draining a Remote Control channel, which lives
+            # as long as its session — measured at 72 minutes on a healthy
+            # fleet. Blocking here made `pin --heal` hang with no output and
+            # took the deploy with it. Saying "could not repair right now" is
+            # recoverable; a hung deploy is not, and the next launch or heal
+            # does this anyway.
+            with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
                 if _read_alive_port(certdir, fingerprint=fp) is not None:
                     return False  # another status line just did it
                 stale = read_daemon_state(certdir)
@@ -4844,13 +4851,33 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     return port, ca
 
 
-def _spawn_lock(certdir: Path, name: str = ".spawn.lock"):
+class SpawnLockBusy(RuntimeError):
+    """Raised when a bounded `_spawn_lock` could not be taken in time."""
+
+
+#: How long `heal` waits for the spawn lock before giving up. It runs inside a
+#: DEPLOY, synchronously, and a deploy that stalls with no output is worse than
+#: one that says it could not repair right now: the operator can re-run a heal,
+#: they cannot un-hang a script. Everything heal would have done is done again
+#: by the next launch or the next heal.
+_HEAL_LOCK_WAIT_S = 10.0
+
+
+def _spawn_lock(certdir: Path, name: str = ".spawn.lock",
+                timeout: "float | None" = None):
     """Exclusive file lock serializing daemon spawns (one elected spawner).
 
     ``name`` picks which lock: cert generation takes its own so it cannot
     deadlock against a spawn that is itself waiting on cert generation.
+
+    ``timeout`` bounds the wait and raises `SpawnLockBusy`; None keeps the
+    blocking behaviour every existing caller has. A bounded wait exists because
+    the holder can legitimately hold this for HOURS — the handover drains a
+    Remote Control channel that lives as long as its session — so a caller with
+    somebody waiting on it must be able to give up and say so.
     """
     import fcntl
+    import time as _time
     from contextlib import contextmanager
 
     @contextmanager
@@ -4858,7 +4885,19 @@ def _spawn_lock(certdir: Path, name: str = ".spawn.lock"):
         Path(certdir).mkdir(parents=True, exist_ok=True)
         lockf = open(Path(certdir) / name, "w")
         try:
-            fcntl.flock(lockf, fcntl.LOCK_EX)
+            if timeout is None:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+            else:
+                deadline = _time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if _time.monotonic() >= deadline:
+                            raise SpawnLockBusy(
+                                f"{name} still held after {timeout:.0f}s")
+                        _time.sleep(0.1)
             yield
         finally:
             try:
@@ -8365,6 +8404,7 @@ def _watch_own_code(
             # orphaned — invisible to the sweep, holding a port forever. Taken
             # BEFORE the stop so a loser waits with its server still up rather
             # than dead.
+            spawned = None
             with _spawn_lock(certdir):
                 # Another daemon may have recycled us while we queued.
                 if daemon_fingerprint() == own and not orphaned:
@@ -8397,28 +8437,43 @@ def _watch_own_code(
                 spawned = _spawn_daemon(
                     account_num, email, certdir, listen_fd=handed_fd
                 )
+                if spawned is None:
+                    # AND WE ARE NOT LEAVING AFTER ALL. The spawn failed, this
+                    # daemon keeps serving, and a marker saying "draining" on a
+                    # process that is back to accepting would spare a genuine
+                    # orphan for the whole TTL. Released only on this path:
+                    # every other way out of here ends in `os._exit`.
+                    done_draining()
+                    _log_lifecycle("successor did not come up")
+            # THE LOCK ENDS HERE, AND THE DRAIN HAPPENS OUTSIDE IT.
+            #
+            # `.spawn.lock` serializes the SPAWN — two unserialized spawns
+            # leave one successor orphaned, holding a port forever. The spawn
+            # is done. The wait below is this process finishing connections it
+            # already owns, and it is UNBOUNDED BY DESIGN: a Remote Control
+            # channel lives as long as its session, so "until they end" can be
+            # hours. Holding the lock across it froze every future spawn for
+            # that whole time.
+            #
+            # Measured live: a predecessor held this lock for 72 minutes while
+            # legitimately serving ONE channel, with the daemon then serving
+            # the port queued behind it and `pin --heal` blocked with no output
+            # — and `deploy.sh` calls heal synchronously. Nothing was wrong
+            # with the drain. The lock was the fault, and the drain being
+            # CORRECT is what made it unbounded.
+            if spawned is not None:
                 # THE PORT NEVER LEFT: the listening socket went down by fd,
                 # so arrivals queue in the backlog the whole time this waits.
-                # Free, for the same reason as site 1.
                 server.await_inflight(_HANDOVER_DRAIN_SECONDS)
-                if spawned is not None:
-                    _log_lifecycle("successor is serving — leaving the wiring to it")
-                    # OUR COPY OF THE FD STAYS OPEN, deliberately. This process
-                    # returns from here into its own exit, and closing a
-                    # listening descriptor two processes hold is only ever
-                    # dangerous in the other direction: close it a moment too
-                    # early and the port is gone. Nothing here accepts on it —
-                    # `release_listener` joined the accept loop before handing
-                    # it over.
-                    handed_over = True
-                    return
-                # AND WE ARE NOT LEAVING AFTER ALL. The spawn failed, this
-                # daemon keeps serving, and a marker saying "draining" on a
-                # process that is back to accepting would spare a genuine
-                # orphan for the whole TTL. Released only on this path: every
-                # other way out of this block ends in `os._exit`.
-                done_draining()
-                _log_lifecycle("successor did not come up")
+                _log_lifecycle("successor is serving — leaving the wiring to it")
+                # OUR COPY OF THE FD STAYS OPEN, deliberately. This process
+                # returns from here into its own exit, and closing a listening
+                # descriptor two processes hold is only ever dangerous in the
+                # other direction: close it a moment too early and the port is
+                # gone. Nothing here accepts on it — `release_listener` joined
+                # the accept loop before handing it over.
+                handed_over = True
+                return
             # TRY AGAIN, BOUNDED. Returning here left the thread dead with the
             # code on disk still new, so the daemon served the stale code
             # forever — the 22-hour outage this watchdog exists to end, reached
@@ -11115,9 +11170,22 @@ class PinProxy:
             # A drain that CAN cut has to say so before it cuts. The cut line
             # is honest and it is too late — by then the decision a reader
             # would have made from the log has been made.
+            # "AT THE START", BECAUSE THIS LINE IS PRINTED ONCE AND THE DRAIN
+            # CAN RUN FOR HOURS. The number is derived now and never again, so
+            # a reader arriving later takes an hours-old snapshot for the
+            # current state. Measured: this line said 14 while the drain's own
+            # beat, re-derived every 15s, said 1 and the socket table agreed
+            # with the beat — and the gap was read as the drain waiting on
+            # channels that had already left, which argued for killing a
+            # process serving a live one.
+            #
+            # A LINE PER BEAT IS NOT THE ANSWER: it would bury the drain's real
+            # events in the one file a person reads to find out why a daemon
+            # died. Name the snapshot and point at the record that IS current.
             _log_lifecycle(
-                f"draining with {streams} long-lived channel(s) still open — "
-                f"{drain_fate(budget)}")
+                f"draining with {streams} long-lived channel(s) still open at "
+                f"the start — {drain_fate(budget)}. This count is not "
+                f"re-printed; `.draining-{os.getpid()}` carries the live one")
         beat_draining(self._certdir, owed=self.inflight_requests(),
                       live=self.live_replies(started),
                       quiet=self.content_free_seconds(),
