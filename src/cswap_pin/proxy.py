@@ -1798,7 +1798,14 @@ def heal(backup_root: Path, identity: dict | None = None,
             # NOT THE SAME FALSE AS "nothing to heal". Both reach the caller as
             # a bare False and it prints "Nothing to heal" — the opposite of
             # what happened. The return type cannot carry the difference, so
-            # the log does.
+            # this line does.
+            #
+            # TO THE CALLER'S STDERR, NOT TO `daemon.log`. `_log_lifecycle`
+            # writes to stderr and stderr IS the log only inside the daemon;
+            # heal runs in the CLI, so this reaches whoever ran it — a deploy's
+            # own output — and searching the daemon corpus for it finds
+            # nothing. Anything that must survive the process goes in a file
+            # under certdir instead (see `_watchdog_had_its_turn`).
             _log_lifecycle(f"heal gave up waiting for the spawn lock: {exc}")
             return False
         except Exception:  # noqa: BLE001 — a heal must never raise
