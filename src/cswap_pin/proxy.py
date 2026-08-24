@@ -3976,6 +3976,16 @@ def observed_bridge_owners() -> dict[str, str | None]:
     disagree with, unknown means the caller must not claim agreement. Dropping
     the key would let a status line report a match for a session it could not
     read — the same shape as the defect this exists to surface.
+
+    THE ORGANIZATION ONLY, AND THAT UNDER-DETECTS ON A ROSTER THIS ONE IS NOT.
+    Claude Code compares BOTH the account uuid and the organization uuid, so a
+    caller keying on this value alone cannot see two slots that share an
+    organization: switching between them changes the account, CC mints a fresh
+    bridge with history suppressed, and an org comparison stays silent.
+    Measured: six enabled slots, six distinct organizations, no pair — so an
+    org match implies an account match here and the narrowing costs nothing.
+    That is a fact about the roster, not about this function. Widen the return
+    to the pair the day any two enabled slots land in one organization.
     """
     home = require("paths").get_claude_config_home()
     owners: dict[str, str | None] = {}
