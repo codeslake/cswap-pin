@@ -1728,7 +1728,7 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # exact damage this recycle exists to avoid.
                     if isinstance(stale.get("port"), int):
                         _write_port_hint(certdir, stale["port"])
-                    _kill_daemon(int(stale["pid"]))
+                    _kill_daemon(int(stale["pid"]), certdir)
                     # ONLY AFTER A KILL. `recycled` decides whether the spawn
                     # guard below is fingerprinted, and setting it merely for
                     # ENTERING this branch made a no-op recycle look like a
@@ -4869,7 +4869,7 @@ def _spawn_lock(certdir: Path, name: str = ".spawn.lock"):
     return _locked()
 
 
-def _kill_daemon(pid: int) -> None:
+def _kill_daemon(pid: int, certdir: "Path | None" = None) -> None:
     """TERM a daemon, then escalate to KILL if it does not exit — so a daemon
     that ignores TERM (or hangs mid-teardown) never lingers as an orphan
     holding a port. Mirrors a supervisor recycle: bounded wait, then force.
@@ -4913,6 +4913,21 @@ def _kill_daemon(pid: int) -> None:
     for _ in range(int(_DRAIN_SECONDS * 10) + 20):
         if not _pid_alive(pid):
             return
+        # A DRAIN THAT ANNOUNCED ITSELF IS NOT AN ORPHAN. This escalation
+        # exists so a daemon that IGNORES the signal never lingers holding a
+        # port; a daemon that took it and is beating its marker is leaving on
+        # its own and holds nothing anyone waits for. `_sweep_orphan_daemons`
+        # already spares exactly this case with exactly this predicate -- its
+        # own comment records the same incident, a handover that cut nothing
+        # becoming a TERM one second later that cut 13 mid-response replies.
+        #
+        # NOT A LONGER WAIT: returning. Blocking here would hold a deploy open
+        # for as long as a legitimate three-hour reply takes. The marker
+        # expires by MTIME, so a drainer that stops beating stops being spared
+        # and the next sweep reaps it -- the leak stays bounded without this
+        # loop having to be the thing that bounds it.
+        if certdir is not None and is_draining(certdir, pid):
+            return
         time.sleep(0.1)
     try:
         os.kill(pid, 9)  # SIGKILL escalation
@@ -4946,7 +4961,7 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
     spawn.
     """
     held = _holder_owns(certdir)
-    _kill_daemon(pid)
+    _kill_daemon(pid, certdir)
     return held
 
 
@@ -5066,7 +5081,7 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
                              draining_owed(certdir, pid),
                              draining_since(certdir, pid), pid))
             continue
-        _kill_daemon(pid)
+        _kill_daemon(pid, certdir)
 
     # BUT A PILE OF THEM IS A LEAK, and this count is the only thing bounding
     # it now that `_HANDOVER_DRAIN_SECONDS` is infinite. The count tells them
@@ -5110,7 +5125,7 @@ def _sweep_orphan_daemons(certdir: Path, keep_pid: int) -> None:
                 "A drain that never ends is "
                 "the leak the removed wall clock used to bound; this line is "
                 "the signal it happened")
-            _kill_daemon(pid)
+            _kill_daemon(pid, certdir)
 
 
 def _quiet_phrase(secs: "float | None") -> str:
@@ -11146,9 +11161,36 @@ class PinProxy:
                         f"process open on a wedged peer")
             if budget > 0:
                 deadline = started + budget
+                # THE BUDGET WAS CHOSEN BEFORE THE HANDOVER EXISTED, and the
+                # three paths that share this lifecycle cannot see each other's
+                # locals -- which is why `proxy.json` is the arbitration point.
+                # A signal drain picks the capped arm because the port would
+                # otherwise go dark. If a successor then takes the port while
+                # this drain is running, that reason is gone: nothing waits on
+                # this process, it accepts nothing, and it is one idle process
+                # finishing replies it already owes. Exactly the condition
+                # `_HANDOVER_DRAIN_SECONDS` was made infinite for.
+                #
+                # Measured: a TERM armed the 30s arm, twenty seconds later this
+                # process's own watchdog handed over with the successor already
+                # serving, and at thirty seconds the clock from before the
+                # handover cut 13 mid-response replies.
+                #
+                # `teardown_drain_budget(handed_over=...)` means to prevent
+                # this and CANNOT: `_HELD_DRAIN_SECONDS` is `_DRAIN_SECONDS`,
+                # so all four combinations of its arguments return 30.0. The
+                # fact has to be re-read HERE, where it can change mid-wait.
+                promoted = budget == float("inf")
                 while time.monotonic() < deadline:
                     if not self._owed_still_moving(started):
                         break
+                    if not promoted and _superseded_on_the_port(self._certdir):
+                        promoted = True
+                        deadline = float("inf")
+                        _log_lifecycle(
+                            "a successor took the port while this drain was "
+                            "running — dropping the wall clock so the replies "
+                            "already owed can finish")
                     # SAY WE ARE STILL HERE. Without this a wait past
                     # `_DRAINING_MARKER_TTL` looks abandoned and the orphan
                     # sweep TERMs a daemon that is mid-reply, which is the

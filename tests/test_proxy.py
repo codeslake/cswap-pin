@@ -4516,7 +4516,7 @@ class TestEnsureProxyLifecycle:
         # recycle refuses to signal a pid it cannot identify as one of ours,
         # and the pytest process is not (see test_a_reused_pid_is_not_killed).
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 52000)
         got, ca = pin_proxy.ensure_proxy(self._Sw(tmp_path))
         srv.close()
@@ -5015,7 +5015,7 @@ class TestOrphanSweep:
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids",
                             lambda cd: list(found))
         killed = []
-        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
         pin_proxy._sweep_orphan_daemons(certdir, keep_pid=202)
         assert sorted(killed) == [101, 303]  # everything but the keeper
 
@@ -12021,7 +12021,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         # reused freely, and killing on liveness alone aims TERM at whatever
         # unrelated process inherited the number.
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
 
         def _spawn(num, email, cd, **kw):
             spawned.append((num, email))
@@ -12048,7 +12048,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         hint_at_kill = {}
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
 
-        def _kill(pid):
+        def _kill(pid, certdir=None):
             # Whatever the successor can reclaim, it can only be what was on
             # disk at THIS moment.
             hint_at_kill["port"] = proxy.read_port_hint(certdir)
@@ -12077,7 +12077,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         monkeypatch.setattr(
             proxy,
             "_kill_daemon",
-            lambda pid: pytest.fail("recycled a daemon running CURRENT code"),
+            lambda pid, certdir=None: pytest.fail("recycled a daemon running CURRENT code"),
         )
         try:
             assert proxy.heal(tmp_path) is False
@@ -12096,7 +12096,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         monkeypatch.setattr(
             proxy,
             "_kill_daemon",
-            lambda pid: pytest.fail("signalled a pid it could not identify"),
+            lambda pid, certdir=None: pytest.fail("signalled a pid it could not identify"),
         )
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         try:
@@ -12556,7 +12556,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         )
         killed = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         try:
             proxy.heal(tmp_path)
@@ -12586,7 +12586,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         )
         kills = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: kills.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: kills.append(pid))
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: port)
         try:
             for _ in range(5):
@@ -12613,7 +12613,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         )
         spawns = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: None)
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: None)
         monkeypatch.setattr(
             proxy, "_spawn_daemon", lambda n, e, c, **k: spawns.append(n) or port
         )
@@ -12640,7 +12640,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         certdir, port, cfg, srv = self._fixture(tmp_path, monkeypatch)
         kills, spawns = [], []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [])  # no ps
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid: kills.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: kills.append(pid))
         monkeypatch.setattr(
             proxy, "_spawn_daemon", lambda n, e, c, **k: spawns.append(n) or port
         )
@@ -17417,3 +17417,59 @@ class TestADrainSaysWhichArmItIsOn:
         import cswap_pin.proxy as pin_proxy
         assert pin_proxy._DRAIN_SECONDS != float("inf")
         assert "CAPPED" in pin_proxy.drain_fate(pin_proxy._DRAIN_SECONDS)
+
+
+class TestTheKillerSparesADrainThatAnnouncedItself:
+    """SIGKILL escalation exists for a daemon that IGNORES the signal.
+
+    A daemon that took the TERM and is beating its draining marker is leaving
+    on its own and holds nothing anyone waits for -- a successor has the port.
+    Escalating against it converts a logged cut into an unlogged hard kill
+    partway through a reply, which is strictly worse than the cut.
+
+    `_sweep_orphan_daemons` already spares exactly this case with exactly this
+    predicate; its own comment records the incident -- a handover that cut
+    nothing becoming a TERM one second later that cut 13 mid-response replies.
+    This is the same rule for the other killer.
+    """
+
+    def _kill(self, monkeypatch, *, draining, certdir="/nonexistent"):
+        import cswap_pin.proxy as pin_proxy
+        signals = []
+        monkeypatch.setattr(pin_proxy.os, "kill",
+                            lambda p, sig: signals.append(sig))
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(pin_proxy, "is_draining",
+                            lambda _c, _p: draining)
+        # The loop counts in 0.1s sleeps to `_DRAIN_SECONDS + 2`; nothing here
+        # depends on real time passing.
+        monkeypatch.setattr(pin_proxy.time, "sleep", lambda _s: None)
+        pin_proxy._kill_daemon(4242, certdir)
+        return signals
+
+    def test_an_announced_drain_is_not_escalated_against(self, monkeypatch):
+        """THE FIX. TERM is still sent -- that is how the drain starts -- and
+        SIGKILL is not."""
+        sigs = self._kill(monkeypatch, draining=True)
+        assert sigs == [15], (
+            f"expected TERM only, got {sigs} (9 is SIGKILL against a daemon "
+            "that was finishing its replies)")
+
+    def test_CONTROL_a_daemon_that_never_announces_is_still_KILLED(
+            self, monkeypatch):
+        """What keeps the case above from being "the killer never kills". A
+        daemon that ignores the signal is the whole reason this escalation
+        exists, and it must still be reaped."""
+        sigs = self._kill(monkeypatch, draining=False)
+        assert sigs == [15, 9], (
+            f"the SIGKILL escalation stopped firing on a daemon that ignored "
+            f"TERM, which is what it is for: {sigs}")
+
+    def test_CONTROL_a_caller_with_no_certdir_behaves_as_before(
+            self, monkeypatch):
+        """`certdir` is optional, so an older call site cannot silently gain
+        the sparing behaviour -- it has no way to ask the question."""
+        sigs = self._kill(monkeypatch, draining=True, certdir=None)
+        assert sigs == [15, 9], (
+            f"a call with no certdir spared a daemon it cannot have checked: "
+            f"{sigs}")

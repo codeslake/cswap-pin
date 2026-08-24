@@ -1259,7 +1259,7 @@ class TestPortReclamationAcrossRespawn:
         killed = []
         # 4242 is a pin daemon for THIS certdir — the recycle is legitimate.
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [4242])
-        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 51000)
         monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
 
@@ -1294,7 +1294,7 @@ class TestPortReclamationAcrossRespawn:
         # daemon for this certdir carries it.
         monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: True)
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [])
-        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 51000)
         monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
 
@@ -4289,7 +4289,7 @@ class TestDrainReportsWhatItCut:
 
         killed = []
         real_kill, real_pids = pp._kill_daemon, pp._pin_daemon_pids
-        pp._kill_daemon = lambda pid: killed.append(pid)
+        pp._kill_daemon = lambda pid, certdir=None: killed.append(pid)
         pids = _fake_pids(7000, pp._MAX_DRAINING_PREDECESSORS + 1)
         pp._pin_daemon_pids = lambda certdir: list(pids)
         try:
@@ -4944,7 +4944,7 @@ class TestDrainReportsWhatItCut:
         killed = []
         real_kill = pp._kill_daemon
         real_pids = pp._pin_daemon_pids
-        pp._kill_daemon = lambda pid: killed.append(pid)
+        pp._kill_daemon = lambda pid, certdir=None: killed.append(pid)
         # A PREDECESSOR AND A REAL ORPHAN, so the case cannot pass by sparing
         # everything — which is the failure mode of a guard that only ever
         # removes a kill.
@@ -8595,3 +8595,65 @@ class TestEverySmallCaseHolder:
             request,
             tmp_path_factory,
         )
+
+
+class TestAHandoverMidDrainDropsTheClock:
+    """The budget is chosen once, and a handover can arrive after it.
+
+    A signal drain takes the CAPPED arm because the port would otherwise go
+    dark. If a successor then takes the port while that drain is running, the
+    reason is gone -- nothing waits on this process and it accepts nothing.
+    It is one idle process finishing replies it already owes, which is the
+    exact condition `_HANDOVER_DRAIN_SECONDS` was made infinite for.
+
+    Measured: a TERM armed the 30s arm; twenty seconds later this process's own
+    watchdog handed over with the successor already serving; at thirty seconds
+    the clock from BEFORE the handover cut 13 mid-response replies.
+
+    `teardown_drain_budget(handed_over=...)` means to prevent this and cannot:
+    `_HELD_DRAIN_SECONDS` IS `_DRAIN_SECONDS`, so all four combinations of its
+    arguments return 30.0 -- measured. The fact has to be re-read where it can
+    change mid-wait, which is here.
+    """
+
+    def _drain(self, tmp_path, monkeypatch, *, superseded, moving_for=3):
+        import cswap_pin.proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        seen = {"n": 0}
+
+        def moving(_started):
+            seen["n"] += 1
+            return seen["n"] <= moving_for
+
+        monkeypatch.setattr(proxy, "_owed_still_moving", moving)
+        monkeypatch.setattr(pp, "_superseded_on_the_port",
+                            lambda _c: superseded)
+        monkeypatch.setattr(pp.time, "sleep", lambda _s: None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            proxy.await_inflight(5.0)
+        return err.getvalue()
+
+    def test_a_successor_taking_the_port_drops_the_wall_clock(
+            self, tmp_path, monkeypatch):
+        out = self._drain(tmp_path, monkeypatch, superseded=True)
+        assert "dropping the wall clock" in out, out
+
+    def test_CONTROL_no_successor_means_the_clock_still_binds(
+            self, tmp_path, monkeypatch):
+        """What keeps the case above from being "always uncapped". With
+        nothing serving the port, hurrying is correct and the cap stays."""
+        out = self._drain(tmp_path, monkeypatch, superseded=False)
+        assert "dropping the wall clock" not in out, out
+
+    def test_CONTROL_the_promotion_happens_at_most_once(
+            self, tmp_path, monkeypatch):
+        """The check runs every pass of a loop that can spin thousands of
+        times. Announcing on each would bury the drain's own lines in the one
+        file a person reads to find out why a daemon died."""
+        out = self._drain(tmp_path, monkeypatch, superseded=True,
+                          moving_for=25)
+        assert out.count("dropping the wall clock") == 1, out
