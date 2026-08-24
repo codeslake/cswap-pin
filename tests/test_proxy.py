@@ -17473,3 +17473,41 @@ class TestTheKillerSparesADrainThatAnnouncedItself:
         assert sigs == [15, 9], (
             f"a call with no certdir spared a daemon it cannot have checked: "
             f"{sigs}")
+
+
+class TestTheBudgetGuardWorksOnOneArmAndNotTheOther:
+    """`handed_over` is load-bearing on one arm and inert on the other.
+
+    Written because the scoped fact was stated as a general one. Measuring
+    `reason='signal'` alone gives four 30.0s, and "so the guard is a no-op"
+    followed — which would have marked a working branch as dead code for the
+    next reader to delete.
+
+    THE SIGNAL ARM CANNOT BE HELPED BY IT, and that is the real finding:
+    `_HELD_DRAIN_SECONDS` IS `_DRAIN_SECONDS`, so the guard picks between two
+    equal numbers there. It is also evaluated ONCE, before a handover can have
+    happened, which is why the drain re-reads `_superseded_on_the_port` inside
+    the wait instead. A budget chosen at drain start cannot know something that
+    becomes true twenty seconds later.
+    """
+
+    def test_the_signal_arm_is_the_same_number_either_way(self):
+        import cswap_pin.proxy as p
+        got = {p.teardown_drain_budget("signal", held, handed_over=ho)
+               for held in (True, False) for ho in (True, False)}
+        assert got == {p._DRAIN_SECONDS}, got
+
+    def test_CONTROL_the_refcount_arm_really_does_use_it(self):
+        """Without this the case above reads as "the guard is dead"."""
+        import cswap_pin.proxy as p
+        assert p.teardown_drain_budget("refcount", True,
+                                       handed_over=False) == p._DRAIN_SECONDS
+        assert p.teardown_drain_budget("refcount", True,
+                                       handed_over=True) == float("inf")
+
+    def test_the_two_held_constants_are_what_make_the_signal_arm_inert(self):
+        """Names the CAUSE, so a future divergence is a deliberate act. If
+        these two ever differ, the signal arm stops being inert and the first
+        case above fails, which is the notice."""
+        import cswap_pin.proxy as p
+        assert p._HELD_DRAIN_SECONDS == p._DRAIN_SECONDS
