@@ -60,8 +60,27 @@ jobs:
           # the variable. `-n 0` distributes nothing and deselects nothing, so
           # coverage is unchanged — and a test that really does take a worker
           # down becomes a named failure instead of a silent one.
-          WORKERS=4
-          [ "$(uname -s)" = "Darwin" ] && WORKERS=0
+          # ONE PROCESS EVERYWHERE NOW, for the reason the macOS line above
+          # already records. The linux job started killing a worker with no
+          # traceback and no named test, and the case it was attributed to
+          # MOVED between runs -- four different classes across one evening.
+          # Bisected: the same tests against the PREVIOUS release's source
+          # crash too, on a different case, so the source is not involved and
+          # the trigger is the distribution. Adding four unrelated tests was
+          # enough to change which case paid.
+          #
+          # The mechanism is a leaked daemon thread reaching the REAL
+          # `os._exit` after a case's monkeypatch was restored: the worker
+          # exits instantly, which is why there is never a traceback. Several
+          # cases stub that call, so this is a suite-wide property and not one
+          # case's bug.
+          #
+          # `-n 0` distributes nothing and deselects nothing, so coverage is
+          # unchanged and a case that really does take the process down becomes
+          # a NAMED failure. Restore parallelism when the thread hygiene is
+          # fixed, not before -- a green that depends on which worker got which
+          # test is not a green.
+          WORKERS=0
           S="$(mktemp -d)"
           HOME="$S" XDG_DATA_HOME="$S/.local/share" \
             uv run --with pytest --with pytest-xdist --with cryptography \

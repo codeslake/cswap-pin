@@ -10672,8 +10672,19 @@ class TestTheDaemonWatchesItsOwnCode:
 
         blocked = not spawned
         release.set()
+        # STOP THE WATCHDOG, do not hope it returns. `done` is the only thing
+        # that ends its loop; without setting it the join is a 5s wait and then
+        # a LEAKED daemon thread running `_watch_own_code` against fixtures
+        # pytest has already torn down and monkeypatches it has already
+        # restored. That thread dies on a closed fd in a non-main thread, which
+        # xdist turns into a dead worker attributed to whichever case happened
+        # to be next.
+        done.set()
         t.join(timeout=5)
         w.join(timeout=5)
+        assert not w.is_alive(), (
+            "the watchdog thread outlived the case that started it — it will "
+            "run against torn-down state and kill an unrelated test")
 
         assert blocked, (
             "the watchdog spawned while another holder had the spawn lock — "
