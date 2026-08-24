@@ -10868,7 +10868,73 @@ class TestTheDaemonWatchesItsOwnCode:
             "every later session dials an address nobody answers"
         )
 
-    def _live_daemon(self, tmp_path, monkeypatch, paths):
+    def case_a_real_daemon_start_wires_a_config_naming_NOTHING(
+        self, tmp_path, monkeypatch
+    ):
+        """The call site, RUN rather than read.
+
+        `TestTheServingDaemonOwnsTheWiring` drives `ensure_wired_to` with both
+        of its collaborators stubbed, so it proves the decision and nothing
+        else: not that `daemon_main` reaches the call, and not that the write
+        and the read agree on a real file. Nobody calls `wire_global_config`
+        in this test -- the daemon is the only thing that can have written it.
+        """
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        certdir, cfg, _ = self._live_daemon(tmp_path, monkeypatch, paths)
+        st = pin_proxy.read_daemon_state(certdir)
+        assert pin_proxy._wired_port() == st["port"], (
+            "a serving daemon left the config naming no port at all, so every "
+            "hand-launched session afterwards runs unpinned",
+            cfg.read_text())
+
+    def case_a_real_daemon_start_REWIRES_a_config_naming_ANOTHER_port(
+        self, tmp_path, monkeypatch
+    ):
+        """THE ARM NO DEPLOY HAS EXERCISED, which is why a quiet log proves
+        nothing about it.
+
+        Every daemon the fleet has started so far came up onto a config that
+        already named its port, so only the no-op arm ran and it writes
+        nothing by design. "No rewire line appeared" is then a statement about
+        the TRIGGER, not about the repair -- and the two are indistinguishable
+        from outside. This makes the trigger occur.
+        """
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        certdir, cfg, _ = self._live_daemon(
+            tmp_path, monkeypatch, paths, stale_port=41111)
+        st = pin_proxy.read_daemon_state(certdir)
+        assert pin_proxy._wired_port() == st["port"] != 41111, (
+            "the daemon served one port while the config sent sessions to "
+            "another -- the split a human had to repair by hand",
+            cfg.read_text())
+
+    def case_CONTROL_a_block_the_pin_did_not_write_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """The repair is scoped to the pin's own keys, and must stay scoped.
+
+        `wire_global_config` modifies only what `_WIRE_MARK` records, so a
+        `CSWAP_PIN_PORT` some launcher or person set is not ours to correct --
+        and a serving daemon calling into it must not become the exception.
+        Found by seeding the case above with an unmarked block by hand, which
+        reported a repair failure over code keeping this promise.
+        """
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        certdir, cfg, _ = self._live_daemon(
+            tmp_path, monkeypatch, paths,
+            cfg_text=json.dumps({"env": {"CSWAP_PIN_PORT": "41111"}}))
+        assert pin_proxy._wired_port() == 41111, (
+            "a daemon start rewrote an env block the pin never wrote",
+            cfg.read_text())
+
+    def _live_daemon(self, tmp_path, monkeypatch, paths, stale_port=None,
+                     cfg_text="{}"):
         """A REAL daemon_main up to the point it installs its signal teardown,
         returning that teardown closure — the one both the refcount watcher and
         the SIGTERM handler call. A stand-in closure cannot race the state it
@@ -10882,8 +10948,18 @@ class TestTheDaemonWatchesItsOwnCode:
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(exist_ok=True)
         cfg = tmp_path / ".claude.json"
-        cfg.write_text("{}")
+        cfg.write_text(cfg_text)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        # THE REAL WRITER, never a hand-built block. `wire_global_config`
+        # only ever modifies keys it recorded in `_WIRE_MARK`, so an
+        # approximation of its output without that mark is a config it is
+        # required to leave alone -- a seed that tests the opposite of what it
+        # was written for. Measured: a hand-built `{"env": {"CSWAP_PIN_PORT":
+        # "41111"}}` made this harness report a repair failure over code doing
+        # exactly what it promises.
+        if stale_port is not None:
+            pin_proxy.wire_global_config(stale_port, certdir / "ca.pem")
+            assert pin_proxy._wired_port() == stale_port, cfg.read_text()
 
         class _Reached(Exception):
             pass
