@@ -8714,3 +8714,58 @@ class TestARequestThatArrivesMidDrainIsNotBornStale:
         proxy._owed["c"] = now - (pp._DRAIN_STALL_SECONDS + 10.0)
         proxy._content_at["c"] = now - 1.0   # fresh seed must not rescue it
         assert proxy._owed_still_moving(started) is False
+
+
+class TestABeatIsNeverReadHalfWritten:
+    """A short marker and an old marker must not read the same.
+
+    `draining_bridges` reports "cannot be asked" for a marker with fewer than
+    six lines, and that verdict is reserved for a predecessor from a release
+    predating the held-bridge record. A non-atomic beat -- which fires every
+    few seconds for the whole life of a drain -- puts the CURRENT release into
+    that state for the width of one write, and the successor then refuses to
+    say whether any bridge is deaf.
+    """
+
+    def test_a_concurrent_reader_never_sees_a_short_marker(self, tmp_path):
+        import os
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        pid = os.getpid()
+        # SEEDED THROUGH THE REAL WRITERS. `beat_draining` reads line 0 (the
+        # drain's start) out of the existing marker, so a beat with no
+        # `announce_draining` before it writes NOTHING -- and an absent marker
+        # also reports False, which is a different and correct answer this
+        # case must not accidentally assert on.
+        done = pp.announce_draining(certdir, pid)   # returns a release callable
+        pp.beat_draining(certdir, pid, owed=1, live=0, quiet=0.0,
+                         streams=1, bridges={"cse_seed"})
+        assert pp.draining_bridges(certdir, pid)[1] is True, "seed beat unreadable"
+
+        stop, short = threading.Event(), []
+
+        def beat():
+            n = 0
+            while not stop.is_set():
+                pp.beat_draining(certdir, pid, owed=1, live=0, quiet=0.0,
+                                 streams=1, bridges={f"cse_{n % 4}"})
+                n += 1
+
+        t = threading.Thread(target=beat, daemon=True)
+        t.start()
+        try:
+            for _ in range(6000):
+                if pp.draining_bridges(certdir, pid)[1] is not True:
+                    short.append(1)
+                    break
+        finally:
+            stop.set()
+            t.join(timeout=5.0)
+            done()
+        assert not short, (
+            "a reader saw a marker with no held-bridge line while a beat was "
+            "in flight — that is the verdict reserved for an old release")

@@ -5591,7 +5591,29 @@ def beat_draining(certdir: Path, pid: int | None = None,
             if streams is None:
                 tail = f"{tail or chr(10) + '0.0'}\n0"
             tail = f"{tail}\n{' '.join(sorted(bridges))}"
-        path.write_text(f"{start}\n{int(owed)}\n{live_n}{tail}")
+        # ATOMIC, BECAUSE A READER CANNOT TELL A SHORT FILE FROM AN OLD ONE.
+        # `write_text` truncates and then writes, so a beat -- which fires
+        # every few seconds -- is a window in which `draining_bridges` reads
+        # fewer than six lines and reports "cannot be asked". That is the
+        # verdict reserved for a predecessor predating the record, and it is
+        # indistinguishable from catching this write mid-flight.
+        #
+        # No fsync: the requirement is that other PROCESSES see one version or
+        # the other, which `os.replace` gives on its own. Durability across a
+        # crash is worthless for a beat that repeats.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
+        try:
+            tmp.write_text(f"{start}\n{int(owed)}\n{live_n}{tail}")
+            os.replace(tmp, path)
+        except (OSError, ValueError):
+            # NOT O_EXCL and unlinked here rather than left: the name is
+            # scoped to this pid, and a survivor would otherwise be litter in
+            # the one directory somebody opens to read a handover.
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
     except (OSError, ValueError):
         pass
 
