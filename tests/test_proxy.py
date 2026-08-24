@@ -120,6 +120,24 @@ def _ask_for_a_reply(port, timeout=2.0):
             pass
 
 
+def _accept_until_closed(sock, limit=8):
+    """Accept until the socket closes, then stop QUIETLY.
+
+    A bare `accept()` on a closed fd raises `OSError: Bad file descriptor` in a
+    NON-MAIN thread. pytest surfaces that as an unhandled-thread warning when
+    it is lucky and xdist turns it into a dead worker when it is not — and the
+    test that dies is whichever one happened to share the worker, so it MOVED
+    between runs. A crash that relocates with the distribution is a shared
+    fixture's fault, not the fault of the case it lands on; adding four
+    unrelated tests was enough to change which one paid.
+    """
+    try:
+        for _ in range(limit):
+            sock.accept()
+    except OSError:
+        pass
+
+
 class TestHistoryCarriesAcrossASwitch:
     """Keep a session's bridge when cswap rotates the account under it.
 
@@ -9743,7 +9761,7 @@ class TestUnwireWhenDead:
         srv.bind(("127.0.0.1", 0))
         srv.listen(1)
         port = srv.getsockname()[1]
-        threading.Thread(target=lambda: [srv.accept() for _ in range(8)],
+        threading.Thread(target=_accept_until_closed, args=(srv,),
                          daemon=True).start()
         try:
             certdir = tmp_path / "pin-proxy"
@@ -9768,7 +9786,7 @@ class TestUnwireWhenDead:
         srv.bind(("127.0.0.1", 0))
         srv.listen(1)
         port = srv.getsockname()[1]
-        threading.Thread(target=lambda: [srv.accept() for _ in range(8)],
+        threading.Thread(target=_accept_until_closed, args=(srv,),
                          daemon=True).start()
         try:
             cfg, certdir = self._cfg(
