@@ -13072,10 +13072,24 @@ class PinProxy:
                 # traces only exist under --debug, which no session here runs,
                 # so nothing else can tell those apart.
                 if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
+                    # HOW MANY DID NOT ASK, in the same line. The absence of
+                    # this line is half the diagnosis, and a bare "a session
+                    # asked" cannot say whether that was one of two or one of
+                    # fourteen. A rotation that tears one bridge down while
+                    # ONE of fourteen asked is a different fault from one
+                    # where all fourteen asked, and the counts were being
+                    # reconstructed by hand afterwards from a log that never
+                    # recorded the denominator.
+                    try:
+                        held = len(self.held_bridge_ids())
+                    except Exception:  # noqa: BLE001 — a log must not cost a request
+                        held = -1
                     _log_lifecycle(
                         "a session asked who its credential belongs to — "
                         "answered as the pinned account, which is what lets a "
-                        "live bridge survive the account rotation")
+                        "live bridge survive the account rotation"
+                        + (f" (this daemon is carrying {held} bridge(s))"
+                           if held >= 0 else ""))
                 if path.split("?", 1)[0].rstrip("/") == \
                         "/api/claude_code/policy_limits":
                     _log_lifecycle(
