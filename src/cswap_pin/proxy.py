@@ -9585,6 +9585,25 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # "no teardown line" becomes evidence of a CRASH rather than of nothing.
     _log_lifecycle(f"serving on port {proxy.port} for account {account_num}")
 
+    # SAY WHERE WE START, BECAUSE THE VERDICT IS PER-PROCESS AND TRANSITION-ONLY.
+    # `_report_deaf_bridges` logs only on CHANGE and `_last_deaf` dies with the
+    # process, so after a handover the newest inbound verdict on record belongs
+    # to a daemon that no longer exists. Its only caller is a request path
+    # gated on a session starting or posting, so on a QUIET host the successor
+    # never speaks at all and a reader cannot tell "nothing is wrong" from "the
+    # live daemon has not answered yet".
+    #
+    # AND NOT AS A CLEAR. A fresh daemon holds no bridges, so running the
+    # normal report here would print "every posting bridge holds an inbound
+    # stream (0 posting)" — a vacuous truth wearing a pass. Say the count and
+    # let the reader decide; a verdict arrives on the first sweep.
+    try:
+        _log_lifecycle(
+            f"carrying {len(proxy.held_bridge_ids())} bridge(s) at start — no "
+            "inbound verdict yet, the first one follows a session start or post")
+    except Exception:  # noqa: BLE001 — a log must not stop a serving daemon
+        pass
+
     # THE SERVING DAEMON OWNS THE WIRING, because nothing else was putting it
     # back. A departing daemon unwires `.claude.json` when it sees the port
     # unserved, and that check is right at the instant it runs — but on a
