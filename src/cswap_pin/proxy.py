@@ -1493,6 +1493,20 @@ _SPLICE_LOCK_S = 5.0
 _HEAL_DEFER_FILE = ".heal-deferred"
 
 
+def _clear_heal_defer(certdir: Path) -> None:
+    """Forget an outstanding sighting. The record means "a deferral is OPEN".
+
+    Left behind, it is a sentence a later daemon can inherit without earning
+    it: pids are reused, and a reused pid that happens to carry the same stale
+    fingerprint would be retired on its FIRST sight rather than its second —
+    the cut this deferral exists to prevent, caused by its own bookkeeping.
+    """
+    try:
+        (Path(certdir) / _HEAL_DEFER_FILE).unlink(missing_ok=True)
+    except OSError:  # nothing to clear is the state we wanted anyway
+        pass
+
+
 def _watchdog_had_its_turn(certdir: Path, pid: int, fingerprint) -> bool:
     """True when this exact stale daemon was already seen once and left alone.
 
@@ -1741,7 +1755,15 @@ def heal(backup_root: Path, identity: dict | None = None,
     # made such a daemon IMMORTAL — it can never match the current fingerprint,
     # so it is stale by definition, and 0.1.5 recycled it. Treat a missing
     # fingerprint as stale, which is what it means.
-    if alive is None and stale_fp != fp and _read_alive_port(certdir) is not None:
+    stale_is_serving = (alive is None and stale_fp != fp
+                        and _read_alive_port(certdir) is not None)
+    if not stale_is_serving:
+        # The watchdog did its job (or there was never anything stale), so no
+        # sighting is outstanding. This is the COMMON exit -- the deferral
+        # works by the daemon being replaced without us -- and therefore the
+        # clear that actually keeps the record from going stale.
+        _clear_heal_defer(certdir)
+    if stale_is_serving:
         # Serving, but running code we no longer ship. Recycle it: the spawn
         # below rebinds the SAME port, so live sessions never see the swap.
         #
@@ -1761,6 +1783,9 @@ def heal(backup_root: Path, identity: dict | None = None,
                 "code watchdog, which replaces it without darkening the port. "
                 "The next heal retires it if that did not happen")
             return False
+        # Past the deferral: this daemon is being retired, so the sighting has
+        # done its job and must not outlive it.
+        _clear_heal_defer(certdir)
         try:
             # BOUNDED, BECAUSE A DEPLOY CALLS THIS SYNCHRONOUSLY. The holder
             # can be a handover draining a Remote Control channel, which lives

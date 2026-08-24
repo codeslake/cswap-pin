@@ -12290,6 +12290,52 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         finally:
             srv.close()
 
+    def case_a_sighting_does_not_outlive_the_daemon_it_was_about(
+            self, tmp_path, monkeypatch):
+        """The deferral's own bookkeeping must not become a stale sentence.
+
+        The COMMON end of a deferral is the watchdog replacing the daemon
+        without heal doing anything, so this exit is the one that decides
+        whether the record ever gets cleared. Left behind, a reused pid
+        carrying the same stale fingerprint is retired on its first sight
+        instead of its second -- the cut the deferral exists to prevent.
+        """
+        from cswap_pin import proxy
+
+        srv, _port, _cfg, certdir = self._serving_daemon(
+            tmp_path, monkeypatch, proxy.daemon_fingerprint()
+        )
+        stale = certdir / proxy._HEAL_DEFER_FILE
+        stale.write_text(json.dumps({"pid": 4242, "fingerprint": "an-old-release"}))
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
+        try:
+            assert proxy.heal(tmp_path) is False
+            assert not stale.exists(), stale.read_text()
+        finally:
+            srv.close()
+
+    def case_the_retirement_itself_clears_the_sighting(
+            self, tmp_path, monkeypatch):
+        """The other exit: heal did the retiring, so the episode is over and
+        the record must not survive into the successor's lifetime."""
+        from cswap_pin import proxy
+
+        srv, _port, _cfg, certdir = self._serving_daemon(
+            tmp_path, monkeypatch, "an-old-release"
+        )
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
+        monkeypatch.setattr(proxy, "_kill_daemon",
+                            lambda pid, certdir=None: None)
+        monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: 1)
+        try:
+            proxy.heal(tmp_path)                  # defers, records the sighting
+            assert (certdir / proxy._HEAL_DEFER_FILE).exists(), "nothing recorded"
+            self._watchdog_missed_its_turn(certdir)
+            proxy.heal(tmp_path)                  # retires it
+            assert not (certdir / proxy._HEAL_DEFER_FILE).exists()
+        finally:
+            srv.close()
+
     def case_an_unidentifiable_pid_is_never_signalled(self, tmp_path, monkeypatch):
         """When `ps` cannot prove the pid is ours, kill NOTHING. Being unable
         to identify a process is not a reason to signal it."""
