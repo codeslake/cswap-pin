@@ -3361,6 +3361,54 @@ class TestPinStore:
         save_pin(tmp_path, None, None)
         assert load_pin(tmp_path) is None
 
+    def case_a_neighbouring_key_survives_a_pin(self, tmp_path):
+        """`remoteControl` is SHARED, and rebuilding it deletes its neighbours.
+
+        `debugSlowMs` lives in that section, is read by this package, and is
+        written by nobody in `save_pin` — so an assignment of the whole
+        section silently switched the pin's own slow-request diagnostic OFF on
+        every machine where a pin was set. Its contract is "absent is OFF",
+        so the loss is invisible: no error, just an instrument that stops
+        reporting.
+        """
+        from cswap_pin.proxy import load_pin, require, save_pin
+        settings = require("settings")
+        path = settings.settings_path(tmp_path)
+        save_pin(tmp_path, "pin@example.com", "org-uuid-1")
+        raw = settings._read_raw(path)
+        raw["remoteControl"]["debugSlowMs"] = 1500
+        raw["ui"] = {"theme": "dark"}
+        settings._write_raw(path, raw) if hasattr(settings, "_write_raw") else \
+            path.write_text(json.dumps(raw, indent=2))
+
+        save_pin(tmp_path, "other@example.com", "org-uuid-2")
+
+        after = settings._read_raw(path)
+        assert after["remoteControl"].get("debugSlowMs") == 1500, (
+            "a re-pin deleted a neighbouring key in the shared section — the "
+            "pin's own diagnostic goes OFF and says nothing")
+        assert after.get("ui") == {"theme": "dark"}, "an outer section was lost"
+        assert load_pin(tmp_path) == ("other@example.com", "org-uuid-2")
+
+    def case_CONTROL_clearing_still_removes_the_pin(self, tmp_path):
+        """What stops the fix above from becoming "never remove anything". A
+        clear must still drop the pin keys, and drop the section when nothing
+        else is left."""
+        from cswap_pin.proxy import load_pin, require, save_pin
+        settings = require("settings")
+        path = settings.settings_path(tmp_path)
+        save_pin(tmp_path, "pin@example.com", "org-uuid-1")
+        raw = settings._read_raw(path)
+        raw["remoteControl"]["debugSlowMs"] = 1500
+        path.write_text(json.dumps(raw, indent=2))
+
+        save_pin(tmp_path, None, None)
+
+        after = settings._read_raw(path)
+        assert load_pin(tmp_path) is None, "the pin survived a clear"
+        assert after["remoteControl"].get("debugSlowMs") == 1500, (
+            "clearing the pin took a neighbour with it")
+
     def case_a_clear_and_re_pin_cycle_is_byte_stable(self, tmp_path):
         """Identical content must produce an identical FILE, not just an
         equal dict.

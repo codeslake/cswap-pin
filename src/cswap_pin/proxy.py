@@ -3354,12 +3354,30 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     read = getattr(_settings, "_read_raw_for_write", None) or _settings._read_raw
     raw = read(path)
     if email:
-        raw["remoteControl"] = {
-            "pinnedEmail": email,
-            "pinnedOrganizationUuid": org_uuid or "",
-        }
+        # MERGE, NEVER ASSIGN. `_read_raw_for_write` above guards the OUTER
+        # dict so a read-modify-write cannot discard autoswitch, UI and every
+        # unknown section — and assigning the INNER dict reintroduced exactly
+        # that fault one level down. `remoteControl` is shared: `debugSlowMs`
+        # is read here and written by nobody in this function, so rebuilding
+        # the section deleted a live setting of our own on every pin.
+        section = raw.get("remoteControl")
+        if not isinstance(section, dict):
+            section = {}
+        section["pinnedEmail"] = email
+        section["pinnedOrganizationUuid"] = org_uuid or ""
+        raw["remoteControl"] = section
     else:
-        raw.pop("remoteControl", None)
+        # CLEARING DROPS THE PIN, NOT THE SECTION. Removing the whole thing
+        # takes every neighbouring key with it, which is the same deletion by
+        # a different route.
+        section = raw.get("remoteControl")
+        if isinstance(section, dict):
+            section.pop("pinnedEmail", None)
+            section.pop("pinnedOrganizationUuid", None)
+            if not section:
+                raw.pop("remoteControl", None)
+        else:
+            raw.pop("remoteControl", None)
     # ORDER PRESERVED, never sorted. The original defect was real — clearing
     # POPS this key and pinning re-ASSIGNS it, and a pop-then-assign appends at
     # the end, so a clear+re-pin rewrote identical content in a different order
