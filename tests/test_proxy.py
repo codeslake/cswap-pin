@@ -17025,6 +17025,27 @@ class TestABlindDaemonRepairsItself:
         def set(self):
             self.left = 0
 
+    def _drive_with(self, monkeypatch, tmp_path, srv):
+        """`_drive` for a server the caller already holds, so a test can read
+        state back off the instance."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(os, "_exit",
+                            lambda code: (_ for _ in ()).throw(SystemExit(code)))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 1234)
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+        try:
+            pin_proxy._watch_own_code(
+                srv, "1", "a@b.c", tmp_path, self._Ticks(),
+                lambda *a: None, interval=0.01,
+                _own_fingerprint=pin_proxy.daemon_fingerprint())
+        except SystemExit:
+            pass
+
     def _drive(self, monkeypatch, tmp_path, provider):
         """Run a few watchdog ticks with the code CURRENT and a holder present,
         so the only reason to act is blindness."""
@@ -17169,3 +17190,106 @@ class TestABlindDaemonRepairsItself:
         assert pin_proxy._can_mint(lambda: "a-token") is True
         assert pin_proxy._can_mint(_boom) is False
         assert pin_proxy._can_mint(lambda: None) is False
+
+
+class TestTheUnpinnableMarkComesBackOff:
+    """A repaired account must clear the mark, or nothing looks repaired.
+
+    Measured after a re-login fixed a dead refresh lineage: /health said
+    can_pin TRUE, the usage store's strike was cleared, and `proxy.json` still
+    carried `unpinnable: true`. So the TUI kept showing "cloud UNPINNED" over a
+    working pin, and `_read_alive_port` -- which refuses a marked daemon --
+    made every launch spawn a successor over a healthy one.
+
+    The mark was written once per process and had no eraser.
+    """
+
+    def _record(self, tmp_path, marked):
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        rec = {"port": 41000, "pid": os.getpid(), "fingerprint": "FP"}
+        if marked:
+            rec["unpinnable"] = True
+        (tmp_path / pin_proxy._STATE_FILE).write_text(json.dumps(rec))
+
+    def _mark_now(self, tmp_path):
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        return json.loads(
+            (tmp_path / pin_proxy._STATE_FILE).read_text()).get("unpinnable")
+
+    def test_the_mark_is_removed(self, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        self._record(tmp_path, marked=True)
+        assert pin_proxy.clear_daemon_unpinnable(tmp_path) is True
+        assert self._mark_now(tmp_path) is None, (
+            "the record still says the pin is dead after it recovered")
+
+    def test_clearing_twice_is_not_a_transition(self, tmp_path):
+        """The caller logs on a True return, and this runs on a timer. A second
+        pass must say False or the log repeats for ever."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._record(tmp_path, marked=True)
+        assert pin_proxy.clear_daemon_unpinnable(tmp_path) is True
+        assert pin_proxy.clear_daemon_unpinnable(tmp_path) is False
+
+    def test_an_unmarked_record_is_left_alone(self, tmp_path):
+        """CONTROL: without it the test above passes on a function that
+        rewrites the record on every tick."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._record(tmp_path, marked=False)
+        before = (tmp_path / pin_proxy._STATE_FILE).read_text()
+        assert pin_proxy.clear_daemon_unpinnable(tmp_path) is False
+        assert (tmp_path / pin_proxy._STATE_FILE).read_text() == before
+
+    def test_another_daemons_record_is_not_touched(self, tmp_path):
+        """Only when the record is OURS -- the same guard the mark carries.
+        Clearing a successor's mark would tell the fleet its blind daemon is
+        fine."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        (tmp_path / pin_proxy._STATE_FILE).write_text(json.dumps(
+            {"port": 41000, "pid": os.getpid() + 1, "fingerprint": "FP",
+             "unpinnable": True}))
+        assert pin_proxy.clear_daemon_unpinnable(tmp_path) is False
+        assert self._mark_now(tmp_path) is True
+
+    def test_an_unreadable_record_is_not_a_crash(self, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        (tmp_path / pin_proxy._STATE_FILE).write_text("{not json")
+        assert pin_proxy.clear_daemon_unpinnable(tmp_path) is False
+
+    def test_the_watchdog_calls_it_when_it_can_mint(self, monkeypatch, tmp_path):
+        """THE WIRING. The eraser can be perfect and never reached -- which is
+        how the mark survived a repair in the first place."""
+        from cswap_pin import proxy as pin_proxy
+
+        called = []
+        monkeypatch.setattr(pin_proxy, "clear_daemon_unpinnable",
+                            lambda _cd: called.append("clear") or True)
+
+        healthy = TestABlindDaemonRepairsItself._Srv(lambda: "a-token")
+        healthy._warned_unpinnable = True
+        TestABlindDaemonRepairsItself()._drive_with(
+            monkeypatch, tmp_path, healthy)
+
+        # REACHED, not counted. The stub returns True on every tick; the real
+        # function returns False once there is nothing left to clear, and that
+        # is what keeps the log to one line -- asserted by
+        # `test_clearing_twice_is_not_a_transition`. Counting here would be
+        # asserting the stub.
+        assert called and set(called) == {"clear"}, (
+            "a daemon that can mint left the record saying it cannot")
+        assert healthy._warned_unpinnable is False, (
+            "the once-per-process warn flag was not reset, so a SECOND "
+            "episode would be silent")

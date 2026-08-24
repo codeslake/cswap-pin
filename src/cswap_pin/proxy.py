@@ -6490,6 +6490,40 @@ def clear_blind_recycle(certdir: Path) -> None:
         pass
 
 
+def clear_daemon_unpinnable(certdir: Path) -> bool:
+    """Drop the ``unpinnable`` mark once this daemon can mint again.
+
+    THE MARK HAD NO ERASER. `mark_daemon_unpinnable` writes it once per
+    process and nothing ever took it back, so an account repaired by a
+    re-login left the flag standing for the life of the daemon: the TUI kept
+    showing "cloud UNPINNED" over a pin that was working, and -- worse --
+    `_read_alive_port` kept REFUSING to reuse a healthy daemon, so every
+    launch spawned a successor over it.
+
+    Only when the record is ours, exactly as the mark is. Returns whether the
+    mark was actually there to remove, so a caller can log a transition rather
+    than a rewrite on every tick.
+    """
+    import json
+
+    path = Path(certdir) / _STATE_FILE
+    try:
+        st = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(st, dict) or st.get("pid") != os.getpid():
+        return False
+    if not st.pop("unpinnable", None):
+        return False
+    tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(json.dumps(st))
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
 def read_daemon_state(certdir: Path) -> dict | None:
     """The recorded daemon state (``{port, pid, fingerprint}``), or None if the
     file is absent or corrupt."""
@@ -8140,6 +8174,18 @@ def _watch_own_code(
             now = time.time()
             if not blind:
                 clear_blind_recycle(certdir)
+                # AND TAKE THE MARK BACK. Recovery is not only "stop trying to
+                # recycle" -- the record has to stop saying the pin is dead, or
+                # the badge lies and every launch refuses a daemon that works.
+                if clear_daemon_unpinnable(certdir):
+                    # Warn again if it goes bad later: the flag on the instance
+                    # is once-per-process, and without this reset a second
+                    # episode is silent.
+                    setattr(server, "_warned_unpinnable", False)
+                    _log_lifecycle(
+                        "the pinned token can be minted again — cleared the "
+                        "unpinnable mark"
+                    )
             replace_for_blind = blind and blind_recycle_due(certdir, now)
             if (daemon_fingerprint() == own and not orphaned
                     and not replace_for_blind):
