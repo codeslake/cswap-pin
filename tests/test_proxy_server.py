@@ -8657,3 +8657,60 @@ class TestAHandoverMidDrainDropsTheClock:
         out = self._drain(tmp_path, monkeypatch, superseded=True,
                           moving_for=25)
         assert out.count("dropping the wall clock") == 1, out
+
+
+class TestARequestThatArrivesMidDrainIsNotBornStale:
+    """A new request on an OPEN connection is aged from its own debt.
+
+    `release_listener` sheds ARRIVALS, not requests. A keep-alive connection
+    that is already open can begin a fresh request while the drain runs, and
+    `_owed` carries 0.0 for it until the first response byte goes out. Aged
+    from the drain's start, such a request reads as however long the drain has
+    been running and is cut on its first evaluation -- so the longer a daemon
+    politely waits for everyone else, the more certainly it kills whoever
+    arrives last.
+
+    Observed on a live host as `cut 1 in-flight request(s) after 2569.8s of no
+    wall-clock cap (0 mid-response, 1 before headers; delivered 0/0/0 B;
+    content-free 0/0/0 s)`. The two zeros are what identify it: no response
+    byte ever went out, and the debt was seconds old, not 2569.
+    """
+
+    @staticmethod
+    def _proxy(tmp_path):
+        import cswap_pin.proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        return pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                           upstream=("127.0.0.1", 1))
+
+    def test_a_request_that_began_seconds_ago_is_still_moving(self, tmp_path):
+        import cswap_pin.proxy as pp
+        proxy = self._proxy(tmp_path)
+        now, started = pp.time.monotonic(), pp.time.monotonic() - 3000.0
+        # Owed, no response byte yet, and the debt is one second old.
+        proxy._owed["c"] = 0.0
+        proxy._content_at["c"] = now - 1.0
+        assert proxy._owed_still_moving(started) is True
+
+    def test_CONTROL_an_upstream_that_never_answers_still_ages_out(
+            self, tmp_path):
+        """The property the fix must not spend. A request whose OWN debt is
+        older than the stall window is still released, so a wedged upstream
+        cannot hold the daemon open for ever."""
+        import cswap_pin.proxy as pp
+        proxy = self._proxy(tmp_path)
+        now, started = pp.time.monotonic(), pp.time.monotonic() - 3000.0
+        proxy._owed["c"] = 0.0
+        proxy._content_at["c"] = now - (pp._DRAIN_STALL_SECONDS + 10.0)
+        assert proxy._owed_still_moving(started) is False
+
+    def test_CONTROL_a_stale_mid_response_reply_still_ages_out(self, tmp_path):
+        """The other half of the predicate is untouched: once a response has
+        started, `_owed` carries the last-byte stamp and that is what binds."""
+        import cswap_pin.proxy as pp
+        proxy = self._proxy(tmp_path)
+        now, started = pp.time.monotonic(), pp.time.monotonic() - 3000.0
+        proxy._owed["c"] = now - (pp._DRAIN_STALL_SECONDS + 10.0)
+        proxy._content_at["c"] = now - 1.0   # fresh seed must not rescue it
+        assert proxy._owed_still_moving(started) is False

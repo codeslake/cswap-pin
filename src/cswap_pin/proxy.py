@@ -11850,15 +11850,25 @@ class PinProxy:
         rather than the thing that decides.
 
         A connection owed but not yet started (value 0.0) is measured from the
-        drain's own start: its request is being read or relayed upstream, which
-        is real work, but an upstream that never answers must not hold the
-        daemon open forever either.
+        moment its OWN debt began, not from the drain's: its request is being
+        read or relayed upstream, which is real work, and an upstream that
+        never answers still ages out `_DRAIN_STALL_SECONDS` after that request
+        arrived, so the daemon is not held open forever either.
         """
         now = time.monotonic()
         with self._live_lock:
-            stamps = list(self._owed.values())
-        for stamp in stamps:
-            if now - (stamp or since) < _DRAIN_STALL_SECONDS:
+            # THE DEBT'S OWN CLOCK, NOT THE DRAIN'S. `release_listener` sheds
+            # ARRIVALS, not requests, so a keep-alive connection can begin a
+            # NEW request mid-drain — and its `_owed` stamp stays 0.0 until the
+            # first response byte. Aged from the drain's start, a request that
+            # arrived seconds ago reads as however long the drain has run and
+            # is cut on its first evaluation. `_owe_answer` re-seeds
+            # `_content_at` per request, so that is the stamp that dates the
+            # debt; `since` remains the fallback for an entry already gone.
+            stamps = [(stamp, self._content_at.get(conn, since))
+                      for conn, stamp in self._owed.items()]
+        for stamp, owed_since in stamps:
+            if now - (stamp or owed_since) < _DRAIN_STALL_SECONDS:
                 return True
         return False
 
