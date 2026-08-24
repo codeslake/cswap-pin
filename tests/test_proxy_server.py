@@ -3860,7 +3860,14 @@ class TestDrainReportsWhatItCut:
             assert proxy.await_inflight(0.0) == 0
         # NOT SILENCE — a clean drain now says it drained clean, because "no
         # line" meant both that and "this daemon never drained at all".
-        assert "cut" not in err.getvalue(), err.getvalue()
+        # ANCHORED, NOT THE BARE WORD. "cut" appears in the drain's own
+        # ANNOUNCEMENT on a capped arm ("...and cuts whatever is still moving
+        # when it expires"), so a substring test cannot tell a warning from a
+        # cut. The cut LINE is `cut <n> in-flight`, which is exactly what the
+        # fleet's drain watcher greps for -- one shape, checked the same way in
+        # both places.
+        assert not re.search(r"cut \d+ in-flight", err.getvalue()), \
+            err.getvalue()
         assert "drained clean" in err.getvalue(), err.getvalue()
 
     def case_an_open_connection_with_no_request_does_not_hold_the_drain(self, certdir):
@@ -7103,7 +7110,10 @@ class TestDrainReportsWhatItCut:
                 assert proxy.await_inflight(0.0) == 0, (
                     "a tunnel owes nobody an answer, so cutting it costs "
                     "nothing and must not be reported as a cut request")
-            assert "cut" not in err.getvalue(), err.getvalue()
+            # Anchored for the same reason as the sibling case above: the
+            # capped arm's announcement contains the word.
+            assert not re.search(r"cut \d+ in-flight", err.getvalue()), \
+                err.getvalue()
             assert "closed 1 idle connection(s)" in err.getvalue(), (
                 "the tunnel WAS closed and the line must account for it, or "
                 "the two counters go back to being one number: "
