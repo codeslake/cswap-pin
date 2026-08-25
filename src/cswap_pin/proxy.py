@@ -13326,6 +13326,7 @@ class PinProxy:
                 f"[c{getattr(self._local, 'cid', 0)}] "
                 f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n",
                 self._debug,
+                cap=_TRACE_MAX_BYTES,
             )
 
         # Opt-in: when CSWAP_PIN_SHAPE names a file, record the message-array

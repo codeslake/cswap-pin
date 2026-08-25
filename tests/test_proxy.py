@@ -18291,3 +18291,57 @@ class TestADeadMarkerIsReapedOnALivePath:
                             lambda *_a, **_k: (_ for _ in ()).throw(OSError("boom")))
         done = m.announce_draining(tmp_path, pid=os.getpid())
         assert done is not None
+
+
+
+class TestTheTraceCeilingBindsTheFILEnotTheConstant:
+    """0.1.200 raised `_TRACE_MAX_BYTES` to 4 MiB and the file kept rotating
+    at 64 KiB. Two writers share the trace and only one passed the cap; the
+    request-line writer is the high-frequency one, so it truncated the file
+    back continuously and the response writer's ceiling never bound.
+
+    It was "verified" by importing the constant on three hosts. The constant
+    was correct the whole time, which is exactly why that verified nothing —
+    the rotated FILE is the only thing that carries the answer:
+
+        trace.log.1  65,762 B     <- _LOG_MAX_BYTES, not _TRACE_MAX_BYTES
+        trace.log.2  65,885 B
+
+    So this asserts on bytes written, and on every writer binding the cap,
+    because a third writer added later would reintroduce it silently.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_EVERY_writer_to_the_trace_binds_the_trace_cap(self):
+        import inspect, re
+        import cswap_pin.proxy as m
+        src = inspect.getsource(m)
+        calls = []
+        for mm in re.finditer(r"_append_capped\(\s*\n?\s*debug_path", src):
+            frag = src[mm.start():mm.start() + 320]
+            d = e = 0
+            for i, c in enumerate(frag):
+                if c == "(":
+                    d += 1
+                elif c == ")":
+                    d -= 1
+                    if d == 0:
+                        e = i + 1
+                        break
+            calls.append(" ".join(frag[:e].split()))
+        assert calls, "no writer found — the search itself is broken"
+        uncapped = [c for c in calls if "cap=_TRACE_MAX_BYTES" not in c]
+        assert not uncapped, f"{len(uncapped)} of {len(calls)} writers use the 64 KiB default: {uncapped}"
+
+    def case_the_file_actually_grows_past_the_always_on_bound(self, tmp_path):
+        """The behavioural half. Writing past 64 KiB must NOT rotate."""
+        import cswap_pin.proxy as m
+        f = tmp_path / "trace.log"
+        fh = None
+        line = "x" * 512 + "\n"
+        for _ in range(200):                      # ~100 KiB, past _LOG_MAX_BYTES
+            fh = m._append_capped(str(f), line, fh, cap=m._TRACE_MAX_BYTES)
+        assert f.stat().st_size > m._LOG_MAX_BYTES, (
+            f"rotated at {f.stat().st_size} — the 64 KiB bound is still binding")
