@@ -9143,3 +9143,205 @@ class TestASpuriousStream404DoesNotEndTheSession:
     def case_a_real_200_is_untouched(self):
         got = self._relay(self.STREAM, b"200 OK", prime=self.BEAT)
         assert got.startswith(b"HTTP/1.1 200"), got[:40]
+
+
+class TestTheEvidenceSurvivesAHandover:
+    """THE DEFECT THE IN-MEMORY MAP HAD, and it is not a tuning problem.
+
+    A long-held stream stays with the DEPARTING daemon for the whole drain
+    while its session's heartbeats move to the successor. So the process
+    holding the doomed connection is structurally unable to see that its
+    session is alive, for as long as the drain lasts -- measured at 2110s.
+    An in-memory map answers "no evidence" for exactly the population this
+    guard exists for. Measured live: a stream 404 on a session whose
+    heartbeats were 41s old, declined, mid-drain.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    SID = "cse_handover0000000000000"
+    STREAM = f"/v1/code/sessions/{SID}/worker/events/stream"
+    BEAT = f"/v1/code/sessions/{SID}/worker/heartbeat"
+
+    @staticmethod
+    def _cold():
+        """A daemon that has just started. Each case gets a FRESH certdir but
+        `_worker_alive` is module state, so without this a sibling case's entry
+        trips the write throttle and the file is never written in the new dir."""
+        from cswap_pin import proxy as pp
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()
+
+    @staticmethod
+    def _relay(path, status, certdir):
+        import socket as _s
+        from cswap_pin import proxy as pp
+        up_a, up_b = _s.socketpair(); cl_a, cl_b = _s.socketpair()
+        try:
+            up_b.sendall(b"HTTP/1.1 " + status + b"\r\nContent-Length: 2\r\n\r\nno")
+            up_b.shutdown(_s.SHUT_WR)
+            pp._relay_response(up_a, cl_a, 0, method="GET", path=path,
+                               certdir=certdir)
+            cl_a.shutdown(_s.SHUT_WR)
+            return cl_b.recv(4096)
+        finally:
+            for x in (up_a, up_b, cl_a, cl_b):
+                try: x.close()
+                except OSError: pass
+
+    def case_a_successors_heartbeat_reaches_the_departing_daemon(self, certdir):
+        """THE WHOLE POINT. One 'process' records the 2xx; a SECOND, with an
+        empty map, must still see it. Clearing `_worker_alive` between the two
+        is exactly what a fresh daemon starts with."""
+        from cswap_pin import proxy as pp
+        self._cold()
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()          # the OTHER daemon's memory
+        got = self._relay(self.STREAM, b"404 Not Found", certdir)
+        assert got.startswith(b"HTTP/1.1 503"), (
+            "a daemon that did not personally see the heartbeat let the 404 "
+            f"through — this is the live wmac case. got {got[:40]!r}")
+
+    def case_CONTROL_no_shared_record_still_declines(self, certdir):
+        """Without this, a relay that rewrote every 404 would pass above."""
+        from cswap_pin import proxy as pp
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()
+        got = self._relay(self.STREAM, b"404 Not Found", certdir)
+        assert got.startswith(b"HTTP/1.1 404"), got[:40]
+
+    def case_CONTROL_a_stale_shared_record_declines(self, certdir):
+        """The file must expire like the map did, or a session that died an
+        hour ago keeps its stream alive forever."""
+        import json
+        from cswap_pin import proxy as pp
+        self._cold()
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()
+        f = pp._alive_path(certdir)
+        f.write_text(json.dumps(
+            {self.SID: __import__("time").time() - pp._STREAM_LIVE_SECONDS - 30}))
+        got = self._relay(self.STREAM, b"404 Not Found", certdir)
+        assert got.startswith(b"HTTP/1.1 404"), got[:40]
+
+    def case_the_record_is_wall_clock_not_monotonic(self, certdir):
+        """monotonic is not comparable across processes, and two of them read
+        this file. A monotonic stamp would read as ~55 years in the past on a
+        freshly booted host and expire instantly."""
+        import json, time as _t
+        from cswap_pin import proxy as pp
+        self._cold()
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        v = json.loads(pp._alive_path(certdir).read_text())[self.SID]
+        assert abs(v - _t.time()) < 60, (
+            f"stamp {v} is not wall clock; monotonic would be ~{_t.monotonic():.0f}")
+
+    def case_a_corrupt_file_is_not_evidence(self, certdir):
+        from cswap_pin import proxy as pp
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()
+        pp._alive_path(certdir).write_text("{not json")
+        got = self._relay(self.STREAM, b"404 Not Found", certdir)
+        assert got.startswith(b"HTTP/1.1 404"), got[:40]
+
+    def case_a_second_daemons_write_does_not_erase_the_first(self, certdir):
+        """Both processes write this file. A plain overwrite would drop the
+        other's sessions, which is a self-inflicted version of the bug."""
+        import json
+        from cswap_pin import proxy as pp
+        other = "cse_theotherdaemons000000"
+        self._cold()
+        pp._note_worker_status(
+            f"/v1/code/sessions/{other}/worker/heartbeat", b"HTTP/1.1 200 OK", certdir)
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        got = json.loads(pp._alive_path(certdir).read_text())
+        assert other in got and self.SID in got, sorted(got)
+
+
+class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
+    """THE DRAIN PROTECTED NOTHING AND COST EVERYTHING.
+
+    An SSE stream owes an answer for its whole life, so `await_inflight` waits
+    on one for ever. Measured: 3316.7s of waiting that closed one idle
+    connection and owed nobody an answer, while every session on the host sat
+    in the window where a spurious 404 ends it.
+
+    The successor already holds the listener, so a released client reconnects
+    at once -- `handleStreamEnd` backs off 1s and carries `from_sequence_num`.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _server(certdir):
+        from cswap_pin.proxy import PinProxy
+        return PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                        upstream=("127.0.0.1", 1))
+
+    @staticmethod
+    def _conn():
+        import socket as _s
+        return _s.socketpair()
+
+    def _register(self, srv, age):
+        """A stream connection whose last CONTENT was `age` seconds ago."""
+        import time as _t
+        a, b = self._conn()
+        with srv._live_lock:
+            srv._open_conns.add(a)
+            srv._stream_conns.add(a)
+            srv._content_at[a] = _t.monotonic() - age
+        return a, b
+
+    def case_a_content_free_stream_is_handed_over(self, certdir):
+        from cswap_pin import proxy as pp
+        srv = self._server(certdir)
+        a, b = self._register(srv, pp._CLIENT_LIVENESS_SECONDS + 5)
+        assert srv.release_idle_streams() == 1
+        # AND THE CLIENT REALLY SAW EOF -- a count alone would pass on a
+        # method that returned 1 and shut nothing down.
+        assert b.recv(16) == b"", "the client did not get a clean EOF"
+
+    def case_CONTROL_a_stream_still_delivering_is_left_alone(self, certdir):
+        """The half that makes this a handover and not a cut. Without it,
+        releasing every stream unconditionally passes the case above."""
+        from cswap_pin import proxy as pp
+        srv = self._server(certdir)
+        a, b = self._register(srv, 1.0)          # content one second ago
+        assert srv.release_idle_streams() == 0
+        b.send(b"x")                              # still a live socket
+        assert a.recv(1) == b"x"
+
+    def case_the_threshold_is_the_CLIENTS_OWN(self, certdir):
+        """45s is `dn` in the 2.1.245 bundle, the liveness timeout the client
+        re-arms on every frame. If this drifts from what the client does, we
+        are cutting streams it would have kept."""
+        from cswap_pin import proxy as pp
+        assert pp._CLIENT_LIVENESS_SECONDS == 45.0
+
+    def case_a_NON_stream_connection_is_never_touched(self, certdir):
+        import time as _t
+        srv = self._server(certdir)
+        a, b = self._conn()
+        with srv._live_lock:
+            srv._open_conns.add(a)               # open, but not a stream
+            srv._content_at[a] = _t.monotonic() - 600
+        assert srv.release_idle_streams() == 0
+
+    def case_a_stream_with_NO_content_stamp_is_left_alone(self, certdir):
+        """An entry with no stamp is one we have never seen deliver. Defaulting
+        it to `now` keeps it; defaulting to 0 would release every fresh stream
+        on the first drain."""
+        import socket as _s
+        srv = self._server(certdir)
+        a, b = self._conn()
+        with srv._live_lock:
+            srv._open_conns.add(a)
+            srv._stream_conns.add(a)             # no _content_at entry
+        assert srv.release_idle_streams() == 0

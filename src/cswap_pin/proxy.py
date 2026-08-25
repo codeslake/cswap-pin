@@ -6185,6 +6185,13 @@ def drain_fate(budget: float) -> str:
 # stream produces (SSE keep-alives are seconds apart) and far short of the ten
 # minutes that was cutting real replies.
 _DRAIN_STALL_SECONDS = 90.0
+#: THE CLIENT'S OWN LIVENESS TIMEOUT, read out of the 2.1.245 bundle rather
+#: than chosen: `resetLivenessTimer(){ ... setTimeout(this.onLivenessTimeout,
+#: dn) }` with `dn = 45000`, re-armed on every frame received. A stream that
+#: has been content-free this long is one the CLIENT is about to drop and
+#: reconnect on its own, so handing it over costs nothing it was not already
+#: going to do.
+_CLIENT_LIVENESS_SECONDS = 45.0
 
 # STALE MEANS UNTOUCHED, NOT OLD. This was `_HANDOVER_DRAIN_SECONDS + 60`,
 # which is now infinite — a marker that never expires spares whatever pid
@@ -11540,10 +11547,19 @@ class PinProxy:
             # A LINE PER BEAT IS NOT THE ANSWER: it would bury the drain's real
             # events in the one file a person reads to find out why a daemon
             # died. Name the snapshot and point at the record that IS current.
+            # HANDED OVER BEFORE THE WAIT, not cut after it. These are the
+            # channels the wait can never outlast, and the successor is
+            # already accepting on the inherited listener.
+            handed = self.release_idle_streams()
+            if handed:
+                streams = max(0, streams - handed)
             _log_lifecycle(
                 f"draining with {streams} long-lived channel(s) still open at "
                 f"the start — {drain_fate(budget)}. This count is not "
-                f"re-printed; `.draining-{os.getpid()}` carries the live one")
+                f"re-printed; `.draining-{os.getpid()}` carries the live one"
+                + (f"; handed {handed} content-free stream(s) to the successor"
+                   " rather than waiting out a reconnect the client was going"
+                   " to make anyway" if handed else ""))
         beat_draining(self._certdir, owed=self.inflight_requests(),
                       live=self.live_replies(started),
                       quiet=self.content_free_seconds(),
@@ -11782,6 +11798,41 @@ class PinProxy:
                 conn.close()
             except OSError:
                 pass
+
+    def release_idle_streams(
+            self, older_than: float = _CLIENT_LIVENESS_SECONDS) -> int:
+        """Hand content-free streams to the successor instead of outliving them.
+
+        WHY A DRAIN OTHERWISE NEVER ENDS. An SSE stream owes an answer for its
+        whole life, so `await_inflight` waits on one for ever. Measured: a
+        drain ran 3316.7s and closed one idle connection while owing nobody an
+        answer. The wait protects nothing -- the successor already holds the
+        listener, so a client that reconnects lands on it at once and
+        `handleStreamEnd` carries `from_sequence_num`, losing no events.
+
+        ONLY CONTENT-FREE ONES. A stream still delivering is real work and is
+        left alone; this is not a cut, and the threshold is the client's own
+        (see `_CLIENT_LIVENESS_SECONDS`), so every connection released here was
+        already going to be dropped by the other end.
+
+        SHUTDOWN, NOT CLOSE, and `SHUT_WR` specifically: the client sees a
+        clean EOF rather than an RST even with unread bytes in our queue --
+        the 2x2 in `_close_open_connections` is the measurement behind that.
+
+        `time.monotonic`, because `_content_at` is stamped with it. Comparing
+        it against a wall clock reads as ~55 years of silence and would
+        release every stream on the first pass.
+        """
+        now = time.monotonic()
+        with self._live_lock:
+            victims = [c for c in (self._stream_conns & self._open_conns)
+                       if now - self._content_at.get(c, now) >= older_than]
+        for conn in victims:
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+        return len(victims)
 
     # -- internals ----------------------------------------------------------
 
@@ -13514,6 +13565,7 @@ class PinProxy:
                 # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
+                certdir=getattr(self, "_certdir", None),
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
                 # client has received nothing and the SDK retries; after it,
                 # part of an answer is already delivered.
@@ -14386,39 +14438,103 @@ _STREAM_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker/events/stream")
 _WORKER_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker")
 _worker_alive: dict[str, float] = {}
 _worker_alive_lock = threading.Lock()
+#: WHERE THE EVIDENCE LIVES, AND IT CANNOT BE THIS PROCESS'S MEMORY. A
+#: long-held stream stays with the DEPARTING daemon for the whole drain while
+#: its session's heartbeats move to the successor, so the process holding the
+#: doomed connection is structurally unable to see that its session is alive.
+#: An in-memory map answers "no evidence" for exactly the population this
+#: guard exists for. Measured: a stream 404 on a session whose heartbeats were
+#: 41s old, declined, during a drain that ran 2110s.
+#:
+#: WALL CLOCK, NOT `monotonic`: two processes read this file and monotonic
+#: clocks are not comparable across them.
+_ALIVE_FILE = "worker-alive.json"
+#: One write per session per interval. This sits on the request path, and a
+#: heartbeat every ~33s does not need a write every time.
+_ALIVE_WRITE_EVERY = 10.0
 
 
-def _note_worker_status(path: str | None, status_line: bytes) -> None:
-    """Remember when a session last had a worker route answer 2xx."""
+def _alive_path(certdir) -> "Path | None":
+    return Path(certdir) / _ALIVE_FILE if certdir else None
+
+
+def _alive_load(certdir) -> dict:
+    p = _alive_path(certdir)
+    if p is None:
+        return {}
+    try:
+        got = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _note_worker_status(path: str | None, status_line: bytes,
+                        certdir=None) -> None:
+    """Remember when a session last had a worker route answer 2xx.
+
+    Recorded in this process AND in a file every daemon can read, because the
+    daemon that will be asked is not always the one that saw the answer.
+    """
     m = _WORKER_ROUTE.search(path or "")
     if m is None or not status_line.startswith(b"HTTP/1.1 2"):
         return
-    now = time.monotonic()
+    sid, now = m.group(1), time.time()
     with _worker_alive_lock:
-        _worker_alive[m.group(1)] = now
+        last = _worker_alive.get(sid, 0.0)
+        _worker_alive[sid] = now
         if len(_worker_alive) > 256:
             # One entry per session this daemon has ever relayed for, so it
             # grows for as long as the process lives. Anything past the window
             # can never satisfy the check again.
-            for sid, seen in list(_worker_alive.items()):
+            for k, seen in list(_worker_alive.items()):
                 if now - seen > _STREAM_LIVE_SECONDS:
-                    del _worker_alive[sid]
+                    del _worker_alive[k]
+        if now - last < _ALIVE_WRITE_EVERY:
+            return
+    p = _alive_path(certdir)
+    if p is None:
+        return
+    shared = _alive_load(certdir)
+    shared[sid] = now
+    # MERGED, NOT OVERWRITTEN: the departing daemon and its successor both
+    # write here. A lost update costs one entry and fails toward "no
+    # evidence", which is the direction that lets the 404 through.
+    shared = {k: v for k, v in shared.items()
+              if isinstance(v, (int, float)) and now - v <= _STREAM_LIVE_SECONDS}
+    try:
+        tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(shared))
+        os.replace(tmp, p)      # atomic, so a reader never sees a torn file
+    except OSError:
+        pass
 
 
-def _stream_404_is_spurious(path: str | None) -> bool:
-    """Whether a 404 on this path contradicts what the pin just saw.
+def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
+    """Whether a 404 on this path contradicts what ANY daemon just saw.
 
-    False whenever there is no evidence either way -- a fresh daemon holds no
-    history, and the first heartbeat is ~33s away. That direction is the safe
+    False whenever there is no evidence either way. That direction is the safe
     one: with no evidence the 404 goes through and the client behaves exactly
     as it does today.
+
+    The NEWER of this process's memory and the shared file wins. Memory alone
+    is blind during a handover; the file alone lags by up to the write
+    interval.
     """
     m = _STREAM_ROUTE.search(path or "")
     if m is None:
         return False
+    sid, now = m.group(1), time.time()
     with _worker_alive_lock:
-        seen = _worker_alive.get(m.group(1))
-    return seen is not None and (time.monotonic() - seen) <= _STREAM_LIVE_SECONDS
+        seen = _worker_alive.get(sid)
+    shared = _alive_load(certdir).get(sid)
+    if isinstance(shared, (int, float)):
+        seen = shared if seen is None else max(seen, shared)
+    if seen is None:
+        return False
+    # A future stamp is clock skew, not evidence of anything; bound it both
+    # ways so a corrupt entry cannot mark a session alive forever.
+    return -_STREAM_LIVE_SECONDS <= (now - seen) <= _STREAM_LIVE_SECONDS
 
 
 def _relay_response(
@@ -14430,6 +14546,7 @@ def _relay_response(
     on_headers=None,
     on_status=None,
     path: str | None = None,
+    certdir=None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -14493,8 +14610,9 @@ def _relay_response(
             )
             _TRACE.flush()
         return _AUTH_REJECTED
-    _note_worker_status(path, status_line)
-    if status_line.startswith(b"HTTP/1.1 404") and _stream_404_is_spurious(path):
+    _note_worker_status(path, status_line, certdir)
+    if (status_line.startswith(b"HTTP/1.1 404")
+            and _stream_404_is_spurious(path, certdir)):
         if _TRACE is not None:
             _TRACE.write(
                 f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
@@ -14591,12 +14709,12 @@ def _relay_response(
             return _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
-                on_headers=None, path=path,
+                on_headers=None, path=path, certdir=certdir,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
-            on_headers=None, path=path,
+            on_headers=None, path=path, certdir=certdir,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
