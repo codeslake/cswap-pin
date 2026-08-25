@@ -15691,6 +15691,72 @@ class TestTheSweepWillNotCloseARunningWorker:
         assert deleted == ["cse_elsewhere"]
 
 
+class TestTheStallPredicateOnACappedArm:
+    """`_HELD_DRAIN_SECONDS` is 30 and `_DRAIN_STALL_SECONDS` is 90, and that
+    inequality invites a wrong reading: that the predicate cannot fire inside
+    the capped budget so the arm is a bare ceiling. A careful peer reached
+    exactly that conclusion from the two constants.
+
+    It measures from the DEBT'S last byte, not from the drain's start. A
+    connection already silent for longer than the window when the drain begins
+    breaks out at second 0 — which is the whole point on this arm, where every
+    second is a second with nothing serving the port.
+
+    What it genuinely cannot do here is catch a connection that goes quiet
+    DURING the 30s. The ceiling bounds that, and shrinking the window to reach
+    inside it is refused on measurement elsewhere: byte-free waits reach 23s on
+    healthy traffic.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _owed(self, last_byte_age):
+        import threading
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        now = time.monotonic()
+        s = types.SimpleNamespace(_live_lock=threading.Lock(), _owed={}, _content_at={})
+        conn = object()
+        s._owed[conn] = now - last_byte_age
+        s._content_at[conn] = now - last_byte_age
+        # `since` is the drain's start; pass NOW so the debt's own clock is the
+        # only thing that can make this answer False
+        return pin_proxy.PinProxy._owed_still_moving(s, now)
+
+    def case_a_debt_older_than_the_window_breaks_out_immediately(self):
+        from cswap_pin import proxy as pin_proxy
+
+        age = pin_proxy._DRAIN_STALL_SECONDS + 10
+        assert self._owed(age) is False, (
+            f"a connection silent for {age:.0f}s when the drain began still "
+            f"read as moving, so a {pin_proxy._HELD_DRAIN_SECONDS:.0f}s budget "
+            "would be spent in full on something already wedged")
+
+    def case_CONTROL_a_fresh_debt_is_protected_by_the_ceiling_instead(self):
+        """Without this the case above passes on a predicate that answers False
+        for everything, which would cut live replies at second 0."""
+        assert self._owed(1.0) is True
+
+    def case_CONTROL_just_inside_the_window_is_still_moving(self):
+        """The boundary, so a window change has to come here and be argued."""
+        from cswap_pin import proxy as pin_proxy
+
+        assert self._owed(pin_proxy._DRAIN_STALL_SECONDS - 1) is True
+
+    def case_the_two_constants_are_the_reason_this_file_exists(self):
+        """If the ceiling ever exceeds the window, a reader's intuition becomes
+        correct and these cases stop describing anything. Fail loudly then,
+        rather than passing while meaning something else."""
+        from cswap_pin import proxy as pin_proxy
+
+        assert pin_proxy._HELD_DRAIN_SECONDS < pin_proxy._DRAIN_STALL_SECONDS, (
+            "the capped arm now outlives the stall window — re-read the "
+            "comment at the wait loop, it describes the opposite")
+
+
 class TestEverySmallCaseHolder:
     """Every small case-holder in this file, as ONE pytest test.
 
@@ -15705,6 +15771,7 @@ class TestEverySmallCaseHolder:
         run_cases(
             [
                 TestLiveRemoteControlSessions(),
+                TestTheStallPredicateOnACappedArm(),
                 TestTheSweepWillNotCloseARunningWorker(),
                 TestRepinIsLive(),
                 TestIsPinnedRoute(),

@@ -11590,6 +11590,20 @@ class PinProxy:
                 # so all four combinations of its arguments return 30.0. The
                 # fact has to be re-read HERE, where it can change mid-wait.
                 promoted = budget == float("inf")
+                # WHAT THE PREDICATE BUYS ON A CAPPED ARM, because 30 < 90
+                # invites the reading that it buys nothing and a careful reader
+                # reached exactly that. `_owed_still_moving` measures from the
+                # DEBT'S last byte, not from this drain's start, so a
+                # connection already silent for 90s when the drain begins
+                # breaks out at second 0 — measured. That is the whole point
+                # here: never spend a capped budget of port-dark time on
+                # something that was wedged before we started.
+                #
+                # What it cannot do on this arm is catch a connection that goes
+                # quiet DURING the 30s, and it does not need to: the ceiling is
+                # what bounds that, and shrinking the window to reach inside it
+                # is refused elsewhere on measurement — byte-free waits reach
+                # 23s on healthy traffic.
                 while time.monotonic() < deadline:
                     if not self._owed_still_moving(started):
                         break
