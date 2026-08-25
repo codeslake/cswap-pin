@@ -12539,7 +12539,7 @@ class PinProxy:
     def sweep_superseded_bridges(self, token: str) -> int:
         """Close bridges that a NEWER bridge of the same name has replaced.
 
-        THREE CONDITIONS, ALL REQUIRED. Each alone closes something in use;
+        FOUR CONDITIONS, ALL REQUIRED. Each alone closes something in use;
         the measurement that ruled each one out is named with it.
 
         1. ``connection_status == "connected"``. Only a connected bridge
@@ -12555,6 +12555,11 @@ class PinProxy:
            bridges here, 202 are the newest thing carrying their title, and
            closing those would delete exactly what someone put away on
            purpose. The other 67 are the shape this exists for.
+
+        4. ``worker_status != "running"``. The server reports this for every
+           machine, so it sees what local pids cannot. `idle` means nothing --
+           a live session is usually idle -- so it may only SAVE a bridge,
+           never condemn one.
 
         "NO PROCESS ON THIS MACHINE" IS DELIBERATELY NOT A CONDITION. The pin
         exists so ONE account holds every machine's bridges, so this host sees
@@ -12607,6 +12612,19 @@ class PinProxy:
             if item.get("connection_status") != "connected":
                 continue
             if item.get("status") != "archived":
+                continue
+            # A RUNNING WORKER IS A SESSION AT WORK, and the listing says so
+            # for every machine, which local pids cannot. Measured on a live
+            # roster: of three bridges passing all three conditions above, one
+            # was `running` and had no process here -- so the three conditions
+            # alone would close a bridge another machine was working on.
+            # A FOURTH NEGATIVE GUARD, in the same spirit as `sid in live`:
+            # `running` is evidence of life, `idle` is evidence of nothing (5
+            # of the 7 locally-live bridges were idle in that same sample), so
+            # only `running` may save a bridge and nothing here may condemn
+            # one. An age floor was the obvious alternative and does not work:
+            # the running bridge measured was 160 minutes old.
+            if str(item.get("worker_status") or "").lower() == "running":
                 continue
             if (item.get("last_event_at") or "") >= newest[title]:
                 continue  # the newest of its name — someone put this away

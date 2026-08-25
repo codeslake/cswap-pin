@@ -15592,6 +15592,105 @@ class TestTeardownAsksThePortBeforeUnwiring:
         )
 
 
+class TestTheSweepWillNotCloseARunningWorker:
+    """The sweep is fleet-wide and its liveness evidence was machine-local.
+
+    `sid in live` is a NEGATIVE guard and correctly so, but it can only ever
+    save a bridge running HERE. The pin exists precisely so one account holds
+    every machine's bridges, so the sweep routinely looks at sessions whose
+    pids it cannot see -- and the three original conditions are all satisfiable
+    by a session another machine is working in right now.
+
+    MEASURED on a live roster of 20 bridges: three passed all three
+    conditions, and one of them was `worker_status: "running"` with no process
+    on this host. That is a session at work, and the sweep would have closed
+    it.
+
+    An age floor was the obvious alternative and is measurably the wrong
+    instrument -- the running bridge was 160 minutes old, so any floor short
+    enough to let the sweep work would still have deleted it.
+
+    `idle` is deliberately NOT protective: 5 of the 7 locally-live bridges in
+    that same sample were idle, so idle is evidence of nothing. Only `running`
+    saves a bridge, and nothing here condemns one.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _daemon(self, sessions, deleted):
+        from cswap_pin import proxy as pin_proxy
+
+        d = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        d._list_bridges = lambda tok: sessions
+        d._restore_bridge_titles = lambda s, tok: None
+        d._bridge_api = lambda m, path, tok, **kw: (
+            deleted.append(path.rsplit("/", 1)[-1]) or {"ok": True}
+        )
+        return d
+
+    def _roster(self, victim_worker_status):
+        """One local live bridge and one older bridge of the same title.
+
+        Everything except `worker_status` is held identical, so a case that
+        changes its answer is answering about that field and nothing else.
+        """
+        return [
+            {"id": "cse_local_new", "title": "cswap", "status": "active",
+             "connection_status": "connected", "worker_status": "idle",
+             "last_event_at": "2026-01-02T00:00:00Z"},
+            {"id": "cse_elsewhere", "title": "cswap", "status": "archived",
+             "connection_status": "connected",
+             "worker_status": victim_worker_status,
+             "last_event_at": "2026-01-01T00:00:00Z"},
+        ]
+
+    def case_a_running_worker_on_another_machine_is_left_alone(self,
+                                                               monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_local_new"})
+        deleted: list[str] = []
+        closed = self._daemon(self._roster("running"), deleted
+                              ).sweep_superseded_bridges("tok")
+        assert deleted == [], (
+            "a bridge whose worker is RUNNING was closed. It has no process "
+            "here because it belongs to another machine, which is the normal "
+            f"case under a pin, not evidence that it is dead: {deleted}")
+        assert closed == 0
+
+    def case_CONTROL_an_idle_superseded_bridge_is_still_closed(self,
+                                                              monkeypatch):
+        """The same roster with only `worker_status` changed. Without this the
+        case above passes on a sweep that closes nothing at all."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_local_new"})
+        deleted: list[str] = []
+        closed = self._daemon(self._roster("idle"), deleted
+                              ).sweep_superseded_bridges("tok")
+        assert deleted == ["cse_elsewhere"], (
+            f"the sweep stopped doing its job: {deleted}")
+        assert closed == 1
+
+    def case_CONTROL_an_unspecified_worker_status_is_not_running(self,
+                                                                monkeypatch):
+        """The server also answers `WORKER_STATUS_UNSPECIFIED` (2 of 20 in the
+        sample). It is not `running`, so it must not save a bridge -- reading
+        "not idle" as "alive" would switch the sweep off for that whole
+        class."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_local_new"})
+        deleted: list[str] = []
+        self._daemon(self._roster("WORKER_STATUS_UNSPECIFIED"), deleted
+                     ).sweep_superseded_bridges("tok")
+        assert deleted == ["cse_elsewhere"]
+
+
 class TestEverySmallCaseHolder:
     """Every small case-holder in this file, as ONE pytest test.
 
@@ -15606,6 +15705,7 @@ class TestEverySmallCaseHolder:
         run_cases(
             [
                 TestLiveRemoteControlSessions(),
+                TestTheSweepWillNotCloseARunningWorker(),
                 TestRepinIsLive(),
                 TestIsPinnedRoute(),
                 TestParseUpstreamProxy(),
