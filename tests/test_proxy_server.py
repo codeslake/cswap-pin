@@ -6069,6 +6069,67 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def _silent_deaf(self, connected):
+        """One bridge, deaf, then aged out by falling silent. Returns the line.
+
+        `connected` is what the daemon last learned claude.ai holds -- a set,
+        or None for a listing that did not answer.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lambda m: lines.append(m)
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_QUIET/worker/messages", conn=None)
+            srv._connected_bridges = {"cse_QUIET"}
+            srv._report_deaf_bridges()
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+            srv._bridge_posts["cse_QUIET"] -= pp._DEAF_WINDOW_S + 1
+            srv._connected_bridges = connected
+            srv._report_deaf_bridges()
+            return lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_a_silent_bridge_the_server_still_holds_is_named_as_such(self):
+        """THE ONE A POPUP CAN ACTUALLY APPEAR IN.
+
+        A bridge that went deaf and then quiet is unobservable for RECOVERY,
+        but not for whether anybody is looking at it -- and only the ones
+        somebody is looking at can show the disconnect popup. The daemon
+        already holds that set; a reader downstream was fetching its own copy
+        to answer the same question.
+        """
+        line = self._silent_deaf({"cse_QUIET"})
+        assert "STILL ATTACHED" in line, line
+        assert "cse_QUIET" in line, line
+
+    def case_CONTROL_a_silent_bridge_nobody_holds_says_so(self):
+        """The other side. A background job posts whether or not anybody is
+        listening, so a silent bridge the server does not hold has no view
+        and must not read as something waiting to be fixed."""
+        line = self._silent_deaf(set())
+        assert "attached to none of them" in line, line
+        assert "STILL ATTACHED" not in line, line
+
+    def case_CONTROL_an_unreadable_listing_is_not_an_all_clear(self):
+        """UNKNOWN IS NOT ZERO -- the rule the verdict above already follows.
+        Spending a listing that never answered as "nobody is attached" turns
+        an outage of the listing into good news."""
+        line = self._silent_deaf(None)
+        assert "no listing was available" in line, line
+        assert "attached to none of them" not in line, line
+        assert "STILL ATTACHED" not in line, line
+
     def case_an_armed_trace_shows_responses_not_just_requests(self, certdir):
         """The file-armed trace could not show what the server ANSWERED.
 

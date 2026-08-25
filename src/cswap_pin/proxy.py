@@ -11140,6 +11140,10 @@ class PinProxy:
         cannot leave on its own, so a reader taking that as repaired inverts
         the fact. Whether a silent bridge recovered cannot be answered here;
         naming it is the point, not guessing it.
+
+        What CAN be answered is whether claude.ai is still attached to one,
+        and the line says so: that is what separates a silent bridge somebody
+        is still looking at from one nobody is.
         """
         line = f"{DEAF_REPORT_CLEAR} ({posted} posting)"
         if not isinstance(prev, list) or not prev:
@@ -11150,9 +11154,35 @@ class PinProxy:
                 if stamp - posts.get(b, -1e9) > _DEAF_WINDOW_S]
         if not gone:
             return line
+        # AND WHICH OF THE SILENT ONES STILL HAS A VIEW. Whether a quiet
+        # bridge recovered is still unanswerable, but whether claude.ai is
+        # attached to it is not, and that is the half that decides whether a
+        # popup can appear at all. `_connected_bridges` is the same set
+        # `deaf_bridges` scopes itself with, so this costs no new lookup and
+        # cannot disagree with the verdict above it.
+        #
+        # A downstream reader was doing this intersection itself, against a
+        # listing it fetched separately -- two sources for one fact, and the
+        # one further from the data.
+        known = getattr(self, "_connected_bridges", None)
+        held = None if known is None else [b for b in gone if b in known]
+        if held is None:
+            # UNKNOWN IS NOT "ATTACHED TO NOTHING", the same rule the verdict
+            # above follows. Claiming an empty intersection off a listing that
+            # never answered is how an outage reads as an all-clear.
+            tail = (", and no listing was available to say which of them "
+                    "claude.ai still holds")
+        elif held:
+            tail = (f", and claude.ai is STILL ATTACHED to {len(held)} of "
+                    f"them, which is where a popup would appear: "
+                    f"{' '.join(held)}")
+        else:
+            tail = (", and claude.ai is attached to none of them, so there is "
+                    "no view for a popup to appear in")
         return (line + f" — but {len(gone)} of them stopped posting instead of "
                 "recovering, so this line does not cover them and deafness is "
-                f"not a state a session leaves by itself: {' '.join(gone)}")
+                f"not a state a session leaves by itself: {' '.join(gone)}"
+                + tail)
 
     def _report_deaf_bridges(self) -> None:
         """Say which bridges post but hold no inbound stream, on CHANGE.

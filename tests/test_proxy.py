@@ -4873,7 +4873,16 @@ class TestRefcount:
 # `pip install cswap-pin` user is in — so these fail there for a reason that
 # is not a defect in this package. Marked rather than skipped inside the
 # tests: the workflow's `-m "not needs_host_seam"` is visible in the log,
-# where a silent skip is not. They still run locally, against the checkout.
+# where a silent skip is not.
+#
+# THEY RUN LOCALLY ONLY AGAINST A CHECKOUT INSTALLED AS THE HOST, and the two
+# obvious ways both mislead: `--with claude-swap` pulls the RELEASED host, so
+# cases fail exactly as they do in CI and read as a defect here; and a bare
+# PYTHONPATH is not enough, because `_host.require` resolves package METADATA
+# rather than importing. Build the checkout in:
+#
+#     uv run --with pytest --with cryptography --with <claude-swap-checkout> \
+#         python -m pytest tests/ -p no:randomly -m needs_host_seam
 @pytest.mark.needs_host_seam
 class TestAutoViewPinBadge:
     """The auto-switch view marks the cloud-pinned account ON ITS OWN ROW.
