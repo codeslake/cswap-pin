@@ -4372,6 +4372,38 @@ def remembered_pin_identity(certdir) -> dict | None:
     return d if isinstance(d, dict) and d.get("accountUuid") else None
 
 
+def _live_config_owner() -> str:
+    """What `oauthAccount` names right now, for a log line. Never raises."""
+    try:
+        cfg = require("paths").get_global_config_path()
+        here = json.loads(cfg.read_text(encoding="utf-8")).get("oauthAccount")
+        return str((here or {}).get("accountUuid") or here)[:12]
+    except Exception:  # noqa: BLE001 — a log line must not fail a bridge
+        return "unreadable"
+
+
+def pin_identity_is_live(ident: dict) -> bool:
+    """Does the live config name ``ident`` right now?
+
+    Deliberately NOT a method: it reads a file and needs nothing from the
+    proxy instance, and hanging it off `self` breaks callers that invoke
+    `_reassert_pin_identity` unbound.
+
+    Unreadable counts as NOT live — an answer we could not take must never
+    stand in for the one we wanted.
+    """
+    try:
+        cfg = require("paths").get_global_config_path()
+        here = (json.loads(cfg.read_text(encoding="utf-8"))
+                .get("oauthAccount")) or {}
+    except Exception:  # noqa: BLE001 — unreadable is not "it is fine"
+        return False
+    if not isinstance(here, dict):
+        return False
+    keys = [k for k in ("accountUuid", "organizationUuid") if ident.get(k)]
+    return bool(keys) and all(here.get(k) == ident.get(k) for k in keys)
+
+
 def splice_config_identity(identity: dict | None,
                            lock_timeout: float = _SPLICE_LOCK_S) -> bool:
     """Make the live config name ``identity``. True when it changed anything.
@@ -11824,6 +11856,23 @@ class PinProxy:
             splice_config_identity(ident)
         except Exception:  # noqa: BLE001 — a bridge must never fail on the pin
             pass
+        # VERIFY, BECAUSE THE RETURN CANNOT CARRY IT. `splice_config_identity`
+        # answers False for four states and one of them — lock not taken — is
+        # a skipped write its own comment says leaves the field drifted. Here
+        # the owner is stamped from that field on the request being forwarded,
+        # so a skipped write mints a bridge CC can refuse to reattach.
+        #
+        # NAME WHAT THE FIELD HOLDS, not just that it is wrong: the cause is
+        # unmeasured, and a log that carries the value is what makes the next
+        # occurrence a diagnosis instead of another mystery. No retry until
+        # that log says which cause it is.
+        if pin_identity_is_live(ident):
+            return
+        _log_lifecycle(
+            "could not name the pin in the live config before minting a "
+            f"bridge — it holds {_live_config_owner()!r}, so the owner is "
+            "stamped from that and Claude Code can refuse to reattach the "
+            "bridge later. Requirement 1 breaking, at the moment it breaks")
 
     def _sweep_bridges_after_connect(self, token: str) -> None:
         """Sweep superseded bridges, right after this session opened one.

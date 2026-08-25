@@ -6069,6 +6069,80 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def _splice_probe(self, *, splice, live, owner="OTHER"):
+        """Run the mint re-assert with the three module hooks stubbed.
+
+        EVERY GLOBAL RESTORED, and that is not tidiness. A first cut replaced
+        `pin_identity_is_live` and restored only two of the three, so the stub
+        leaked into later cases — one in this class and one in another file —
+        and they asserted against a leftover lambda instead of the function.
+        A module-level patch that is not restored is a test that edits the
+        NEXT test.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        saved = {n: getattr(pp, n) for n in
+                 ("_log_lifecycle", "splice_config_identity",
+                  "pin_identity_is_live", "_live_config_owner",
+                  "remembered_pin_identity")}
+        pp._log_lifecycle = lines.append
+        pp.splice_config_identity = lambda *a, **k: splice
+        pp.pin_identity_is_live = lambda _i: live
+        pp._live_config_owner = lambda: owner
+        pp.remembered_pin_identity = lambda _c: {"accountUuid": "PIN"}
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._certdir = None
+            srv._live_lock = threading.Lock()
+            srv._reassert_pin_identity()
+            return lines
+        finally:
+            for n, v in saved.items():
+                setattr(pp, n, v)
+
+    def case_a_skipped_splice_is_logged_at_the_moment_it_costs(self):
+        """A SKIPPED WRITE IS INVISIBLE, AND THIS IS THE ONE PATH IT COSTS.
+
+        `splice_config_identity` returns False for four different states —
+        unparseable, not a dict, already correct, and lock-not-taken — and its
+        own comment calls the last a SKIPPED write that leaves the field
+        drifted. On the mint path that difference IS requirement 1: the owner
+        is stamped from this field on the request being forwarded, so a
+        skipped write mints a bridge Claude Code can refuse to reattach.
+
+        Measured: nine of ten live pointers carried the pin, the tenth carried
+        the active account, and nothing on either side recorded why.
+        """
+        lines = self._splice_probe(splice=False, live=False, owner="OTHER")
+        assert lines, "a skipped splice said nothing at all"
+        last = lines[-1].lower()
+        assert "requirement 1" in last, lines[-1]
+        assert "refuse to reattach" in last, lines[-1]
+        assert "'other'" in last, (
+            "the line does not say what the field actually holds, which is "
+            "the whole reason it is worth logging: " + lines[-1])
+
+    def case_CONTROL_a_splice_that_landed_says_nothing(self):
+        """Silence is the whole point on the healthy path — this runs on every
+        bridge mint, and a line per mint would bury the one that matters."""
+        assert self._splice_probe(splice=True, live=True) == []
+
+    def case_CONTROL_an_unreadable_config_is_not_taken_as_pinned(self):
+        """`pin_identity_is_live` must answer NO when it cannot read — an
+        answer we could not take must never stand in for the one we wanted."""
+        import cswap_pin.proxy as pp
+
+        real = pp.require
+        pp.require = lambda _n: (_ for _ in ()).throw(RuntimeError("no host"))
+        try:
+            assert pp.pin_identity_is_live({"accountUuid": "PIN"}) is False
+            assert pp._live_config_owner() == "unreadable"
+        finally:
+            pp.require = real
+
     def _silent_deaf(self, connected):
         """One bridge, deaf, then aged out by falling silent. Returns the line.
 
