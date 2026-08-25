@@ -1487,6 +1487,13 @@ def _resolve_pinned_slot(backup_root: Path, email: str) -> str | None:
 
 #: The splice's own lock budget when the caller names none -- a hand-run
 #: `cswap pin`, where waiting is better than skipping the write.
+#: A watcher greps this, so it is a symbol here rather than a literal in one
+#: f-string. Same rule as DEAF_REPORT_MARK: a rename must break the matcher
+#: loudly instead of turning it into a permanent "no verdict yet".
+PIN_NOT_NAMED_AT_MINT = (
+    "could not name the pin in the live config before minting a bridge")
+
+
 _SPLICE_LOCK_S = 5.0
 
 
@@ -4372,36 +4379,36 @@ def remembered_pin_identity(certdir) -> dict | None:
     return d if isinstance(d, dict) and d.get("accountUuid") else None
 
 
-def _live_config_owner() -> str:
-    """What `oauthAccount` names right now, for a log line. Never raises."""
-    try:
-        cfg = require("paths").get_global_config_path()
-        here = json.loads(cfg.read_text(encoding="utf-8")).get("oauthAccount")
-        return str((here or {}).get("accountUuid") or here)[:12]
-    except Exception:  # noqa: BLE001 — a log line must not fail a bridge
-        return "unreadable"
+def live_pin_identity_state(ident: dict) -> "tuple[bool, str]":
+    """`(does the config name ``ident`` now, what it names instead)`.
 
+    ONE READ ANSWERS BOTH, and that is the point. A separate reader for the
+    log can succeed where the check failed and then name the PIN as the
+    drifted owner — a line that contradicts itself, on a healthy config, in
+    the one field that exists to make the next occurrence diagnosable.
 
-def pin_identity_is_live(ident: dict) -> bool:
-    """Does the live config name ``ident`` right now?
+    WHAT THIS DOES NOT PROVE. It reads after `splice_config_identity` released
+    the config lock, and Claude Code reads the field again after the POST it
+    is about to forward returns. So a True is a fact about the file at this
+    instant, never a guarantee about the value CC will stamp. It is here to
+    catch the skipped write, which is the failure that was silent; the
+    residual race is not something an in-process check can close.
 
-    Deliberately NOT a method: it reads a file and needs nothing from the
-    proxy instance, and hanging it off `self` breaks callers that invoke
-    `_reassert_pin_identity` unbound.
-
-    Unreadable counts as NOT live — an answer we could not take must never
-    stand in for the one we wanted.
+    Unreadable is NOT live and names itself as such — an answer we could not
+    take must never stand in for the one we wanted.
     """
     try:
         cfg = require("paths").get_global_config_path()
-        here = (json.loads(cfg.read_text(encoding="utf-8"))
-                .get("oauthAccount")) or {}
+        here = json.loads(cfg.read_text(encoding="utf-8")).get("oauthAccount")
     except Exception:  # noqa: BLE001 — unreadable is not "it is fine"
-        return False
+        return False, "unreadable"
     if not isinstance(here, dict):
-        return False
+        return False, "not-an-object"
     keys = [k for k in ("accountUuid", "organizationUuid") if ident.get(k)]
-    return bool(keys) and all(here.get(k) == ident.get(k) for k in keys)
+    live = bool(keys) and all(here.get(k) == ident.get(k) for k in keys)
+    # THE UUID ONLY, never the surrounding object: this string ships to a log
+    # on other people's machines and the object beside it carries an address.
+    return live, str(here.get("accountUuid") or "no-uuid")[:12]
 
 
 def splice_config_identity(identity: dict | None,
@@ -11866,11 +11873,11 @@ class PinProxy:
         # unmeasured, and a log that carries the value is what makes the next
         # occurrence a diagnosis instead of another mystery. No retry until
         # that log says which cause it is.
-        if pin_identity_is_live(ident):
+        live, holds = live_pin_identity_state(ident)
+        if live:
             return
         _log_lifecycle(
-            "could not name the pin in the live config before minting a "
-            f"bridge — it holds {_live_config_owner()!r}, so the owner is "
+            f"{PIN_NOT_NAMED_AT_MINT} — it holds {holds}, so the owner is "
             "stamped from that and Claude Code can refuse to reattach the "
             "bridge later. Requirement 1 breaking, at the moment it breaks")
 

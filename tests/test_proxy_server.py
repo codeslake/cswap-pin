@@ -11,6 +11,7 @@ import contextlib
 import http.client
 import io
 import json
+import types
 import pathlib
 import re
 import socket
@@ -6069,15 +6070,20 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
-    def _splice_probe(self, *, splice, live, owner="OTHER"):
-        """Run the mint re-assert with the three module hooks stubbed.
+    def _splice_probe(self, *, state):
+        """Run the mint re-assert with `live_pin_identity_state` stubbed.
 
-        EVERY GLOBAL RESTORED, and that is not tidiness. A first cut replaced
-        `pin_identity_is_live` and restored only two of the three, so the stub
-        leaked into later cases — one in this class and one in another file —
-        and they asserted against a leftover lambda instead of the function.
-        A module-level patch that is not restored is a test that edits the
-        NEXT test.
+        NO `splice=` KNOB. A first cut had one and it was INERT — the code
+        discards `splice_config_identity`'s return, so the knob reached
+        nothing and only `state` drove the outcome. With cases at (F,F) and
+        (T,T) a reverted implementation that logs on the BOOLEAN — the exact
+        defect this change removes — passed both. The pair that separates
+        them is a failed splice whose field is already correct, and it is
+        `case_CONTROL_already_correct_stays_silent` below.
+
+        EVERY GLOBAL RESTORED: a module-level patch that is not restored is a
+        test that edits the NEXT test, measured here when a stub leaked into
+        another file's cases.
         """
         import threading
 
@@ -6086,12 +6092,12 @@ class TestDrainReportsWhatItCut:
         lines = []
         saved = {n: getattr(pp, n) for n in
                  ("_log_lifecycle", "splice_config_identity",
-                  "pin_identity_is_live", "_live_config_owner",
-                  "remembered_pin_identity")}
+                  "live_pin_identity_state", "remembered_pin_identity")}
         pp._log_lifecycle = lines.append
-        pp.splice_config_identity = lambda *a, **k: splice
-        pp.pin_identity_is_live = lambda _i: live
-        pp._live_config_owner = lambda: owner
+        # False on purpose: the splice reporting failure must NOT decide the
+        # verdict — only what the config holds afterwards may.
+        pp.splice_config_identity = lambda *a, **k: False
+        pp.live_pin_identity_state = lambda _i: state
         pp.remembered_pin_identity = lambda _c: {"accountUuid": "PIN"}
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
@@ -6106,40 +6112,62 @@ class TestDrainReportsWhatItCut:
     def case_a_skipped_splice_is_logged_at_the_moment_it_costs(self):
         """A SKIPPED WRITE IS INVISIBLE, AND THIS IS THE ONE PATH IT COSTS.
 
-        `splice_config_identity` returns False for four different states —
-        unparseable, not a dict, already correct, and lock-not-taken — and its
-        own comment calls the last a SKIPPED write that leaves the field
-        drifted. On the mint path that difference IS requirement 1: the owner
-        is stamped from this field on the request being forwarded, so a
-        skipped write mints a bridge Claude Code can refuse to reattach.
-
-        Measured: nine of ten live pointers carried the pin, the tenth carried
-        the active account, and nothing on either side recorded why.
+        `splice_config_identity` returns False for four states and one of them
+        — lock not taken — is a skipped write its own comment says leaves the
+        field drifted. Here the owner is stamped from that field on the
+        request being forwarded, so a skipped write mints a bridge Claude Code
+        can refuse to reattach.
         """
-        lines = self._splice_probe(splice=False, live=False, owner="OTHER")
+        lines = self._splice_probe(state=(False, "OTHER"))
         assert lines, "a skipped splice said nothing at all"
-        last = lines[-1].lower()
-        assert "requirement 1" in last, lines[-1]
-        assert "refuse to reattach" in last, lines[-1]
-        assert "'other'" in last, (
-            "the line does not say what the field actually holds, which is "
-            "the whole reason it is worth logging: " + lines[-1])
+        last = lines[-1]
+        import cswap_pin.proxy as pp
+        assert pp.PIN_NOT_NAMED_AT_MINT in last, last
+        assert "requirement 1" in last.lower(), last
+        assert "OTHER" in last, (
+            "the line does not say what the field holds, which is the whole "
+            "reason it is worth logging: " + last)
 
-    def case_CONTROL_a_splice_that_landed_says_nothing(self):
-        """Silence is the whole point on the healthy path — this runs on every
-        bridge mint, and a line per mint would bury the one that matters."""
-        assert self._splice_probe(splice=True, live=True) == []
+    def case_CONTROL_already_correct_stays_silent(self):
+        """THE PAIR THAT SEPARATES THIS FIX FROM THE BUG IT REPLACES.
 
-    def case_CONTROL_an_unreadable_config_is_not_taken_as_pinned(self):
-        """`pin_identity_is_live` must answer NO when it cannot read — an
-        answer we could not take must never stand in for the one we wanted."""
+        The splice reports False and the field is ALREADY the pin — the
+        benign fourth state. An implementation that logged on the boolean
+        would cry wolf here on a perfectly healthy mint; this one must be
+        silent. Without this case the suite cannot tell the two apart.
+        """
+        assert self._splice_probe(state=(True, "PIN")) == []
+
+    def case_CONTROL_an_unreadable_config_names_itself(self):
+        """Unreadable is NOT live, and the log must say so rather than
+        reporting a value it never read."""
         import cswap_pin.proxy as pp
 
         real = pp.require
         pp.require = lambda _n: (_ for _ in ()).throw(RuntimeError("no host"))
         try:
-            assert pp.pin_identity_is_live({"accountUuid": "PIN"}) is False
-            assert pp._live_config_owner() == "unreadable"
+            live, holds = pp.live_pin_identity_state({"accountUuid": "PIN"})
+            assert live is False and holds == "unreadable", (live, holds)
+        finally:
+            pp.require = real
+
+    def case_CONTROL_the_log_never_carries_the_object_around_the_uuid(self):
+        """This string ships to a log on other people's machines, and the
+        object beside `accountUuid` carries an address."""
+        import json
+        import cswap_pin.proxy as pp
+
+        real = pp.require
+        cfg = pathlib.Path(tempfile.mkdtemp()) / "c.json"
+        cfg.write_text(json.dumps(
+            {"oauthAccount": {"email": "someone@example.com"}}))
+        pp.require = lambda _n: types.SimpleNamespace(
+            get_global_config_path=lambda: cfg)
+        try:
+            live, holds = pp.live_pin_identity_state({"accountUuid": "PIN"})
+            assert live is False, holds
+            assert "@" not in holds and "{" not in holds, holds
+            assert holds == "no-uuid", holds
         finally:
             pp.require = real
 
