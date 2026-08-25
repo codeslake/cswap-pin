@@ -18243,3 +18243,51 @@ class TestTheArmedTraceOutlivesWhatItDiagnoses:
         import inspect
         sig = inspect.signature(m._append_capped)
         assert sig.parameters["cap"].default == m._LOG_MAX_BYTES
+
+
+
+class TestADeadMarkerIsReapedOnALivePath:
+    """`_collect_dead_markers` was reachable only from `_spawn_daemon`, so a
+    marker whose process died without a subsequent spawn sat past its TTL
+    indefinitely. Measured: 801s old, dead, 651s past a 150s TTL.
+
+    The disk cost is nothing -- under 100 bytes. The cost that was mispriced
+    is ATTENTION: the same file made two sessions investigate it
+    independently, each spending a round on whether it meant something. A
+    reaper that never runs leaves exactly the trace of a reaper that does not
+    exist.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_drain_start_reaps_a_dead_marker(self, tmp_path, monkeypatch):
+        import cswap_pin.proxy as m
+        cd = tmp_path
+        stale = m.draining_marker_path(cd, 999999)
+        stale.write_text("dead\n")
+        import os, time
+        old = time.time() - (m._DRAINING_MARKER_TTL + 60)
+        os.utime(stale, (old, old))
+        m.announce_draining(cd, pid=os.getpid())
+        assert not stale.exists(), "the dead marker survived a drain start"
+
+    def case_CONTROL_a_LIVE_drainers_marker_is_not_reaped(self, tmp_path):
+        """It keys on the TTL, which a live drainer beats. Reaping by age
+        alone would kill the marker of the process it exists to protect."""
+        import cswap_pin.proxy as m
+        import os
+        cd = tmp_path
+        mine = m.draining_marker_path(cd, os.getpid())
+        mine.write_text("beating\n")
+        m.announce_draining(cd, pid=os.getpid())
+        assert mine.exists()
+
+    def case_reaping_never_stops_a_drain(self, tmp_path, monkeypatch):
+        """Housekeeping on the drain path must not raise into it."""
+        import cswap_pin.proxy as m
+        import os
+        monkeypatch.setattr(m, "_collect_dead_markers",
+                            lambda *_a, **_k: (_ for _ in ()).throw(OSError("boom")))
+        done = m.announce_draining(tmp_path, pid=os.getpid())
+        assert done is not None

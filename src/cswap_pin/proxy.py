@@ -5565,6 +5565,15 @@ def announce_draining(certdir: Path, pid: int | None = None, server=None):
     ever REMOVE a kill, never cause one.
     """
     pid = os.getpid() if pid is None else pid
+    # REAP THE CORPSES FIRST, because this is the only LIVE path that runs
+    # often enough to. `_collect_dead_markers` is otherwise reachable only
+    # from `_spawn_daemon`, so a marker whose process died without a
+    # subsequent spawn sits past its TTL indefinitely. A drain starting is
+    # the natural moment: it is the event markers exist for, and it is rare.
+    try:
+        _collect_dead_markers(certdir)
+    except Exception:  # noqa: BLE001 — housekeeping must not stop a drain
+        pass
     path = draining_marker_path(certdir, pid)
     key = str(path)
     with _DRAINING_LOCK:
