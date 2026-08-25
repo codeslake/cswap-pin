@@ -13511,6 +13511,9 @@ class PinProxy:
             return _relay_response(
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
+                # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
+                # a spurious stream 404 needs both to be recognised.
+                path=path,
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
                 # client has received nothing and the SDK retries; after it,
                 # part of an answer is already delivered.
@@ -14362,6 +14365,62 @@ class _StampingWriter:
         return getattr(self._sock, name)
 
 
+#: A 404 on the Remote Control event stream that the SESSION DID NOT EARN.
+#: `GET /v1/code/sessions/<id>/worker/events/stream` came back 404 on four
+#: sessions whose other worker routes were answering 200 seconds either side of
+#: it -- one of them a `PUT /worker` that succeeded on the same id right after.
+#: The server had not lost those sessions.
+#:
+#: It costs the whole session anyway. The client treats 404 here as permanent
+#: (`M7y = {401,403,404}`), so `Sr()` sends `end_session` to the child and the
+#: person reads "Remote Control disconnected -- session not found (code 404)"
+#: and has to reconnect by hand. A 5xx cannot do that: `validateStatus: f<500`
+#: keeps it away from the flag-setter entirely, and the retry predicate takes
+#: `>= 500`, so the client simply asks again.
+#:
+#: So relay it as 503 while the pin can still SEE the session working, and let
+#: it through untouched once it cannot. Liveness is read off traffic already
+#: crossing this hop -- no probe, no extra request.
+_STREAM_LIVE_SECONDS = 90.0
+_STREAM_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker/events/stream")
+_WORKER_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker")
+_worker_alive: dict[str, float] = {}
+_worker_alive_lock = threading.Lock()
+
+
+def _note_worker_status(path: str | None, status_line: bytes) -> None:
+    """Remember when a session last had a worker route answer 2xx."""
+    m = _WORKER_ROUTE.search(path or "")
+    if m is None or not status_line.startswith(b"HTTP/1.1 2"):
+        return
+    now = time.monotonic()
+    with _worker_alive_lock:
+        _worker_alive[m.group(1)] = now
+        if len(_worker_alive) > 256:
+            # One entry per session this daemon has ever relayed for, so it
+            # grows for as long as the process lives. Anything past the window
+            # can never satisfy the check again.
+            for sid, seen in list(_worker_alive.items()):
+                if now - seen > _STREAM_LIVE_SECONDS:
+                    del _worker_alive[sid]
+
+
+def _stream_404_is_spurious(path: str | None) -> bool:
+    """Whether a 404 on this path contradicts what the pin just saw.
+
+    False whenever there is no evidence either way -- a fresh daemon holds no
+    history, and the first heartbeat is ~33s away. That direction is the safe
+    one: with no evidence the 404 goes through and the client behaves exactly
+    as it does today.
+    """
+    m = _STREAM_ROUTE.search(path or "")
+    if m is None:
+        return False
+    with _worker_alive_lock:
+        seen = _worker_alive.get(m.group(1))
+    return seen is not None and (time.monotonic() - seen) <= _STREAM_LIVE_SECONDS
+
+
 def _relay_response(
     up: ssl.SSLSocket,
     client: ssl.SSLSocket,
@@ -14370,6 +14429,7 @@ def _relay_response(
     method: str | None = None,
     on_headers=None,
     on_status=None,
+    path: str | None = None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -14433,6 +14493,16 @@ def _relay_response(
             )
             _TRACE.flush()
         return _AUTH_REJECTED
+    _note_worker_status(path, status_line)
+    if status_line.startswith(b"HTTP/1.1 404") and _stream_404_is_spurious(path):
+        if _TRACE is not None:
+            _TRACE.write(
+                f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
+                " (session still answering — relayed as 503 so the client"
+                " retries instead of ending)\n"
+            )
+            _TRACE.flush()
+        status_line = b"HTTP/1.1 503 Service Unavailable"
     if _TRACE is not None:
         _TRACE.write(
             f"[c{cid}]     <- "
@@ -14521,12 +14591,12 @@ def _relay_response(
             return _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
-                on_headers=None,
+                on_headers=None, path=path,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
-            on_headers=None,
+            on_headers=None, path=path,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send

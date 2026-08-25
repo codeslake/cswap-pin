@@ -9049,3 +9049,97 @@ class TestAMarkerIsAnswerableTheMomentItExists:
             assert pp.draining_bridges(certdir, pid)[1] is False
         finally:
             done()
+
+
+class TestASpuriousStream404DoesNotEndTheSession:
+    """A 404 on the RC event stream that the pin can see is not true.
+
+    MEASURED 2026-08-25 on a live host. `GET .../worker/events/stream` came
+    back 404 for four sessions whose other worker routes were answering 200
+    seconds either side of it, one of them a `PUT /worker` on the same id
+    right after. Three of the thirteen carried no `from_sequence_num` at all,
+    so it is not a resume point ageing out, and the retried request was
+    byte-identical to the one that had just been answered 200.
+
+    The client cannot tell. 404 is in its permanent set, so it sends
+    `end_session` to the child and the person reconnects by hand. 503 is not:
+    `validateStatus: f<500` keeps it away from the flag-setter and the retry
+    predicate takes `>= 500`.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _relay(path, status, prime=None, age=0.0):
+        """Drive the REAL relay and return what the client actually received.
+
+        `prime` is a route to answer 200 on first, which is the only way the
+        pin learns a session is alive -- there is no probe and no extra
+        request, just traffic already crossing this hop.
+        """
+        import socket as _s
+        from cswap_pin import proxy as pp
+
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()
+        if prime is not None:
+            pp._note_worker_status(prime, b"HTTP/1.1 200 OK")
+            if age:
+                with pp._worker_alive_lock:
+                    for k in pp._worker_alive:
+                        pp._worker_alive[k] -= age
+
+        up_a, up_b = _s.socketpair()
+        cl_a, cl_b = _s.socketpair()
+        try:
+            up_b.sendall(b"HTTP/1.1 " + status +
+                         b"\r\nContent-Length: 2\r\n\r\nno")
+            up_b.shutdown(_s.SHUT_WR)
+            pp._relay_response(up_a, cl_a, 0, method="GET", path=path)
+            cl_a.shutdown(_s.SHUT_WR)
+            return cl_b.recv(4096)
+        finally:
+            for s_ in (up_a, up_b, cl_a, cl_b):
+                try: s_.close()
+                except OSError: pass
+
+    SID = "cse_013L9dri6ged52FB83rBYvb8"
+    STREAM = f"/v1/code/sessions/{SID}/worker/events/stream?from_sequence_num=1249"
+    BEAT = f"/v1/code/sessions/{SID}/worker/heartbeat"
+
+    def case_a_live_session_keeps_its_stream(self):
+        got = self._relay(self.STREAM, b"404 Not Found", prime=self.BEAT)
+        assert got.startswith(b"HTTP/1.1 503"), (
+            "the pin saw this session's heartbeat answered 200 and then let a "
+            "404 through on its stream, which is the one status the client "
+            f"treats as permanent — it ends the session. got {got[:40]!r}")
+
+    def case_a_session_the_pin_cannot_vouch_for_is_left_alone(self):
+        # THE CONTROL. Without it every case above passes on a relay that
+        # rewrites every 404 it ever sees, and a session the server really has
+        # lost would retry forever instead of ending cleanly.
+        got = self._relay(self.STREAM, b"404 Not Found", prime=None)
+        assert got.startswith(b"HTTP/1.1 404"), (
+            "with no evidence the session is alive the 404 must go through "
+            f"untouched, so the client can end cleanly. got {got[:40]!r}")
+
+    def case_evidence_expires(self):
+        from cswap_pin import proxy as pp
+        got = self._relay(self.STREAM, b"404 Not Found", prime=self.BEAT,
+                          age=pp._STREAM_LIVE_SECONDS + 1.0)
+        assert got.startswith(b"HTTP/1.1 404"), (
+            "a session that stopped answering minutes ago is not evidence of "
+            f"anything; the 404 must go through. got {got[:40]!r}")
+
+    def case_only_the_stream_is_rewritten(self):
+        # A 404 on a NON-stream worker route is a real answer about a real
+        # request and belongs to whoever asked. Rewriting it would hide it.
+        got = self._relay(self.BEAT, b"404 Not Found", prime=self.BEAT)
+        assert got.startswith(b"HTTP/1.1 404"), (
+            "only the event stream turns a 404 into a dead session; every "
+            f"other route's 404 is its own answer. got {got[:40]!r}")
+
+    def case_a_real_200_is_untouched(self):
+        got = self._relay(self.STREAM, b"200 OK", prime=self.BEAT)
+        assert got.startswith(b"HTTP/1.1 200"), got[:40]
