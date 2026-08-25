@@ -5482,6 +5482,14 @@ def _component_tag() -> str:
 
 _COMPONENT = _component_tag()
 _LOG_MAX_BYTES = 64 * 1024
+#: The ARMED trace only. `daemon.log` is always on and its 64 KiB is a
+#: deliberate bound on a file nobody asked for; the request trace is written
+#: only while `trace-to` exists, so its ceiling is a diagnostic decision and
+#: not a disk one. MEASURED: at 64 KiB the trace retained 1.1 minutes on a
+#: busy host and rotated TWICE inside a seven-second control window, which
+#: voided the measurement outright. A diagnostic that cannot outlive the
+#: thing being diagnosed is not one.
+_TRACE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def configured_port(certdir: Path) -> int | None:
@@ -5856,7 +5864,7 @@ def refcount_fifo_path(certdir: Path) -> Path:
     return Path(certdir) / _FIFO_NAME
 
 
-def _rotate_if_over(path: Path) -> None:
+def _rotate_if_over(path: Path, cap: int = _LOG_MAX_BYTES) -> None:
     """Rotate ``path`` through ``.1`` and ``.2`` once it passes the cap.
 
     Extracted from `_open_daemon_log` so the OPT-IN traces get the same
@@ -5871,7 +5879,7 @@ def _rotate_if_over(path: Path) -> None:
     unlink is the fallback the cap falls back to rather than giving up on it.
     """
     try:
-        if not path.exists() or path.stat().st_size <= _LOG_MAX_BYTES:
+        if not path.exists() or path.stat().st_size <= cap:
             return
         previous = path.with_suffix(path.suffix + ".1")
         if previous.exists():
@@ -5884,8 +5892,8 @@ def _rotate_if_over(path: Path) -> None:
             pass
 
 
-def _append_capped(path, line: str, fh=None):
-    """Append ``line`` to ``path`` under `_LOG_MAX_BYTES`. Returns the handle.
+def _append_capped(path, line: str, fh=None, cap: int = _LOG_MAX_BYTES):
+    """Append ``line`` to ``path`` under ``cap``. Returns the handle.
 
     Pass the previous handle back in to keep it; this reopens only when the
     file rotated underneath it, which is the one case a held descriptor cannot
@@ -5902,13 +5910,13 @@ def _append_capped(path, line: str, fh=None):
     """
     try:
         if fh is None or fh.closed:
-            _rotate_if_over(Path(path))
+            _rotate_if_over(Path(path), cap)
             fh = open(path, "a", buffering=1, encoding="utf-8",
                       errors="replace")
         fh.write(line)
-        if fh.tell() > _LOG_MAX_BYTES:
+        if fh.tell() > cap:
             fh.close()
-            _rotate_if_over(Path(path))
+            _rotate_if_over(Path(path), cap)
             fh = open(path, "a", buffering=1, encoding="utf-8",
                       errors="replace")
         return fh
@@ -13969,7 +13977,8 @@ class PinProxy:
             # connection thread without a lock.
             if debug_path != self._debug_for:
                 self._debug, self._debug_for = None, debug_path
-            self._debug = _append_capped(debug_path, text, self._debug)
+            self._debug = _append_capped(
+                debug_path, text, self._debug, cap=_TRACE_MAX_BYTES)
 
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")

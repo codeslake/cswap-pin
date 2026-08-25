@@ -18204,3 +18204,42 @@ class TestTheServingDaemonOwnsTheWiring:
         monkeypatch.setattr(p, "wire_global_config", _boom)
         monkeypatch.setattr(p, "_log_lifecycle", lambda _m: None)
         assert p.ensure_wired_to(36301, "/nonexistent") is False
+
+
+
+class TestTheArmedTraceOutlivesWhatItDiagnoses:
+    """`daemon.log` is always on and its 64 KiB is a bound on a file nobody
+    asked for. The request trace is written only while `trace-to` exists, so
+    its ceiling is a diagnostic decision, not a disk one.
+
+    MEASURED: at 64 KiB the trace retained 1.1 minutes on a busy host and
+    rotated TWICE inside a seven-second control window, voiding the
+    measurement outright. A diagnostic that cannot outlive the thing being
+    diagnosed is not one.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_the_trace_ceiling_is_larger_than_the_always_on_log(self):
+        import cswap_pin.proxy as m
+        assert m._TRACE_MAX_BYTES > m._LOG_MAX_BYTES
+
+    def case_CONTROL_the_always_on_log_keeps_its_own_bound(self):
+        """Raising them together would grow a file nobody opted into."""
+        import cswap_pin.proxy as m
+        assert m._LOG_MAX_BYTES == 64 * 1024
+
+    def case_the_cap_is_honoured_where_it_is_passed(self, tmp_path):
+        import cswap_pin.proxy as m
+        f = tmp_path / "t.log"
+        fh = None
+        for _ in range(50):
+            fh = m._append_capped(str(f), "x" * 100 + "\n", fh, cap=1000)
+        assert f.stat().st_size <= 1200, f.stat().st_size
+
+    def case_the_default_is_still_the_always_on_bound(self):
+        import cswap_pin.proxy as m
+        import inspect
+        sig = inspect.signature(m._append_capped)
+        assert sig.parameters["cap"].default == m._LOG_MAX_BYTES
