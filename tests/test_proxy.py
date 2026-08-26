@@ -18345,3 +18345,52 @@ class TestTheTraceCeilingBindsTheFILEnotTheConstant:
             fh = m._append_capped(str(f), line, fh, cap=m._TRACE_MAX_BYTES)
         assert f.stat().st_size > m._LOG_MAX_BYTES, (
             f"rotated at {f.stat().st_size} — the 64 KiB bound is still binding")
+
+
+class TestATransportOutageIsNotASessionEnding:
+    """A 404 that arrives while this hop is failing is not a verdict.
+
+    `_stream_404_is_spurious` reads liveness off worker traffic that CROSSED
+    this hop. When the upstream is down that traffic stops, so the evidence is
+    absent for exactly the reason the guard should fire -- and absence is its
+    False, which lets the 404 through and costs the session permanently
+    (`M7y = {401,403,404}` -> `end_session` -> code 4090, which the client
+    treats as terminal and never retries).
+
+    Measured on a work mac: an ssh -D socks tunnel flapped on a ~15 minute
+    cycle; privoxy accepted connections and never completed CONNECT, and the
+    trace carried 333 5xx across every route plus 51 404s.
+    """
+
+    def _reset(self):
+        import cswap_pin.proxy as pp
+        pp._hop_trouble_at = 0.0
+        return pp
+
+    def test_a_404_just_after_an_upstream_5xx_is_suspect(self):
+        pp = self._reset()
+        pp._note_hop_trouble(b"HTTP/1.1 502 Bad Gateway")
+        assert pp._hop_recently_failed() is True
+
+    def test_a_404_long_after_the_hop_recovered_is_still_a_verdict(self):
+        pp = self._reset()
+        pp._note_hop_trouble(b"HTTP/1.1 502 Bad Gateway")
+        pp._hop_trouble_at = time.time() - (pp._HOP_TROUBLE_SECONDS + 30)
+        assert pp._hop_recently_failed() is False
+
+    def test_a_hop_that_never_failed_keeps_todays_behaviour(self):
+        """The control: without this the predicate could just return True."""
+        pp = self._reset()
+        assert pp._hop_recently_failed() is False
+
+    def test_a_2xx_is_not_trouble(self):
+        pp = self._reset()
+        pp._note_hop_trouble(b"HTTP/1.1 200 OK")
+        assert pp._hop_recently_failed() is False
+
+    def test_a_404_is_not_itself_trouble(self):
+        """Only 5xx is transport-shaped. A 404 must not arm the guard that
+        protects 404s, or one spurious 404 would excuse every later one."""
+        pp = self._reset()
+        pp._note_hop_trouble(b"HTTP/1.1 404 Not Found")
+        assert pp._hop_recently_failed() is False

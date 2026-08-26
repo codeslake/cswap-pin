@@ -14434,6 +14434,36 @@ class _StampingWriter:
 #: it through untouched once it cannot. Liveness is read off traffic already
 #: crossing this hop -- no probe, no extra request.
 _STREAM_LIVE_SECONDS = 90.0
+#: A 404 that arrives while THIS HOP is failing is not a verdict either.
+#:
+#: `_stream_404_is_spurious` reads liveness off worker traffic that crossed this
+#: hop and answers False when there is no evidence. Safe while the transport
+#: works; inverted when it does not, because the traffic stops BECAUSE the hop
+#: is down -- the evidence is absent for the very reason the guard should fire,
+#: and the 404 then ends the session permanently.
+#:
+#: Only 5xx arms this. A 404 must not, or one spurious 404 would excuse every
+#: later one.
+_HOP_TROUBLE_SECONDS = 120.0
+_hop_trouble_at = 0.0
+_hop_trouble_lock = threading.Lock()
+
+
+def _note_hop_trouble(status_line: bytes) -> None:
+    """Record that this hop just returned a transport-shaped failure."""
+    if not status_line.startswith(b"HTTP/1.1 5"):
+        return
+    global _hop_trouble_at
+    with _hop_trouble_lock:
+        _hop_trouble_at = time.time()
+
+
+def _hop_recently_failed() -> bool:
+    with _hop_trouble_lock:
+        at = _hop_trouble_at
+    if not at:
+        return False
+    return 0 <= (time.time() - at) <= _HOP_TROUBLE_SECONDS
 _STREAM_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker/events/stream")
 _WORKER_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker")
 _worker_alive: dict[str, float] = {}
@@ -14611,8 +14641,11 @@ def _relay_response(
             _TRACE.flush()
         return _AUTH_REJECTED
     _note_worker_status(path, status_line, certdir)
+    _note_hop_trouble(status_line)
     if (status_line.startswith(b"HTTP/1.1 404")
-            and _stream_404_is_spurious(path, certdir)):
+            and _STREAM_ROUTE.search(path or "")
+            and (_stream_404_is_spurious(path, certdir)
+                 or _hop_recently_failed())):
         if _TRACE is not None:
             _TRACE.write(
                 f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
