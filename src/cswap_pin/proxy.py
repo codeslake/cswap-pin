@@ -6676,6 +6676,73 @@ def ensure_proxy_secret(certdir: Path) -> str:
     return token
 
 
+#: A retired secret keeps working for this long after a rotation.
+#:
+#: The wiring reaches a session through `~/.claude.json`, which the client
+#: reads ONCE at exec. A rotated secret is therefore unreachable to every LIVE
+#: process, and refusing the old one 407s each of them until it restarts.
+#: Without a window, rotating a leaked credential and cutting the fleet are the
+#: same operation.
+#:
+#: Long enough that an operator can rewire and let sessions turn over; short
+#: enough that a leaked value is not honoured indefinitely.
+_RETIRED_SECRET_SECONDS = 3600.0
+_retired_secret: "str | None" = None
+_retired_at = 0.0
+
+
+def _retire_secret(old: "str | None") -> None:
+    """Keep accepting `old` for the grace window. None clears it at once."""
+    global _retired_secret, _retired_at
+    _retired_secret = old or None
+    _retired_at = time.time() if old else 0.0
+
+
+def _retired_still_valid() -> "str | None":
+    if not _retired_secret:
+        return None
+    if time.time() - _retired_at > _RETIRED_SECRET_SECONDS:
+        return None
+    return _retired_secret
+
+
+def rotate_proxy_secret(certdir: Path) -> str:
+    """Mint a replacement credential, sparing the old one for the grace window.
+
+    `ensure_proxy_secret` is idempotent on purpose -- a respawn must not
+    invalidate wiring live sessions already hold. That makes it the wrong tool
+    when the value itself has to change, which is why this exists separately
+    rather than as a flag on it.
+
+    The retirement is what keeps this from being an outage: the caller rewrites
+    the wiring, new processes take the new value, and the ones already running
+    keep working on the old one until they turn over.
+    """
+    import secrets
+
+    old = read_proxy_secret(certdir)
+    path = proxy_secret_path(certdir)
+    token = secrets.token_urlsafe(32)
+    tmp = path.with_suffix(f".{os.getpid()}.rot")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, token.encode("ascii"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return old or ""
+    # AFTER the write, and only for a REAL predecessor. Retiring "" would put
+    # an empty password into the accepted set, which authorises everyone.
+    _retire_secret(old or None)
+    return token
+
+
 def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None) -> bool:
     """Whether a CONNECT may use this proxy.
 
@@ -6688,6 +6755,10 @@ def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None) -> boo
 
     if not secret:
         return True
+    accepted = [secret]
+    retired = _retired_still_valid()
+    if retired:
+        accepted.append(retired)
     for key, value in headers:
         if key.lower() != "proxy-authorization":
             continue
@@ -6702,7 +6773,14 @@ def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None) -> boo
             continue
         # user:pass — the secret is the password; the user part is cosmetic.
         _, _, presented = decoded.partition(":")
-        if hmac.compare_digest(presented, secret):
+        # EVERY candidate is compared, never short-circuited: returning early
+        # on the first match would make the reply time depend on WHICH secret
+        # matched, which is the leak constant-time comparison exists to avoid.
+        ok = False
+        for candidate in accepted:
+            if hmac.compare_digest(presented, candidate):
+                ok = True
+        if ok:
             return True
     return False
 

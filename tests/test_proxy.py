@@ -18394,3 +18394,98 @@ class TestATransportOutageIsNotASessionEnding:
         pp = self._reset()
         pp._note_hop_trouble(b"HTTP/1.1 404 Not Found")
         assert pp._hop_recently_failed() is False
+
+
+class TestRotatingTheSecretDoesNotCutLiveSessions:
+    """A credential rotation must not 407 the sessions already holding the old one.
+
+    The wiring reaches a session through `~/.claude.json`, which Claude Code
+    reads ONCE at exec. So a rotated secret is unreachable to every live
+    process, and rejecting the old one cuts each of them until it restarts --
+    the 407 storm this codebase already carries measured history of.
+
+    Idempotence avoided the problem by never rotating. That is the right
+    default and the wrong ceiling: it means a leaked credential can only be
+    replaced by cutting the fleet.
+
+    So the retired secret keeps working for a grace window, which is the only
+    thing that makes rotation and no-interruption compatible.
+    """
+
+    @staticmethod
+    def _hdr(secret):
+        import base64
+        v = base64.b64encode(f"cswap:{secret}".encode()).decode()
+        return [("Proxy-Authorization", f"Basic {v}")]
+
+    def test_the_current_secret_is_accepted(self):
+        import cswap_pin.proxy as pp
+        assert pp._proxy_authorized(self._hdr("new"), "new") is True
+
+    def test_a_wrong_secret_is_still_refused(self):
+        """THE CONTROL. Without it a grace window could accept anything."""
+        import cswap_pin.proxy as pp
+        pp._retire_secret(None)
+        assert pp._proxy_authorized(self._hdr("junk"), "new") is False
+
+    def test_the_retired_secret_is_accepted_inside_the_window(self):
+        import cswap_pin.proxy as pp
+        pp._retire_secret("old")
+        try:
+            assert pp._proxy_authorized(self._hdr("old"), "new") is True
+        finally:
+            pp._retire_secret(None)
+
+    def test_the_retired_secret_stops_working_after_the_window(self):
+        import time
+        import cswap_pin.proxy as pp
+        pp._retire_secret("old")
+        pp._retired_at = time.time() - (pp._RETIRED_SECRET_SECONDS + 60)
+        try:
+            assert pp._proxy_authorized(self._hdr("old"), "new") is False
+        finally:
+            pp._retire_secret(None)
+
+
+class TestTheRotationItself:
+    """`rotate_proxy_secret` must mint a new one AND spare the old."""
+
+    def test_it_mints_a_different_secret(self, tmp_path):
+        import cswap_pin.proxy as pp
+        pp._retire_secret(None)
+        first = pp.ensure_proxy_secret(tmp_path)
+        second = pp.rotate_proxy_secret(tmp_path)
+        try:
+            assert second and second != first
+            assert pp.read_proxy_secret(tmp_path) == second
+        finally:
+            pp._retire_secret(None)
+
+    def test_the_old_one_still_authorises_afterwards(self, tmp_path):
+        """The whole point: a live session holding the old value keeps working."""
+        import base64
+        import cswap_pin.proxy as pp
+        pp._retire_secret(None)
+        first = pp.ensure_proxy_secret(tmp_path)
+        second = pp.rotate_proxy_secret(tmp_path)
+        hdr = [("Proxy-Authorization",
+                "Basic " + base64.b64encode(f"cswap:{first}".encode()).decode())]
+        try:
+            assert pp._proxy_authorized(hdr, second) is True
+        finally:
+            pp._retire_secret(None)
+
+    def test_rotating_with_nothing_stored_is_not_an_error(self, tmp_path):
+        """THE CONTROL: a first rotation has no predecessor to spare, and must
+        not retire an empty string into the accepted set."""
+        import base64
+        import cswap_pin.proxy as pp
+        pp._retire_secret(None)
+        made = pp.rotate_proxy_secret(tmp_path)
+        hdr = [("Proxy-Authorization",
+                "Basic " + base64.b64encode(b"cswap:").decode())]
+        try:
+            assert made
+            assert pp._proxy_authorized(hdr, made) is False
+        finally:
+            pp._retire_secret(None)
