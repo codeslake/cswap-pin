@@ -9115,6 +9115,33 @@ class TestASpuriousStream404DoesNotEndTheSession:
             "404 through on its stream, which is the one status the client "
             f"treats as permanent — it ends the session. got {got[:40]!r}")
 
+    def case_a_404_during_a_hop_failure_is_relayed_as_503(self):
+        """The transport-outage case: no liveness evidence, because the hop is
+        down. That absence is why the guard must fire, not why it must not."""
+        from cswap_pin import proxy as pp
+        pp._hop_trouble_at = 0.0
+        pp._note_hop_trouble(b"HTTP/1.1 502 Bad Gateway")
+        try:
+            got = self._relay(self.STREAM, b"404 Not Found", prime=None)
+        finally:
+            pp._hop_trouble_at = 0.0
+        assert got.startswith(b"HTTP/1.1 503"), (
+            "this hop had just returned a 502, so the 404 is not a verdict — "
+            f"relaying it ends the session permanently. got {got[:40]!r}")
+
+    def case_a_404_off_the_stream_route_is_untouched_during_trouble(self):
+        """THE SCOPE CONTROL. `_hop_recently_failed` knows nothing about paths,
+        so without the route test every 404 on the machine becomes a 503."""
+        from cswap_pin import proxy as pp
+        pp._hop_trouble_at = 0.0
+        pp._note_hop_trouble(b"HTTP/1.1 502 Bad Gateway")
+        try:
+            got = self._relay("/v1/messages", b"404 Not Found", prime=None)
+        finally:
+            pp._hop_trouble_at = 0.0
+        assert got.startswith(b"HTTP/1.1 404"), (
+            f"only the RC stream route is protected. got {got[:40]!r}")
+
     def case_a_session_the_pin_cannot_vouch_for_is_left_alone(self):
         # THE CONTROL. Without it every case above passes on a relay that
         # rewrites every 404 it ever sees, and a session the server really has
