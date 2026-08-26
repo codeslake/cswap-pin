@@ -18489,3 +18489,51 @@ class TestTheRotationItself:
             assert pp._proxy_authorized(hdr, made) is False
         finally:
             pp._retire_secret(None)
+
+
+class TestTheRetirementMustCrossProcesses:
+    """The daemon is not the process that rotates, so memory cannot carry this.
+
+    `_current_secret()` re-reads the secret FILE per request, so a rotation is
+    visible to the daemon at once. The retirement was a module global in
+    whichever process called `rotate_proxy_secret` -- a CLI, a script, never
+    the daemon -- so the daemon enforced the new secret while every live
+    session still presented the old one. The grace window existed only in a
+    process that had already exited.
+
+    It has to live beside the secret, like `worker-alive.json` does for the
+    other fact two processes must share.
+    """
+
+    def test_a_rotation_is_visible_to_a_different_process(self, tmp_path):
+        import base64
+        import cswap_pin.proxy as pp
+        old = pp.ensure_proxy_secret(tmp_path)
+        new = pp.rotate_proxy_secret(tmp_path)
+        # simulate the daemon: a process that never called rotate
+        pp._retire_secret(None)
+        hdr = [("Proxy-Authorization",
+                "Basic " + base64.b64encode(f"cswap:{old}".encode()).decode())]
+        try:
+            assert pp._proxy_authorized(hdr, new, certdir=tmp_path) is True, (
+                "the daemon rejected a live session's credential seconds after "
+                "a rotation it did not perform — the grace window never "
+                "reached it")
+        finally:
+            pp._retire_secret(None)
+
+    def test_an_expired_retirement_on_disk_is_not_honoured(self, tmp_path):
+        """THE CONTROL. A persisted window that never expires is worse than
+        none: a leaked value would be honoured forever."""
+        import base64, json
+        import cswap_pin.proxy as pp
+        old = pp.ensure_proxy_secret(tmp_path)
+        new = pp.rotate_proxy_secret(tmp_path)
+        pp._retire_secret(None)
+        p = pp._retired_path(tmp_path)
+        d = json.loads(p.read_text())
+        d["at"] = d["at"] - (pp._RETIRED_SECRET_SECONDS + 60)
+        p.write_text(json.dumps(d))
+        hdr = [("Proxy-Authorization",
+                "Basic " + base64.b64encode(f"cswap:{old}".encode()).decode())]
+        assert pp._proxy_authorized(hdr, new, certdir=tmp_path) is False

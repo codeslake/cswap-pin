@@ -6687,23 +6687,62 @@ def ensure_proxy_secret(certdir: Path) -> str:
 #: Long enough that an operator can rewire and let sessions turn over; short
 #: enough that a leaked value is not honoured indefinitely.
 _RETIRED_SECRET_SECONDS = 3600.0
+_RETIRED_FILE = "proxy.retired"
 _retired_secret: "str | None" = None
 _retired_at = 0.0
 
 
-def _retire_secret(old: "str | None") -> None:
-    """Keep accepting `old` for the grace window. None clears it at once."""
+def _retired_path(certdir) -> Path:
+    return Path(certdir) / _RETIRED_FILE
+
+
+def _retire_secret(old: "str | None", certdir=None) -> None:
+    """Keep accepting `old` for the grace window. None clears it at once.
+
+    ON DISK WHEN A CERTDIR IS GIVEN, because the process that ROTATES is never
+    the daemon that AUTHORISES. `_current_secret()` re-reads the secret file
+    per request, so a rotation reaches the daemon at once -- and a retirement
+    held in the rotating process's memory reaches it never. The daemon then
+    demands the new value while every live session still presents the old one,
+    which is the outage the window exists to prevent.
+    """
     global _retired_secret, _retired_at
     _retired_secret = old or None
     _retired_at = time.time() if old else 0.0
+    if certdir is None:
+        return
+    path = _retired_path(certdir)
+    try:
+        if not old:
+            path.unlink(missing_ok=True)
+            return
+        fd = os.open(str(path) + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, json.dumps({"secret": old, "at": _retired_at}).encode())
+        finally:
+            os.close(fd)
+        os.replace(str(path) + ".tmp", path)
+    except OSError:
+        pass          # a window we cannot persist is a window we do not get
 
 
-def _retired_still_valid() -> "str | None":
-    if not _retired_secret:
+def _retired_still_valid(certdir=None) -> "str | None":
+    """The retired secret if it is still inside the window, else None."""
+    now = time.time()
+    if _retired_secret and now - _retired_at <= _RETIRED_SECRET_SECONDS:
+        return _retired_secret
+    if certdir is None:
         return None
-    if time.time() - _retired_at > _RETIRED_SECRET_SECONDS:
+    try:
+        d = json.loads(_retired_path(certdir).read_text())
+    except (OSError, ValueError):
         return None
-    return _retired_secret
+    sec, at = d.get("secret"), d.get("at")
+    if not isinstance(sec, str) or not sec or not isinstance(at, (int, float)):
+        return None
+    # Bounded BOTH ways: a future stamp is clock skew, not a licence to honour
+    # a retired value forever.
+    return sec if -_RETIRED_SECRET_SECONDS <= (now - at) <= _RETIRED_SECRET_SECONDS else None
 
 
 def rotate_proxy_secret(certdir: Path) -> str:
@@ -6739,11 +6778,12 @@ def rotate_proxy_secret(certdir: Path) -> str:
         return old or ""
     # AFTER the write, and only for a REAL predecessor. Retiring "" would put
     # an empty password into the accepted set, which authorises everyone.
-    _retire_secret(old or None)
+    _retire_secret(old or None, certdir)
     return token
 
 
-def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None) -> bool:
+def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None,
+                      certdir=None) -> bool:
     """Whether a CONNECT may use this proxy.
 
     No secret configured => authorized, so a daemon from before this change
@@ -6756,7 +6796,7 @@ def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None) -> boo
     if not secret:
         return True
     accepted = [secret]
-    retired = _retired_still_valid()
+    retired = _retired_still_valid(certdir)
     if retired:
         accepted.append(retired)
     for key, value in headers:
@@ -13132,7 +13172,8 @@ class PinProxy:
         #
         # Nothing Claude Code does reaches here (it CONNECTs), so this refusal
         # cannot cut off the sessions the pin toggle is about.
-        if not _proxy_authorized(parsed, self._current_secret()):
+        if not _proxy_authorized(parsed, self._current_secret(),
+                                 certdir=self._certdir):
             self._refuse_unauthorized(conn)
             return
         split = urlsplit(url)
