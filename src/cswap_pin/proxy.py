@@ -2658,6 +2658,43 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 # to. Same shape as the routes above, captured rather than merely matched.
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
+# `claude remote-control` DOES NOT USE `/v1/code/sessions/<id>/bridge` AT ALL.
+# It registers an ENVIRONMENT, and every route in that lifecycle lives under a
+# subtree nothing here matched, so the whole feature resolved to the active
+# account while the pin reported itself healthy:
+#
+#     POST   /v1/environments/bridge                      -> environment_id
+#     DELETE /v1/environments/bridge/<env>
+#     POST   /v1/environments/<env>/bridge/reconnect
+#     GET    /v1/environments/<env>/work/poll
+#     POST   /v1/environments/<env>/work/<id>/ack|stop|heartbeat
+#
+# All five carry `Authorization: Bearer <getAccessToken()>` from one header
+# builder, so they are OAuth ownership routes exactly like `/bridge` is, and
+# the registration is a CREATE the server cannot transfer afterwards.
+#
+# The REPL's `/remote-control` is a different code path and was never broken —
+# it mints `/v1/code/sessions/<id>/bridge`, which the table below has always
+# pinned. That is why one worked from the pinned account's claude.ai and the
+# other was invisible there, and why searching the trace for the SELF-HOSTED
+# RUNNER routes found nothing: those belong to `claude self-hosted-runner`,
+# authenticate with a pool secret rather than a bearer, and are not this
+# feature. 0 of 19,211 traced requests, a true measurement of the wrong
+# subject.
+#
+# `?beta=true` IS THE DISCRIMINATOR AND IT IS LOAD-BEARING. A second product
+# shares this subtree: the managed-agents SDK spells every one of its
+# environment calls with that flag (`/v1/environments?beta=true`,
+# `/v1/environments/<id>/work/poll?beta=true`, `.../heartbeat?beta=true`) and
+# authenticates as an API client, not as this login. Swapping a credential we
+# have not looked at is the `/worker` mistake, so the surface stays out.
+_ENV_BRIDGE = re.compile(
+    r"^/v1/environments/"
+    r"(?:bridge(?:/|$|\?)"
+    r"|[^/?]+/(?:bridge/reconnect(?:/|$|\?)|work(?:/|$|\?)))"
+)
+_ENV_SDK_BETA = re.compile(r"[?&]beta=true(?:&|$)")
+
 
 
 # How rarely presence may trigger a superseded-bridge sweep. Presence is posted
@@ -2826,6 +2863,9 @@ def is_pinned_route(path: str) -> bool:
         return False
     if _WORKER_SUBTREE.search(path):
         return False
+    # The `claude remote-control` environment lifecycle — see `_ENV_BRIDGE`.
+    if _ENV_BRIDGE.search(path) and not _ENV_SDK_BETA.search(path):
+        return True
     # ``/api/oauth/validate`` IS THE ROUTE THAT KEEPS A LIVE BRIDGE ALIVE
     # ACROSS A SWAP, and it is the only one here that is not about creating or
     # owning an asset — it is a QUESTION.
@@ -4199,7 +4239,13 @@ def should_wait_for_pin(method: str, path: str) -> bool:
     and sends, because a launch that hangs is worse than a session on the
     wrong account.
     """
-    return method == "POST" and path.rstrip("/") == "/v1/code/sessions"
+    bare = path.split("?", 1)[0].rstrip("/")
+    # `POST /v1/environments/bridge` is the same bargain one subtree over: it
+    # is where `claude remote-control` fixes the ENVIRONMENT's owner, and an
+    # environment registered on the wrong account cannot be moved either — the
+    # machine simply never appears on the pinned account's claude.ai.
+    return method == "POST" and bare in (
+        "/v1/code/sessions", "/v1/environments/bridge")
 
 
 def titles_to_restore(

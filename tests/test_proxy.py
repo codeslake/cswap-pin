@@ -777,6 +777,16 @@ class TestLiveRemoteControlSessions:
         assert should_wait_for_pin("POST", "/v1/messages") is False
         assert should_wait_for_pin("GET", "/v1/code/sessions") is False
         assert should_wait_for_pin("GET", "/v1/code/sessions/cse_x/bridge") is False
+        # THE SIBLING CREATE ONE SUBTREE OVER. `claude remote-control`
+        # registers an environment instead of a session, and an environment
+        # minted on the wrong account is just as unmovable -- the machine
+        # never shows up on the pinned account's claude.ai at all.
+        assert should_wait_for_pin("POST", "/v1/environments/bridge") is True
+        assert should_wait_for_pin("POST", "/v1/environments/bridge/") is True
+        assert should_wait_for_pin("GET", "/v1/environments/bridge") is False
+        # Only the CREATE. Deregister is a DELETE and reconnect is not this
+        # route; neither loses anything permanent to a lost race.
+        assert should_wait_for_pin("POST", "/v1/environments/bridge/env_01") is False
 
     def case_a_name_the_user_typed_on_the_web_is_never_overwritten(
         self, monkeypatch
@@ -2508,6 +2518,41 @@ class TestIsPinnedRoute:
             ("/api/oauth/files", False,
              "the bare collection is not an owned asset; only a file's own "
              "content is"),
+            # `claude remote-control` REGISTERS AN ENVIRONMENT, and none of
+            # its routes went through `/v1/code/sessions/<id>/bridge`. Read
+            # out of the 2.1.251 binary: one header builder gives all of them
+            # `Authorization: Bearer <getAccessToken()>`, so every one is an
+            # OAuth ownership route and the registration is a create the
+            # server will not transfer afterwards.
+            ("/v1/environments/bridge", True,
+             "POST here is where the environment's owner is fixed; unswapped, "
+             "the machine never appears on the pinned account's claude.ai"),
+            ("/v1/environments/bridge/env_01", True,
+             "deregister must reach the account that owns the environment"),
+            ("/v1/environments/env_01/bridge/reconnect", True,
+             "reconnect re-mints a session token for the environment, the "
+             "same bargain as /v1/sessions/<id>/unarchive"),
+            ("/v1/environments/env_01/work/poll", True,
+             "the work queue IS the inbound half -- polled as the active "
+             "account it returns the wrong account's queue, which is the "
+             "state where claude.ai shows nothing"),
+            ("/v1/environments/env_01/work/w1/ack", True,
+             "acking work belongs to whoever was handed it"),
+            ("/v1/environments/env_01/work/w1/stop", True, "same owner as ack"),
+            # THE NEIGHBOURING PRODUCT, which shares the subtree and does not
+            # share the credential. Same reasoning as the /worker exclusion:
+            # never swap an Authorization we have not looked at.
+            ("/v1/environments?beta=true", False,
+             "the managed-agents SDK surface authenticates as an API client"),
+            ("/v1/environments/env_01?beta=true", False,
+             "managed-agents, not the remote-control bridge"),
+            ("/v1/environments/env_01/work/poll?beta=true", False,
+             "the SDK spells every environments call with beta=true; that is "
+             "the discriminator between the two products"),
+            # A prefix must not run past the segment boundary, same guard the
+            # /v1/code/sessions rows carry.
+            ("/v1/environmentsXYZ/bridge", False,
+             "a different collection entirely"),
         ):
             assert is_pinned_route(path) is pinned, f"{path}: {why}"
 
