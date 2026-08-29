@@ -2767,6 +2767,116 @@ class TestChainRediscovery:
                 proxy.stop()
             inner.stop()
 
+    def case_the_absolute_form_path_swaps_a_pinned_route_too(
+        self, certdir, monkeypatch
+    ):
+        """`claude remote-control` registers its environment THROUGH THIS PATH.
+
+        Its bridge client uses the proxy in absolute form -- measured on the
+        wire as `POST https://api.anthropic.com/v1/environments/bridge` with
+        the OAuth bearer in the clear -- so it never becomes a CONNECT and the
+        MITM never sees it. This branch was written for the auto-updater and
+        telemetry and said in a comment that nothing Claude Code does reaches
+        it, so it relayed verbatim: every environment was registered under the
+        ACTIVE account while the route table read correct and every other
+        check reported the pin healthy.
+
+        Three assertions, because the swap has to be right in three ways at
+        once: it fires for a pinned route, it does NOT fire for inference on
+        the same host, and it does NOT fire for another host at all.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        seen: list[bytes] = []
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        chain_port = srv.getsockname()[1]
+
+        def chain():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                        d = c.recv(1)
+                        if not d:
+                            break
+                        buf += d
+                    seen.append(buf)
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                finally:
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+
+        threading.Thread(target=chain, daemon=True).start()
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+
+            def ask(url, host):
+                c = socket.create_connection(("127.0.0.1", proxy.port),
+                                             timeout=10)
+                try:
+                    c.sendall(
+                        f"POST {url} HTTP/1.1\r\nHost: {host}\r\n"
+                        f"Authorization: Bearer ACTIVE\r\n"
+                        f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                    c.settimeout(10)
+                    try:
+                        c.recv(256)
+                    except OSError:
+                        pass
+                finally:
+                    c.close()
+
+            ask("https://api.anthropic.com/v1/environments/bridge",
+                "api.anthropic.com")
+            ask("https://api.anthropic.com/v1/messages", "api.anthropic.com")
+            ask("https://example.com/v1/environments/bridge", "example.com")
+
+            deadline = time.time() + 10
+            while len(seen) < 3 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 3, f"the chain saw {len(seen)} request(s), not 3"
+
+            env, msgs, other = seen
+            assert b"Bearer PINTOKEN" in env, (
+                "the environment registration went out on the ACTIVE bearer — "
+                "`claude remote-control` gives the machine to the wrong "
+                "account, which is invisible to every route-table check")
+            assert b"Bearer ACTIVE" not in env
+            # THE CONTROL THAT MATTERS MOST: inference must keep billing the
+            # account the user swapped to. A swap that fires here is a
+            # regression with no symptom until the bill arrives.
+            assert b"Bearer ACTIVE" in msgs and b"Bearer PINTOKEN" not in msgs, (
+                "inference was swapped to the pin on the absolute-form path")
+            # AND A BEARER BELONGS TO ITS ORIGIN. Rewriting one en route to
+            # somebody else's server hands out the pinned account's token.
+            assert b"Bearer ACTIVE" in other and b"Bearer PINTOKEN" not in other, (
+                "the pin token was sent to a host that did not mint it")
+        finally:
+            if proxy:
+                proxy.stop()
+            try:
+                srv.close()
+            except OSError:
+                pass
+
     def case_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
         """Where the second hop comes from: the inner proxy reports its own
         upstream while it is alive, and a launch records both. Probed rather

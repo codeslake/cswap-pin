@@ -12909,7 +12909,18 @@ class PinProxy:
                 return
             parts = line.split(" ")
             if parts[0] == "CONNECT":
-                target = parts[1]  # host:port
+                target = parts[1] if len(parts) > 1 else ""  # host:port
+                if not target.strip():
+                    # An empty target makes `_blind_tunnel` dial host "" — every
+                    # chain hop refuses the empty authority and the request ends
+                    # on a direct dial that never sees a bearer. Indistinguishable
+                    # from a healthy tunnel until now, which is how a whole
+                    # feature can route around the pin while the route table
+                    # reads correct. Logged, not refused: these connections
+                    # already fail, and a 400 is a different failure than the one
+                    # the client gets today.
+                    self._tunnel_trace(
+                        f"CONNECT with an unreadable authority: {line[:120]!r}")
                 # Keep the CONNECT headers rather than draining them: the
                 # proxy credential arrives here and nowhere else.
                 connect_headers: list[tuple[str, str]] = []
@@ -13216,8 +13227,12 @@ class PinProxy:
         # forward proxy. The CONNECT path could soften because refusing there
         # bought nothing the swap decision does not already buy.
         #
-        # Nothing Claude Code does reaches here (it CONNECTs), so this refusal
-        # cannot cut off the sessions the pin toggle is about.
+        # "Nothing Claude Code does reaches here (it CONNECTs)" was written on
+        # this line and is false: the Remote Control bridge client uses the
+        # proxy in absolute form, so `claude remote-control` registers its
+        # environment THROUGH HERE. The refusal still cannot cut those off --
+        # they carry our credential like every other session -- but the swap
+        # below exists because they arrive on this path and not the other.
         if not _proxy_authorized(parsed, self._current_secret(),
                                  certdir=self._certdir):
             self._refuse_unauthorized(conn)
@@ -13228,6 +13243,39 @@ class PinProxy:
         # auto-updater, telemetry) could not succeed at all.
         secure = split.scheme == "https"
         host, port = split.hostname, split.port or (443 if secure else 80)
+        # THE SAME OWNERSHIP DECISION THE MITM MAKES, because the same routes
+        # arrive here. An absolute-form request is not a weaker request: it
+        # carries the identical bearer and the server fixes the identical
+        # ownership from it. Claude Code's Remote Control bridge client speaks
+        # this way -- `POST https://api.anthropic.com/v1/environments/bridge`
+        # with the OAuth bearer in the clear -- so leaving this path unswapped
+        # gave `claude remote-control` to the active account no matter what the
+        # route table said.
+        #
+        # Guarded on the ORIGIN. This path forwards to an arbitrary host, and a
+        # bearer belongs to the host it was minted for; rewriting one on the way
+        # to somebody else's server would hand out the pinned account's token.
+        if host == UPSTREAM_HOST:
+            rel = split.path or "/"
+            if split.query:
+                rel += "?" + split.query
+            if is_pinned_route(rel):
+                token = self._pin_token_provider()
+                if token:
+                    headers = [
+                        f"Authorization: Bearer {token}"
+                        if h.split(":", 1)[0].strip().lower() == "authorization"
+                        else h
+                        for h in headers
+                    ]
+                # TRACED LIKE THE MITM PATH, because being untraced is half of
+                # what this cost. The MITM writes `pinned=.. swapped=..` for
+                # every request; this branch wrote nothing at all, so a feature
+                # travelling here left the same evidence as a feature that was
+                # not running.
+                self._tunnel_trace(
+                    f"{method} {rel} pinned=True swapped={bool(token)} "
+                    "(absolute-form)")
         # Re-read like every other egress site: the daemon is constructed with
         # chain_proxy=None, so reading self._chain here meant this path ALWAYS
         # dialled the origin direct — bypassing the egress proxy on exactly the
