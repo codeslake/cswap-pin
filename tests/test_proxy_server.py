@@ -140,6 +140,75 @@ class _FakeUpstream:
         self._thr.join(timeout=2.0)
 
 
+class _RecordingChain:
+    """A plain-HTTP chain hop that records each request and answers a canned
+    reply. `answer(request_bytes) -> response_bytes` decides what to send.
+
+    READS THE BODY BEFORE ANSWERING, because a hop that replies on the headers
+    alone cannot show a request whose body was never forwarded — the shape that
+    deadlocked every swapped POST for a release.
+
+    Teardown wakes the accept thread before joining: closing a listening socket
+    does NOT interrupt another thread blocked in `accept()`, which is the same
+    reason `_ProbeChain.stop` does it.
+    """
+
+    def __init__(self, answer):
+        self.answer, self.seen, self._stop = answer, [], False
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(8)
+        self.port = self._srv.getsockname()[1]
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                c, _ = self._srv.accept()
+            except OSError:
+                return
+            if self._stop:
+                c.close()
+                return
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                    d = c.recv(1)
+                    if not d:
+                        break
+                    buf += d
+                want = 0
+                for ln in buf.split(b"\r\n"):
+                    if ln.lower().startswith(b"content-length:"):
+                        want = int(ln.split(b":", 1)[1])
+                while len(buf.split(b"\r\n\r\n", 1)[-1]) < want:
+                    d = c.recv(65536)
+                    if not d:
+                        break
+                    buf += d
+                self.seen.append(buf)
+                c.sendall(self.answer(buf))
+            except OSError:
+                pass
+            finally:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            with socket.create_connection(self._srv.getsockname(), timeout=0.2):
+                pass
+        except OSError:
+            pass
+        self._srv.close()
+        self._thr.join(timeout=2.0)
+
+
 def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: str):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
     trusting the proxy's CA. Returns the response status."""
@@ -2789,36 +2858,10 @@ class TestChainRediscovery:
         import base64
 
         secret = ensure_proxy_secret(certdir)
-        seen: list[bytes] = []
-
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(8)
-        chain_port = srv.getsockname()[1]
-
-        def chain():
-            while True:
-                try:
-                    c, _ = srv.accept()
-                except OSError:
-                    return
-                try:
-                    buf = b""
-                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
-                        d = c.recv(1)
-                        if not d:
-                            break
-                        buf += d
-                    seen.append(buf)
-                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                finally:
-                    try:
-                        c.close()
-                    except OSError:
-                        pass
-
-        threading.Thread(target=chain, daemon=True).start()
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        chain_port = chain.port
         proxy = None
         try:
             write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
@@ -2872,10 +2915,7 @@ class TestChainRediscovery:
         finally:
             if proxy:
                 proxy.stop()
-            try:
-                srv.close()
-            except OSError:
-                pass
+            chain.stop()
 
     def case_a_refused_swap_is_taken_back_on_the_absolute_form_path(
         self, certdir
@@ -2892,40 +2932,13 @@ class TestChainRediscovery:
         import base64
 
         secret = ensure_proxy_secret(certdir)
-        seen: list[bytes] = []
-
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(8)
-        chain_port = srv.getsockname()[1]
-
-        def chain():
-            while True:
-                try:
-                    c, _ = srv.accept()
-                except OSError:
-                    return
-                try:
-                    buf = b""
-                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
-                        d = c.recv(1)
-                        if not d:
-                            break
-                        buf += d
-                    seen.append(buf)
-                    # The pin's bearer is refused; the one that arrived is not.
-                    body = (b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
-                            if b"Bearer PINTOKEN" in buf else
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
-                    c.sendall(body)
-                finally:
-                    try:
-                        c.close()
-                    except OSError:
-                        pass
-
-        threading.Thread(target=chain, daemon=True).start()
+        # The pin's bearer is refused; the one that arrived is not.
+        chain = _RecordingChain(
+            lambda req: (b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
+                         if b"Bearer PINTOKEN" in req else
+                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"))
+        seen = chain.seen
+        chain_port = chain.port
         proxy = None
         try:
             write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
@@ -2937,11 +2950,18 @@ class TestChainRediscovery:
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             got = b""
             try:
+                # A ROUTE THAT IS STILL PINNED, and one with a BODY: the work
+                # queue moved out of the table when the wire showed it carries
+                # a token of its own, and a take-back test aimed there stops
+                # exercising the take-back while still passing its own name.
+                rbody = b'{"session_id":"cse_X"}'
                 c.sendall(
-                    b"GET https://api.anthropic.com/v1/environments/env_1/work/poll"
-                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"POST https://api.anthropic.com/v1/environments/env_1"
+                    b"/bridge/reconnect HTTP/1.1\r\nHost: api.anthropic.com\r\n"
                     b"Authorization: Bearer ACTIVE\r\n"
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                    + f"Content-Length: {len(rbody)}\r\n".encode()
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                    + rbody)
                 c.settimeout(10)
                 while b"\r\n\r\n" not in got:
                     d = c.recv(4096)
@@ -2961,15 +2981,103 @@ class TestChainRediscovery:
             assert b"Bearer ACTIVE" in seen[1], (
                 "the retry did not restore the bearer the client sent")
             assert got.startswith(b"HTTP/1.1 200"), (
-                f"the client got {got.split(b'0d0a')[0][:40]!r}, not the "
+                f"the client got {got.splitlines()[0][:40]!r}, not the "
                 "answer the take-back earned")
         finally:
             if proxy:
                 proxy.stop()
+            chain.stop()
+
+    def case_both_new_trace_lines_are_actually_written(self, certdir):
+        """"Being untraced is half of what this cost" — so hold them.
+
+        A whole feature travelled the absolute-form path leaving exactly the
+        evidence a feature that was NOT RUNNING leaves, because that branch
+        wrote nothing. Deleting either line back out was measured as a
+        no-op against the whole suite, which makes the fix one edit from
+        being undone by someone tidying.
+
+        Read from the source rather than from a captured file: the trace's
+        destination is a per-daemon path this case has no business arming,
+        and what regressed is the CALL, not the sink.
+        """
+        import inspect
+        import cswap_pin.proxy as pp
+
+        relay = inspect.getsource(pp.PinProxy._plain_relay)
+        assert "(absolute-form)" in relay, (
+            "the swap on this path is silent again — a request travelling "
+            "here leaves the same evidence as one that never ran")
+        assert "swap refused" in relay, (
+            "a take-back leaves no line, so a 401 that was survived is "
+            "indistinguishable from one that never happened")
+        handler = inspect.getsource(pp.PinProxy._handle_client)
+        assert "unreadable authority" in handler, (
+            "a CONNECT the proxy cannot parse is silently blind-tunnelled to "
+            "host '' again, which is how a feature routes around the pin "
+            "while every route check reports it correct")
+        # AND THE SHAPE IT LOGS, not the text. That branch runs before any
+        # credential check and the remainder of the line is whatever the
+        # client wrote — a proxy URL with userinfo in it, say.
+        assert "line[:120]" not in handler, (
+            "the raw CONNECT line is being copied into the trace again")
+
+    def case_the_take_back_fires_on_403_and_404_and_NOT_on_500(self, certdir):
+        """WHICH codes take a swap back, in both directions.
+
+        401 alone was exercised, so narrowing the set to `(401,)` and widening
+        it to `>= 400` were both invisible. They fail in opposite ways: the
+        narrow one lets a 403 kill Remote Control, and the wide one replays the
+        WHOLE request on the client's bearer whenever the origin has a bad
+        minute — a 500 is the origin's own answer and belongs to it.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+
+        def ask(code):
+            chain = _RecordingChain(
+                lambda req: (f"HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n"
+                             .encode()
+                             if b"Bearer PINTOKEN" in req else
+                             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+            proxy = None
             try:
-                srv.close()
-            except OSError:
-                pass
+                write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+                proxy = PinProxy(certdir=certdir,
+                                 pin_token_provider=lambda: "PINTOKEN",
+                                 rediscover_chain=True)
+                proxy.start()
+                cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+                c = socket.create_connection(("127.0.0.1", proxy.port),
+                                             timeout=10)
+                try:
+                    c.sendall(
+                        b"POST https://api.anthropic.com/v1/environments/bridge"
+                        b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        b"Authorization: Bearer ACTIVE\r\n"
+                        + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                    c.settimeout(10)
+                    try:
+                        c.recv(256)
+                    except OSError:
+                        pass
+                finally:
+                    c.close()
+                return len(chain.seen)
+            finally:
+                if proxy:
+                    proxy.stop()
+                chain.stop()
+
+        assert ask(403) == 2, "a 403 did not take the swap back"
+        assert ask(404) == 2, "a 404 did not take the swap back"
+        # THE CONTROL, and the half a widened set would break: an origin error
+        # is the origin's answer, not a verdict on our bearer.
+        assert ask(500) == 1, (
+            "a 500 replayed the request on the client's bearer — the take-back "
+            "is for a REFUSAL, not for any failure")
 
     def case_a_swapped_request_with_a_BODY_still_completes(self, certdir):
         """The registration this whole feature exists to pin carries a body.
@@ -2988,50 +3096,10 @@ class TestChainRediscovery:
         import base64
 
         secret = ensure_proxy_secret(certdir)
-        seen: list[bytes] = []
-
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(8)
-        chain_port = srv.getsockname()[1]
-
-        def chain():
-            while True:
-                try:
-                    c, _ = srv.accept()
-                except OSError:
-                    return
-                try:
-                    # AN ORIGIN THAT WAITS FOR THE BODY, which is the whole
-                    # point: one that answers on the headers alone cannot show
-                    # the deadlock, and the first version of this harness did
-                    # exactly that.
-                    buf = b""
-                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
-                        d = c.recv(1)
-                        if not d:
-                            break
-                        buf += d
-                    want = 0
-                    for ln in buf.split(b"\r\n"):
-                        if ln.lower().startswith(b"content-length:"):
-                            want = int(ln.split(b":", 1)[1])
-                    body = b""
-                    while len(body) < want:
-                        d = c.recv(want - len(body))
-                        if not d:
-                            break
-                        body += d
-                    seen.append(buf + body)
-                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                finally:
-                    try:
-                        c.close()
-                    except OSError:
-                        pass
-
-        threading.Thread(target=chain, daemon=True).start()
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        seen = chain.seen
+        chain_port = chain.port
         proxy = None
         try:
             write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
@@ -3071,10 +3139,7 @@ class TestChainRediscovery:
         finally:
             if proxy:
                 proxy.stop()
-            try:
-                srv.close()
-            except OSError:
-                pass
+            chain.stop()
 
     def case_a_cleartext_absolute_form_request_is_NEVER_swapped(self, certdir):
         """A bearer belongs on a wire that hides it.
@@ -3088,36 +3153,10 @@ class TestChainRediscovery:
         import base64
 
         secret = ensure_proxy_secret(certdir)
-        seen: list[bytes] = []
-
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(8)
-        chain_port = srv.getsockname()[1]
-
-        def chain():
-            while True:
-                try:
-                    c, _ = srv.accept()
-                except OSError:
-                    return
-                try:
-                    buf = b""
-                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
-                        d = c.recv(1)
-                        if not d:
-                            break
-                        buf += d
-                    seen.append(buf)
-                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                finally:
-                    try:
-                        c.close()
-                    except OSError:
-                        pass
-
-        threading.Thread(target=chain, daemon=True).start()
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        chain_port = chain.port
         proxy = None
         try:
             write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
@@ -3153,10 +3192,7 @@ class TestChainRediscovery:
         finally:
             if proxy:
                 proxy.stop()
-            try:
-                srv.close()
-            except OSError:
-                pass
+            chain.stop()
 
     def case_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
         """Where the second hop comes from: the inner proxy reports its own

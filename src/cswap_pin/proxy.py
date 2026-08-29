@@ -2696,8 +2696,25 @@ _ENV_BRIDGE = re.compile(
     # and nothing looks broken. Listing creates nothing and mints nothing.
     r"(?:$|\?"
     r"|/(?:bridge(?:/|$|\?)"
-    r"|[^/?]+/(?:bridge/reconnect(?:/|$|\?)|work(?:/|$|\?))))"
+    r"|[^/?]+/bridge/reconnect(?:/|$|\?)))"
 )
+
+# THE `work/` SUBTREE IS EXCLUDED FOR THE REASON `/worker` IS: it does not
+# carry the account's OAuth bearer. In the bridge client every OAuth call goes
+# through one wrapper that reads `getAccessToken()` -- register, deregister,
+# `bridge/reconnect`, archive -- while `pollForWork`, `acknowledgeWork`,
+# `stopWork` and `heartbeatWork` each take a token as an ARGUMENT and send
+# whatever the caller hands them.
+#
+# Measured on the wire, against an environment THIS PIN REGISTERED: the
+# register answered fine swapped, and the very next `work/poll` on the same
+# environment answered 401 swapped and 200 with the bearer it arrived with.
+# Ownership is still the pin's, because the register is; the work queue simply
+# is not an ownership route.
+#
+# Kept as its own name rather than merely left out of the pattern above, so
+# the next reader sees a decision instead of an omission.
+_ENV_WORK = re.compile(r"^/v1/environments/[^/?]+/work(?:/|$|\?)")
 _ENV_SDK_BETA = re.compile(r"[?&]beta=true(?:&|$)")
 
 

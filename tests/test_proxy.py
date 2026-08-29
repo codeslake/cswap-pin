@@ -787,6 +787,15 @@ class TestLiveRemoteControlSessions:
         # Only the CREATE. Deregister is a DELETE and reconnect is not this
         # route; neither loses anything permanent to a lost race.
         assert should_wait_for_pin("POST", "/v1/environments/bridge/env_01") is False
+        # THE STRIP ITSELF, which is new and changed the OLD route's answer:
+        # `POST /v1/code/sessions?x=1` used to be False and is now True. The
+        # four lines above read as full coverage of the change while the one
+        # behaviour that actually moved had nothing holding it.
+        assert should_wait_for_pin("POST", "/v1/code/sessions?beta=true") is True
+        assert should_wait_for_pin("POST", "/v1/environments/bridge?x=1") is True
+        # And the strip must not reach past the query: a different route that
+        # merely CONTAINS the pinned one is still a different route.
+        assert should_wait_for_pin("POST", "/v1/code/sessionsX?x=1") is False
 
     def case_a_name_the_user_typed_on_the_web_is_never_overwritten(
         self, monkeypatch
@@ -2541,20 +2550,39 @@ class TestIsPinnedRoute:
             ("/v1/environments/env_01/bridge/reconnect", True,
              "reconnect re-mints a session token for the environment, the "
              "same bargain as /v1/sessions/<id>/unarchive"),
-            ("/v1/environments/env_01/work/poll", True,
-             "the work queue IS the inbound half -- polled as the active "
-             "account it returns the wrong account's queue, which is the "
-             "state where claude.ai shows nothing"),
-            ("/v1/environments/env_01/work/w1/ack", True,
-             "acking work belongs to whoever was handed it"),
-            ("/v1/environments/env_01/work/w1/stop", True, "same owner as ack"),
+            # THE `/worker` EXCLUSION, ONE SUBTREE OVER. Every OAuth call in
+            # the bridge client goes through one wrapper reading
+            # `getAccessToken()`; the work queue's four methods each take a
+            # token as an ARGUMENT and send what the caller hands them.
+            # Measured against an environment the pin had just registered: the
+            # register answered fine swapped, and the very next `work/poll` on
+            # that same environment answered 401 swapped and 200 with the
+            # bearer it arrived with. Ownership is still the pin's, because
+            # the REGISTER is; the work queue is simply not an ownership route.
+            ("/v1/environments/env_01/work/poll", False,
+             "the work queue does not carry the account bearer; swapping it "
+             "is the 403 storm the /worker subtree already measured"),
+            ("/v1/environments/env_01/work/w1/ack", False,
+             "same credential as poll"),
+            ("/v1/environments/env_01/work/w1/stop", False, "same as ack"),
+            ("/v1/environments/env_01/work/w1/heartbeat", False,
+             "same as ack; named because it is the one that runs forever"),
             # THE NEIGHBOURING PRODUCT, which shares the subtree and does not
             # share the credential. Same reasoning as the /worker exclusion:
             # never swap an Authorization we have not looked at.
             ("/v1/environments?beta=true", False,
              "the managed-agents SDK surface authenticates as an API client"),
-            ("/v1/environments/env_01?beta=true", False,
+            # POINTED AT A PATH THE PINNED-ROUTE REGEX ACTUALLY REACHES.
+            # `/v1/environments/<id>` alone never matched it, so asserting
+            # False there exercised nothing and would stay green with the
+            # beta guard deleted — three rows reading as three checks of a
+            # discriminator, one of which carried none of it.
+            ("/v1/environments/env_01/bridge/reconnect?beta=true", False,
              "managed-agents, not the remote-control bridge"),
+            # AND THE `&` FORM, which no row exercised: a guard narrowed to
+            # `\?beta=true$` passes every other row here.
+            ("/v1/environments?limit=100&beta=true", False,
+             "the flag is the discriminator wherever it sits in the query"),
             ("/v1/environments/env_01/work/poll?beta=true", False,
              "the SDK spells every environments call with beta=true; that is "
              "the discriminator between the two products"),
@@ -2562,6 +2590,16 @@ class TestIsPinnedRoute:
             # /v1/code/sessions rows carry.
             ("/v1/environmentsXYZ/bridge", False,
              "a different collection entirely"),
+            # THE INNER BOUNDARIES, unguarded until now. This repo has already
+            # shipped a vacuous boundary group of exactly this shape once —
+            # `_PRESENCE` — so each `(?:/|$|\?)` gets a row that would catch
+            # it becoming a bare prefix.
+            ("/v1/environments/bridgehead", False,
+             "`bridge` is a segment, not a prefix"),
+            ("/v1/environments/env_01/bridge/reconnected", False,
+             "the reconnect route is exact; a longer name is a different one"),
+            ("/v1/environments/env_01/workflows", False,
+             "`work` is a segment; nothing here says workflows are ours"),
         ):
             assert is_pinned_route(path) is pinned, f"{path}: {why}"
 

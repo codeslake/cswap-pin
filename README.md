@@ -30,16 +30,47 @@ else — `/v1/messages` above all — through untouched.
 claude session
   HTTPS_PROXY ─► cswap pin proxy ──► (whatever HTTPS_PROXY was already set) ──► api.anthropic.com
                    swaps bearer on: /v1/code/sessions*, /v1/sessions/*,
+                                    /v1/environments, /v1/environments/bridge*,
+                                    /v1/environments/<env>/bridge/reconnect,
                                     /api/frame/*, /v1/ultrareview/*
                    passes through:  /v1/messages, /api/oauth/usage, everything else
-                   NEVER swapped:   .../worker/*, .../client/presence
+                   NEVER swapped:   .../worker/*, .../client/presence,
+                                    /v1/environments/<env>/work/*, ?beta=true
 ```
 
 Inference keeps billing whichever account cswap has swapped onto. Only the
 claude.ai-side assets are pinned.
 
-Two exceptions inside the pinned prefix are worth naming, because both were
-learned by breaking them:
+### Remote Control has two front doors, and they own sessions differently
+
+| you run | it creates | ownership route |
+|---|---|---|
+| `/remote-control` in the REPL | a bridge on the current session | `POST /v1/code/sessions/<id>/bridge` |
+| `claude remote-control` | an ENVIRONMENT this machine offers | `POST /v1/environments/bridge` |
+
+The second family is easy to miss, because `remote-control` is the
+subcommand's name while the ownership it creates travels on a path that does
+not contain it. Pin only the first and `claude remote-control` registers every
+machine on whichever account is currently active — with nothing reporting a
+fault, because nothing is failing. The machine is simply absent from the
+pinned account's browser.
+
+**A pinned route is only swapped on a path that reads the bearer, and there
+are two.** The MITM terminates a `CONNECT` and inspects each request inside
+it; the other forwards absolute-form requests (`POST https://host/path`),
+which is plain-proxy form. Remote Control's bridge client speaks the second,
+so adding its routes to the table changes nothing until that path swaps too.
+Both now take the same decision from the same predicate, and both write a line
+saying what they decided — an untraced path leaves exactly the evidence a
+feature that is not running leaves.
+
+A swap the upstream REFUSES (401/403/404) is taken back and the request goes
+again with the bearer it arrived with. That is what lets an environment
+registered before the pin knew this route keep working instead of dying on its
+next poll.
+
+Three exceptions inside the pinned prefixes are worth naming, because all
+three were learned by breaking them:
 
 - **`/worker/*`** carries the session's own channel credential, not an OAuth
   bearer. Swapping it makes the server reject every worker call and leaves
@@ -49,6 +80,21 @@ learned by breaking them:
   registers the pinned account while the process actually listening belongs to
   the active one — so inbound has nobody to reach. It returns `200` either way,
   which is what made it hard to find.
+- **`/v1/environments/<env>/work/*`** is the same shape as `/worker/*`, one
+  path over. In the bridge client every OAuth call goes through one wrapper
+  that reads the account's access token — register, deregister,
+  `bridge/reconnect`, archive — while `poll`, `ack`, `stop` and `heartbeat`
+  each take a token as an *argument* and send whatever the caller hands them.
+  Measured against an environment this proxy had just registered: the register
+  answered fine swapped, and the very next `work/poll` on that same
+  environment answered `401` swapped and `200` unswapped. Ownership is still
+  the pin's, because the register is; the work queue is simply not an
+  ownership route.
+
+`?beta=true` under `/v1/environments` is excluded for a different reason: it
+is a second product (the managed-agents SDK) sharing the path space with a
+credential this proxy has never looked at. Swapping an `Authorization` nobody
+has read is the mistake `/worker` already measured.
 
 ### A wrong guess cannot cost you a session
 
