@@ -2669,6 +2669,73 @@ class TestPeekStatusHandsBackEveryByteItTook:
         assert _peek_status(self.Sock(b"")) == (None, b"")
 
 
+class TestARenameIsRespectedWhereverItWasMade:
+    """The restore may overwrite a title IT wrote, and nothing else.
+
+    A reconnect leaves a server-invented slug behind, and putting the session's
+    own name back is what this feature is for. But it was also reverting a
+    title typed into claude.ai's `/rename` -- measured, within minutes, on a
+    session a person had just named.
+
+    The server cannot settle it: its record carries a `created_at` and a
+    `last_event_at` and NO timestamp for the title, so "who wrote it last"
+    is not a question it can answer. The ledger is this side's half.
+
+    A shape test is not the answer and was tried: it claimed names people had
+    chosen. This asks something the pin actually knows -- did I write that.
+    """
+
+    NAMES = {"b1": "dotfiles-80"}
+
+    def _sessions(self, title):
+        return [{"id": "b1", "title": title}]
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_slug_we_have_never_named_is_restored(self):
+        """THE POPULATION THE FEATURE EXISTS FOR. An unknown bridge must still
+        be restored, or the ledger disarms the fix for every session that has
+        not been named yet -- which is all of them, the first time."""
+        from cswap_pin.proxy import titles_to_restore
+
+        for ledger in (None, {}, {"b2": "somebody else"}):
+            got = titles_to_restore(
+                self._sessions("host-a-curious-torvalds"), self.NAMES, ledger)
+            assert got == [("b1", "dotfiles-80")], (ledger, got)
+
+    def case_a_title_we_wrote_ourselves_is_ours_to_leave_alone(self):
+        """Already correct: no request, and no PUT per live session per
+        connect."""
+        from cswap_pin.proxy import titles_to_restore
+
+        assert titles_to_restore(self._sessions("dotfiles-80"), self.NAMES,
+                                 {"b1": "dotfiles-80"}) == []
+
+    def case_a_title_MOVED_AWAY_from_ours_belongs_to_whoever_moved_it(self):
+        """THE CASE THIS CLASS EXISTS FOR. We wrote `dotfiles-80`; the server
+        now says something else; nobody here changed it. That is a person in
+        the browser, and a rename belongs to whoever made it last wherever
+        they made it."""
+        from cswap_pin.proxy import titles_to_restore
+
+        assert titles_to_restore(self._sessions("lmd42-dotfiles"), self.NAMES,
+                                 {"b1": "dotfiles-80"}) == []
+
+    def case_the_ledger_is_consulted_by_the_restore_that_uses_it(self):
+        """A reader nothing calls is a fix that passes its own test and changes
+        no behaviour -- and the writer matters as much as the reader: with no
+        `_record_title` the ledger stays empty and every title reads as one we
+        have never written."""
+        import inspect
+        import cswap_pin.proxy as pp
+
+        src = inspect.getsource(pp.PinProxy._restore_bridge_titles)
+        assert "_titles_we_wrote(" in src, "the restore does not read the ledger"
+        assert "_record_title(" in src, (
+            "nothing writes the ledger, so it can never say a title was ours")
+
+
 class TestParseUpstreamProxy:
     """One function, nine inputs. It was nine test methods; the CASES are the
     value here, not the ceremony around each one, so they are a table."""

@@ -4270,8 +4270,46 @@ def should_wait_for_pin(method: str, path: str) -> bool:
         "/v1/code/sessions", "/v1/environments/bridge")
 
 
+#: Titles this pin has PUT, keyed by bridge id. The one thing that separates
+#: "the server invented a name" from "a person renamed it in the browser":
+#: neither is the local name, and the server record carries no timestamp saying
+#: when its title was set (measured — `created_at` and `last_event_at` only).
+_TITLES_WRITTEN = "titles-written.json"
+
+
+def _titles_we_wrote(certdir) -> dict:
+    # NO CERTDIR MEANS NO LEDGER, and the documented default for a bridge we
+    # have never named is RESTORE. Failing closed here would disarm the whole
+    # feature for anything constructed without one.
+    if not certdir:
+        return {}
+    try:
+        return json.loads((Path(certdir) / _TITLES_WRITTEN).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_title(certdir, sid: str, title: str) -> None:
+    """Remember a title we just PUT, so a later change AWAY from it is somebody
+    else's edit and not ours to undo."""
+    if not certdir:
+        return
+    try:
+        d = _titles_we_wrote(certdir)
+        d[sid] = title
+        # BOUNDED. One entry per bridge this machine has ever named would grow
+        # without limit; the restore only ever asks about LIVE ones.
+        if len(d) > 500:
+            d = dict(list(d.items())[-500:])
+        tmp = Path(certdir) / (_TITLES_WRITTEN + ".tmp")
+        tmp.write_text(json.dumps(d))
+        tmp.replace(Path(certdir) / _TITLES_WRITTEN)
+    except (OSError, ValueError):
+        pass
+
+
 def titles_to_restore(
-    sessions: list[dict], names: dict[str, str]
+    sessions: list[dict], names: dict[str, str], ours: "dict | None" = None
 ) -> list[tuple[str, str]]:
     """``(bridge id, name)`` for listed bridges the server titles wrongly.
 
@@ -4309,12 +4347,24 @@ def titles_to_restore(
         # in any local record" plus a slug guard, and the slug guard was
         # protecting a case the registry makes impossible.
         #
-        # WHAT THE NARROWING WAS FOR: a title typed in the claude.ai web app,
-        # which would be reverted here. Both examples that justified it turned
-        # out not to be that — one is a session's own name, and the other
-        # appears in NO local record at all and its owner never named it. With
-        # no case left to protect, the guard was costing the feature and buying
-        # nothing.
+        # A THIRD CASE ARRIVED, and it is the one the narrowing was for: a
+        # title typed into claude.ai's `/rename`, reverted here within minutes.
+        # The guard that is possible is not a shape test — those claimed names
+        # people had chosen — it is a LEDGER. A title we PUT ourselves is ours
+        # to overwrite; a title that has moved AWAY from what we last wrote was
+        # set by somebody else, and a rename belongs to whoever made it last
+        # wherever they made it.
+        #
+        # The server offers nothing better: its record carries no timestamp for
+        # the title, so "who wrote it last" cannot be asked of it. The ledger
+        # is this side's half of that question.
+        #
+        # UNKNOWN MEANS RESTORE. A bridge we have never named is the first-pass
+        # case the whole feature exists for -- the reconnect that left a slug
+        # behind -- and refusing it there would disarm the restore for exactly
+        # the population it was written to fix.
+        if ours is not None and sid in ours and current != (ours[sid] or "").strip():
+            continue
         out.append((sid, want.strip()))
     return out
 
@@ -12787,12 +12837,15 @@ class PinProxy:
         if not names:
             return 0
         done = 0
-        for sid, want in titles_to_restore(sessions, names):
+        certdir = getattr(self, "_certdir", None)
+        ours = _titles_we_wrote(certdir)
+        for sid, want in titles_to_restore(sessions, names, ours):
             body = json.dumps({"title": want}).encode("utf-8")
             if self._bridge_api(
                 "PUT", f"/v1/code/sessions/{sid}", token, body=body
             ) is None:
                 continue
+            _record_title(certdir, sid, want)
             for item in sessions:
                 if item.get("id") == sid:
                     item["title"] = want
