@@ -13255,13 +13255,16 @@ class PinProxy:
         # Guarded on the ORIGIN. This path forwards to an arbitrary host, and a
         # bearer belongs to the host it was minted for; rewriting one on the way
         # to somebody else's server would hand out the pinned account's token.
+        unswapped = None      # set only when a swap actually happened
+        rel = (split.path or "/") + (f"?{split.query}" if split.query else "")
         if host == UPSTREAM_HOST:
-            rel = split.path or "/"
-            if split.query:
-                rel += "?" + split.query
             if is_pinned_route(rel):
                 token = self._pin_token_provider()
                 if token:
+                    # ARMED ONLY WHEN THE SWAP HAPPENED. With no token nothing
+                    # changed, so a second attempt would replay an identical
+                    # request and double every failure.
+                    unswapped = list(headers)
                     headers = [
                         f"Authorization: Bearer {token}"
                         if h.split(":", 1)[0].strip().lower() == "authorization"
@@ -13286,50 +13289,76 @@ class PinProxy:
         # skipping the hop behind it — and on a host with no direct route out
         # that is not a downgrade, it is a failure. This is the auto-updater's
         # and telemetry's path.
-        up = head = None
-        for chain in self._chain_candidates():
+        def dial(hdrs):
+            """`(socket, head)` for one attempt, or `(None, None)`."""
+            for chain in self._chain_candidates():
+                try:
+                    sock = _dial_chain(chain, extra_ca=self._chain_ca())
+                except (OSError, ssl.SSLError):
+                    continue
+                # A plain proxy takes the absolute-form line as-is. Our own
+                # credential for the chain rides here, not the client's.
+                return sock, (
+                    f"{method} {url} HTTP/1.1\r\n"
+                    + "\r\n".join(hdrs)
+                    + "\r\n"
+                    + chain.connect_headers()
+                    + "\r\n"
+                )
             try:
-                up = _dial_chain(chain, extra_ca=self._chain_ca())
-            except (OSError, ssl.SSLError):
-                up = None
-                continue
-            # A plain proxy takes the absolute-form line as-is. Our own
-            # credential for the chain rides here, not the client's.
-            head = (
-                f"{method} {url} HTTP/1.1\r\n"
-                + "\r\n".join(headers)
-                + "\r\n"
-                + chain.connect_headers()
-                + "\r\n"
-            )
-            break
-        if up is None:
-            try:
-                up = socket.create_connection((host, port), timeout=15)
+                sock = socket.create_connection((host, port), timeout=15)
                 if secure:
                     # An https:// origin dialled direct needs the handshake,
                     # verified. Without it we sent cleartext HTTP at a TLS
                     # port and the request simply failed.
-                    up = _verifying_ctx().wrap_socket(up, server_hostname=host)
+                    sock = _verifying_ctx().wrap_socket(sock,
+                                                        server_hostname=host)
             except (OSError, ssl.SSLError):
+                return None, None
+            rel_path = split.path or "/"
+            if split.query:
+                rel_path += "?" + split.query
+            return sock, (f"{method} {rel_path} HTTP/1.1\r\n"
+                          + "\r\n".join(hdrs) + "\r\n\r\n")
+
+        # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, which the MITM path has
+        # always done and this one did not. An environment registered before
+        # the pin knew this route belongs to the account that registered it,
+        # so asking as the pin gets 401 and Remote Control dies -- a running
+        # session killed by an upgrade, which no deploy is allowed to do.
+        # Nothing has reached the client yet, so the request can still go
+        # again with the bearer it arrived with.
+        for hdrs, retry in ((headers, unswapped is not None),
+                            (unswapped, False)):
+            if hdrs is None:
+                break
+            up, head = dial(hdrs)
+            if up is None:
                 conn.close()
                 return
-            path = split.path or "/"
-            if split.query:
-                path += "?" + split.query
-            head = f"{method} {path} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
-        try:
-            # Connect budget only, same as the tunnel: _pump streams, and a
-            # read timeout left on the socket tears down a response that is
-            # merely quiet — an SSE gap or a slow origin — rather than dead.
-            up.settimeout(None)
-            up.sendall(head.encode("latin1"))
-            _pump(conn, up)
-        finally:
             try:
-                up.close()
-            except OSError:
-                pass
+                # Connect budget only, same as the tunnel: _pump streams, and
+                # a read timeout left on the socket tears down a response that
+                # is merely quiet — an SSE gap or a slow origin — rather than
+                # dead.
+                up.settimeout(None)
+                up.sendall(head.encode("latin1"))
+                if retry:
+                    peeked = _peek_status(up)
+                    if peeked is not None and peeked[0] in (401, 403, 404):
+                        self._tunnel_trace(
+                            f"{method} {rel} swap refused ({peeked[0]}) — "
+                            "retrying as it arrived (absolute-form)")
+                        continue
+                    if peeked is not None:
+                        conn.sendall(peeked[1])
+                _pump(conn, up)
+                return
+            finally:
+                try:
+                    up.close()
+                except OSError:
+                    pass
 
     def _mitm(self, conn: socket.socket) -> bool:
         """Serve requests on this connection. True when it was HANDED OVER.
@@ -14473,6 +14502,29 @@ def _read_chunked_body(sock) -> bytes:
             body += chunk
             need -= len(chunk)
         _read_line(sock)  # the CRLF terminating this chunk
+
+
+def _peek_status(up) -> "tuple[int, bytes] | None":
+    """`(code, the bytes read)` for the response head, or None if unreadable.
+
+    Read so a refused swap can be taken back before anything reaches the
+    client. The bytes are returned rather than discarded because the caller
+    must forward them itself when it keeps the answer -- they are already off
+    the socket and `_pump` will never see them again.
+    """
+    buf = bytearray()
+    while b"\r\n" not in buf and len(buf) < 8192:
+        try:
+            chunk = up.recv(1)
+        except (OSError, ssl.SSLError):
+            return None
+        if not chunk:
+            break
+        buf += chunk
+    line = bytes(buf).split(b"\r\n", 1)[0].split(b" ")
+    if len(line) < 2 or not line[1].isdigit():
+        return None
+    return int(line[1]), bytes(buf)
 
 
 def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:

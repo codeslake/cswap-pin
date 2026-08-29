@@ -2877,6 +2877,100 @@ class TestChainRediscovery:
             except OSError:
                 pass
 
+    def case_a_refused_swap_is_taken_back_on_the_absolute_form_path(
+        self, certdir
+    ):
+        """A running Remote Control must survive the pin learning this route.
+
+        An environment registered before the pin swapped `/v1/environments/`
+        belongs to the account that registered it, so asking as the pin gets
+        401 and the bridge client dies — a live session killed by an upgrade,
+        which no deploy is allowed to do. The MITM path has always taken a
+        refused swap back; this one did not, and the gap cost exactly that.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        seen: list[bytes] = []
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        chain_port = srv.getsockname()[1]
+
+        def chain():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                        d = c.recv(1)
+                        if not d:
+                            break
+                        buf += d
+                    seen.append(buf)
+                    # The pin's bearer is refused; the one that arrived is not.
+                    body = (b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
+                            if b"Bearer PINTOKEN" in buf else
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                    c.sendall(body)
+                finally:
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+
+        threading.Thread(target=chain, daemon=True).start()
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            got = b""
+            try:
+                c.sendall(
+                    b"GET https://api.anthropic.com/v1/environments/env_1/work/poll"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while len(seen) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 2, (
+                f"the swap was not taken back — {len(seen)} attempt(s), so a "
+                "401 reached the client and Remote Control ended")
+            assert b"Bearer PINTOKEN" in seen[0], "the first try was not swapped"
+            assert b"Bearer ACTIVE" in seen[1], (
+                "the retry did not restore the bearer the client sent")
+            assert got.startswith(b"HTTP/1.1 200"), (
+                f"the client got {got.split(b'0d0a')[0][:40]!r}, not the "
+                "answer the take-back earned")
+        finally:
+            if proxy:
+                proxy.stop()
+            try:
+                srv.close()
+            except OSError:
+                pass
+
     def case_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
         """Where the second hop comes from: the inner proxy reports its own
         upstream while it is alive, and a launch records both. Probed rather
