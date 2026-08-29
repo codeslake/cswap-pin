@@ -2719,8 +2719,45 @@ class TestARenameIsRespectedWhereverItWasMade:
         they made it."""
         from cswap_pin.proxy import titles_to_restore
 
-        assert titles_to_restore(self._sessions("lmd42-dotfiles"), self.NAMES,
-                                 {"b1": "dotfiles-80"}) == []
+        assert titles_to_restore(self._sessions("a-name-a-person-typed"),
+                                 self.NAMES, {"b1": "dotfiles-80"}) == []
+
+    def case_the_cap_evicts_by_WRITE_order_not_by_INSERT_order(self, tmp_path):
+        """The entry we wrote most recently must not be the one the cap drops.
+
+        Re-assigning an existing key does not move it in a dict, so `[-500:]`
+        evicted the oldest INSERT no matter when it was last written. A
+        forgotten entry reads as a title we never wrote, which is the restore
+        overwriting somebody's rename again — the fault this ledger exists to
+        stop, returning at the cap.
+        """
+        from cswap_pin.proxy import _record_title, _titles_we_wrote
+
+        _record_title(tmp_path, "b0", "first")
+        for i in range(1, 500):
+            _record_title(tmp_path, f"b{i}", f"n{i}")
+        _record_title(tmp_path, "b0", "newest-but-one")
+        _record_title(tmp_path, "b500", "newest")
+        led = _titles_we_wrote(tmp_path)
+        assert len(led) == 500, led
+        assert led.get("b0") == "newest-but-one", (
+            "the second-most-recently-written entry was evicted while entries "
+            "500 writes older survived")
+
+    def case_a_bridge_we_have_named_is_never_restored_twice(self):
+        """THE CEILING, stated so it is a decision and not a surprise.
+
+        Once this pin has written a title, any later drift is attributed to a
+        person and left alone — including a drift the SERVER caused. The two
+        are indistinguishable: the server records no timestamp for a title, so
+        an AI-written name and a `/rename` arrive identically. Reverting a
+        person's rename is the worse of the two errors, so the restore is a
+        one-shot per bridge by design.
+        """
+        from cswap_pin.proxy import titles_to_restore
+
+        assert titles_to_restore(self._sessions("host-a-curious-torvalds"),
+                                 self.NAMES, {"b1": "dotfiles-80"}) == []
 
     def case_the_ledger_is_consulted_by_the_restore_that_uses_it(self):
         """A reader nothing calls is a fix that passes its own test and changes

@@ -2917,6 +2917,68 @@ class TestChainRediscovery:
                 proxy.stop()
             chain.stop()
 
+    def case_the_environment_create_waits_for_the_pin_on_this_path(
+        self, certdir
+    ):
+        """`should_wait_for_pin` gained `/v1/environments/bridge` — and its one
+        caller is the MITM, which this create never reaches.
+
+        That is the same gap as the route table's: a rule added for
+        `claude remote-control` on the path `claude remote-control` does not
+        use. The bargain it encodes is the whole reason the rule exists — a
+        `consume-busy` instant costs the environment PERMANENTLY, because the
+        server fixes the owner at registration and offers no transfer — so an
+        unreachable retry is a permanent loss with a guard in front of it.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        # The `consume-busy` race exactly: the first ask finds the slot's
+        # refresh lock held for an instant, the next one does not.
+        asks = []
+
+        def provider():
+            asks.append(1)
+            return None if len(asks) == 1 else "PINTOKEN"
+
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                c.settimeout(10)
+                try:
+                    c.recv(256)
+                except OSError:
+                    pass
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while not chain.seen and time.time() < deadline:
+                time.sleep(0.05)
+            assert chain.seen, "the request never reached the chain"
+            assert b"Bearer PINTOKEN" in chain.seen[0], (
+                "the environment was registered on the ACTIVE account because "
+                "the pin token was asked for once and the answer was a "
+                "momentary None — permanently, the server offers no transfer")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
     def case_a_refused_swap_is_taken_back_on_the_absolute_form_path(
         self, certdir
     ):
@@ -3316,6 +3378,43 @@ class TestAbsoluteFormPassthrough:
         finally:
             proxy.stop()
             srv.close()
+
+    def case_an_unauthorized_caller_is_refused_before_its_body_is_read(
+        self, certdir
+    ):
+        """The credential gate must not wait on bytes the client may never send.
+
+        `_read_body` trusts the client's `Content-Length` and loops until it
+        has that many bytes. Reading it AHEAD of the gate lets an
+        unauthenticated caller hold a thread and an unbounded buffer by
+        announcing a body and sending none — no credential required, which is
+        the one thing this gate exists to require.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret
+
+        ensure_proxy_secret(certdir)  # arm the gate; without it the proxy is open
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/messages HTTP/1.1\r\n"
+                    b"Host: api.anthropic.com\r\n"
+                    b"Content-Length: 100000000\r\n\r\n" + b"x" * 10)
+                c.settimeout(5)
+                try:
+                    got = c.recv(200)
+                except (socket.timeout, TimeoutError, OSError):
+                    got = b""
+            finally:
+                c.close()
+            assert got.startswith(b"HTTP/1.1 407"), (
+                f"got {got[:40]!r}: the credential check waited on a body the "
+                "client never sent, so an unauthenticated caller can hold a "
+                "thread and an unbounded buffer")
+        finally:
+            proxy.stop()
 
 
 class TestHealthEndpoint:

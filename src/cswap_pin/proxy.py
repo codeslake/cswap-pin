@@ -2658,10 +2658,10 @@ _EVENT_STREAM = re.compile(r"/worker/events/stream")
 # to. Same shape as the routes above, captured rather than merely matched.
 _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 
-# `claude remote-control` DOES NOT USE `/v1/code/sessions/<id>/bridge` AT ALL.
-# It registers an ENVIRONMENT, and every route in that lifecycle lives under a
-# subtree nothing here matched, so the whole feature resolved to the active
-# account while the pin reported itself healthy:
+# REMOTE CONTROL HAS TWO FRONT DOORS. The REPL's `/remote-control` mints
+# `/v1/code/sessions/<id>/bridge`, which the table below has always pinned;
+# `claude remote-control` registers an ENVIRONMENT instead, and nothing here
+# matched that subtree at all:
 #
 #     POST   /v1/environments/bridge                      -> environment_id
 #     DELETE /v1/environments/bridge/<env>
@@ -2669,25 +2669,15 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 #     GET    /v1/environments/<env>/work/poll
 #     POST   /v1/environments/<env>/work/<id>/ack|stop|heartbeat
 #
-# All five carry `Authorization: Bearer <getAccessToken()>` from one header
-# builder, so they are OAuth ownership routes exactly like `/bridge` is, and
-# the registration is a CREATE the server cannot transfer afterwards.
+# The lifecycle calls carry `Authorization: Bearer <getAccessToken()>` from one
+# header builder, so they are OAuth ownership routes exactly like `/bridge`,
+# and the registration is a CREATE the server cannot transfer afterwards. The
+# `work/` calls do NOT — see below.
 #
-# The REPL's `/remote-control` is a different code path and was never broken —
-# it mints `/v1/code/sessions/<id>/bridge`, which the table below has always
-# pinned. That is why one worked from the pinned account's claude.ai and the
-# other was invisible there, and why searching the trace for the SELF-HOSTED
-# RUNNER routes found nothing: those belong to `claude self-hosted-runner`,
-# authenticate with a pool secret rather than a bearer, and are not this
-# feature. 0 of 19,211 traced requests, a true measurement of the wrong
-# subject.
-#
-# `?beta=true` IS THE DISCRIMINATOR AND IT IS LOAD-BEARING. A second product
-# shares this subtree: the managed-agents SDK spells every one of its
-# environment calls with that flag (`/v1/environments?beta=true`,
-# `/v1/environments/<id>/work/poll?beta=true`, `.../heartbeat?beta=true`) and
-# authenticates as an API client, not as this login. Swapping a credential we
-# have not looked at is the `/worker` mistake, so the surface stays out.
+# `?beta=true` IS THE DISCRIMINATOR AND IT IS LOAD-BEARING. The managed-agents
+# SDK shares this subtree, spells every one of its environment calls with that
+# flag, and authenticates as an API client rather than as this login. Swapping
+# a credential we have not looked at is the `/worker` mistake, so it stays out.
 _ENV_BRIDGE = re.compile(
     r"^/v1/environments"
     # THE COLLECTION IS A READ, and it belongs here for the reason
@@ -2699,22 +2689,11 @@ _ENV_BRIDGE = re.compile(
     r"|[^/?]+/bridge/reconnect(?:/|$|\?)))"
 )
 
-# THE `work/` SUBTREE IS EXCLUDED FOR THE REASON `/worker` IS: it does not
-# carry the account's OAuth bearer. In the bridge client every OAuth call goes
-# through one wrapper that reads `getAccessToken()` -- register, deregister,
-# `bridge/reconnect`, archive -- while `pollForWork`, `acknowledgeWork`,
-# `stopWork` and `heartbeatWork` each take a token as an ARGUMENT and send
-# whatever the caller hands them.
-#
-# Measured on the wire, against an environment THIS PIN REGISTERED: the
-# register answered fine swapped, and the very next `work/poll` on the same
-# environment answered 401 swapped and 200 with the bearer it arrived with.
-# Ownership is still the pin's, because the register is; the work queue simply
-# is not an ownership route.
-#
-# Kept as its own name rather than merely left out of the pattern above, so
-# the next reader sees a decision instead of an omission.
-_ENV_WORK = re.compile(r"^/v1/environments/[^/?]+/work(?:/|$|\?)")
+# `/v1/environments/<env>/work/*` IS ABSENT ON PURPOSE, for the reason
+# `/worker` is: `pollForWork`, `acknowledgeWork`, `stopWork` and
+# `heartbeatWork` each take a token as an ARGUMENT and send whatever the caller
+# hands them, so a swap turns a 200 into a 401. Ownership is still the pin's,
+# because the register is; the work queue is not an ownership route.
 _ENV_SDK_BETA = re.compile(r"[?&]beta=true(?:&|$)")
 
 
@@ -4296,6 +4275,11 @@ def _record_title(certdir, sid: str, title: str) -> None:
         return
     try:
         d = _titles_we_wrote(certdir)
+        # RE-INSERTED, NOT REASSIGNED, so the cap below evicts by WRITE order.
+        # A plain `d[sid] = title` leaves an existing key where it was, and
+        # `[-500:]` would then drop the entry we just wrote in favour of one
+        # untouched for five hundred writes.
+        d.pop(sid, None)
         d[sid] = title
         # BOUNDED. One entry per bridge this machine has ever named would grow
         # without limit; the restore only ever asks about LIVE ones.
@@ -4347,22 +4331,19 @@ def titles_to_restore(
         # in any local record" plus a slug guard, and the slug guard was
         # protecting a case the registry makes impossible.
         #
-        # A THIRD CASE ARRIVED, and it is the one the narrowing was for: a
-        # title typed into claude.ai's `/rename`, reverted here within minutes.
-        # The guard that is possible is not a shape test — those claimed names
-        # people had chosen — it is a LEDGER. A title we PUT ourselves is ours
-        # to overwrite; a title that has moved AWAY from what we last wrote was
-        # set by somebody else, and a rename belongs to whoever made it last
-        # wherever they made it.
+        # A FOURTH RULE, AND IT IS A LEDGER RATHER THAN A SHAPE TEST: a title
+        # we PUT is ours to overwrite, and one that has moved AWAY from what we
+        # last wrote was set by somebody else. The server cannot settle it —
+        # its record carries no timestamp for a title — so this side's record
+        # is the only half of the question anyone has. UNKNOWN MEANS RESTORE:
+        # a bridge we have never named is the population the feature exists
+        # for, and refusing it there would disarm the whole thing.
         #
-        # The server offers nothing better: its record carries no timestamp for
-        # the title, so "who wrote it last" cannot be asked of it. The ledger
-        # is this side's half of that question.
-        #
-        # UNKNOWN MEANS RESTORE. A bridge we have never named is the first-pass
-        # case the whole feature exists for -- the reconnect that left a slug
-        # behind -- and refusing it there would disarm the restore for exactly
-        # the population it was written to fix.
+        # ponytail: one-shot per bridge. A drift the SERVER caused after our
+        # write reads identically to a person's rename, and reverting a person
+        # is the worse of the two errors. Upgrade path, if the slug ever comes
+        # back on a named bridge: drop its entry when this proxy sees that
+        # bridge's own reconnect go by.
         if ours is not None and sid in ours and current != (ours[sid] or "").strip():
             continue
         out.append((sid, want.strip()))
@@ -12986,19 +12967,15 @@ class PinProxy:
             if parts[0] == "CONNECT":
                 target = parts[1] if len(parts) > 1 else ""  # host:port
                 if not target.strip():
-                    # An empty target makes `_blind_tunnel` dial host "" — every
-                    # chain hop refuses the empty authority and the request ends
-                    # on a direct dial that never sees a bearer. Indistinguishable
-                    # from a healthy tunnel until now, which is how a whole
-                    # feature can route around the pin while the route table
-                    # reads correct. Logged, not refused: these connections
-                    # already fail, and a 400 is a different failure than the one
-                    # the client gets today.
-                    # THE SHAPE, NOT THE LINE. This branch runs before any
-                    # credential check, and the remainder of a CONNECT line is
-                    # whatever the client wrote — a proxy URL with userinfo in
-                    # it, say. The length and the token count say what went
-                    # wrong without copying it into a file.
+                    # An empty authority makes `_blind_tunnel` dial host "":
+                    # every hop refuses it and the request ends on a direct
+                    # dial that never sees a bearer, while looking exactly
+                    # like a healthy tunnel. Logged, not refused — these
+                    # connections already fail, and a 400 is a different
+                    # failure than the one the client gets today.
+                    # THE SHAPE, NOT THE LINE: this runs before any credential
+                    # check and the rest of a CONNECT line is whatever the
+                    # client wrote, userinfo included.
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
@@ -13050,8 +13027,11 @@ class PinProxy:
             if len(parts) >= 2 and "://" in parts[1]:
                 # Absolute-form request (plain-proxy mode, no CONNECT). The
                 # native auto-updater and telemetry use axios this way; dropping
-                # them is what pins the "Auto-update failed" banner. Relay
-                # verbatim through the chain — no MITM, no swap.
+                # them is what pins the "Auto-update failed" banner. NOT
+                # verbatim: `claude remote-control`'s bridge client speaks this
+                # form too, so `_plain_relay` takes the same swap decision the
+                # MITM does. "No MITM, no swap" stood on this line for six
+                # releases and is why the route table alone fixed nothing.
                 self._plain_relay(line, conn)
                 return
             conn.close()
@@ -13080,6 +13060,43 @@ class PinProxy:
         respawn. Hence: minted by ``apply_pin``, enforced from that instant.
         """
         return read_proxy_secret(self._certdir) or None
+
+    def _wait_for_pin_token(self, method: str, path: str, token):
+        """`token`, retried briefly where a miss costs something PERMANENT.
+
+        ONE REQUEST IS WORTH A RETRY, and only one. Everywhere else a missing
+        token costs a single request billed elsewhere; on a create it gives the
+        asset away for good, because the server fixes the owner there and
+        offers no transfer. The usual cause is `consume-busy` — the usage
+        collector holding the slot's refresh lock for an instant — so a short
+        retry converts a permanent loss into a wait nobody notices. Bounded,
+        and the request still goes untokened afterwards: a launch that hangs is
+        worse than this fault.
+
+        ONE PLACE, BECAUSE THE TWO CREATES ARRIVE ON DIFFERENT PATHS.
+        `POST /v1/code/sessions` comes through the MITM; `claude
+        remote-control`'s `POST /v1/environments/bridge` only ever arrives in
+        absolute form. A wait wired to one of them is absent from the other,
+        which is the same gap the route table had.
+
+        Takes the token rather than fetching it: the MITM may already hold one
+        from the sweep, and that provider re-reads the credential from disk and
+        takes a cross-process lock on every call.
+        """
+        if token or not should_wait_for_pin(method, path) \
+                or _pin_is_noop(self._pin_token_provider):
+            return token
+        for _ in range(_PIN_WAIT_TRIES):
+            time.sleep(_PIN_WAIT_S)
+            token = self._pin_token_provider()
+            if token:
+                return token
+        _log_lifecycle(
+            "a bridge was created without the pin: the token could not be "
+            "minted in time, so this session belongs to the active account "
+            "permanently and cannot be transferred"
+        )
+        return None
 
     def _refuse_unauthorized(self, conn: socket.socket) -> None:
         """407 a CONNECT that did not present the proxy credential.
@@ -13302,12 +13319,30 @@ class PinProxy:
                 if k.strip().lower() == "proxy-authorization":
                     continue
             headers.append(h)
-        # THE BODY IS OURS TO CARRY, not `_pump`'s. This relied on the pump to
-        # stream it, which cannot work once anything reads the RESPONSE first:
-        # the origin waits for Content-Length bytes nobody sent while we wait
-        # for a status line, and both block forever. `_read_body`'s own
-        # docstring says the retry path requires a materialized body, because
-        # a streamed one cannot be replayed.
+        # STILL A HARD GATE here, unlike CONNECT. This path is plain-HTTP
+        # forwarding to an arbitrary host: there is no bearer to withhold, so
+        # "serve it unpinned" is not a weaker option — it just makes us an open
+        # forward proxy. The CONNECT path could soften because refusing there
+        # bought nothing the swap decision does not already buy.
+        #
+        # Claude Code DOES reach here: its Remote Control bridge client speaks
+        # absolute form, so `claude remote-control` registers its environment
+        # on this path. The refusal cannot cut those off — they carry our
+        # credential — and the swap below exists because they arrive here.
+        #
+        # AND IT COMES BEFORE THE BODY. `_read_body` loops until the client's
+        # own Content-Length is satisfied, so reading first lets an
+        # unauthenticated caller hold a thread and an unbounded buffer by
+        # announcing a body and sending none.
+        if not _proxy_authorized(parsed, self._current_secret(),
+                                 certdir=self._certdir):
+            self._refuse_unauthorized(conn)
+            return
+        # THE BODY IS OURS TO CARRY, not `_pump`'s: anything that reads the
+        # RESPONSE first deadlocks otherwise — the origin waits for
+        # Content-Length bytes nobody sent while we wait for a status line.
+        # The take-back needs it materialized anyway; a streamed body cannot
+        # be replayed.
         body = _read_body(conn, parsed)
         # `_read_body` DECODES a chunked body, so the framing has to be
         # re-declared or the upstream reads a bodyless request — same
@@ -13318,22 +13353,6 @@ class PinProxy:
                        if h.split(":", 1)[0].strip().lower()
                        not in ("transfer-encoding", "content-length")]
             headers.append(f"Content-Length: {len(body)}")
-        # STILL A HARD GATE here, unlike CONNECT. This path is plain-HTTP
-        # forwarding to an arbitrary host: there is no bearer to withhold, so
-        # "serve it unpinned" is not a weaker option — it just makes us an open
-        # forward proxy. The CONNECT path could soften because refusing there
-        # bought nothing the swap decision does not already buy.
-        #
-        # "Nothing Claude Code does reaches here (it CONNECTs)" was written on
-        # this line and is false: the Remote Control bridge client uses the
-        # proxy in absolute form, so `claude remote-control` registers its
-        # environment THROUGH HERE. The refusal still cannot cut those off --
-        # they carry our credential like every other session -- but the swap
-        # below exists because they arrive on this path and not the other.
-        if not _proxy_authorized(parsed, self._current_secret(),
-                                 certdir=self._certdir):
-            self._refuse_unauthorized(conn)
-            return
         split = urlsplit(url)
         # The scheme decides the port. Defaulting every scheme to 80 pointed
         # every https:// target at the wrong port, so those requests (the
@@ -13341,28 +13360,23 @@ class PinProxy:
         secure = split.scheme == "https"
         host, port = split.hostname, split.port or (443 if secure else 80)
         # THE SAME OWNERSHIP DECISION THE MITM MAKES, because the same routes
-        # arrive here. An absolute-form request is not a weaker request: it
-        # carries the identical bearer and the server fixes the identical
-        # ownership from it. Claude Code's Remote Control bridge client speaks
-        # this way -- `POST https://api.anthropic.com/v1/environments/bridge`
-        # with the OAuth bearer in the clear -- so leaving this path unswapped
-        # gave `claude remote-control` to the active account no matter what the
-        # route table said.
+        # arrive here: an absolute-form request carries the identical bearer
+        # and the server fixes the identical ownership from it.
         #
         # Guarded on the ORIGIN. This path forwards to an arbitrary host, and a
-        # bearer belongs to the host it was minted for; rewriting one on the way
-        # to somebody else's server would hand out the pinned account's token.
+        # bearer belongs to the host it was minted for; rewriting one on the
+        # way to somebody else's server would hand out the pinned token.
         unswapped = None      # set only when a swap actually happened
         rel = (split.path or "/") + (f"?{split.query}" if split.query else "")
-        # `and secure` IS THE HALF THAT KEEPS THE TOKEN OFF THE WIRE. The guard
-        # asks WHO, and on its own it says nothing about HOW: an `http://`
-        # absolute-form request to the same host passes it, and the direct dial
-        # then writes the pinned bearer onto a bare TCP socket. The MITM path
-        # cannot do this — it always wraps the upstream — so the exposure would
-        # be new and this path's alone.
+        # `and secure` IS THE HALF THAT KEEPS THE TOKEN OFF THE WIRE. The host
+        # guard asks WHO and says nothing about HOW, so an `http://` request to
+        # the same host passes it and the direct dial then writes the pinned
+        # bearer onto a bare TCP socket. The MITM path always wraps its
+        # upstream, so the exposure would be this path's alone.
         if host == UPSTREAM_HOST and secure:
             if is_pinned_route(rel):
-                token = self._pin_token_provider()
+                token = self._wait_for_pin_token(
+                    method, rel, self._pin_token_provider())
                 if token and any(h.split(":", 1)[0].strip().lower()
                                  == "authorization" for h in headers):
                     # ARMED ONLY WHEN THE SWAP HAPPENED. With no token nothing
@@ -13382,11 +13396,8 @@ class PinProxy:
                               else h)
                         for h in headers
                     ]
-                # TRACED LIKE THE MITM PATH, because being untraced is half of
-                # what this cost. The MITM writes `pinned=.. swapped=..` for
-                # every request; this branch wrote nothing at all, so a feature
-                # travelling here left the same evidence as a feature that was
-                # not running.
+                # TRACED LIKE THE MITM PATH. Untraced, a feature travelling
+                # here leaves the same evidence as one that never ran.
                 self._tunnel_trace(
                     f"{method} {rel} pinned=True swapped={bool(token)} "
                     "(absolute-form)")
@@ -13432,13 +13443,11 @@ class PinProxy:
             return sock, (f"{method} {rel_path} HTTP/1.1\r\n"
                           + "\r\n".join(hdrs) + "\r\n\r\n")
 
-        # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, which the MITM path has
-        # always done and this one did not. An environment registered before
-        # the pin knew this route belongs to the account that registered it,
-        # so asking as the pin gets 401 and Remote Control dies -- a running
-        # session killed by an upgrade, which no deploy is allowed to do.
-        # Nothing has reached the client yet, so the request can still go
-        # again with the bearer it arrived with.
+        # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path already
+        # does. An environment registered before the pin knew this route
+        # belongs to whoever registered it, so asking as the pin gets 401 and a
+        # live Remote Control dies. Nothing has reached the client yet, so the
+        # request can still go again with the bearer it arrived with.
         for hdrs, retry in ((headers, unswapped is not None),
                             (unswapped, False)):
             if hdrs is None:
@@ -13599,27 +13608,7 @@ class PinProxy:
         original_headers = list(headers)
         if pinned:
             token = _tok if _tok_fetched else self._pin_token_provider()
-            # ONE REQUEST IS WORTH A RETRY, and only one. Everywhere else a
-            # missing token costs a single request billed elsewhere; here it
-            # gives the session away permanently, because the server fixes the
-            # owner at creation and offers no transfer. The usual cause is
-            # `consume-busy` — the usage collector holding the slot's refresh
-            # lock for an instant — so a short retry converts a permanent loss
-            # into a wait nobody notices. Bounded, and it still goes without a
-            # token afterwards: a launch that hangs is worse than this fault.
-            if not token and should_wait_for_pin(method, path) \
-                    and not _pin_is_noop(self._pin_token_provider):
-                for _ in range(_PIN_WAIT_TRIES):
-                    time.sleep(_PIN_WAIT_S)
-                    token = self._pin_token_provider()
-                    if token:
-                        break
-                if not token:
-                    _log_lifecycle(
-                        "a bridge was created without the pin: the token could "
-                        "not be minted in time, so this session belongs to the "
-                        "active account permanently and cannot be transferred"
-                    )
+            token = self._wait_for_pin_token(method, path, token)
             if token:
                 headers = [
                     (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
