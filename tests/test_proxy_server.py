@@ -2971,6 +2971,193 @@ class TestChainRediscovery:
             except OSError:
                 pass
 
+    def case_a_swapped_request_with_a_BODY_still_completes(self, certdir):
+        """The registration this whole feature exists to pin carries a body.
+
+        `_plain_relay` left the body to `_pump`, which runs AFTER the response
+        is read — so once a take-back peeked at the status line first, the
+        origin waited for Content-Length bytes nobody had sent while the proxy
+        waited for a status line. Both blocked forever, one thread and two
+        sockets per request. Observed on the fleet as a drain CUT: one request
+        in flight, before headers, 90s content-free.
+
+        The bodyless cases next door pass either way, which is exactly why
+        this one exists.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        seen: list[bytes] = []
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        chain_port = srv.getsockname()[1]
+
+        def chain():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    # AN ORIGIN THAT WAITS FOR THE BODY, which is the whole
+                    # point: one that answers on the headers alone cannot show
+                    # the deadlock, and the first version of this harness did
+                    # exactly that.
+                    buf = b""
+                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                        d = c.recv(1)
+                        if not d:
+                            break
+                        buf += d
+                    want = 0
+                    for ln in buf.split(b"\r\n"):
+                        if ln.lower().startswith(b"content-length:"):
+                            want = int(ln.split(b":", 1)[1])
+                    body = b""
+                    while len(body) < want:
+                        d = c.recv(want - len(body))
+                        if not d:
+                            break
+                        body += d
+                    seen.append(buf + body)
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                finally:
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+
+        threading.Thread(target=chain, daemon=True).start()
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            payload = b'{"machine_name":"m","max_sessions":32}'
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            got = b""
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\n"
+                    + f"Content-Length: {len(payload)}\r\n".encode()
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                    + payload)
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+            finally:
+                c.close()
+
+            assert got.startswith(b"HTTP/1.1 200"), (
+                f"the registration never completed — got {got[:40]!r}. The "
+                "body was never forwarded, so the origin and the proxy each "
+                "waited for the other")
+            assert len(seen) == 1 and payload in seen[0], (
+                "the origin received the request without its body, so the "
+                "registration would be rejected or wrong")
+            assert b"Bearer PINTOKEN" in seen[0], "and it must still be swapped"
+        finally:
+            if proxy:
+                proxy.stop()
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    def case_a_cleartext_absolute_form_request_is_NEVER_swapped(self, certdir):
+        """A bearer belongs on a wire that hides it.
+
+        The host guard asks WHO and says nothing about HOW, so `http://` to the
+        same host passed it and the direct dial would have written the pinned
+        token onto a bare TCP socket. The MITM path cannot do this — it always
+        wraps the upstream — so the exposure would have been this path's alone.
+        """
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        seen: list[bytes] = []
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        chain_port = srv.getsockname()[1]
+
+        def chain():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                        d = c.recv(1)
+                        if not d:
+                            break
+                        buf += d
+                    seen.append(buf)
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                finally:
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+
+        threading.Thread(target=chain, daemon=True).start()
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain_port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"POST http://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                c.settimeout(10)
+                try:
+                    c.recv(256)
+                except OSError:
+                    pass
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while not seen and time.time() < deadline:
+                time.sleep(0.05)
+            assert seen, "the request never reached the chain"
+            assert b"Bearer PINTOKEN" not in seen[0], (
+                "the pinned account's token was written to a cleartext socket")
+            assert b"Bearer ACTIVE" in seen[0], (
+                "the request must still go, unchanged — this is a refusal to "
+                "SWAP, not a refusal to serve")
+        finally:
+            if proxy:
+                proxy.stop()
+            try:
+                srv.close()
+            except OSError:
+                pass
+
     def case_the_next_hop_is_probed_from_the_cache_proxys_health(self, certdir):
         """Where the second hop comes from: the inner proxy reports its own
         upstream while it is alive, and a launch records both. Probed rather

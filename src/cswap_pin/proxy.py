@@ -2689,9 +2689,14 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 # authenticates as an API client, not as this login. Swapping a credential we
 # have not looked at is the `/worker` mistake, so the surface stays out.
 _ENV_BRIDGE = re.compile(
-    r"^/v1/environments/"
-    r"(?:bridge(?:/|$|\?)"
-    r"|[^/?]+/(?:bridge/reconnect(?:/|$|\?)|work(?:/|$|\?)))"
+    r"^/v1/environments"
+    # THE COLLECTION IS A READ, and it belongs here for the reason
+    # `/v1/sessions` does: asked as the active account it answers 200 with the
+    # wrong account's environments, so the pinned machines are simply absent
+    # and nothing looks broken. Listing creates nothing and mints nothing.
+    r"(?:$|\?"
+    r"|/(?:bridge(?:/|$|\?)"
+    r"|[^/?]+/(?:bridge/reconnect(?:/|$|\?)|work(?:/|$|\?))))"
 )
 _ENV_SDK_BETA = re.compile(r"[?&]beta=true(?:&|$)")
 
@@ -12919,8 +12924,14 @@ class PinProxy:
                     # reads correct. Logged, not refused: these connections
                     # already fail, and a 400 is a different failure than the one
                     # the client gets today.
+                    # THE SHAPE, NOT THE LINE. This branch runs before any
+                    # credential check, and the remainder of a CONNECT line is
+                    # whatever the client wrote — a proxy URL with userinfo in
+                    # it, say. The length and the token count say what went
+                    # wrong without copying it into a file.
                     self._tunnel_trace(
-                        f"CONNECT with an unreadable authority: {line[:120]!r}")
+                        "CONNECT with an unreadable authority: "
+                        f"{len(parts)} token(s), {len(line)} bytes")
                 # Keep the CONNECT headers rather than draining them: the
                 # proxy credential arrives here and nowhere else.
                 connect_headers: list[tuple[str, str]] = []
@@ -13221,6 +13232,22 @@ class PinProxy:
                 if k.strip().lower() == "proxy-authorization":
                     continue
             headers.append(h)
+        # THE BODY IS OURS TO CARRY, not `_pump`'s. This relied on the pump to
+        # stream it, which cannot work once anything reads the RESPONSE first:
+        # the origin waits for Content-Length bytes nobody sent while we wait
+        # for a status line, and both block forever. `_read_body`'s own
+        # docstring says the retry path requires a materialized body, because
+        # a streamed one cannot be replayed.
+        body = _read_body(conn, parsed)
+        # `_read_body` DECODES a chunked body, so the framing has to be
+        # re-declared or the upstream reads a bodyless request — same
+        # correction `_mitm` makes.
+        if any(k.lower() == "transfer-encoding" and "chunked" in v.lower()
+               for k, v in parsed):
+            headers = [h for h in headers
+                       if h.split(":", 1)[0].strip().lower()
+                       not in ("transfer-encoding", "content-length")]
+            headers.append(f"Content-Length: {len(body)}")
         # STILL A HARD GATE here, unlike CONNECT. This path is plain-HTTP
         # forwarding to an arbitrary host: there is no bearer to withhold, so
         # "serve it unpinned" is not a weaker option — it just makes us an open
@@ -13257,18 +13284,32 @@ class PinProxy:
         # to somebody else's server would hand out the pinned account's token.
         unswapped = None      # set only when a swap actually happened
         rel = (split.path or "/") + (f"?{split.query}" if split.query else "")
-        if host == UPSTREAM_HOST:
+        # `and secure` IS THE HALF THAT KEEPS THE TOKEN OFF THE WIRE. The guard
+        # asks WHO, and on its own it says nothing about HOW: an `http://`
+        # absolute-form request to the same host passes it, and the direct dial
+        # then writes the pinned bearer onto a bare TCP socket. The MITM path
+        # cannot do this — it always wraps the upstream — so the exposure would
+        # be new and this path's alone.
+        if host == UPSTREAM_HOST and secure:
             if is_pinned_route(rel):
                 token = self._pin_token_provider()
-                if token:
+                if token and any(h.split(":", 1)[0].strip().lower()
+                                 == "authorization" for h in headers):
                     # ARMED ONLY WHEN THE SWAP HAPPENED. With no token nothing
                     # changed, so a second attempt would replay an identical
                     # request and double every failure.
                     unswapped = list(headers)
+                    # AND `Host:` MUST AGREE WITH THE HOST WE GUARDED ON. The
+                    # direct branch rewrites the line to origin form, where
+                    # `Host` is the authority — so a request whose URL says
+                    # upstream and whose header says somewhere else would be
+                    # swapped on the URL and routed on the header.
                     headers = [
                         f"Authorization: Bearer {token}"
                         if h.split(":", 1)[0].strip().lower() == "authorization"
-                        else h
+                        else (f"Host: {UPSTREAM_HOST}"
+                              if h.split(":", 1)[0].strip().lower() == "host"
+                              else h)
                         for h in headers
                     ]
                 # TRACED LIKE THE MITM PATH, because being untraced is half of
@@ -13342,16 +13383,16 @@ class PinProxy:
                 # is merely quiet — an SSE gap or a slow origin — rather than
                 # dead.
                 up.settimeout(None)
-                up.sendall(head.encode("latin1"))
+                up.sendall(head.encode("latin1") + body)
                 if retry:
-                    peeked = _peek_status(up)
-                    if peeked is not None and peeked[0] in (401, 403, 404):
+                    code, seen = _peek_status(up)
+                    if code in (401, 403, 404):
                         self._tunnel_trace(
-                            f"{method} {rel} swap refused ({peeked[0]}) — "
+                            f"{method} {rel} swap refused ({code}) — "
                             "retrying as it arrived (absolute-form)")
                         continue
-                    if peeked is not None:
-                        conn.sendall(peeked[1])
+                    if seen:
+                        conn.sendall(seen)
                 _pump(conn, up)
                 return
             finally:
@@ -14504,26 +14545,41 @@ def _read_chunked_body(sock) -> bytes:
         _read_line(sock)  # the CRLF terminating this chunk
 
 
-def _peek_status(up) -> "tuple[int, bytes] | None":
-    """`(code, the bytes read)` for the response head, or None if unreadable.
+def _peek_status(up) -> "tuple[int | None, bytes]":
+    """`(status code or None, the bytes read)` for the head of a response.
 
     Read so a refused swap can be taken back before anything reaches the
-    client. The bytes are returned rather than discarded because the caller
-    must forward them itself when it keeps the answer -- they are already off
-    the socket and `_pump` will never see them again.
+    client. THE BYTES COME BACK EVEN WHEN THE CODE DOES NOT: they are already
+    off the socket and `_pump` will never see them again, so discarding them
+    on an unparsable status line truncates the response instead of relaying
+    something we merely could not classify.
     """
     buf = bytearray()
     while b"\r\n" not in buf and len(buf) < 8192:
         try:
-            chunk = up.recv(1)
+            chunk = up.recv(4096)
         except (OSError, ssl.SSLError):
-            return None
+            return None, bytes(buf)
         if not chunk:
             break
         buf += chunk
+    # DRAIN THE TLS BUFFER BEFORE HANDING BACK. `_pump` selects on the SOCKET,
+    # and one TLS record can decrypt to more than the read above consumed — so
+    # bytes already decrypted and waiting are invisible to its selector and the
+    # response stalls until the client's own timeout. Its docstring says so;
+    # a byte-at-a-time read here reproduced it exactly.
+    pending = getattr(up, "pending", None)
+    while pending and pending():
+        try:
+            more = up.recv(65536)
+        except (OSError, ssl.SSLError):
+            break
+        if not more:
+            break
+        buf += more
     line = bytes(buf).split(b"\r\n", 1)[0].split(b" ")
     if len(line) < 2 or not line[1].isdigit():
-        return None
+        return None, bytes(buf)
     return int(line[1]), bytes(buf)
 
 

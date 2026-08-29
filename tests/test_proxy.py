@@ -2524,6 +2524,15 @@ class TestIsPinnedRoute:
             # `Authorization: Bearer <getAccessToken()>`, so every one is an
             # OAuth ownership route and the registration is a create the
             # server will not transfer afterwards.
+            # THE COLLECTION IS A READ, same row `/v1/sessions` earns: asked
+            # as the active account it answers 200 with the wrong account's
+            # environments, so every pinned machine is simply absent and
+            # nothing looks broken.
+            ("/v1/environments", True,
+             "the listing is how a machine is found; unpinned it lists the "
+             "active account's environments and the pinned ones vanish"),
+            ("/v1/environments?limit=100", True,
+             "the paginated form is the same read"),
             ("/v1/environments/bridge", True,
              "POST here is where the environment's owner is fixed; unswapped, "
              "the machine never appears on the pinned account's claude.ai"),
@@ -2555,6 +2564,72 @@ class TestIsPinnedRoute:
              "a different collection entirely"),
         ):
             assert is_pinned_route(path) is pinned, f"{path}: {why}"
+
+class TestPeekStatusHandsBackEveryByteItTook:
+    """`_peek_status` reads off the upstream so a refused swap can be taken
+    back. Whatever it consumed is gone from the socket, so the caller has to
+    receive it — and on a TLS socket "consumed" is larger than "returned by
+    recv": one record decrypts whole into the SSL buffer, which `_pump`
+    selects past because a selector watches the SOCKET. Its own docstring says
+    so. A byte-at-a-time read here reproduced exactly that stall: the register
+    left swapped, the answer never reached the client, and the bridge client
+    ended on its own 15s timeout with nothing in any log.
+    """
+
+    class Sock:
+        """A socket whose `pending()` holds bytes a plain `recv` will not
+        return — the shape of an `ssl.SSLSocket` mid-record."""
+
+        def __init__(self, first, buffered=b""):
+            self.first, self.buffered, self.reads = first, buffered, 0
+
+        def recv(self, n):
+            self.reads += 1
+            if self.first:
+                out, self.first = self.first[:n], self.first[n:]
+                return out
+            out, self.buffered = self.buffered[:n], self.buffered[n:]
+            return out
+
+        def pending(self):
+            return len(self.buffered)
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_the_tls_buffer_is_drained(self):
+        from cswap_pin.proxy import _peek_status
+
+        s = self.Sock(b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n\r\nhi")
+        code, seen = _peek_status(s)
+        assert code == 200
+        assert seen == b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi", (
+            "bytes already decrypted were left where `_pump` cannot see them")
+
+    def case_an_unparsable_status_still_returns_its_bytes(self):
+        """Otherwise a response we merely could not CLASSIFY is truncated."""
+        from cswap_pin.proxy import _peek_status
+
+        code, seen = _peek_status(self.Sock(b"garbage not a status\r\n"))
+        assert code is None
+        assert seen == b"garbage not a status\r\n"
+
+    def case_a_refusal_is_reported_by_code(self):
+        from cswap_pin.proxy import _peek_status
+
+        for status, want in ((b"HTTP/1.1 401 Unauthorized\r\n", 401),
+                             (b"HTTP/1.1 403 Forbidden\r\n", 403),
+                             (b"HTTP/1.1 404 Not Found\r\n", 404),
+                             (b"HTTP/1.1 200 OK\r\n", 200)):
+            assert _peek_status(self.Sock(status))[0] == want
+
+    def case_a_closed_socket_is_not_an_exception(self):
+        """EOF before any status line: no code, no bytes, and no raise — the
+        caller relays what it has and lets the client see the close."""
+        from cswap_pin.proxy import _peek_status
+
+        assert _peek_status(self.Sock(b"")) == (None, b"")
+
 
 class TestParseUpstreamProxy:
     """One function, nine inputs. It was nine test methods; the CASES are the
