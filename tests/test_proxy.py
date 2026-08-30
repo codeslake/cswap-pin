@@ -15960,7 +15960,7 @@ class TestTheSweepWillNotCloseARunningWorker:
 #: SECOND response byte), so this bounds that class and says nothing about a
 #: request cut before headers. Raise it when the corpus does -- but the corpus
 #: grows BECAUSE the window grew: a wait the old window cut never banked.
-_LONGEST_BYTE_FREE_WAIT_MEASURED = 123.0
+_LONGEST_BYTE_FREE_WAIT_IN_CORPUS = 123.0
 
 
 class TestTheStallPredicateOnACappedArm:
@@ -16019,7 +16019,7 @@ class TestTheStallPredicateOnACappedArm:
 
         assert self._owed(pin_proxy._DRAIN_STALL_SECONDS - 1) is True
 
-    def case_the_window_clears_the_longest_wait_ever_MEASURED(self):
+    def case_the_window_clears_the_corpus_MAXIMUM(self):
         """The window must sit ABOVE the observed distribution, not inside it.
 
         `_DRAIN_STALL_SECONDS` CUTS a reply that has gone byte-silent that
@@ -16030,21 +16030,20 @@ class TestTheStallPredicateOnACappedArm:
         """
         from cswap_pin import proxy as pin_proxy
 
-        assert pin_proxy._DRAIN_STALL_SECONDS > _LONGEST_BYTE_FREE_WAIT_MEASURED, (
+        assert pin_proxy._DRAIN_STALL_SECONDS > _LONGEST_BYTE_FREE_WAIT_IN_CORPUS, (
             f"the stall window ({pin_proxy._DRAIN_STALL_SECONDS:.0f}s) is at or "
-            f"below the longest byte-free wait a completed reply has survived "
-            f"({_LONGEST_BYTE_FREE_WAIT_MEASURED:.0f}s) -- a drain catching "
-            "that reply would cut it")
+            f"below the corpus maximum ({_LONGEST_BYTE_FREE_WAIT_IN_CORPUS:.0f}s; "
+            "a 140s sample predates the corpus) -- a drain catching that reply "
+            "would cut it")
 
     def case_CONTROL_the_window_is_not_unbounded_either(self):
         """A window large enough to never fire is the other failure. A typo
         guard rather than a measurement -- nothing derives the multiplier --
         and the point is a window ABOVE the observed tail, not detached from
-        it. NOT the ten-minute drain CEILING that cut 12 replies: that is a
-        different constant and it is now deliberately infinite."""
+        it."""
         from cswap_pin import proxy as pin_proxy
 
-        assert pin_proxy._DRAIN_STALL_SECONDS <= 4 * _LONGEST_BYTE_FREE_WAIT_MEASURED, (
+        assert pin_proxy._DRAIN_STALL_SECONDS <= 4 * _LONGEST_BYTE_FREE_WAIT_IN_CORPUS, (
             "the stall window has drifted far past anything measured; it is a "
             "backstop against a wedged peer, not a licence to wait forever")
 

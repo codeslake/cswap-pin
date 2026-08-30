@@ -6173,10 +6173,13 @@ _HELD_DRAIN_SECONDS = _DRAIN_SECONDS
 
 # THE CEILING FOR A HANDOVER WHOSE SUCCESSOR IS ALREADY SERVING, and it is a
 # different number from `_DRAIN_SECONDS` because it buys a different thing.
-# ZERO CUTS BEFORE HEADERS, on every host measured. Every cut was
-# mid-response, so the drain is not malfunctioning and the count is not
-# bookkeeping: those are replies that had already begun streaming to a user
-# and genuinely did not finish inside thirty seconds. A pooled-idle-connection
+# ZERO CUTS BEFORE HEADERS, on every host measured — the CEILING's cuts, all
+# of them mid-response, which is what made the ceiling the fault. The stall
+# PREDICATE that replaced it cuts the opposite class; see
+# `_DRAIN_STALL_SECONDS`, and scope any count by which one produced it. So the
+# drain is not malfunctioning and the count is not bookkeeping: those are
+# replies that had already begun streaming to a user and genuinely did not
+# finish inside thirty seconds. A pooled-idle-connection
 # explanation was proposed and died on that split.
 #
 # So the fault is the CEILING, and at these two call sites paying
@@ -6278,18 +6281,20 @@ def drain_fate(budget: float) -> str:
 # byte-free wait each COMPLETED reply survived — p90 16s, p99 60s, max 123s —
 # so a window inside that distribution cuts the replies at its top.
 #
-# THE CORPUS SEES ONLY STREAMING REPLIES. `_byte_gap` is written from the
-# SECOND response byte on, so a request that never produced one banks nothing
-# — yet this window governs it too, aged from its arrival by the
-# `_content_at` fallback in `_owed_still_moving`. For that class the number is
-# an assumption, not a measurement, and the cuts on record are all of it.
+# THE CORPUS IS BLIND TO WHAT THIS ACTUALLY CUTS. `_byte_gap` starts at the
+# SECOND response byte, so a reply with fewer banks nothing; and a ZERO-write
+# request is aged from ARRIVAL by the `_content_at` fallback in
+# `_owed_still_moving` (a one-write reply, from that write). Every cut the
+# PREDICATE has produced is the zero-write class, so for it the number is an
+# assumption rather than a measurement. Not split into two constants: two
+# observations do not size a second threshold.
 #
 # IT BINDS ON BOTH ARMS. On the handover arm a successor already holds the
 # port, so a wedged connection only keeps an idle process alive. On the HELD
-# arm the port is dark: a debt already silent this long when the drain starts
-# no longer breaks out at second 0, it spends the full `_HELD_DRAIN_SECONDS`.
-# That is the trade — 30s of queued arrivals against cutting a reply the corpus
-# says completes.
+# arm the port is dark, and raising the window WIDENS the band of debts that
+# are waited on rather than breaking out at second 0 — up to a whole
+# `_HELD_DRAIN_SECONDS` of it, against cutting a reply the corpus says
+# completes.
 _DRAIN_STALL_SECONDS = 180.0
 #: THE CLIENT'S OWN LIVENESS TIMEOUT, read out of the 2.1.245 bundle rather
 #: than chosen: `resetLivenessTimer(){ ... setTimeout(this.onLivenessTimeout,
