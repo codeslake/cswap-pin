@@ -803,6 +803,45 @@ class TestLiveRemoteControlSessions:
 
         assert live_bridge_names() == {}
 
+    def case_the_sweeps_own_sentinel_closes_the_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """THE STALENESS BOUND, pinned rather than described.
+
+        An id from the job record says the session HELD that bridge, not that
+        the server still has it. What ends that window is
+        `clear_dead_bridge_records`, which writes `""` into the same field for
+        a bridge the listing no longer carries -- so the empty string has to
+        read as "no bridge" here, or the fallback would keep resurrecting an id
+        the sweep just retired and the window would never close.
+        """
+        from cswap_pin.proxy import live_bridge_names
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps(
+            {"sessionId": "a", "name": "swept", "bridgeSessionId": None,
+             "jobId": "j3", "pid": os.getpid()}))
+        jobs = d.parent / "jobs" / "j3"
+        jobs.mkdir(parents=True)
+        (jobs / "state.json").write_text(json.dumps({"bridgeSessionId": ""}))
+
+        assert live_bridge_names() == {}
+
+    def case_a_missing_job_directory_is_not_a_crash(
+        self, tmp_path, monkeypatch
+    ):
+        """`jobId` outliving its directory is ordinary -- the job dir is Claude
+        Code's to remove. The read has to answer "no bridge", not raise, or one
+        stale record takes down every reader of this pairing."""
+        from cswap_pin.proxy import live_bridge_names
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps(
+            {"sessionId": "a", "name": "gone-job", "jobId": "nope",
+             "pid": os.getpid()}))
+
+        assert live_bridge_names() == {}
+
     def case_provenance_is_read_from_the_record_not_the_name(
         self, tmp_path, monkeypatch
     ):

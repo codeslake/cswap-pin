@@ -3513,12 +3513,24 @@ def _live_bridge_records() -> list[tuple[str, str | None, str | None]]:
     caller wanting names AND provenance still calls two functions that each
     walk the directory. What it removes is a SECOND PLACE that decides what a
     session record means, which is the half that goes stale.
+
+    THE PAIRING IS A TWO-FILE JOIN, and the callers' "one record, one live
+    pid" wording predates that. Claude Code clears the registry's
+    ``bridgeSessionId`` on RC teardown and does not rewrite it when the bridge
+    returns, so the id can only be recovered from the job record. An id
+    sourced that way says the session HELD it, not that the server still has
+    it -- bounded at one sweep, since ``clear_dead_bridge_records`` writes
+    ``""`` there for a bridge the listing no longer carries.
+
+    SORTED, so two registry records naming one job (a resume leaves the old
+    one beside the new) resolve the same way every walk instead of in glob
+    order.
     """
     get_claude_config_home = require("paths").get_claude_config_home
 
     out: list[tuple[str, str | None, str | None]] = []
     try:
-        entries = list((get_claude_config_home() / "sessions").glob("*.json"))
+        entries = sorted((get_claude_config_home() / "sessions").glob("*.json"))
     except OSError:
         return out
     for path in entries:
@@ -3532,20 +3544,23 @@ def _live_bridge_records() -> list[tuple[str, str | None, str | None]]:
         if not isinstance(pid, int) or not _pid_alive(pid):
             continue
         if not bridge:
-            # THE REGISTRY COPY IS CLEARED ON TEARDOWN AND NOT REWRITTEN when
-            # the bridge returns seconds later, so a live session with a live
-            # bridge reads here as having none — and then nothing can name it,
-            # resolve it, or carry it. The JOB record keeps the id across that
-            # and the registry record names the job, so the recovery is a local
-            # join and not a guess: the pin cannot attribute a bridge CREATE to
-            # a session anyway (the request carries nothing identifying, and
-            # pid-from-socket is `/proc/net/tcp`, absent on macOS).
+            # CLEARED ON TEARDOWN AND NOT REWRITTEN when the bridge returns, so
+            # a live session with a live bridge reads here as having none. The
+            # JOB record keeps the id across that and the registry names the
+            # job, so this is a two-file join rather than one record — see
+            # `_live_bridge_records`' own contract note above.
+            #
+            # NOT WRITTEN BACK FROM THE WIRE, which is the obvious alternative:
+            # the new id exists only in the RESPONSE to `POST /v1/code/
+            # sessions`, and this proxy hooks that route on the REQUEST path and
+            # streams the response through unparsed. Attribution is the second
+            # wall (no portable pid-from-socket here), not the first.
             job = rec.get("jobId")
             st = _read_json(get_claude_config_home() / "jobs" / str(job)
                             / "state.json") if job else None
             bridge = (st or {}).get("bridgeSessionId")
             if not bridge:
-                continue  # never had one; naming it would invent a pairing
+                continue  # never had one, or swept; naming it invents a pairing
         name = rec.get("name")
         source = rec.get("nameSource")
         out.append((str(bridge), str(name) if name else None,
@@ -4106,13 +4121,18 @@ def observed_bridge_owners() -> dict[str, str | None]:
             continue
         bridge, pid, job = (rec.get("bridgeSessionId"), rec.get("pid"),
                             rec.get("jobId"))
-        if not bridge or not isinstance(pid, int) or not _pid_alive(pid):
+        if not isinstance(pid, int) or not _pid_alive(pid):
             continue
-        owner = None
-        if job:
-            st = _read_json(home / "jobs" / str(job) / "state.json")
-            if isinstance(st, dict):
-                owner = st.get(_JOB_OWNER[1]) or None
+        # THE SAME CLEARED POINTER `_live_bridge_records` RECOVERS. Requiring
+        # the registry copy here dropped exactly the sessions whose bridge had
+        # been torn off and remade, and this feeds a cross-org WARNING — so the
+        # omission reads as agreement rather than as an unanswered question,
+        # which is the failure the `None` return below exists to avoid.
+        st = _read_json(home / "jobs" / str(job) / "state.json") if job else None
+        bridge = bridge or (st or {}).get("bridgeSessionId")
+        if not bridge:
+            continue
+        owner = st.get(_JOB_OWNER[1]) or None if isinstance(st, dict) else None
         owners[str(bridge)] = owner
     return owners
 
@@ -4450,9 +4470,11 @@ def titles_to_restore(
             continue
         # ANY DIFFERENCE, BECAUSE THE REGISTRY ALREADY PROVED OWNERSHIP.
         # `names` comes from this machine's own session registry, which pairs a
-        # name, a bridge id and a live pid in ONE record. A bridge is in it
-        # only because a session running HERE holds it and gave it that name,
-        # so a cloud title that differs is a title this side did not ask for.
+        # name with a live pid — and, when the pointer has been cleared on a
+        # teardown, with the bridge id from that session's job record. A bridge
+        # is in it only because a session running HERE holds or held it and
+        # gave it that name, so a cloud title that differs is one this side did
+        # not ask for. `_live_bridge_records` states the join and its bound.
         #
         # THREE NARROWER RULES CAME AND WENT, AND EACH BROKE THE FEATURE. A
         # shape regex claimed names people had chosen. Reading only what Claude
@@ -11250,9 +11272,16 @@ class PinProxy:
 
         OWNERSHIP COMES FROM THE REGISTRY, exactly as it does for titles: a
         bridge is in `live_bridge_names()` only because a process running HERE
-        holds it. Another machine's archived bridge is not ours to revive —
-        this host cannot see whether that session is still alive, and the pin
-        deliberately makes one account hold every machine's bridges.
+        holds it — or held it, for an id recovered from the job record after a
+        teardown cleared the registry copy. That widening is why this runs
+        BEFORE `clear_dead_bridge_records` in the sweep and can therefore
+        unarchive on one stale id, for the one pass it takes that sweep to
+        write `""` over it. Reordering is not the answer: the clear keys on
+        `connection_status`, which is the same row this revives.
+
+        Another machine's archived bridge is still not ours to revive — this
+        host cannot see whether that session is alive, and the pin deliberately
+        makes one account hold every machine's bridges.
 
         Route read from the binary and confirmed against the live API:
         `POST /v1/code/sessions/{id}/unarchive` -> 200. Two plausible
