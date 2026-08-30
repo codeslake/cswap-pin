@@ -4142,31 +4142,29 @@ def ca_path_for_trust() -> "Path | None":
         return None
 
 
-#: THE VALUES THAT MEAN NOBODY CHOSE THE NAME. The shipped bundle's validator
-#: fixes the domain at six plus absent: `user`, `peer`, `derived`, `collision`,
-#: `auto`, `hook`.
+#: WHICH `nameSource` VALUES MEAN NOBODY CHOSE THE NAME. The bundle's
+#: validator fixes the domain at `user`, `peer`, `derived`, `collision`,
+#: `auto`, `hook`, plus absent, so this is a subset of a closed set.
 #:
 #: `auto` is where the product INVENTS a name for a session that has none;
-#: `derived` is only where it derives one from an interactive session's cwd. A
-#: `derived`-only guard therefore missed every never-named session, which is
-#: the population most likely to be renamed by hand afterwards.
+#: `derived` only where it takes one from an interactive session's cwd. So a
+#: `derived`-only guard missed every never-named session.
 #:
-#: `collision` IS IN BECAUSE IT DESTROYS THE PROVENANCE IT REPLACES. The
-#: suffix-appending function overwrites `nameSource` unconditionally, and it
-#: runs on the record stamped `auto` one statement earlier, so nothing on disk
-#: then says whether the base name was invented or chosen. The tie goes to
-#: refusing, because the two errors are not symmetric: restoring wrongly
+#: `collision` is in because it ERASES the provenance it replaces: the
+#: suffix-appending function overwrites `nameSource` unconditionally, and runs
+#: on the record stamped `auto` one statement earlier, leaving nothing on disk
+#: to say whether the base name was invented or chosen. The tie goes to
+#: refusing because the errors are not symmetric — restoring wrongly
 #: OVERWRITES a name somebody typed, refusing wrongly only leaves a server
-#: title in place. The bundle's own "is there a chosen name here" predicate
-#: groups `collision` with `auto` too.
+#: title in place.
 #:
-#: `user` and `peer` are a person choosing and another session relaying that
-#: choice. `hook` is out because nothing in the bundle stamps it: 0 sites,
-#: against 2 each for `auto`, `collision` and `user`.
+#: `user` and `peer` are a person choosing and a session relaying that choice.
+#: `hook` is out on a count, not a story: 0 sites stamp it, against 2 each for
+#: `auto`, `collision` and `user`.
 _INVENTED_NAME_SOURCES = ("derived", "auto", "collision")
 
 
-def derived_bridge_names() -> set[str]:
+def invented_bridge_names() -> set[str]:
     """Bridge ids whose LOCAL name is one nobody chose.
 
     Claude Code stamps a session record with `nameSource`, so this is the
@@ -4359,7 +4357,7 @@ def _record_title(certdir, sid: str, title: str) -> None:
 
 def titles_to_restore(
     sessions: list[dict], names: dict[str, str], ours: "dict | None" = None,
-    derived: "set | None" = None,
+    invented: "set | None" = None,
 ) -> list[tuple[str, str]]:
     """``(bridge id, name)`` for listed bridges the server titles wrongly.
 
@@ -4412,12 +4410,11 @@ def titles_to_restore(
         # "ours", the two agree, and the guard stops firing. A new bridge id
         # opens the same hole from the other end, since unknown means restore.
         #
-        # `derived` holds the bridges whose `nameSource` is one of
-        # `_INVENTED_NAME_SOURCES`: Claude Code's own record that it made the
-        # name up, `auto` as well as `derived`. A blank server title is still
-        # restored: there is nothing to overwrite, and that is the population
-        # this exists for.
-        if derived and sid in derived and current:
+        # `invented` holds the bridges whose `nameSource` is one of
+        # `_INVENTED_NAME_SOURCES` — Claude Code's own record that nobody
+        # chose the name. A blank server title is still restored: there is
+        # nothing to overwrite, and that is the population this exists for.
+        if invented and sid in invented and current:
             continue
         out.append((sid, want.strip()))
     return out
@@ -12907,7 +12904,7 @@ class PinProxy:
         certdir = getattr(self, "_certdir", None)
         ours = _titles_we_wrote(certdir)
         for sid, want in titles_to_restore(
-                sessions, names, ours, derived_bridge_names()):
+                sessions, names, ours, invented_bridge_names()):
             body = json.dumps({"title": want}).encode("utf-8")
             if self._bridge_api(
                 "PUT", f"/v1/code/sessions/{sid}", token, body=body

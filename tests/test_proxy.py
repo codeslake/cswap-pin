@@ -799,7 +799,7 @@ class TestLiveRemoteControlSessions:
         paired with a running session, so a dead record's provenance can only
         veto a restore it knows nothing about.
         """
-        from cswap_pin.proxy import derived_bridge_names
+        from cswap_pin.proxy import invented_bridge_names
 
         d = self._sessions_dir(tmp_path, monkeypatch)
         for i, src in enumerate(
@@ -817,7 +817,7 @@ class TestLiveRemoteControlSessions:
             {"name": "n8", "bridgeSessionId": "session_dead",
              "nameSource": "derived", "pid": -1}))
 
-        assert derived_bridge_names() == {
+        assert invented_bridge_names() == {
             "session_derived", "cse_derived", "session_auto", "cse_auto",
             "session_collision", "cse_collision"}
 
@@ -2889,7 +2889,7 @@ class TestARenameIsRespectedWhereverItWasMade:
         # parameter defaults to None and every unit test passes a set
         # explicitly, so deleting this call left the suite byte-identical at
         # 218 passed -- the guard was invisible to it.
-        assert "derived_bridge_names(" in src, (
+        assert "invented_bridge_names(" in src, (
             "the restore does not read provenance, so an invented name can "
             "still overwrite one somebody typed")
 
