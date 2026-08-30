@@ -83,6 +83,13 @@ def _close_sockets_the_test_left_open():
             try:
                 if sock.fileno() < 3:
                     continue
+                # LISTENERS ONLY. A blocked `accept()` is the whole target,
+                # and `_PUMP` is a module-level singleton whose own wakeup
+                # pair and tunnel sockets are created inside whichever test
+                # first touches it — closing those breaks the pump for every
+                # later test, which is what `live_pairs() == 0` was.
+                if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+                    continue
                 # SHUTDOWN BEFORE CLOSE. A `close()` from another thread does
                 # NOT wake a thread already blocked in `accept()` on Linux —
                 # the fd goes away and the blocked call keeps waiting. The
