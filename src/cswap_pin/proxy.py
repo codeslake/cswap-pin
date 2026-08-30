@@ -4249,6 +4249,100 @@ def invented_bridge_names() -> set[str]:
             for spelling in _both_spellings(bridge)}
 
 
+#: Read a transcript backwards in chunks this size when looking for the
+#: newest title. A rename is re-emitted on later turns, so one chunk
+#: normally settles it.
+_TRANSCRIPT_TAIL_STEP = 1 << 16
+
+
+def _last_custom_title(path: Path) -> str | None:
+    """The newest ``custom-title`` in a transcript, read from the END.
+
+    A forward scan is a second of I/O — measured 952 ms on the 752 MB
+    transcript this fleet's busiest session carries — and the caller sits on
+    a request path. Backwards costs one chunk when a rename exists; a
+    transcript with none still costs the whole file every beat, which is why
+    only invented-name records get this far — and an adopted one flips to a
+    chosen source, so it is read once and never again.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos, tail = fh.tell(), b""
+            while pos > 0:
+                step = min(_TRANSCRIPT_TAIL_STEP, pos)
+                pos -= step
+                fh.seek(pos)
+                lines = (fh.read(step) + tail).split(b"\n")
+                # lines[0] is PARTIAL until the read reaches the start, so it
+                # is carried into the next chunk rather than parsed.
+                head, whole = (b"", lines) if pos == 0 else (lines[0], lines[1:])
+                for line in reversed(whole):
+                    if b'"custom-title"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get("type") == "custom-title":
+                        return str(rec.get("customTitle") or "") or None
+                tail = head
+    except OSError:
+        return None
+    return None
+
+
+def adopt_renamed_sessions() -> int:
+    """Carry a rename the session registry never heard about into its record.
+
+    Claude Code stamps ``sessions/<pid>.json`` once, at launch, and a later
+    rename — typed here, or made on claude.ai and pulled down — lands in the
+    TRANSCRIPT and on the server without touching that record. Everything
+    local then reads the launch name: the peer list, ``@``-completion, and
+    this proxy's own title restore. Measured on this fleet: an RC session sat
+    at its derived launch name for a day while the transcript and claude.ai
+    both read the name its owner had chosen.
+
+    Only an INVENTED name is replaced — `_CHOSEN_NAME_SOURCES`' complement,
+    the same test `invented_bridge_names` applies — so this can never
+    overwrite a name somebody typed, and an absent source counts as chosen
+    there as here.
+    """
+    home = require("paths").get_claude_config_home()
+    try:
+        entries = sorted((home / "sessions").glob("*.json"))
+    except OSError:
+        return 0
+    adopted = 0
+    for path in entries:
+        rec = _read_json(path)
+        if not isinstance(rec, dict):
+            continue
+        source, pid = rec.get("nameSource"), rec.get("pid")
+        sid = rec.get("sessionId")
+        if source is None or source in _CHOSEN_NAME_SOURCES or not sid:
+            continue
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        title = next((_last_custom_title(tx) for tx in
+                      (home / "projects").glob(f"*/{sid}.jsonl")), None)
+        if not title or title == rec.get("name"):
+            continue
+        rec["name"], rec["nameSource"] = title, "user"
+        rec["nameSince"] = int(time.time() * 1000)
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(rec), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            continue
+        adopted += 1
+    if adopted:
+        _log_lifecycle(f"adopted the chosen name on {adopted} session "
+                       f"record(s) a rename had left at a generated one")
+    return adopted
+
+
 def live_bridge_names() -> dict[str, str]:
     """Bridge id -> the name its live session goes by, in both spellings.
 
@@ -13018,6 +13112,10 @@ class PinProxy:
         matches on title: leaving it reading the stale listing would decide
         against titles that are one request out of date.
         """
+        # BEFORE the read, or the restore puts back a name the session's own
+        # owner has already replaced — the record is what `live_bridge_names`
+        # reads and the rename never reached it.
+        adopt_renamed_sessions()
         names = live_bridge_names()
         if not names:
             return 0
