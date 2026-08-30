@@ -6329,9 +6329,11 @@ def drain_fate(budget: float) -> str:
 # this is what actually ends a drain now, and the budgets above are backstops
 # against a bug in that predicate.
 #
-# ABOVE THE MEASURED DISTRIBUTION, NOT INSIDE IT. The fleet watcher banks the
-# byte-free wait each COMPLETED reply survived — p90 16s, p99 60s, max 123s —
-# so a window inside that distribution cuts the replies at its top.
+# ABOVE THE MEASURED DISTRIBUTION, NOT INSIDE IT. The fleet watcher banks ONE
+# sample per drain: the longest byte-free wait any COMPLETED reply survived in
+# that daemon's life — p90 16s, p99 60s, max 123s. So the percentiles are over
+# daemon lifetimes, not over replies; only the MAX carries over, and it is the
+# number this has to clear.
 #
 # THE CORPUS IS BLIND TO WHAT THIS ACTUALLY CUTS. `_byte_gap` starts at the
 # SECOND response byte, so a reply with fewer banks nothing; and a ZERO-write
