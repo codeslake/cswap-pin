@@ -40,62 +40,6 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
     _redirect_everything_to(tmp_path, monkeypatch)
 
 
-@pytest.fixture(autouse=True)
-def _close_sockets_the_test_left_open():
-    """Close every socket a test opened, so its accept loop ends with it.
-
-    A LEAKED ACCEPT THREAD IS WHAT KILLS AN XDIST WORKER. It outlives its
-    case, reaches the real `os._exit` inside `_watch_own_code`, and the
-    process vanishes with no traceback — `tests/leakwatch.py` names the
-    signature. Fixing the helpers one at a time MOVES the crash instead of
-    ending it: measured, deselecting the biggest single leaker left 3 of 3
-    `-n 2` runs still short of the full 227.
-
-    A Python thread cannot be killed, so closing its socket is the only
-    lever — `accept()` raises OSError and the loop returns. Sweeping here
-    rather than at each helper also covers the ones nobody has written yet.
-
-    `fileno() < 3` is left alone: stdio is not a test's to close, and the
-    xdist channel rides pipes rather than sockets.
-    """
-    import socket
-    import weakref
-
-    opened: list = []
-    real_init = socket.socket.__init__
-
-    def _init(self, *a, **kw):
-        real_init(self, *a, **kw)
-        try:
-            opened.append(weakref.ref(self))
-        except TypeError:      # not weak-referenceable; nothing to sweep
-            pass
-
-    socket.socket.__init__ = _init
-    try:
-        yield
-    finally:
-        socket.socket.__init__ = real_init
-        for ref in opened:
-            sock = ref()
-            if sock is None:
-                continue
-            try:
-                if sock.fileno() < 3:
-                    continue
-                # SHUTDOWN BEFORE CLOSE. A `close()` from another thread does
-                # NOT wake a thread already blocked in `accept()` on Linux —
-                # the fd goes away and the blocked call keeps waiting. The
-                # shutdown is what makes it return.
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                sock.close()
-            except OSError:
-                pass
-
-
 def _redirect_everything_to(tmp_path, monkeypatch):
     """Point every config-path lookup at this test's own tmp_path."""
     cfg = tmp_path / "conftest-claude.json"
