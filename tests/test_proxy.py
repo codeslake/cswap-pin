@@ -2918,6 +2918,9 @@ class TestARenameIsRespectedWhereverItWasMade:
 
         monkeypatch.setattr(pp, "_host_slug", lambda: "host-a")
         self._plant_invented(tmp_path, "b1")
+        # Or the case cannot tell "arming preserved D" from "arming did not
+        # happen" -- both produce the restore it asserts.
+        assert "b1" in pp.invented_bridge_names()
         assert titles_to_restore(self._sessions("host-a-cozy-badger"),
                                  self.NAMES) == [("b1", "dotfiles-80")]
 

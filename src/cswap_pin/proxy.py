@@ -4404,6 +4404,12 @@ def titles_to_restore(
     (the shim's docstring says so), and both facts are readable here with no
     argument, so the default reads them rather than trusting a caller to pass
     them. Only that caller pays the walk; the daemon passes both.
+
+    THE TWO HALVES DO NOT ARRIVE EQUALLY ARMED. `_record_title` has one caller
+    and it is the daemon's, so through the two-argument door the ledger covers
+    only bridges the daemon has ALSO named; provenance carries the rest, and
+    only for what `_CHOSEN_NAME_SOURCES` excludes. Closing that gap needs a
+    title recorded where it is PUT — bookkeeping the other side owns.
     """
     # A HOST WE CANNOT REACH LEAVES THE DEFAULT WHERE IT WAS. `require` raises
     # when cswap is not importable, and refusing every restore on that is worse
