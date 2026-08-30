@@ -2669,10 +2669,18 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 #     GET    /v1/environments/<env>/work/poll
 #     POST   /v1/environments/<env>/work/<id>/ack|stop|heartbeat
 #
-# The lifecycle calls carry `Authorization: Bearer <getAccessToken()>` from one
-# header builder, so they are OAuth ownership routes exactly like `/bridge`,
-# and the registration is a CREATE the server cannot transfer afterwards. The
-# `work/` calls do NOT — see below.
+# The lifecycle calls carry `Authorization: Bearer <getAccessToken()>`, so they
+# are OAuth ownership routes exactly like `/bridge`, and the registration is a
+# CREATE the server cannot transfer afterwards.
+#
+# THE HEADER BUILDER IS NOT THE DISCRIMINATOR — the WRAPPER is. Measured in the
+# shipped bundle: ONE Authorization builder serves all nine call sites,
+# `pollForWork` included, so "from one header builder" cannot separate them.
+# What separates them is the 401-refresh wrapper, the sole `getAccessToken()`
+# caller: the lifecycle calls go through it and the `work/` ones take a token
+# as an argument instead. The earlier wording said the `work/` calls "do NOT",
+# which is true of the bearer and false of the builder, and reads as the
+# second.
 #
 # `?beta=true` IS THE DISCRIMINATOR AND IT IS LOAD-BEARING. The managed-agents
 # SDK shares this subtree, spells every one of its environment calls with that
