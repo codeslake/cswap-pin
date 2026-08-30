@@ -3487,20 +3487,24 @@ def live_remote_control_sessions() -> list[str]:
     return names
 
 
-def _live_bridge_records() -> list[tuple[str, str | None]]:
-    """``(bridge id, name)`` for every session with a process still alive here.
+def _live_bridge_records() -> list[tuple[str, str | None, str | None]]:
+    """``(bridge id, name, nameSource)`` for every session alive here.
 
     A record alone is not liveness: Claude Code leaves the file behind when a
     session dies, so the registry accumulates. Measured here: 562 records, 293
     of them still ``connected`` server-side, 16 with a process.
 
-    The name comes back unfiltered — ``None`` included — because the two
+    The name comes back unfiltered — ``None`` included — because the three
     callers need different things from it and one of them must not drop a
     nameless session (see ``_live_bridge_ids``).
+
+    ``nameSource`` rides along rather than getting its own walk: it lives in
+    the record this already parses, and a second glob over the same directory
+    is a second answer to the same question.
     """
     get_claude_config_home = require("paths").get_claude_config_home
 
-    out: list[tuple[str, str | None]] = []
+    out: list[tuple[str, str | None, str | None]] = []
     try:
         entries = list((get_claude_config_home() / "sessions").glob("*.json"))
     except OSError:
@@ -3516,7 +3520,9 @@ def _live_bridge_records() -> list[tuple[str, str | None]]:
         if not bridge or not isinstance(pid, int) or not _pid_alive(pid):
             continue
         name = rec.get("name")
-        out.append((str(bridge), str(name) if name else None))
+        source = rec.get("nameSource")
+        out.append((str(bridge), str(name) if name else None,
+                    str(source) if source else None))
     return out
 
 
@@ -4021,7 +4027,7 @@ def _live_bridge_ids() -> set[str]:
     exactly as protected as one that did.
     """
     live: set[str] = set()
-    for bridge, _name in _live_bridge_records():
+    for bridge, _name, _src in _live_bridge_records():
         live.update(_both_spellings(bridge))
     return live
 
@@ -4132,36 +4138,41 @@ def ca_path_for_trust() -> "Path | None":
         return None
 
 
-def derived_bridge_names() -> set:
+#: THE VALUES THAT MEAN THE PRODUCT MADE THE NAME UP, read out of the shipped
+#: bundle rather than guessed. Its validator fixes the whole domain at six
+#: values plus absent -- `user`, `peer`, `derived`, `collision`, `auto`,
+#: `hook` -- and it stamps `auto` at the two sites where it invents a name for
+#: a session that has none. A guard reading only `derived` therefore misses
+#: every never-named session, which is the population most likely to be
+#: renamed by hand afterwards.
+#:
+#: THE OTHER FOUR ARE DELIBERATELY OUT. `user` and `hook` are the user
+#: choosing, directly or through their own configuration. `collision` is a
+#: chosen name with a de-duplicating suffix appended, which is why the bundle
+#: respawns on it beside `user`. `peer` is another session relaying one of
+#: those. Absent says nothing at all -- see below.
+_INVENTED_NAME_SOURCES = ("derived", "auto")
+
+
+def derived_bridge_names() -> set[str]:
     """Bridge ids whose LOCAL name is one nobody chose.
 
-    Claude Code stamps every session record with `nameSource`, and `derived`
-    means it made the name up. Across the records on one machine the field
-    takes four values -- `derived`, `user`, `peer`, and absent on older
-    records -- so this is the product's own statement about provenance, not a
-    guess from the name's shape.
+    Claude Code stamps a session record with `nameSource`, so this is the
+    product's own statement about provenance rather than a guess from the
+    name's shape. `_INVENTED_NAME_SOURCES` says which values mean invented.
 
-    ONLY `derived` COUNTS. An absent field is the common case on older records
-    and treating it as derived would disarm the restore for most sessions,
-    which is the population the feature exists for.
+    ABSENT IS NOT A LEGACY TAIL, and it is not evidence either way. Measured
+    on one host: 8 of 13 records carry no `nameSource`, all 13 have a live
+    process, the NEWEST record is one of the eight and the oldest carries
+    `user`. So the absent set is not shrinking and cannot be waited out, and
+    since it does not say the name was invented, counting it would refuse the
+    restore for most live sessions, which is the population the feature exists
+    for.
     """
-    get_claude_config_home = require("paths").get_claude_config_home
-    out = set()
-    try:
-        entries = list((get_claude_config_home() / "sessions").glob("*.json"))
-    except OSError:
-        return out
-    for path in entries:
-        try:
-            rec = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(rec, dict) or rec.get("nameSource") != "derived":
-            continue
-        bridge = rec.get("bridgeSessionId")
-        if bridge:
-            out.update(_both_spellings(str(bridge)))
-    return out
+    return {spelling
+            for bridge, _name, source in _live_bridge_records()
+            if source in _INVENTED_NAME_SOURCES
+            for spelling in _both_spellings(bridge)}
 
 
 def live_bridge_names() -> dict[str, str]:
@@ -4179,7 +4190,7 @@ def live_bridge_names() -> dict[str, str]:
     no branch signature to match, no ambiguity to decline.
     """
     names: dict[str, str] = {}
-    for bridge, name in _live_bridge_records():
+    for bridge, name, _src in _live_bridge_records():
         if name:
             for spelling in _both_spellings(bridge):
                 names[spelling] = name
@@ -4342,12 +4353,6 @@ def titles_to_restore(
     rewriting titles that already match would put one PUT per live session on
     the wire every time any one of them opens a bridge.
     """
-    # READ ONCE, AND ONLY IF SOMETHING ASKS. The set is consulted only for a
-    # session whose server title DIFFERS from its local name, which on a
-    # healthy machine is none of them, so the whole walk was being paid for an
-    # answer nobody read. Still once per call, not per item: the loop below
-    # runs over the entire listing, and that is what the original comment here
-    # was protecting.
     out: list[tuple[str, str]] = []
     for item in sessions:
         sid = item.get("id")
@@ -4393,9 +4398,11 @@ def titles_to_restore(
         # "ours", the two agree, and the guard stops firing. A new bridge id
         # opens the same hole from the other end, since unknown means restore.
         #
-        # `nameSource == "derived"` is Claude Code's own record that it made
-        # the name up. A blank server title is still restored -- there is
-        # nothing to overwrite, and that is the population this exists for.
+        # `derived` holds the bridges whose `nameSource` is one of
+        # `_INVENTED_NAME_SOURCES`: Claude Code's own record that it made the
+        # name up, `auto` as well as `derived`. A blank server title is still
+        # restored: there is nothing to overwrite, and that is the population
+        # this exists for.
         if derived and sid in derived and current:
             continue
         out.append((sid, want.strip()))

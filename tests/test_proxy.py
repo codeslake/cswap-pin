@@ -751,6 +751,71 @@ class TestLiveRemoteControlSessions:
             "session_x": "RVP_fork", "cse_x": "RVP_fork"
         }
 
+    def case_provenance_is_read_from_the_record_not_the_name(
+        self, tmp_path, monkeypatch
+    ):
+        """`derived` IS NOT THE ONLY INVENTED VALUE -- `auto` is one too.
+
+        THE DOMAIN IS SIX VALUES PLUS ABSENT, not four. Read out of the
+        shipped 2.1.251 bundle, which validates the field against exactly this
+        list and normalises anything else away::
+
+            nameSource:o.nameSource==="user"||o.nameSource==="peer"
+              ||o.nameSource==="derived"||o.nameSource==="collision"
+              ||o.nameSource==="auto"||o.nameSource==="hook"?o.nameSource:void 0
+
+        `auto` IS STAMPED WHERE THE PRODUCT MAKES A NAME UP, at two sites in
+        that bundle -- `if(Ne&&!Ne.name&&ue)Ne.name=ue,Ne.nameSource="auto"`
+        and a job-name generator writing `nameSource:"auto"` beside the name
+        it just produced. So a session that was never named carries `auto`,
+        never `derived`, and a guard reading only `derived` lets the pin PUT
+        that invented name over a title a person typed on claude.ai -- the
+        exact defect this guard exists to stop.
+
+        The bundle groups the two itself:
+        `if(e.nameSource==="auto"||e.nameSource==="collision")return!0`, its
+        own "there is no chosen name here" answer.
+
+        `collision` STAYS OUT, and that is not an oversight. It is a person's
+        name with a de-duplicating suffix appended
+        (`return{...r,name:p,nameSource:"collision"}`), which is why the same
+        bundle respawns on it beside `user`. Restoring it is the ordinary
+        case. `hook` stays out for the same reason: a hook is the user's own
+        configuration choosing the name.
+
+        ABSENT IS NOT A LEGACY TAIL AND NOT PROOF OF ANYTHING. Measured on
+        one host: 8 of 13 records carry no `nameSource`, ALL 13 have a live
+        process, the newest record is one of the eight and the oldest carries
+        `user`. So the absent set is not shrinking and cannot be waited out --
+        and since it does not say the name was invented, refusing the restore
+        for it would disarm the feature for most live sessions.
+
+        THE READ IS PID-FILTERED like every other read of this registry. The
+        set is consulted only for a bridge `live_bridge_names` has already
+        paired with a running session, so a dead record's provenance can only
+        veto a restore it knows nothing about.
+        """
+        from cswap_pin.proxy import derived_bridge_names
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        for i, src in enumerate(
+            ("derived", "auto", "user", "peer", "collision", "hook"), start=1
+        ):
+            (d / f"{i}.json").write_text(json.dumps(
+                {"name": f"n{i}", "bridgeSessionId": f"session_{src}",
+                 "nameSource": src, "pid": os.getpid()}))
+        (d / "7.json").write_text(json.dumps(
+            {"name": "n7", "bridgeSessionId": "session_absent",
+             "pid": os.getpid()}))
+        # -1 rather than a large number: `_pid_alive` refuses it by the sign
+        # guard, so this cannot become a live pid the kernel recycled.
+        (d / "8.json").write_text(json.dumps(
+            {"name": "n8", "bridgeSessionId": "session_dead",
+             "nameSource": "derived", "pid": -1}))
+
+        assert derived_bridge_names() == {
+            "session_derived", "cse_derived", "session_auto", "cse_auto"}
+
     def case_creating_a_bridge_is_worth_waiting_for_a_token(self):
         """Failing open is right everywhere except the one permanent request.
 
@@ -15998,6 +16063,14 @@ class TestTheSweepWillNotCloseARunningWorker:
 #: request cut before headers. Raise it when the corpus does -- but the corpus
 #: grows BECAUSE the window grew: a wait the old window cut never banked.
 _LONGEST_BYTE_FREE_WAIT_IN_CORPUS = 123.0
+#: THE LONGEST ON RECORD, corpus or not, and it is this one the window has to
+#: clear. Scoping the constant above to the corpus made it honest and left the
+#: assertion below 17s too loose: measured, a window of 130.0 -- under a wait
+#: a reply is on record as surviving -- PASSES a `> corpus` check, while 100.0
+#: fails it, so the check works and simply stops short. A number outside the
+#: corpus is still an observation; the corpus bounds what the watcher banked,
+#: not what happened.
+_LONGEST_BYTE_FREE_WAIT_ON_RECORD = 140.0
 
 
 class TestTheStallPredicateOnACappedArm:
@@ -16067,11 +16140,12 @@ class TestTheStallPredicateOnACappedArm:
         """
         from cswap_pin import proxy as pin_proxy
 
-        assert pin_proxy._DRAIN_STALL_SECONDS > _LONGEST_BYTE_FREE_WAIT_IN_CORPUS, (
+        assert pin_proxy._DRAIN_STALL_SECONDS > _LONGEST_BYTE_FREE_WAIT_ON_RECORD, (
             f"the stall window ({pin_proxy._DRAIN_STALL_SECONDS:.0f}s) is at or "
-            f"below the corpus maximum ({_LONGEST_BYTE_FREE_WAIT_IN_CORPUS:.0f}s; "
-            "a 140s sample predates the corpus) -- a drain catching that reply "
-            "would cut it")
+            f"below the longest byte-free wait on record "
+            f"({_LONGEST_BYTE_FREE_WAIT_ON_RECORD:.0f}s, which predates the "
+            f"corpus maximum of {_LONGEST_BYTE_FREE_WAIT_IN_CORPUS:.0f}s) -- a "
+            "drain catching that reply would cut it")
 
     def case_CONTROL_the_window_is_not_unbounded_either(self):
         """A window large enough to never fire is the other failure. A typo
