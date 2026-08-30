@@ -2847,23 +2847,11 @@ class TestTheGuardsOnlyInputStillExists:
         # finding. Absence of the seam is a FAILURE; absence of the SUBJECT is
         # a skip, and the two must not report the same way.
         #
-        # TWO MARKERS, AND NEITHER IS AN EXECUTABLE FORMAT. Two earlier
-        # attempts each failed in one direction:
-        #
-        #   `b"anthropic" in blob`   a wrapper NAMES the package it launches,
-        #                            so a shim satisfied it and the test then
-        #                            failed asserting a defect that did not
-        #                            exist.
-        #   ELF magic + bun prefix   the macOS bundle is Mach-O, so it SKIPPED
-        #                            a healthy binary -- silencing this alarm
-        #                            on two of three machines -- while a
-        #                            non-Claude `bun` (ELF, one bunfs hit)
-        #                            sailed through and failed the same way.
-        #
-        # So: bun's embedded-filesystem prefix rules out shell shims, and the
-        # package name rules out other bun binaries. Measured 131354 / 131354
-        # / 132029 and 266 / 266 / 266 across 2.1.248 / .250 / .251; `bun`
-        # itself is 1 and 0; `node` is 0 and 0.
+        # TWO CONTENT MARKERS, AND DELIBERATELY NOT AN EXECUTABLE FORMAT:
+        # the bundle is ELF on linux and Mach-O on macOS, so testing the
+        # format skips a healthy binary on half the fleet. The bun prefix
+        # rules out shell shims; the package name rules out other bun
+        # programs, which carry the prefix but not the name.
         if (b"/$bunfs/root/" not in blob
                 or b"@anthropic-ai/claude-code" not in blob):
             pytest.skip(
