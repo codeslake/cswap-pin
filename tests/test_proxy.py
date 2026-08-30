@@ -15953,16 +15953,18 @@ class TestTheSweepWillNotCloseARunningWorker:
         assert deleted == ["cse_elsewhere"]
 
 
-#: THE LONGEST BYTE-FREE WAIT A COMPLETED REPLY HAS SURVIVED, from the fleet
-#: drain watcher's corpus (n=262: p50 2s, p90 16s, p99 60s). Only completed
-#: replies are banked, so every sample is a wait that turned out to be
-#: survivable -- which is exactly the population a CUTTING threshold has to
-#: clear. Raise it when the corpus does; that is a measurement, not a tuning.
+#: THE LONGEST BYTE-FREE WAIT IN THE FLEET WATCHER'S CORPUS -- not the longest
+#: ever seen. A 140s sample was reported before the corpus file existed, which
+#: is why the watcher banks them: the daemon log rotates and loses them. Only
+#: STREAMING replies that COMPLETED are banked (`_byte_gap` starts at the
+#: SECOND response byte), so this bounds that class and says nothing about a
+#: request cut before headers. Raise it when the corpus does -- but the corpus
+#: grows BECAUSE the window grew: a wait the old window cut never banked.
 _LONGEST_BYTE_FREE_WAIT_MEASURED = 123.0
 
 
 class TestTheStallPredicateOnACappedArm:
-    """`_HELD_DRAIN_SECONDS` is 30 and `_DRAIN_STALL_SECONDS` is 90, and that
+    """`_HELD_DRAIN_SECONDS` is below `_DRAIN_STALL_SECONDS`, and that
     inequality invites a wrong reading: that the predicate cannot fire inside
     the capped budget so the arm is a bare ceiling. A careful peer reached
     exactly that conclusion from the two constants.
@@ -15970,12 +15972,13 @@ class TestTheStallPredicateOnACappedArm:
     It measures from the DEBT'S last byte, not from the drain's start. A
     connection already silent for longer than the window when the drain begins
     breaks out at second 0 — which is the whole point on this arm, where every
-    second is a second with nothing serving the port.
+    second is a second with nothing serving the port. Raising the window
+    narrows that band, so the raise is paid HERE, in port-dark seconds.
 
     What it genuinely cannot do here is catch a connection that goes quiet
-    DURING the 30s. The ceiling bounds that, and shrinking the window to reach
-    inside it is refused on measurement: byte-free waits on completed replies
-    reach 123s across 262 samples (p90 16s, p99 60s).
+    DURING the capped budget. The ceiling bounds that, and shrinking the window
+    to reach inside it is refused on measurement: byte-free waits on completed
+    replies reach 123s (p90 16s, p99 60s).
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -16020,22 +16023,10 @@ class TestTheStallPredicateOnACappedArm:
         """The window must sit ABOVE the observed distribution, not inside it.
 
         `_DRAIN_STALL_SECONDS` CUTS a reply that has gone byte-silent that
-        long, and its own comment justified the value as "far past any gap a
-        live stream produces". The fleet watcher has since accumulated the
-        population that claim was guessing at -- byte-free waits banked only
-        when a reply COMPLETED, so every sample is a wait that was survivable:
-
-            n=262   p50 2s   p90 16s   p99 60s   MAX 123s
-
-        Two samples at or above 90s. At that window roughly one completed reply
-        in 128 would have been cut mid-flight by a drain that caught it in its
-        silence, which is the interruption this whole path exists to avoid.
-
-        The cost of the larger window is bounded and falls on the right side:
-        it only binds on the HANDOVER arm, where a successor is already serving
-        the port, so a wedged connection holds a process open longer and
-        nothing waits on it. On the capped arm the budget (30s) is far below
-        either value and decides on its own.
+        long, so a window a completed reply is on record as surviving cuts
+        exactly the replies at the top of the distribution -- the interruption
+        this whole path exists to avoid. The corpus is the constant above; this
+        compares the guard against a measurement rather than against itself.
         """
         from cswap_pin import proxy as pin_proxy
 
@@ -16046,9 +16037,11 @@ class TestTheStallPredicateOnACappedArm:
             "that reply would cut it")
 
     def case_CONTROL_the_window_is_not_unbounded_either(self):
-        """A window large enough to never fire is the other failure, and it is
-        the one the ten-minute budget already produced once. The point is a
-        window ABOVE the observed tail, not one detached from it."""
+        """A window large enough to never fire is the other failure. A typo
+        guard rather than a measurement -- nothing derives the multiplier --
+        and the point is a window ABOVE the observed tail, not detached from
+        it. NOT the ten-minute drain CEILING that cut 12 replies: that is a
+        different constant and it is now deliberately infinite."""
         from cswap_pin import proxy as pin_proxy
 
         assert pin_proxy._DRAIN_STALL_SECONDS <= 4 * _LONGEST_BYTE_FREE_WAIT_MEASURED, (

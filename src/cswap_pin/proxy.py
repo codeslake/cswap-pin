@@ -6270,30 +6270,26 @@ def drain_fate(budget: float) -> str:
             "and cuts whatever is still moving when it expires, so this is "
             "not the gapless arm")
 
-# A drainer's marker outlives its own longest wait plus the slack a supervisor
-# would allow, and no longer — a pid is reused freely, so a marker that
-# outlived its writer must never protect whoever inherits the number. Defined
-# HERE rather than beside `is_draining`, which reads it: it is derived from the
-# ceiling above and placing it 200 lines earlier made it a forward reference
-# that broke the import outright (caught by a suite that ran zero tests and
-# said so).
-#
 # NO BYTES FOR THIS LONG AND IT IS WEDGED, NOT SLOW. See `_owed_still_moving`:
 # this is what actually ends a drain now, and the budgets above are backstops
 # against a bug in that predicate.
 #
-# ABOVE THE MEASURED DISTRIBUTION, NOT INSIDE IT. This was 90s, argued as "far
-# past any gap a live stream produces" — a guess, made before the population
-# existed. The fleet watcher's corpus of byte-free waits banked on COMPLETED
-# replies (so every sample survived one) says otherwise: n=262, p50 2s, p90
-# 16s, p99 60s, MAX 123s, with two samples at or above the old value. A window
-# a completed reply has been observed to exceed CUTS about one such reply in
-# 128, which is the interruption this path exists to prevent.
+# ABOVE THE MEASURED DISTRIBUTION, NOT INSIDE IT. The fleet watcher banks the
+# byte-free wait each COMPLETED reply survived — p90 16s, p99 60s, max 123s —
+# so a window inside that distribution cuts the replies at its top.
 #
-# The cost of the larger window falls on the right side. It binds only on the
-# HANDOVER arm, where a successor already holds the port: a wedged connection
-# keeps one idle process alive longer and nothing waits on it. The capped arm's
-# budget is 30s, far below either value, and decides there on its own.
+# THE CORPUS SEES ONLY STREAMING REPLIES. `_byte_gap` is written from the
+# SECOND response byte on, so a request that never produced one banks nothing
+# — yet this window governs it too, aged from its arrival by the
+# `_content_at` fallback in `_owed_still_moving`. For that class the number is
+# an assumption, not a measurement, and the cuts on record are all of it.
+#
+# IT BINDS ON BOTH ARMS. On the handover arm a successor already holds the
+# port, so a wedged connection only keeps an idle process alive. On the HELD
+# arm the port is dark: a debt already silent this long when the drain starts
+# no longer breaks out at second 0, it spends the full `_HELD_DRAIN_SECONDS`.
+# That is the trade — 30s of queued arrivals against cutting a reply the corpus
+# says completes.
 _DRAIN_STALL_SECONDS = 180.0
 #: THE CLIENT'S OWN LIVENESS TIMEOUT, read out of the 2.1.245 bundle rather
 #: than chosen: `resetLivenessTimer(){ ... setTimeout(this.onLivenessTimeout,
@@ -11851,20 +11847,19 @@ class PinProxy:
                 # so all four combinations of its arguments return 30.0. The
                 # fact has to be re-read HERE, where it can change mid-wait.
                 promoted = budget == float("inf")
-                # WHAT THE PREDICATE BUYS ON A CAPPED ARM, because 30 < 90
-                # invites the reading that it buys nothing and a careful reader
-                # reached exactly that. `_owed_still_moving` measures from the
-                # DEBT'S last byte, not from this drain's start, so a
-                # connection already silent for 90s when the drain begins
-                # breaks out at second 0 — measured. That is the whole point
-                # here: never spend a capped budget of port-dark time on
-                # something that was wedged before we started.
+                # WHAT THE PREDICATE BUYS ON A CAPPED ARM, because
+                # `_HELD_DRAIN_SECONDS` < `_DRAIN_STALL_SECONDS` invites the
+                # reading that it buys nothing and a careful reader reached
+                # exactly that. `_owed_still_moving` measures from the DEBT'S
+                # last byte, not from this drain's start, so a connection
+                # already silent longer than the WINDOW when the drain begins
+                # breaks out at second 0 — measured. Raising the window narrows
+                # that band, which is where the raise costs port-dark seconds.
                 #
-                # What it cannot do on this arm is catch a connection that goes
-                # quiet DURING the 30s, and it does not need to: the ceiling is
-                # what bounds that, and shrinking the window to reach inside it
-                # is refused elsewhere on measurement — byte-free waits reach
-                # 23s on healthy traffic.
+                # What it cannot do here is catch a connection that goes quiet
+                # DURING the budget. The ceiling bounds that, and shrinking the
+                # window to reach inside it is refused on measurement: byte-free
+                # waits on completed replies reach 123s.
                 while time.monotonic() < deadline:
                     if not self._owed_still_moving(started):
                         break
