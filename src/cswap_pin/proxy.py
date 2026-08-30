@@ -2918,6 +2918,17 @@ def is_pinned_route(path: str) -> bool:
     # makes every credential resolve to the pin and the guard against storing
     # a foreign credential under a slot agrees with anything. The launch hook
     # repairs the field instead.
+    #
+    # AND THE PRICE OF THAT EXCLUSION, STATED HERE SO IT IS NOT REDISCOVERED AS
+    # A BUG SOMEWHERE ELSE. `/login` reads ``oauthAccount`` once before the
+    # sign-in and once after, and disconnects Remote Control when the two
+    # differ. Before is whatever the splice left — the PIN. After is this
+    # route's unswapped answer — the account just signed in. So a `/login` into
+    # anything but the pinned account ends "Login successful. Remote Control
+    # disconnected." and archives the conversation. Nothing in that comparison
+    # is the bridge pointer, so it is not a carry fault and no carry can
+    # prevent it; the only lever is this exclusion, and the objection above is
+    # why it stands.
     # ``/api/claude_code/policy_limits`` IS THE ROUTE THAT DECIDES WHETHER
     # REMOTE CONTROL IS ALLOWED AT ALL, and a wrong answer here is permanent.
     # Claude Code polls it hourly and feeds the answer into `setSessionCache`,
@@ -4386,7 +4397,33 @@ def titles_to_restore(
     Only a DIFFERENCE is worth a request. This runs on every RC connect, so
     rewriting titles that already match would put one PUT per live session on
     the wire every time any one of them opens a bridge.
+
+    ``ours`` and ``invented`` DEFAULT TO ARMED, and that default is the fix
+    rather than a convenience. cswap's own copy of this repair reaches here
+    through a TWO-PARAMETER shim, so both arrived as None on the caller that
+    actually fired -- and None disarms both guards below. Measured: the daemon,
+    passing both, skipped the bridge; the other caller put the invented name
+    back over one a person had typed, twice in a row, on a machine whose daemon
+    was running the provenance fix. Both facts are readable here with no
+    argument, so the policy lives in one place rather than in whichever caller
+    remembers to pass it.
+
+    The walk is paid only by the caller that supplies neither -- the daemon
+    passes both and never reaches it -- so this costs one registry read per
+    pass of that caller's own cadence, not one per RC connect.
     """
+    # A HOST WE CANNOT REACH LEAVES THE DEFAULT WHERE IT WAS. `require` raises
+    # when cswap is not importable, and refusing every restore on that is worse
+    # than the state this widens.
+    if ours is None or invented is None:
+        try:
+            if ours is None:
+                ours = _titles_we_wrote(
+                    Path(require("paths").get_backup_root()) / "pin-proxy")
+            if invented is None:
+                invented = invented_bridge_names()
+        except Exception:  # noqa: BLE001 — no host, no provenance to read
+            pass
     out: list[tuple[str, str]] = []
     for item in sessions:
         sid = item.get("id")

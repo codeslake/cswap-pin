@@ -2839,8 +2839,83 @@ class TestARenameIsRespectedWhereverItWasMade:
     def _sessions(self, title):
         return [{"id": "b1", "title": title}]
 
+    def _plant_invented(self, tmp_path, bridge):
+        """A LIVE local record saying Claude Code invented this name.
+
+        `pid` is this process because `_live_bridge_records` filters on a live
+        pid: a record without one is invisible, and the case would then pass
+        for the wrong reason.
+        """
+        d = tmp_path / "claude-home" / "sessions"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": "s", "bridgeSessionId": bridge,
+             "name": "dotfiles-80", "nameSource": "derived"}))
+
+    def _plant_ledger(self, tmp_path, bridge, title):
+        """A titles-written entry where the daemon keeps one."""
+        d = tmp_path / "data-home" / "claude-swap" / "pin-proxy"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "titles-written.json").write_text(json.dumps({bridge: title}))
+
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
+
+    def case_the_two_arg_caller_still_reads_provenance(self, tmp_path):
+        """THE CALLER THAT ACTUALLY REVERTED THE NAME PASSES NEITHER GUARD.
+
+        cswap's own copy of this repair reaches here through a TWO-PARAMETER
+        shim -- `titles_to_restore(sessions, names)` -- so `ours` and
+        `invented` both take their defaults, and a default of "unknown"
+        disarms both guards. That is the caller that fired: the daemon, passing
+        both, skipped this bridge, while the other put the invented name back
+        over the one a person had typed, twice in a row, on a machine whose
+        daemon was running the provenance fix.
+
+        So the default cannot be "no provenance". Both facts are readable from
+        this machine with no argument, and reading them is what keeps the
+        policy in one place instead of in whoever remembers to pass it.
+        """
+        from cswap_pin.proxy import titles_to_restore
+
+        self._plant_invented(tmp_path, "b1")
+        assert titles_to_restore(self._sessions("a-title-somebody-typed"),
+                                 self.NAMES) == []
+
+    def case_the_two_arg_caller_still_reads_the_ledger(self, tmp_path):
+        """The other half of the same hole. We PUT 'dotfiles-80'; the server
+        now says something else; nobody here changed it. Through the shim that
+        passes no ledger, that read as a bridge we had never named."""
+        from cswap_pin.proxy import titles_to_restore
+
+        self._plant_ledger(tmp_path, "b1", "dotfiles-80")
+        assert titles_to_restore(self._sessions("a-title-somebody-typed"),
+                                 self.NAMES) == []
+
+    def case_CONTROL_the_two_arg_caller_still_restores(self, tmp_path):
+        """Without this the two cases above pass on a default that refuses
+        every restore. Nothing planted, so the bridge is unknown to both
+        halves and the local name goes back on -- the population the feature
+        exists for, reached through the same two-argument door."""
+        from cswap_pin.proxy import titles_to_restore
+
+        assert titles_to_restore(self._sessions("a-title-somebody-typed"),
+                                 self.NAMES) == [("b1", "dotfiles-80")]
+
+    def case_CONTROL_the_armed_default_still_lets_a_SERVER_SLUG_through(
+        self, tmp_path, monkeypatch
+    ):
+        """State D, reached through the two-argument door rather than by
+        passing the set. Arming the default must not re-refuse the slug that
+        `_looks_generated` was added to let through, or this change undoes the
+        one before it."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import titles_to_restore
+
+        monkeypatch.setattr(pp, "_host_slug", lambda: "host-a")
+        self._plant_invented(tmp_path, "b1")
+        assert titles_to_restore(self._sessions("host-a-cozy-badger"),
+                                 self.NAMES) == [("b1", "dotfiles-80")]
 
     def case_a_DERIVED_local_name_never_overwrites_a_typed_one(self):
         """The ledger closes only the window; provenance closes the case.
