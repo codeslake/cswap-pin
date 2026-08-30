@@ -2693,6 +2693,43 @@ class TestARenameIsRespectedWhereverItWasMade:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    def case_a_DERIVED_local_name_never_overwrites_a_typed_one(self):
+        """The ledger closes only the window; provenance closes the case.
+
+        Measured on a live session: the pin's ledger held 'dotfiles-80', the
+        server title read 'dotfiles-80', and the local record read
+        `name='dotfiles-80'` with `nameSource='derived'`. The two agreed, so
+        the ledger guard could not fire, and a name Claude Code invented kept
+        landing on top of one a person had typed on claude.ai -- twice.
+
+        `derived` is the product's own record that nobody chose the name. Not a
+        shape test: the same machine's records also carry `user`, `peer` and an
+        absent field, and only this value means invented.
+        """
+        from cswap_pin.proxy import titles_to_restore
+
+        assert titles_to_restore(self._sessions("lmd42-dotfiles"), self.NAMES,
+                                 None, {"b1"}) == []
+
+    def case_CONTROL_a_derived_name_STILL_fills_a_blank_title(self):
+        """Refusing everywhere would disarm the feature. A bridge the server
+        left untitled has nothing a person could have typed, so the local name
+        goes on regardless of where it came from."""
+        from cswap_pin.proxy import titles_to_restore
+
+        assert titles_to_restore(self._sessions(""), self.NAMES,
+                                 None, {"b1"}) == [("b1", "dotfiles-80")]
+
+    def case_CONTROL_a_chosen_name_is_still_restored_over_a_slug(self):
+        """The other half: a `user` or `peer` name is not in the derived set,
+        so a server slug over it is still corrected. Without this the case
+        above passes on a guard that refuses every restore."""
+        from cswap_pin.proxy import titles_to_restore
+
+        assert titles_to_restore(self._sessions("host-a-cozy-badger"),
+                                 self.NAMES, None, set()) == [
+            ("b1", "dotfiles-80")]
+
     def case_a_slug_we_have_never_named_is_restored(self):
         """THE POPULATION THE FEATURE EXISTS FOR. An unknown bridge must still
         be restored, or the ledger disarms the fix for every session that has

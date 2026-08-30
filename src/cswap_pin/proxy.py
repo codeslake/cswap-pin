@@ -4132,6 +4132,38 @@ def ca_path_for_trust() -> "Path | None":
         return None
 
 
+def derived_bridge_names() -> set:
+    """Bridge ids whose LOCAL name is one nobody chose.
+
+    Claude Code stamps every session record with `nameSource`, and `derived`
+    means it made the name up. Across the records on one machine the field
+    takes four values -- `derived`, `user`, `peer`, and absent on older
+    records -- so this is the product's own statement about provenance, not a
+    guess from the name's shape.
+
+    ONLY `derived` COUNTS. An absent field is the common case on older records
+    and treating it as derived would disarm the restore for most sessions,
+    which is the population the feature exists for.
+    """
+    get_claude_config_home = require("paths").get_claude_config_home
+    out = set()
+    try:
+        entries = list((get_claude_config_home() / "sessions").glob("*.json"))
+    except OSError:
+        return out
+    for path in entries:
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("nameSource") != "derived":
+            continue
+        bridge = rec.get("bridgeSessionId")
+        if bridge:
+            out.update(_both_spellings(str(bridge)))
+    return out
+
+
 def live_bridge_names() -> dict[str, str]:
     """Bridge id -> the name its live session goes by, in both spellings.
 
@@ -4301,7 +4333,8 @@ def _record_title(certdir, sid: str, title: str) -> None:
 
 
 def titles_to_restore(
-    sessions: list[dict], names: dict[str, str], ours: "dict | None" = None
+    sessions: list[dict], names: dict[str, str], ours: "dict | None" = None,
+    derived: "set | None" = None,
 ) -> list[tuple[str, str]]:
     """``(bridge id, name)`` for listed bridges the server titles wrongly.
 
@@ -4353,6 +4386,17 @@ def titles_to_restore(
         # back on a named bridge: drop its entry when this proxy sees that
         # bridge's own reconnect go by.
         if ours is not None and sid in ours and current != (ours[sid] or "").strip():
+            continue
+        # A NAME NOBODY CHOSE MUST NOT OVERWRITE ONE SOMEBODY TYPED. The ledger
+        # above only protects the window between a rename and the next restore:
+        # once this pin has pushed a derived name, the ledger records it as
+        # "ours", the two agree, and the guard stops firing. A new bridge id
+        # opens the same hole from the other end, since unknown means restore.
+        #
+        # `nameSource == "derived"` is Claude Code's own record that it made
+        # the name up. A blank server title is still restored -- there is
+        # nothing to overwrite, and that is the population this exists for.
+        if derived and sid in derived and current:
             continue
         out.append((sid, want.strip()))
     return out
@@ -12839,7 +12883,8 @@ class PinProxy:
         done = 0
         certdir = getattr(self, "_certdir", None)
         ours = _titles_we_wrote(certdir)
-        for sid, want in titles_to_restore(sessions, names, ours):
+        for sid, want in titles_to_restore(
+                sessions, names, ours, derived_bridge_names()):
             body = json.dumps({"title": want}).encode("utf-8")
             if self._bridge_api(
                 "PUT", f"/v1/code/sessions/{sid}", token, body=body
