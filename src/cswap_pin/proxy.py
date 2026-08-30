@@ -10951,18 +10951,12 @@ class PinProxy:
         login = _login_identity()
         if login is None or login == getattr(self, "_login_seen", None):
             return False
-        # THE FIRST OBSERVATION IS THE ONE A RESTART LOSES. Skipping it read
-        # as "no baseline, so nothing can have changed", which is the opposite
-        # of what a daemon start means: a `/login` performed while this daemon
-        # was down has no predecessor to differ from, and every deploy recycles
-        # this daemon -- which is exactly when a person logs in. The pointer
-        # then kept naming the previous account until the NEXT login.
-        #
-        # The skip's stated cost -- a write to every live session's state file
-        # on a machine where nothing moved -- is not real: `carry_live_pointers`
-        # already returns without writing for a record whose owner equals the
-        # login, so on an unchanged machine this carries nothing. The guard was
-        # at the wrong layer, and the layer below it was already correct.
+        # NO FIRST-OBSERVATION SKIP. A `/login` made while this daemon was
+        # down has no predecessor to differ from, and every deploy recycles
+        # the daemon — so skipping the first tick loses exactly the case it
+        # matters in. Nothing is wasted on an unchanged machine either:
+        # `carry_live_pointers` already returns without writing when a
+        # record's owner equals the login.
         self._login_seen = login
         self.carry_live_pointers(login)
         return True
