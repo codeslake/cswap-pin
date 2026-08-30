@@ -4144,25 +4144,22 @@ def ca_path_for_trust() -> "Path | None":
 
 
 #: THE ONLY TWO VALUES THAT SAY A PERSON CHOSE THE NAME. Everything else in
-#: the field's domain counts as invented, which makes this a COMPLEMENT and
-#: that is the point: the bundle's validator closes the domain at `user`,
-#: `peer`, `derived`, `collision`, `auto`, `hook`, and a value added in a
-#: later release lands on the REFUSING side rather than slipping through
-#: silently. An allow-list of invented values expires the day the product
-#: adds one; this does not.
+#: the field's closed domain (`derived`, `collision`, `auto`, `hook`) counts
+#: as invented, and stating it as a COMPLEMENT is the point: a value added in
+#: a later release lands on the REFUSING side instead of slipping through. An
+#: allow-list of invented values expires the day the product adds one.
 #:
-#: `peer` is literally a `user` name relayed -- the sync that writes this
-#: field into the session registry maps it, `Ne==="user"?"peer":Ne`.
+#: That is the safe side because the errors are not symmetric — restoring
+#: wrongly OVERWRITES a name somebody typed, refusing wrongly only leaves a
+#: server title in place — and refusing is cheap here, since a server SLUG is
+#: restored either way (`_looks_generated`, at the call site).
 #:
-#: THE ASYMMETRY IS WHY THE UNKNOWN GOES HERE. Restoring wrongly OVERWRITES a
-#: name somebody typed; refusing wrongly only leaves a server title in place.
-#: And refusing costs less than it looks, because a server SLUG is restored
-#: either way -- see `_looks_generated` at the call site.
+#: `peer` is a `user` name relayed: the sync that writes this field into the
+#: session registry maps it, `Ne==="user"?"peer":Ne`.
 #:
-#: An ABSENT field is not in either list and is treated as CHOSEN. It does not
-#: say the name was invented, and it is the majority of records: creation
-#: writes `source` only for a named or an interactive session, so a
-#: non-interactive unnamed one is stamped absent by current code.
+#: ABSENT is in neither list and counts as chosen. It does not say the name
+#: was invented, and it is the majority — creation writes `source` only for a
+#: named or an interactive session.
 _CHOSEN_NAME_SOURCES = ("user", "peer")
 
 
