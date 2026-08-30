@@ -13078,6 +13078,27 @@ class TestTheDaemonRepairsItsOwnWiring:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    def _dead_port(self, avoid):
+        """A port that genuinely refuses, and that is NOT ``avoid``.
+
+        `bind(0)` draws from the ephemeral range, and on linux that range
+        (32768-60999) CONTAINS the 36301 these cases use as the daemon's port;
+        on macOS (49152-65535) it does not. A draw that collides makes
+        `_wired_port() == port` true in `_is_claimed`, which short-circuits to
+        "already wired" and never reaches the repair -- so the case asserting
+        the claim check reaches it fails with `[] == [36301]`, on linux only
+        and roughly once in 28k draws. Reproduced by forcing the collision.
+        """
+        import socket
+
+        while True:
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()  # genuinely refusing
+            if port != avoid:
+                return port
+
     def _ours(self, tmp_path, monkeypatch, port):
         """A daemon record owned by THIS process, on ``port``."""
         from cswap_pin import proxy
@@ -13089,14 +13110,9 @@ class TestTheDaemonRepairsItsOwnWiring:
         return certdir
 
     def case_a_wiring_naming_a_DEAD_port_is_repaired(self, tmp_path, monkeypatch):
-        import socket
-
         from cswap_pin import proxy
 
-        dead = socket.socket()
-        dead.bind(("127.0.0.1", 0))
-        dead_port = dead.getsockname()[1]
-        dead.close()  # genuinely refusing
+        dead_port = self._dead_port(36301)
 
         certdir = self._ours(tmp_path, monkeypatch, 36301)
         # This daemon WAS the pin's: the wiring named it before it broke. That
@@ -13128,14 +13144,9 @@ class TestTheDaemonRepairsItsOwnWiring:
         daemon this repair exists for HAD one and lost it; an orphan never had
         one at all.
         """
-        import socket
-
         from cswap_pin import proxy
 
-        dead = socket.socket()
-        dead.bind(("127.0.0.1", 0))
-        dead_port = dead.getsockname()[1]
-        dead.close()
+        dead_port = self._dead_port(36301)
 
         certdir = self._ours(tmp_path, monkeypatch, 36301)
         # never wired: an orphan. No marker file is written.
@@ -13198,14 +13209,9 @@ class TestTheDaemonRepairsItsOwnWiring:
     ):
         """Only the daemon named by the record may claim the wiring. Otherwise
         two daemons repair to two different ports, forever."""
-        import socket
-
         from cswap_pin import proxy
 
-        dead = socket.socket()
-        dead.bind(("127.0.0.1", 0))
-        dead_port = dead.getsockname()[1]
-        dead.close()
+        dead_port = self._dead_port(36301)
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True, exist_ok=True)
@@ -13231,14 +13237,9 @@ class TestTheDaemonRepairsItsOwnWiring:
         """A capability with no caller is the defect this whole evening kept
         finding. `_is_claimed` runs every few seconds from watch_refcount, so
         the repair must be wired into it — not merely defined."""
-        import socket
-
         from cswap_pin import proxy
 
-        dead = socket.socket()
-        dead.bind(("127.0.0.1", 0))
-        dead_port = dead.getsockname()[1]
-        dead.close()
+        dead_port = self._dead_port(36301)
 
         certdir = self._ours(tmp_path, monkeypatch, 36301)
         monkeypatch.setattr(proxy, "_wired_port", lambda: dead_port)
