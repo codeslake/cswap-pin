@@ -3494,8 +3494,10 @@ def _live_bridge_records() -> list[tuple[str, str | None, str | None]]:
     """``(bridge id, name, nameSource)`` for every session alive here.
 
     A record alone is not liveness: Claude Code leaves the file behind when a
-    session dies, so the registry accumulates. Measured here: 562 records, 293
-    of them still ``connected`` server-side, 16 with a process.
+    session dies, so the registry accumulates — once measured at 562 records
+    against 16 live processes. Treat the ratio as the point and not the
+    numbers: the same host later read 16 records with 15 alive, so a census
+    frozen here goes stale faster than anyone rereads it.
 
     The name comes back unfiltered — ``None`` included — because the three
     callers need different things from it and one of them must not drop a
@@ -4157,9 +4159,15 @@ def ca_path_for_trust() -> "Path | None":
 #: `peer` is a `user` name relayed: the sync that writes this field into the
 #: session registry maps it, `Ne==="user"?"peer":Ne`.
 #:
-#: ABSENT is in neither list and counts as chosen. It does not say the name
-#: was invented, and it is the majority — creation writes `source` only for a
-#: named or an interactive session.
+#: ABSENT is in neither list and counts as chosen — and the bundle agrees:
+#: its own "does this have a chosen name" formatter reads
+#: `nameSource===void 0||nameSource==="user"||nameSource==="peer"`, which is
+#: this tuple plus absent.
+#:
+#: Absent is also the MAJORITY, by mechanism rather than by census: creation
+#: persists `nameSource:C?.source==="derived"?"derived":void 0`, so only an
+#: interactive session keeps a value — a session named explicitly with
+#: `--name` builds `source:"user"` and then lands with the field ABSENT.
 _CHOSEN_NAME_SOURCES = ("user", "peer")
 
 
@@ -4170,6 +4178,11 @@ def invented_bridge_names() -> set[str]:
     product's own statement about provenance rather than a guess from the
     name's shape. `_CHOSEN_NAME_SOURCES` says which values do NOT.
 
+    TWO VALIDATORS SHIP AND THIS READS THE REGISTRY ONE. The session-registry
+    parser closes the domain at six values; a separate zod schema for JOB
+    state allows only `user`, `auto`, `collision`. Anyone grepping will find
+    both, so: the six-value list is the one that governs the file read here.
+
     AN ABSENT FIELD IS NOT COUNTED, and it is not a legacy tail. Measured on
     one host: it was the MAJORITY of records, every one of them with a live
     process, and it held BOTH ends of the age range -- so it is not a tail
@@ -4177,8 +4190,10 @@ def invented_bridge_names() -> set[str]:
     SAY the name was invented, and counting it would refuse the restore for
     most live sessions, which is the population the feature exists for.
 
-    That last part is this side's judgement, not the bundle's position: the
-    bundle's own job-state sync reads an absent field AS `auto`.
+    The bundle holds BOTH positions on absent, so this is a choice between
+    them rather than a reading of one: its label formatter groups absent with
+    `user` and `peer` (the half this follows), while its job-state sync reads
+    an absent field as `auto`.
     """
     return {spelling
             for bridge, _name, source in _live_bridge_records()
@@ -4211,19 +4226,19 @@ def live_bridge_names() -> dict[str, str]:
 # RETIRED, deliberately not left behind as a helper nobody calls. It matched
 # any lowercase-hyphen-word-word string with no anchor, so it claimed
 # `ai-inter-session` — a name the user chose — was the server's. See
-# `_looks_generated`, which is now anchored on this machine's host slug, and
-# `server_generated_titles`, which reads what Claude Code recorded instead of
-# inferring it.
+# `_looks_generated`, which is now anchored on this machine's host slug.
 
 
 def _looks_generated(title: str) -> bool:
     """A SLUG the server minted for a nameless bridge.
 
-    NARROWED TO THE ONE SHAPE THAT HAS NO RECORD. `ai-title` covers the
-    sentences Claude Code wrote from a conversation, and
-    `server_generated_titles` reads them — but the slug a bridge gets when it
-    has no name at all (`host-a-cozy-badger`) is minted SERVER-SIDE and
-    never lands in a transcript, so nothing local records it.
+    NARROWED TO THE ONE SHAPE ANYTHING CAN RECOGNISE. A slug a bridge gets
+    when it has no name at all (`host-a-cozy-badger`) is minted SERVER-SIDE
+    and never lands in a transcript, so nothing local records it — the
+    anchor below is all there is. The SENTENCES claude.ai writes for an
+    active bridge are recorded nowhere either, and no reader of them survives
+    in this package, so this answers False for those and callers must say
+    what they do about it.
 
     The two rules that used to live here are gone. The `" " in title` rule
     claimed every title with a space was the server's, which overwrote
@@ -4237,6 +4252,14 @@ def _looks_generated(title: str) -> bool:
     no edit here — the failure mode of a hardcoded list is that it goes stale
     the first time a host is renamed.
 
+    AND BOUNDED AT EXACTLY TWO TRAILING SEGMENTS. The suffix used to be `+`,
+    which was harmless while nothing called this and became a defect the
+    moment the title guard did: `<host>-notes` is not a slug, and reading it
+    as one lets the restore overwrite a name somebody typed. Every server
+    slug on record here has two — cozy-badger, curious-torvalds,
+    misty-crayon, robust-dream, serene-unicorn, eventual-cake, inbound-demo.
+    A slug of some other shape now merely stays, which is the cheap error.
+
     A blank title counts: there is nothing to overwrite.
     """
     title = title.strip()
@@ -4245,7 +4268,7 @@ def _looks_generated(title: str) -> bool:
     host = _host_slug()
     if not host:
         return False
-    return bool(re.match(rf"^{re.escape(host)}(?:-[a-z0-9]+)+$", title))
+    return bool(re.match(rf"^{re.escape(host)}(?:-[a-z0-9]+){{2}}$", title))
 
 
 def _host_slug() -> str:
@@ -4414,8 +4437,12 @@ def titles_to_restore(
         # `_looks_generated` is already this file's test for "the server
         # minted this", and it answers True for a blank title too, so it
         # subsumes the blank carve-out instead of adding a second rule.
-        # Without it the guard also refused a server SLUG, which is the exact
-        # population the restore exists for.
+        # Without it the guard also refused a server SLUG, which is MOST of
+        # the population the restore exists for -- not all: a server-written
+        # SENTENCE is still refused here, because nothing local records that
+        # the server wrote it. Measured in this file's own sample, that is 2
+        # of 8. A shape test for sentences was tried before and claimed names
+        # people had chosen; leaving those uncorrected is the cheaper error.
         if invented and sid in invented and not _looks_generated(current):
             continue
         out.append((sid, want.strip()))

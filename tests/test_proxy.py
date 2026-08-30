@@ -757,8 +757,11 @@ class TestLiveRemoteControlSessions:
         """`derived` IS NOT THE ONLY INVENTED VALUE -- `auto` is one too.
 
         THE DOMAIN IS SIX VALUES PLUS ABSENT, not four. Read out of the
-        shipped 2.1.251 bundle, which validates the field against exactly this
-        list and normalises anything else away::
+        shipped 2.1.251 bundle's SESSION-REGISTRY parser, which closes the
+        domain at these six and normalises anything else away (a separate zod
+        schema for JOB state allows only three -- `user`, `auto`,
+        `collision` -- so a grep finds two validators; this file reads the
+        registry)::
 
             nameSource:o.nameSource==="user"||o.nameSource==="peer"
               ||o.nameSource==="derived"||o.nameSource==="collision"
@@ -789,11 +792,15 @@ class TestLiveRemoteControlSessions:
         the UNFILTERED registry -- reading it through `_live_bridge_records`
         would make "has a live process" the population's own definition, which
         cannot fail -- absent was the majority and held BOTH ends of the age
-        range. The mechanism says it without a census: creation writes
-        `source` only for a named or an interactive session, so a
-        non-interactive unnamed one is stamped absent by CURRENT code. It is
-        excluded because counting it would refuse the restore for most live
-        sessions, which is the population the feature exists for.
+        range. The MECHANISM says it without a census: creation persists
+        `nameSource:C?.source==="derived"?"derived":void 0`, so only an
+        INTERACTIVE session keeps a value -- a session named explicitly with
+        `--name` builds `source:"user"` and lands with the field ABSENT. So
+        absent frequently means a person named it, which is exactly why
+        counting it as invented would refuse the restore for most live
+        sessions. The bundle agrees: its label formatter reads
+        `nameSource===void 0||nameSource==="user"||nameSource==="peer"` as the
+        chosen set.
 
         THE READ IS PID-FILTERED like every other read of this registry. The
         set is consulted only for a bridge `live_bridge_names` has already
@@ -2752,6 +2759,57 @@ class TestPeekStatusHandsBackEveryByteItTook:
         assert _peek_status(self.Sock(b"")) == (None, b"")
 
 
+class TestTheGuardsOnlyInputStillExists:
+    """`nameSource` IS A THIRD-PARTY FIELD AND THE GUARD HAS NO OTHER INPUT.
+
+    If a Claude Code release renames or drops it, `invented_bridge_names()`
+    returns the empty set, `if invented` is falsy, and the title guard becomes
+    a silent no-op -- the pin resumes overwriting names people typed, with the
+    whole suite still green. Every other case here writes its own fixture
+    records containing `nameSource`, so they verify our PARSER against our own
+    fixture and cannot fail for that reason.
+
+    NOT a `needs_host_seam` case: that marker means an unreleased
+    `claude_swap` seam, a different thing. This reads the installed Claude
+    binary and SKIPS where there is none, which is CI -- visibly, so a skip is
+    not mistaken for a pass.
+    """
+
+    def test_the_shipped_bundle_still_stamps_nameSource(self):
+        import re
+        import shutil
+        from pathlib import Path
+
+        import pytest
+
+        exe = shutil.which("claude")
+        if not exe:
+            pytest.skip("no `claude` on PATH -- nothing to check the seam against")
+        binary = Path(exe).resolve()
+        if not binary.is_file():
+            pytest.skip(f"`claude` does not resolve to a file: {binary}")
+        blob = binary.read_bytes()
+
+        # THE CONTROL FIRST. A 200MB binary that answers 0 for everything is
+        # an unreadable instrument, not a changed product, and the two must
+        # not report the same way.
+        assert blob.count(b"anthropic") > 0, (
+            f"read {len(blob)} bytes of {binary.name} and found no "
+            "'anthropic' -- the instrument is broken, not the product")
+
+        assert blob.count(b"nameSource") > 0, (
+            "the shipped bundle no longer mentions `nameSource`, which is the "
+            "ONLY input to the title-restore provenance guard. The guard is "
+            "now a silent no-op and will overwrite names people typed.")
+
+        # The two values the guard treats as CHOSEN. If the product stops
+        # emitting them the complement swallows everything.
+        for value in (b'"user"', b'"peer"'):
+            assert re.search(rb"nameSource[^A-Za-z0-9_]{0,4}" + value, blob), (
+                f"no `nameSource` site carries {value.decode()} any more -- "
+                "`_CHOSEN_NAME_SOURCES` no longer matches what ships")
+
+
 class TestARenameIsRespectedWhereverItWasMade:
     """The restore may overwrite a title IT wrote, and nothing else.
 
@@ -2828,6 +2886,37 @@ class TestARenameIsRespectedWhereverItWasMade:
         assert titles_to_restore(self._sessions("host-a-cozy-badger"),
                                  self.NAMES, None, {"b1"}) == [
             ("b1", "dotfiles-80")]
+
+    def case_a_host_PREFIXED_name_a_person_typed_is_NOT_a_slug(
+        self, monkeypatch
+    ):
+        """The permissive arm has to be BOUNDED or it eats what it protects.
+
+        `_looks_generated` anchored `^{host}(?:-[a-z0-9]+)+$` -- an unbounded
+        suffix -- so ANY title beginning with this machine's host slug read as
+        server-minted and the restore overwrote it. Measured before the
+        bound: `host-a-notes` and `host-a-cswap-pin-review-2026` both
+        RESTORED, replacing a name somebody typed with an invented one, which
+        is the single thing this guard exists to prevent. The predicate had
+        NO production caller until it became this guard's permissive arm, so
+        its looseness had never decided anything.
+
+        EXACTLY TWO TRAILING SEGMENTS, because that is every server slug on
+        record here: cozy-badger, curious-torvalds, misty-crayon,
+        robust-dream, serene-unicorn, eventual-cake, inbound-demo -- 7 of 7.
+        Erring tight errs toward REFUSING, this file's cheap side: a slug of
+        some other shape would merely stay, where a loose anchor destroys a
+        title instead.
+        """
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import titles_to_restore
+
+        monkeypatch.setattr(pp, "_host_slug", lambda: "host-a")
+        for typed in ("host-a-notes", "host-a-cswap-pin-review-2026"):
+            assert titles_to_restore(self._sessions(typed), self.NAMES,
+                                     None, {"b1"}) == [], (
+                f"{typed!r} begins with the host slug but nobody minted it "
+                "that way -- restoring over it destroys a typed name")
 
     def case_CONTROL_a_derived_name_STILL_fills_a_blank_title(self):
         """Refusing everywhere would disarm the feature. A bridge the server
