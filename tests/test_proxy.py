@@ -711,6 +711,27 @@ class TestLiveRemoteControlSessions:
 
         assert live_remote_control_sessions() == ["with-rc"]
 
+    def case_a_pointer_cleared_on_teardown_is_still_listed(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SESSION THIS WARNING IS FOR. `cswap pin` uses this list to say
+        which open Remote Control sessions a re-pin cannot move. A teardown
+        blanks the registry pointer and CC does not rewrite it when the bridge
+        returns, so requiring that copy dropped the session and the warning
+        went quiet — reading as "nothing is affected" rather than as a session
+        it could not see."""
+        from cswap_pin.proxy import live_remote_control_sessions
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps(
+            {"sessionId": "a", "name": "torn-off", "bridgeSessionId": None,
+             "jobId": "j1"}))
+        jobs = d.parent / "jobs" / "j1"
+        jobs.mkdir(parents=True)
+        (jobs / "state.json").write_text(json.dumps({"bridgeSessionId": "cse_x"}))
+
+        assert live_remote_control_sessions() == ["torn-off"]
+
     def case_unreadable_registry_is_not_an_error(self, tmp_path, monkeypatch):
         from cswap_pin.proxy import live_remote_control_sessions
 
@@ -16999,6 +17020,23 @@ class TestObservedBridgeOwners:
         home = self._home(
             tmp_path,
             [{"bridgeSessionId": "cse_a", "pid": 4242, "jobId": "j1"}],
+            {"j1": {"bridgeSessionId": "cse_a",
+                    "bridgeOwnerOrganizationUuid": "org-2"}},
+        )
+        P = self._wire(monkeypatch, home)
+        assert P.observed_bridge_owners() == {"cse_a": "org-2"}
+
+    def case_a_pointer_cleared_on_teardown_still_reports_its_org(
+        self, tmp_path, monkeypatch
+    ):
+        """THE POPULATION THIS READER WAS DROPPING. Claude Code clears the
+        registry's `bridgeSessionId` on RC teardown and does not rewrite it
+        when the bridge returns, so requiring that copy here silently removed
+        exactly the sessions a cross-org warning most needs to name -- and an
+        omission on this path reads as agreement, not as an open question."""
+        home = self._home(
+            tmp_path,
+            [{"bridgeSessionId": None, "pid": 4242, "jobId": "j1"}],
             {"j1": {"bridgeSessionId": "cse_a",
                     "bridgeOwnerOrganizationUuid": "org-2"}},
         )

@@ -3477,12 +3477,20 @@ def live_remote_control_sessions() -> list[str]:
     Claude Code records one file per live session with a ``bridgeSessionId``
     that is set only while RC is connected. Best-effort: an unreadable or
     absent registry just yields nothing.
+
+    THE CLEARED POINTER COUNTS TOO, and this is the reader where omitting it
+    costs the most: a teardown blanks that field and CC does not rewrite it
+    when the bridge returns, so the session this exists to WARN about would
+    drop out and `cswap pin` would report nothing to reconnect. Silence here
+    is read as "nothing is affected", which is the one answer it must not give
+    by accident. ``_live_bridge_records`` states the job-record join.
     """
     get_claude_config_home = require("paths").get_claude_config_home
+    home = get_claude_config_home()
 
     names: list[str] = []
     try:
-        entries = sorted((get_claude_config_home() / "sessions").glob("*.json"))
+        entries = sorted((home / "sessions").glob("*.json"))
     except OSError:
         return names
     for path in entries:
@@ -3490,7 +3498,13 @@ def live_remote_control_sessions() -> list[str]:
             rec = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(rec, dict) and rec.get("bridgeSessionId"):
+        if not isinstance(rec, dict):
+            continue
+        bridge, job = rec.get("bridgeSessionId"), rec.get("jobId")
+        if not bridge and job:
+            st = _read_json(home / "jobs" / str(job) / "state.json")
+            bridge = (st or {}).get("bridgeSessionId")
+        if bridge:
             names.append(str(rec.get("name") or rec.get("sessionId") or path.stem))
     return names
 
@@ -4245,9 +4259,11 @@ def live_bridge_names() -> dict[str, str]:
     after one `cc-update --apply --force`: 'Session interrupted by user' twice
     and six 'host-a-<word>-<word>', for sessions that all had names.
 
-    This registry is the one place both halves live in a single record, keyed
-    by a pid that says whether the session is still there. No cwd to resolve,
-    no branch signature to match, no ambiguity to decline.
+    This registry is where both halves meet, keyed by a pid that says whether
+    the session is still there — one record, or that record plus the job one
+    it names once a teardown has cleared the pointer (see
+    ``_live_bridge_records``). No cwd to resolve, no branch signature to
+    match, no ambiguity to decline.
     """
     names: dict[str, str] = {}
     for bridge, name, _src in _live_bridge_records():
@@ -12994,8 +13010,10 @@ class PinProxy:
         and a reconnect on another machine produced 'host-b-curious-
         torvalds' for a session called `slack`.
 
-        The registry is the exact pairing — name, bridge id and owning pid in
-        one record — so nothing here guesses from cwd, branch or timing.
+        The registry is the exact pairing — a name and an owning pid, with the
+        bridge id from that record or, after a teardown cleared it, from the
+        job record it names — so nothing here guesses from cwd, branch or
+        timing.
 
         Renamed items are updated IN PLACE because the caller's close pass
         matches on title: leaving it reading the stale listing would decide
