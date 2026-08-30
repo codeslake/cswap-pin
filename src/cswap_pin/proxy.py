@@ -3522,9 +3522,8 @@ def _live_bridge_records() -> list[tuple[str, str | None, str | None]]:
     it -- bounded at one sweep, since ``clear_dead_bridge_records`` writes
     ``""`` there for a bridge the listing no longer carries.
 
-    SORTED, so two registry records naming one job (a resume leaves the old
-    one beside the new) resolve the same way every walk instead of in glob
-    order.
+    SORTED, because a resume leaves the old registry record beside the new one
+    and the join can make both resolve to one bridge.
     """
     get_claude_config_home = require("paths").get_claude_config_home
 
@@ -4123,11 +4122,10 @@ def observed_bridge_owners() -> dict[str, str | None]:
                             rec.get("jobId"))
         if not isinstance(pid, int) or not _pid_alive(pid):
             continue
-        # THE SAME CLEARED POINTER `_live_bridge_records` RECOVERS. Requiring
-        # the registry copy here dropped exactly the sessions whose bridge had
-        # been torn off and remade, and this feeds a cross-org WARNING — so the
-        # omission reads as agreement rather than as an unanswered question,
-        # which is the failure the `None` return below exists to avoid.
+        # THE SAME CLEARED POINTER `_live_bridge_records` RECOVERS, and this
+        # one feeds a cross-org WARNING — so dropping the session reads as
+        # agreement rather than as an unanswered question, the failure the
+        # `None` return below already exists to avoid.
         st = _read_json(home / "jobs" / str(job) / "state.json") if job else None
         bridge = bridge or (st or {}).get("bridgeSessionId")
         if not bridge:
