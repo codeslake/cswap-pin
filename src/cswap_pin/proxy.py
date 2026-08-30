@@ -2677,12 +2677,10 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 # shipped bundle: ONE Authorization builder serves all nine call sites,
 # `pollForWork` included, so "from one header builder" cannot separate them.
 # What separates them is the 401-refresh wrapper, the sole `getAccessToken()`
-# caller IN THE RC CLIENT: the lifecycle calls go through it and the `work/`
-# ones take a token as an argument instead. Scope matters for anyone checking
-# this -- the binary also bundles unrelated auth libraries defining and calling
-# a method of the same name, so a bare grep answers 33 and reproduces nothing. The earlier wording said the `work/` calls "do NOT",
-# which is true of the bearer and false of the builder, and reads as the
-# second.
+# caller IN THE RC CLIENT: the lifecycle calls go through it, the `work/` ones
+# take a token as an argument. Scope is load-bearing for anyone rechecking
+# this -- the binary also bundles unrelated auth libraries defining a method
+# of the same name, so a bare grep answers 33 and reproduces nothing.
 #
 # `?beta=true` IS THE DISCRIMINATOR AND IT IS LOAD-BEARING. The managed-agents
 # SDK shares this subtree, spells every one of its environment calls with that
@@ -2691,9 +2689,12 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 _ENV_BRIDGE = re.compile(
     r"^/v1/environments"
     # THE COLLECTION IS A READ, and it belongs here for the reason
-    # `/v1/sessions` does: asked as the active account it answers 200 with the
-    # wrong account's environments, so the pinned machines are simply absent
-    # and nothing looks broken. Listing creates nothing and mints nothing.
+    # `/v1/sessions` does. REASONED BY ANALOGY, NOT TRACED HERE: the 200 with
+    # the wrong account's contents was measured on `/v1/sessions` (see that
+    # route's own note), and the same shape is EXPECTED here -- the pinned
+    # machines simply absent, nothing looking broken. The decision does not
+    # rest on it either way: listing creates nothing and mints nothing, so
+    # there is no ownership to get wrong by including it.
     r"(?:$|\?"
     r"|/(?:bridge(?:/|$|\?)"
     r"|[^/?]+/bridge/reconnect(?:/|$|\?)))"
@@ -4142,26 +4143,27 @@ def ca_path_for_trust() -> "Path | None":
         return None
 
 
-#: WHICH `nameSource` VALUES MEAN NOBODY CHOSE THE NAME. The bundle's
-#: validator fixes the domain at `user`, `peer`, `derived`, `collision`,
-#: `auto`, `hook`, plus absent, so this is a subset of a closed set.
+#: THE ONLY TWO VALUES THAT SAY A PERSON CHOSE THE NAME. Everything else in
+#: the field's domain counts as invented, which makes this a COMPLEMENT and
+#: that is the point: the bundle's validator closes the domain at `user`,
+#: `peer`, `derived`, `collision`, `auto`, `hook`, and a value added in a
+#: later release lands on the REFUSING side rather than slipping through
+#: silently. An allow-list of invented values expires the day the product
+#: adds one; this does not.
 #:
-#: `auto` is where the product INVENTS a name for a session that has none;
-#: `derived` only where it takes one from an interactive session's cwd. So a
-#: `derived`-only guard missed every never-named session.
+#: `peer` is literally a `user` name relayed -- the sync that writes this
+#: field into the session registry maps it, `Ne==="user"?"peer":Ne`.
 #:
-#: `collision` is in because it ERASES the provenance it replaces: the
-#: suffix-appending function overwrites `nameSource` unconditionally, and runs
-#: on the record stamped `auto` one statement earlier, leaving nothing on disk
-#: to say whether the base name was invented or chosen. The tie goes to
-#: refusing because the errors are not symmetric — restoring wrongly
-#: OVERWRITES a name somebody typed, refusing wrongly only leaves a server
-#: title in place.
+#: THE ASYMMETRY IS WHY THE UNKNOWN GOES HERE. Restoring wrongly OVERWRITES a
+#: name somebody typed; refusing wrongly only leaves a server title in place.
+#: And refusing costs less than it looks, because a server SLUG is restored
+#: either way -- see `_looks_generated` at the call site.
 #:
-#: `user` and `peer` are a person choosing and a session relaying that choice.
-#: `hook` is out on a count, not a story: 0 sites stamp it, against 2 each for
-#: `auto`, `collision` and `user`.
-_INVENTED_NAME_SOURCES = ("derived", "auto", "collision")
+#: An ABSENT field is not in either list and is treated as CHOSEN. It does not
+#: say the name was invented, and it is the majority of records: creation
+#: writes `source` only for a named or an interactive session, so a
+#: non-interactive unnamed one is stamped absent by current code.
+_CHOSEN_NAME_SOURCES = ("user", "peer")
 
 
 def invented_bridge_names() -> set[str]:
@@ -4169,7 +4171,7 @@ def invented_bridge_names() -> set[str]:
 
     Claude Code stamps a session record with `nameSource`, so this is the
     product's own statement about provenance rather than a guess from the
-    name's shape. `_INVENTED_NAME_SOURCES` says which values mean invented.
+    name's shape. `_CHOSEN_NAME_SOURCES` says which values do NOT.
 
     AN ABSENT FIELD IS NOT COUNTED, and it is not a legacy tail. Measured on
     one host: it was the MAJORITY of records, every one of them with a live
@@ -4183,7 +4185,7 @@ def invented_bridge_names() -> set[str]:
     """
     return {spelling
             for bridge, _name, source in _live_bridge_records()
-            if source in _INVENTED_NAME_SOURCES
+            if source is not None and source not in _CHOSEN_NAME_SOURCES
             for spelling in _both_spellings(bridge)}
 
 
@@ -4410,11 +4412,14 @@ def titles_to_restore(
         # "ours", the two agree, and the guard stops firing. A new bridge id
         # opens the same hole from the other end, since unknown means restore.
         #
-        # `invented` holds the bridges whose `nameSource` is one of
-        # `_INVENTED_NAME_SOURCES` — Claude Code's own record that nobody
-        # chose the name. A blank server title is still restored: there is
-        # nothing to overwrite, and that is the population this exists for.
-        if invented and sid in invented and current:
+        # `invented` holds the bridges Claude Code's own record says nobody
+        # named. REFUSED ONLY AGAINST A TITLE A PERSON COULD HAVE TYPED:
+        # `_looks_generated` is already this file's test for "the server
+        # minted this", and it answers True for a blank title too, so it
+        # subsumes the blank carve-out instead of adding a second rule.
+        # Without it the guard also refused a server SLUG, which is the exact
+        # population the restore exists for.
+        if invented and sid in invented and not _looks_generated(current):
             continue
         out.append((sid, want.strip()))
     return out

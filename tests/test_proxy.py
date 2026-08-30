@@ -764,35 +764,36 @@ class TestLiveRemoteControlSessions:
               ||o.nameSource==="derived"||o.nameSource==="collision"
               ||o.nameSource==="auto"||o.nameSource==="hook"?o.nameSource:void 0
 
-        `auto` IS WHERE THE PRODUCT MAKES A NAME UP. Two literal stamps --
-        `if(Ne&&!Ne.name&&ue)Ne.name=ue,Ne.nameSource="auto"` and a job-name
-        generator writing `nameSource:"auto"` beside the name it just produced
-        -- plus `??"auto"` and `?"auto":void 0` defaults that yield it without
-        a literal assignment. `derived` is stamped in ONE place, for a name
-        taken from an INTERACTIVE session's cwd. So a session that was never
-        named carries `auto`, never `derived`, and a guard reading only
-        `derived` let the pin PUT that invented name over a title a person
-        typed on claude.ai -- the defect this guard exists to stop.
+        `user` AND `peer` ARE THE ONLY TWO THAT SAY A PERSON CHOSE THE NAME,
+        so the rule is a COMPLEMENT: everything else in that closed domain
+        counts as invented, and a value from a later release lands on the
+        refusing side instead of slipping through. `peer` is literally a
+        `user` name relayed -- the registry sync writes
+        `Ne==="user"?"peer":Ne`.
 
-        `collision` IS IN TOO, because it overwrites the provenance it
-        replaces: `return{...r,name:p,nameSource:"collision"}` runs
-        unconditionally on the record stamped `auto` one statement earlier, so
-        a `collision` record's base name may have been invented or chosen and
-        nothing on disk says which. The bundle groups it with `auto` itself:
-        `if(e.nameSource==="auto"||e.nameSource==="collision")return!0`.
-        Refusing is the safe side -- restoring wrongly OVERWRITES a typed
-        name, refusing wrongly only leaves a server title in place.
+        `auto` IS WHERE THE PRODUCT MAKES A NAME UP: two literal stamps plus
+        `??"auto"` and `?"auto":void 0` defaults. `derived` is stamped in ONE
+        place and only for an INTERACTIVE session, taking the name from the
+        cwd (`o==="interactive"?{name:NM(be()),source:"derived"}:void 0`);
+        every other never-named session falls to the `void 0` arm, which is
+        why a `derived`-only guard missed all of them. `collision` erases the
+        provenance it replaces. `hook` has 0 stamp sites today, so including
+        it costs nothing now and catches it the day one appears.
 
-        `hook` STAYS OUT: nothing in the bundle stamps it. 0 sites for
-        `nameSource[:=]"hook"`, against 2 each for `auto`, `collision` and
-        `user`.
+        Refusing is the cheap side of the asymmetry this file already states:
+        restoring wrongly OVERWRITES a name somebody typed, refusing wrongly
+        only leaves a server title in place -- and a server SLUG is still
+        restored either way, so the cost is smaller than it looks.
 
-        ABSENT IS NOT A LEGACY TAIL AND NOT PROOF OF ANYTHING. Measured on
-        one host: 8 of 13 records carried no `nameSource`, ALL 13 had a live
-        process, and the absent value held BOTH ends of the age range -- so it
-        is not a tail waiting to drain. It is still not counted, because it
-        does not SAY the name was invented and counting it would refuse the
-        restore for most live sessions.
+        ABSENT STAYS OUT, and not as a legacy tail. Measured on one host over
+        the UNFILTERED registry -- reading it through `_live_bridge_records`
+        would make "has a live process" the population's own definition, which
+        cannot fail -- absent was the majority and held BOTH ends of the age
+        range. The mechanism says it without a census: creation writes
+        `source` only for a named or an interactive session, so a
+        non-interactive unnamed one is stamped absent by CURRENT code. It is
+        excluded because counting it would refuse the restore for most live
+        sessions, which is the population the feature exists for.
 
         THE READ IS PID-FILTERED like every other read of this registry. The
         set is consulted only for a bridge `live_bridge_names` has already
@@ -803,23 +804,26 @@ class TestLiveRemoteControlSessions:
 
         d = self._sessions_dir(tmp_path, monkeypatch)
         for i, src in enumerate(
-            ("derived", "auto", "collision", "user", "peer", "hook"), start=1
+            ("derived", "auto", "collision", "hook",
+             "a-value-from-a-later-release", "user", "peer"), start=1
         ):
             (d / f"{i}.json").write_text(json.dumps(
                 {"name": f"n{i}", "bridgeSessionId": f"session_{src}",
                  "nameSource": src, "pid": os.getpid()}))
-        (d / "7.json").write_text(json.dumps(
-            {"name": "n7", "bridgeSessionId": "session_absent",
+        (d / "8.json").write_text(json.dumps(
+            {"name": "n8", "bridgeSessionId": "session_absent",
              "pid": os.getpid()}))
         # -1 rather than a large number: `_pid_alive` refuses it by the sign
         # guard, so this cannot become a live pid the kernel recycled.
-        (d / "8.json").write_text(json.dumps(
-            {"name": "n8", "bridgeSessionId": "session_dead",
+        (d / "9.json").write_text(json.dumps(
+            {"name": "n9", "bridgeSessionId": "session_dead",
              "nameSource": "derived", "pid": -1}))
 
         assert invented_bridge_names() == {
             "session_derived", "cse_derived", "session_auto", "cse_auto",
-            "session_collision", "cse_collision"}
+            "session_collision", "cse_collision", "session_hook", "cse_hook",
+            "session_a-value-from-a-later-release",
+            "cse_a-value-from-a-later-release"}
 
     def case_creating_a_bridge_is_worth_waiting_for_a_token(self):
         """Failing open is right everywhere except the one permanent request.
@@ -2419,7 +2423,16 @@ class TestIsPinnedRoute:
         for path, pinned, why in (
             ("/v1/code/sessions", True,
              "Remote Control creates and uses claude.ai code sessions here"),
-            ("/api/frame/deploy/init", True,
+            # A REAL ROUTE, and it has to be. `is_pinned_route` matches this
+            # subtree by PREFIX (`startswith("/api/frame/")`), so any string
+            # under it would pass -- which is how `/api/frame/deploy/init`
+            # sat here as a fixture and got copied outward as though it
+            # shipped. Measured across 2.1.248 / .250 / .251: `deploy/init`
+            # 0 occurrences in all three, against `deploy/prepare` 4 and
+            # `deploy/direct` 10 as controls, and `frame/deploy` totals 5,
+            # fully accounted for by those two. Not dynamically built either
+            # (`deploy/$` is 0).
+            ("/api/frame/deploy/direct", True,
              "artifact publishes are owned by the creating bearer too"),
             # RC reconnect unarchives at /v1/sessions/{id}/unarchive — NOT
             # /v1/code/sessions — before re-bridging. Keeping the disk bearer
@@ -2766,22 +2779,55 @@ class TestARenameIsRespectedWhereverItWasMade:
     def case_a_DERIVED_local_name_never_overwrites_a_typed_one(self):
         """The ledger closes only the window; provenance closes the case.
 
-        Measured on a live session: the pin's ledger held 'dotfiles-80', the
-        server title read 'dotfiles-80', and the local record read
-        `name='dotfiles-80'` with `nameSource='derived'`. The two agreed, so
-        the ledger guard could not fire, and a name Claude Code invented kept
-        landing on top of one a person had typed on claude.ai -- twice.
+        THE STATE THIS FIXES IS AN UNKNOWN BRIDGE, not an agreeing ledger.
+        Measured over the four reachable states, ledger-only vs ledger plus
+        provenance::
+
+            A  ledger == server == local          []        []
+            B  renamed, bridge IN the ledger      []        []
+            C  renamed, bridge NOT in the ledger  [(b1,..)] []
+            D  server SLUG, invented local name   [(b1,..)] [(b1,..)]
+
+        A returns before either guard (`current == want`); in B the ledger
+        already refuses. C is this guard's exclusive value -- a bridge minted
+        after a restart is unknown to the ledger, unknown means restore, and
+        the invented name went out over the person's. D is the population the
+        feature exists for; see
+        `case_an_invented_name_IS_still_restored_over_a_SERVER_SLUG`.
 
         `derived` is the product's own record that nobody chose the name. Not a
         shape test: the same machine's records also carry `user`, `peer` and an
         absent field. `derived` is not the ONLY invented value -- see
-        `_INVENTED_NAME_SOURCES`, which also holds `auto` and `collision` --
-        but it is the one this case pins.
+        `_CHOSEN_NAME_SOURCES`, whose complement also covers `auto`,
+        `collision` and `hook` -- but `derived` is the one this case pins.
         """
         from cswap_pin.proxy import titles_to_restore
 
-        assert titles_to_restore(self._sessions("lmd42-dotfiles"), self.NAMES,
+        assert titles_to_restore(self._sessions("a-title-somebody-typed"), self.NAMES,
                                  None, {"b1"}) == []
+
+    def case_an_invented_name_IS_still_restored_over_a_SERVER_SLUG(
+        self, monkeypatch
+    ):
+        """THE POPULATION THE FEATURE EXISTS FOR, which the guard was refusing.
+
+        `and current` refused every NON-EMPTY title, and a server slug is
+        non-empty -- so a never-named session whose cloud title read
+        `host-a-cozy-badger` kept the slug. Measured: `[]`, where the ledger
+        alone gave `[('b1', 'dotfiles-80')]`. This guard exists to protect a
+        name a person typed, and a slug is the opposite of that.
+
+        `_looks_generated` is already this file's "the server minted it,
+        nobody typed it" test AND already answers True for a blank title, so
+        it SUBSUMES the blank carve-out rather than adding a second rule.
+        """
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import titles_to_restore
+
+        monkeypatch.setattr(pp, "_host_slug", lambda: "host-a")
+        assert titles_to_restore(self._sessions("host-a-cozy-badger"),
+                                 self.NAMES, None, {"b1"}) == [
+            ("b1", "dotfiles-80")]
 
     def case_CONTROL_a_derived_name_STILL_fills_a_blank_title(self):
         """Refusing everywhere would disarm the feature. A bridge the server
@@ -5526,7 +5572,7 @@ class TestWorkerJwtRoutesAreNotSwapped:
             "/v1/code/sessions/cse_x/bridge",
             "/v1/code/sessions/cse_x/archive",
             "/v1/sessions/session_x/unarchive",
-            "/api/frame/deploy/init",
+            "/api/frame/deploy/direct",
             "/api/frame/frames?limit=20",
         ):
             assert is_pinned_route(path), f"{path} must be pinned"
