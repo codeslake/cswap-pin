@@ -2777,6 +2777,7 @@ class TestTheGuardsOnlyInputStillExists:
     """
 
     def test_the_shipped_bundle_still_stamps_nameSource(self):
+        import re
         import shutil
         from pathlib import Path
 
@@ -2793,10 +2794,19 @@ class TestTheGuardsOnlyInputStillExists:
         # a machine whose product is healthy buys an investigation, not a
         # finding. Absence of the seam is a FAILURE; absence of the SUBJECT is
         # a skip, and the two must not report the same way.
-        if b"anthropic" not in blob:
+        #
+        # NOT `b"anthropic" in blob`, which was the first attempt and is not
+        # discriminating: a wrapper naturally names the package it launches
+        # (`@anthropic-ai/claude-code`), so a three-line shim SATISFIED it and
+        # the test then failed asserting a production defect that did not
+        # exist. ELF magic and bun's embedded-filesystem prefix cannot appear
+        # in a shell script -- measured 131354 / 131354 / 132029 across
+        # 2.1.248 / .250 / .251.
+        if not blob.startswith(b"\x7fELF") or b"/$bunfs/root/" not in blob:
             pytest.skip(
-                f"{binary.name} does not look like the Claude bundle "
-                f"({len(blob)} bytes, no 'anthropic') -- not the seam")
+                f"{binary.name} is not the Claude bundle "
+                f"({len(blob)} bytes, no ELF header or bun filesystem) "
+                "-- a launcher shim, not the seam")
 
         # THE REGISTRY WRITER, NOT MERELY THE IDENTIFIER. `nameSource` occurs
         # 45 times across the job-state zod schema, the spawn paths, a log
@@ -2805,10 +2815,18 @@ class TestTheGuardsOnlyInputStillExists:
         # 49-byte file containing the word satisfied that, which is why this
         # anchors on the one line that persists the field into the file the
         # pin actually reads. Exactly 1 occurrence in 2.1.248, .250 and .251.
-        assert b'source==="derived"?"derived":void 0' in blob, (
-            "the session registry no longer writes `nameSource`, the ONLY "
-            "input to the title-restore provenance guard. The guard is now a "
-            "silent no-op and will overwrite names people typed.")
+        # TOLERANT OF MINIFIER DRIFT, and it costs nothing: the exact byte
+        # string and this regex both match exactly 1 site in all three
+        # bundles, so spacing or an `undefined` for `void 0` cannot turn a
+        # routine release into a false alarm.
+        assert re.search(
+            rb'source\s*===\s*"derived"\s*\?\s*"derived"\s*:'
+            rb'\s*(?:void 0|undefined|null)', blob), (
+            "the session registry writer for `nameSource` changed shape. That "
+            "field is the ONLY input to the title-restore provenance guard, "
+            "so re-read the writer before trusting the guard: if the field is "
+            "gone the guard is a silent no-op and will overwrite names people "
+            "typed.")
 
         # And the two values the guard reads as CHOSEN. If the product stops
         # emitting them the complement swallows every live session.

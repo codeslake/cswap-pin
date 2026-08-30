@@ -4232,10 +4232,13 @@ def _looks_generated(title: str) -> bool:
     """A SLUG the server minted for a nameless bridge.
 
     NARROWED TO THE ONE SHAPE THE PRODUCT ITSELF RECOGNISES. The slug a
-    nameless bridge gets (`host-a-cozy-badger`) is applied SERVER-SIDE, so no
-    local RECORD of it exists — but the GRAMMAR is shipped: the bundle carries
-    the word lists, mints `${adjective}-${noun}`, and its own recogniser
-    accepts only two parts, both from those lists.
+    nameless bridge gets (`host-a-cozy-badger`) is applied SERVER-SIDE — the
+    client sends only `machine_name` at bridge registration and derives no
+    title from the hostname — so no local RECORD of it exists, and "just read
+    the local record" is the mistake three earlier rounds made. The GRAMMAR,
+    though, IS shipped: the bundle carries the word lists and mints
+    `${adjective}-${noun}`, with a recogniser that accepts only two parts,
+    both from those lists.
 
     The SENTENCES claude.ai writes for an active bridge are recorded nowhere
     and no reader of them survives in this package, so this answers False for
@@ -4258,8 +4261,10 @@ def _looks_generated(title: str) -> bool:
     moment the title guard did: `<host>-notes` is not a slug, and reading it
     as one lets the restore overwrite a name somebody typed.
 
-    THE NUMERIC TAIL IS DELIBERATELY NOT MATCHED. The bundle also accepts a
-    de-duplicating `-<digits>`, so `<host>-cozy-badger-2` answers False here.
+    THE NUMERIC TAIL IS DELIBERATELY NOT MATCHED. A SECOND recogniser in the
+    bundle — the one that strips a generated suffix, not the two-part one
+    above — also accepts a de-duplicating `-<digits>`, so `<host>-cozy-badger-2`
+    answers False here.
     Matching it needs `(?:-[0-9]{1,4})?`, which also claims
     `<host>-my-notes-2024`; the product can afford that only because it ALSO
     checks both words against its lists, and copying those here would go
