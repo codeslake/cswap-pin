@@ -18586,12 +18586,33 @@ class TestTheCarryFollowsTheLoginNotTheClock:
         (tmp_path / ".claude.json").write_text("{}")
         return obj, carried
 
-    def test_the_first_look_is_not_a_change(self, tmp_path, monkeypatch):
-        """Starting the sweep must not restamp every pointer on this machine
-        just because nothing had been seen yet."""
+    def test_the_first_look_carries_a_pointer_that_disagrees(
+            self, tmp_path, monkeypatch):
+        """A LOGIN ACROSS A DAEMON RESTART HAS NO PREDECESSOR TO DIFFER FROM.
+
+        The first look used to return early with no baseline recorded, so a
+        `/login` performed while the daemon was down was never carried and the
+        pointer kept naming the previous account until the NEXT login. Every
+        deploy recycles this daemon, which is exactly when a person logs in.
+
+        The reason given for skipping — restamping every pointer on a machine
+        where nothing moved — belongs to `carry_live_pointers`, which already
+        refuses to write a record whose owner already equals the login. So the
+        skip bought nothing and cost the one case it was standing in front
+        of."""
         obj, carried = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+        assert obj._carry_on_login_change() is True
+        assert carried == [("A", "org")]
+
+    def test_CONTROL_a_second_look_at_an_unchanged_login_does_nothing(
+            self, tmp_path, monkeypatch):
+        """The carry is still keyed on the login MOVING. Without this the beat
+        would call into the carry every pass, which is the contention the
+        original skip was reaching for — at the wrong layer."""
+        obj, carried = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+        obj._carry_on_login_change()
         assert obj._carry_on_login_change() is False
-        assert carried == []
+        assert carried == [("A", "org")], carried
 
     def test_a_changed_login_carries_at_once(self, tmp_path, monkeypatch):
         from cswap_pin import proxy as pin_proxy
@@ -18604,7 +18625,7 @@ class TestTheCarryFollowsTheLoginNotTheClock:
         box[0] = ("B", "org")
         os.utime(tmp_path / ".claude.json", (1, 1))     # the file moved
         assert obj._carry_on_login_change() is True
-        assert carried == [("B", "org")], (
+        assert carried[-1] == ("B", "org"), (
             "the login moved and the carry waited for the beat -- that window "
             "is where a live session loses its bridge")
 
@@ -18619,10 +18640,16 @@ class TestTheCarryFollowsTheLoginNotTheClock:
         obj, carried = self._proxy(tmp_path, monkeypatch, box)
         monkeypatch.setattr(pin_proxy, "_login_identity", lambda: box[0])
         obj._carry_on_login_change()
+        # MEASURED AS A DELTA, not as the whole list. The subject is the BEATS:
+        # the file is rewritten every 10-30s with the same identity and none of
+        # those may carry. The first look is a separate question (a login made
+        # while this daemon was down has no predecessor to differ from), and an
+        # exact-equality assertion here pinned that answer by accident.
+        before = len(carried)
         for i in range(5):
             os.utime(tmp_path / ".claude.json", (i + 2, i + 2))
             assert obj._carry_on_login_change() is False
-        assert carried == []
+        assert len(carried) == before, carried
 
     def test_an_unmoved_file_costs_only_a_stat(self, tmp_path, monkeypatch):
         """The identity parse must not run on every 0.5s tick."""
