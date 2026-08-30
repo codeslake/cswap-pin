@@ -4226,14 +4226,11 @@ def live_bridge_names() -> dict[str, str]:
 def _looks_generated(title: str) -> bool:
     """A SLUG the server minted for a nameless bridge.
 
-    NARROWED TO THE ONE SHAPE THE PRODUCT ITSELF RECOGNISES. A slug a bridge
-    gets when it has no name at all (`host-a-cozy-badger`) is applied
-    SERVER-SIDE — the client sends `machine_name` at bridge registration and
-    derives no title from the hostname — so no local RECORD of it exists. The
-    GRAMMAR, though, is local and shipped: the bundle carries the word lists
-    and mints `${adjective}-${noun}`, with its own recogniser splitting on
-    `-` and accepting only when there are exactly two parts and both are in
-    those lists.
+    NARROWED TO THE ONE SHAPE THE PRODUCT ITSELF RECOGNISES. The slug a
+    nameless bridge gets (`host-a-cozy-badger`) is applied SERVER-SIDE, so no
+    local RECORD of it exists — but the GRAMMAR is shipped: the bundle carries
+    the word lists, mints `${adjective}-${noun}`, and its own recogniser
+    accepts only two parts, both from those lists.
 
     The SENTENCES claude.ai writes for an active bridge are recorded nowhere
     and no reader of them survives in this package, so this answers False for
@@ -4251,24 +4248,17 @@ def _looks_generated(title: str) -> bool:
     no edit here — the failure mode of a hardcoded list is that it goes stale
     the first time a host is renamed.
 
-    AND BOUNDED AT EXACTLY TWO TRAILING SEGMENTS, which is the product's own
-    grammar and not a guess from a sample. The suffix used to be `+`, which
-    was harmless while nothing called this and became a defect the moment the
-    title guard did: `<host>-notes` is not a slug, and reading it as one lets
-    the restore overwrite a name somebody typed. Six slugs on record confirm
-    the shape word for word — cozy-badger, curious-torvalds, misty-crayon,
-    robust-dream, serene-unicorn, eventual-cake, every half of them in the
-    shipped lists.
+    AND BOUNDED AT EXACTLY TWO TRAILING SEGMENTS, per that grammar. The
+    suffix used to be `+`, harmless while nothing called this and a defect the
+    moment the title guard did: `<host>-notes` is not a slug, and reading it
+    as one lets the restore overwrite a name somebody typed.
 
-    THE NUMERIC TAIL IS DELIBERATELY NOT MATCHED. The bundle also accepts
-    `-<adj>-<noun>-<up to 4 digits>` for a de-duplicated name, so
-    `<host>-cozy-badger-2` is producible and this answers False for it.
+    THE NUMERIC TAIL IS DELIBERATELY NOT MATCHED. The bundle also accepts a
+    de-duplicating `-<digits>`, so `<host>-cozy-badger-2` answers False here.
     Matching it needs `(?:-[0-9]{1,4})?`, which also claims
-    `<host>-my-notes-2024` — a title somebody could type. The product can
-    afford that regex because
-    it ALSO checks both words against its lists; copying the lists here would
-    go stale. So the tail stays unmatched: that slug merely survives, where a
-    loose anchor destroys a name.
+    `<host>-my-notes-2024`; the product can afford that only because it ALSO
+    checks both words against its lists, and copying those here would go
+    stale. So that slug merely survives, where a loose anchor destroys a name.
 
     A blank title counts: there is nothing to overwrite.
     """
