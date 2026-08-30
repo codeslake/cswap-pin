@@ -4151,23 +4151,14 @@ def ca_path_for_trust() -> "Path | None":
 #: a later release lands on the REFUSING side instead of slipping through. An
 #: allow-list of invented values expires the day the product adds one.
 #:
-#: That is the safe side because the errors are not symmetric — restoring
+#: Refusing is the safe side because the errors are not symmetric — restoring
 #: wrongly OVERWRITES a name somebody typed, refusing wrongly only leaves a
-#: server title in place — and refusing is cheap here, since a server SLUG is
-#: restored either way (`_looks_generated`, at the call site).
+#: server title in place — and it is cheap, because a server SLUG is restored
+#: either way (`_looks_generated`, at the call site).
 #:
-#: `peer` is a `user` name relayed: the sync that writes this field into the
-#: session registry maps it, `Ne==="user"?"peer":Ne`.
-#:
-#: ABSENT is in neither list and counts as chosen — and the bundle agrees:
-#: its own "does this have a chosen name" formatter reads
-#: `nameSource===void 0||nameSource==="user"||nameSource==="peer"`, which is
-#: this tuple plus absent.
-#:
-#: Absent is also the MAJORITY, by mechanism rather than by census: creation
-#: persists `nameSource:C?.source==="derived"?"derived":void 0`, so only an
-#: interactive session keeps a value — a session named explicitly with
-#: `--name` builds `source:"user"` and then lands with the field ABSENT.
+#: `peer` is a `user` name relayed. ABSENT is in neither list and counts as
+#: chosen; `invented_bridge_names` carries why, and it is not the age of the
+#: record.
 _CHOSEN_NAME_SOURCES = ("user", "peer")
 
 
@@ -4434,15 +4425,11 @@ def titles_to_restore(
         #
         # `invented` holds the bridges Claude Code's own record says nobody
         # named. REFUSED ONLY AGAINST A TITLE A PERSON COULD HAVE TYPED:
-        # `_looks_generated` is already this file's test for "the server
-        # minted this", and it answers True for a blank title too, so it
-        # subsumes the blank carve-out instead of adding a second rule.
-        # Without it the guard also refused a server SLUG, which is MOST of
-        # the population the restore exists for -- not all: a server-written
-        # SENTENCE is still refused here, because nothing local records that
-        # the server wrote it. Measured in this file's own sample, that is 2
-        # of 8. A shape test for sentences was tried before and claimed names
-        # people had chosen; leaving those uncorrected is the cheaper error.
+        # `_looks_generated` answers True for a server slug AND for a blank
+        # title, so it subsumes the blank carve-out rather than adding a rule.
+        # It answers False for a server-written SENTENCE, which therefore
+        # still stands on an invented-named bridge — 2 of 8 in this file's
+        # sample, and see that function for why nothing can do better.
         if invented and sid in invented and not _looks_generated(current):
             continue
         out.append((sid, want.strip()))
