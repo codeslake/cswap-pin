@@ -2852,29 +2852,13 @@ class TestARenameIsRespectedWhereverItWasMade:
             {"pid": os.getpid(), "sessionId": "s", "bridgeSessionId": bridge,
              "name": "dotfiles-80", "nameSource": "derived"}))
 
-    def _plant_ledger(self, tmp_path, bridge, title):
-        """A titles-written entry where the daemon keeps one."""
-        d = tmp_path / "data-home" / "claude-swap" / "pin-proxy"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "titles-written.json").write_text(json.dumps({bridge: title}))
-
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
     def case_the_two_arg_caller_still_reads_provenance(self, tmp_path):
-        """THE CALLER THAT ACTUALLY REVERTED THE NAME PASSES NEITHER GUARD.
-
-        cswap's own copy of this repair reaches here through a TWO-PARAMETER
-        shim -- `titles_to_restore(sessions, names)` -- so `ours` and
-        `invented` both take their defaults, and a default of "unknown"
-        disarms both guards. That is the caller that fired: the daemon, passing
-        both, skipped this bridge, while the other put the invented name back
-        over the one a person had typed, twice in a row, on a machine whose
-        daemon was running the provenance fix.
-
-        So the default cannot be "no provenance". Both facts are readable from
-        this machine with no argument, and reading them is what keeps the
-        policy in one place instead of in whoever remembers to pass it.
+        """cswap's own copy calls `titles_to_restore(sessions, names)`, so both
+        guards took a None that disarms them. That is the caller that was
+        overwriting names while the daemon, passing both, skipped the bridge.
         """
         from cswap_pin.proxy import titles_to_restore
 
@@ -2888,7 +2872,9 @@ class TestARenameIsRespectedWhereverItWasMade:
         passes no ledger, that read as a bridge we had never named."""
         from cswap_pin.proxy import titles_to_restore
 
-        self._plant_ledger(tmp_path, "b1", "dotfiles-80")
+        d = tmp_path / "data-home" / "claude-swap" / "pin-proxy"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "titles-written.json").write_text(json.dumps({"b1": "dotfiles-80"}))
         assert titles_to_restore(self._sessions("a-title-somebody-typed"),
                                  self.NAMES) == []
 
