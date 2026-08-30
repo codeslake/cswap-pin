@@ -2677,8 +2677,10 @@ _BRIDGE_ID = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/")
 # shipped bundle: ONE Authorization builder serves all nine call sites,
 # `pollForWork` included, so "from one header builder" cannot separate them.
 # What separates them is the 401-refresh wrapper, the sole `getAccessToken()`
-# caller: the lifecycle calls go through it and the `work/` ones take a token
-# as an argument instead. The earlier wording said the `work/` calls "do NOT",
+# caller IN THE RC CLIENT: the lifecycle calls go through it and the `work/`
+# ones take a token as an argument instead. Scope matters for anyone checking
+# this -- the binary also bundles unrelated auth libraries defining and calling
+# a method of the same name, so a bare grep answers 33 and reproduces nothing. The earlier wording said the `work/` calls "do NOT",
 # which is true of the bearer and false of the builder, and reads as the
 # second.
 #
@@ -3498,9 +3500,11 @@ def _live_bridge_records() -> list[tuple[str, str | None, str | None]]:
     callers need different things from it and one of them must not drop a
     nameless session (see ``_live_bridge_ids``).
 
-    ``nameSource`` rides along rather than getting its own walk: it lives in
-    the record this already parses, and a second glob over the same directory
-    is a second answer to the same question.
+    ``nameSource`` rides along rather than being re-read by a parse of its
+    own: it is already in the record this reads. NOT a saving in I/O -- a
+    caller wanting names AND provenance still calls two functions that each
+    walk the directory. What it removes is a SECOND PLACE that decides what a
+    session record means, which is the half that goes stale.
     """
     get_claude_config_home = require("paths").get_claude_config_home
 
@@ -4138,20 +4142,28 @@ def ca_path_for_trust() -> "Path | None":
         return None
 
 
-#: THE VALUES THAT MEAN THE PRODUCT MADE THE NAME UP, read out of the shipped
-#: bundle rather than guessed. Its validator fixes the whole domain at six
-#: values plus absent -- `user`, `peer`, `derived`, `collision`, `auto`,
-#: `hook` -- and it stamps `auto` at the two sites where it invents a name for
-#: a session that has none. A guard reading only `derived` therefore misses
-#: every never-named session, which is the population most likely to be
-#: renamed by hand afterwards.
+#: THE VALUES THAT MEAN NOBODY CHOSE THE NAME. The shipped bundle's validator
+#: fixes the domain at six plus absent: `user`, `peer`, `derived`, `collision`,
+#: `auto`, `hook`.
 #:
-#: THE OTHER FOUR ARE DELIBERATELY OUT. `user` and `hook` are the user
-#: choosing, directly or through their own configuration. `collision` is a
-#: chosen name with a de-duplicating suffix appended, which is why the bundle
-#: respawns on it beside `user`. `peer` is another session relaying one of
-#: those. Absent says nothing at all -- see below.
-_INVENTED_NAME_SOURCES = ("derived", "auto")
+#: `auto` is where the product INVENTS a name for a session that has none;
+#: `derived` is only where it derives one from an interactive session's cwd. A
+#: `derived`-only guard therefore missed every never-named session, which is
+#: the population most likely to be renamed by hand afterwards.
+#:
+#: `collision` IS IN BECAUSE IT DESTROYS THE PROVENANCE IT REPLACES. The
+#: suffix-appending function overwrites `nameSource` unconditionally, and it
+#: runs on the record stamped `auto` one statement earlier, so nothing on disk
+#: then says whether the base name was invented or chosen. The tie goes to
+#: refusing, because the two errors are not symmetric: restoring wrongly
+#: OVERWRITES a name somebody typed, refusing wrongly only leaves a server
+#: title in place. The bundle's own "is there a chosen name here" predicate
+#: groups `collision` with `auto` too.
+#:
+#: `user` and `peer` are a person choosing and another session relaying that
+#: choice. `hook` is out because nothing in the bundle stamps it: 0 sites,
+#: against 2 each for `auto`, `collision` and `user`.
+_INVENTED_NAME_SOURCES = ("derived", "auto", "collision")
 
 
 def derived_bridge_names() -> set[str]:
@@ -4161,13 +4173,15 @@ def derived_bridge_names() -> set[str]:
     product's own statement about provenance rather than a guess from the
     name's shape. `_INVENTED_NAME_SOURCES` says which values mean invented.
 
-    ABSENT IS NOT A LEGACY TAIL, and it is not evidence either way. Measured
-    on one host: 8 of 13 records carry no `nameSource`, all 13 have a live
-    process, the NEWEST record is one of the eight and the oldest carries
-    `user`. So the absent set is not shrinking and cannot be waited out, and
-    since it does not say the name was invented, counting it would refuse the
-    restore for most live sessions, which is the population the feature exists
-    for.
+    AN ABSENT FIELD IS NOT COUNTED, and it is not a legacy tail. Measured on
+    one host: it was the MAJORITY of records, every one of them with a live
+    process, and it held BOTH ends of the age range -- so it is not a tail
+    waiting to drain. It stays uncounted for a different reason: it does not
+    SAY the name was invented, and counting it would refuse the restore for
+    most live sessions, which is the population the feature exists for.
+
+    That last part is this side's judgement, not the bundle's position: the
+    bundle's own job-state sync reads an absent field AS `auto`.
     """
     return {spelling
             for bridge, _name, source in _live_bridge_records()

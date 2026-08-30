@@ -764,31 +764,35 @@ class TestLiveRemoteControlSessions:
               ||o.nameSource==="derived"||o.nameSource==="collision"
               ||o.nameSource==="auto"||o.nameSource==="hook"?o.nameSource:void 0
 
-        `auto` IS STAMPED WHERE THE PRODUCT MAKES A NAME UP, at two sites in
-        that bundle -- `if(Ne&&!Ne.name&&ue)Ne.name=ue,Ne.nameSource="auto"`
-        and a job-name generator writing `nameSource:"auto"` beside the name
-        it just produced. So a session that was never named carries `auto`,
-        never `derived`, and a guard reading only `derived` lets the pin PUT
-        that invented name over a title a person typed on claude.ai -- the
-        exact defect this guard exists to stop.
+        `auto` IS WHERE THE PRODUCT MAKES A NAME UP. Two literal stamps --
+        `if(Ne&&!Ne.name&&ue)Ne.name=ue,Ne.nameSource="auto"` and a job-name
+        generator writing `nameSource:"auto"` beside the name it just produced
+        -- plus `??"auto"` and `?"auto":void 0` defaults that yield it without
+        a literal assignment. `derived` is stamped in ONE place, for a name
+        taken from an INTERACTIVE session's cwd. So a session that was never
+        named carries `auto`, never `derived`, and a guard reading only
+        `derived` let the pin PUT that invented name over a title a person
+        typed on claude.ai -- the defect this guard exists to stop.
 
-        The bundle groups the two itself:
-        `if(e.nameSource==="auto"||e.nameSource==="collision")return!0`, its
-        own "there is no chosen name here" answer.
+        `collision` IS IN TOO, because it overwrites the provenance it
+        replaces: `return{...r,name:p,nameSource:"collision"}` runs
+        unconditionally on the record stamped `auto` one statement earlier, so
+        a `collision` record's base name may have been invented or chosen and
+        nothing on disk says which. The bundle groups it with `auto` itself:
+        `if(e.nameSource==="auto"||e.nameSource==="collision")return!0`.
+        Refusing is the safe side -- restoring wrongly OVERWRITES a typed
+        name, refusing wrongly only leaves a server title in place.
 
-        `collision` STAYS OUT, and that is not an oversight. It is a person's
-        name with a de-duplicating suffix appended
-        (`return{...r,name:p,nameSource:"collision"}`), which is why the same
-        bundle respawns on it beside `user`. Restoring it is the ordinary
-        case. `hook` stays out for the same reason: a hook is the user's own
-        configuration choosing the name.
+        `hook` STAYS OUT: nothing in the bundle stamps it. 0 sites for
+        `nameSource[:=]"hook"`, against 2 each for `auto`, `collision` and
+        `user`.
 
         ABSENT IS NOT A LEGACY TAIL AND NOT PROOF OF ANYTHING. Measured on
-        one host: 8 of 13 records carry no `nameSource`, ALL 13 have a live
-        process, the newest record is one of the eight and the oldest carries
-        `user`. So the absent set is not shrinking and cannot be waited out --
-        and since it does not say the name was invented, refusing the restore
-        for it would disarm the feature for most live sessions.
+        one host: 8 of 13 records carried no `nameSource`, ALL 13 had a live
+        process, and the absent value held BOTH ends of the age range -- so it
+        is not a tail waiting to drain. It is still not counted, because it
+        does not SAY the name was invented and counting it would refuse the
+        restore for most live sessions.
 
         THE READ IS PID-FILTERED like every other read of this registry. The
         set is consulted only for a bridge `live_bridge_names` has already
@@ -799,7 +803,7 @@ class TestLiveRemoteControlSessions:
 
         d = self._sessions_dir(tmp_path, monkeypatch)
         for i, src in enumerate(
-            ("derived", "auto", "user", "peer", "collision", "hook"), start=1
+            ("derived", "auto", "collision", "user", "peer", "hook"), start=1
         ):
             (d / f"{i}.json").write_text(json.dumps(
                 {"name": f"n{i}", "bridgeSessionId": f"session_{src}",
@@ -814,7 +818,8 @@ class TestLiveRemoteControlSessions:
              "nameSource": "derived", "pid": -1}))
 
         assert derived_bridge_names() == {
-            "session_derived", "cse_derived", "session_auto", "cse_auto"}
+            "session_derived", "cse_derived", "session_auto", "cse_auto",
+            "session_collision", "cse_collision"}
 
     def case_creating_a_bridge_is_worth_waiting_for_a_token(self):
         """Failing open is right everywhere except the one permanent request.
@@ -2769,7 +2774,9 @@ class TestARenameIsRespectedWhereverItWasMade:
 
         `derived` is the product's own record that nobody chose the name. Not a
         shape test: the same machine's records also carry `user`, `peer` and an
-        absent field, and only this value means invented.
+        absent field. `derived` is not the ONLY invented value -- see
+        `_INVENTED_NAME_SOURCES`, which also holds `auto` and `collision` --
+        but it is the one this case pins.
         """
         from cswap_pin.proxy import titles_to_restore
 
@@ -2786,9 +2793,14 @@ class TestARenameIsRespectedWhereverItWasMade:
                                  None, {"b1"}) == [("b1", "dotfiles-80")]
 
     def case_CONTROL_a_chosen_name_is_still_restored_over_a_slug(self):
-        """The other half: a `user` or `peer` name is not in the derived set,
-        so a server slug over it is still corrected. Without this the case
-        above passes on a guard that refuses every restore."""
+        """The other half: handed an EMPTY set, the restore still corrects a
+        server slug. Without this the case above passes on a guard that
+        refuses every restore.
+
+        Scope: this pins `titles_to_restore`, not the classifier -- the set is
+        hardcoded here. That `user`/`peer`/`hook`/absent stay OUT of the set is
+        proved where it is computed, in
+        `case_provenance_is_read_from_the_record_not_the_name`."""
         from cswap_pin.proxy import titles_to_restore
 
         assert titles_to_restore(self._sessions("host-a-cozy-badger"),
@@ -2873,6 +2885,13 @@ class TestARenameIsRespectedWhereverItWasMade:
         assert "_titles_we_wrote(" in src, "the restore does not read the ledger"
         assert "_record_title(" in src, (
             "nothing writes the ledger, so it can never say a title was ours")
+        # THE PROVENANCE READER NEEDS THE SAME WIRE, for the same reason. Its
+        # parameter defaults to None and every unit test passes a set
+        # explicitly, so deleting this call left the suite byte-identical at
+        # 218 passed -- the guard was invisible to it.
+        assert "derived_bridge_names(" in src, (
+            "the restore does not read provenance, so an invented name can "
+            "still overwrite one somebody typed")
 
 
 class TestParseUpstreamProxy:
@@ -16129,8 +16148,12 @@ class TestTheStallPredicateOnACappedArm:
 
         assert self._owed(pin_proxy._DRAIN_STALL_SECONDS - 1) is True
 
-    def case_the_window_clears_the_corpus_MAXIMUM(self):
+    def case_the_window_clears_the_longest_wait_ON_RECORD(self):
         """The window must sit ABOVE the observed distribution, not inside it.
+
+        Checked against the longest wait ON RECORD, which is NOT the corpus
+        maximum -- the corpus is what the watcher banked, and a wait reported
+        before that file existed is still a wait a reply survived.
 
         `_DRAIN_STALL_SECONDS` CUTS a reply that has gone byte-silent that
         long, so a window a completed reply is on record as surviving cuts
