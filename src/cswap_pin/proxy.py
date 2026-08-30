@@ -6280,10 +6280,21 @@ def drain_fate(budget: float) -> str:
 #
 # NO BYTES FOR THIS LONG AND IT IS WEDGED, NOT SLOW. See `_owed_still_moving`:
 # this is what actually ends a drain now, and the budgets above are backstops
-# against a bug in that predicate. Ninety seconds is far past any gap a live
-# stream produces (SSE keep-alives are seconds apart) and far short of the ten
-# minutes that was cutting real replies.
-_DRAIN_STALL_SECONDS = 90.0
+# against a bug in that predicate.
+#
+# ABOVE THE MEASURED DISTRIBUTION, NOT INSIDE IT. This was 90s, argued as "far
+# past any gap a live stream produces" — a guess, made before the population
+# existed. The fleet watcher's corpus of byte-free waits banked on COMPLETED
+# replies (so every sample survived one) says otherwise: n=262, p50 2s, p90
+# 16s, p99 60s, MAX 123s, with two samples at or above the old value. A window
+# a completed reply has been observed to exceed CUTS about one such reply in
+# 128, which is the interruption this path exists to prevent.
+#
+# The cost of the larger window falls on the right side. It binds only on the
+# HANDOVER arm, where a successor already holds the port: a wedged connection
+# keeps one idle process alive longer and nothing waits on it. The capped arm's
+# budget is 30s, far below either value, and decides there on its own.
+_DRAIN_STALL_SECONDS = 180.0
 #: THE CLIENT'S OWN LIVENESS TIMEOUT, read out of the 2.1.245 bundle rather
 #: than chosen: `resetLivenessTimer(){ ... setTimeout(this.onLivenessTimeout,
 #: dn) }` with `dn = 45000`, re-armed on every frame received. A stream that
