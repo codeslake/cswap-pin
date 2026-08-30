@@ -3529,8 +3529,23 @@ def _live_bridge_records() -> list[tuple[str, str | None, str | None]]:
         if not isinstance(rec, dict):
             continue
         bridge, pid = rec.get("bridgeSessionId"), rec.get("pid")
-        if not bridge or not isinstance(pid, int) or not _pid_alive(pid):
+        if not isinstance(pid, int) or not _pid_alive(pid):
             continue
+        if not bridge:
+            # THE REGISTRY COPY IS CLEARED ON TEARDOWN AND NOT REWRITTEN when
+            # the bridge returns seconds later, so a live session with a live
+            # bridge reads here as having none — and then nothing can name it,
+            # resolve it, or carry it. The JOB record keeps the id across that
+            # and the registry record names the job, so the recovery is a local
+            # join and not a guess: the pin cannot attribute a bridge CREATE to
+            # a session anyway (the request carries nothing identifying, and
+            # pid-from-socket is `/proc/net/tcp`, absent on macOS).
+            job = rec.get("jobId")
+            st = _read_json(get_claude_config_home() / "jobs" / str(job)
+                            / "state.json") if job else None
+            bridge = (st or {}).get("bridgeSessionId")
+            if not bridge:
+                continue  # never had one; naming it would invent a pairing
         name = rec.get("name")
         source = rec.get("nameSource")
         out.append((str(bridge), str(name) if name else None,

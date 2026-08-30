@@ -751,6 +751,58 @@ class TestLiveRemoteControlSessions:
             "session_x": "RVP_fork", "cse_x": "RVP_fork"
         }
 
+    def case_a_pointer_cleared_on_teardown_is_read_from_the_job_record(
+        self, tmp_path, monkeypatch
+    ):
+        """THE REGISTRY COPY IS CLEARED AND NOT REWRITTEN, so a live session
+        with a live bridge reads here as having none.
+
+        Measured on one host: a rotation tore the bridge off and it was back
+        two seconds later in the same process, with the server posting to it
+        the whole time -- and the registry record was rewritten at the
+        teardown with `bridgeSessionId` null and never again. That session
+        then vanished from this pairing, which is what
+        `_restore_bridge_titles` needs to name it and what the gate needs to
+        resolve it.
+
+        The id is not lost, only that copy of it: the JOB record still holds
+        it, and the registry record names the job. Same join
+        `observed_bridge_owners` already makes, in the other direction.
+        """
+        from cswap_pin.proxy import live_bridge_names
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps(
+            {"sessionId": "a", "name": "cswap", "bridgeSessionId": None,
+             "jobId": "j1", "pid": os.getpid()}))
+        jobs = d.parent / "jobs" / "j1"
+        jobs.mkdir(parents=True)
+        (jobs / "state.json").write_text(
+            json.dumps({"bridgeSessionId": "cse_live"}))
+
+        assert live_bridge_names() == {"cse_live": "cswap"}
+
+    def case_CONTROL_a_session_that_never_had_a_bridge_stays_out(
+        self, tmp_path, monkeypatch
+    ):
+        """The fallback must not invent a pairing. A record with no pointer
+        and no job has nothing to fall back TO, and a job record that names no
+        bridge is the same answer -- otherwise "before RC ever connects" turns
+        into a bridge id somebody has to explain."""
+        from cswap_pin.proxy import live_bridge_names
+
+        d = self._sessions_dir(tmp_path, monkeypatch)
+        (d / "1.json").write_text(json.dumps(
+            {"sessionId": "a", "name": "no-rc", "pid": os.getpid()}))
+        (d / "2.json").write_text(json.dumps(
+            {"sessionId": "b", "name": "job-no-bridge", "jobId": "j2",
+             "pid": os.getpid()}))
+        jobs = d.parent / "jobs" / "j2"
+        jobs.mkdir(parents=True)
+        (jobs / "state.json").write_text(json.dumps({"lastSequenceNum": 3}))
+
+        assert live_bridge_names() == {}
+
     def case_provenance_is_read_from_the_record_not_the_name(
         self, tmp_path, monkeypatch
     ):
