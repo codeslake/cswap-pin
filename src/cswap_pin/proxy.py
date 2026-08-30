@@ -4174,12 +4174,15 @@ def invented_bridge_names() -> set[str]:
     state allows only `user`, `auto`, `collision`. Anyone grepping will find
     both, so: the six-value list is the one that governs the file read here.
 
-    AN ABSENT FIELD IS NOT COUNTED, and it is not a legacy tail. Measured on
-    one host: it was the MAJORITY of records, every one of them with a live
-    process, and it held BOTH ends of the age range -- so it is not a tail
-    waiting to drain. It stays uncounted for a different reason: it does not
-    SAY the name was invented, and counting it would refuse the restore for
-    most live sessions, which is the population the feature exists for.
+    AN ABSENT FIELD IS NOT COUNTED, and the reason is MECHANICAL rather than
+    a census. Creation persists `nameSource:C?.source==="derived"?"derived":
+    void 0`, so only an INTERACTIVE session keeps a value: a session named
+    explicitly with `--name` builds `source:"user"` and then lands with the
+    field ABSENT. Absent therefore frequently means a person named it, which
+    is exactly why counting it as invented would refuse the restore for most
+    live sessions -- the population the feature exists for. (It is also the
+    majority on the host measured, but that number moves week to week and the
+    mechanism does not.)
 
     The bundle holds BOTH positions on absent, so this is a choice between
     them rather than a reading of one: its label formatter groups absent with
@@ -4223,13 +4226,18 @@ def live_bridge_names() -> dict[str, str]:
 def _looks_generated(title: str) -> bool:
     """A SLUG the server minted for a nameless bridge.
 
-    NARROWED TO THE ONE SHAPE ANYTHING CAN RECOGNISE. A slug a bridge gets
-    when it has no name at all (`host-a-cozy-badger`) is minted SERVER-SIDE
-    and never lands in a transcript, so nothing local records it — the
-    anchor below is all there is. The SENTENCES claude.ai writes for an
-    active bridge are recorded nowhere either, and no reader of them survives
-    in this package, so this answers False for those and callers must say
-    what they do about it.
+    NARROWED TO THE ONE SHAPE THE PRODUCT ITSELF RECOGNISES. A slug a bridge
+    gets when it has no name at all (`host-a-cozy-badger`) is applied
+    SERVER-SIDE — the client sends `machine_name` at bridge registration and
+    derives no title from the hostname — so no local RECORD of it exists. The
+    GRAMMAR, though, is local and shipped: the bundle carries the word lists
+    and mints `${adjective}-${noun}`, with its own recogniser splitting on
+    `-` and accepting only when there are exactly two parts and both are in
+    those lists.
+
+    The SENTENCES claude.ai writes for an active bridge are recorded nowhere
+    and no reader of them survives in this package, so this answers False for
+    those and callers must say what they do about it.
 
     The two rules that used to live here are gone. The `" " in title` rule
     claimed every title with a space was the server's, which overwrote
@@ -4243,13 +4251,24 @@ def _looks_generated(title: str) -> bool:
     no edit here — the failure mode of a hardcoded list is that it goes stale
     the first time a host is renamed.
 
-    AND BOUNDED AT EXACTLY TWO TRAILING SEGMENTS. The suffix used to be `+`,
-    which was harmless while nothing called this and became a defect the
-    moment the title guard did: `<host>-notes` is not a slug, and reading it
-    as one lets the restore overwrite a name somebody typed. Every server
-    slug on record here has two — cozy-badger, curious-torvalds,
-    misty-crayon, robust-dream, serene-unicorn, eventual-cake, inbound-demo.
-    A slug of some other shape now merely stays, which is the cheap error.
+    AND BOUNDED AT EXACTLY TWO TRAILING SEGMENTS, which is the product's own
+    grammar and not a guess from a sample. The suffix used to be `+`, which
+    was harmless while nothing called this and became a defect the moment the
+    title guard did: `<host>-notes` is not a slug, and reading it as one lets
+    the restore overwrite a name somebody typed. Six slugs on record confirm
+    the shape word for word — cozy-badger, curious-torvalds, misty-crayon,
+    robust-dream, serene-unicorn, eventual-cake, every half of them in the
+    shipped lists.
+
+    THE NUMERIC TAIL IS DELIBERATELY NOT MATCHED. The bundle also accepts
+    `-<adj>-<noun>-<up to 4 digits>` for a de-duplicated name, so
+    `<host>-cozy-badger-2` is producible and this answers False for it.
+    Matching it needs `(?:-[0-9]{1,4})?`, which also claims
+    `<host>-my-notes-2024` — a title somebody could type. The product can
+    afford that regex because
+    it ALSO checks both words against its lists; copying the lists here would
+    go stale. So the tail stays unmatched: that slug merely survives, where a
+    loose anchor destroys a name.
 
     A blank title counts: there is nothing to overwrite.
     """

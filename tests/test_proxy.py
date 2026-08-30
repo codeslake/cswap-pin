@@ -2434,11 +2434,12 @@ class TestIsPinnedRoute:
             # subtree by PREFIX (`startswith("/api/frame/")`), so any string
             # under it would pass -- which is how `/api/frame/deploy/init`
             # sat here as a fixture and got copied outward as though it
-            # shipped. Measured across 2.1.248 / .250 / .251: `deploy/init`
-            # 0 occurrences in all three, against `deploy/prepare` 4 and
-            # `deploy/direct` 10 as controls, and `frame/deploy` totals 5,
-            # fully accounted for by those two. Not dynamically built either
-            # (`deploy/$` is 0).
+            # shipped. Measured across 2.1.248 / .250 / .251, all three
+            # identical: `/api/frame/deploy/init` 0 occurrences, against
+            # `/api/frame/deploy/direct` 3 as the control. The 5 `frame/deploy`
+            # sites enumerate as those 3 plus 2 `.../deploy/prepare`, so
+            # nothing else hides under that prefix, and it is not built
+            # dynamically either (`deploy/$` is 0).
             ("/api/frame/deploy/direct", True,
              "artifact publishes are owned by the creating bearer too"),
             # RC reconnect unarchives at /v1/sessions/{id}/unarchive — NOT
@@ -2776,7 +2777,6 @@ class TestTheGuardsOnlyInputStillExists:
     """
 
     def test_the_shipped_bundle_still_stamps_nameSource(self):
-        import re
         import shutil
         from pathlib import Path
 
@@ -2786,27 +2786,35 @@ class TestTheGuardsOnlyInputStillExists:
         if not exe:
             pytest.skip("no `claude` on PATH -- nothing to check the seam against")
         binary = Path(exe).resolve()
-        if not binary.is_file():
-            pytest.skip(f"`claude` does not resolve to a file: {binary}")
-        blob = binary.read_bytes()
+        blob = binary.read_bytes() if binary.is_file() else b""
 
-        # THE CONTROL FIRST. A 200MB binary that answers 0 for everything is
-        # an unreadable instrument, not a changed product, and the two must
-        # not report the same way.
-        assert blob.count(b"anthropic") > 0, (
-            f"read {len(blob)} bytes of {binary.name} and found no "
-            "'anthropic' -- the instrument is broken, not the product")
+        # AN UNREADABLE INSTRUMENT SKIPS RATHER THAN FAILING. `claude` on PATH
+        # can resolve to a launcher shim instead of the bundle, and reddening
+        # a machine whose product is healthy buys an investigation, not a
+        # finding. Absence of the seam is a FAILURE; absence of the SUBJECT is
+        # a skip, and the two must not report the same way.
+        if b"anthropic" not in blob:
+            pytest.skip(
+                f"{binary.name} does not look like the Claude bundle "
+                f"({len(blob)} bytes, no 'anthropic') -- not the seam")
 
-        assert blob.count(b"nameSource") > 0, (
-            "the shipped bundle no longer mentions `nameSource`, which is the "
-            "ONLY input to the title-restore provenance guard. The guard is "
-            "now a silent no-op and will overwrite names people typed.")
+        # THE REGISTRY WRITER, NOT MERELY THE IDENTIFIER. `nameSource` occurs
+        # 45 times across the job-state zod schema, the spawn paths, a log
+        # string and the TUI label formatter, so asserting the bare word
+        # passes even if the SESSION REGISTRY stops writing it -- measured, a
+        # 49-byte file containing the word satisfied that, which is why this
+        # anchors on the one line that persists the field into the file the
+        # pin actually reads. Exactly 1 occurrence in 2.1.248, .250 and .251.
+        assert b'source==="derived"?"derived":void 0' in blob, (
+            "the session registry no longer writes `nameSource`, the ONLY "
+            "input to the title-restore provenance guard. The guard is now a "
+            "silent no-op and will overwrite names people typed.")
 
-        # The two values the guard treats as CHOSEN. If the product stops
-        # emitting them the complement swallows everything.
-        for value in (b'"user"', b'"peer"'):
-            assert re.search(rb"nameSource[^A-Za-z0-9_]{0,4}" + value, blob), (
-                f"no `nameSource` site carries {value.decode()} any more -- "
+        # And the two values the guard reads as CHOSEN. If the product stops
+        # emitting them the complement swallows every live session.
+        for value in (b'nameSource==="user"', b'nameSource==="peer"'):
+            assert value in blob, (
+                f"no site carries {value.decode()} any more -- "
                 "`_CHOSEN_NAME_SOURCES` no longer matches what ships")
 
 
@@ -2901,12 +2909,17 @@ class TestARenameIsRespectedWhereverItWasMade:
         NO production caller until it became this guard's permissive arm, so
         its looseness had never decided anything.
 
-        EXACTLY TWO TRAILING SEGMENTS, because that is every server slug on
-        record here: cozy-badger, curious-torvalds, misty-crayon,
-        robust-dream, serene-unicorn, eventual-cake, inbound-demo -- 7 of 7.
+        EXACTLY TWO TRAILING SEGMENTS, and that is the PRODUCT'S grammar, not
+        a sample: the bundle ships the word lists and mints
+        `${adjective}-${noun}`, with a recogniser that splits on `-` and
+        accepts only two parts, both in those lists. Six slugs on record match
+        it word for word -- cozy-badger, curious-torvalds, misty-crayon,
+        robust-dream, serene-unicorn, eventual-cake. (`inbound-demo` is NOT:
+        neither half is in any shipped list, so it is a name somebody typed
+        and never belonged in this evidence.)
+
         Erring tight errs toward REFUSING, this file's cheap side: a slug of
-        some other shape would merely stay, where a loose anchor destroys a
-        title instead.
+        some other shape merely stays, where a loose anchor destroys a title.
         """
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import titles_to_restore
