@@ -2847,18 +2847,28 @@ class TestTheGuardsOnlyInputStillExists:
         # finding. Absence of the seam is a FAILURE; absence of the SUBJECT is
         # a skip, and the two must not report the same way.
         #
-        # NOT `b"anthropic" in blob`, which was the first attempt and is not
-        # discriminating: a wrapper naturally names the package it launches
-        # (`@anthropic-ai/claude-code`), so a three-line shim SATISFIED it and
-        # the test then failed asserting a production defect that did not
-        # exist. ELF magic and bun's embedded-filesystem prefix cannot appear
-        # in a shell script -- measured 131354 / 131354 / 132029 across
-        # 2.1.248 / .250 / .251.
-        if not blob.startswith(b"\x7fELF") or b"/$bunfs/root/" not in blob:
+        # TWO MARKERS, AND NEITHER IS AN EXECUTABLE FORMAT. Two earlier
+        # attempts each failed in one direction:
+        #
+        #   `b"anthropic" in blob`   a wrapper NAMES the package it launches,
+        #                            so a shim satisfied it and the test then
+        #                            failed asserting a defect that did not
+        #                            exist.
+        #   ELF magic + bun prefix   the macOS bundle is Mach-O, so it SKIPPED
+        #                            a healthy binary -- silencing this alarm
+        #                            on two of three machines -- while a
+        #                            non-Claude `bun` (ELF, one bunfs hit)
+        #                            sailed through and failed the same way.
+        #
+        # So: bun's embedded-filesystem prefix rules out shell shims, and the
+        # package name rules out other bun binaries. Measured 131354 / 131354
+        # / 132029 and 266 / 266 / 266 across 2.1.248 / .250 / .251; `bun`
+        # itself is 1 and 0; `node` is 0 and 0.
+        if (b"/$bunfs/root/" not in blob
+                or b"@anthropic-ai/claude-code" not in blob):
             pytest.skip(
-                f"{binary.name} is not the Claude bundle "
-                f"({len(blob)} bytes, no ELF header or bun filesystem) "
-                "-- a launcher shim, not the seam")
+                f"{binary.name} is not the Claude bundle ({len(blob)} bytes) "
+                "-- a launcher shim or another bun program, not the seam")
 
         # THE REGISTRY WRITER, NOT MERELY THE IDENTIFIER. `nameSource` occurs
         # 45 times across the job-state zod schema, the spawn paths, a log

@@ -4194,20 +4194,22 @@ def invented_bridge_names() -> set[str]:
     state allows only `user`, `auto`, `collision`. Anyone grepping will find
     both, so: the six-value list is the one that governs the file read here.
 
-    AN ABSENT FIELD IS NOT COUNTED, and the reason is MECHANICAL rather than
-    a census. Creation persists `nameSource:C?.source==="derived"?"derived":
-    void 0`, so only an INTERACTIVE session keeps a value: a session named
-    explicitly with `--name` builds `source:"user"` and then lands with the
-    field ABSENT. Absent therefore frequently means a person named it, which
-    is exactly why counting it as invented would refuse the restore for most
-    live sessions -- the population the feature exists for. (It is also the
-    majority on the host measured, but that number moves week to week and the
-    mechanism does not.)
+    AN ABSENT FIELD IS NOT COUNTED, and the source for that is the bundle's
+    own label formatter, which groups absent WITH `user` and `peer` as "has a
+    chosen name". Counting absent as invented would refuse the restore for
+    most live sessions -- the population the feature exists for.
+
+    NOT ARGUED FROM CREATION. An earlier version of this said a `--name`
+    launch builds `source:"user"` and lands with the field ABSENT, offered as
+    a mechanism rather than a count. Measured on the one host it can be
+    checked on: 15 live records, ZERO carrying `--name` in argv, yet 6
+    carrying an explicit `user`/`peer` -- so creation is not the only writer
+    and that sentence explained the wrong thing. The field is also written
+    later, on naming, which is why the census and the mechanism disagreed.
 
     The bundle holds BOTH positions on absent, so this is a choice between
-    them rather than a reading of one: its label formatter groups absent with
-    `user` and `peer` (the half this follows), while its job-state sync reads
-    an absent field as `auto`.
+    them rather than a reading of one: the label formatter above, against a
+    job-state sync that reads an absent field as `auto`.
     """
     return {spelling
             for bridge, _name, source in _live_bridge_records()
