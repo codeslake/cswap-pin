@@ -11833,7 +11833,24 @@ class PinProxy:
             # twice) every machine would certify health forever. Silence is the
             # honest answer to a question nothing has answered yet.
             if not (getattr(self, "_bridge_posts", None) or {}):
-                return          # nothing has ever posted: no claim either way
+                # A STANDING CLAIM OUTLIVES ITS SUBJECT OTHERWISE. Silence is
+                # right for a daemon that never claimed anything, and wrong
+                # for one that said "N bridges are deaf" and now has nothing
+                # posting: the transition record still reads deaf, and every
+                # reader takes the newest transition for the current state.
+                # Generic on purpose -- it does not matter whether the
+                # sessions were stopped by a person, slept with the machine,
+                # crashed, or were recycled by a deploy. The subject is gone,
+                # so the verdict goes with it.
+                prev = getattr(self, "_last_deaf", None)
+                if isinstance(prev, list) and prev:
+                    self._last_deaf = []
+                    _log_lifecycle(
+                        "%s — nothing is posting any more, so the %d bridge(s) "
+                        "named there have no subject left to judge and this "
+                        "withdraws that verdict rather than leaving it to "
+                        "stand" % (DEAF_REPORT_CLEAR, len(prev)))
+                return          # nothing posting: no claim either way
             # THE EARLY BRANCH BELOW PRINTS BEFORE THE PREDECESSOR LOOP, so it
             # has no window to drift across and takes its count here.
             posted = self._posting_now()

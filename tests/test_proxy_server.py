@@ -6418,6 +6418,77 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_deaf_verdict_is_withdrawn_when_its_subject_is_gone(self):
+        """A STANDING CLAIM OUTLIVES ITS SUBJECT OTHERWISE.
+
+        Every reader takes the newest transition for the current state, so a
+        daemon that says "N bridges are deaf" and then goes quiet leaves that
+        verdict standing with nothing behind it. MEASURED: a person ran
+        `claude daemon stop --any`, every worker went down, and the remote gate
+        FAILed on a deaf line from before the stop -- an alarm for a state a
+        person had chosen. The cause does not matter (stopped, slept, crashed,
+        redeployed); what matters is that the population is gone.
+        """
+        import threading
+        from cswap_pin import proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_DEAF/worker/messages")
+            srv._connected_bridges = set(srv._bridge_posts)
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], lines
+
+            # every session goes away: nothing posts any more
+            srv._reset_bridge_traffic()
+            lines.clear()
+            srv._report_deaf_bridges()
+            assert lines, (
+                "the deaf verdict was left standing with no subject -- a "
+                "reader takes the newest transition for the current state")
+            assert pp.DEAF_REPORT_CLEAR in lines[-1], lines[-1]
+
+            # CONTROL: it withdraws ONCE, not on every quiet sweep
+            lines.clear()
+            srv._report_deaf_bridges()
+            assert lines == [], (
+                "it repeats the withdrawal every sweep, which buries the "
+                "transition it exists to mark: %r" % lines)
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_CONTROL_a_daemon_that_never_claimed_stays_silent(self):
+        """Silence IS right for a fresh daemon. Withdrawing unconditionally
+        would assert health over a population that never existed, which is the
+        defect the early return was written for."""
+        import threading
+        from cswap_pin import proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._report_deaf_bridges()
+            assert lines == [], (
+                "it certified something before any bridge had posted: %r"
+                % lines)
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_deaf_means_the_server_holds_it_and_we_do_not(self, certdir):
         """POSTING WITHOUT A STREAM HAS TWO READINGS and only one is a fault.
 
