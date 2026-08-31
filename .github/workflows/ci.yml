@@ -42,6 +42,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      # THE LOCKFILE IS DERIVED AND NOTHING WAS CHECKING IT. Bumping the
+      # version in pyproject.toml changes `uv.lock`, and the suite never opens
+      # it -- `uv run` resolves on its own -- so a release could ship with a
+      # lock naming the previous version and every job stayed green. Measured:
+      # two version bumps landed with the lock left behind, and it surfaced as
+      # an unexplained modified file in the working tree rather than as a
+      # failure anyone was told about.
+      - name: The lockfile matches pyproject
+        run: uv lock --check
+
       - name: Suite
         run: |
           # Kept in step with publish.yml's copy — see the header. HOME and
