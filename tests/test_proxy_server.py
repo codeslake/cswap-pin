@@ -6362,6 +6362,62 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_both_counts_come_from_ONE_snapshot(self):
+        """A NUMERATOR LARGER THAN ITS DENOMINATOR, measured in the wild:
+        `4 of 1 bridge(s) post but hold no inbound stream`.
+
+        `posted` was sampled ABOVE the predecessor loop, which reads pid files
+        and asks each draining daemon what it holds. That is real time, and on
+        a handover posts keep arriving into `_bridge_posts` while it runs, so
+        the two counts described the same set seconds apart. Both are taken
+        after that work now.
+
+        THE POST IS INJECTED THROUGH THE INSTANCE, never by rebinding a module
+        global: `run_cases` walks 63 cases in ONE process, so a global patched
+        here leaks into every case after it -- measured, seven of them failed
+        on the first attempt at this test.
+        """
+        import threading
+        lines = []
+        from cswap_pin import proxy as pp
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            def wire(bid):
+                srv._note_bridge_traffic(
+                    f"/v1/code/sessions/{bid}/worker/messages")
+                srv._connected_bridges = set(srv._bridge_posts)
+
+            wire("cse_ONE")
+
+            # A POST LANDS WHILE THE DEAF SET IS BEING BUILT -- the same
+            # window the predecessor loop opens on a real handover.
+            real_deaf = srv.deaf_bridges
+
+            def deaf_then_a_late_post(*a, **k):
+                out = real_deaf(*a, **k)
+                wire("cse_TWO")
+                return out
+            srv.deaf_bridges = deaf_then_a_late_post
+
+            srv._report_deaf_bridges()
+            assert lines, "no deaf line at all"
+            last = lines[-1]
+            m = re.search(r"(\d+) of (\d+) bridge\(s\)", last)
+            assert m, last
+            num, den = int(m.group(1)), int(m.group(2))
+            assert num <= den, (
+                f"numerator above denominator: {last!r} -- the two counts came "
+                f"from different snapshots")
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_deaf_means_the_server_holds_it_and_we_do_not(self, certdir):
         """POSTING WITHOUT A STREAM HAS TWO READINGS and only one is a fault.
 

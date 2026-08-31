@@ -11801,6 +11801,8 @@ class PinProxy:
             # honest answer to a question nothing has answered yet.
             if not (getattr(self, "_bridge_posts", None) or {}):
                 return          # nothing has ever posted: no claim either way
+            # THE EARLY BRANCH BELOW PRINTS BEFORE THE PREDECESSOR LOOP, so it
+            # has no window to drift across and takes its count here.
             posted = self._posting_now()
             # AND THE STREAMS THIS PROCESS NEVER accept()ED. A handover passes
             # the LISTENING socket down, so posts arrive here at once while
@@ -11846,6 +11848,13 @@ class PinProxy:
                 (elsewhere.update(ids) if said else mute.append(p))
             now = (("mute", tuple(sorted(mute))) if mute
                    else sorted(self.deaf_bridges(elsewhere=elsewhere)))
+            # RE-COUNTED BESIDE ITS OWN NUMERATOR. The loop above reads pid
+            # files and asks each draining daemon what it holds -- real time,
+            # during which posts keep arriving -- so the count taken before it
+            # describes a smaller set than `now` does. Measured on a handover:
+            # `4 of 1 bridge(s)`, a numerator above its denominator, from two
+            # counts of the same set taken seconds apart.
+            posted = self._posting_now()
             prev = getattr(self, "_last_deaf", None)
             if now == prev:
                 return
