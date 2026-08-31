@@ -18604,6 +18604,46 @@ class TestTheCarryFollowsTheLoginNotTheClock:
         assert obj._carry_on_login_change() is True
         assert carried == [("A", "org")]
 
+    def test_the_DETECTION_is_logged_even_when_nothing_needs_carrying(
+            self, tmp_path, monkeypatch):
+        """THE INSTRUMENT, not the repair. `carry_live_pointers` logs under
+        `if carried:`, so a pass that moves nothing is silent, and a real
+        login was left with its only carry line 97s after the identity moved
+        with no way to tell a detection delay from the first pass that had
+        something to move. Those need opposite fixes."""
+        from cswap_pin import proxy as pin_proxy
+
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        obj, carried = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+        obj.carry_live_pointers = lambda lg: 0        # nothing to move
+        assert obj._carry_on_login_change() is True
+        assert any("signed-in account moved" in m for m in said), said
+
+    def test_CONTROL_a_pass_PAST_the_mtime_gate_with_no_move_is_silent(
+            self, tmp_path, monkeypatch):
+        """CONTROL. Logging unconditionally also passes the test above and
+        turns the line into a heartbeat, which answers nothing.
+
+        IT HAS TO GET PAST THE MTIME GATE TO MEAN THAT. Calling twice does
+        not: the file's mtime does not move between two calls, so the second
+        returns at the stat and never reaches the line under test. That
+        version passed against a deliberately unconditional log, because it
+        was testing the gate rather than the log."""
+        from cswap_pin import proxy as pin_proxy
+
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        obj, _ = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+        obj._carry_on_login_change()                  # first look, records A
+        said.clear()
+        # SAME LOGIN, NEW MTIME: the gate opens and the identity compare is
+        # what has to keep it quiet.
+        f = tmp_path / ".claude.json"
+        os.utime(f, (f.stat().st_atime + 60, f.stat().st_mtime + 60))
+        assert obj._carry_on_login_change() is False
+        assert said == [], said
+
     def test_CONTROL_a_second_look_at_an_unchanged_login_does_nothing(
             self, tmp_path, monkeypatch):
         """The carry is still keyed on the login MOVING. Without this the beat

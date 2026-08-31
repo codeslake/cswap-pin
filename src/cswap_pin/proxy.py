@@ -11043,7 +11043,8 @@ class PinProxy:
             return False
         self._login_seen_mtime = mtime
         login = _login_identity()
-        if login is None or login == getattr(self, "_login_seen", None):
+        prev = getattr(self, "_login_seen", None)
+        if login is None or login == prev:
             return False
         # NO FIRST-OBSERVATION SKIP. A `/login` made while this daemon was
         # down has no predecessor to differ from, and every deploy recycles
@@ -11051,6 +11052,13 @@ class PinProxy:
         # matters in. Nothing is wasted on an unchanged machine either:
         # `carry_live_pointers` already returns without writing when a
         # record's owner equals the login.
+        # THE DETECTION, NOT ONLY THE OUTCOME. `carry_live_pointers` logs
+        # under `if carried:`, so a pass that moves nothing is silent, and
+        # that silence cannot be told from never having noticed the login.
+        # This line is what dates the detection against a tear-off.
+        _log_lifecycle(
+            "the signed-in account moved (%s -> %s); carrying live bridge "
+            "pointers now" % ((prev or ("?",))[0], login[0]))
         self._login_seen = login
         self.carry_live_pointers(login)
         return True
