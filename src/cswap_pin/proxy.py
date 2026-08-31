@@ -5851,9 +5851,42 @@ def _component_tag() -> str:
     try:
         from cswap_pin import __version__
 
-        return f"cswap-pin/{__version__}"
+        tag = f"cswap-pin/{__version__}"
     except Exception:  # noqa: BLE001 — a log line is not worth an exception
         return "cswap-pin"
+    return tag + _host_head()
+
+
+def _host_head() -> str:
+    """`+<name>@<sha>` for a host installed from a checkout, else "".
+
+    THE VERSION NAMES THIS PACKAGE AND NOTHING ELSE. A pin release runs on
+    whatever host tree is installed beside it, and that tree is what carries
+    the open pull requests -- so two daemons logging the same version can be
+    running different host code, and a reader months later cannot tell which.
+    The version answers "which pin"; this answers "which of everything else".
+
+    Read from `.git` directly rather than through a subprocess: this runs at
+    import in a proxy that must not spawn, and a detached HEAD or a missing
+    ref simply yields no suffix. A wheel install has no `.git` and is silent,
+    which is correct -- there its version IS the whole provenance.
+    """
+    try:
+        import pathlib
+        host = __import__("claude_swap")
+        d = pathlib.Path(host.__file__).resolve().parent
+        for root in (d, *d.parents):
+            g = root / ".git"
+            if not g.is_dir():
+                continue
+            head = (g / "HEAD").read_text().strip()
+            if head.startswith("ref: "):
+                ref = g / head[5:]
+                head = ref.read_text().strip() if ref.exists() else ""
+            return f"+{root.name}@{head[:8]}" if head else ""
+        return ""
+    except Exception:  # noqa: BLE001 — provenance must not cost a log line
+        return ""
 
 
 _COMPONENT = _component_tag()

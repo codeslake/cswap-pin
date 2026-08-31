@@ -19429,3 +19429,74 @@ class TestTheRetirementMustCrossProcesses:
         hdr = [("Proxy-Authorization",
                 "Basic " + base64.b64encode(f"cswap:{old}".encode()).decode())]
         assert pp._proxy_authorized(hdr, new, certdir=tmp_path) is False
+
+
+class TestTheLogLineNamesTheHostCheckoutToo:
+    """A pin release runs on whatever host tree is installed beside it, and
+    that tree carries the open pull requests.
+
+    Two daemons logging the same `cswap-pin/<version>` can be running
+    different host code, so a reader months later cannot tell which -- which is
+    the whole reason the version is in the line at all. Reading an old log to
+    decide whether a behaviour was fixed needs both halves.
+    """
+
+    def _fake_host(self, tmp_path, monkeypatch, head=None, ref=None):
+        """A package on disk, optionally inside a git checkout."""
+        root = tmp_path / "cswap_fork"
+        pkg = root / "src" / "claude_swap"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        if head is not None:
+            g = root / ".git"
+            g.mkdir()
+            (g / "HEAD").write_text(head)
+            if ref:
+                p = g / ref[0]
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(ref[1])
+        import types
+        mod = types.ModuleType("claude_swap")
+        mod.__file__ = str(pkg / "__init__.py")
+        monkeypatch.setitem(__import__("sys").modules, "claude_swap", mod)
+        return root
+
+    def test_a_checkout_head_reaches_the_tag(self, tmp_path, monkeypatch):
+        self._fake_host(tmp_path, monkeypatch,
+                        head="ref: refs/heads/integration\n",
+                        ref=("refs/heads/integration", "5b552e15deadbeef\n"))
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == "+cswap_fork@5b552e15"
+
+    def test_a_detached_head_still_names_it(self, tmp_path, monkeypatch):
+        self._fake_host(tmp_path, monkeypatch, head="abcdef1234567890\n")
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == "+cswap_fork@abcdef12"
+
+    def test_CONTROL_a_wheel_install_stays_silent(self, tmp_path, monkeypatch):
+        """No `.git` is not a failure to report: there the version IS the whole
+        provenance, and a suffix invented for it would be a lie."""
+        self._fake_host(tmp_path, monkeypatch, head=None)
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == ""
+
+    def test_CONTROL_a_missing_host_is_silent_not_an_exception(
+            self, monkeypatch):
+        """Provenance must never cost a log line."""
+        import sys
+        monkeypatch.setitem(sys.modules, "claude_swap", None)
+        import cswap_pin.proxy as pp
+        assert pp._host_head() == ""
+
+    def test_the_TAG_carries_it_not_just_the_helper(
+            self, tmp_path, monkeypatch):
+        """THE HELPER IS NOT THE LOG LINE. Testing `_host_head()` alone passes
+        with `+ _host_head()` deleted from the tag -- measured, that mutant
+        survived -- and the tag is what every line is built from."""
+        import cswap_pin.proxy as pp
+        self._fake_host(tmp_path, monkeypatch,
+                        head="ref: refs/heads/integration\n",
+                        ref=("refs/heads/integration", "5b552e15deadbeef\n"))
+        tag = pp._component_tag()
+        assert tag.startswith("cswap-pin/"), tag
+        assert "+cswap_fork@5b552e15" in tag, tag
