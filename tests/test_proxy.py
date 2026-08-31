@@ -18614,11 +18614,42 @@ class TestTheCarryFollowsTheLoginNotTheClock:
         from cswap_pin import proxy as pin_proxy
 
         said = []
+        monkeypatch.setenv("CSWAP_PIN_DEBUG", str(tmp_path / "trace"))
         monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
         obj, carried = self._proxy(tmp_path, monkeypatch, [("A", "org")])
         obj.carry_live_pointers = lambda lg: 0        # nothing to move
         assert obj._carry_on_login_change() is True
         assert any("signed-in account moved" in m for m in said), said
+
+    def test_CONTROL_the_line_is_OFF_by_default(self, tmp_path, monkeypatch):
+        """THIS LOG SHIPS ON OTHER PEOPLE'S MACHINES. Every other line in it is
+        about an outage and earns its place; this one is for chasing a cause,
+        so a third party gets it only by asking. Without this the gate can be
+        dropped and every other test here still passes."""
+        from cswap_pin import proxy as pin_proxy
+
+        said = []
+        monkeypatch.delenv("CSWAP_PIN_DEBUG", raising=False)
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        obj, _ = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+        assert obj._carry_on_login_change() is True   # the CARRY still runs
+        assert said == [], said                       # it just says nothing
+
+    def test_the_line_never_carries_a_whole_account_uuid(
+            self, tmp_path, monkeypatch):
+        """Truncated identifiers, never whole ones. The neighbouring splice
+        line already states the rule and this one was written past it."""
+        from cswap_pin import proxy as pin_proxy
+
+        whole = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        said = []
+        monkeypatch.setenv("CSWAP_PIN_DEBUG", str(tmp_path / "trace"))
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        obj, _ = self._proxy(tmp_path, monkeypatch, [(whole, "org")])
+        obj.carry_live_pointers = lambda lg: 0
+        obj._carry_on_login_change()
+        assert said and whole not in said[0], said
+        assert whole[:12] in said[0], said
 
     def test_CONTROL_a_pass_PAST_the_mtime_gate_with_no_move_is_silent(
             self, tmp_path, monkeypatch):
@@ -18634,6 +18665,7 @@ class TestTheCarryFollowsTheLoginNotTheClock:
 
         said = []
         monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        monkeypatch.setenv("CSWAP_PIN_DEBUG", str(tmp_path / "trace"))
         obj, _ = self._proxy(tmp_path, monkeypatch, [("A", "org")])
         obj._carry_on_login_change()                  # first look, records A
         said.clear()

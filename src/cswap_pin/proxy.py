@@ -11056,9 +11056,17 @@ class PinProxy:
         # under `if carried:`, so a pass that moves nothing is silent, and
         # that silence cannot be told from never having noticed the login.
         # This line is what dates the detection against a tear-off.
-        _log_lifecycle(
-            "the signed-in account moved (%s -> %s); carrying live bridge "
-            "pointers now" % ((prev or ("?",))[0], login[0]))
+        #
+        # OPT-IN, and truncated. Every other line in this log earns its place
+        # on someone else's machine by being about an outage; this one is for
+        # chasing a cause and would otherwise put an account identifier in a
+        # third party's log for nothing. Same switch as the request trace, so
+        # it turns on and off without restarting the daemon being observed.
+        if trace_target(getattr(self, "_certdir", None)):
+            _log_lifecycle(
+                "the signed-in account moved (%s -> %s); carrying live bridge "
+                "pointers now"
+                % (str((prev or ("?",))[0])[:12], str(login[0])[:12]))
         self._login_seen = login
         self.carry_live_pointers(login)
         return True
