@@ -6302,15 +6302,22 @@ class TestDrainReportsWhatItCut:
                     if re.search(r"_stream_conns\.discard\(", ln)]
         assert discards, "no discard site found — this guard is watching nothing"
 
-        missing = []
-        for i in discards:
-            window = "\n".join(lines[max(0, i - 2):i + 12])
-            if "_stream_owner.pop(" not in window:
-                missing.append(lines[i].strip())
-        assert not missing, (
-            "a connection leaves `_stream_conns` without leaving "
-            "`_stream_owner`, so its socket object is pinned for the life of "
-            f"the daemon: {missing}")
+        # ONE SITE NOW, AND IT IS THE HELPER. The three call sites each spelled
+        # discard + pop, and the pairing was a rule a reader had to keep. They
+        # are `_forget_stream` now, so the two cannot be separated by an edit
+        # that forgets one -- a strictly stronger form of what this guarded.
+        assert len(discards) == 1, (
+            "more than one place drops a stream socket; they were unified into "
+            f"`_forget_stream` so the pairing cannot rot: {[lines[i].strip() for i in discards]}")
+        window = "\n".join(lines[max(0, discards[0] - 2):discards[0] + 12])
+        assert "_stream_owner" in window and ".pop(" in window, (
+            "the sole discard site no longer drops the owner map with it, so a "
+            "socket object is pinned for the life of the daemon")
+
+        # AND EVERY CALLER GOES THROUGH IT, or a new site could discard
+        # directly and this count would still read 1.
+        assert src.count("self._forget_stream(") >= 3, (
+            "a stream-ending site stopped routing through the helper")
 
     def case_the_deaf_report_says_it_in_words_a_watcher_can_match(self):
         """The two log lines are an INTERFACE, not prose.
@@ -7360,6 +7367,39 @@ class TestDrainReportsWhatItCut:
             "call that forgets the pin restamps live sessions onto whatever "
             f"account is signed in: {between!r}")
 
+    def case_a_deaf_bridge_carries_how_long_it_has_been_deaf(self):
+        """A duration read off two log lines measures the POLL, not the fleet.
+
+        The deaf verdict is re-evaluated at most once per
+        `_BRIDGE_SWEEP_COOLDOWN_S` (600s), so the gap between the line that
+        names a deaf bridge and the line that clears it is quantised to that
+        interval. Three "recovery times" were reported off that gap -- 12s,
+        7min, 10min -- and the 10min one is exactly one cooldown, which is the
+        interval and not a recovery.
+
+        The pin already knows the exact instant: it HOLDS the stream, so the
+        moment it drops one is local state and costs no request. Recording it
+        turns the duration into a measurement instead of an artefact of how
+        often we happen to look.
+        """
+        import cswap_pin.proxy as pp
+        import inspect
+
+        assert hasattr(pp.PinProxy, "deaf_for"), (
+            "no way to ask how long a bridge has been without its stream, so "
+            "every duration has to be inferred from log spacing")
+
+        src = inspect.getsource(pp.PinProxy._forget_stream)
+        assert "_stream_lost" in src, (
+            "the loss instant is not recorded where the stream is dropped")
+
+        # AND THE REPORT MUST CARRY IT, or the number exists and nobody reads
+        # it -- the same shape as a detector nothing consults.
+        rep = inspect.getsource(pp.PinProxy._report_deaf_bridges)
+        assert "deaf_for" in rep, (
+            "the deaf report still states no duration, so a reader has only "
+            "the log spacing to go on and will read the cooldown as recovery")
+
     def case_the_pin_never_kills_a_session_to_cure_deafness(self):
         """A deaf bridge is REPORTED and never repaired by killing anything.
 
@@ -8036,7 +8076,13 @@ class TestDrainReportsWhatItCut:
             # sockets whose descriptors have been reused.
             paid = src.find("self._note_reply_finished(conn)")
             assert paid != -1, "the debt boundary moved; this guard is blind"
-            assert "self._stream_conns.discard(conn)" in src[paid:paid + 700], (
+            # THE ACT, NOT THE SPELLING. The three sites that ended a stream
+            # were `_stream_conns.discard` + `_stream_owner.pop`, one fact
+            # written three times; they are `_forget_stream` now, which also
+            # records WHEN so a duration stops being read off log spacing.
+            # Pinning the old literal made this guard fail on that move while
+            # the property it guards was intact.
+            assert "self._forget_stream(conn)" in src[paid:paid + 700], (
                 "the subscription mark outlives the reply that set it")
         finally:
             for s_ in (a, b, c, d):

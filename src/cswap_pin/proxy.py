@@ -11024,6 +11024,8 @@ class PinProxy:
         # separately because the drain must treat them the other way round:
         # every other connection is waited for, these are let go.
         self._stream_conns: set = set()
+        #: bridge id -> monotonic instant its LAST stream socket went.
+        self._stream_lost: dict = {}
         # PER-BRIDGE, and initialised HERE or the accounting is dead in
         # production while every test stays green: `_note_bridge_traffic`
         # swallows its own errors by design, so a missing dict is a silent
@@ -12003,12 +12005,24 @@ class PinProxy:
                     f"{len(now)} of {posted} bridge(s) {DEAF_REPORT_MARK} — "
                     "claude.ai can see them and messages reach the server, "
                     "but the session never receives them; only a NEW PROCESS "
-                    f"clears it: {' '.join(now)}"
+                    # WITH HOW LONG, from the instant the stream went rather
+                    # than from the spacing of these lines. This report runs at
+                    # most once per `_BRIDGE_SWEEP_COOLDOWN_S`, so a reader
+                    # timing a recovery off two of them measures the cooldown;
+                    # `deaf_for` is local state and measures the bridge.
+                    # UNKNOWN stays unknown -- a daemon that took the port over
+                    # mid-life never saw the loss.
+                    f"clears it: {' '.join(self._with_deaf_age(b) for b in now)}"
                 )
             else:
                 _log_lifecycle(self._deaf_clear_line(posted, prev))
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
+
+    def _with_deaf_age(self, bid: str) -> str:
+        """`<id>` or `<id> (deaf 42s)` — the age only when this process saw it go."""
+        age = self.deaf_for(bid)
+        return bid if age is None else f"{bid} (deaf {int(age)}s)"
 
     def deaf_bridges(self, window: float = _DEAF_WINDOW_S, now=None,
                      elsewhere: "set | None" = None) -> list:
@@ -12133,6 +12147,50 @@ class PinProxy:
                     "the old one")
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
+
+    def _forget_stream(self, conn) -> None:
+        """Drop a stream socket and its owner, and REMEMBER WHEN.
+
+        The three sites that ended a stream each spelled this as
+        `_stream_conns.discard` + `_stream_owner.pop` -- one fact, written
+        three times, and nowhere to hang the instant it happened.
+
+        WHY THE INSTANT IS WORTH KEEPING. `deaf_bridges` answers a boolean,
+        and the report reading it runs at most once per
+        `_BRIDGE_SWEEP_COOLDOWN_S`. Any duration taken from the spacing of its
+        log lines is therefore quantised to that interval: three "recovery
+        times" were read off that spacing and one was exactly one cooldown --
+        the interval reported as a recovery. The moment a stream goes is state
+        this process already holds, so recording it costs no request and no
+        poll, and it is the only number here that measures the bridge rather
+        than our own cadence.
+
+        ONLY WHEN THE LAST ONE GOES. A session can hold more than one stream
+        socket across a reconnect; stamping on the first drop would date the
+        loss from a socket that was replaced a moment later.
+
+        The caller holds `_live_lock`, so this must not take it.
+        """
+        self._stream_conns.discard(conn)
+        owner = getattr(self, "_stream_owner", {})
+        bid = owner.pop(conn, None)
+        if bid is None:
+            return
+        still = {owner[c] for c in (self._stream_conns & self._open_conns)
+                 if c in owner}
+        if bid not in still:
+            self._stream_lost[bid] = time.monotonic()
+
+    def deaf_for(self, bid: str, now=None) -> "float | None":
+        """Seconds since this bridge's last stream went, or None if unknown.
+
+        None is UNKNOWN and never 0: a daemon that took the port over mid-life
+        never saw the loss, and 0 there would read as "just now".
+        """
+        lost = getattr(self, "_stream_lost", {}).get(bid)
+        if lost is None:
+            return None
+        return (time.monotonic() if now is None else now) - lost
 
     def held_bridge_ids(self) -> set:
         """Bridges whose inbound stream THIS process is holding open.
@@ -12869,7 +12927,6 @@ class PinProxy:
                 self._open_conns.discard(conn)
                 # Or the set grows for the life of the daemon, holding a
                 # socket object per finished subscription.
-                self._stream_conns.discard(conn)
                 # AND THE OWNER MAP WITH IT, or the set grows for the life of
                 # the daemon. It belongs HERE and not in the 101-upgrade
                 # branch: Remote Control's inbound is a held GET, built from
@@ -12877,7 +12934,7 @@ class PinProxy:
                 # on this teardown. (An older comment here said it was a
                 # blind-tunnelled WebSocket to a separate ingress host, which
                 # contradicted `_EVENT_STREAM` and is not what CC does.)
-                self._stream_owner.pop(conn, None)
+                self._forget_stream(conn)
                 self._owed.pop(conn, None)
                 self._delivered.pop(conn, None)
                 self._content_at.pop(conn, None)
@@ -14057,13 +14114,13 @@ class PinProxy:
                     # mark lets a later drain claim it and un-owe a reply that
                     # is still being written, uncounted.
                     with self._live_lock:
-                        self._stream_conns.discard(conn)
-                        # AND THE OWNER MAP, and here it is not merely a
-                        # leak: the connection stays OPEN as keep-alive, so a
-                        # stale entry makes `deaf_bridges` read this session as
-                        # HOLDING a stream after its stream ended — a false
-                        # negative in the check, worse than the leak.
-                        self._stream_owner.pop(conn, None)
+                        self._forget_stream(conn)
+                        # THE OWNER MAP GOES WITH IT, inside that call, and
+                        # here it is not merely a leak: the connection stays
+                        # OPEN as keep-alive, so a stale entry makes
+                        # `deaf_bridges` read this session as HOLDING a stream
+                        # after its stream ended — a false negative in the
+                        # check, worse than the leak.
                 got_one = self._handle_one_request(tls, conn)
                 served_one = True
                 if not got_one:
@@ -14424,10 +14481,9 @@ class PinProxy:
                         # connection stays in every map for the life of the
                         # daemon.
                         with self._live_lock:
-                            self._stream_conns.discard(_c)
                             # AND THE OWNER MAP. Keyed on the same object; the
                             # two are one fact and must be dropped together.
-                            self._stream_owner.pop(_c, None)
+                            self._forget_stream(_c)
                     release = getattr(self._local, "release", None)
 
                     def _release_tunnel():
