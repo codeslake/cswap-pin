@@ -7336,6 +7336,30 @@ class TestDrainReportsWhatItCut:
             "the method no longer delegates to the module-level carry, so "
             "the two can drift apart")
 
+    def case_the_forget_call_carries_no_live_pointer(self):
+        """The live carry runs only where the splice has just run.
+
+        `carry_live_pointers` has no pin-org guard; its sibling
+        `_carry_history_pointers` does. What stands in for one is that the
+        splice writes the field this carry reads, immediately above it. The
+        splice is guarded on `identity`, so a carry guarded only on
+        `account_num` would fire on the no-identity call -- the one that
+        FORGETS the pin -- and restamp every LIVE session onto whatever
+        account happens to be signed in. Those sessions' bridges are not that
+        account's, and Claude Code answers 500 on a bridge it cannot use.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        src = inspect.getsource(pp.heal)
+        between = src[src.index("_carry_history_pointers(certdir)"):
+                      src.index("carry_live_pointers(")]
+        assert "if identity:" in between, (
+            "the live carry in `heal` is not guarded on `identity`, so the "
+            "call that forgets the pin restamps live sessions onto whatever "
+            f"account is signed in: {between!r}")
+
     def case_the_pin_never_kills_a_session_to_cure_deafness(self):
         """A deaf bridge is REPORTED and never repaired by killing anything.
 
@@ -7802,25 +7826,25 @@ class TestDrainReportsWhatItCut:
         # construction for exactly the tunnel it exists to protect. Measured on
         # pmac 2026-08-31: `drained clean in 2240.2s`, holding the two bridges
         # of the greencard and canada_pr sessions, and unbounded in principle.
-        assert "tunnel_deadline" in src, (
-            "the tunnel wait is bounded only on silence, and a bridge inbound "
-            "tunnel is never silent — the server keepalives it. That leaves "
-            "the uncapped arm with no reachable exit")
+        assert "tunnel_deadline" not in src, (
+            "a wall clock is back on the tunnel wait. A bridge inbound stream "
+            "is never silent because the server keepalives it, and while this "
+            "process holds that stream THE SESSION IS RECEIVING THROUGH IT. "
+            "Releasing it on a clock turns a working channel into a deaf "
+            "bridge, and Claude Code rebuilds the receive side after neither "
+            "an EOF nor a reset. Unbounded is the correct behaviour here: the "
+            "cost is one lingering process, and the alternative is a cut")
 
-        # AND THE CUT TAKES THE CHANNEL DOWN EITHER WAY. Waiting does not save
-        # it -- there is no fd handover in this repo (`SCM_RIGHTS` appears
-        # nowhere) -- so the wait only moves the cut to a moment nobody chose.
-        # Bounding it puts the cut next to the deploy that caused it, where
-        # `_report_deaf_bridges` names it in the same minute and the session
-        # re-homes. On pmac the sessions did exactly that, 12 s after the log
-        # said `ONLY A NEW PROCESS CLEARS IT`.
+    def case_a_chatty_bridge_holds_the_drain_and_is_never_released(
+            self, certdir):
+        """A live Remote Control stream is served until it ends, on no clock.
 
-    def case_a_chatty_tunnel_does_not_hold_the_drain_for_ever(self, certdir):
-        """The behaviour, not the source text.
-
-        A tunnel whose peer keeps talking pins `quiet_for()` near zero. Under
-        the old condition the loop had no other exit, so this call would run
-        until the tunnel ended on its own.
+        `quiet_for()` pins near zero while the peer keeps talking, so the only
+        exit stays closed and this call keeps waiting. That is the channel
+        working, not a hang: the session receives through this process for as
+        long as it holds the stream. A drain that ran 2240s held two sessions'
+        bridges and both were healthy throughout; deafness arrived when it
+        ended, not while it lasted.
         """
         import cswap_pin.proxy as pp
 
@@ -7829,46 +7853,35 @@ class TestDrainReportsWhatItCut:
             pin_token_provider=lambda: "PIN-TOKEN",
             upstream=("127.0.0.1", 1),
         )
-        # THE DEADLINE IS HONOURED, NOT THE NUMBER. Asserting the shipped 150 s
-        # would make this case sleep 150 s on every run -- the first version
-        # did, and cost the class 156 s. Patch the constant instead: what has
-        # to hold is that the loop stops at whatever it says, and a bound of
-        # one second proves that as well as a bound of a hundred and fifty.
-        old_pump, old_cap = pp._PUMP, pp._TUNNEL_DRAIN_SECONDS
+        old_pump = pp._PUMP
         _Chatty.released = []
         pp._PUMP = _Chatty("bridge")
-        pp._TUNNEL_DRAIN_SECONDS = 1.0
         try:
-            t0 = time.monotonic()
-            proxy.await_inflight(float("inf"))
-            waited = time.monotonic() - t0
+            th = threading.Thread(target=proxy.await_inflight,
+                                  args=(float("inf"),), daemon=True)
+            th.start()
+            th.join(timeout=3.0)
+            still_waiting = th.is_alive()
         finally:
-            pp._PUMP, pp._TUNNEL_DRAIN_SECONDS = old_pump, old_cap
-        # One beat is `_DRAINING_BEAT_SECONDS`, so the loop cannot notice the
-        # deadline sooner than that; the slack is for the beat, not the cap.
-        # AND IT LETS THE CHANNEL GO. Bounding the wait alone leaves the
-        # tunnel open on a process about to exit, so the peer gets an RST
-        # instead of a clean EOF -- the deadline stops the hang and the
-        # release is what makes the ending orderly. A mutant that dropped the
-        # release passed until this existed.
-        assert "bridge" in _Chatty.released, (
-            "the drain stopped waiting but never released the bridge tunnel, "
-            "so it still dies with the process instead of ending cleanly")
-        assert waited < pp._DRAINING_BEAT_SECONDS * 2, (
-            "a chatty tunnel held the uncapped drain for %.1fs against a 1s "
-            "cap; its only exit is silence and this peer never goes silent"
-            % waited)
+            pp._PUMP = old_pump
+        assert still_waiting, (
+            "the drain stopped waiting on a bridge whose peer is still "
+            "talking — the only thing that ends this wait must be the stream "
+            "ending, never a timer")
+        assert "bridge" not in _Chatty.released, (
+            "the drain RELEASED a live bridge tunnel. That is the cut this "
+            "invariant exists to prevent: the peer sees EOF, the session goes "
+            "deaf, and nothing rebuilds the receive side")
 
-    def case_CONTROL_a_bulk_tunnel_is_not_cut_by_the_bridge_deadline(
-            self, certdir):
-        """THE HALF THE DEADLINE MUST NOT TOUCH.
+    def case_CONTROL_a_bulk_tunnel_is_not_cut_either(self, certdir):
+        """THE OTHER KIND, held by the same rule.
 
         Every host that is not the upstream takes a blind CONNECT and lands in
         the same pump — git, pip, npm, the auto-updater. A transfer still
         moving bytes is real work, and the silence bound waits it out
         correctly; only the keepalived bridge can never satisfy that bound.
-        Without this the first version's clock cut a running `git clone` at
-        150s because a recycle happened to be draining.
+        A shipped clock cut a running `git clone` at 150s because a recycle
+        happened to be draining. Both kinds are now held by silence alone.
         """
         import cswap_pin.proxy as pp
 
@@ -7896,8 +7909,9 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._PUMP, pp._TUNNEL_DRAIN_SECONDS = old_pump, old_cap
         assert still_waiting, (
-            "the drain gave up on a bulk tunnel after %.1fs; the bridge "
-            "deadline reached a population it must not touch" % waited)
+            "the drain gave up on a bulk tunnel after %.1fs; a transfer still "
+            "moving bytes is real work and only silence may end this wait"
+            % waited)
         assert "bridge" not in _Chatty.released and not _Chatty.released, (
             "a non-bridge tunnel was released by the bridge deadline: %r"
             % (_Chatty.released,))

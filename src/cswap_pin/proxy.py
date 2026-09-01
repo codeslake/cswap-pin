@@ -1766,14 +1766,21 @@ def heal(backup_root: Path, identity: dict | None = None,
         # daemon's next `.claude.json` mtime poll; measured, a revived session
         # reattached ONE SECOND later and lost its bridge, well inside it.
         #
-        # NOT A SECOND SOURCE OF TRUTH: both carries read `_login_identity()`,
-        # the field the splice just wrote, so they agree by construction.
-        try:
-            _live = _login_identity()
-            if _live:
-                carry_live_pointers(_live)
-        except Exception:  # noqa: BLE001 — a launch must never fail on the pin
-            pass
+        # UNDER `identity`, THE SAME CONDITION THE SPLICE RUNS UNDER. This
+        # carry has no pin-org guard — its sibling `_carry_history_pointers`
+        # does — and what stands in for one is that the splice just wrote the
+        # field it reads. On the no-identity call, the one that FORGETS, the
+        # splice does not run, so `_login_identity()` is whatever is signed in
+        # and this would restamp every LIVE session onto an account that does
+        # not own their bridges. Handing Claude Code a bridge it cannot use is
+        # a 500; a lost history is survivable.
+        if identity:
+            try:
+                _live = _login_identity()
+                if _live:
+                    carry_live_pointers(_live)
+            except Exception:  # noqa: BLE001 — a launch must not fail on the pin
+                pass
 
     stale_st = read_daemon_state(certdir)
     stale_fp = (stale_st or {}).get("fingerprint")
@@ -12281,29 +12288,21 @@ class PinProxy:
             # supervisor counting to `_DRAIN_SECONDS + 2`, and the held arm is
             # holding the port dark.
             if budget == float("inf"):
-                tunnel_deadline = started + _TUNNEL_DRAIN_SECONDS
+                # A LIVE BRIDGE IS SERVED UNTIL IT ENDS, ON NO CLOCK. This
+                # loop once carried a deadline that released the keepalived
+                # Remote Control stream once it passed, on the reasoning that
+                # waiting can never outlast a stream that never goes quiet.
+                # It cannot, and that is the point: while this process holds
+                # the stream the session is RECEIVING through it. Releasing it
+                # turns a working channel into a deaf bridge, and Claude Code
+                # rebuilds the receive side after neither an EOF nor a reset.
+                #
+                # The silence bound is the exit that matters and it is
+                # reachable: a WEDGED peer moves no bytes, so `quiet_for`
+                # crosses the TTL and the loop leaves. Only a peer still
+                # talking holds this open, which is work, not a leak.
                 while (_PUMP.live_pairs()
                        and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
-                    # THE DEADLINE BINDS THE BRIDGE, NOT EVERY TUNNEL. Every
-                    # host that is not the upstream takes a blind CONNECT and
-                    # lands in the same pump — git, pip, npm, the
-                    # auto-updater. A transfer still moving bytes is real work
-                    # and the silence bound waits it out correctly; only the
-                    # keepalived bridge can never satisfy that bound, so only
-                    # it is released on a clock.
-                    if (_PUMP.live_pairs(kind="bridge")
-                            and time.monotonic() >= tunnel_deadline):
-                        n = _PUMP.release_pairs(kind="bridge")
-                        _log_lifecycle(
-                            f"{n} bridge tunnel(s) still talking after "
-                            f"{int(_TUNNEL_DRAIN_SECONDS)}s — a Remote "
-                            "Control inbound stream is keepalived and never "
-                            "goes quiet, so waiting cannot outlast it and no "
-                            "handover can carry it. Released now, beside the "
-                            "recycle that caused it, so the session re-homes "
-                            "on the successor instead of losing its receive "
-                            "side at an arbitrary moment later")
-                        continue
                     beat_draining(self._certdir,
                                   owed=self.inflight_requests(),
                                   live=self.live_replies(started),
@@ -12311,11 +12310,7 @@ class PinProxy:
                                   streams=self.live_stream_count()
                                   + _PUMP.live_pairs(),
                                   bridges=self.held_bridge_ids())
-                    # NO LONGER THAN THE DEADLINE HAS LEFT. An unconditional
-                    # beat makes the bound 150-165s while the log says 150.
-                    left = tunnel_deadline - time.monotonic()
-                    time.sleep(_DRAINING_BEAT_SECONDS if left <= 0
-                               else min(_DRAINING_BEAT_SECONDS, left))
+                    time.sleep(_DRAINING_BEAT_SECONDS)
                 if _PUMP.live_pairs():
                     _log_lifecycle(
                         f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
