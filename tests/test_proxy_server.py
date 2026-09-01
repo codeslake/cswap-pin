@@ -7469,6 +7469,53 @@ class TestDrainReportsWhatItCut:
             "already-running session's pointer behind, so each is vetoed into "
             "a fresh mint on its next reattach")
 
+    def case_a_dead_marker_is_reaped_by_the_beat(self, certdir, tmp_path):
+        """The corpse reap runs once per drain START, not on the beat.
+
+        `announce_draining` carries it and its comment claims to be "the only
+        LIVE path that runs often enough". It is not: a drain announces once
+        and then beats for as long as it lasts, so a marker left by a process
+        that died AFTER that announcement waits for the NEXT drain to begin.
+
+        Measured on the second machine: a marker 410s old -- past a 150s TTL --
+        sat in the directory while the live drain beat its own every few
+        seconds, in code that has carried the reap since 0.1.201.
+
+        The beat is where it belongs: it is the path that runs while a drain is
+        happening, which is exactly when corpses appear.
+        """
+        import os
+        import time
+
+        import cswap_pin.proxy as pp
+
+        d = tmp_path / "certdir"
+        d.mkdir()
+        dead = d / (pp._DRAINING_PREFIX + "999999")
+        dead.write_text("x")
+        old = time.time() - (pp._DRAINING_MARKER_TTL + 60)
+        os.utime(dead, (old, old))
+
+        # THE BEAT REFRESHES, it does not create -- `announce_draining` is what
+        # creates. So stand one up the way an announcement would, or this
+        # measures the wrong contract.
+        mine = d / (pp._DRAINING_PREFIX + "4242")
+        mine.write_text("x")
+        os.utime(mine, (old, old))
+
+        pp.beat_draining(d, pid=4242)
+        assert not dead.exists(), (
+            "a marker past its TTL survived a beat, so it waits for the next "
+            "drain to START -- which on a quiet machine is never")
+        # AND NEVER THE CALLER'S OWN, even though it is just as old. A beat
+        # reaps before it refreshes; deleting this one makes the refresh raise
+        # on a missing file, and the drain then loses the protection that stops
+        # the sweep TERMing it mid-reply.
+        assert mine.exists(), (
+            "the reap took the marker that protects the drain doing the "
+            "reaping")
+        assert mine.stat().st_mtime > old, "the beat did not refresh its own"
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 

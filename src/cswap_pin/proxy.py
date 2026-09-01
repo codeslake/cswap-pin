@@ -5869,7 +5869,7 @@ def _quiet_phrase(secs: "float | None") -> str:
     return f"{secs:.0f}s"
 
 
-def _collect_dead_markers(certdir: Path) -> None:
+def _collect_dead_markers(certdir: Path, keep_pid: int | None = None) -> None:
     """Remove `.draining-<pid>` markers nothing has beaten since the TTL.
 
     A DRAINER THAT IS SIGKILLED CANNOT UNLINK ITS OWN, and every reap above
@@ -5886,7 +5886,15 @@ def _collect_dead_markers(certdir: Path) -> None:
         markers = list(Path(certdir).glob(f"{_DRAINING_PREFIX}*"))
     except OSError:
         return
+    keep = None if keep_pid is None else f"{_DRAINING_PREFIX}{keep_pid}"
     for path in markers:
+        # NEVER THE CALLER'S OWN. A beat reaps before it refreshes, so on a
+        # drain whose beat is slower than the TTL this would delete the marker
+        # that protects it and the write that follows would raise on a missing
+        # file -- the drain then loses its protection mid-reply and the sweep
+        # TERMs it. An invariant here, not an ordering the next edit can undo.
+        if keep is not None and path.name == keep:
+            continue
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
@@ -6212,6 +6220,15 @@ def beat_draining(certdir: Path, pid: int | None = None,
     outcome that existed before any of this.
     """
     path = draining_marker_path(certdir, os.getpid() if pid is None else pid)
+    # REAP THE CORPSES HERE, not only where a drain ANNOUNCES. That call runs
+    # once per drain; this one runs for as long as one lasts, which is when a
+    # marker's owner actually dies. Measured: a marker 410s past a 150s TTL sat
+    # beside a live drain beating its own every few seconds.
+    _pid = os.getpid() if pid is None else pid
+    try:
+        _collect_dead_markers(certdir, keep_pid=_pid)
+    except Exception:  # noqa: BLE001 — housekeeping must not stop a beat
+        pass
     try:
         if owed is None:
             os.utime(path)
