@@ -11195,6 +11195,13 @@ class PinProxy:
             # read next time it looks; this one is for the session that will
             # never look again, because its refusal is cached in memory and
             # nothing it does puts a request on the wire.
+            # A DEAF BRIDGE IS THE SAME REMEDY FOR A DIFFERENT FAULT, and it
+            # had no actor at all: the report names "only a NEW PROCESS clears
+            # it" and nothing performed it.
+            try:
+                self.recycle_deaf_sessions()
+            except Exception:  # noqa: BLE001 — never take the daemon down
+                pass
             try:
                 self.recycle_denied_sessions()
             except Exception:  # noqa: BLE001 — never take the daemon down
@@ -11305,6 +11312,60 @@ class PinProxy:
                 f"cleared {cleared} job record(s) naming a bridge the server no "
                 f"longer has, so those sessions can mint a live one")
         return cleared
+
+    def recycle_deaf_sessions(self) -> int:
+        """Replace the worker of a session whose bridge posts but cannot hear.
+
+        `deaf_bridges` is the detector and it had no actor. The state it names
+        is one Claude Code cannot leave on its own -- `close()` sets
+        state="closed" and `connect()` returns at once, forever -- so the
+        report's own text says a new process is the only cure. This performs
+        it, under the same three guards as :meth:`recycle_denied_sessions`:
+        background sessions only (a terminal has nothing to respawn it), idle
+        only (a busy one loses in-flight work), and once per session per daemon
+        so a session that stays deaf is not restarted in a loop.
+
+        NO POLICY LOOKUP. That gate belongs to the denial case, where a fresh
+        worker would read the same refusal; a deaf bridge is not a verdict
+        about anything and re-asking would only add a way to fail.
+
+        Never raises for the caller's sake -- it runs on a sweep.
+        """
+        deaf = set(self.deaf_bridges())
+        if not deaf:
+            return 0
+        # UNKNOWN IS NOT GONE. With no listing, `deaf_bridges` cannot have
+        # confirmed the server holds the stream, and restarting on a network
+        # hiccup is the failure this guard exists for.
+        if getattr(self, "_connected_bridges", None) is None:
+            return 0
+        done = 0
+        for rec in _live_session_records():
+            if rec.get("kind") != "bg":
+                continue
+            sid = str(rec.get("sessionId") or "")
+            try:
+                pid = int(rec.get("pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not sid or pid <= 0 or sid in self._recycled:
+                continue
+            if not _session_is_idle(str(rec.get("jobId") or "")):
+                continue               # NOT marked recycled: try again later
+            job_rec = _read_json(_config_home_for_policy() / "jobs" /
+                                 str(rec.get("jobId") or "") / "state.json")
+            bid = str((job_rec or {}).get("bridgeSessionId") or "")
+            if not bid or bid.replace("session_", "cse_") not in deaf:
+                continue
+            self._recycled.add(sid)
+            if _signal_worker(pid):
+                done += 1
+                _log_lifecycle(
+                    f"session {rec.get('name') or sid} held a bridge that "
+                    "posts but receives nothing — asked its worker to restart, "
+                    "which is the only thing that clears it; the conversation "
+                    "is resumed from disk")
+        return done
 
     def recycle_denied_sessions(self) -> int:
         """Replace the worker of a session refusing Remote Control in error.

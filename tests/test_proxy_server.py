@@ -7336,6 +7336,73 @@ class TestDrainReportsWhatItCut:
             "the method no longer delegates to the module-level carry, so "
             "the two can drift apart")
 
+    def case_a_deaf_bridge_gets_a_new_process(self, certdir, monkeypatch):
+        """A deaf bridge has a DETECTOR and had no actor, for four hours.
+
+        `_report_deaf_bridges` writes one line, on change, and that is all that
+        ever happened: measured, the line "1 of 12 bridge(s) post but hold no
+        inbound stream ... only a NEW PROCESS clears it" appeared exactly once
+        and the session sat on `rc failed` until a person noticed. The line
+        names the remedy in its own text and nothing performed it.
+
+        `recycle_denied_sessions` already has the machinery and the three
+        guards; it is gated on a POLICY refusal, which this is not. Same shape,
+        different discriminator -- and deaf is the stronger one, because it
+        means the bridge exists and does not work.
+        """
+        import cswap_pin.proxy as pp
+
+        killed = []
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._recycled = set()
+        srv._connected_bridges = {"cse_DEAF", "cse_FINE"}
+        monkeypatch.setattr(pp, "_signal_worker",
+                            lambda pid: (killed.append(pid), True)[1])
+        monkeypatch.setattr(pp, "_session_is_idle", lambda job: job != "busy")
+        monkeypatch.setattr(srv, "deaf_bridges", lambda **k: ["cse_DEAF"])
+
+        def _rec(sid, pid, kind, job, bid):
+            return {"sessionId": sid, "pid": pid, "kind": kind, "jobId": job,
+                    "startedAt": 1.0, "name": sid}
+        jobs = {"jdeaf": "session_DEAF", "jfine": "session_FINE",
+                "jterm": "session_DEAF", "busy": "session_DEAF"}
+        monkeypatch.setattr(pp, "_read_json",
+                            lambda path: {"bridgeSessionId":
+                                          jobs.get(path.parent.name, "")})
+        monkeypatch.setattr(pp, "_live_session_records", lambda: [
+            _rec("deaf", 101, "bg", "jdeaf", None),
+            _rec("fine", 102, "bg", "jfine", None),
+            _rec("term", 103, "interactive", "jterm", None),
+            _rec("busy", 104, "bg", "busy", None),
+        ])
+
+        assert srv.recycle_deaf_sessions() == 1, killed
+        assert killed == [101], (
+            "only the deaf, background, idle session may be replaced: a "
+            f"terminal has nothing to respawn it and a busy one loses work: "
+            f"{killed}")
+
+        # ONCE PER DAEMON, or a session that stays deaf is restarted forever.
+        killed.clear()
+        assert srv.recycle_deaf_sessions() == 0 and killed == [], killed
+
+        # AND AN UNKNOWN LISTING IS NOT "GONE". A network hiccup must not
+        # restart the machine.
+        srv2 = pp.PinProxy.__new__(pp.PinProxy)
+        srv2._recycled = set()
+        srv2._connected_bridges = None
+        monkeypatch.setattr(srv2, "deaf_bridges", lambda **k: ["cse_DEAF"])
+        killed.clear()
+        assert srv2.recycle_deaf_sessions() == 0 and killed == [], killed
+
+        # AND SOMETHING MUST ASK, which is the whole lesson of the detector
+        # that shipped dormant for three releases.
+        import inspect
+        wired = inspect.getsource(pp.PinProxy._title_sweep_loop)
+        assert "recycle_deaf_sessions" in wired, (
+            "nothing calls the deaf recycle, so the detector still has no "
+            "actor and the outage repeats")
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 
