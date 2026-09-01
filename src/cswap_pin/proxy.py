@@ -6623,6 +6623,23 @@ _CLIENT_LIVENESS_SECONDS = 45.0
 # `_DRAINING_BEAT_SECONDS`, so the TTL bounds SILENCE rather than duration and
 # a three-hour drain and a SIGKILLed one stop looking alike.
 _DRAINING_MARKER_TTL = 150.0
+#: How long the uncapped drain waits on tunnels before letting them go.
+#:
+#: THE SILENCE EXIT IS UNREACHABLE FOR THE CHANNEL THE WAIT PROTECTS. Remote
+#: Control RECEIVES on a WebSocket tunnel and the server keepalives it, so
+#: `_PUMP.quiet_for()` never climbs to `_DRAINING_MARKER_TTL` and the loop's
+#: only exit is the tunnel ending on its own. Measured on a mac 2026-08-31:
+#: `drained clean in 2240.2s` while holding two sessions' bridges, and
+#: unbounded in principle.
+#:
+#: WAITING DOES NOT SAVE THE CHANNEL. There is no fd handover here -- the
+#: successor cannot inherit a live connection -- so the cut happens either
+#: way; the wait only moves it to a moment nobody chose. Bounding it puts the
+#: cut beside the deploy that caused it, where `_report_deaf_bridges` names it
+#: in the same minute and the session re-homes on the successor's listener.
+#: On that mac the sessions did exactly that, twelve seconds after the log
+#: said `ONLY A NEW PROCESS CLEARS IT`.
+_TUNNEL_DRAIN_SECONDS = _DRAINING_MARKER_TTL
 _DRAINING_BEAT_SECONDS = 15.0
 
 # THE LEAK BOUND THAT REPLACED THE WALL CLOCK, and it is a different quantity
@@ -12175,8 +12192,10 @@ class PinProxy:
             # supervisor counting to `_DRAIN_SECONDS + 2`, and the held arm is
             # holding the port dark.
             if budget == float("inf"):
+                tunnel_deadline = started + _TUNNEL_DRAIN_SECONDS
                 while (_PUMP.live_pairs()
-                       and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL):
+                       and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL
+                       and time.monotonic() < tunnel_deadline):
                     beat_draining(self._certdir,
                                   owed=self.inflight_requests(),
                                   live=self.live_replies(started),
@@ -12186,10 +12205,29 @@ class PinProxy:
                                   bridges=self.held_bridge_ids())
                     time.sleep(_DRAINING_BEAT_SECONDS)
                 if _PUMP.live_pairs():
-                    _log_lifecycle(
-                        f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
-                        f"{int(_PUMP.quiet_for())}s rather than holding this "
-                        f"process open on a wedged peer")
+                    # WHICH EXIT WAS TAKEN, because the two mean opposite
+                    # things to a reader. A quiet tunnel is a peer that went
+                    # away; a chatty one at the deadline is a live Remote
+                    # Control channel about to lose its receive side, and that
+                    # is the line somebody needs when a session goes deaf.
+                    quiet = _PUMP.quiet_for()
+                    if quiet > _DRAINING_MARKER_TTL:
+                        _log_lifecycle(
+                            f"leaving {_PUMP.live_pairs()} tunnel(s) quiet for "
+                            f"{int(quiet)}s rather than holding this "
+                            f"process open on a wedged peer")
+                    else:
+                        n = _PUMP.live_pairs()
+                        released = _PUMP.release_pairs()
+                        _log_lifecycle(
+                            f"{n} tunnel(s) still talking after "
+                            f"{int(_TUNNEL_DRAIN_SECONDS)}s — a bridge inbound "
+                            "stream is keepalived and never goes quiet, so "
+                            "waiting cannot outlast it and no handover can "
+                            f"carry it. Released {released} now, beside the "
+                            "recycle that caused it, so the session re-homes "
+                            "on the successor instead of losing its receive "
+                            "side at an arbitrary moment later")
             if budget > 0:
                 deadline = started + budget
                 # THE BUDGET WAS CHOSEN BEFORE THE HANDOVER EXISTED, and the
@@ -15697,6 +15735,35 @@ class _PumpLoop:
         """
         with self._lock:
             return len(self._peer) // 2
+
+    def release_pairs(self) -> int:
+        """Let every driven tunnel go, and say how many.
+
+        SHUT_WR, NOT CLOSE, and on BOTH sides: each peer sees a clean EOF
+        rather than the RST it would get when this process exits with the
+        sockets still open. That is the same policy `release_idle_streams`
+        uses for SSE, and the 2x2 in `_close_open_connections` is the
+        measurement behind preferring it.
+
+        BOTH SIDES, because a tunnel has no client/upstream asymmetry here --
+        `add` takes an unordered pair and `_peer` maps each to the other. Half
+        a shutdown leaves the other end waiting on a socket nobody will write
+        to again.
+
+        THIS IS NOT A HANDOVER. The successor cannot inherit a live connection
+        (no `SCM_RIGHTS` anywhere in this tree), so the channel ends here
+        whatever we do. What this buys is WHEN: beside the recycle that caused
+        it, rather than whenever the peer happens to stop talking.
+        """
+        with self._lock:
+            socks = list(self._peer)
+            pairs = len(socks) // 2
+        for s_ in socks:
+            try:
+                s_.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+        return pairs
 
     def add(self, a, b, on_close=None) -> None:
         """Take over a pair of sockets. Returns AT ONCE.

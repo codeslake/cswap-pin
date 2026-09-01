@@ -7625,6 +7625,85 @@ class TestDrainReportsWhatItCut:
         assert hasattr(_PUMP, "reset_for_tests"), (
             "nothing can clear the shared pump between cases, so a leftover "
             "tunnel makes one case fail about another case's state")
+
+        # AND SILENCE IS NOT REACHABLE FOR THE CHANNEL THIS PROTECTS.
+        # Remote Control RECEIVES on a WebSocket tunnel and the server sends
+        # keepalives on it, so `_last_move` keeps refreshing and `quiet_for()`
+        # never climbs to the TTL. The wait's only exit is therefore closed by
+        # construction for exactly the tunnel it exists to protect. Measured on
+        # pmac 2026-08-31: `drained clean in 2240.2s`, holding the two bridges
+        # of the greencard and canada_pr sessions, and unbounded in principle.
+        assert "tunnel_deadline" in src, (
+            "the tunnel wait is bounded only on silence, and a bridge inbound "
+            "tunnel is never silent — the server keepalives it. That leaves "
+            "the uncapped arm with no reachable exit")
+
+        # AND THE CUT TAKES THE CHANNEL DOWN EITHER WAY. Waiting does not save
+        # it -- there is no fd handover in this repo (`SCM_RIGHTS` appears
+        # nowhere) -- so the wait only moves the cut to a moment nobody chose.
+        # Bounding it puts the cut next to the deploy that caused it, where
+        # `_report_deaf_bridges` names it in the same minute and the session
+        # re-homes. On pmac the sessions did exactly that, 12 s after the log
+        # said `ONLY A NEW PROCESS CLEARS IT`.
+
+    def case_a_chatty_tunnel_does_not_hold_the_drain_for_ever(self, certdir):
+        """The behaviour, not the source text.
+
+        A tunnel whose peer keeps talking pins `quiet_for()` near zero. Under
+        the old condition the loop had no other exit, so this call would run
+        until the tunnel ended on its own.
+        """
+        import cswap_pin.proxy as pp
+
+        class _Chatty:
+            """live, and never quiet."""
+
+            released = 0
+
+            def live_pairs(self):
+                return 1
+
+            def quiet_for(self):
+                return 0.0
+
+            def release_pairs(self):
+                type(self).released += 1
+                return 1
+
+        proxy = pp.PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PIN-TOKEN",
+            upstream=("127.0.0.1", 1),
+        )
+        # THE DEADLINE IS HONOURED, NOT THE NUMBER. Asserting the shipped 150 s
+        # would make this case sleep 150 s on every run -- the first version
+        # did, and cost the class 156 s. Patch the constant instead: what has
+        # to hold is that the loop stops at whatever it says, and a bound of
+        # one second proves that as well as a bound of a hundred and fifty.
+        old_pump, old_cap = pp._PUMP, pp._TUNNEL_DRAIN_SECONDS
+        pp._PUMP = _Chatty()
+        pp._TUNNEL_DRAIN_SECONDS = 1.0
+        try:
+            t0 = time.monotonic()
+            proxy.await_inflight(float("inf"))
+            waited = time.monotonic() - t0
+        finally:
+            pp._PUMP, pp._TUNNEL_DRAIN_SECONDS = old_pump, old_cap
+        # One beat is `_DRAINING_BEAT_SECONDS`, so the loop cannot notice the
+        # deadline sooner than that; the slack is for the beat, not the cap.
+        # AND IT LETS THE CHANNEL GO. Bounding the wait alone leaves the
+        # tunnel open on a process about to exit, so the peer gets an RST
+        # instead of a clean EOF -- the deadline stops the hang and the
+        # release is what makes the ending orderly. A mutant that dropped the
+        # release passed until this existed.
+        assert _Chatty.released == 1, (
+            "the drain stopped waiting but never released the tunnel, so it "
+            "still dies with the process instead of ending cleanly")
+        assert waited < pp._DRAINING_BEAT_SECONDS * 2, (
+            "a chatty tunnel held the uncapped drain for %.1fs against a 1s "
+            "cap; its only exit is silence and this peer never goes silent"
+            % waited)
+
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
         """The channel a session cannot reopen for itself must survive a recycle.
 
