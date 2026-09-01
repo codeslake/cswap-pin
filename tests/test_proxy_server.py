@@ -7303,6 +7303,39 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_the_carry_is_reachable_without_a_daemon(self, certdir):
+        """A switch must be able to carry pointers with no daemon running.
+
+        The only trigger today is the daemon noticing `.claude.json` move, so
+        the carry does not happen at all while the daemon is down -- and the
+        sessions that miss it are refused Remote Control until it comes back.
+        `cswap` is in the process that just wrote that file and can do it
+        itself, but only if the carry is callable without a `PinProxy`.
+
+        It already is, in fact: the method touches `self` nowhere. This pins
+        that as a contract rather than an accident, because a later `self.`
+        would break the caller silently -- an AttributeError inside a
+        best-effort call is swallowed and the carry just stops happening.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        assert callable(getattr(pp, "carry_live_pointers", None)), (
+            "there is no module-level carry, so a switch cannot run one "
+            "without constructing a daemon")
+
+        src = inspect.getsource(pp.carry_live_pointers)
+        assert "self" not in src, (
+            "the module-level carry reaches for `self`, so the caller that "
+            f"has no daemon cannot use it: {src[:200]!r}")
+
+        # AND THE METHOD MUST STILL WORK, or every daemon-side caller breaks.
+        m = inspect.getsource(pp.PinProxy.carry_live_pointers)
+        assert "carry_live_pointers(" in m.split("def ", 1)[1], (
+            "the method no longer delegates to the module-level carry, so "
+            "the two can drift apart")
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 

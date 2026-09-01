@@ -3994,6 +3994,126 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     return found[0] if len(found) == 1 else None
 
 
+def carry_live_pointers(login: "tuple[str, str]") -> int:
+    """Point a RUNNING session's bridge record at the account now signed in.
+
+    WHY THIS EXISTS BESIDE `_carry_history_pointers`. That one is documented
+    "for sessions with a bridge and NO PROCESS" and means it — measured, it
+    returned 0 candidates on a host where one live session's pointer named
+    a dead account and was the only session being refused Remote Control.
+    Claude Code compares that pointer to `~/.claude.json`'s `oauthAccount`;
+    on a mismatch it will not reattach, it MINTS — and minting is the path
+    the org-policy gate can refuse.
+
+    THE RACE THAT JUSTIFIED EXCLUDING LIVE SESSIONS IS HANDLED BY SCOPE,
+    not by a lock. The session's own process writes `bridgeSessionId` and
+    `lastSequenceNum` to this file; this writes ONLY the two owner fields,
+    and re-reads immediately before the rename so every other field comes
+    from the freshest copy on disk. A lost race therefore costs one sweep
+    of ours and nothing of theirs — the opposite of the read-modify-write
+    that made excluding them the safe choice.
+
+    NO WRITE WHEN IT ALREADY AGREES: this runs on a beat, and rewriting a
+    correct record every pass is contention on a file its owner is also
+    writing, bought for nothing.
+
+    `bridgeOwnerAccountUuid` HAS TWO WRITERS THAT MEAN OPPOSITE THINGS, and
+    anything reading it has to say which one it wants. Claude Code writes
+    the bridge's true server-side owner while a session runs. This writes
+    the account now SIGNED IN, so CC's local comparison agrees and it
+    reattaches instead of minting. Neither is wrong; they answer different
+    questions.
+
+    So a reader must pick, and the two questions want opposite values:
+
+        reattach-or-mint    the LOGIN. CC compares the stored pointer to
+                            `~/.claude.json`'s `oauthAccount`, never to the
+                            pin, and mints on a mismatch.
+        who owns the bridge the PIN. The pin re-asserts its identity on the
+                            request that mints one, so that is who the
+                            bridge belongs to server-side.
+
+    Three separate readers have already taken the wrong one, which is what
+    makes this worth stating here rather than at any one of them: a
+    reattach path that compared against the pin, a disconnect path that
+    compared against the login, and an external gate that graded THIS
+    function's deliberate output as a veto risk. All three read a field
+    whose value was correct.
+
+    A fourth reader will arrive. If it asks "does this pointer match what
+    CC will compare it against", it wants the login and this function's
+    output is the answer. If it asks "whose bridge is this", it wants the
+    pin and must not read this field at all while a session is live.
+    """
+    account, org = login
+    if not account:
+        return 0
+    # NO PIN-ORG GUARD HERE, and that is deliberate. The launch-path carry
+    # refuses when the pin's org differs from the login's; copying that
+    # here made this a no-op in the NORMAL case, because a pin account that
+    # differs from the active account is not an anomaly — it is the entire
+    # point of the pin. Refusing there refuses the state the feature exists
+    # to serve.
+    #
+    # The server side is already handled and not by this stamp:
+    # `/api/oauth/validate` is a pinned route, so when Claude Code asks who
+    # the current credential belongs to, the answer comes back as the
+    # PINNED account and CC re-baselines instead of tearing the bridge
+    # down. This stamp only has to make the LOCAL comparison agree so a
+    # reattach is attempted at all.
+    home = _config_home_for_policy()
+    carried = 0
+    for job in _live_job_ids():
+        path = home / "jobs" / job / "state.json"
+        rec = _read_json(path)
+        if not isinstance(rec, dict) or not rec.get("bridgeSessionId"):
+            continue
+        if rec.get(_JOB_OWNER[0]) == account and \
+                (rec.get(_JOB_OWNER[1]) or "") == (org or ""):
+            continue
+        fresh = _read_json(path)          # re-read: theirs wins on the rest
+        if not isinstance(fresh, dict) or not fresh.get("bridgeSessionId"):
+            continue
+        fresh[_JOB_OWNER[0]] = account
+        fresh[_JOB_OWNER[1]] = org
+        tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps(fresh), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            continue
+        carried += 1
+    # THE OTHER STORE, and leaving it out is why the first cut of this
+    # changed nothing for the session it was written for. `_carry_history_
+    # pointers` writes BOTH and says why: an interactive resume has no
+    # CLAUDE_JOB_DIR, so Claude Code reads the TRANSCRIPT.
+    for sid in _live_session_ids():
+        found = _last_pointer(sid)
+        if not found:
+            continue
+        path, rec = found
+        out = _carry_pointer(rec, (account, org), _TRANSCRIPT_OWNER)
+        if out is None:
+            continue
+        try:
+            # O_APPEND and the newline check, exactly as the launch-path
+            # carry does it: a transcript truncated mid-write ends without
+            # one, and appending there would fuse two records into a line
+            # neither side can parse.
+            with path.open("a+b") as fh:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    fh.write(b"\n")
+                fh.write(json.dumps(out).encode("utf-8") + b"\n")
+        except OSError:
+            continue
+        carried += 1
+    if carried:
+        _log_lifecycle(
+            f"carried {carried} running session(s) bridge pointer onto the "
+            f"current login")
+    return carried
+
 def _carry_history_pointers(certdir: Path) -> int:
     """Let sessions that are not running keep their bridge across a rotation.
 
@@ -11124,124 +11244,13 @@ class PinProxy:
         return True
 
     def carry_live_pointers(self, login: "tuple[str, str]") -> int:
-        """Point a RUNNING session's bridge record at the account now signed in.
+        """Delegate to the module-level carry.
 
-        WHY THIS EXISTS BESIDE `_carry_history_pointers`. That one is documented
-        "for sessions with a bridge and NO PROCESS" and means it — measured, it
-        returned 0 candidates on a host where one live session's pointer named
-        a dead account and was the only session being refused Remote Control.
-        Claude Code compares that pointer to `~/.claude.json`'s `oauthAccount`;
-        on a mismatch it will not reattach, it MINTS — and minting is the path
-        the org-policy gate can refuse.
-
-        THE RACE THAT JUSTIFIED EXCLUDING LIVE SESSIONS IS HANDLED BY SCOPE,
-        not by a lock. The session's own process writes `bridgeSessionId` and
-        `lastSequenceNum` to this file; this writes ONLY the two owner fields,
-        and re-reads immediately before the rename so every other field comes
-        from the freshest copy on disk. A lost race therefore costs one sweep
-        of ours and nothing of theirs — the opposite of the read-modify-write
-        that made excluding them the safe choice.
-
-        NO WRITE WHEN IT ALREADY AGREES: this runs on a beat, and rewriting a
-        correct record every pass is contention on a file its owner is also
-        writing, bought for nothing.
-
-        `bridgeOwnerAccountUuid` HAS TWO WRITERS THAT MEAN OPPOSITE THINGS, and
-        anything reading it has to say which one it wants. Claude Code writes
-        the bridge's true server-side owner while a session runs. This writes
-        the account now SIGNED IN, so CC's local comparison agrees and it
-        reattaches instead of minting. Neither is wrong; they answer different
-        questions.
-
-        So a reader must pick, and the two questions want opposite values:
-
-            reattach-or-mint    the LOGIN. CC compares the stored pointer to
-                                `~/.claude.json`'s `oauthAccount`, never to the
-                                pin, and mints on a mismatch.
-            who owns the bridge the PIN. The pin re-asserts its identity on the
-                                request that mints one, so that is who the
-                                bridge belongs to server-side.
-
-        Three separate readers have already taken the wrong one, which is what
-        makes this worth stating here rather than at any one of them: a
-        reattach path that compared against the pin, a disconnect path that
-        compared against the login, and an external gate that graded THIS
-        function's deliberate output as a veto risk. All three read a field
-        whose value was correct.
-
-        A fourth reader will arrive. If it asks "does this pointer match what
-        CC will compare it against", it wants the login and this function's
-        output is the answer. If it asks "whose bridge is this", it wants the
-        pin and must not read this field at all while a session is live.
+        A switch runs this with no daemon in the process, so the body
+        cannot live on the class. Kept as a method because every
+        daemon-side caller reaches it that way.
         """
-        account, org = login
-        if not account:
-            return 0
-        # NO PIN-ORG GUARD HERE, and that is deliberate. The launch-path carry
-        # refuses when the pin's org differs from the login's; copying that
-        # here made this a no-op in the NORMAL case, because a pin account that
-        # differs from the active account is not an anomaly — it is the entire
-        # point of the pin. Refusing there refuses the state the feature exists
-        # to serve.
-        #
-        # The server side is already handled and not by this stamp:
-        # `/api/oauth/validate` is a pinned route, so when Claude Code asks who
-        # the current credential belongs to, the answer comes back as the
-        # PINNED account and CC re-baselines instead of tearing the bridge
-        # down. This stamp only has to make the LOCAL comparison agree so a
-        # reattach is attempted at all.
-        home = _config_home_for_policy()
-        carried = 0
-        for job in _live_job_ids():
-            path = home / "jobs" / job / "state.json"
-            rec = _read_json(path)
-            if not isinstance(rec, dict) or not rec.get("bridgeSessionId"):
-                continue
-            if rec.get(_JOB_OWNER[0]) == account and \
-                    (rec.get(_JOB_OWNER[1]) or "") == (org or ""):
-                continue
-            fresh = _read_json(path)          # re-read: theirs wins on the rest
-            if not isinstance(fresh, dict) or not fresh.get("bridgeSessionId"):
-                continue
-            fresh[_JOB_OWNER[0]] = account
-            fresh[_JOB_OWNER[1]] = org
-            tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
-            try:
-                tmp.write_text(json.dumps(fresh), encoding="utf-8")
-                tmp.replace(path)
-            except OSError:
-                continue
-            carried += 1
-        # THE OTHER STORE, and leaving it out is why the first cut of this
-        # changed nothing for the session it was written for. `_carry_history_
-        # pointers` writes BOTH and says why: an interactive resume has no
-        # CLAUDE_JOB_DIR, so Claude Code reads the TRANSCRIPT.
-        for sid in _live_session_ids():
-            found = _last_pointer(sid)
-            if not found:
-                continue
-            path, rec = found
-            out = _carry_pointer(rec, (account, org), _TRANSCRIPT_OWNER)
-            if out is None:
-                continue
-            try:
-                # O_APPEND and the newline check, exactly as the launch-path
-                # carry does it: a transcript truncated mid-write ends without
-                # one, and appending there would fuse two records into a line
-                # neither side can parse.
-                with path.open("a+b") as fh:
-                    fh.seek(-1, os.SEEK_END)
-                    if fh.read(1) != b"\n":
-                        fh.write(b"\n")
-                    fh.write(json.dumps(out).encode("utf-8") + b"\n")
-            except OSError:
-                continue
-            carried += 1
-        if carried:
-            _log_lifecycle(
-                f"carried {carried} running session(s) bridge pointer onto the "
-                f"current login")
-        return carried
+        return carry_live_pointers(login)
 
     def clear_dead_bridge_records(self, connected: "set[str] | None") -> int:
         """Let a live session mint a new bridge when its own is a corpse.
