@@ -7440,6 +7440,35 @@ class TestDrainReportsWhatItCut:
             "no-process carry follows it, so every LIVE session keeps a "
             "pointer that will not reattach until the daemon's next poll")
 
+    def case_the_mint_time_reassert_carries_live_pointers(self, certdir):
+        """The splice that runs ON THE CREATE moves the field for EVERYONE.
+
+        `_reassert_pin_identity` is correctly ordered for the bridge being
+        minted -- its own docstring says it runs when the owner is stamped. It
+        is not ordered for the sessions ALREADY running: their pointers were
+        stamped against the pre-splice account, and the moment this rewrites
+        `oauthAccount` those pointers disagree with what CC will compare them
+        against. Each is then vetoed on its next reattach and minted fresh.
+
+        This is the site that fires most often -- once per bridge create -- so
+        leaving it uncarried is what keeps producing unclaimed bridges even
+        after the launch path was fixed.
+
+        The carry is a no-op once the pointers agree, so the added cost is one
+        read per live session per create, not a write.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        src = inspect.getsource(pp.PinProxy._reassert_pin_identity)
+        assert "splice_config_identity" in src, (
+            "anchored on the wrong method; this case proves nothing")
+        assert "carry_live_pointers" in src, (
+            "the mint-time splice moves `oauthAccount` and leaves every "
+            "already-running session's pointer behind, so each is vetoed into "
+            "a fresh mint on its next reattach")
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 

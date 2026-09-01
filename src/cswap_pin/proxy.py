@@ -12724,6 +12724,19 @@ class PinProxy:
             return
         try:
             splice_config_identity(ident)
+            # AND EVERY SESSION ALREADY RUNNING, because the splice above moves
+            # the field CC compares their pointers against. Ordered correctly
+            # for the bridge being minted and not for them: theirs were stamped
+            # against the pre-splice account, so each is vetoed into a fresh
+            # mint on its next reattach. This is the site that fires most --
+            # once per create -- so leaving it uncarried keeps producing
+            # unclaimed bridges after the launch path is fixed.
+            #
+            # A no-op once they agree: the carry writes only on a difference,
+            # so the steady-state cost is one read per live session.
+            _live = _login_identity()
+            if _live:
+                carry_live_pointers(_live)
         except Exception:  # noqa: BLE001 — a bridge must never fail on the pin
             pass
         # VERIFY, BECAUSE THE RETURN CANNOT CARRY IT. `splice_config_identity`
