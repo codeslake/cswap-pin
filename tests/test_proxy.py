@@ -18676,6 +18676,44 @@ class TestTheCarryFollowsTheLoginNotTheClock:
         assert obj._carry_on_login_change() is False
         assert said == [], said
 
+    def test_an_unreadable_pass_does_not_retire_the_mtime(
+            self, tmp_path, monkeypatch):
+        """A read that learned nothing leaves the gate open.
+
+        The mtime was recorded before the identity was read, so one pass that
+        could not resolve the login -- the config caught mid-write, a partial
+        parse -- retired that mtime permanently and the carry it owed never
+        ran. The next reattach then compares pointers against a config nobody
+        carried onto, which is a veto and a fresh mint: a new session name and
+        no history. This is also what made the CONTROL beside it flaky, since
+        a first pass that read None left `_login_seen` unset and the second
+        logged a move from `?`.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        monkeypatch.setenv("CSWAP_PIN_DEBUG", str(tmp_path / "trace"))
+        obj, _ = self._proxy(tmp_path, monkeypatch, [("A", "org")])
+
+        real = pin_proxy._login_identity
+        looks = []
+
+        def _flaky():
+            looks.append(1)
+            return None if len(looks) == 1 else real()
+
+        monkeypatch.setattr(pin_proxy, "_login_identity", _flaky)
+        assert obj._carry_on_login_change() is False
+        assert getattr(obj, "_login_seen_mtime", None) is None, (
+            "an unreadable pass consumed the mtime gate, so the carry it owed "
+            "can never run at this mtime again")
+
+        # THE SAME MTIME, now readable. Nothing touched the file in between.
+        assert obj._carry_on_login_change() is True, (
+            "the retry never happened: one transient read failure disarmed "
+            "the carry until something else wrote the config")
+
     def test_CONTROL_a_second_look_at_an_unchanged_login_does_nothing(
             self, tmp_path, monkeypatch):
         """The carry is still keyed on the login MOVING. Without this the beat

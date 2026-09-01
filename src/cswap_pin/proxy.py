@@ -11258,10 +11258,18 @@ class PinProxy:
             return False
         if mtime == getattr(self, "_login_seen_mtime", None):
             return False
-        self._login_seen_mtime = mtime
         login = _login_identity()
+        # A READ THAT LEARNED NOTHING MUST NOT CONSUME THE GATE. Recording the
+        # mtime first means one unreadable pass — the config caught mid-write,
+        # a partial parse — retires that mtime for good, and the carry it owed
+        # never runs. The bridge pointers then disagree with the config at the
+        # next reattach, which is a fresh mint: a new name and no history.
+        # Leave the gate open so the next look retries.
+        if login is None:
+            return False
+        self._login_seen_mtime = mtime
         prev = getattr(self, "_login_seen", None)
-        if login is None or login == prev:
+        if login == prev:
             return False
         # NO FIRST-OBSERVATION SKIP. A `/login` made while this daemon was
         # down has no predecessor to differ from, and every deploy recycles
