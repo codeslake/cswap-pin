@@ -4372,6 +4372,34 @@ def _fake_pids(base: int, count: int) -> list[int]:
     return list(range(base, base + count))
 
 
+class _Chatty:
+    """One live pair of `kind`, never quiet."""
+
+    released = []
+
+    def __init__(self, kind="bridge"):
+        self.kind = kind
+        self.live = 1
+
+    def live_pairs(self, kind=None):
+        # GONE MEANS GONE. Reporting the pair after it was released
+        # spins the drain for ever -- and `kind is None` must not
+        # match a released pair whose kind was merely cleared.
+        if not self.live:
+            return 0
+        return 1 if kind in (None, self.kind) else 0
+
+    def quiet_for(self):
+        return 0.0
+
+    def release_pairs(self, kind=None):
+        if not self.live or kind not in (None, self.kind):
+            return 0
+        type(self).released.append(kind)
+        self.live = 0
+        return 1
+
+
 class TestDrainReportsWhatItCut:
     """The drain line must say what was still open, not always zero.
 
@@ -7655,21 +7683,6 @@ class TestDrainReportsWhatItCut:
         """
         import cswap_pin.proxy as pp
 
-        class _Chatty:
-            """live, and never quiet."""
-
-            released = 0
-
-            def live_pairs(self):
-                return 1
-
-            def quiet_for(self):
-                return 0.0
-
-            def release_pairs(self):
-                type(self).released += 1
-                return 1
-
         proxy = pp.PinProxy(
             certdir=certdir,
             pin_token_provider=lambda: "PIN-TOKEN",
@@ -7681,7 +7694,8 @@ class TestDrainReportsWhatItCut:
         # to hold is that the loop stops at whatever it says, and a bound of
         # one second proves that as well as a bound of a hundred and fifty.
         old_pump, old_cap = pp._PUMP, pp._TUNNEL_DRAIN_SECONDS
-        pp._PUMP = _Chatty()
+        _Chatty.released = []
+        pp._PUMP = _Chatty("bridge")
         pp._TUNNEL_DRAIN_SECONDS = 1.0
         try:
             t0 = time.monotonic()
@@ -7696,13 +7710,56 @@ class TestDrainReportsWhatItCut:
         # instead of a clean EOF -- the deadline stops the hang and the
         # release is what makes the ending orderly. A mutant that dropped the
         # release passed until this existed.
-        assert _Chatty.released == 1, (
-            "the drain stopped waiting but never released the tunnel, so it "
-            "still dies with the process instead of ending cleanly")
+        assert "bridge" in _Chatty.released, (
+            "the drain stopped waiting but never released the bridge tunnel, "
+            "so it still dies with the process instead of ending cleanly")
         assert waited < pp._DRAINING_BEAT_SECONDS * 2, (
             "a chatty tunnel held the uncapped drain for %.1fs against a 1s "
             "cap; its only exit is silence and this peer never goes silent"
             % waited)
+
+    def case_CONTROL_a_bulk_tunnel_is_not_cut_by_the_bridge_deadline(
+            self, certdir):
+        """THE HALF THE DEADLINE MUST NOT TOUCH.
+
+        Every host that is not the upstream takes a blind CONNECT and lands in
+        the same pump — git, pip, npm, the auto-updater. A transfer still
+        moving bytes is real work, and the silence bound waits it out
+        correctly; only the keepalived bridge can never satisfy that bound.
+        Without this the first version's clock cut a running `git clone` at
+        150s because a recycle happened to be draining.
+        """
+        import cswap_pin.proxy as pp
+
+        proxy = pp.PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PIN-TOKEN",
+            upstream=("127.0.0.1", 1),
+        )
+        old_pump, old_cap = pp._PUMP, pp._TUNNEL_DRAIN_SECONDS
+        _Chatty.released = []
+        pp._PUMP = _Chatty("tunnel")        # a bulk transfer, not a bridge
+        pp._TUNNEL_DRAIN_SECONDS = 0.0      # the deadline is already past
+        try:
+            t0 = time.monotonic()
+            # It must NOT return on the clock. The bound that applies here is
+            # silence, and this peer never goes silent, so the call is
+            # expected to keep waiting -- which is what the old behaviour was
+            # and what a bulk transfer needs.
+            th = threading.Thread(target=proxy.await_inflight,
+                                  args=(float("inf"),), daemon=True)
+            th.start()
+            th.join(timeout=3.0)
+            still_waiting = th.is_alive()
+            waited = time.monotonic() - t0
+        finally:
+            pp._PUMP, pp._TUNNEL_DRAIN_SECONDS = old_pump, old_cap
+        assert still_waiting, (
+            "the drain gave up on a bulk tunnel after %.1fs; the bridge "
+            "deadline reached a population it must not touch" % waited)
+        assert "bridge" not in _Chatty.released and not _Chatty.released, (
+            "a non-bridge tunnel was released by the bridge deadline: %r"
+            % (_Chatty.released,))
 
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
         """The channel a session cannot reopen for itself must survive a recycle.
