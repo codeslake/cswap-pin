@@ -2800,6 +2800,8 @@ DEAF_REPORT_BLIND = "cannot say whether any bridge is deaf"
 
 # THE TWO LINES `_note_attachment` writes. Same contract as the deaf pair:
 # a watcher matches them, so a reword is a fleet-wide silent break.
+RENAME_REPORT_OK = "a session rename reached the bridge"
+RENAME_REPORT_FAIL = "a session rename was REFUSED by the bridge"
 ATTACH_REPORT_OK = "claude.ai attachment downloaded as the pinned account"
 ATTACH_REPORT_FAIL = "claude.ai attachment could NOT be downloaded"
 
@@ -12030,6 +12032,46 @@ class PinProxy:
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
+    def _note_rename(self, method: str, path: str, status_line: bytes) -> None:
+        """Say whether a session rename reached its bridge, on CHANGE.
+
+        `updateSessionTitle` PUTs with `validateStatus: (d) => d < 500`, so a
+        4xx raises nothing in the CLI and the roster keeps showing the new
+        name. The only party who learns the rename did not land is a PEER
+        reading the stale label off a cross-session message, and by then a
+        reply has gone to the wrong session. The proxy sees both the route and
+        the status, so it is the only place that can say so.
+
+        Never raises: a statistic must not cost a request.
+        """
+        try:
+            if method != "PUT":
+                return
+            # EXACTLY ONE SEGMENT after the prefix: the collection mints a
+            # bridge and a sub-resource is a different write, and neither is a
+            # rename.
+            head = path.split("?", 1)[0]
+            rest = head[len("/v1/code/sessions/"):] if head.startswith(
+                "/v1/code/sessions/") else None
+            if not rest or "/" in rest:
+                return
+            parts = status_line.split(b" ")
+            code = parts[1].decode("latin1", "replace") if len(parts) > 1 else "?"
+            ok = code.startswith("2")
+            state = "ok" if ok else code
+            if state == getattr(self, "_last_rename", None):
+                return
+            self._last_rename = state
+            if ok:
+                _log_lifecycle(RENAME_REPORT_OK)
+            else:
+                _log_lifecycle(
+                    f"{RENAME_REPORT_FAIL} — upstream answered {code}; the "
+                    "roster still shows the new name and peers keep seeing "
+                    "the old one")
+        except Exception:  # noqa: BLE001 — a statistic must not cost a request
+            pass
+
     def held_bridge_ids(self) -> set:
         """Bridges whose inbound stream THIS process is holding open.
 
@@ -14369,6 +14411,7 @@ class PinProxy:
                 # number that means the same thing for both.
                 on_status=lambda st: (
                     self._note_attachment(path, st),
+                    self._note_rename(method, path, st),
                     self._tunnel_trace(
                         f"    <- {st.decode('latin1', 'replace').strip()}"
                         f"  {method} {path}  ua={_ua}"),

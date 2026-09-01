@@ -7221,6 +7221,88 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_refused_rename_leaves_a_record(self, certdir):
+        """`updateSessionTitle` PUTs the title and swallows the answer.
+
+        The CLI's own call carries `validateStatus: (d) => d < 500`, so a 4xx
+        raises nothing and leaves one debug line. The roster keeps showing the
+        new name, so the only party who learns the rename did not land is the
+        PEER reading the old label off a cross-session message — and by then a
+        reply has already gone to the wrong session.
+
+        The proxy is the only place that sees both the route and the status, so
+        it is the only place the failure can stop being silent. Same shape as
+        the attachment notifier one class up: on CHANGE, carrying the code,
+        never raising.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._live_lock = threading.Lock()
+            P = "/v1/code/sessions/cse_01AAAAAAAAAAAAAAAAAAAAAA"
+
+            srv._note_rename("PUT", P, b"HTTP/1.1 403 Forbidden")
+            assert lines, (
+                "a refused rename left no record anywhere, which is the whole "
+                "defect: the CLI swallows it and the roster still shows the "
+                "new name")
+            assert pp.RENAME_REPORT_FAIL in lines[-1], lines[-1]
+            assert "403" in lines[-1], (
+                "the failure does not carry its status, so a reader cannot "
+                f"tell a refused owner from a vanished bridge: {lines[-1]!r}")
+
+            before = len(lines)
+            srv._note_rename("PUT", P, b"HTTP/1.1 403 Forbidden")
+            assert len(lines) == before, (
+                "it logged again with nothing changed; the CLI retries the "
+                "title on reconnect, so one line per PUT buries the change")
+
+            # AND BACK, or a session that recovers keeps reading as broken.
+            srv._note_rename("PUT", P, b"HTTP/1.1 200 OK")
+            assert pp.RENAME_REPORT_OK in lines[-1], lines[-1]
+
+            # A GET ON THE SAME PATH SAYS NOTHING. The route is shared, so
+            # keying on the path alone would report every failed poll as a
+            # failed rename.
+            before = len(lines)
+            srv._note_rename("GET", P, b"HTTP/1.1 404 Not Found")
+            assert len(lines) == before, (
+                f"it reported a GET on the sessions route: {lines[-1]!r}")
+
+            # AND THE COLLECTION ROUTE IS NOT A RENAME EITHER -- `POST
+            # /v1/code/sessions` mints a bridge and its 4xx is a different bug.
+            before = len(lines)
+            srv._note_rename("PUT", "/v1/code/sessions", b"HTTP/1.1 400 Bad")
+            assert len(lines) == before, (
+                f"it reported about the collection route: {lines[-1]!r}")
+
+            # NOR A SUB-RESOURCE. The prefix test alone passes this, so without
+            # it a PUT under the bridge id reports as a failed rename.
+            before = len(lines)
+            srv._note_rename("PUT", P + "/worker/events", b"HTTP/1.1 404 No")
+            assert len(lines) == before, (
+                f"it reported a PUT under the bridge id: {lines[-1]!r}")
+
+            # AND A QUERY STRING IS NOT A SEGMENT. Stripping it is what keeps
+            # the rename itself from being filtered out as a sub-resource.
+            srv._note_rename("PUT", P + "?x=1/2", b"HTTP/1.1 500 Err")
+            assert pp.RENAME_REPORT_FAIL in lines[-1], lines[-1]
+
+            # AND SOMETHING MUST ASK.
+            import inspect
+            wired = inspect.getsource(pp.PinProxy._forward)
+            assert "_note_rename" in wired, (
+                "nothing calls the rename notifier, so a refused rename stays "
+                "exactly as silent as it was")
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 
