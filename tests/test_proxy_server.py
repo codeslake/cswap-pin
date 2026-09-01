@@ -7355,6 +7355,9 @@ class TestDrainReportsWhatItCut:
         killed = []
         srv = pp.PinProxy.__new__(pp.PinProxy)
         srv._recycled = set()
+        # THE DISK STAMP NEEDS A DIRECTORY. Not the real certdir: this case
+        # must not leave a stamp that shields a later one.
+        srv._certdir = certdir
         srv._connected_bridges = {"cse_DEAF", "cse_FINE"}
         monkeypatch.setattr(pp, "_signal_worker",
                             lambda pid: (killed.append(pid), True)[1])
@@ -7390,6 +7393,7 @@ class TestDrainReportsWhatItCut:
         # restart the machine.
         srv2 = pp.PinProxy.__new__(pp.PinProxy)
         srv2._recycled = set()
+        srv2._certdir = certdir
         srv2._connected_bridges = None
         monkeypatch.setattr(srv2, "deaf_bridges", lambda **k: ["cse_DEAF"])
         killed.clear()
@@ -7515,6 +7519,56 @@ class TestDrainReportsWhatItCut:
             "the reap took the marker that protects the drain doing the "
             "reaping")
         assert mine.stat().st_mtime > old, "the beat did not refresh its own"
+
+    def case_a_recycle_is_remembered_across_daemon_generations(
+            self, certdir, tmp_path, monkeypatch):
+        """"Once per daemon" became "once per proxy redeploy", which is a loop.
+
+        `_recycled` lives in the daemon's memory, so a new generation starts
+        empty. On a day with four pin releases that is four kills of the same
+        session -- measured, two sessions were each TERMed twice under two
+        daemon pids, with `worker crashed (exit 143) - respawning...` repeating
+        on the user's screen. A restart does not clear the deaf condition
+        either, so nothing ends the loop.
+
+        The stamp goes on disk beside the other state this directory already
+        holds, so the next generation can see it.
+        """
+        import os
+        import time
+
+        import cswap_pin.proxy as pp
+
+        d = tmp_path / "cert"
+        d.mkdir()
+        assert not pp._recycled_recently(d, "sess-A"), "nothing recycled yet"
+
+        pp._remember_recycle(d, "sess-A")
+        assert pp._recycled_recently(d, "sess-A"), (
+            "a fresh generation reading this directory must see that the "
+            "previous one already tried")
+        assert not pp._recycled_recently(d, "sess-B"), (
+            "the stamp is per session; one recycle must not shield another")
+
+        # AND IT EXPIRES, or a session that goes deaf months later can never
+        # be repaired.
+        p = pp._recycle_stamp_path(d, "sess-A")
+        old = time.time() - (pp._RECYCLE_COOLDOWN_S + 60)
+        os.utime(p, (old, old))
+        assert not pp._recycled_recently(d, "sess-A"), (
+            "past the cooldown the repair must be available again")
+
+        # AND AN UNREADABLE STAMP FAILS OPEN -- refusing there would disable
+        # the repair entirely, and the in-memory set still bounds this
+        # generation.
+        assert not pp._recycled_recently(d / "nope", "sess-A")
+
+        # AND THE RECYCLE MUST CONSULT IT.
+        import inspect
+        src = inspect.getsource(pp.PinProxy.recycle_deaf_sessions)
+        assert "_recycled_recently" in src and "_remember_recycle" in src, (
+            "the disk stamp exists and the recycle does not read it, so the "
+            "loop is unchanged")
 
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.

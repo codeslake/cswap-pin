@@ -5869,6 +5869,35 @@ def _quiet_phrase(secs: "float | None") -> str:
     return f"{secs:.0f}s"
 
 
+def _recycle_stamp_path(certdir: Path, sid: str) -> Path:
+    """Where a session's last recycle is remembered, across daemon generations."""
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(sid))[:80]
+    return Path(certdir) / f"{_RECYCLED_PREFIX}{safe}"
+
+
+def _recycled_recently(certdir: Path, sid: str) -> bool:
+    """Has any generation recycled this session inside the cooldown?
+
+    Fails OPEN -- an unreadable stamp answers False -- because refusing on a
+    read error would disable the repair entirely, and the in-memory set still
+    bounds the current generation.
+    """
+    try:
+        age = time.time() - _recycle_stamp_path(certdir, sid).stat().st_mtime
+    except OSError:
+        return False
+    return age < _RECYCLE_COOLDOWN_S
+
+
+def _remember_recycle(certdir: Path, sid: str) -> None:
+    """Record that this session was just recycled. Never raises."""
+    try:
+        _recycle_stamp_path(certdir, sid).write_text(
+            str(int(time.time())), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _collect_dead_markers(certdir: Path, keep_pid: int | None = None) -> None:
     """Remove `.draining-<pid>` markers nothing has beaten since the TTL.
 
@@ -6821,6 +6850,18 @@ _MAX_DRAINING_PREDECESSORS = 8
 # `draining_marker_path` writes, and a literal in both is a sweep that silently
 # stops matching the day the name changes.
 _DRAINING_PREFIX = ".draining-"
+
+#: A recycle is remembered ON DISK, because `_recycled` lives in the daemon's
+#: memory and a new generation starts empty. "Once per daemon" therefore became
+#: "once per proxy REDEPLOY", and on a day with four releases that is a kill
+#: loop: measured, two sessions were each TERMed twice under two daemon pids,
+#: with the user watching `worker crashed (exit 143) — respawning...` repeat.
+#: A restart does not clear the condition either, so the loop has no end.
+_RECYCLED_PREFIX = ".recycled-"
+#: Long enough that a session which stays deaf is not restarted again by the
+#: next release. The remedy is a new process, and if one did not help, more of
+#: them will not.
+_RECYCLE_COOLDOWN_S = 6 * 3600.0
 
 # "This marker does not say what it would cost to reap me." Sorts after every
 # known count, because this orders what to KILL and an unparseable file is not
@@ -11388,6 +11429,8 @@ class PinProxy:
                 continue
             if not sid or pid <= 0 or sid in self._recycled:
                 continue
+            if _recycled_recently(self._certdir, sid):
+                continue               # a previous GENERATION already tried
             if not _session_is_idle(str(rec.get("jobId") or "")):
                 continue               # NOT marked recycled: try again later
             job_rec = _read_json(_config_home_for_policy() / "jobs" /
@@ -11396,6 +11439,7 @@ class PinProxy:
             if not bid or bid.replace("session_", "cse_") not in deaf:
                 continue
             self._recycled.add(sid)
+            _remember_recycle(self._certdir, sid)
             if _signal_worker(pid):
                 done += 1
                 _log_lifecycle(
