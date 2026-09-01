@@ -7336,240 +7336,32 @@ class TestDrainReportsWhatItCut:
             "the method no longer delegates to the module-level carry, so "
             "the two can drift apart")
 
-    def case_a_deaf_bridge_gets_a_new_process(self, certdir, monkeypatch):
-        """A deaf bridge has a DETECTOR and had no actor, for four hours.
+    def case_the_pin_never_kills_a_session_to_cure_deafness(self):
+        """A deaf bridge is REPORTED and never repaired by killing anything.
 
-        `_report_deaf_bridges` writes one line, on change, and that is all that
-        ever happened: measured, the line "1 of 12 bridge(s) post but hold no
-        inbound stream ... only a NEW PROCESS clears it" appeared exactly once
-        and the session sat on `rc failed` until a person noticed. The line
-        names the remedy in its own text and nothing performed it.
+        The pin once grew `recycle_deaf_sessions`, which SIGTERMed the worker
+        behind a bridge holding no inbound stream. It crash-looped two peer
+        sessions before it was removed. Deafness is a real condition and the
+        pin cannot cure it -- Claude Code does not rebuild the Remote Control
+        receive channel after an EOF or a reset, so the only remedy is a new
+        process and the REPL is what dispatches one. The log line saying "only
+        a new process clears it" is addressed to that REPL, not to this daemon.
 
-        `recycle_denied_sessions` already has the machinery and the three
-        guards; it is gated on a POLICY refusal, which this is not. Same shape,
-        different discriminator -- and deaf is the stronger one, because it
-        means the bridge exists and does not work.
+        Guarding the absence, because the detector and the actor look alike and
+        this shape has been rebuilt from its own report before.
         """
         import cswap_pin.proxy as pp
+        import pathlib
 
-        killed = []
-        srv = pp.PinProxy.__new__(pp.PinProxy)
-        srv._recycled = set()
-        # THE DISK STAMP NEEDS A DIRECTORY. Not the real certdir: this case
-        # must not leave a stamp that shields a later one.
-        srv._certdir = certdir
-        srv._connected_bridges = {"cse_DEAF", "cse_FINE"}
-        monkeypatch.setattr(pp, "_signal_worker",
-                            lambda pid: (killed.append(pid), True)[1])
-        monkeypatch.setattr(pp, "_session_is_idle", lambda job: job != "busy")
-        monkeypatch.setattr(srv, "deaf_bridges", lambda **k: ["cse_DEAF"])
-
-        def _rec(sid, pid, kind, job, bid):
-            return {"sessionId": sid, "pid": pid, "kind": kind, "jobId": job,
-                    "startedAt": 1.0, "name": sid}
-        jobs = {"jdeaf": "session_DEAF", "jfine": "session_FINE",
-                "jterm": "session_DEAF", "busy": "session_DEAF"}
-        monkeypatch.setattr(pp, "_read_json",
-                            lambda path: {"bridgeSessionId":
-                                          jobs.get(path.parent.name, "")})
-        monkeypatch.setattr(pp, "_live_session_records", lambda: [
-            _rec("deaf", 101, "bg", "jdeaf", None),
-            _rec("fine", 102, "bg", "jfine", None),
-            _rec("term", 103, "interactive", "jterm", None),
-            _rec("busy", 104, "bg", "busy", None),
-        ])
-
-        assert srv.recycle_deaf_sessions() == 1, killed
-        assert killed == [101], (
-            "only the deaf, background, idle session may be replaced: a "
-            f"terminal has nothing to respawn it and a busy one loses work: "
-            f"{killed}")
-
-        # ONCE PER DAEMON, or a session that stays deaf is restarted forever.
-        killed.clear()
-        assert srv.recycle_deaf_sessions() == 0 and killed == [], killed
-
-        # AND AN UNKNOWN LISTING IS NOT "GONE". A network hiccup must not
-        # restart the machine.
-        srv2 = pp.PinProxy.__new__(pp.PinProxy)
-        srv2._recycled = set()
-        srv2._certdir = certdir
-        srv2._connected_bridges = None
-        monkeypatch.setattr(srv2, "deaf_bridges", lambda **k: ["cse_DEAF"])
-        killed.clear()
-        assert srv2.recycle_deaf_sessions() == 0 and killed == [], killed
-
-        # AND SOMETHING MUST ASK, which is the whole lesson of the detector
-        # that shipped dormant for three releases.
-        import inspect
-        wired = inspect.getsource(pp.PinProxy._title_sweep_loop)
-        assert "recycle_deaf_sessions" in wired, (
-            "nothing calls the deaf recycle, so the detector still has no "
-            "actor and the outage repeats")
-
-    def case_the_splice_carries_live_pointers_too(self, certdir):
-        """A splice moves the field CC compares against. Live pointers must move
-        with it, in the same act.
-
-        `bridgeOwnerAccountUuid` and `~/.claude.json`'s `oauthAccount` are the
-        two ends of one comparison, read at two different times: the pointer is
-        stamped when a job record is written, the comparison runs at reattach.
-        The splice moves the second end. Anything stamped before it and
-        reattaching after it disagrees, and CC MINTS -- `restored_owner_mismatch`
-        in the binary, "minting fresh, history channels suppressed" in the log.
-
-        `_carry_history_pointers` already runs here and is documented for
-        sessions with a bridge and NO PROCESS, so it leaves exactly the live
-        ones. Those waited for the daemon's next `.claude.json` mtime poll --
-        measured, a session reattached ONE SECOND after being revived and lost
-        its bridge, which is well inside that window.
-
-        Pinned as source, not behaviour: the launch path this sits on needs a
-        whole proxy to exercise, and what regressed is which of the two carries
-        is called.
-        """
-        import inspect
-
-        import cswap_pin.proxy as pp
-
-        # NAMED, not discovered. A `dir(pp)` sweep matched some other holder
-        # of the same call first and reported the site unfixed after it was
-        # fixed -- an instrument answering about the wrong function.
-        src = inspect.getsource(pp.heal)
-        assert "_carry_history_pointers(certdir)" in src, (
-            "`heal` no longer carries on the launch path; this case is "
-            "anchored on the wrong function and proves nothing")
-        assert "carry_live_pointers" in src, (
-            "the splice moves the field CC compares against and only the "
-            "no-process carry follows it, so every LIVE session keeps a "
-            "pointer that will not reattach until the daemon's next poll")
-
-    def case_the_mint_time_reassert_carries_live_pointers(self, certdir):
-        """The splice that runs ON THE CREATE moves the field for EVERYONE.
-
-        `_reassert_pin_identity` is correctly ordered for the bridge being
-        minted -- its own docstring says it runs when the owner is stamped. It
-        is not ordered for the sessions ALREADY running: their pointers were
-        stamped against the pre-splice account, and the moment this rewrites
-        `oauthAccount` those pointers disagree with what CC will compare them
-        against. Each is then vetoed on its next reattach and minted fresh.
-
-        This is the site that fires most often -- once per bridge create -- so
-        leaving it uncarried is what keeps producing unclaimed bridges even
-        after the launch path was fixed.
-
-        The carry is a no-op once the pointers agree, so the added cost is one
-        read per live session per create, not a write.
-        """
-        import inspect
-
-        import cswap_pin.proxy as pp
-
-        src = inspect.getsource(pp.PinProxy._reassert_pin_identity)
-        assert "splice_config_identity" in src, (
-            "anchored on the wrong method; this case proves nothing")
-        assert "carry_live_pointers" in src, (
-            "the mint-time splice moves `oauthAccount` and leaves every "
-            "already-running session's pointer behind, so each is vetoed into "
-            "a fresh mint on its next reattach")
-
-    def case_a_dead_marker_is_reaped_by_the_beat(self, certdir, tmp_path):
-        """The corpse reap runs once per drain START, not on the beat.
-
-        `announce_draining` carries it and its comment claims to be "the only
-        LIVE path that runs often enough". It is not: a drain announces once
-        and then beats for as long as it lasts, so a marker left by a process
-        that died AFTER that announcement waits for the NEXT drain to begin.
-
-        Measured on the second machine: a marker 410s old -- past a 150s TTL --
-        sat in the directory while the live drain beat its own every few
-        seconds, in code that has carried the reap since 0.1.201.
-
-        The beat is where it belongs: it is the path that runs while a drain is
-        happening, which is exactly when corpses appear.
-        """
-        import os
-        import time
-
-        import cswap_pin.proxy as pp
-
-        d = tmp_path / "certdir"
-        d.mkdir()
-        dead = d / (pp._DRAINING_PREFIX + "999999")
-        dead.write_text("x")
-        old = time.time() - (pp._DRAINING_MARKER_TTL + 60)
-        os.utime(dead, (old, old))
-
-        # THE BEAT REFRESHES, it does not create -- `announce_draining` is what
-        # creates. So stand one up the way an announcement would, or this
-        # measures the wrong contract.
-        mine = d / (pp._DRAINING_PREFIX + "4242")
-        mine.write_text("x")
-        os.utime(mine, (old, old))
-
-        pp.beat_draining(d, pid=4242)
-        assert not dead.exists(), (
-            "a marker past its TTL survived a beat, so it waits for the next "
-            "drain to START -- which on a quiet machine is never")
-        # AND NEVER THE CALLER'S OWN, even though it is just as old. A beat
-        # reaps before it refreshes; deleting this one makes the refresh raise
-        # on a missing file, and the drain then loses the protection that stops
-        # the sweep TERMing it mid-reply.
-        assert mine.exists(), (
-            "the reap took the marker that protects the drain doing the "
-            "reaping")
-        assert mine.stat().st_mtime > old, "the beat did not refresh its own"
-
-    def case_a_recycle_is_remembered_across_daemon_generations(
-            self, certdir, tmp_path, monkeypatch):
-        """"Once per daemon" became "once per proxy redeploy", which is a loop.
-
-        `_recycled` lives in the daemon's memory, so a new generation starts
-        empty. On a day with four pin releases that is four kills of the same
-        session -- measured, two sessions were each TERMed twice under two
-        daemon pids, with `worker crashed (exit 143) - respawning...` repeating
-        on the user's screen. A restart does not clear the deaf condition
-        either, so nothing ends the loop.
-
-        The stamp goes on disk beside the other state this directory already
-        holds, so the next generation can see it.
-        """
-        import os
-        import time
-
-        import cswap_pin.proxy as pp
-
-        d = tmp_path / "cert"
-        d.mkdir()
-        assert not pp._recycled_recently(d, "sess-A"), "nothing recycled yet"
-
-        pp._remember_recycle(d, "sess-A")
-        assert pp._recycled_recently(d, "sess-A"), (
-            "a fresh generation reading this directory must see that the "
-            "previous one already tried")
-        assert not pp._recycled_recently(d, "sess-B"), (
-            "the stamp is per session; one recycle must not shield another")
-
-        # AND IT EXPIRES, or a session that goes deaf months later can never
-        # be repaired.
-        p = pp._recycle_stamp_path(d, "sess-A")
-        old = time.time() - (pp._RECYCLE_COOLDOWN_S + 60)
-        os.utime(p, (old, old))
-        assert not pp._recycled_recently(d, "sess-A"), (
-            "past the cooldown the repair must be available again")
-
-        # AND AN UNREADABLE STAMP FAILS OPEN -- refusing there would disable
-        # the repair entirely, and the in-memory set still bounds this
-        # generation.
-        assert not pp._recycled_recently(d / "nope", "sess-A")
-
-        # AND THE RECYCLE MUST CONSULT IT.
-        import inspect
-        src = inspect.getsource(pp.PinProxy.recycle_deaf_sessions)
-        assert "_recycled_recently" in src and "_remember_recycle" in src, (
-            "the disk stamp exists and the recycle does not read it, so the "
-            "loop is unchanged")
-
+        src = pathlib.Path(pp.__file__).read_text(encoding="utf-8")
+        for banned in ("recycle_deaf_sessions", "_RECYCLED_PREFIX",
+                       "_recycled_recently", "_remember_recycle"):
+            assert banned not in src, (
+                f"{banned} is back: the pin must never kill a session to cure "
+                "a deaf bridge -- report it and let the REPL re-home itself")
+        assert hasattr(pp.PinProxy, "deaf_bridges"), (
+            "the DETECTOR must stay -- removing the report is the opposite "
+            "error, and it is what left a session on `rc failed` for hours")
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 
