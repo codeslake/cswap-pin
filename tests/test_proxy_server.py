@@ -7403,6 +7403,43 @@ class TestDrainReportsWhatItCut:
             "nothing calls the deaf recycle, so the detector still has no "
             "actor and the outage repeats")
 
+    def case_the_splice_carries_live_pointers_too(self, certdir):
+        """A splice moves the field CC compares against. Live pointers must move
+        with it, in the same act.
+
+        `bridgeOwnerAccountUuid` and `~/.claude.json`'s `oauthAccount` are the
+        two ends of one comparison, read at two different times: the pointer is
+        stamped when a job record is written, the comparison runs at reattach.
+        The splice moves the second end. Anything stamped before it and
+        reattaching after it disagrees, and CC MINTS -- `restored_owner_mismatch`
+        in the binary, "minting fresh, history channels suppressed" in the log.
+
+        `_carry_history_pointers` already runs here and is documented for
+        sessions with a bridge and NO PROCESS, so it leaves exactly the live
+        ones. Those waited for the daemon's next `.claude.json` mtime poll --
+        measured, a session reattached ONE SECOND after being revived and lost
+        its bridge, which is well inside that window.
+
+        Pinned as source, not behaviour: the launch path this sits on needs a
+        whole proxy to exercise, and what regressed is which of the two carries
+        is called.
+        """
+        import inspect
+
+        import cswap_pin.proxy as pp
+
+        # NAMED, not discovered. A `dir(pp)` sweep matched some other holder
+        # of the same call first and reported the site unfixed after it was
+        # fixed -- an instrument answering about the wrong function.
+        src = inspect.getsource(pp.heal)
+        assert "_carry_history_pointers(certdir)" in src, (
+            "`heal` no longer carries on the launch path; this case is "
+            "anchored on the wrong function and proves nothing")
+        assert "carry_live_pointers" in src, (
+            "the splice moves the field CC compares against and only the "
+            "no-process carry follows it, so every LIVE session keeps a "
+            "pointer that will not reattach until the daemon's next poll")
+
     def case_a_bridge_archived_later_is_still_swept(self, certdir):
         """The superseded sweep fired on ONE event and missed half the cases.
 

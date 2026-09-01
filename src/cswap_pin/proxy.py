@@ -1753,6 +1753,27 @@ def heal(backup_root: Path, identity: dict | None = None,
     # `ensure_proxy` runs the same sweep synchronously before `execvpe`.
     if account_num:
         _carry_history_pointers(certdir)
+        # AND THE LIVE ONES, in the same act as the splice above. The two ends
+        # of CC's comparison are `bridgeOwnerAccountUuid` and this config's
+        # `oauthAccount`, read at different times: the pointer is stamped when
+        # a job record is written, the comparison runs at reattach. The splice
+        # just moved the second end, so anything stamped before it and
+        # reattaching after it disagrees and CC MINTS -- `restored_owner_mismatch`
+        # in the binary, "minting fresh, history channels suppressed" in its log.
+        #
+        # `_carry_history_pointers` is documented for sessions with a bridge and
+        # NO PROCESS, so it leaves exactly the live ones. Those waited for the
+        # daemon's next `.claude.json` mtime poll; measured, a revived session
+        # reattached ONE SECOND later and lost its bridge, well inside it.
+        #
+        # NOT A SECOND SOURCE OF TRUTH: both carries read `_login_identity()`,
+        # the field the splice just wrote, so they agree by construction.
+        try:
+            _live = _login_identity()
+            if _live:
+                carry_live_pointers(_live)
+        except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+            pass
 
     stale_st = read_daemon_state(certdir)
     stale_fp = (stale_st or {}).get("fingerprint")
