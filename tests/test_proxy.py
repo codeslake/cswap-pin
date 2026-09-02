@@ -17800,12 +17800,36 @@ class TestTheSpliceHoldsTheConfigLock:
         # CONTROL 1: young enough -> not asked again
         assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
         assert asked == ["PINTOKEN"]
-        # CONTROL 2: the bearer answers as someone else -> nothing written
+        # CONTROL 2: the bearer answers as someone else -> nothing written,
+        # and the beat says so once.
+        import contextlib
+        import io
+
         (certdir / "pin-identity.json").write_text(json.dumps(
             {**self.PIN, "profileFetchedAt": old_ms}))
         answer["accountUuid"] = "SOMEONE-ELSE"
-        assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+            assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
         assert pin_proxy.remembered_pin_identity(certdir)["profileFetchedAt"] == old_ms
+        assert err.getvalue().count("could not be refreshed") == 1, err.getvalue()
+        assert "answers as SOMEONE-ELSE" in err.getvalue()
+        # CONTROL 3: the pin IS the active account -> the provider answers
+        # None and the ACTIVE bearer is used; nothing available says why.
+        answer["accountUuid"] = "PIN"
+        asked.clear()
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token", lambda: "ACTIVETOKEN")
+        me = _t.SimpleNamespace(_certdir=certdir, _pin_token_provider=lambda: None)
+        assert pin_proxy.PinProxy._freshen_pin_identity(me) is True
+        assert asked == ["ACTIVETOKEN"], asked
+        (certdir / "pin-identity.json").write_text(json.dumps(
+            {**self.PIN, "profileFetchedAt": old_ms}))
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token", lambda: None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+        assert "no bearer to ask with" in err.getvalue(), err.getvalue()
 
     def case_the_beat_freshens_and_re_asserts_the_pin(self):
         """The wiring the cases above assume: the periodic beat is where the

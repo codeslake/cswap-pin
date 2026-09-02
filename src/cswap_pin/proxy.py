@@ -12673,8 +12673,27 @@ class PinProxy:
         age_s = time.time() - _profile_stamp_ms(ident) / 1000.0
         if age_s < _PIN_PROFILE_MAX_AGE_S:
             return False
-        fresh = pin_profile_for(self._pin_token_provider())
+        # THE ACTIVE BEARER WHEN THE PIN IS THE ACTIVE ACCOUNT. The provider
+        # answers None then -- there is nothing to swap -- but that token IS
+        # the pin's, and the uuid check below is what keeps a foreign answer
+        # out. Same fallback `sweep_policy_once` makes.
+        token = self._pin_token_provider() or _active_oauth_token()
+        fresh = pin_profile_for(token) if token else None
         if not fresh or fresh.get("accountUuid") != ident.get("accountUuid"):
+            # SAY WHY, or a stale stamp on one host and a fresh one on another
+            # look like the same silent beat. Once an hour: the condition
+            # persists across beats and the line is for a person.
+            now = time.time()
+            if now - getattr(self, "_freshen_warned_at", 0.0) > 3600.0:
+                self._freshen_warned_at = now
+                why = ("no bearer to ask with" if not token
+                       else "the profile request failed" if not fresh
+                       else "the bearer answers as "
+                            f"{str(fresh.get('accountUuid'))[:12]}, not the pin")
+                _log_lifecycle(
+                    f"the pin's profile stamp is {age_s / 3600:.0f}h old and "
+                    f"could not be refreshed: {why} — Claude Code re-fetches "
+                    "it as the active account on the next session start")
             return False
         remember_pin_identity(certdir, {**ident, **fresh})
         _log_lifecycle("refreshed the pin's profile from the server, so the "
