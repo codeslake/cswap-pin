@@ -4244,6 +4244,30 @@ def _carry_history_pointers(certdir: Path) -> int:
     return len(carried)
 
 
+def _outbound_only_bridge_ids() -> set[str]:
+    """Bridges whose record says they hold no inbound stream BY DESIGN.
+
+    `bridgeOutboundOnly` is an input to Claude Code's reattach and is False or
+    absent on every record this fleet has written so far; when a build starts
+    setting it, such a bridge posts and never opens the event stream, which is
+    exactly the shape the deaf report names. Excluding them here is a no-op
+    until then, so absent/False stays byte-identical to today.
+    """
+    out: set[str] = set()
+    try:
+        home = _config_home_for_policy()
+        paths = list((home / "jobs").glob("*/state.json")) + \
+            list((home / "sessions").glob("*.json"))
+    except Exception:  # noqa: BLE001 — no host, nothing to read
+        return out
+    for path in paths:
+        rec = _read_json(path)
+        if isinstance(rec, dict) and rec.get("bridgeOutboundOnly") is True \
+                and rec.get("bridgeSessionId"):
+            out.update(_both_spellings(str(rec["bridgeSessionId"])))
+    return out
+
+
 def _live_bridge_ids() -> set[str]:
     """Bridge ids whose owning process is still alive on THIS machine.
 
@@ -11984,6 +12008,9 @@ class PinProxy:
         if not posts:
             return []
         holding = self.held_bridge_ids() | (elsewhere or set())
+        # AN OUTBOUND-ONLY BRIDGE IS NOT DEAF, it never listens; see
+        # `_outbound_only_bridge_ids`. Empty on this fleet today.
+        holding |= _outbound_only_bridge_ids()
         out = [bid for bid, last in posts.items()
                if stamp - last <= window and bid not in holding]
         # AND THE SERVER MUST BE HOLDING IT. Posting without a stream has two

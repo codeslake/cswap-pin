@@ -17977,6 +17977,61 @@ class TestTheSpliceHoldsTheConfigLock:
         assert me._listing_complete is True
 
 
+    # ------------------------------------------------------------------
+    # DORMANT FIELDS, PRE-WIRED. Both are in Claude Code's record schema and
+    # neither is populated on this fleet yet. When they switch on, the pin
+    # must already do the right thing, and until then absent/False must be
+    # byte-identical to today.
+
+    def case_an_outbound_only_bridge_is_never_reported_deaf(
+            self, tmp_path, monkeypatch):
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        home = tmp_path / "cfg"
+        (home / "jobs" / "j1").mkdir(parents=True)
+        (home / "jobs" / "j2").mkdir(parents=True)
+        (home / "sessions").mkdir()
+        (home / "jobs" / "j1" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_OUT", "bridgeOutboundOnly": True}))
+        (home / "jobs" / "j2" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_IN", "bridgeOutboundOnly": False}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
+        now = _time.monotonic()
+        me = _t.SimpleNamespace(_bridge_posts={"cse_OUT": now, "cse_IN": now},
+                                held_bridge_ids=lambda: set(),
+                                _connected_bridges=None)
+        assert pin_proxy.PinProxy.deaf_bridges(me, now=now) == ["cse_IN"], (
+            "an outbound-only bridge was reported deaf, or a real deaf one was "
+            "hidden with it")
+        # CONTROL: absent is the same as False, today's fleet exactly
+        (home / "jobs" / "j1" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_OUT"}))
+        assert pin_proxy.PinProxy.deaf_bridges(me, now=now) == ["cse_IN", "cse_OUT"]
+
+    def case_the_carry_keeps_a_field_it_does_not_know(self, tmp_path, monkeypatch):
+        """`bridgeSessionGroupingId` travels with the record whatever the pin
+        does to the owner fields: the carry re-reads and rewrites the whole
+        record, so a field it has never heard of survives it."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = tmp_path / "cfg"
+        (home / "jobs" / "j1").mkdir(parents=True)
+        (home / "jobs" / "j1" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_X", "bridgeOwnerAccountUuid": "OLD",
+             "bridgeSessionGroupingId": "grp_7", "bridgeOutboundOnly": False}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
+        monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["j1"])
+        monkeypatch.setattr(pin_proxy, "_live_session_ids", lambda: [])
+        assert pin_proxy.carry_live_pointers(("PIN", "ORG")) == 1
+        rec = json.loads((home / "jobs" / "j1" / "state.json").read_text())
+        assert rec["bridgeOwnerAccountUuid"] == "PIN"
+        assert rec["bridgeSessionGroupingId"] == "grp_7", rec
+        assert rec["bridgeOutboundOnly"] is False, rec
+
+
 class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
     """The two halves of one measured failure.
 
