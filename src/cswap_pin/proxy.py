@@ -2824,6 +2824,11 @@ def slow_report_ms(certdir) -> "float | None":
 #: clear line and `deaf_bridges` must reason about the same population.
 _DEAF_WINDOW_S = 300.0
 
+#: A bridge opens its ear seconds after its first post; until then it has
+#: lost nothing. The stream GET follows register within seconds and Claude
+#: Code's own reconnect backoff tops out at 16s, so 30s covers it.
+_DEAF_STARTUP_GRACE_S = 30.0
+
 DEAF_REPORT_MARK = "post but hold no inbound stream"
 DEAF_REPORT_CLEAR = "every posting bridge holds an inbound stream"
 # THE THIRD ANSWER, because two of them leak the case that actually happens.
@@ -11720,6 +11725,10 @@ class PinProxy:
     def _reset_bridge_traffic(self) -> None:
         """Start the per-bridge accounting. Safe to call more than once."""
         self._bridge_posts: dict = {}
+        #: bridge id -> monotonic instant of the FIRST post this daemon saw
+        #: from it, never overwritten. `deaf_bridges` uses this to give a
+        #: just-registered bridge time to open its stream.
+        self._bridge_first_post: dict = {}
         # conn -> bridge id, for connections carrying that bridge's inbound
         # stream. NOT "when a stream was last opened": the stream is issued
         # once and held for the life of the session, so a recency stamp ages
@@ -11759,6 +11768,7 @@ class PinProxy:
                     self._stream_lost.pop(bid.group(1), None)
             else:
                 self._bridge_posts[bid.group(1)] = stamp
+                self._bridge_first_post.setdefault(bid.group(1), stamp)
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
@@ -12088,6 +12098,18 @@ class PinProxy:
         holding |= _outbound_only_bridge_ids()
         out = [bid for bid, last in posts.items()
                if stamp - last <= window and bid not in holding]
+        # A BRIDGE THAT HAS JUST REGISTERED IS NOT YET DEAF. Its stream GET
+        # follows its first post within seconds; this daemon judging it in
+        # that gap is the state itself, not a loss, and no timer ever
+        # retracts a transition-only report. Shielded only while this daemon
+        # never saw its stream go -- a REAL loss (`deaf_for` answers a
+        # number) is reported at once, grace or not.
+        first_post = getattr(self, "_bridge_first_post", None) or {}
+        deaf_for = getattr(self, "deaf_for", None)
+        out = [bid for bid in out
+               if not ((deaf_for is None or deaf_for(bid, now=stamp) is None)
+                       and stamp - first_post.get(bid, -1e9)
+                       < _DEAF_STARTUP_GRACE_S)]
         # AND THE SERVER MUST BE HOLDING IT. Posting without a stream has two
         # readings and our own sockets cannot separate them: a bridge that
         # LOST its ear, and one claude.ai is not attached to at all -- a

@@ -6446,7 +6446,10 @@ class TestDrainReportsWhatItCut:
         srv._open_conns.add(conn_a)
         srv._note_bridge_traffic(B, now=101.0)
 
-        deaf = srv.deaf_bridges(window=60.0, now=110.0)
+        # PAST THE STARTUP GRACE: B posted at 101.0 and this checks at 135.0,
+        # 34s later -- long enough that a just-registered bridge would also
+        # be judged by now, so this is a real, standing loss.
+        deaf = srv.deaf_bridges(window=60.0, now=135.0)
         assert deaf == ["cse_BBB"], (
             f"the pin could not name the bridge that posts and never listens: "
             f"{deaf}")
@@ -6510,6 +6513,60 @@ class TestDrainReportsWhatItCut:
         srv._open_conns.discard(conn_a)
         srv._note_bridge_traffic(A, now=100002.0)
         assert "cse_AAA" in srv.deaf_bridges(window=60.0, now=100003.0)
+
+    def case_a_bridge_that_has_just_registered_is_not_yet_deaf(self, certdir):
+        """The burst measured on a mac after `cc-update --apply --force`:
+        six bridges registered in six seconds, each posted before it had
+        opened its stream, and the daemon named every one deaf although the
+        stream GET followed within seconds on all of them — the ordinary
+        gap between register and subscribe, not a loss.
+
+        `deaf_bridges` must give a bridge this daemon just met a grace period
+        before judging it, UNLESS this daemon already saw a real loss for it
+        (`deaf_for` answers a number), which must be reported at once.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._stream_lost = {}
+        srv._reset_bridge_traffic()
+        srv._live_lock = threading.Lock()
+        srv._stream_conns = set()
+        srv._open_conns = set()
+
+        NEW = "/v1/code/sessions/cse_NEW/worker/messages"
+
+        # (a) posted 5s ago, no stream, no recorded loss -- not deaf yet.
+        srv._note_bridge_traffic(NEW, now=1000.0)
+        assert srv.deaf_bridges(window=60.0, now=1005.0) == [], (
+            "a bridge that just registered was named deaf before its stream "
+            "GET had a chance to arrive: "
+            + repr(srv.deaf_bridges(window=60.0, now=1005.0)))
+
+        # (b) same bridge, grace + 1s later, still no stream -- now deaf.
+        past_grace = 1000.0 + pp._DEAF_STARTUP_GRACE_S + 1.0
+        assert srv.deaf_bridges(window=60.0, now=past_grace) == ["cse_NEW"], (
+            "the grace never expires, so a bridge that truly never opened "
+            "its ear is never reported: "
+            + repr(srv.deaf_bridges(window=60.0, now=past_grace)))
+
+        # (c) a bridge whose stream WAS held and then dropped -- the grace
+        # must not shield a real loss, even seconds after its first post.
+        LOST = "/v1/code/sessions/cse_LOST/worker/messages"
+        LOST_STREAM = "/v1/code/sessions/cse_LOST/worker/events/stream"
+        conn = object()
+        srv._note_bridge_traffic(LOST, now=2000.0)
+        srv._note_bridge_traffic(LOST_STREAM, now=2001.0, conn=conn)
+        srv._stream_conns.add(conn)
+        srv._open_conns.add(conn)
+        srv._forget_stream(conn)
+        srv._note_bridge_traffic(LOST, now=2005.0)
+        assert srv.deaf_bridges(window=60.0, now=2005.0) == ["cse_LOST"], (
+            "the startup grace shielded a bridge whose stream this daemon "
+            "watched go, which is exactly the loss the check exists to name: "
+            + repr(srv.deaf_bridges(window=60.0, now=2005.0)))
 
     def case_the_owner_map_is_pruned_wherever_the_stream_set_is(self):
         """`_stream_owner` is keyed on the connection object, so it must be
@@ -6606,6 +6663,10 @@ class TestDrainReportsWhatItCut:
                 f"it certified health before any bridge had posted: {lines}")
 
             wire("POST /v1/code/sessions/cse_DEAF/worker/messages HTTP/1.1")
+            # PAST THE STARTUP GRACE: this case posts and judges in the same
+            # instant, which a freshly-registered bridge is exactly not.
+            srv._bridge_first_post["cse_DEAF"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
             srv._report_deaf_bridges()
             assert lines, (
                 "a bridge that posts and holds no stream produced no line, so "
@@ -6668,6 +6729,10 @@ class TestDrainReportsWhatItCut:
                 srv._connected_bridges = set(srv._bridge_posts)
 
             wire("cse_ONE")
+            # PAST THE STARTUP GRACE, or this bridge is shielded as freshly
+            # registered rather than judged.
+            srv._bridge_first_post["cse_ONE"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
 
             # A POST LANDS WHILE THE DEAF SET IS BEING BUILT -- the same
             # window the predecessor loop opens on a real handover.
@@ -6718,6 +6783,10 @@ class TestDrainReportsWhatItCut:
             srv._note_bridge_traffic(
                 "/v1/code/sessions/cse_DEAF/worker/messages")
             srv._connected_bridges = set(srv._bridge_posts)
+            # PAST THE STARTUP GRACE, or this bridge is shielded as freshly
+            # registered rather than judged.
+            srv._bridge_first_post["cse_DEAF"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
             srv._report_deaf_bridges()
             assert lines and pp.DEAF_REPORT_MARK in lines[-1], lines
 
@@ -6790,6 +6859,11 @@ class TestDrainReportsWhatItCut:
 
         wire("/v1/code/sessions/cse_WATCHED/worker/messages")
         wire("/v1/code/sessions/cse_NOBODY/worker/messages")
+        # PAST THE STARTUP GRACE, or these are shielded as freshly registered
+        # rather than judged.
+        for bid in ("cse_WATCHED", "cse_NOBODY"):
+            srv._bridge_first_post[bid] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
 
         srv._connected_bridges = {"cse_WATCHED"}
         assert srv.deaf_bridges() == ["cse_WATCHED"], (
@@ -6874,6 +6948,10 @@ class TestDrainReportsWhatItCut:
             for old in ("cse_OLD1", "cse_OLD2"):
                 srv._bridge_posts[old] -= pp._DEAF_WINDOW_S + 1
             wire("POST /v1/code/sessions/cse_NOW/worker/messages HTTP/1.1")
+            # PAST THE STARTUP GRACE, or this bridge is shielded as freshly
+            # registered rather than judged.
+            srv._bridge_first_post["cse_NOW"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
 
             srv._report_deaf_bridges()
             assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
@@ -6921,6 +6999,10 @@ class TestDrainReportsWhatItCut:
                 srv._connected_bridges = set(srv._bridge_posts)
 
             wire("POST /v1/code/sessions/cse_QUIET/worker/messages HTTP/1.1")
+            # PAST THE STARTUP GRACE, or this bridge is shielded as freshly
+            # registered rather than judged.
+            srv._bridge_first_post["cse_QUIET"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
             srv._report_deaf_bridges()
             assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
 
@@ -6966,6 +7048,10 @@ class TestDrainReportsWhatItCut:
                 srv._connected_bridges = set(srv._bridge_posts)
 
             wire("POST /v1/code/sessions/cse_OK/worker/messages HTTP/1.1")
+            # PAST THE STARTUP GRACE, or this bridge is shielded as freshly
+            # registered rather than judged.
+            srv._bridge_first_post["cse_OK"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
             srv._report_deaf_bridges()
             assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
 
@@ -7103,6 +7189,10 @@ class TestDrainReportsWhatItCut:
             srv._open_conns = set()
             srv._note_bridge_traffic(
                 "/v1/code/sessions/cse_QUIET/worker/messages", conn=None)
+            # PAST THE STARTUP GRACE, or this bridge is shielded as freshly
+            # registered rather than judged.
+            srv._bridge_first_post["cse_QUIET"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
             srv._connected_bridges = {"cse_QUIET"}
             srv._report_deaf_bridges()
             assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
@@ -7326,6 +7416,10 @@ class TestDrainReportsWhatItCut:
             srv._note_bridge_traffic(
                 "/v1/code/sessions/cse_LIVE/worker/messages")
             srv._connected_bridges = {"cse_LIVE"}
+            # PAST THE STARTUP GRACE, or this bridge is shielded as freshly
+            # registered rather than judged.
+            srv._bridge_first_post["cse_LIVE"] = (
+                time.monotonic() - pp._DEAF_STARTUP_GRACE_S - 1)
 
             # A PREDECESSOR IS STILL DRAINING, so the stream for cse_LIVE may
             # be held by it. This process cannot see it either way.
