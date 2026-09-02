@@ -682,6 +682,55 @@ class TestStreamingRelay:
             upstream.stop()
 
 
+class _IdleClosingUpstream(_FakeUpstream):
+    """Answers every request on a connection and closes the connection once
+    it has been idle for ``hold`` seconds: a server-side keep-alive timeout,
+    the shape a Node proxy has by default at 5 s."""
+
+    def __init__(self, certdir: Path, hold: float):
+        self.hold = hold
+        self.accepted = 0
+        super().__init__(certdir)
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            tls = None
+            try:
+                tls = self._ctx.wrap_socket(conn, server_side=True)
+                tls.settimeout(self.hold)
+                while True:
+                    data = b""
+                    while b"\r\n\r\n" not in data:
+                        chunk = tls.recv(4096)
+                        if not chunk:
+                            raise OSError("client closed")
+                        data += chunk
+                    head, _, rest = data.partition(b"\r\n\r\n")
+                    m = [l for l in head.decode("latin1").lower().split("\r\n")
+                         if l.startswith("content-length:")]
+                    want = int(m[0].split(":")[1]) if m else 0
+                    while len(rest) < want:
+                        chunk = tls.recv(4096)
+                        if not chunk:
+                            raise OSError("client closed")
+                        rest += chunk
+                    tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            except (OSError, ssl.SSLError):
+                pass
+            finally:
+                # The TLS object owns the fd after wrap_socket; closing the
+                # raw socket would close nothing and send no FIN.
+                try:
+                    (tls or conn).close()
+                except OSError:
+                    pass
+
+
 class _FramingUpstream:
     """A TLS server that answers with a caller-chosen raw response.
 
@@ -4267,6 +4316,95 @@ class TestStreamEndIsNamed:
         clock["t"] += 61
         d._note_stream_end("cse_A", 0.2, "upstream")
         assert len(lines) == 3 and "1 more" in lines[2], lines[2]
+
+
+class TestAStaleUpstreamIsRedialled:
+    """The hop behind the pin closes an idle keep-alive after a few seconds
+    (Node's default is 5 s). The pin kept reusing that socket for the client's
+    next request and, when the send met the closed side, dropped the client
+    without an answer: a fresh session's first prompt, typed a few seconds
+    after launch, failed once and worked on the retry."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _proxy(certdir, upstream):
+        from cswap_pin.proxy import PinProxy
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PIN-TOKEN",
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        return proxy
+
+    @staticmethod
+    def _keepalive(proxy_port, ca_path):
+        ctx = ssl.create_default_context(cafile=str(ca_path))
+        conn = http.client.HTTPSConnection(
+            "api.anthropic.com", context=ctx, timeout=5)
+        conn.set_tunnel("api.anthropic.com", 443)
+        conn._create_connection = lambda *a, **k: socket.create_connection(
+            ("127.0.0.1", proxy_port), timeout=5)
+        return conn
+
+    @staticmethod
+    def _ask(conn):
+        conn.request("GET", "/v1/messages", headers={"Authorization": "Bearer t"})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+
+    def case_a_request_after_the_hop_closed_its_idle_side_is_answered(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+        # The budget is parked out of the way: what saves this request is the
+        # pending close being seen, not the clock.
+        monkeypatch.setattr(pp, "_UPSTREAM_IDLE_REUSE_S", 60.0)
+        up = _IdleClosingUpstream(certdir, hold=0.3)
+        proxy = self._proxy(certdir, up)
+        try:
+            conn = self._keepalive(proxy.port, certdir / "ca.pem")
+            assert self._ask(conn) == (200, b"ok")
+            time.sleep(0.8)  # past the hop's hold: its side is closed
+            assert self._ask(conn) == (200, b"ok"), (
+                "the client's second request died on the hop's closed side")
+            assert up.accepted == 2, "the pin did not dial a fresh upstream"
+            conn.close()
+        finally:
+            proxy.stop()
+            up.stop()
+
+    def case_a_young_quiet_upstream_is_still_reused(self, certdir):
+        up = _IdleClosingUpstream(certdir, hold=5.0)
+        proxy = self._proxy(certdir, up)
+        try:
+            conn = self._keepalive(proxy.port, certdir / "ca.pem")
+            assert self._ask(conn) == (200, b"ok")
+            time.sleep(0.2)
+            assert self._ask(conn) == (200, b"ok")
+            assert up.accepted == 1, "a live keep-alive was dropped for nothing"
+            conn.close()
+        finally:
+            proxy.stop()
+            up.stop()
+
+    def case_an_upstream_idle_past_the_budget_is_dialled_fresh(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_UPSTREAM_IDLE_REUSE_S", 0.2)
+        up = _IdleClosingUpstream(certdir, hold=5.0)  # the hop would still serve
+        proxy = self._proxy(certdir, up)
+        try:
+            conn = self._keepalive(proxy.port, certdir / "ca.pem")
+            assert self._ask(conn) == (200, b"ok")
+            time.sleep(0.5)
+            assert self._ask(conn) == (200, b"ok")
+            assert up.accepted == 2, "the idle budget did not force a fresh dial"
+            conn.close()
+        finally:
+            proxy.stop()
+            up.stop()
 
 
 class TestBlindTunnelIsTraced:

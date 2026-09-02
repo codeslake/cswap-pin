@@ -2585,6 +2585,11 @@ def _wrap_upstream(ctx: ssl.SSLContext, sock, server_hostname: str):
 # upstream's 15s that costs every request 15s and reads as a hang. 2s is
 # ~7x the slowest healthy CONNECT, so a real hop is never cut.
 _HOP_CONNECT_BUDGET_S = 2.0
+# A kept upstream socket idle longer than this is dialled fresh. Node's
+# default server keep-alive is 5 s and the hop behind us is a Node proxy: a
+# request sent into its closed side gets EOF, and the client an unanswered
+# request.
+_UPSTREAM_IDLE_REUSE_S = 4.0
 # Reaching a hop and getting its answer are two different legs. The dial is
 # loopback or LAN; the CONNECT reply waits for the hop's OWN outbound round
 # trip to the upstream, so it carries real internet latency and needs a budget
@@ -14207,6 +14212,7 @@ class PinProxy:
                         # after its stream ended — a false negative in the
                         # check, worse than the leak.
                 got_one = self._handle_one_request(tls, conn)
+                self._local.up_idle_since = time.monotonic()
                 served_one = True
                 if not got_one:
                     break
@@ -14652,6 +14658,9 @@ class PinProxy:
         """The live upstream TLS socket for this MITM connection, dialing on
         first use. Reused across requests so keep-alive and SSE work."""
         up = getattr(self._local, "up", None)
+        if up is not None and not self._upstream_reusable(up):
+            self._drop_upstream()
+            up = None
         if up is None:
             # The context must describe the socket we ACTUALLY got, not the
             # chain we hoped for. _connect_upstream falls back to a direct
@@ -14664,7 +14673,21 @@ class PinProxy:
                 self._upstream_ctx(via_loopback), raw, UPSTREAM_HOST
             )
             self._local.up = up
+            self._local.up_idle_since = time.monotonic()
         return up
+
+    def _upstream_reusable(self, up) -> bool:
+        """A kept upstream socket is reused only while young and quiet: idle
+        past ``_UPSTREAM_IDLE_REUSE_S`` it is presumed closed by the hop, and
+        one with bytes pending while nothing was asked for is being closed."""
+        since = getattr(self._local, "up_idle_since", None)
+        if since is None or time.monotonic() - since > _UPSTREAM_IDLE_REUSE_S:
+            return False
+        try:
+            readable, _, _ = select.select([up], [], [], 0)
+        except (OSError, ValueError):
+            return False
+        return not readable
 
     def _drop_upstream(self) -> None:
         up = getattr(self._local, "up", None)
