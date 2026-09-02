@@ -6114,49 +6114,51 @@ class TestDaemonPortStability:
         removes the window entirely, because the socket was never ours to
         close. Both must work — a machine without a supervisor still relies on
         the reclaim above.
-        """
-        import os
-        import socket
 
-        from cswap_pin.proxy import PinProxy, ensure_ca
+        IN A CHILD, NEVER IN THIS PROCESS. The supervisor convention is fd 3,
+        and `dup2(x, 3)` silently closes whatever fd 3 already is. In a
+        pytest-xdist worker that is execnet's channel to the controller; its
+        receiver thread then terminates the worker with a SIGINT that xdist
+        reports against whatever case happens to be running -- measured with
+        strace across four full runs, a different innocent class each time.
+        The child gets its own fd 3, which is what the convention describes.
+        """
+        import subprocess
+        import sys
+
+        from cswap_pin.proxy import ensure_ca
 
         ensure_ca(tmp_path, "api.anthropic.com")
-        lsn = socket.socket()
-        lsn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        lsn.bind(("127.0.0.1", 0))
-        lsn.listen(8)
-        port = lsn.getsockname()[1]
-        os.dup2(lsn.fileno(), 3)
-        os.environ["LISTEN_FDS"] = "1"
-        os.environ["LISTEN_PID"] = str(os.getpid())
-        try:
-            proxy = PinProxy(tmp_path, lambda: "tok")
-            proxy.start()
-            assert proxy.port == port, "did not serve the port it was handed"
-            socket.create_connection(("127.0.0.1", port), timeout=2).close()
-            proxy.stop(drain=0)
-            # THE POINT: our stop must not take the port with it. The test's
-            # own `lsn` would keep the fd alive no matter what stop() did, so
-            # drop it first and force a collection — that is what exposes a
-            # release that merely unreferences the socket instead of
-            # detaching it (CPython's finalizer closes the fd, and the
-            # supervisor's port dies with our handover).
-            # The fixture's own descriptors would keep the port bound no
-            # matter what release did, and dup2 left TWO: `lsn` and fd 3.
-            # Close both, so the only thing that can still hold the address is
-            # whatever release_listener did with the socket it adopted. A
-            # release that merely unreferences it hands the fd to CPython's
-            # finalizer, which closes it — and the port dies here.
-            import gc
-
-            lsn.close()
-            gc.collect()
-            socket.create_connection(("127.0.0.1", port), timeout=2).close()
-            return
-        finally:
-            os.environ.pop("LISTEN_FDS", None)
-            os.environ.pop("LISTEN_PID", None)
-            lsn.close()
+        script = r"""
+import gc, os, socket, sys
+from cswap_pin.proxy import PinProxy
+certdir = sys.argv[1]
+lsn = socket.socket()
+lsn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+lsn.bind(("127.0.0.1", 0)); lsn.listen(8)
+port = lsn.getsockname()[1]
+os.dup2(lsn.fileno(), 3)
+os.environ["LISTEN_FDS"] = "1"
+os.environ["LISTEN_PID"] = str(os.getpid())
+proxy = PinProxy(certdir, lambda: "tok")
+proxy.start()
+assert proxy.port == port, f"did not serve the port it was handed: {proxy.port} != {port}"
+socket.create_connection(("127.0.0.1", port), timeout=2).close()
+proxy.stop(drain=0)
+# THE POINT: our stop must not take the port with it. `lsn` would keep the
+# port bound whatever stop() did, so drop it and force a collection: the only
+# thing that can still hold the address is what release_listener did with
+# the socket it adopted (fd 3, now the daemon's). A release that merely
+# unreferences it hands the fd to CPython's finalizer, which closes it, and
+# the port dies here.
+lsn.close(); gc.collect()
+socket.create_connection(("127.0.0.1", port), timeout=2).close()
+print("OK", port)
+"""
+        r = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and r.stdout.startswith("OK"), (
+            f"rc={r.returncode}\nstdout={r.stdout}\nstderr={r.stderr[-1500:]}")
 
     def case_a_handover_never_leaves_the_port_unbound(self, tmp_path):
         """THE GAP, measured: a successor must inherit the SOCKET, not the port.
