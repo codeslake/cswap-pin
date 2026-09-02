@@ -11534,8 +11534,6 @@ class TestTheDaemonWatchesItsOwnCode:
         # connect is refused, which is what "dead" means to the repair. A bare
         # free port is not that -- the daemon simply reclaims it and serves
         # the very port the config names, so the arm under test never runs.
-        # This case passed for months on exactly that, plus a daemon a
-        # previous case had left running.
         hold = socket.socket()
         hold.bind(("127.0.0.1", 0))
         dead = hold.getsockname()[1]
