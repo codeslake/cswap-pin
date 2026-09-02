@@ -6575,41 +6575,26 @@ class TestDrainReportsWhatItCut:
             "loss would go unreported while the listing is failing: "
             + repr(srv.deaf_bridges()))
 
-    def case_a_session_that_recovered_can_be_repaired_again(self, certdir):
-        """THE ONCE-PER-DAEMON MARK IS A LOOP GUARD, NOT A QUOTA.
+    def case_nothing_marks_a_session_for_repair_any_more(self, certdir):
+        """The `_recycled` mark went with the repair it bounded.
 
-        `_recycled` exists so a session recycled into the same denial is not
-        recycled forever. A session found sitting on a LIVE bridge is proof
-        that loop did not happen, so the mark has done its job and must come
-        off -- otherwise a long-lived daemon spends its whole lifetime of
-        repairs on first faults and can do nothing about a later, unrelated
-        break. Measured on a mac: a daemon 20 hours old had marked eleven
-        sessions, and none of them could be helped again.
+        It existed so a session recycled into the same denial was not recycled
+        forever, and it had to be CLEARED on recovery or a long-lived daemon
+        spent its whole lifetime of repairs on first faults (measured: a daemon
+        20 hours old had marked eleven sessions and could help none of them
+        again). Both halves are moot now: the pin ends no session's worker, so
+        there is no repair to bound and no mark to clear.
 
-        The loop guard still holds, because a session that never recovers
-        never reaches the branch that clears the mark.
+        Kept as a case rather than deleted, because the mark and the repair
+        arrived together and would return together.
         """
-        import inspect
-
         import cswap_pin.proxy as pp
+        import pathlib as _p
 
-        srv = pp.PinProxy.__new__(pp.PinProxy)
-        srv._recycled = {"S-RECOVERED", "S-STILL-BROKEN"}
-        srv._connected_bridges = {"cse_BACK"}
-
-        src = inspect.getsource(pp.PinProxy.recycle_denied_sessions)
-        assert "_recycled.discard" in src, (
-            "nothing takes the mark off, so a repaired session is unrepairable "
-            "for the life of the daemon")
-        # AND IT IS ON THE RECOVERY BRANCH, not somewhere the loop guard needs
-        # it: the discard must sit under the connected-bridge test, above the
-        # `add`, or it either never fires or undoes the guard.
-        before_add = src.split("self._recycled.add(")[0]
-        assert "_recycled.discard" in before_add, (
-            "the mark is cleared after the recycle rather than on recovery")
-        assert "_connected_bridges" in before_add.split(
-            "_recycled.discard")[0], (
-            "the mark is cleared without first proving the bridge is back")
+        src = _p.Path(pp.__file__).read_text(encoding="utf-8")
+        assert "_recycled" not in src, (
+            "the recycle bookkeeping is back without its repair, or the repair "
+            "is back with it")
 
     def case_the_denominator_is_the_population_the_verdict_judges(
             self, certdir):
@@ -7395,10 +7380,104 @@ class TestDrainReportsWhatItCut:
 
         # AND THE REPORT MUST CARRY IT, or the number exists and nobody reads
         # it -- the same shape as a detector nothing consults.
+        # AND IT IS BOUNDED. A dict nothing prunes holds one entry per bridge
+        # that ever lost a stream, for the life of the daemon -- the shape a
+        # previous fix here had to remove when the same map pinned a socket
+        # object per stream. It is dropped when the bridge gets one back.
+        est = inspect.getsource(pp.PinProxy._note_bridge_traffic)
+        assert "_stream_lost.pop(" in est, (
+            "nothing clears the loss record when a stream comes back, so it "
+            "grows for the life of the daemon")
+
         rep = inspect.getsource(pp.PinProxy._report_deaf_bridges)
         assert "deaf_for" in rep, (
             "the deaf report still states no duration, so a reader has only "
             "the log spacing to go on and will read the cooldown as recovery")
+
+    def case_the_pin_signals_no_session_worker_at_all(self):
+        """The pin does not decide when a user's session restarts.
+
+        Two repairs here ended a session's worker: one keyed on a deaf bridge,
+        one on a policy refusal cached in that process. Both are gone. The
+        second looked defensible -- the verdict lives in memory, every external
+        surface is closed, and a measured case came back in 12s with the
+        conversation intact -- but the registry cannot tell a background
+        session somebody is ATTACHED TO from one nobody is watching. `kind` has
+        two values, `bg` and `interactive`, and every session a person works in
+        through the agent view is `bg`. So "only a background session" was
+        never the guard it read as, and the idle test means "between turns",
+        which is exactly what a session looks like while its user reads.
+
+        The cause is upstream of the symptom: `/api/claude_code/policy_limits`
+        is a pinned route, so an answer fetched THROUGH the pin is correct. A
+        wrong one can only be cached when that question left the machine
+        without passing the pin. That window is where this is fixed.
+
+        Guarding the absence: the two removals were a year apart in kind but
+        one week apart in fact, and both were argued for from a real symptom.
+        """
+        import cswap_pin.proxy as pp
+        import pathlib
+
+        src = pathlib.Path(pp.__file__).read_text(encoding="utf-8")
+        for banned in ("_signal_worker", "recycle_denied_sessions",
+                       "recycle_deaf_sessions"):
+            assert banned not in src, (
+                f"{banned} is back: the pin must not end a session's worker. "
+                "Fix what made the session wrong, and report what you cannot "
+                "fix -- never restart somebody's session to clear it")
+
+        # AND THE SIGNALS THAT REMAIN CANNOT REACH A SESSION. Checked on the
+        # TARGET, not the signal number: an allowlist of constants has to grow
+        # every time a holder learns a new one, and it drifted twice while
+        # being written. The registry is the only way this daemon learns a
+        # session's pid, so the invariant is that the two never meet in one
+        # function. `os.kill(pid, 0)` is exempt because POSIX defines it as
+        # sending nothing -- the liveness probe the registry readers need.
+        import ast, re
+        sessiony = re.compile(r"session|bridge|job|policy", re.I)
+
+        def sends_a_signal(call):
+            if len(call.args) < 2:
+                return True
+            sig = call.args[1]
+            return not (isinstance(sig, ast.Constant) and sig.value == 0)
+
+        def offenders(text):
+            out = []
+            for fn in ast.walk(ast.parse(text)):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not any(isinstance(n, ast.Call)
+                           and isinstance(n.func, ast.Attribute)
+                           and n.func.attr == "kill" and sends_a_signal(n)
+                           for n in ast.walk(fn)):
+                    continue
+                names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+                names |= {n.attr for n in ast.walk(fn)
+                          if isinstance(n, ast.Attribute)}
+                hit = sorted(x for x in names if sessiony.search(x))
+                if hit:
+                    out.append((fn.name, hit))
+            return out
+
+        # THE CONTROL, in the same run. A guard whose pattern matches nothing
+        # reports a clean file exactly like a guard that works, so re-derive
+        # the shape that was removed and require this to see it.
+        removed_shape = (
+            "def _signal_worker(self, sid, sig):\n"
+            "    for r in _live_session_records():\n"
+            "        if r.get('sessionId') == sid:\n"
+            "            os.kill(int(r['pid']), sig)\n")
+        assert offenders(removed_shape), (
+            "the guard is blind: it does not flag the very function that was "
+            "removed, so its verdict on the live file means nothing")
+
+        assert not offenders(src), (
+            f"a signal is sent from a function that reads the session "
+            f"registry: {offenders(src)}. The pin must not end a session's "
+            "worker -- fix what made the session wrong, and report what you "
+            "cannot fix")
 
     def case_the_pin_never_kills_a_session_to_cure_deafness(self):
         """A deaf bridge is REPORTED and never repaired by killing anything.

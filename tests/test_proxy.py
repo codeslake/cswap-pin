@@ -1373,85 +1373,6 @@ class TestLiveRemoteControlSessions:
         assert daemon.sweep_policy_once() is True
         assert asked == ["active-token"]
 
-    def _denied_fixture(self, pin_proxy, monkeypatch, tmp_path, kind="bg",
-                        refusal_at="2026-08-19T07:32:50.819Z",
-                        started_ms=1787000000000, allowed=True, busy=False,
-                        quoted=False, marker=None):
-        """One live session that printed the org-policy refusal.
-
-        Shared by the four cases below because they differ in ONE input each --
-        the kind, the refusal's age, the pin's answer -- and the fixture is the
-        bulk of every one of them.
-        """
-        home = tmp_path / "config"
-        (home / "sessions").mkdir(parents=True)
-        (home / "projects" / "proj").mkdir(parents=True)
-        (home / "sessions" / "4242.json").write_text(json.dumps({
-            "pid": 4242, "sessionId": "sid-1", "kind": kind,
-            "startedAt": started_ms, "procStart": "999", "name": "RVP",
-            "jobId": "job-1"}))
-        (home / "jobs" / "job-1").mkdir(parents=True)
-        (home / "jobs" / "job-1" / "state.json").write_text(json.dumps({
-            "bridgeSessionId": "cse_live",
-            "inFlight": {"tasks": 1 if busy else 0, "queued": 0}}))
-        refusal = marker or (
-            "<local-command-stdout>Remote Control is disabled by your "
-            "organization's policy. Contact your organization admin "
-            "for access.</local-command-stdout>")
-        # A REAL refusal is a `system` record; a paste of one lands inside a
-        # `user` message. Only the first is evidence about THIS process.
-        entry = ({"timestamp": refusal_at, "type": "user",
-                  "message": {"role": "user", "content": refusal}} if quoted
-                 else {"timestamp": refusal_at, "type": "system",
-                       "subtype": "local_command_output", "content": refusal})
-        (home / "projects" / "proj" / "sid-1.jsonl").write_text(
-            json.dumps({"timestamp": "2026-08-19T01:00:00.000Z",
-                        "type": "system", "content": "hello"}) + "\n" +
-            json.dumps(entry) + "\n")
-
-        doc = {"restrictions": {}, "compliance_taints": []}
-        if not allowed:
-            doc["restrictions"] = {"allow_remote_control": {"allowed": False}}
-        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
-        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
-        monkeypatch.setattr(pin_proxy, "_proc_is_alive",
-                            lambda pid, start: pid == 4242)
-        signalled = []
-        monkeypatch.setattr(pin_proxy, "_signal_worker",
-                            lambda pid: signalled.append(pid) or True)
-
-        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
-        daemon._pin_token_provider = lambda: "tok"
-        daemon._recycled = set()
-        daemon._connected_bridges = set()
-        return daemon, signalled
-
-    def case_a_session_refused_by_a_stale_policy_is_recycled(
-        self, tmp_path, monkeypatch
-    ):
-        """THE REPAIR THE DAEMON COULD NOT DO UNTIL NOW.
-
-        A process that once read another account's denial keeps refusing
-        Remote Control for its whole life: the verdict is cached in memory, the
-        gate's pre-fetch returns early when a document is cached, and every
-        external surface was checked and is closed -- no reload signal, the
-        file is behind the cache, the eligibility inputs are exec-time env.
-
-        What IS reachable is the process itself. A background session is built
-        to be respawned -- its job record carries `resumeSessionId` and
-        `respawnFlags` and its transcript is on disk -- so replacing the worker
-        costs nothing and clears both caches. MEASURED: SIGTERM to the worker,
-        a new one 12s later, Remote Control connected with no user action.
-        """
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
-                                                 tmp_path)
-        assert daemon.recycle_denied_sessions() == 1
-        assert signalled == [4242]
-        assert daemon.recycle_denied_sessions() == 0, (
-            "a second pass signalled the same session again — that is a "
-            "recycle loop, not a repair")
-
     def case_the_policy_fetch_trusts_the_pins_own_certificate(
         self, monkeypatch
     ):
@@ -1525,122 +1446,6 @@ class TestLiveRemoteControlSessions:
         assert seen["context"] is not None, (
             "fell back to the default TLS context, which cannot verify the "
             "pin's own MITM certificate")
-
-    def case_a_session_disconnected_by_a_rotation_is_recovered(
-        self, tmp_path, monkeypatch
-    ):
-        """RECOVERY, SINCE PREVENTION IS NOT AVAILABLE.
-
-        An account rotation tears a bridge down with "Remote Control
-        disconnected — signed-in claude.ai account or organization changed on
-        this machine". That comparison cannot be won from here: the owner field
-        it reads is wanted in opposite directions by the reattach check and the
-        live check, and the env that would bypass it cannot reach a background
-        worker, which is pre-spawned into a pool before its session exists.
-
-        So the daemon restores instead of preventing. The same worker recycle
-        that clears a cached policy denial also re-establishes the bridge —
-        MEASURED, Remote Control came back with no user action.
-        """
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(
-            pin_proxy, monkeypatch, tmp_path,
-            marker="Remote Control disconnected — signed-in claude.ai account "
-                   "or organization changed on this machine")
-        daemon._connected_bridges = set()          # its bridge is gone
-        assert daemon.recycle_denied_sessions() == 1
-        assert signalled == [4242]
-
-    def case_a_session_that_already_has_its_bridge_back_is_left_alone(
-        self, tmp_path, monkeypatch
-    ):
-        """THE GUARD THAT KEEPS A ROTATION FROM RESTARTING THE WHOLE HOST.
-
-        Every session on the machine prints the disconnect line on the same
-        rotation, and most get their bridge back on their own. Recycling on the
-        transcript line alone would restart thirteen working sessions to fix
-        the one that did not recover. The server's own connected set is the
-        discriminator, and it is already paid for by the title sweep.
-        """
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(
-            pin_proxy, monkeypatch, tmp_path,
-            marker="Remote Control disconnected — signed-in claude.ai account "
-                   "or organization changed on this machine")
-        daemon._connected_bridges = {"cse_live"}   # it reconnected already
-        assert daemon.recycle_denied_sessions() == 0
-        assert signalled == []
-
-    def case_a_session_that_only_QUOTED_the_refusal_is_left_alone(
-        self, tmp_path, monkeypatch
-    ):
-        """MEASURED, AND IT NEARLY SHIPPED. A dry run of this repair against
-        the real machine flagged the very session that was WRITING it: the
-        user had pasted the refusal into the conversation and it had been
-        quoted back. A session discussing the bug is indistinguishable from
-        one suffering it, by substring.
-
-        Claude Code writes a real local-command refusal as a `type: "system"`
-        record with `content`/`subtype` and no `message`; a paste lands inside
-        a `user` message. That field is the discriminator.
-        """
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
-                                                 tmp_path, quoted=True)
-        assert daemon.recycle_denied_sessions() == 0, (
-            "a session that merely quoted the refusal was restarted")
-        assert signalled == []
-
-    def case_a_session_mid_turn_is_left_alone(self, tmp_path, monkeypatch):
-        """A REFUSAL IS NOT AN EMERGENCY, AND WORK IN FLIGHT IS REAL.
-
-        The worker exits on SIGTERM and the session resumes, but whatever it
-        was doing at that moment does not: a tool call is abandoned and the
-        turn re-runs. For a background agent that can mean a half-finished
-        deploy repeated. Remote Control being refused costs nothing by
-        comparison, and the session will be idle again shortly.
-        """
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
-                                                 tmp_path, busy=True)
-        assert daemon.recycle_denied_sessions() == 0
-        assert signalled == []
-
-    def case_an_interactive_session_is_never_recycled(self, tmp_path,
-                                                      monkeypatch):
-        """THE GUARD THAT MATTERS MOST. Only a `bg` session is respawned by the
-        Claude Code daemon. Signalling an interactive one does not replace it,
-        it ENDS it — the user's terminal, mid-conversation, to fix a slash
-        command they may not even have run."""
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
-                                                 tmp_path, kind="interactive")
-        assert daemon.recycle_denied_sessions() == 0
-        assert signalled == []
-
-    def case_a_refusal_older_than_the_process_is_left_alone(self, tmp_path,
-                                                            monkeypatch):
-        """A transcript keeps every refusal it ever printed, including ones
-        belonging to a worker that has already been replaced. Without an age
-        test the daemon reads its own past success as a fresh fault and
-        recycles the session forever."""
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(
-            pin_proxy, monkeypatch, tmp_path,
-            refusal_at="2026-08-19T01:00:00.000Z",
-            started_ms=1787116800000)      # process started after the refusal
-        assert daemon.recycle_denied_sessions() == 0
-        assert signalled == []
-
-    def case_a_real_denial_recycles_nothing(self, tmp_path, monkeypatch):
-        """THE CONTROL. When the PIN's own answer denies Remote Control the
-        refusal is correct, and a fresh worker would read the same denial and
-        refuse again — an endless recycle of every session on the host."""
-        from cswap_pin import proxy as pin_proxy
-        daemon, signalled = self._denied_fixture(pin_proxy, monkeypatch,
-                                                 tmp_path, allowed=False)
-        assert daemon.recycle_denied_sessions() == 0
-        assert signalled == []
 
     def case_an_unaskable_policy_leaves_the_file_alone(self, tmp_path,
                                                        monkeypatch):
@@ -1866,6 +1671,32 @@ class TestLiveRemoteControlSessions:
         assert daemon.clear_dead_bridge_records(None) == 0
         assert json.loads(state.read_text())["bridgeSessionId"] == "cse_whatever"
 
+    def case_the_worker_recycle_is_gone_and_stays_gone(self):
+        """Eight cases here graded a repair that ended a session's worker.
+
+        Each was a real guard on that repair -- a real denial recycles nothing,
+        a refusal older than the process is left alone, a session mid-turn is
+        left alone, an interactive one is never touched. They graded the
+        BOUNDARIES of an act the pin no longer performs.
+
+        The act went because the boundaries could not hold the one that
+        mattered: the session registry has two kinds, `bg` and `interactive`,
+        and every session a person works in through the agent view is `bg`. So
+        "only a background session" never meant "nobody is watching", and the
+        idle test means "between turns", which is what a session looks like
+        while its user reads. The cause sits upstream anyway --
+        `/api/claude_code/policy_limits` is a pinned route, so a wrong answer
+        can only be cached when that question left the machine without passing
+        the pin.
+        """
+        import cswap_pin.proxy as pp
+        import pathlib
+
+        src = pathlib.Path(pp.__file__).read_text(encoding="utf-8")
+        for banned in ("recycle_denied_sessions", "_signal_worker",
+                       "recycle_deaf_sessions"):
+            assert banned not in src, f"{banned} is back"
+
     def case_the_daemon_arms_the_periodic_title_sweep(self, monkeypatch):
         """THE WIRING, NOT THE METHOD — same reason as the connect hook above:
         a repair nothing invokes is the defect being fixed, one layer up.
@@ -1890,7 +1721,6 @@ class TestLiveRemoteControlSessions:
         daemon.sweep_titles_once = lambda: ticks.append("titles")
         daemon.sweep_policy_once = lambda: ticks.append("policy")
         daemon.carry_live_pointers = lambda login: ticks.append("pointers")
-        daemon.recycle_denied_sessions = lambda: ticks.append("recycle")
         # ONLY THE PERIOD IS SHORTENED, never the first-pass delay: if the loop
         # goes back to sleeping a whole period before its first sweep, this
         # test must fail. MEASURED — it did exactly that, and a daemon replaced
@@ -1924,10 +1754,6 @@ class TestLiveRemoteControlSessions:
             "the policy repair is not on the daemon's beat, so a stale "
             "org-policy answer keeps refusing Remote Control machine-wide "
             "with nothing running to correct it")
-        assert "recycle" in ticks, (
-            "the worker recycle is not on the daemon's beat, so a session "
-            "already holding another account's denial refuses Remote Control "
-            "for the rest of its life with nothing running to release it")
 
 
 class TestRepinIsLive:
@@ -17845,6 +17671,237 @@ class TestTheSpliceHoldsTheConfigLock:
             tmp_path, monkeypatch,
             {"accountUuid": "PIN", "organizationUuid": "OTHER-ORG"})
         assert pin_proxy.splice_config_identity(self.PIN) is True
+
+
+    # ------------------------------------------------------------------
+    # THE OSCILLATION, AT ITS SOURCE. Claude Code re-fetches its profile once
+    # `oauthAccount.profileFetchedAt` is a day old and writes the answer whole,
+    # as the ACTIVE account. The splice used to write a stamp as old as the
+    # pinned slot's last login, so every splice re-opened that fetch and the
+    # field swung between the two accounts on every session start. These
+    # cases pin the three halves of the repair: the mapping CC's gate reads,
+    # the freshness that survives a stale hand-over, and the splice that
+    # carries it into the live config.
+
+    def case_the_profile_mapping_is_the_one_claude_code_writes(self):
+        """Same keys as CC's own writer (2.1.257 `D7e`), absent-vs-null
+        included: its gate tests four of them for `!== undefined`, so a null
+        where CC omits the key re-opens the fetch this exists to close."""
+        from cswap_pin import proxy as pin_proxy
+
+        doc = {"account": {"uuid": "PIN", "email": "p@x",
+                           "created_at": "2026-02-08",
+                           "display_name": "Jun", "full_name": ""},
+               "organization": {"uuid": "ORG", "billing_type": "stripe",
+                                "subscription_created_at": "2026-02-10",
+                                "cc_onboarding_flags": {"a": 1},
+                                "seat_tier": None,
+                                "has_extra_usage_enabled": None}}
+        got = pin_proxy.profile_identity_from(doc, now_ms=1234)
+        assert got == {
+            "accountUuid": "PIN", "emailAddress": "p@x",
+            "organizationUuid": "ORG", "accountCreatedAt": "2026-02-08",
+            "billingType": "stripe", "subscriptionCreatedAt": "2026-02-10",
+            "ccOnboardingFlags": {"a": 1}, "claudeCodeTrialEndsAt": None,
+            "claudeCodeTrialDurationDays": None, "seatTier": None,
+            "hasExtraUsageEnabled": False, "displayName": "Jun",
+            "profileFetchedAt": 1234}, got
+        # CONTROLS: a null billing type is ABSENT, as CC leaves it; and a
+        # document without an account uuid is not an identity at all.
+        doc["organization"]["billing_type"] = None
+        assert "billingType" not in pin_proxy.profile_identity_from(doc, now_ms=1)
+        doc["account"]["uuid"] = ""
+        assert pin_proxy.profile_identity_from(doc, now_ms=1) is None
+
+    def case_remembering_never_downgrades_a_fresher_profile(self, tmp_path):
+        """The host hands over the pinned slot's stored config; the daemon
+        refreshes the file from the server. Same account, newer stamp on disk:
+        the disk copy is kept AND returned, because the caller splices what
+        this returns."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        fresh = {**self.PIN, "profileFetchedAt": 2000, "billingType": "stripe"}
+        stale = {**self.PIN, "profileFetchedAt": 1000}
+        assert pin_proxy.remember_pin_identity(certdir, fresh) == fresh
+        assert pin_proxy.remember_pin_identity(certdir, stale) == fresh, (
+            "the host's stale copy overwrote the daemon's fresh one")
+        assert pin_proxy.remembered_pin_identity(certdir) == fresh
+        # CONTROL: a different account replaces the file whatever its stamp,
+        # and forgetting still forgets.
+        other = {"accountUuid": "OTHER", "profileFetchedAt": 1}
+        assert pin_proxy.remember_pin_identity(certdir, other) == other
+        assert pin_proxy.remembered_pin_identity(certdir) == other
+        assert pin_proxy.remember_pin_identity(certdir, None) is None
+        assert pin_proxy.remembered_pin_identity(certdir) is None
+
+    def case_the_splice_freshens_a_stale_copy_of_the_pin(
+            self, tmp_path, monkeypatch):
+        """A config that already names the pin is rewritten only to carry a
+        STRICTLY newer profile stamp. Strictly, so two writers cannot
+        ping-pong: CC only ever writes a newer stamp than the one it read."""
+        import contextlib
+        import io
+
+        pin_proxy, cfg, _ = self._wire(
+            tmp_path, monkeypatch, {**self.PIN, "profileFetchedAt": 1000})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pin_proxy.splice_config_identity(
+                {**self.PIN, "profileFetchedAt": 2000}) is True
+        assert json.loads(cfg.read_text())["oauthAccount"]["profileFetchedAt"] == 2000
+        assert "freshened the pin's profile stamp" in err.getvalue()
+        assert "splicing the pin" not in err.getvalue(), (
+            "a freshen must not read as the account having moved")
+        # CONTROLS: equal, older, or no stamp at all writes nothing.
+        for ident in ({**self.PIN, "profileFetchedAt": 2000},
+                      {**self.PIN, "profileFetchedAt": 1500},
+                      dict(self.PIN)):
+            assert pin_proxy.splice_config_identity(ident) is False, ident
+        assert json.loads(cfg.read_text())["oauthAccount"]["profileFetchedAt"] == 2000
+
+    def case_the_daemon_freshens_the_remembered_pin_as_the_pin(
+            self, tmp_path, monkeypatch):
+        """Past half of CC's window the daemon asks the server AS THE PIN and
+        merges the answer over what it remembered. Young enough, it asks
+        nothing; a bearer answering as someone else writes nothing."""
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        old_ms = int((_time.time() - 13 * 3600) * 1000)
+        pin_proxy.remember_pin_identity(
+            certdir, {**self.PIN, "profileFetchedAt": old_ms,
+                      "organizationRole": "admin"})
+        asked = []
+        answer = {**self.PIN, "profileFetchedAt": int(_time.time() * 1000),
+                  "billingType": "stripe"}
+
+        def fake_profile(token):
+            asked.append(token)
+            return dict(answer)
+
+        monkeypatch.setattr(pin_proxy, "pin_profile_for", fake_profile)
+        me = _t.SimpleNamespace(_certdir=certdir,
+                                _pin_token_provider=lambda: "PINTOKEN")
+        assert pin_proxy.PinProxy._freshen_pin_identity(me) is True
+        assert asked == ["PINTOKEN"], "asked with something other than the pin's bearer"
+        got = pin_proxy.remembered_pin_identity(certdir)
+        assert got["profileFetchedAt"] == answer["profileFetchedAt"]
+        assert got["billingType"] == "stripe"
+        assert got["organizationRole"] == "admin", (
+            "the refresh dropped a field the identity carried")
+        # CONTROL 1: young enough -> not asked again
+        assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+        assert asked == ["PINTOKEN"]
+        # CONTROL 2: the bearer answers as someone else -> nothing written
+        (certdir / "pin-identity.json").write_text(json.dumps(
+            {**self.PIN, "profileFetchedAt": old_ms}))
+        answer["accountUuid"] = "SOMEONE-ELSE"
+        assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+        assert pin_proxy.remembered_pin_identity(certdir)["profileFetchedAt"] == old_ms
+
+    def case_the_beat_freshens_and_re_asserts_the_pin(self):
+        """The wiring the cases above assume: the periodic beat is where the
+        refresh runs and where the live config receives it."""
+        import inspect
+
+        from cswap_pin import proxy as pin_proxy
+
+        beat = inspect.getsource(pin_proxy.PinProxy._title_sweep_loop)
+        assert "self._freshen_pin_identity()" in beat
+        assert "splice_config_identity(ident)" in beat, (
+            "a fresh stamp that never reaches the live config closes nothing")
+
+    def case_heal_splices_the_fresher_remembered_identity(
+            self, tmp_path, monkeypatch):
+        """The launch path: the host's identity is the pinned slot's stored
+        config, stale by construction; what the daemon remembered is fresher
+        and that is what must reach the live config."""
+        pin_proxy, cfg, _ = self._wire(
+            tmp_path, monkeypatch, {"accountUuid": "OTHER"})
+        monkeypatch.setattr(pin_proxy, "_resolve_pinned_slot",
+                            lambda *a, **kw: 1)
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda *a, **kw: ("pinned@example.com", None))
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(exist_ok=True)
+        pin_proxy.remember_pin_identity(
+            certdir, {**self.PIN, "profileFetchedAt": 2000})
+
+        pin_proxy.heal(tmp_path, identity={**self.PIN, "profileFetchedAt": 1000},
+                       lock_timeout=0.5)
+
+        got = json.loads(cfg.read_text())["oauthAccount"]
+        assert got["accountUuid"] == "PIN"
+        assert got["profileFetchedAt"] == 2000, (
+            "heal spliced the host's stale copy over the daemon's fresh one")
+
+    # ------------------------------------------------------------------
+    # THE TEAR-OFF. With the field swinging, the carry stamped every live
+    # bridge's owner onto the ACTIVE account; the next splice returned the
+    # config to the pin; CC compared owner against file, asked validate, heard
+    # the pin, found it was not the owner it had recorded, and tore four
+    # bridges off in three seconds. The owner a pointer must name is the
+    # account that owns the bridge server-side: the pin, when one is set.
+
+    def case_a_live_pointer_names_the_pin_when_one_is_set(
+            self, tmp_path, monkeypatch):
+        import pathlib
+        import re
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("ACTIVE", "ACTIVE-ORG"))
+        assert pin_proxy._pointer_owner(certdir) == ("ACTIVE", "ACTIVE-ORG"), (
+            "with no pin the login owns the bridge and the pointer follows it")
+        pin_proxy.remember_pin_identity(certdir, self.PIN)
+        assert pin_proxy._pointer_owner(certdir) == ("PIN", "ORG"), (
+            "under a pin the login was stamped as owner: the next splice "
+            "makes CC tear the bridge off")
+        # AND NO CARRY SITE READS THE LOGIN DIRECTLY ANY MORE.
+        src = pathlib.Path(pin_proxy.__file__).read_text(encoding="utf-8")
+        assert not re.search(r"carry_live_pointers\(_login_identity\(\)\)", src)
+        assert src.count("_pointer_owner(") >= 5, (
+            "a carry site stopped resolving its owner through _pointer_owner")
+
+    def case_a_bridge_that_posted_through_this_pin_is_not_cleared(
+            self, tmp_path, monkeypatch):
+        """`connected` is one listing, taken at the start of the sweep. A
+        bridge minted since, or mid-reconnect, is absent from it; the pin saw
+        its posts, and that is the evidence a snapshot cannot carry."""
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        home = tmp_path / "cfg"
+        for job, bid in (("live", "cse_LIVE"), ("dead", "session_DEAD")):
+            (home / "jobs" / job).mkdir(parents=True)
+            (home / "jobs" / job / "state.json").write_text(
+                json.dumps({"bridgeSessionId": bid}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
+        monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["live", "dead"])
+
+        me = _t.SimpleNamespace(_bridge_posts={"cse_LIVE": _time.monotonic()})
+        assert pin_proxy.PinProxy.clear_dead_bridge_records(me, connected=set()) == 1
+        live = json.loads((home / "jobs" / "live" / "state.json").read_text())
+        dead = json.loads((home / "jobs" / "dead" / "state.json").read_text())
+        assert live["bridgeSessionId"] == "cse_LIVE", "a bridge that just posted was cleared"
+        assert dead["bridgeSessionId"] == "", "the control corpse was kept"
+        # CONTROL: the same post, older than the window, is no longer life.
+        me = _t.SimpleNamespace(_bridge_posts={
+            "cse_LIVE": _time.monotonic() - pin_proxy._DEAF_WINDOW_S - 1})
+        assert pin_proxy.PinProxy.clear_dead_bridge_records(me, connected=set()) == 1
+        live = json.loads((home / "jobs" / "live" / "state.json").read_text())
+        assert live["bridgeSessionId"] == ""
 
 
 class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:

@@ -1713,6 +1713,11 @@ def heal(backup_root: Path, identity: dict | None = None,
     # cannot arrive. Re-read instead: a field that still does not name the pin
     # after a splice that claimed nothing to do is a config we cannot write.
     if identity and account_num:
+        # THE FRESHER COPY WINS, and it is remembered BEFORE the splice so the
+        # splice writes it: the host's identity is the pinned slot's stored
+        # config, whose profile stamp is as old as that slot's last login.
+        identity = remember_pin_identity(backup_root / "pin-proxy",
+                                         identity) or identity
         try:
             # BOTH KEYS, like the splice's own no-op test. Comparing the
             # account uuid alone calls a config healthy whose ORG has drifted,
@@ -1729,12 +1734,6 @@ def heal(backup_root: Path, identity: dict | None = None,
                     "that will not reattach")
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
             pass
-        # AND CACHE IT FOR THE DAEMON, which has no caller to hand it one. A
-        # pin armed before this existed has nothing cached, so without a write
-        # on the launch path the re-assert on the create stays dormant until
-        # the next `cswap pin`. Inside this branch on purpose: `identity` is
-        # truthy here, and the no-identity call is the one that FORGETS.
-        remember_pin_identity(backup_root / "pin-proxy", identity)
 
     # THE ACTUAL PER-LAUNCH HOOK LANDS HERE, NOT IN `ensure_proxy`. The rc file
     # runs `cswap pin --ensure` before every hand-launched `claude`, and that
@@ -1776,7 +1775,7 @@ def heal(backup_root: Path, identity: dict | None = None,
         # a 500; a lost history is survivable.
         if identity:
             try:
-                _live = _login_identity()
+                _live = _pointer_owner(backup_root / "pin-proxy")
                 if _live:
                     carry_live_pointers(_live)
             except Exception:  # noqa: BLE001 — a launch must not fail on the pin
@@ -4022,8 +4021,29 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     return found[0] if len(found) == 1 else None
 
 
+def _pointer_owner(certdir) -> "tuple[str, str] | None":
+    """The account a live bridge pointer must name: the PIN when there is one.
+
+    A bridge is minted as the pin (`/v1/code/sessions` is swapped), so that is
+    who owns it server-side, and `/api/oauth/validate` answers the same. Stamp
+    the login instead and the two disagree the moment the config returns to
+    the pin: CC compares owner against file, asks validate, hears the pin,
+    finds it is not the owner it recorded, and tears the bridge off --
+    measured, four live sessions in three seconds. Without a pin the login is
+    the owner and the pointer follows it, as before.
+    """
+    ident = remembered_pin_identity(certdir) if certdir is not None else None
+    if ident and ident.get("accountUuid"):
+        return (str(ident["accountUuid"]),
+                str(ident.get("organizationUuid") or ""))
+    return _login_identity()
+
+
 def carry_live_pointers(login: "tuple[str, str]") -> int:
-    """Point a RUNNING session's bridge record at the account now signed in.
+    """Point a RUNNING session's bridge record at the account that owns it.
+
+    ``login`` is what the caller resolved through :func:`_pointer_owner`: the
+    pin when one is set, else the account signed in.
 
     WHY THIS EXISTS BESIDE `_carry_history_pointers`. That one is documented
     "for sessions with a bridge and NO PROCESS" and means it — measured, it
@@ -4139,7 +4159,7 @@ def carry_live_pointers(login: "tuple[str, str]") -> int:
     if carried:
         _log_lifecycle(
             f"carried {carried} running session(s) bridge pointer onto the "
-            f"current login")
+            f"account that owns them")
     return carried
 
 def _carry_history_pointers(certdir: Path) -> int:
@@ -4858,6 +4878,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # real failure itself and answers False for both "could not write" and
     # "already correct", so an `except` around it guards a case that cannot
     # arrive -- a lock timeout, which this path can now hit, was silent here.
+    identity = remember_pin_identity(certdir, identity) or identity
     try:
         if not splice_config_identity(identity):
             now = _login_identity()
@@ -4867,7 +4888,6 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                                "account until the next switch")
     except Exception:  # noqa: BLE001 — the pin is already live
         pass
-    remember_pin_identity(certdir, identity)
     return ensure_proxy(switcher) is not None
 
 
@@ -4875,7 +4895,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
 _PIN_IDENTITY_NAME = "pin-identity.json"
 
 
-def remember_pin_identity(certdir, identity: dict | None) -> None:
+def remember_pin_identity(certdir, identity: dict | None) -> "dict | None":
     """Leave the pinned ``oauthAccount`` where the daemon can re-apply it.
 
     THE PACKAGE NEVER DERIVES THIS. ``identity_for_config`` lives host-side on
@@ -4884,15 +4904,31 @@ def remember_pin_identity(certdir, identity: dict | None) -> None:
     caller. The daemon has no caller: it is still serving requests long after
     the launch that knew the answer exited. Arming has the answer and writes it
     once; the host still computes, the package only stores.
+
+    NEVER DOWNGRADES FRESHNESS. The host hands over the pinned slot's stored
+    config, whose `profileFetchedAt` is whenever that account was last the
+    live login; the daemon refreshes this file from the server. Same account
+    and a newer stamp on disk means the disk copy is the truer one, so it is
+    kept -- and RETURNED, because what this returns is what the caller must
+    splice. Writing the stale copy over it would re-open Claude Code's
+    profile fetch on the very next launch.
     """
-    try:
-        p = Path(certdir) / _PIN_IDENTITY_NAME
-        if identity:
-            p.write_text(json.dumps(identity), encoding="utf-8")
-        else:
+    p = Path(certdir) / _PIN_IDENTITY_NAME
+    if not identity:
+        try:
             p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    kept = remembered_pin_identity(certdir)
+    if (kept and kept.get("accountUuid") == identity.get("accountUuid")
+            and _profile_stamp_ms(kept) > _profile_stamp_ms(identity)):
+        return kept
+    try:
+        p.write_text(json.dumps(identity), encoding="utf-8")
     except OSError:
         pass  # a pin that cannot cache its identity still pins
+    return identity
 
 
 def remembered_pin_identity(certdir) -> dict | None:
@@ -4900,7 +4936,7 @@ def remembered_pin_identity(certdir) -> dict | None:
     try:
         d = json.loads(
             (Path(certdir) / _PIN_IDENTITY_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return None
     return d if isinstance(d, dict) and d.get("accountUuid") else None
 
@@ -5014,10 +5050,18 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
     # matching everything.
     here = data.get("oauthAccount")
     keys = [k for k in ("accountUuid", "organizationUuid") if identity.get(k)]
+    freshening = False
     if isinstance(here, dict) and keys and all(
         here.get(k) == identity[k] for k in keys
     ):
-        return False
+        # NAMES THE PIN ALREADY. Rewrite only to carry a FRESHER profile
+        # stamp: Claude Code re-fetches its profile as the ACTIVE account once
+        # the stamp is a day old, and that fetch is what moves this field off
+        # the pin. Strictly newer, so two writers can never ping-pong -- CC
+        # only ever writes a newer stamp than the one it read.
+        if _profile_stamp_ms(identity) <= _profile_stamp_ms(here):
+            return False
+        freshening = True
     was = here.get("accountUuid") if isinstance(here, dict) else here
     data["oauthAccount"] = identity
     # ATOMIC. A torn write here is read by every live session, and is worse
@@ -5038,9 +5082,14 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
     # `os.replace` records a splice that did not happen -- which is the one
     # thing an attribution line must never do. Truncated uuids, never
     # addresses: this log ships on other people's machines.
-    _log_lifecycle("splicing the pin into the live config: "
-                   f"{str(was)[:12]} -> "
-                   f"{str(identity.get('accountUuid'))[:12]}")
+    if freshening:
+        _log_lifecycle("freshened the pin's profile stamp in the live config, "
+                       "so Claude Code does not re-fetch it as the active "
+                       "account")
+    else:
+        _log_lifecycle("splicing the pin into the live config: "
+                       f"{str(was)[:12]} -> "
+                       f"{str(identity.get('accountUuid'))[:12]}")
     return True
 
 
@@ -10620,152 +10669,6 @@ def _config_home_for_policy() -> Path:
     return require("paths").get_claude_config_home()
 
 
-#: What Claude Code prints when `isPolicyAllowed("allow_remote_control")` is
-#: false. It lands in the session's transcript as local command output, which
-#: is the ONLY external trace of a refusal — the verdict is decided in memory
-#: with no request on the wire, so there is nothing else to observe.
-_RC_POLICY_REFUSAL = "Remote Control is disabled by your organization's policy"
-
-#: The OTHER way a session loses Remote Control, and the one that cannot be
-#: prevented from here. An account rotation tears the bridge down because the
-#: owner field is compared against two different things by two different
-#: checks, which want opposite values, and the env that would bypass the
-#: comparison cannot reach a background worker — those are pre-spawned into a
-#: pool before their session exists. So this is recovered, not avoided.
-_RC_DISCONNECTED = "Remote Control disconnected"
-
-_RC_LOST = (_RC_POLICY_REFUSAL, _RC_DISCONNECTED)
-
-#: Only the tail of a transcript is read. A refusal that matters is recent by
-#: construction (it has to be newer than the process), and these files reach
-#: gigabytes — one of them was 11 GB.
-_TRANSCRIPT_TAIL_BYTES = 262144
-
-
-def _proc_is_alive(pid: int, proc_start: "str | None") -> bool:
-    """Is `pid` alive AND still the process the registry recorded?
-
-    The second half is the point. Between reading a session record and
-    signalling it the kernel can hand that pid to something else entirely, and
-    a SIGTERM aimed at a session would land on whatever inherited the number.
-    `procStart` is the kernel's own start-time field, unique per pid lifetime.
-    """
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    if not proc_start:
-        return True                    # nothing recorded to compare against
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-            return fh.read().rsplit(") ", 1)[1].split()[19] == str(proc_start)
-    except (OSError, IndexError):
-        return True                    # not Linux, or unreadable: do not block
-
-
-def _signal_worker(pid: int) -> bool:
-    """Ask a background session's worker to exit so the daemon respawns it.
-
-    SIGTERM, never SIGKILL: the worker gets to flush its transcript and release
-    its socket, and the Claude Code daemon then rebuilds the session from
-    `resumeSessionId` and `respawnFlags`.
-    """
-    try:
-        os.kill(pid, signal.SIGTERM)
-        return True
-    except OSError:
-        return False
-
-
-def _live_session_records() -> "list[dict]":
-    """Registry records for sessions whose process is still the one recorded."""
-    out: list[dict] = []
-    try:
-        home = _config_home_for_policy()
-        for path in (home / "sessions").glob("*.json"):
-            rec = _read_json(path)
-            if not isinstance(rec, dict):
-                continue
-            try:
-                pid = int(rec.get("pid") or 0)
-            except (TypeError, ValueError):
-                continue
-            if pid > 0 and _proc_is_alive(pid, rec.get("procStart")):
-                out.append(rec)
-    except Exception:  # noqa: BLE001 — no host, nothing to enumerate
-        return []
-    return out
-
-
-def _session_is_idle(job_id: str) -> bool:
-    """Is this session between turns, with nothing in flight?
-
-    A worker exits on SIGTERM and the session resumes, but the turn it was in
-    the middle of does not: a tool call is abandoned and re-run. For a
-    background agent that can be a half-finished deploy repeated. Remote
-    Control being refused costs nothing by comparison, so wait for a gap.
-
-    Unreadable counts as BUSY. The whole point is to not act while work is in
-    flight, and "I could not tell" is not "there is none".
-    """
-    if not job_id:
-        return False
-    try:
-        rec = _read_json(_config_home_for_policy() / "jobs" / job_id /
-                         "state.json")
-        flight = (rec or {}).get("inFlight") or {}
-        return not int(flight.get("tasks") or 0) \
-            and not int(flight.get("queued") or 0)
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _refused_rc_since(session_id: str, since_ms: float) -> bool:
-    """Did this session print the org-policy refusal after `since_ms`?
-
-    AFTER, because a transcript keeps every refusal it ever printed — including
-    the ones a previous worker printed before it was replaced. Without the age
-    test the daemon reads its own past success as a fresh fault and recycles
-    the same session forever.
-    """
-    try:
-        home = _config_home_for_policy()
-        paths = list((home / "projects").glob(f"*/{session_id}.jsonl"))
-    except Exception:  # noqa: BLE001
-        return False
-    for path in paths:
-        try:
-            size = path.stat().st_size
-            with path.open("rb") as fh:
-                if size > _TRANSCRIPT_TAIL_BYTES:
-                    fh.seek(size - _TRANSCRIPT_TAIL_BYTES)
-                    fh.readline()      # drop the partial line seek landed in
-                for raw in fh:
-                    if not any(m.encode() in raw for m in _RC_LOST):
-                        continue
-                    try:
-                        rec = json.loads(raw.decode("utf-8", "replace"))
-                        # THE RECORD KIND IS THE WHOLE PRECISION OF THIS CHECK.
-                        # Claude Code writes a local command's output as a
-                        # `system` record; a session that merely QUOTES the
-                        # refusal — pasted by the user, echoed back by an agent
-                        # — carries it inside a `user` or `assistant` message.
-                        # Substring alone restarts sessions for talking about
-                        # the bug.
-                        if rec.get("type") != "system":
-                            continue
-                        stamp = str(rec.get("timestamp") or "")
-                        when = _dt.datetime.fromisoformat(
-                            stamp.replace("Z", "+00:00")).timestamp() * 1000
-                    except Exception:  # noqa: BLE001 — unparseable line
-                        continue
-                    if when >= since_ms:
-                        return True
-        except OSError:
-            continue
-    return False
-
-
 def _active_oauth_token() -> "str | None":
     """The access token of the account cswap currently has active.
 
@@ -10845,6 +10748,89 @@ def policy_limits_for(token: "str | None") -> "dict | None":
                 req, timeout=10, context=_verifying_context()) as resp:
             doc = json.loads(resp.read().decode())
         return doc if isinstance(doc, dict) else None
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return None
+
+
+#: Claude Code re-fetches its profile once `oauthAccount.profileFetchedAt` is a
+#: day old (2.1.257 `$An`: 86400000 ms) and writes the answer into the field
+#: WHOLE, account uuid included. That fetch travels as the ACTIVE account, so
+#: on a pinned machine it is the write that moves the field off the pin. A
+#: spliced identity younger than this never opens that gate.
+_PIN_PROFILE_MAX_AGE_S = 12 * 3600.0
+
+
+def _profile_stamp_ms(ident) -> float:
+    """`profileFetchedAt` as a number, or 0 when absent or unreadable."""
+    v = (ident or {}).get("profileFetchedAt") if isinstance(ident, dict) else None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0.0
+    return float(v)
+
+
+def profile_identity_from(doc, now_ms=None) -> "dict | None":
+    """`oauthAccount` as Claude Code writes it from `/api/oauth/profile`.
+
+    The same keys and the same absent-vs-null rules as CC's own writer
+    (2.1.257 `D7e`), because its profile gate tests these names: a field
+    spelled differently here is a field CC finds missing, and a missing one
+    re-opens the fetch this exists to keep closed.
+    """
+    if not isinstance(doc, dict):
+        return None
+    acct, org = doc.get("account"), doc.get("organization")
+    if not isinstance(acct, dict) or not isinstance(org, dict):
+        return None
+    uuid = acct.get("uuid")
+    if not isinstance(uuid, str) or not uuid:
+        return None
+    flags = org.get("cc_onboarding_flags")
+    out = {
+        "accountUuid": uuid,
+        "hasExtraUsageEnabled": bool(org.get("has_extra_usage_enabled")),
+        "ccOnboardingFlags": flags if flags is not None else {},
+        "claudeCodeTrialEndsAt": org.get("claude_code_trial_ends_at"),
+        "claudeCodeTrialDurationDays": org.get("claude_code_trial_duration_days"),
+        "seatTier": org.get("seat_tier"),
+        "profileFetchedAt": int(time.time() * 1000 if now_ms is None else now_ms),
+    }
+    # `?? void 0` on CC's side: absent when the server sends nothing, never null.
+    for key, val in (("emailAddress", acct.get("email")),
+                     ("organizationUuid", org.get("uuid")),
+                     ("accountCreatedAt", acct.get("created_at")),
+                     ("billingType", org.get("billing_type")),
+                     ("subscriptionCreatedAt", org.get("subscription_created_at"))):
+        if val is not None:
+            out[key] = val
+    for key, val in (("displayName", acct.get("display_name")),
+                     ("fullName", acct.get("full_name"))):
+        if val:
+            out[key] = val
+    return out
+
+
+def pin_profile_for(token: "str | None") -> "dict | None":
+    """The pinned account's own profile in `oauthAccount` shape, or None.
+
+    Asked with the PIN's bearer, so the stamp it carries is true and the
+    fields are the pin's own -- not a copy of whatever account was live when
+    the pinned slot was last the login. Same route Claude Code asks, which is
+    deliberately unswapped by this proxy, so the bearer we send is the one the
+    server answers for.
+    """
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/profile",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json",
+                     "anthropic-version": "2023-06-01",
+                     "anthropic-client-platform": "cli"})
+        with urllib.request.urlopen(
+                req, timeout=10, context=_verifying_context()) as resp:
+            doc = json.loads(resp.read().decode())
+        return profile_identity_from(doc)
     except Exception:  # noqa: BLE001 — never take the daemon down
         return None
 
@@ -10987,11 +10973,6 @@ class PinProxy:
         # other, and a long content gap reads as evidence about a byte
         # ceiling that it cannot speak to in either direction.
         self._byte_gap: dict = {}
-        # Sessions this daemon has already asked to restart. Per daemon, not
-        # persisted: a recycle that did not help must not be repeated, and a
-        # NEW daemon is entitled to try once — its predecessor may have died
-        # before the worker came back.
-        self._recycled: set[str] = set()
         # What the server last said is CONNECTED, filled by the title sweep
         # from the listing it already pays for. None until the first sweep, and
         # None again is never treated as "nothing is connected".
@@ -11232,20 +11213,32 @@ class PinProxy:
             # minting is what the policy gate can refuse — so these two are the
             # halves of "Remote Control still works after the account moved".
             try:
-                login = _login_identity()      # (accountUuid, organizationUuid)
+                login = _pointer_owner(getattr(self, "_certdir", None))
                 if login:
                     self.carry_live_pointers(login)
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
-            # LAST, because it is the only one that acts on a PROCESS rather
-            # than on a file. Everything above repairs state a session will
-            # read next time it looks; this one is for the session that will
-            # never look again, because its refusal is cached in memory and
-            # nothing it does puts a request on the wire.
+            # AND THE PIN'S OWN PROFILE STAMP, on the same beat. The splice
+            # writes the remembered identity, and Claude Code re-fetches its
+            # profile as the ACTIVE account once that stamp is a day old --
+            # the write that starts every account oscillation seen here. Kept
+            # younger than that from the server, as the pin, and re-asserted
+            # so the live config carries it before CC's gate would open.
+            # Idempotent: the splice writes only when the field moved or the
+            # stamp there is older than ours.
             try:
-                self.recycle_denied_sessions()
+                self._freshen_pin_identity()
+                ident = remembered_pin_identity(getattr(self, "_certdir", None))
+                if ident:
+                    splice_config_identity(ident)
             except Exception:  # noqa: BLE001 — never take the daemon down
                 pass
+            # NOTHING HERE ACTS ON A PROCESS. Everything above repairs state a
+            # session will read next time it looks. A session whose refusal is
+            # cached in memory is not repaired by ending it: that is the user's
+            # session, and the pin does not decide when one restarts. The cause
+            # is a policy answer fetched while the pin was not in that
+            # session's path, and that is where it is fixed.
 
     def _carry_on_login_change(self) -> bool:
         """Carry immediately when the signed-in account moves, not on the beat.
@@ -11295,7 +11288,8 @@ class PinProxy:
                 "pointers now"
                 % (str((prev or ("?",))[0])[:12], str(login[0])[:12]))
         self._login_seen = login
-        self.carry_live_pointers(login)
+        self.carry_live_pointers(
+            _pointer_owner(getattr(self, "_certdir", None)) or login)
         return True
 
     def carry_live_pointers(self, login: "tuple[str, str]") -> int:
@@ -11342,7 +11336,17 @@ class PinProxy:
             if not isinstance(rec, dict):
                 continue
             bid = rec.get("bridgeSessionId")
-            if not bid or str(bid).replace("session_", "cse_") in connected:
+            cse = str(bid).replace("session_", "cse_") if bid else ""
+            if not bid or cse in connected:
+                continue
+            # A BRIDGE THAT SPOKE THROUGH THIS PIN JUST NOW IS NOT A CORPSE,
+            # whatever one listing says. `connected` is a snapshot from the
+            # start of the sweep; a bridge minted since, or mid-reconnect, is
+            # absent from it and clearing its record makes the session mint
+            # AGAIN -- measured, four records cleared in the minutes after a
+            # tear-off, each a live session. The pin saw their posts.
+            last = getattr(self, "_bridge_posts", {}).get(cse)
+            if last is not None and time.monotonic() - last <= _DEAF_WINDOW_S:
                 continue
             fresh = _read_json(path)      # re-read: their writes win on the rest
             if not isinstance(fresh, dict) or fresh.get("bridgeSessionId") != bid:
@@ -11360,94 +11364,6 @@ class PinProxy:
                 f"cleared {cleared} job record(s) naming a bridge the server no "
                 f"longer has, so those sessions can mint a live one")
         return cleared
-
-    def recycle_denied_sessions(self) -> int:
-        """Replace the worker of a session refusing Remote Control in error.
-
-        WHY A SIGNAL AND NOT A REPAIR. The verdict lives in the process's own
-        memory (`setSessionCache`), and every external surface was checked and
-        is closed: Claude Code installs no reload signal handler, the cache is
-        consulted BEFORE the file so rewriting `policy-limits.json` cannot
-        reach it, the eligibility inputs are exec-time env, and the gate's
-        pre-fetch returns early whenever a document is already cached — so
-        `/remote-control` refuses without putting one byte on the wire. The
-        only door left is the hourly poll, up to an hour away.
-
-        A background session is built to be replaced: its job record carries
-        `resumeSessionId` and `respawnFlags` and its transcript is on disk, so
-        a fresh worker resumes the same conversation. MEASURED on the linux host
-        2026-08-19: SIGTERM to a session that had refused for over two hours, a
-        new worker 12s later, Remote Control connected with no user action and
-        the conversation intact.
-
-        THREE THINGS THIS MUST NEVER DO, each of which it has a guard for:
-        end an interactive session (nothing respawns it — that is the user's
-        terminal); recycle on a refusal older than the process (its own past
-        success, read as a fresh fault, forever); or recycle when the pin's own
-        answer really does deny, where a fresh worker reads the same denial and
-        the loop never converges.
-        """
-        doc = policy_limits_for(
-            self._pin_token_provider() or _active_oauth_token())
-        if not isinstance(doc, dict):
-            return 0                   # unaskable; never act on no answer
-        entry = (doc.get("restrictions") or {}).get("allow_remote_control")
-        if isinstance(entry, dict) and entry.get("allowed") is False:
-            return 0                   # the refusal is CORRECT, not stale
-        done = 0
-        for rec in _live_session_records():
-            if rec.get("kind") != "bg":
-                continue               # only a bg session gets respawned
-            sid = str(rec.get("sessionId") or "")
-            try:
-                pid = int(rec.get("pid") or 0)
-                started = float(rec.get("startedAt") or 0)
-            except (TypeError, ValueError):
-                continue
-            if not sid or pid <= 0 or sid in self._recycled:
-                continue
-            if not _refused_rc_since(sid, started):
-                continue
-            if not _session_is_idle(str(rec.get("jobId") or "")):
-                continue               # NOT marked recycled: try again later
-            # AND ONLY IF IT REALLY HAS NO BRIDGE RIGHT NOW. Every session on
-            # the host prints the disconnect line on the same rotation, and
-            # most get their bridge back on their own; acting on the
-            # transcript alone would restart twelve working sessions to fix
-            # the one that did not recover. The server's own connected set is
-            # the discriminator, and the title sweep has already paid for it.
-            #
-            # `None` means the listing failed. Unknown is not "gone" — that
-            # conflation is what makes a repair start restarting the machine
-            # the moment the network hiccups.
-            if self._connected_bridges is None:
-                continue
-            # FROM THE JOB RECORD, not the registry one.
-            job_rec = _read_json(_config_home_for_policy() / "jobs" /
-                                 str(rec.get("jobId") or "") / "state.json")
-            bid = str((job_rec or {}).get("bridgeSessionId") or "")
-            if bid and bid.replace("session_", "cse_") in \
-                    self._connected_bridges:
-                # AND THE MARK COMES OFF, because the once-per-daemon rule was
-                # written to stop a LOOP -- a session recycled into the same
-                # denial, forever -- and a session sitting on a live bridge is
-                # the proof that loop is not what happened. Keeping the mark
-                # past a recovery spends a daemon's whole lifetime of repairs
-                # on first faults: this daemon had used all of its by the time
-                # a later, unrelated break arrived, and nothing could act.
-                # A session that never recovers never reaches here, so it is
-                # still recycled exactly once and the loop guard holds.
-                self._recycled.discard(sid)
-                continue               # it already has its bridge back
-            self._recycled.add(sid)    # once per session per daemon, always
-            if _signal_worker(pid):
-                done += 1
-                _log_lifecycle(
-                    f"session {rec.get('name') or sid} was refusing Remote "
-                    "Control on a policy answer left by another account — "
-                    "asked its worker to restart so it re-reads one that "
-                    "allows it; the conversation is resumed from disk")
-        return done
 
     def sweep_policy_once(self) -> bool:
         """Put the ACTIVE account's real policy answer in CC's cache file.
@@ -11725,6 +11641,14 @@ class PinProxy:
             if _EVENT_STREAM.search(path):
                 if conn is not None:
                     self._stream_owner[conn] = bid.group(1)
+                    # AND THE LOSS IS OVER, so the record of it goes. Keyed by
+                    # bridge id it is small, but it would otherwise hold one
+                    # entry for every bridge that ever lost a stream, for the
+                    # life of the daemon -- the same unbounded shape that once
+                    # pinned a socket object per stream here. Bounded to
+                    # bridges that are deaf RIGHT NOW, which is the only
+                    # population `deaf_for` is ever asked about.
+                    self._stream_lost.pop(bid.group(1), None)
             else:
                 self._bridge_posts[bid.group(1)] = stamp
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
@@ -12721,6 +12645,33 @@ class PinProxy:
         self._last_bridge_sweep = stamp
         return True
 
+    def _freshen_pin_identity(self) -> bool:
+        """Refresh the remembered pin's profile before Claude Code's gate would.
+
+        The remembered identity is what every splice writes, and CC re-fetches
+        the profile (as the ACTIVE account, which is the write that moves the
+        field off the pin) once the stamp in the live config is a day old.
+        Refreshed from the server AS THE PIN, so the stamp is true and the
+        fields are the pin's own. True when the file was rewritten.
+
+        A bearer that answers as some other account is not ours to write:
+        the file keeps what it has and the next beat asks again.
+        """
+        certdir = getattr(self, "_certdir", None)
+        ident = remembered_pin_identity(certdir) if certdir is not None else None
+        if not ident:
+            return False
+        age_s = time.time() - _profile_stamp_ms(ident) / 1000.0
+        if age_s < _PIN_PROFILE_MAX_AGE_S:
+            return False
+        fresh = pin_profile_for(self._pin_token_provider())
+        if not fresh or fresh.get("accountUuid") != ident.get("accountUuid"):
+            return False
+        remember_pin_identity(certdir, {**ident, **fresh})
+        _log_lifecycle("refreshed the pin's profile from the server, so the "
+                       "live config stays inside Claude Code's fetch window")
+        return True
+
     def _reassert_pin_identity(self) -> None:
         """Re-name the pin in the live config before a bridge is minted.
 
@@ -12751,7 +12702,7 @@ class PinProxy:
             #
             # A no-op once they agree: the carry writes only on a difference,
             # so the steady-state cost is one read per live session.
-            _live = _login_identity()
+            _live = _pointer_owner(self._certdir)
             if _live:
                 carry_live_pointers(_live)
         except Exception:  # noqa: BLE001 — a bridge must never fail on the pin
