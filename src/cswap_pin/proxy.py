@@ -5472,6 +5472,33 @@ def _pin_is_noop(provider) -> bool:
         return False
 
 
+def _keychain_denied_here() -> bool:
+    """macOS only: whether THIS process is refused Claude Code's OAuth
+    Keychain item. A process outside the login session is (``security``
+    rc=36: the access prompt cannot be shown there), and a daemon it spawns
+    inherits the refusal for its whole lineage, successors included. Two
+    reads a second apart, so a transient burst is not a denial; an absent
+    item is not one either."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        kc = require("macos_keychain")
+        cred = require("credentials")
+    except Exception:  # noqa: BLE001 -- no host, nothing to ask
+        return False
+    for attempt in range(2):
+        try:
+            kc.get_password(cred.CLAUDE_CODE_KEYCHAIN_SERVICE,
+                            kc.keychain_account_name())
+            return False
+        except kc.KEYCHAIN_ERRORS as e:
+            if "rc=36" not in str(e):
+                return False
+        if attempt == 0:
+            time.sleep(1.0)
+    return True
+
+
 def ensure_proxy(switcher) -> tuple[int, Path] | None:
     """Make sure a pin proxy is serving for the pinned account.
 
@@ -5604,6 +5631,13 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                         wire_global_config(port, ca)
                         return port, ca
                     time.sleep(0.1)
+        if _keychain_denied_here():
+            _log_lifecycle(
+                "not spawning the pin daemon from here: this process cannot "
+                "read the Keychain (security rc=36), and a daemon it starts "
+                "could never mint. Start it from the login session -- the TUI "
+                "does, and so does `cswap pin --ensure` in a terminal there")
+            return None
         port = _spawn_daemon(account_num, email, certdir)
         if port is None:
             # The spawn failed. Anything still wired in .claude.json may name a
@@ -11210,6 +11244,8 @@ class PinProxy:
                 # a second on the handover path for nothing.
                 self._sweep_wake.wait(0.5)
                 waited += 0.5
+                if this_process_is_draining():
+                    continue
                 # THE LOGIN CAN MOVE INSIDE THE BEAT. Claude Code watches
                 # ~/.claude.json and tears a bridge off the moment the account
                 # it names stops matching the pointer; this sweep is 300s
@@ -11228,6 +11264,12 @@ class PinProxy:
                     pass
             if self._stop:
                 return
+            # A daemon that handed over serves the connections it still holds
+            # and nothing else: the successor owns the config, the pointers
+            # and the titles, and a second beat on the same files is a second
+            # writer.
+            if this_process_is_draining():
+                continue
             try:
                 self.sweep_titles_once()
             except Exception:  # noqa: BLE001 — never take the daemon down

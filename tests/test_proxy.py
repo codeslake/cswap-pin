@@ -1756,6 +1756,46 @@ class TestLiveRemoteControlSessions:
             "org-policy answer keeps refusing Remote Control machine-wide "
             "with nothing running to correct it")
 
+    def case_a_draining_daemon_runs_no_beat(self, monkeypatch):
+        """After a handover the successor owns the config, the pointers and
+        the titles; a drainer that kept beating was a second writer on the
+        same files, and on macOS a drainer born outside the login session
+        kept asking the Keychain every interval for an answer it could never
+        get."""
+        import threading
+        from cswap_pin import proxy as pin_proxy
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._stop = False
+        daemon._sweep_wake = threading.Event()
+        daemon._accept_loop = lambda: None
+        ticks: list[str] = []
+        daemon.sweep_titles_once = lambda: ticks.append("titles")
+        daemon.sweep_policy_once = lambda: ticks.append("policy")
+        daemon.carry_live_pointers = lambda login: ticks.append("pointers")
+        daemon._freshen_pin_identity = lambda: ticks.append("freshen")
+        daemon._carry_on_login_change = lambda: ticks.append("carry")
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_S", 0.5)
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_FIRST_S", 0.0)
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("acct", "org"))
+        draining = {"yes": True}
+        monkeypatch.setattr(pin_proxy, "this_process_is_draining",
+                            lambda: draining["yes"])
+        daemon._start_accept_loop()
+        try:
+            time.sleep(1.6)
+            assert ticks == [], f"a draining daemon still beat: {ticks}"
+            # THE CONTROL: the same loop, no longer draining, beats — so the
+            # silence above was the guard and not a loop that never ran.
+            draining["yes"] = False
+            for _ in range(400):
+                if "titles" in ticks and "carry" in ticks:
+                    break
+                time.sleep(0.01)
+        finally:
+            daemon._stop = True
+        assert "titles" in ticks and "carry" in ticks, ticks
+
 
 class TestRepinIsLive:
     """Switching accounts in cswap never asks you to restart a session, and
@@ -5042,6 +5082,26 @@ class TestEnsureProxy:
         assert spawned == [("2", "pin@example.com")]
         assert ca == tmp_path / "pin-proxy" / "ca.pem"
 
+    def case_no_first_spawn_from_a_keychain_denied_process(
+            self, tmp_path, monkeypatch):
+        """A daemon spawned by a process the Keychain refuses inherits the
+        refusal and can never mint; the launch goes unpinned instead, and a
+        capable ensure (the TUI's) spawns later. The control at the end is
+        the same call with the refusal lifted."""
+        from cswap_pin import proxy as pin_proxy
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        spawned = []
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda a, e, c, **kw: spawned.append(a) or 9955)
+        denied = {"yes": True}
+        monkeypatch.setattr(pin_proxy, "_keychain_denied_here",
+                            lambda: denied["yes"])
+        assert pin_proxy.ensure_proxy(self._Sw(tmp_path)) is None
+        assert spawned == [], "a refused process still spawned the daemon"
+        denied["yes"] = False
+        port, _ = pin_proxy.ensure_proxy(self._Sw(tmp_path))
+        assert port == 9955 and spawned == ["2"]
+
     def case_reuses_live_daemon(self, tmp_path, monkeypatch):
         import os, socket
         from cswap_pin import proxy as pin_proxy
@@ -5075,6 +5135,70 @@ class TestEnsureProxy:
 
 
 
+
+
+class TestKeychainDeniedHere:
+    """The classifier behind the macOS first-spawn guard."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _fake_host(monkeypatch, answers):
+        import types
+        from cswap_pin import proxy as pin_proxy
+
+        class Refused(Exception):
+            pass
+
+        calls = []
+
+        def get_password(service, account):
+            calls.append((service, account))
+            a = answers.pop(0)
+            if isinstance(a, int):
+                raise Refused(f"security find-generic-password failed (rc={a}): ")
+            return a
+        kc = types.SimpleNamespace(
+            KEYCHAIN_ERRORS=(Refused,), get_password=get_password,
+            keychain_account_name=lambda: "me")
+        cred = types.SimpleNamespace(
+            CLAUDE_CODE_KEYCHAIN_SERVICE="Claude Code-credentials")
+        monkeypatch.setattr(
+            pin_proxy, "require",
+            lambda name: {"macos_keychain": kc, "credentials": cred}[name])
+        monkeypatch.setattr(pin_proxy.sys, "platform", "darwin")
+        monkeypatch.setattr(pin_proxy.time, "sleep", lambda s: None)
+        return calls
+
+    def case_two_refusals_are_a_denial(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+        calls = self._fake_host(monkeypatch, [36, 36])
+        assert pin_proxy._keychain_denied_here() is True
+        assert len(calls) == 2, "one refusal must not decide it"
+
+    def case_a_transient_refusal_is_not(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+        self._fake_host(monkeypatch, [36, "{}"])
+        assert pin_proxy._keychain_denied_here() is False
+
+    def case_an_absent_item_is_not(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+        self._fake_host(monkeypatch, [44, 44])
+        assert pin_proxy._keychain_denied_here() is False
+
+    def case_a_readable_item_is_not(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+        calls = self._fake_host(monkeypatch, ["{}"])
+        assert pin_proxy._keychain_denied_here() is False
+        assert len(calls) == 1
+
+    def case_other_platforms_never_ask(self, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+        calls = self._fake_host(monkeypatch, [36, 36])
+        monkeypatch.setattr(pin_proxy.sys, "platform", "linux")
+        assert pin_proxy._keychain_denied_here() is False
+        assert calls == []
 
 class TestDaemonState:
     """The daemon records port+pid+fingerprint in a JSON state file so a
