@@ -41,6 +41,37 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_daemon_thread_outlives_its_test():
+    """A daemon thread that outlives its test runs against the NEXT test.
+
+    The title-sweep loop calls `_carry_on_login_change`, which logs through
+    the module-level `_log_lifecycle` -- the same name a later test
+    monkeypatches to a list. A loop left running by one test then appends
+    its own first-look line into another test's recorder, and that test
+    fails with a message about an identity it never used. Measured on CI:
+    the control case that asserts silence received "(? -> A)" from a thread
+    it did not own, on the slow runner only. Name the leaker instead.
+    """
+    import threading
+    import time
+
+    def sweeps():
+        return {t for t in threading.enumerate()
+                if getattr(getattr(t, "_target", None), "__name__", "") == "_title_sweep_loop"}
+
+    before = sweeps()
+    yield
+    deadline = time.monotonic() + 2.0
+    while sweeps() - before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    leaked = sweeps() - before
+    assert not leaked, (
+        "this test left a daemon's title-sweep thread running "
+        f"({len(leaked)}); stop() every PinProxy it started, or its beat "
+        "pollutes the next test's module-level stubs")
+
+
+@pytest.fixture(autouse=True)
 def _close_sockets_the_test_left_open():
     """Close every socket a test opened, so its accept loop ends with it.
 

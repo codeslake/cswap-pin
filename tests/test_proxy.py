@@ -11503,11 +11503,14 @@ class TestTheDaemonWatchesItsOwnCode:
         from cswap_pin import proxy as pin_proxy
 
         certdir, cfg, _ = self._live_daemon(tmp_path, monkeypatch, paths)
-        st = pin_proxy.read_daemon_state(certdir)
-        assert pin_proxy._wired_port() == st["port"], (
-            "a serving daemon left the config naming no port at all, so every "
-            "hand-launched session afterwards runs unpinned",
-            cfg.read_text())
+        try:
+            st = pin_proxy.read_daemon_state(certdir)
+            assert pin_proxy._wired_port() == st["port"], (
+                "a serving daemon left the config naming no port at all, so "
+                "every hand-launched session afterwards runs unpinned",
+                cfg.read_text())
+        finally:
+            self._stop_live()
 
     def case_a_real_daemon_start_REWIRES_a_config_naming_ANOTHER_port(
         self, tmp_path, monkeypatch
@@ -11521,16 +11524,37 @@ class TestTheDaemonWatchesItsOwnCode:
         the TRIGGER, not about the repair -- and the two are indistinguishable
         from outside. This makes the trigger occur.
         """
+        import socket
+
         import claude_swap.paths as paths
         from cswap_pin import proxy as pin_proxy
 
-        certdir, cfg, _ = self._live_daemon(
-            tmp_path, monkeypatch, paths, stale_port=41111)
-        st = pin_proxy.read_daemon_state(certdir)
-        assert pin_proxy._wired_port() == st["port"] != 41111, (
-            "the daemon served one port while the config sent sessions to "
-            "another -- the split a human had to repair by hand",
-            cfg.read_text())
+        # A PORT THE DAEMON CANNOT TAKE AND NOBODY ANSWERS ON. Bound but never
+        # listening: the daemon's own bind fails and it serves elsewhere, and a
+        # connect is refused, which is what "dead" means to the repair. A bare
+        # free port is not that -- the daemon simply reclaims it and serves
+        # the very port the config names, so the arm under test never runs.
+        # This case passed for months on exactly that, plus a daemon a
+        # previous case had left running.
+        hold = socket.socket()
+        hold.bind(("127.0.0.1", 0))
+        dead = hold.getsockname()[1]
+        try:
+            certdir, cfg, _ = self._live_daemon(
+                tmp_path, monkeypatch, paths, stale_port=dead)
+            try:
+                st = pin_proxy.read_daemon_state(certdir)
+                assert st["port"] != dead, (
+                    "premise: the daemon bound the held port, so nothing was "
+                    "wrong for it to repair", st)
+                assert pin_proxy._wired_port() == st["port"], (
+                    "the daemon served one port while the config sent sessions "
+                    "to another -- the split a human had to repair by hand",
+                    cfg.read_text())
+            finally:
+                self._stop_live()
+        finally:
+            hold.close()
 
     def case_CONTROL_a_block_the_pin_did_not_write_is_left_alone(
         self, tmp_path, monkeypatch
@@ -11549,9 +11573,12 @@ class TestTheDaemonWatchesItsOwnCode:
         certdir, cfg, _ = self._live_daemon(
             tmp_path, monkeypatch, paths,
             cfg_text=json.dumps({"env": {"CSWAP_PIN_PORT": "41111"}}))
-        assert pin_proxy._wired_port() == 41111, (
-            "a daemon start rewrote an env block the pin never wrote",
-            cfg.read_text())
+        try:
+            assert pin_proxy._wired_port() == 41111, (
+                "a daemon start rewrote an env block the pin never wrote",
+                cfg.read_text())
+        finally:
+            self._stop_live()
 
     def _live_daemon(self, tmp_path, monkeypatch, paths, stale_port=None,
                      cfg_text="{}"):
@@ -11591,14 +11618,39 @@ class TestTheDaemonWatchesItsOwnCode:
             raise _Reached
 
         monkeypatch.setattr(pin_proxy, "_install_signal_teardown", _grab)
+        # THE SERVER, so a case can end it. `daemon_main` keeps it in a local;
+        # the teardown closure is the SIGTERM path and unwires shared state
+        # (the wiring receipt under the data home), which the next case then
+        # reads as "not ours". Stopping the object joins its sweep thread and
+        # touches nothing on disk.
+        real_proxy = pin_proxy.PinProxy
+
+        class _Recording(real_proxy):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                box["srv"] = self
+
+        monkeypatch.setattr(pin_proxy, "PinProxy", _Recording)
         try:
             pin_proxy.daemon_main("1", "a@b.c", certdir)
         except _Reached:
             pass
+        finally:
+            monkeypatch.setattr(pin_proxy, "PinProxy", real_proxy)
+        self._live_srv = box.get("srv")
         st = pin_proxy.read_daemon_state(certdir)
         assert st and st["pid"] == os.getpid(), st
         assert st["port"] != 36301, st
         return certdir, cfg, box["teardown"]
+
+    def _stop_live(self):
+        """End the daemon `_live_daemon` started: the sweep thread must not
+        outlive the case, and the daemon's own teardown is the wrong tool
+        (it is the SIGTERM path and unwires state the next case shares)."""
+        srv = getattr(self, "_live_srv", None)
+        if srv is not None:
+            srv.stop(drain=0)
+            self._live_srv = None
 
 
 class TestHealRestoresWithoutRestart:

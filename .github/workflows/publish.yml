@@ -36,6 +36,30 @@ jobs:
       # is duplicated rather than shared because a `workflow_call` that fails to
       # load would take the release with it, and "no release, no error anyone
       # reads" is a worse failure than two copies of eight lines.
+      # THE CI WORKFLOW ON THIS SAME COMMIT MUST HAVE PASSED. This job runs
+      # the suite once, single-process; ci.yml runs it on every push with
+      # workers and on macOS too. They are different runs and can disagree --
+      # a commit went out with its CI red on one platform while this suite
+      # was green -- and a release cannot be un-uploaded. Wait for CI to
+      # settle (the tag lands seconds after the push that started it), then
+      # refuse anything but success. No CI run for the sha is a refusal too.
+      - name: CI on this commit must be green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          for i in $(seq 1 60); do
+            v=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --commit "$GITHUB_SHA" \
+                  --json status,conclusion --jq 'if length==0 then "none" elif any(.[]; .status!="completed") then "pending" else (map(.conclusion)|join(",")) end')
+            case "$v" in
+              success) echo "CI green on $GITHUB_SHA"; exit 0 ;;
+              pending) echo "CI still running on $GITHUB_SHA ($i/60) — waiting"; sleep 20 ;;
+              none)    [ "$i" -lt 6 ] && { echo "no CI run yet for $GITHUB_SHA — waiting"; sleep 20; } \
+                       || { echo "REFUSED: no CI run for $GITHUB_SHA"; exit 1; } ;;
+              *)       echo "REFUSED: CI concluded '$v' on $GITHUB_SHA — nothing is uploaded"; exit 1 ;;
+            esac
+          done
+          echo "REFUSED: CI did not settle in 20 minutes"; exit 1
       - name: The suite must pass before anything is uploaded
         run: |
           # HOME and XDG_DATA_HOME redirected: the suite drives real cert
