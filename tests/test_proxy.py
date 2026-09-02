@@ -1244,6 +1244,7 @@ class TestLiveRemoteControlSessions:
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         daemon._list_bridges = lambda token: listing
+        daemon._listing_complete = True   # a stubbed listing is whole
         revived = []
         daemon.revive_archived_bridges = \
             lambda rows, tok: revived.append(len(rows))
@@ -16173,6 +16174,7 @@ class TestTheSweepWillNotCloseARunningWorker:
 
         d = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         d._list_bridges = lambda tok: sessions
+        d._listing_complete = True
         d._restore_bridge_titles = lambda s, tok: None
         d._bridge_api = lambda m, path, tok, **kw: (
             deleted.append(path.rsplit("/", 1)[-1]) or {"ok": True}
@@ -17891,7 +17893,7 @@ class TestTheSpliceHoldsTheConfigLock:
         monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["live", "dead"])
 
         me = _t.SimpleNamespace(_bridge_posts={"cse_LIVE": _time.monotonic()})
-        assert pin_proxy.PinProxy.clear_dead_bridge_records(me, connected=set()) == 1
+        assert pin_proxy.PinProxy.clear_dead_bridge_records(me, listed=set()) == 1
         live = json.loads((home / "jobs" / "live" / "state.json").read_text())
         dead = json.loads((home / "jobs" / "dead" / "state.json").read_text())
         assert live["bridgeSessionId"] == "cse_LIVE", "a bridge that just posted was cleared"
@@ -17899,9 +17901,56 @@ class TestTheSpliceHoldsTheConfigLock:
         # CONTROL: the same post, older than the window, is no longer life.
         me = _t.SimpleNamespace(_bridge_posts={
             "cse_LIVE": _time.monotonic() - pin_proxy._DEAF_WINDOW_S - 1})
-        assert pin_proxy.PinProxy.clear_dead_bridge_records(me, connected=set()) == 1
+        assert pin_proxy.PinProxy.clear_dead_bridge_records(me, listed=set()) == 1
         live = json.loads((home / "jobs" / "live" / "state.json").read_text())
         assert live["bridgeSessionId"] == ""
+
+
+    def case_the_sweep_clears_on_existence_not_on_connection(self, monkeypatch):
+        """A listed bridge -- disconnected, archived -- is one its session
+        reattaches to. The clear receives every listed id, and nothing at all
+        from a listing that did not reach its last page."""
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        rows = [{"id": "cse_OFF", "connection_status": "disconnected",
+                 "status": "archived"},
+                {"id": "cse_ON", "connection_status": "connected"}]
+        got = {}
+
+        def fake_list(self, token):
+            self._listing_complete = got.get("complete", True)
+            return rows
+
+        monkeypatch.setattr(pin_proxy.PinProxy, "_list_bridges", fake_list)
+        me = _t.SimpleNamespace(
+            _pin_token_provider=lambda: "t",
+            revive_archived_bridges=lambda sessions, token: 0,
+            _restore_bridge_titles=lambda sessions, token: 0,
+            clear_dead_bridge_records=lambda ids: got.__setitem__("ids", ids),
+            _list_bridges=lambda token: fake_list(me, token))
+        pin_proxy.PinProxy.sweep_titles_once(me)
+        assert got.get("ids") == {"cse_OFF", "cse_ON"}, got
+        assert me._connected_bridges == {"cse_ON"}, "the deaf report still wants connected"
+        # CONTROL: an incomplete listing clears nothing
+        got.clear()
+        got["complete"] = False
+        pin_proxy.PinProxy.sweep_titles_once(me)
+        assert "ids" not in got, "a partial listing drove a clear"
+
+    def case_a_listing_that_lost_a_page_is_not_complete(self):
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        pages = iter([{"data": [{"id": "cse_1"}], "next_cursor": "c2"}, None])
+        me = _t.SimpleNamespace(_bridge_api=lambda m, p, t: next(pages))
+        assert pin_proxy.PinProxy._list_bridges(me, "t") == [{"id": "cse_1"}]
+        assert me._listing_complete is False
+        pages = iter([{"data": [{"id": "cse_1"}], "next_cursor": None}])
+        assert pin_proxy.PinProxy._list_bridges(me, "t") == [{"id": "cse_1"}]
+        assert me._listing_complete is True
 
 
 class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:

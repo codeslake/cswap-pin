@@ -11301,8 +11301,13 @@ class PinProxy:
         """
         return carry_live_pointers(login)
 
-    def clear_dead_bridge_records(self, connected: "set[str] | None") -> int:
-        """Let a live session mint a new bridge when its own is a corpse.
+    def clear_dead_bridge_records(self, listed: "set[str] | None") -> int:
+        """Let a live session mint a new bridge when its own no longer exists.
+
+        ``listed`` is every bridge id the server returned, whatever its
+        status or connection: a disconnected or archived bridge still exists
+        and its session reattaches to it, history intact. Only an id absent
+        from a COMPLETE listing is a corpse.
 
         MEASURED across fourteen live sessions on one host — same active
         account, same pin, same restart second. Thirteen had a job record
@@ -11320,12 +11325,12 @@ class PinProxy:
         conversation with no bridge MINTS one — which is precisely what the
         other thirteen did.
 
-        ``connected`` is the set of bridge ids the server reports as connected.
         ``None`` means the listing could not be taken and NOTHING is cleared:
         every id looks dead through a failed read, and acting on that would
         wipe the bridge of every live session at once — the worst outcome here,
         from the most ordinary failure.
         """
+        connected = listed
         if connected is None:
             return 0
         home = _config_home_for_policy()
@@ -11478,17 +11483,21 @@ class PinProxy:
         # a second chance for the account to have moved underneath us.
         self.revive_archived_bridges(sessions, token)
         # ON THE SAME LISTING. `connected` is what the server says is attached
-        # right now; a live session's job record naming anything else is
-        # pointing at a corpse and can never reattach. Passing the set built
-        # HERE keeps the "could not ask" case honest — `_list_bridges` already
-        # returned above when it was None, so this is never a failed read
-        # masquerading as an empty one.
+        # right now, and it feeds the deaf report only. The clear below is
+        # decided on EXISTENCE: a bridge that is listed, disconnected or
+        # archived, is one its session reattaches to (Claude Code unarchives
+        # on reconnect) and reattaching is what keeps the conversation's
+        # history. Clearing on `connected` made a torn-off session MINT on
+        # its next /remote-control -- an empty duplicate beside the bridge
+        # that held everything, measured on one of two sessions reconnected
+        # the same way, the other still pointing at its bridge. Only a
+        # COMPLETE listing may say a bridge is gone.
         self._connected_bridges = {
             r.get("id") for r in sessions
             if r.get("connection_status") == "connected" and r.get("id")}
-        self.clear_dead_bridge_records({
-            r.get("id") for r in sessions
-            if r.get("connection_status") == "connected" and r.get("id")})
+        if getattr(self, "_listing_complete", False):
+            self.clear_dead_bridge_records(
+                {r.get("id") for r in sessions if r.get("id")})
         return self._restore_bridge_titles(sessions, token)
 
     def release_listener(self, hand_down: bool = False) -> "int | None":
@@ -13326,6 +13335,11 @@ class PinProxy:
         sweep that saw only page one would treat every later bridge as absent.
         """
         out, cursor = [], None
+        # A PARTIAL LISTING IS A LISTING WITH EVERY LATER BRIDGE MISSING, and
+        # a reader deciding "the server no longer has it" from one would
+        # clear every live pointer past the failed page. Complete only when
+        # the last page was read; a caller that acts on absence checks this.
+        self._listing_complete = False
         for _ in range(40):
             path = "/v1/code/sessions?limit=100"
             if cursor:
@@ -13336,6 +13350,7 @@ class PinProxy:
             out.extend(page.get("data") or [])
             cursor = page.get("next_cursor")
             if not cursor:
+                self._listing_complete = True
                 break
         return out
 
