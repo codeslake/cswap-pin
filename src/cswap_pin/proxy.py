@@ -2748,6 +2748,7 @@ _BRIDGE_SWEEP_COOLDOWN_S = 600.0
 _SLOW_REPORT_COOLDOWN_S = 60.0
 # Same ceiling, same reason: one line per request would bury the count.
 _BUSY_REPORT_COOLDOWN_S = 60.0
+_STREAM_END_COOLDOWN_S = 60.0
 _SLOW_RECHECK_S = 5.0
 _SLOW_CACHE: dict = {}
 
@@ -11315,6 +11316,24 @@ class PinProxy:
             # is a policy answer fetched while the pin was not in that
             # session's path, and that is where it is fixed.
 
+    def _note_stream_end(self, bridge: str, seconds: float, closer: str) -> None:
+        """One line per bridge per minute when its inbound stream ends; the
+        ends the cooldown swallows are counted into the next line. A give-up
+        leaves no error anywhere else: the stream just ends, repeatedly."""
+        now = time.monotonic()
+        led = getattr(self, "_stream_ends", None)
+        if led is None:
+            led = self._stream_ends = {}
+        last, more = led.get(bridge, (None, 0))
+        if last is not None and now - last < _STREAM_END_COOLDOWN_S:
+            led[bridge] = (last, more + 1)
+            return
+        led[bridge] = (now, 0)
+        extra = f"; {more} more in the last minute" if more else ""
+        _log_lifecycle(
+            f"the inbound stream for {bridge[:16]} ended after {seconds:.1f}s, "
+            f"closed by the {closer}{extra}")
+
     def _carry_on_login_change(self) -> bool:
         """Carry immediately when the signed-in account moves, not on the beat.
 
@@ -14552,10 +14571,19 @@ class PinProxy:
                             # two are one fact and must be dropped together.
                             self._forget_stream(_c)
                     release = getattr(self._local, "release", None)
+                    _m = _STREAM_ROUTE.search(path or "")
+                    _bridge = _m.group(1) if _m else None
+                    _t0 = time.monotonic()
 
-                    def _release_tunnel():
+                    def _release_tunnel(closed_by=None):
                         if release:
                             release()
+                        if _bridge:
+                            self._note_stream_end(
+                                _bridge, time.monotonic() - _t0,
+                                "upstream" if closed_by is up else
+                                "client" if closed_by is client else "unknown")
+                    _release_tunnel._wants_closer = True
 
                     _pump_detached(up, client, _release_tunnel)
                     self._local.detached = True
@@ -16107,7 +16135,7 @@ class _PumpLoop:
                 except (KeyError, ValueError, OSError):
                     pass
 
-    def _close_pair(self, a, b, on_close) -> None:
+    def _close_pair(self, a, b, on_close, closed_by=None) -> None:
         # CALLER HOLDS THE LOCK. It mutates `_peer`, and the run loop now
         # takes the lock only around the map — so each call site wraps it
         # rather than the method taking a second, non-reentrant acquire.
@@ -16124,7 +16152,10 @@ class _PumpLoop:
                 pass
         if on_close is not None:
             try:
-                on_close()
+                if getattr(on_close, "_wants_closer", False):
+                    on_close(closed_by)
+                else:
+                    on_close()
             except Exception:  # noqa: BLE001 — never take the loop down
                 pass
 
@@ -16170,7 +16201,7 @@ class _PumpLoop:
                     data = b""
                 if not data:
                     with self._lock:
-                        self._close_pair(src, dst, on_close)
+                        self._close_pair(src, dst, on_close, closed_by=src)
                     continue
                 # NEVER BLOCK THIS THREAD. It carries every tunnel, so a
                 # peer that stops reading would stall all of them — releasing

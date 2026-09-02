@@ -4151,8 +4151,13 @@ class TestWebSocketUpgrade:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def case_upgrade_headers_reach_upstream_and_tunnel_opens(self, certdir):
+    def case_upgrade_headers_reach_upstream_and_tunnel_opens(
+            self, certdir, monkeypatch):
+        from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy
+
+        lines: list[str] = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
 
         up = _WebSocketUpstream(certdir)
         proxy = PinProxy(
@@ -4192,11 +4197,76 @@ class TestWebSocketUpgrade:
             tls.sendall(b"PING")
             assert tls.recv(4096) == b"PONG"
             tls.close()
+            # THE END IS NAMED. This upstream closes right after PONG, so
+            # it usually wins the race with the client's close; which side
+            # gets named is decided by the pump and proven in
+            # TestStreamEndIsNamed. Here: the daemon wrote the line, for this
+            # bridge, naming a side.
+            for _ in range(60):
+                if any("inbound stream for cse_x" in ln for ln in lines):
+                    break
+                time.sleep(0.05)
+            ended = [ln for ln in lines if "inbound stream for cse_x" in ln]
+            assert ended, lines
+            assert ("closed by the upstream" in ended[0]
+                    or "closed by the client" in ended[0]), ended[0]
         finally:
             proxy.stop()
             up.stop()
 
         assert up.saw_upgrade, "upstream never saw the Upgrade headers"
+
+
+class TestStreamEndIsNamed:
+    """A Remote Control give-up leaves no error in any proxy: the inbound
+    stream just ends, again and again. The pump tells its callback which
+    side ended it, and the daemon writes one line per bridge per minute."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_the_pump_names_the_side_that_closed(self):
+        import socket
+        import threading
+        from cswap_pin.proxy import _PUMP
+        feed, a = socket.socketpair()
+        b, sink = socket.socketpair()
+        got: list = []
+        done = threading.Event()
+
+        def cb(closed_by=None):
+            got.append(closed_by)
+            done.set()
+        cb._wants_closer = True
+        _PUMP.add(a, b, cb, "bridge")
+        feed.close()
+        assert done.wait(3.0), "the callback never ran"
+        assert got == [a], "the side that saw EOF must be the one named"
+        sink.close()
+        # THE CONTROL: a callback that does not ask still gets the bare call.
+        feed2, a2 = socket.socketpair()
+        b2, sink2 = socket.socketpair()
+        plain = threading.Event()
+        _PUMP.add(a2, b2, plain.set, "bridge")
+        sink2.close()
+        assert plain.wait(3.0), "a plain callback stopped being called"
+        feed2.close()
+
+    def case_one_line_per_bridge_per_minute(self, monkeypatch):
+        from cswap_pin import proxy as pp
+        lines: list[str] = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(pp.time, "monotonic", lambda: clock["t"])
+        d = pp.PinProxy.__new__(pp.PinProxy)
+        d._note_stream_end("cse_A", 0.4, "upstream")
+        d._note_stream_end("cse_A", 0.3, "upstream")
+        d._note_stream_end("cse_B", 9.0, "client")
+        assert len(lines) == 2 and "cse_A" in lines[0] and "cse_B" in lines[1]
+        assert "closed by the upstream" in lines[0] and "0.4s" in lines[0]
+        clock["t"] += 61
+        d._note_stream_end("cse_A", 0.2, "upstream")
+        assert len(lines) == 3 and "1 more" in lines[2], lines[2]
 
 
 class TestBlindTunnelIsTraced:
