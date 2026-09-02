@@ -209,7 +209,8 @@ class _RecordingChain:
         self._thr.join(timeout=2.0)
 
 
-def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: str):
+def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: str,
+                           ua: str | None = None):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
     trusting the proxy's CA. Returns the response status."""
     ctx = ssl.create_default_context(cafile=str(ca_path))
@@ -221,7 +222,10 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
     conn._create_connection = lambda *a, **k: socket.create_connection(
         ("127.0.0.1", proxy_port), timeout=10
     )
-    conn.request("POST", path, body="{}", headers={"Authorization": f"Bearer {bearer}"})
+    headers = {"Authorization": f"Bearer {bearer}"}
+    if ua is not None:
+        headers["User-Agent"] = ua
+    conn.request("POST", path, body="{}", headers=headers)
     resp = conn.getresponse()
     resp.read()
     conn.close()
@@ -308,6 +312,32 @@ class TestPinProxyServer:
             )
             assert status == 200
             assert upstream.seen_auth == "Bearer PIN-TOKEN"
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_profile_route_is_swapped_for_claude_code_only(self, certdir):
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "PIN-TOKEN",
+            upstream=("127.0.0.1", upstream.port),
+        )
+        proxy.start()
+        try:
+            for ua, want in (
+                ("claude-code/2.1.257", "Bearer PIN-TOKEN"),
+                ("claude-swap/1.0", "Bearer disk-token"),
+                (None, "Bearer disk-token"),
+            ):
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem",
+                    "/api/oauth/profile", bearer="disk-token", ua=ua,
+                )
+                assert status == 200, ua
+                assert upstream.seen_auth == want, ua
         finally:
             proxy.stop()
             upstream.stop()

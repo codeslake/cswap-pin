@@ -2633,6 +2633,33 @@ class TestIsPinnedRoute:
         ):
             assert is_pinned_route(path) is pinned, f"{path}: {why}"
 
+
+class TestTheProfileRouteIsPinnedForClaudeCodeOnly:
+    """Claude Code's profile fetch is answered as the pin, so an account
+    switch underneath a live bridge is invisible to Remote Control; cswap's
+    own fetch of the same route keeps seeing the live account."""
+
+    def test_claude_code_clients_are_swapped(self):
+        for ua in ("claude-code/2.1.257", "claude-cli/2.1.257 (external, cli)"):
+            assert is_pinned_route("/api/oauth/profile", ua), ua
+            assert is_pinned_route("/api/oauth/profile?beta=true", ua), ua
+            assert is_pinned_route("/api/oauth/profile/", ua), ua
+
+    def test_cswap_and_anonymous_callers_keep_the_live_account(self):
+        for ua in ("claude-swap/1.0", "Python-urllib/3.12", ""):
+            assert not is_pinned_route("/api/oauth/profile", ua), repr(ua)
+        assert not is_pinned_route("/api/oauth/profile")
+
+    def test_the_match_is_exact_and_the_refresh_sibling_stays_out(self):
+        assert not is_pinned_route("/api/oauth/profiles", "claude-code/2.1.257")
+        assert not is_pinned_route("/api/oauth/profile-x", "claude-code/2.1.257")
+        assert not is_pinned_route("/api/oauth/token", "claude-code/2.1.257")
+
+    def test_a_user_agent_never_pins_an_unrelated_route(self):
+        assert not is_pinned_route("/v1/messages", "claude-code/2.1.257")
+        assert not is_pinned_route("/api/oauth/validate/x", "claude-code/2.1.257")
+
+
 class TestPeekStatusHandsBackEveryByteItTook:
     """`_peek_status` reads off the upstream so a refused swap can be taken
     back. Whatever it consumed is gone from the socket, so the caller has to

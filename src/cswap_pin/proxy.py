@@ -2862,7 +2862,15 @@ def trace_target(certdir) -> "str | None":
     return target
 
 
-def is_pinned_route(path: str) -> bool:
+# Claude Code's own clients. cswap's urllib callers say ``claude-swap/``.
+_CLAUDE_CODE_UA = ("claude-code/", "claude-cli/")
+
+
+def _is_claude_code_ua(ua: str) -> bool:
+    return bool(ua) and ua.lstrip().lower().startswith(_CLAUDE_CODE_UA)
+
+
+def is_pinned_route(path: str, ua: str = "") -> bool:
     """Whether a request path's bearer must be swapped to the pinned account.
 
     True for the routes whose server-side ownership is decided by the OAuth
@@ -2940,18 +2948,19 @@ def is_pinned_route(path: str) -> bool:
     # ruled out pinning ``oauthAccount`` itself.
     if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
         return True
-    # ``/api/oauth/profile`` STAYS OUT even though Claude Code merges it into
-    # ``oauthAccount``: it is also cswap's identity oracle. Its
-    # ``fetch_oauth_profile`` asks this route over urllib, obeying the proxy
-    # vars a pinned session exports to its children, so swapping the bearer
-    # makes every credential resolve to the pin and the guard against storing
-    # a foreign credential under a slot agrees with anything. The launch hook
-    # repairs the field instead.
-    # THE PRICE, SO IT IS NOT RE-DIAGNOSED ELSEWHERE: `/login` compares
-    # ``oauthAccount`` before the sign-in against after, and drops Remote
-    # Control when they differ — the splice's value against this route's
-    # unswapped one. No bridge pointer is read there, so no carry can prevent
-    # it, and this exclusion is the only lever.
+    # ``/api/oauth/profile`` is pinned for Claude Code's own client and for
+    # nobody else. Claude Code merges the answer into ``oauthAccount`` and
+    # drops Remote Control when it names a different account than the one it
+    # holds (`/login`, an account switch, a re-fetch after a rotation), so the
+    # unswapped route ended every bridge on the host at each switch. cswap's
+    # ``fetch_oauth_profile`` asks the same route over urllib, through the same
+    # proxy vars, and must keep seeing the live account: it is the oracle that
+    # decides which slot a credential belongs to. The User-Agent is the only
+    # thing that tells the two callers apart.
+    if _is_claude_code_ua(ua) and (
+        path.split("?", 1)[0].rstrip("/") == "/api/oauth/profile"
+    ):
+        return True
     # ``/api/claude_code/policy_limits`` IS THE ROUTE THAT DECIDES WHETHER
     # REMOTE CONTROL IS ALLOWED AT ALL, and a wrong answer here is permanent.
     # Claude Code polls it hourly and feeds the answer into `setSessionCache`,
@@ -13986,7 +13995,10 @@ class PinProxy:
         # bearer onto a bare TCP socket. The MITM path always wraps its
         # upstream, so the exposure would be this path's alone.
         if host == UPSTREAM_HOST and secure:
-            if is_pinned_route(rel):
+            ua = next((h.split(":", 1)[1].strip() for h in headers
+                       if h.split(":", 1)[0].strip().lower() == "user-agent"),
+                      "")
+            if is_pinned_route(rel, ua):
                 token = self._wait_for_pin_token(
                     method, rel, self._pin_token_provider())
                 if token and any(h.split(":", 1)[0].strip().lower()
@@ -14181,7 +14193,8 @@ class PinProxy:
                 headers.append((k.strip(), v.strip()))
         body = _read_body(tls, headers)
 
-        pinned = is_pinned_route(path)
+        ua = next((v for k, v in headers if k.lower() == "user-agent"), "")
+        pinned = is_pinned_route(path, ua)
         # TWO CLOCKS, because the total alone cannot say who was slow — see
         # `_note_slow_request`. `_t_pin` closes where the request leaves us.
         _t_req = _t_pin = time.monotonic()
