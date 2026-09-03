@@ -1873,6 +1873,27 @@ class TestLiveRemoteControlSessions:
         finally:
             proxy._stop = True
 
+    def case_the_trace_tick_joins_after_a_real_stop(self, tmp_path):
+        """`_trace_tick_loop` is a `while True:` thread nothing ended --
+        `stop()`/`release_listener()` never touched it, and it woke twice a
+        second forever. Measured: 130 of 169 live threads at suite end were
+        this one. The full `stop()` (past the drain, not `release_listener`
+        alone) must end it, and promptly -- within one `wait(0.5)` beat."""
+        from cswap_pin import proxy as pin_proxy
+
+        proxy = pin_proxy.PinProxy(certdir=tmp_path,
+                                   pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            thread = proxy._trace_tick_thread
+            assert thread.is_alive(), "the trace tick never started"
+        finally:
+            proxy.stop()
+
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), (
+            "the trace tick thread outlived a real stop() -- nothing ends it")
+
 
 class TestRepinIsLive:
     """Switching accounts in cswap never asks you to restart a session, and

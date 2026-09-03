@@ -11466,9 +11466,14 @@ class PinProxy:
         # as long as it parked -- and `release_listener` setting `_stop`
         # ended the tick at a handover, right when a draining process is
         # still relaying the connections it holds and still writing to the
-        # trace. Ends only when the process does, like `_watch_own_code`'s
-        # watchdog thread.
-        threading.Thread(target=self._trace_tick_loop, daemon=True).start()
+        # trace. Gated on its OWN event, set only at the end of `stop()`
+        # (after the drain), so the tick outlives `_stop` but not the
+        # process -- a `stop()` that never runs used to leak this thread
+        # forever, one per proxy the suite ever started.
+        self._trace_tick_stop = threading.Event()
+        self._trace_tick_thread = threading.Thread(
+            target=self._trace_tick_loop, daemon=True)
+        self._trace_tick_thread.start()
         _provider = getattr(self, "_pin_token_provider", None)
         if getattr(_provider, "can_pin_cached", None) is not None:
             threading.Thread(target=self._warm_mint_cache, daemon=True).start()
@@ -11598,14 +11603,14 @@ class PinProxy:
             # session's path, and that is where it is fixed.
 
     def _trace_tick_loop(self) -> None:
-        """Run `_trace_tick` on its own 0.5s beat, for the life of the
-        process -- see the note where this thread is started."""
-        while True:
+        """Run `_trace_tick` on its own 0.5s beat, until `stop()` ends it --
+        see the note where this thread is started."""
+        while not self._trace_tick_stop.is_set():
             try:
                 self._trace_tick()
             except Exception:  # noqa: BLE001 — never take this thread down
                 pass
-            time.sleep(0.5)
+            self._trace_tick_stop.wait(0.5)
 
     def _warm_mint_cache(self) -> None:
         """Populate the mint cache ONCE, off the request path and off
@@ -13033,7 +13038,15 @@ class PinProxy:
         — completes.
         """
         self.release_listener()
-        return self.await_inflight(drain)
+        cut = self.await_inflight(drain)
+        # ONLY HERE, AFTER THE DRAIN -- `release_listener`'s `_stop` must not
+        # end the tick (see the note where `_trace_tick_loop` starts): a
+        # draining process still relays what it holds and still writes to
+        # the trace through the whole wait this method just did.
+        tick_stop = getattr(self, "_trace_tick_stop", None)
+        if tick_stop is not None:
+            tick_stop.set()
+        return cut
 
     def _close_open_connections(self) -> None:
         """Close every open connection, write end first.
