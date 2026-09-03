@@ -8366,6 +8366,18 @@ _STAND_DOWN_SIGNAL = getattr(signal, "SIGHUP", None)
 # An unhandled USR1 is fatal on delivery, so this only has to outlast the
 # kernel's trip to the other process, not any work the handler does.
 _ASK_SETTLE_SECONDS = 0.25
+# HOW LONG `stop()` WILL WAIT FOR THE STANDBY TO ACTUALLY GO. A single
+# fire-and-forget `send_signal` can race the child's own startup — the SIGHUP
+# only means "release" once `standby_main` has reached
+# `signal.signal(signal.SIGHUP, _release)`, and a child spawned moments
+# earlier may not have gotten that far. MEASURED: a holder whose daemon spawn
+# was stubbed to die on every retry (a tight, near-zero-backoff respawn loop)
+# sent one SIGHUP that `os.kill` accepted without error, yet the standby was
+# still alive, still holding the descriptor, minutes later — and outlived the
+# whole suite to become an orphaned holder once its parent (this test
+# process) finally exited. Re-sent until the child is confirmed dead, bounded
+# so a genuinely wedged standby cannot hang teardown forever.
+_STANDBY_RELEASE_BOUND_S = 3.0
 
 # How long a bridge creation waits for a token it could not mint. Three tries
 # at 0.3s is under a second — below the noise of opening Remote Control, and
@@ -8980,6 +8992,7 @@ class PortHolder:
         no guard here that would catch it.
         """
         import signal
+        import subprocess
 
         self._stop = True
         # RELEASE THE STANDBY FIRST, and by SIGHUP. It is detached and outlives
@@ -8988,12 +9001,27 @@ class PortHolder:
         # is still there, still holding the descriptor, and will arm the moment
         # `getppid()` moves. SIGHUP, never SIGTERM. Death must keep the
         # address. Only being asked releases it.
+        #
+        # RE-SENT UNTIL CONFIRMED DEAD — see `_STANDBY_RELEASE_BOUND_S`. A
+        # single `send_signal` that `os.kill` accepts is not proof the
+        # standby is gone: the signal can arrive before `standby_main` has
+        # installed its own handler, and a stop that only fires once leaves
+        # exactly that standby behind, still holding the descriptor.
         standby = getattr(self, "_standby", None)
         if standby is not None and getattr(standby, "returncode", 0) is None:
-            try:
-                standby.send_signal(signal.SIGHUP)
-            except (OSError, ValueError):
-                pass
+            deadline = time.monotonic() + _STANDBY_RELEASE_BOUND_S
+            while True:
+                try:
+                    standby.send_signal(signal.SIGHUP)
+                except (OSError, ValueError):
+                    break
+                try:
+                    standby.wait(timeout=0.2)
+                    break  # confirmed gone
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() >= deadline:
+                    break
         # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
         # is only meaningful while the Popen it came from is ours — and a pid
         # is reused freely, so signalling it after the child is gone aims at

@@ -9429,6 +9429,69 @@ print("OK", port)
             f"the report does not name how many attempts failed: {said[0]!r}"
         )
 
+    def case_the_teardown_does_not_leave_the_standby_running(self, tmp_path):
+        """`stop()` returning must mean the whole lineage let go — standby
+        included, not just the daemon it stubs out here.
+
+        SAME SHAPE AS THE CASE ABOVE: a daemon spawn stubbed to die on every
+        attempt, with no backoff, so `stop()` runs moments after
+        `_spawn_standby()` placed a REAL standby subprocess. Measured before
+        the fix: `send_signal(SIGHUP)` returned without raising, `stop()`
+        returned, and the standby was still alive minutes later — the signal
+        can arrive before `standby_main` has installed its own handler, and a
+        release that only fires once has no way to notice it did not land.
+        That standby outlived the whole suite and, once its parent (this
+        process) finally exited, armed as an orphaned holder — still naming
+        `--standby` in argv, because it never re-exec'd.
+        """
+        import time
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        spawns = []
+
+        def _fake_spawn():
+            spawns.append(1)
+            holder._proc = _ExitedProc(1)      # dies instantly, every time
+            holder.daemon_pid = 4000 + len(spawns)
+
+        holder._spawn = _fake_spawn
+        # NO BACKOFF — this is what narrows `stop()` onto the same race
+        # window `_spawn_standby()`'s child is still starting up in.
+        holder._backoff = lambda failures: 0.0
+        holder.start()
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and len(spawns) < 3:
+                time.sleep(0.01)
+        finally:
+            holder.stop()
+
+        # /proc, not `ps` — `ps` truncates the command line to COLUMNS (80
+        # under pytest) and this certdir is long enough to fall past that,
+        # which would make every match here silently fail. See the sibling
+        # checks elsewhere in this file that hit the same trap.
+        survivors = []
+        for entry in pathlib.Path("/proc").glob("[0-9]*"):
+            try:
+                argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+            except OSError:
+                continue
+            cmd = argv.decode(errors="replace")
+            if "cswap_pin.proxy" in cmd and str(tmp_path) in cmd:
+                survivors.append(f"{entry.name} {cmd.strip()}")
+
+        from conftest import _reap_pin_processes
+        try:
+            assert not survivors, (
+                "stop() returned but left a pin process still running for "
+                f"this certdir, argv naming it as a standby: {survivors}"
+            )
+        finally:
+            _reap_pin_processes(tmp_path)
+
     def case_a_mark_that_cannot_be_cleared_is_not_reported_as_cleared(
         self, tmp_path
     ):
