@@ -17713,7 +17713,7 @@ class TestADeferredRefreshIsCounted:
         monkeypatch.setattr(pin_proxy, "load_pin",
                             lambda root: ("a@example.com", "org"))
         monkeypatch.setattr(pin_proxy, "resolve_pin_token",
-                            lambda creds, consume: (None, consume(creds)))
+                            lambda creds, consume: (None, consume(creds).credentials))
         return pin_proxy.make_pin_token_provider(_Switcher(), "1",
                                                  "a@example.com")
 
