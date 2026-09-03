@@ -3485,18 +3485,21 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     read = getattr(_settings, "_read_raw_for_write", None) or _settings._read_raw
     raw = read(path)
     if email:
-        # MERGE, NEVER ASSIGN. `_read_raw_for_write` above guards the OUTER
-        # dict so a read-modify-write cannot discard autoswitch, UI and every
-        # unknown section — and assigning the INNER dict reintroduced exactly
-        # that fault one level down. `remoteControl` is shared: `debugSlowMs`
-        # is read here and written by nobody in this function, so rebuilding
-        # the section deleted a live setting of our own on every pin.
+        # REBUILD WITH THE PAIR FIRST, NEIGHBOURS CARRIED IN THEIR ORDER.
+        # `_read_raw_for_write` above guards the OUTER dict so a
+        # read-modify-write cannot discard autoswitch, UI and every unknown
+        # section. `remoteControl` is shared too: `debugSlowMs` is read here
+        # and written by nobody in this function, so it must survive too.
         section = raw.get("remoteControl")
         if not isinstance(section, dict):
             section = {}
-        section["pinnedEmail"] = email
-        section["pinnedOrganizationUuid"] = org_uuid or ""
-        raw["remoteControl"] = section
+        section.pop("pinnedEmail", None)
+        section.pop("pinnedOrganizationUuid", None)
+        raw["remoteControl"] = {
+            "pinnedEmail": email,
+            "pinnedOrganizationUuid": org_uuid or "",
+            **section,
+        }
     else:
         # CLEARING DROPS THE PIN, NOT THE SECTION. Removing the whole thing
         # takes every neighbouring key with it, which is the same deletion by
@@ -3509,27 +3512,10 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
                 raw.pop("remoteControl", None)
         else:
             raw.pop("remoteControl", None)
-    # ORDER PRESERVED, never sorted. The original defect was real — clearing
-    # POPS this key and pinning re-ASSIGNS it, and a pop-then-assign appends at
-    # the end, so a clear+re-pin rewrote identical content in a different order
-    # on a file symlinked into the dotfiles repo. 0.1.70 fixed that by sorting
-    # the whole file, and the reasoning held only while this was the sole
-    # writer. It is not. FOUR others write this same path, all through the
-    # host's insertion-order writer (`json.dumps(data, indent=2)`, no
-    # sort_keys):
-    #
-    #     settings.py   save_settings / set_setting / unset_setting
-    #     pin.py        _clear_pin_record
-    #
-    # Each appends a NEW section at the end, because `raw[k] = v` on a fresh
-    # key does. Sorting
-    # here then drags that key inward on the next pin — an order-only diff on a
-    # tracked file, once per new section, forever. So the invariant that
-    # matters on a SHARED file is agreeing with its other writers, not being
-    # internally tidy. Preserving order costs one move of this key the first
-    # time a clear+re-pin happens after this change — a content-meaningful
-    # diff, since the key really was removed and re-added — and is byte-stable
-    # from then on, under BOTH pin cycles and new sections.
+    # ORDER PRESERVED, never sorted: the pair is written first and every
+    # neighbour follows in its prior order. A pin is therefore a fixed point —
+    # a file the old code left pair-last is normalised ONCE, on its next pin,
+    # to the dotfiles record's order, and stays byte-stable after that.
     _settings.atomic_write_json(path, raw)
 
 

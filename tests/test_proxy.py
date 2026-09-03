@@ -4108,6 +4108,34 @@ class TestPinStore:
         assert after.get("ui") == {"theme": "dark"}, "an outer section was lost"
         assert load_pin(tmp_path) == ("other@example.com", "org-uuid-2")
 
+    def case_a_clear_then_pin_leaves_the_bytes_unchanged(self, tmp_path):
+        """A clear followed by a pin writes the same bytes as the pin alone, pair first.
+
+        Clearing pops the pinned pair; pinning again re-assigns it — and a
+        pop-then-assign appends at the end, past a neighbour that was already
+        there. That is a JSON-equal rewrite that dirties every dotdrop-linked
+        settings.json on the fleet (debugSlowMs moved ahead of the pin).
+        """
+        from cswap_pin.proxy import require, save_pin
+        settings = require("settings")
+        path = settings.settings_path(tmp_path)
+
+        save_pin(tmp_path, "pin@example.com", "org-uuid-1")
+        raw = settings._read_raw(path)
+        raw["remoteControl"]["debugSlowMs"] = 1500
+        path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+        save_pin(tmp_path, "pin@example.com", "org-uuid-1")  # re-pin: keeps order
+        before = path.read_bytes()
+
+        save_pin(tmp_path, None, None)
+        save_pin(tmp_path, "pin@example.com", "org-uuid-1")
+
+        assert path.read_bytes() == before, (
+            "a clear+pin moved debugSlowMs ahead of the pinned pair — a "
+            "JSON-equal rewrite that dirties every dotdrop-linked "
+            "settings.json on the fleet")
+
     def case_CONTROL_clearing_still_removes_the_pin(self, tmp_path):
         """What stops the fix above from becoming "never remove anything". A
         clear must still drop the pin keys, and drop the section when nothing
