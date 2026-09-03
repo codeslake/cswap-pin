@@ -8,6 +8,8 @@ inference (/v1/messages) and everything else must pass through untouched.
 from __future__ import annotations
 
 import json
+import socket
+import threading
 import types
 import os
 import pathlib
@@ -12254,32 +12256,18 @@ class TestABlindDaemonIsNotReusedForever:
     def case_a_marked_daemon_is_not_reused(self, tmp_path):
         import json
         import os
-        import socket
 
         from cswap_pin import proxy as pin_proxy
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True)
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        # BACKLOG BIGGER THAN THE NUMBER OF PROBES, because nothing here ever
-        # calls accept(). `_read_alive_port` connects once per call and this
-        # case calls it twice, so every completed connection stays parked in
-        # the accept queue — and how many fit there is NOT the same on both
-        # platforms. Measured, same script, listen(1) and never accepting:
-        #
-        #   Linux 6.8.0    connect #1 OK   #2 OK        #3 TimeoutError
-        #   Darwin 24.6.0  connect #1 OK   #2 Timeout   #3 TimeoutError
-        #
-        # So Linux holds two and Darwin holds one, and the second probe below
-        # timed out there. `TimeoutError` is an `OSError`, which
-        # `_read_alive_port` catches and turns into None — so the assertion
-        # failed as `None == 51504` and read like a logic bug in the function
-        # under test rather than like scaffolding running out of room. This
-        # was the first failure the macOS CI job ever reported.
-        srv.listen(8)
-        port = srv.getsockname()[1]
+        # A REAL /health ANSWER, not a socket that merely accepts:
+        # `_serving_can_pin` now retries and treats repeated silence after
+        # connect as a wedge (see `TestAWedgeIsNotTrustedForever`), so a
+        # listener that never reads or writes is no longer a stand-in for
+        # "healthy" -- it is exactly the wedge that check exists to catch.
+        stub = _HealthStub(lambda n: _health_ok({"can_pin": True}))
+        port = stub.port
         state = certdir / "proxy.json"
         state.write_text(
             json.dumps({"port": port, "pid": os.getpid(), "fingerprint": "fp"})
@@ -12297,7 +12285,7 @@ class TestABlindDaemonIsNotReusedForever:
             # monitor asking "is anything there" must not be told no.
             assert pin_proxy._read_alive_port(certdir) == port
         finally:
-            srv.close()
+            stub.close()
 
     def case_marking_a_daemon_that_is_not_ours_does_nothing(self, tmp_path):
         import json
@@ -12312,6 +12300,254 @@ class TestABlindDaemonIsNotReusedForever:
         assert "unpinnable" not in json.loads(state.read_text()), (
             "one daemon marked another's record"
         )
+
+
+class _HealthStub:
+    """A raw TCP server speaking exactly the wire format `_serving_can_pin`
+    sends: one request line, then either a `\\r\\n\\r\\n`-terminated JSON
+    body it closes the connection after, or nothing at all.
+
+    ``script(n)`` is called once per accepted connection, ``n`` counting
+    from 1, and returns the bytes to write back -- or ``None`` to accept the
+    connection and never answer it: the wedge this whole fix exists to
+    catch. A silent connection is kept referenced (never closed) so nothing
+    garbage-collects it out from under a client still waiting on it.
+    """
+
+    def __init__(self, script):
+        self._script = script
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self.port = self._sock.getsockname()[1]
+        self._n = 0
+        self._parked = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self._n += 1
+            threading.Thread(
+                target=self._serve, args=(conn, self._n), daemon=True
+            ).start()
+
+    def _serve(self, conn, n):
+        try:
+            conn.recv(4096)
+            payload = self._script(n)
+            if payload is None:
+                self._parked.append(conn)
+                return
+            conn.sendall(payload)
+        except OSError:
+            return
+        finally:
+            if conn not in self._parked:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        for conn in self._parked:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def _health_ok(body: dict) -> bytes:
+    payload = json.dumps(body).encode()
+    return (b"HTTP/1.1 200 OK\r\nContent-Length: "
+            + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+
+
+class TestAWedgeIsNotTrustedForever:
+    """A daemon that ACCEPTS TCP but never answers `/health` is not the same
+    as a busy one -- `_serving_can_pin` used to answer both with `None`
+    ("it would not say"), which `_read_alive_port` and `heal`'s recycle gate
+    both read as healthy by policy. Measured on a Mac: `cswap pin --heal`
+    printed "Nothing to heal" twice against a trio that accepted TCP and
+    never answered, and the launcher kept re-wiring the wedged port.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_socket_that_accepts_and_never_answers_is_a_wedge(self):
+        from cswap_pin import proxy as pin_proxy
+
+        stub = _HealthStub(lambda n: None)
+        try:
+            result = pin_proxy._serving_can_pin(stub.port, timeout=0.2)
+            assert result is False, (
+                "a socket that accepts TCP and never answers must read as "
+                f"a wedge, not unknown: got {result!r}")
+        finally:
+            stub.close()
+
+    def case_nobody_listening_is_unknown_not_a_wedge(self):
+        """A connect failure is a DIFFERENT population -- the caller's own
+        dead-port check already handles it -- and must answer at once
+        rather than retrying `_PIN_PROBE_ATTEMPTS` times for no reason."""
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()  # nothing is listening now
+
+        t0 = time.monotonic()
+        result = pin_proxy._serving_can_pin(port, timeout=1.0)
+        elapsed = time.monotonic() - t0
+        assert result is None, (
+            f"a refused connection was read as a wedge: {result!r}")
+        assert elapsed < 0.5, (
+            "retried a connect failure instead of answering at once: "
+            f"{elapsed:.2f}s")
+
+    def case_an_answer_on_a_later_attempt_is_not_a_wedge(self):
+        from cswap_pin import proxy as pin_proxy
+
+        def _script(n):
+            return None if n == 1 else _health_ok({"can_pin": True})
+
+        stub = _HealthStub(_script)
+        try:
+            result = pin_proxy._serving_can_pin(stub.port, timeout=0.3)
+            assert result is not False, (
+                "a daemon that answered on a later attempt was still "
+                f"called a wedge: {result!r}")
+        finally:
+            stub.close()
+
+    def case_a_mint_stalled_120s_is_treated_as_a_wedge(self):
+        from cswap_pin import proxy as pin_proxy
+
+        stub = _HealthStub(
+            lambda n: _health_ok({"can_pin": True, "mint_stalled_s": 120.0}))
+        try:
+            result = pin_proxy._serving_can_pin(stub.port, timeout=0.3)
+            assert result is False, (
+                "a mint stalled for 120s answered can_pin=true and was "
+                f"trusted: {result!r}")
+        finally:
+            stub.close()
+
+    def case_a_mint_stalled_5s_is_not_a_wedge(self):
+        from cswap_pin import proxy as pin_proxy
+
+        stub = _HealthStub(
+            lambda n: _health_ok({"can_pin": True, "mint_stalled_s": 5.0}))
+        try:
+            result = pin_proxy._serving_can_pin(stub.port, timeout=0.3)
+            assert result is not False, (
+                "a mint stalled for only 5s -- a refresh still in flight -- "
+                f"was already treated as a wedge: {result!r}")
+        finally:
+            stub.close()
+
+    def case_read_alive_port_refuses_a_same_fingerprint_wedge(
+            self, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        stub = _HealthStub(lambda n: None)
+        try:
+            certdir = tmp_path / "pin-proxy"
+            certdir.mkdir(parents=True)
+            (certdir / "proxy.json").write_text(json.dumps(
+                {"port": stub.port, "pid": os.getpid(), "fingerprint": "fp"}))
+            assert pin_proxy._read_alive_port(
+                certdir, fingerprint="fp") is None, (
+                "a daemon that accepts TCP and never answers /health was "
+                "reused")
+            # THE CONTROL. A bare liveness probe still finds it -- it IS
+            # serving, just not answering, and a monitor asking "is
+            # anything there" must not be told no.
+            assert pin_proxy._read_alive_port(certdir) == stub.port
+        finally:
+            stub.close()
+
+    def case_heal_recycles_a_same_fingerprint_wedge(
+            self, tmp_path, monkeypatch):
+        """`heal`'s recycle gate required a STALE fingerprint (the code
+        watchdog's own trigger), so a daemon running CURRENT code that has
+        simply wedged -- accepts TCP, answers nothing -- never matched:
+        `stale_fp != fp` reads False and the whole recycle branch is
+        skipped, forever. `_serving_can_pin` is stubbed straight to `False`
+        here because ITS behaviour is covered above; this case is about the
+        recycle gate, not socket timing.
+        """
+        from cswap_pin import proxy
+        import claude_swap.paths as paths
+
+        fp = proxy.daemon_fingerprint()
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+
+        def _accept_until_closed():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                conn.close()
+        threading.Thread(target=_accept_until_closed, daemon=True).start()
+
+        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        (certdir / "proxy.json").write_text(json.dumps(
+            {"pid": os.getpid(), "port": port, "fingerprint": fp}))
+        (certdir / "ca.pem").write_bytes(b"x")
+        (tmp_path / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "c@e.com"}}))
+        (tmp_path / "sequence.json").write_text(json.dumps(
+            {"accounts": {"1": {"email": "c@e.com"}}}))
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"CSWAP_PIN_PORT": str(port),
+                    "HTTPS_PROXY": f"http://127.0.0.1:{port}"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(
+            paths, "get_default_global_config_path", lambda: cfg)
+
+        kills = []
+        monkeypatch.setattr(
+            proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
+        monkeypatch.setattr(
+            proxy, "_kill_daemon",
+            lambda pid, certdir=None: kills.append(pid))
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda n, e, c, **k: port + 1)
+        try:
+            result = proxy.heal(tmp_path)
+            assert kills == [os.getpid()], (
+                "heal left a wedged, current-code daemon in place instead "
+                f"of recycling it: kills={kills!r}")
+            assert result is True, (
+                "heal killed the wedge but did not report having repaired "
+                "it")
+        finally:
+            srv.close()
 
 
 class TestClientRegistrationIsNotSwapped:
@@ -12505,17 +12741,16 @@ class TestHealReWiresAServingDaemon:
     def _fixture(self, tmp_path, monkeypatch, wired_port=None):
         """A serving daemon + a pin record. ``wired_port`` sets what the config
         claims (None = not wired at all)."""
-        import socket
-
         from cswap_pin import proxy
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True, exist_ok=True)
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(4)
-        port = srv.getsockname()[1]
+        # A REAL /health ANSWER, not a socket that merely accepts:
+        # `_serving_can_pin` now retries and treats repeated silence after
+        # connect as a wedge (see `TestAWedgeIsNotTrustedForever`), and these
+        # cases are about a daemon that IS healthy and merely unwired.
+        srv = _HealthStub(lambda n: _health_ok({"can_pin": True}))
+        port = srv.port
         # The REAL fingerprint, not a literal. These tests are about a daemon
         # that is serving CURRENT code and merely unwired; a literal made it
         # indistinguishable from one running code we no longer ship, which heal
@@ -12897,17 +13132,17 @@ class TestAnUpgradeDoesNotWaitForALaunch:
 
     def _serving_daemon(self, tmp_path, monkeypatch, fingerprint):
         """A daemon serving under ``fingerprint``, with a pin record."""
-        import socket
-
         from cswap_pin import proxy
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True, exist_ok=True)
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(4)
-        port = srv.getsockname()[1]
+        # A REAL /health ANSWER, not a socket that merely accepts:
+        # `_serving_can_pin` now retries and treats repeated silence after
+        # connect as a wedge (see `TestAWedgeIsNotTrustedForever`), and a
+        # daemon here is meant to read as genuinely serving -- staleness
+        # comes from `fingerprint`, not from silence.
+        srv = _HealthStub(lambda n: _health_ok({"can_pin": True}))
+        port = srv.port
         proxy.write_daemon_state(certdir, port, os.getpid(), fingerprint)
         (tmp_path / "settings.json").write_text(
             json.dumps(
@@ -18466,19 +18701,29 @@ class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
         finally:
             srv.close()
 
-    def test_a_daemon_that_will_not_answer_reads_as_healthy(self, tmp_path):
-        """None is "it would not say", and must not recycle on every launch.
-
-        A busy daemon missing the deadline is the common case; refusing it
-        would spawn a successor per launch and cut in-flight requests each
-        time — the non-convergence this file already records.
+    def test_a_daemon_that_will_not_answer_at_all_is_a_wedge(self, tmp_path):
+        """A daemon missing ONE deadline is still healthy -- `_serving_can_pin`
+        retries `_PIN_PROBE_ATTEMPTS` times before giving up, which is what
+        keeps a merely busy daemon (a slow tick, the common case) from being
+        recycled on every launch and cutting in-flight requests. But silence
+        across EVERY attempt is no longer read as "it would not say" and
+        left alone forever: on 0.1.240 `/health` answers within milliseconds
+        even under a stalled mint, so repeated silence is the request
+        handler itself, not a busy credential store. See
+        `TestAWedgeIsNotTrustedForever` for `_serving_can_pin` in isolation
+        and for the case a later attempt DOES answer.
         """
         from cswap_pin import proxy as pin_proxy
 
         srv, port = self._health_server(None)      # accepts, answers nothing
         try:
             cd = self._record(tmp_path, port)
-            assert pin_proxy._read_alive_port(cd, fingerprint="FP") == port
+            assert pin_proxy._read_alive_port(cd, fingerprint="FP") is None, (
+                "a daemon that never answers /health was reused instead of "
+                "recycled")
+            # THE CONTROL. A bare liveness probe still finds it -- it IS
+            # serving, just not answering.
+            assert pin_proxy._read_alive_port(cd) == port
         finally:
             srv.close()
 

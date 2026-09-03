@@ -7761,6 +7761,98 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_409_on_a_worker_post_clears_the_bridge_from_deaf_state(
+            self, certdir):
+        """A bridge the server superseded is not the same as one gone deaf.
+
+        Measured on a linux host after the 0.1.240 rollout (`daemon.log` +
+        `trace.log` of one generation): four of six ids named in DEAF lines
+        had ended with `<- HTTP/1.1 409 Conflict  POST
+        .../worker/events/delivery` and `... 409 Conflict  POST
+        .../worker/events`, then nothing more. They stayed in
+        `_bridge_posts` for the full `_DEAF_WINDOW_S` and were reported at
+        ages 54-244s, with a line whose claims ("messages reach the
+        server", "only a NEW PROCESS clears it") are false for a bridge the
+        server already refused every message from.
+        `sweep_superseded_bridges` clears the same id eventually, but a full
+        listing poll later than the 409 that already told us. The relay
+        sees the worker POST's path and its response status at the same
+        site (`_forward`'s `on_status`), so that is where this clears it.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        def _srv():
+            s = pp.PinProxy.__new__(pp.PinProxy)
+            s._live_lock = threading.Lock()
+            s._stream_conns = set()
+            s._open_conns = set()
+            s._reset_bridge_traffic()
+            s._stream_lost = {}
+            return s
+
+        WORKER = "/v1/code/sessions/cse_SUPERSEDED/worker/events/delivery"
+        # A BRIDGE-ID-BEARING PATH, so this is a real test of the worker-
+        # subtree guard rather than the "no bridge id at all" guard next to
+        # it: a path with no trailing segment (bare "/sessions/<id>") never
+        # matches `_BRIDGE_ID` either, and would pass this control even with
+        # the worker-subtree check deleted.
+        NON_WORKER = "/v1/code/sessions/cse_SUPERSEDED/rename"
+
+        srv = _srv()
+        srv._note_bridge_traffic(WORKER, now=100.0)
+        srv._stream_lost["cse_SUPERSEDED"] = 100.0
+        assert srv.deaf_bridges(window=60.0, now=101.0) == [
+            "cse_SUPERSEDED"], (
+            "setup: a bridge that posted and holds no stream starts out "
+            "deaf")
+
+        srv._note_bridge_superseded(WORKER, b"HTTP/1.1 409 Conflict")
+        assert srv.deaf_bridges(window=60.0, now=101.0) == [], (
+            "a 409 to its own worker POST means the server already "
+            "superseded this bridge; `deaf_bridges` must stop naming it")
+        assert "cse_SUPERSEDED" not in srv._stream_lost, (
+            "its stream-loss record must go with it, or a create retried "
+            "under the same id inherits a loss that was never its own")
+
+        # CONTROL: a 200 on the same route leaves the bridge exactly posted.
+        srv = _srv()
+        srv._note_bridge_traffic(WORKER, now=100.0)
+        srv._note_bridge_superseded(WORKER, b"HTTP/1.1 200 OK")
+        assert srv.deaf_bridges(window=60.0, now=101.0) == [
+            "cse_SUPERSEDED"], (
+            "a 200 must not touch the bridge's posting record")
+
+        # CONTROL: a 409 on a route that is not a worker POST changes
+        # nothing -- only the worker POST itself is authoritative that the
+        # server rejected THIS bridge.
+        srv = _srv()
+        srv._note_bridge_traffic(WORKER, now=100.0)
+        srv._note_bridge_superseded(NON_WORKER, b"HTTP/1.1 409 Conflict")
+        assert srv.deaf_bridges(window=60.0, now=101.0) == [
+            "cse_SUPERSEDED"], (
+            "a 409 on a non-worker route must not clear the bridge")
+
+        # `_posting_now` is `_report_deaf_bridges`'s own denominator, and it
+        # reads real wall time rather than an injected `now`.
+        srv = _srv()
+        srv._note_bridge_traffic(WORKER, now=time.monotonic())
+        assert srv._posting_now() == 1
+        srv._note_bridge_superseded(WORKER, b"HTTP/1.1 409 Conflict")
+        assert srv._posting_now() == 0, (
+            "the superseded bridge still counted toward the denominator "
+            "`_report_deaf_bridges` divides by")
+
+        # AND SOMETHING MUST WIRE IT: `_forward`'s `on_status` is the only
+        # site that sees the worker POST's path and its response status
+        # together.
+        import inspect
+        wired = inspect.getsource(pp.PinProxy._forward)
+        assert "_note_bridge_superseded" in wired, (
+            "nothing calls the notifier, so a superseded bridge is still "
+            "reported deaf until the window or a sweep clears it")
+
     def case_the_carry_is_reachable_without_a_daemon(self, certdir):
         """A switch must be able to carry pointers with no daemon running.
 

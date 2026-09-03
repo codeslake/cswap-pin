@@ -1789,7 +1789,19 @@ def heal(backup_root: Path, identity: dict | None = None,
     # made such a daemon IMMORTAL — it can never match the current fingerprint,
     # so it is stale by definition, and 0.1.5 recycled it. Treat a missing
     # fingerprint as stale, which is what it means.
-    stale_is_serving = (alive is None and stale_fp != fp
+    fp_stale = stale_fp != fp
+    # A WEDGE: current code, not marked unpinnable (that gap is a credential
+    # problem no respawn fixes -- see the case below), but the fingerprinted
+    # probe still refused it. The only way `alive is None` reaches here under
+    # a MATCHING fingerprint and no `unpinnable` mark is `_serving_can_pin`
+    # answering False -- it already retried and confirmed nothing comes back.
+    # Without this, `stale_fp != fp` never held for a daemon running code we
+    # DO ship, so a wedge on current code was never a match and `heal` read
+    # it as healthy forever. Measured on a Mac: `cswap pin --heal` printed
+    # "Nothing to heal" twice against a trio that accepted TCP and never
+    # answered.
+    wedged = not fp_stale and not (stale_st or {}).get("unpinnable")
+    stale_is_serving = (alive is None and (fp_stale or wedged)
                         and _read_alive_port(certdir) is not None)
     if not stale_is_serving:
         # The watchdog did its job (or there was never anything stale), so no
@@ -1798,8 +1810,9 @@ def heal(backup_root: Path, identity: dict | None = None,
         # clear that actually keeps the record from going stale.
         _clear_heal_defer(certdir)
     if stale_is_serving:
-        # Serving, but running code we no longer ship. Recycle it: the spawn
-        # below rebinds the SAME port, so live sessions never see the swap.
+        # Serving, but running code we no longer ship (or wedged on code we
+        # do). Recycle it: the spawn below rebinds the SAME port, so live
+        # sessions never see the swap.
         #
         # NOT WITHOUT A SLOT. A dangling pin (its account gone from the
         # registry) has nothing to spawn afterwards, so killing here would
@@ -1807,11 +1820,16 @@ def heal(backup_root: Path, identity: dict | None = None,
         # recycle exists to prevent, caused by the recycle.
         if not account_num:
             return False
-        # LET THE GAPLESS PATH GO FIRST. Every daemon reaching here is the code
-        # watchdog's own trigger, and the watchdog replaces it while it keeps
-        # serving. TERMing instead is what turns a deploy into a cut.
+        # LET THE GAPLESS PATH GO FIRST -- BUT ONLY FOR THE REASON IT EXISTS
+        # FOR. `_watchdog_had_its_turn` defers one tick so the code watchdog's
+        # own gapless replacement can win the race; that watchdog fires on a
+        # STALE FINGERPRINT, and a wedge is not a code deploy -- the same
+        # deadlock that broke `/health` may just as well have broken the
+        # watchdog's own thread, so waiting a tick on it wastes exactly the
+        # time a wedge should not get.
         stale_pid = int((stale_st or {}).get("pid") or 0)
-        if stale_pid and not _watchdog_had_its_turn(certdir, stale_pid, stale_fp):
+        if fp_stale and stale_pid and not _watchdog_had_its_turn(
+                certdir, stale_pid, stale_fp):
             _log_lifecycle(
                 "a daemon on stale code is serving — leaving it to its own "
                 "code watchdog, which replaces it without darkening the port. "
@@ -7985,6 +8003,25 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+# HOW MANY TIMES `_serving_can_pin` RECONNECTS before calling a port that
+# accepts TCP and never answers a wedge rather than "unknown". A single
+# timeout is indistinguishable from an ordinary slow tick; on 0.1.240
+# `/health` answers within milliseconds even under a stalled mint (see
+# `mint_stalled` below), so silence across every attempt is the request
+# handler itself, not the credential store.
+_PIN_PROBE_ATTEMPTS = 3
+
+# HOW LONG A `mint_stalled_s` MAY RUN before it is a reason to recycle rather
+# than wait. `_MINT_LOCK_BOUND_S` already bounds one REQUEST's wait on the
+# refresh lock; this bounds how long the DAEMON may report the lock busy
+# before something is wrong that a request-scoped timeout cannot fix. A
+# credential store the daemon cannot read is cleared only by a fresh process
+# started from the GUI session (`heal-pin.sh`'s whole reason to exist), so a
+# stall past this is a reason to recycle, not to keep waiting on the same
+# process.
+_MINT_STALL_WEDGE_S = 60.0
+
+
 def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
     """What the daemon on ``port`` says about minting, or None if it will not say.
 
@@ -7992,27 +8029,47 @@ def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
     <n>` run to completion returned rc=0, printed "Pinned the cloud account",
     left the daemon pid unchanged and `can_pin` false throughout — because the
     record it consulted had lost its `unpinnable` mark to a respawn.
+
+    A CONNECT FAILURE IS "NOBODY THERE" and answers None on the first try:
+    the caller's own dead-port check already handles that population, and
+    retrying it would only cost time for no new information. A socket that
+    ACCEPTS and then never answers is different -- see `_PIN_PROBE_ATTEMPTS`
+    -- and reads as a confirmed wedge (False), not "it would not say" (None).
+    Measured on a Mac: `cswap pin --heal` printed "Nothing to heal" twice
+    against a trio that accepted TCP and never answered, because this
+    returned None and every caller reads None as healthy by policy.
     """
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sk:
-            sk.settimeout(timeout)
-            sk.sendall(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-            buf = b""
-            while len(buf) < 65536:
-                chunk = sk.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-    except OSError:
-        return None
-    parts = buf.split(b"\r\n\r\n", 1)
-    if len(parts) != 2:
-        return None
-    try:
-        val = json.loads(parts[1]).get("can_pin")
-    except ValueError:
-        return None
-    return val if isinstance(val, bool) else None
+    for attempt in range(_PIN_PROBE_ATTEMPTS):
+        try:
+            sk = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        except OSError:
+            return None
+        try:
+            with sk:
+                sk.settimeout(timeout)
+                sk.sendall(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+                buf = b""
+                while len(buf) < 65536:
+                    chunk = sk.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+        except OSError:
+            continue  # connected, then nothing -- a wedge, not "nobody there"
+        parts = buf.split(b"\r\n\r\n", 1)
+        if len(parts) != 2:
+            continue  # connected, but no full answer either -- same wedge
+        try:
+            body = json.loads(parts[1])
+        except ValueError:
+            return None  # a real, if malformed, answer -- not silence
+        held = body.get("mint_stalled_s")
+        if isinstance(held, (int, float)) and held > _MINT_STALL_WEDGE_S:
+            return False
+        val = body.get("can_pin")
+        return val if isinstance(val, bool) else None
+    # Every attempt connected and none produced an answer.
+    return False
 
 
 def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | None:
@@ -12353,6 +12410,36 @@ class PinProxy:
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
+    def _note_bridge_superseded(self, path: str, status_line: bytes) -> None:
+        """A worker POST refused with 409 is not a bridge gone quiet.
+
+        `_note_bridge_traffic` records only the REQUEST, so a bridge the
+        server has already superseded stays in `_bridge_posts` for the full
+        `_DEAF_WINDOW_S` and `deaf_bridges` reports it with a line that
+        claims "messages reach the server" and "only a NEW PROCESS clears
+        it" — both false for one whose every worker POST comes back 409.
+        `sweep_superseded_bridges` clears the same id eventually, driven by
+        a listing poll, but always later than the 409 that already told us.
+
+        Never raises: a statistic must not cost a request.
+        """
+        try:
+            if not status_line.startswith(b"HTTP/1.1 409"):
+                return
+            if not _WORKER_SUBTREE.search(path) or _EVENT_STREAM.search(path):
+                return
+            bid = _BRIDGE_ID.search(path)
+            if not bid:
+                return
+            b = bid.group(1)
+            self._bridge_posts.pop(b, None)
+            self._bridge_first_post.pop(b, None)
+            stream_lost = getattr(self, "_stream_lost", None)
+            if stream_lost is not None:
+                stream_lost.pop(b, None)
+        except Exception:  # noqa: BLE001 — a statistic must not cost a request
+            pass
+
     def _forget_stream(self, conn) -> None:
         """Drop a stream socket and its owner, and REMEMBER WHEN.
 
@@ -14869,6 +14956,7 @@ class PinProxy:
                 on_status=lambda st: (
                     self._note_attachment(path, st),
                     self._note_rename(method, path, st),
+                    self._note_bridge_superseded(path, st),
                     self._tunnel_trace(
                         f"    <- {st.decode('latin1', 'replace').strip()}"
                         f"  {method} {path}  ua={_ua}"),
