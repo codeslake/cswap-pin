@@ -9444,6 +9444,7 @@ print("OK", port)
         process) finally exited, armed as an orphaned holder — still naming
         `--standby` in argv, because it never re-exec'd.
         """
+        import signal
         import time
 
         from cswap_pin.proxy import PortHolder, ensure_ca
@@ -9461,13 +9462,27 @@ print("OK", port)
         # NO BACKOFF — this is what narrows `stop()` onto the same race
         # window `_spawn_standby()`'s child is still starting up in.
         holder._backoff = lambda failures: 0.0
-        holder.start()
+        # SIGHUP IGNORED IN THIS PROCESS, BEFORE start() — `Popen`'s
+        # `restore_signals` only resets SIGPIPE/SIGXFZ/SIGXFSZ, so the
+        # standby inherits whatever disposition WE hold across its exec.
+        # The default pytest gives us here is SIG_DFL, under which an early
+        # HUP (one that lands before `standby_main` installs its own
+        # handler) just kills the child — masking a `stop()` that never
+        # confirms the release, because the standby is gone either way.
+        # SIG_IGN reproduces the real supervisor's disposition: that same
+        # early HUP is discarded, the standby lives on unreleased, and only
+        # a `stop()` that resends until confirmed dead can still pass.
+        old_hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)
         try:
-            deadline = time.time() + 5
-            while time.time() < deadline and len(spawns) < 3:
-                time.sleep(0.01)
+            holder.start()
+            try:
+                deadline = time.time() + 5
+                while time.time() < deadline and len(spawns) < 3:
+                    time.sleep(0.01)
+            finally:
+                holder.stop()
         finally:
-            holder.stop()
+            signal.signal(signal.SIGHUP, old_hup)
 
         # /proc, not `ps` — `ps` truncates the command line to COLUMNS (80
         # under pytest) and this certdir is long enough to fall past that,
