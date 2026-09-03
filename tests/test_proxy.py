@@ -16850,6 +16850,124 @@ class TestTheSweepWillNotCloseARunningWorker:
         assert deleted == ["cse_elsewhere"]
 
 
+class TestDeadCreatorBridgeIdsIsPositiveEvidenceOnly:
+    """`_dead_creator_bridge_ids` must never condemn by SUBTRACTION.
+
+    `_live_job_ids`/`_live_bridge_ids` read a session record that is
+    absent, unparseable, or answers a signal with anything but "no such
+    process" as dead -- fine as a negative guard, wrong as the sole gate on
+    a DELETE. This keeps its own record instead (a pid it stamps into the
+    job's own `state.json` while the job is live) and only ever calls a
+    bridge dead when THAT stamped pid raises `ProcessLookupError`
+    specifically. Every other shape -- absent, torn, unstamped, or any
+    other errno -- must resolve to KEEP.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _home(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        (home / "sessions").mkdir(parents=True)
+        (home / "jobs").mkdir(parents=True)
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
+                            lambda: home)
+        return home
+
+    def _job(self, home, job_id, state):
+        d = home / "jobs" / job_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "state.json").write_text(json.dumps(state))
+
+    def _session(self, home, sid, pid, job_id):
+        (home / "sessions" / f"{sid}.json").write_text(
+            json.dumps({"pid": pid, "jobId": job_id}))
+
+    def case_a_live_record_and_a_live_pid_is_not_dead(self, tmp_path,
+                                                       monkeypatch):
+        """The ordinary case: stamped and read back in the same call, on a
+        pid this test process itself is (definitely alive)."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._session(home, "s1", os.getpid(), "j1")
+        self._job(home, "j1", {"bridgeSessionId": "cse_1"})
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert "cse_1" not in dead and "session_1" not in dead, dead
+        stamped = json.loads((home / "jobs" / "j1" / "state.json").read_text())
+        assert stamped[pin_proxy._CREATOR_PID_KEY] == os.getpid(), (
+            "the stamp never landed even though the job was live")
+
+    def case_an_absent_session_record_with_a_live_stamped_pid_is_not_dead(
+            self, tmp_path, monkeypatch):
+        """No registry entry names this job any more (GC'd, or never
+        re-read) -- but an EARLIER call already stamped a pid that is still
+        alive, and that stamp is what must be trusted, not the absence."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._job(home, "j2", {"bridgeSessionId": "cse_2",
+                               pin_proxy._CREATOR_PID_KEY: os.getpid()})
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert "cse_2" not in dead and "session_2" not in dead, dead
+
+    def case_torn_json_is_not_dead(self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        (home / "jobs" / "j3").mkdir(parents=True)
+        (home / "jobs" / "j3" / "state.json").write_text("{not json")
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert dead == set(), dead
+
+    def case_a_permission_error_on_kill_is_not_dead(self, tmp_path,
+                                                    monkeypatch):
+        """A reused pid now owned by someone else answers `os.kill` with
+        `PermissionError`, not `ProcessLookupError` -- ambiguous, and must
+        not be read as proof of death."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._job(home, "j4", {"bridgeSessionId": "cse_4",
+                               pin_proxy._CREATOR_PID_KEY: 424242})
+
+        def _kill(pid, sig):
+            if pid == 424242:
+                raise PermissionError()
+            raise ProcessLookupError()
+
+        monkeypatch.setattr(pin_proxy.os, "kill", _kill)
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert "cse_4" not in dead and "session_4" not in dead, dead
+
+    def case_a_recorded_creator_pid_with_process_lookup_error_is_dead(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._job(home, "j5", {"bridgeSessionId": "cse_5",
+                               pin_proxy._CREATOR_PID_KEY: 999999})
+
+        def _kill(pid, sig):
+            if pid == 999999:
+                raise ProcessLookupError()
+            raise AssertionError(f"unexpected os.kill({pid}, {sig})")
+
+        monkeypatch.setattr(pin_proxy.os, "kill", _kill)
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert {"cse_5", "session_5"} & dead, dead
+
+    def case_a_job_record_without_a_creator_pid_is_not_dead(self, tmp_path,
+                                                            monkeypatch):
+        """Never stamped (no live session named this job this call, or
+        ever) -- unknown, not dead."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._job(home, "j6", {"bridgeSessionId": "cse_6"})
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert "cse_6" not in dead and "session_6" not in dead, dead
+
 class TestTheSweepClosesADeadCreatorsTwin:
     """A twin THIS HOST minted, whose creating process has since died, is
     closed even while merely `disconnected` -- Claude Code may never get
@@ -16943,6 +17061,31 @@ class TestTheSweepClosesADeadCreatorsTwin:
         assert deleted == [], (
             f"closed a bridge with no local record naming it: {deleted}")
         assert closed == 0
+
+    def case_end_to_end_through_a_real_dead_creator_bridge_ids(
+            self, tmp_path, monkeypatch):
+        """The same shape as the first case, but `_dead_creator_bridge_ids`
+        runs FOR REAL against a fake `~/.claude/jobs/<j>/state.json` instead
+        of being stubbed out -- proves the sweep is wired to the real
+        function's return value, not just to a name that happens to match."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = tmp_path / "cfg"
+        (home / "jobs" / "jdead").mkdir(parents=True)
+        (home / "jobs" / "jdead" / "state.json").write_text(json.dumps({
+            "bridgeSessionId": "cse_dead_creator",
+            pin_proxy._CREATOR_PID_KEY: 999999,  # not a real pid on this box
+        }))
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
+                            lambda: home)
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_local_new"})
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == ["cse_dead_creator"], deleted
+        assert closed == 1
 
 
 #: THE LONGEST BYTE-FREE WAIT IN THE FLEET WATCHER'S CORPUS -- not the longest

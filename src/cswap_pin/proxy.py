@@ -3864,14 +3864,13 @@ def _live_session_ids() -> list[str]:
     return out
 
 
-def _live_job_ids() -> list[str]:
-    """Job ids of sessions with a LIVE process, from the registry.
+def _live_job_pids() -> dict[str, int]:
+    """Job id -> pid of the LIVE process that owns it, from the registry.
 
-    The opposite selection to `_carry_candidates`, which takes only sessions
-    with NO process. Both are needed: that one keeps an ended session's bridge
-    across a rotation, this one keeps a RUNNING session's reattach possible.
+    `_live_job_ids` is this with the pid dropped, kept for its own callers
+    that never needed it.
     """
-    out: list[str] = []
+    out: dict[str, int] = {}
     try:
         home = require("paths").get_claude_config_home()
         for path in (home / "sessions").glob("*.json"):
@@ -3885,10 +3884,20 @@ def _live_job_ids() -> list[str]:
                 os.kill(int(pid), 0)
             except Exception:  # noqa: BLE001 — gone, or not ours to signal
                 continue
-            out.append(str(job))
+            out[str(job)] = int(pid)
     except Exception:  # noqa: BLE001 — no host, nothing to enumerate
-        return []
+        return {}
     return out
+
+
+def _live_job_ids() -> list[str]:
+    """Job ids of sessions with a LIVE process, from the registry.
+
+    The opposite selection to `_carry_candidates`, which takes only sessions
+    with NO process. Both are needed: that one keeps an ended session's bridge
+    across a rotation, this one keeps a RUNNING session's reattach possible.
+    """
+    return list(_live_job_pids())
 
 
 def _carry_candidates() -> list[tuple[str, str | None]]:
@@ -4319,27 +4328,75 @@ def _live_bridge_ids() -> set[str]:
     return live
 
 
+#: OUR OWN FIELD, stamped into Claude Code's `jobs/<id>/state.json` next to
+#: `bridgeSessionId` -- nothing else in this codebase keeps a record mapping
+#: a bridge to its creating pid, so `_dead_creator_bridge_ids` has to make
+#: one before it can ever read one back.
+_CREATOR_PID_KEY = "cswapPinCreatorPid"
+
+
 def _dead_creator_bridge_ids() -> set[str]:
     """Bridge ids named in a job record THIS HOST wrote, whose creating
-    process is no longer alive here.
+    process is CONFIRMED gone -- POSITIVE evidence only.
 
-    POSITIVE evidence, not the "no live process holds it" a sleeping Mac's
-    bridge answers identically to (see the note on
-    `sweep_superseded_bridges`) -- a job directory this host wrote, naming a
-    bridge, whose job id `_live_job_ids` no longer counts as live.
+    `_live_job_ids` / `_live_bridge_ids` condemn by SUBTRACTION: a session
+    record that is merely absent, unparseable, or answers a signal with
+    anything other than "no such process" reads exactly like a dead one to
+    both -- fine as a NEGATIVE guard (never close something provably alive),
+    wrong as the sole gate on a DELETE, since one torn or GC'd record then
+    removes a bridge from protection and adds it to condemnation in the same
+    step. Measured: a missing session record, a torn one, and an EPERM from
+    `os.kill` were all indistinguishable from "the creator is dead" through
+    that path.
+
+    So this keeps its own record. STAMP FIRST, while a live job's pid is
+    still knowable -- there is no earlier record of it to read back, and
+    once the creator is gone this is the only chance there will ever be.
+    Every live job, every call: cheap (a handful of jobs at most), and
+    correctness needs the FIRST stamp landed before the process dies, not
+    the latest one.
+
+    Then READ: a bridge is dead only when its job's `state.json` carries
+    BOTH `bridgeSessionId` and a stamped pid, and signalling that exact pid
+    raises ``ProcessLookupError`` -- not merely "some" exception. No record,
+    an unreadable one, no stamped pid, or any other errno (most of all
+    ``PermissionError`` -- a reused pid now owned by someone else) all
+    resolve to KEEP, never to dead.
     """
     try:
         home = require("paths").get_claude_config_home()
     except Exception:  # noqa: BLE001 — no host, nothing to enumerate
         return set()
-    live_jobs = set(_live_job_ids())
+
+    for job, pid in _live_job_pids().items():
+        path = home / "jobs" / job / "state.json"
+        rec = _read_json(path)
+        if not isinstance(rec, dict) or not rec.get("bridgeSessionId"):
+            continue
+        if rec.get(_CREATOR_PID_KEY) == pid:
+            continue  # already agrees -- no write, no contention with CC
+        rec[_CREATOR_PID_KEY] = pid
+        tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps(rec), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass  # best-effort: the next live call tries again
+
     out: set[str] = set()
     for path in (home / "jobs").glob("*/state.json"):
-        if path.parent.name in live_jobs:
+        rec = _read_json(path)
+        if not isinstance(rec, dict):
             continue
-        bridge = (_read_json(path) or {}).get("bridgeSessionId")
-        if bridge:
+        bridge, pid = rec.get("bridgeSessionId"), rec.get(_CREATOR_PID_KEY)
+        if not bridge or not isinstance(pid, int):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
             out.update(_both_spellings(str(bridge)))
+        except Exception:  # noqa: BLE001 — unknown resolves to KEEP
+            continue
     return out
 
 
