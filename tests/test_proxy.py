@@ -19044,7 +19044,7 @@ class TestTheSpliceHoldsTheConfigLock:
                             lambda: home)
 
         job_dirs = ["j_dead", "j_live", "j_nostamp", "j_needstamp"]
-        before = {j: (home / "jobs" / j / "state.json").stat()
+        before = {j: (home / "jobs" / j / "state.json").read_bytes()
                   for j in job_dirs}
 
         now = _time.monotonic()
@@ -19059,10 +19059,8 @@ class TestTheSpliceHoldsTheConfigLock:
             "the verdict changed when the write pass was skipped")
 
         for j in job_dirs:
-            after = (home / "jobs" / j / "state.json").stat()
-            b = before[j]
-            assert (after.st_mtime_ns, after.st_size) == (
-                b.st_mtime_ns, b.st_size), (
+            after = (home / "jobs" / j / "state.json").read_bytes()
+            assert after == before[j], (
                 f"deaf_bridges wrote to {j}/state.json from the request "
                 "thread")
             tmps = list((home / "jobs" / j).glob(".state.json.cswap-*"))
