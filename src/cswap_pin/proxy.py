@@ -4319,6 +4319,30 @@ def _live_bridge_ids() -> set[str]:
     return live
 
 
+def _dead_creator_bridge_ids() -> set[str]:
+    """Bridge ids named in a job record THIS HOST wrote, whose creating
+    process is no longer alive here.
+
+    POSITIVE evidence, not the "no live process holds it" a sleeping Mac's
+    bridge answers identically to (see the note on
+    `sweep_superseded_bridges`) -- a job directory this host wrote, naming a
+    bridge, whose job id `_live_job_ids` no longer counts as live.
+    """
+    try:
+        home = require("paths").get_claude_config_home()
+    except Exception:  # noqa: BLE001 — no host, nothing to enumerate
+        return set()
+    live_jobs = set(_live_job_ids())
+    out: set[str] = set()
+    for path in (home / "jobs").glob("*/state.json"):
+        if path.parent.name in live_jobs:
+            continue
+        bridge = (_read_json(path) or {}).get("bridgeSessionId")
+        if bridge:
+            out.update(_both_spellings(str(bridge)))
+    return out
+
+
 def observed_bridge_owners() -> dict[str, str | None]:
     """``bridge id -> the organizationUuid its record says it belongs to``.
 
@@ -13993,8 +14017,13 @@ class PinProxy:
     def sweep_superseded_bridges(self, token: str) -> int:
         """Close bridges that a NEWER bridge of the same name has replaced.
 
-        FOUR CONDITIONS, ALL REQUIRED. Each alone closes something in use;
-        the measurement that ruled each one out is named with it.
+        A SECOND, NARROWER PATH accepts a merely ``disconnected`` twin too,
+        but only with positive local evidence THIS HOST minted it and its
+        creating process has died -- see the note where it branches, below.
+
+        FOUR CONDITIONS, ALL REQUIRED, for the path this docstring covers.
+        Each alone closes something in use; the measurement that ruled each
+        one out is named with it.
 
         1. ``connection_status == "connected"``. Only a connected bridge
            competes for a message; a disconnected one costs nothing and
@@ -14050,6 +14079,15 @@ class PinProxy:
         self._restore_bridge_titles(sessions, token)
 
         live = _live_bridge_ids()
+        # A SECOND, NARROWER ACCEPTING PATH, alongside the four conditions
+        # above: a twin still merely `disconnected` (Claude Code may never
+        # get around to archiving a session nobody is left to reconnect),
+        # closed ONLY with POSITIVE local evidence -- a job record THIS HOST
+        # wrote, naming this bridge, whose creating process has since died.
+        # "No process holds it" alone is never enough: another machine's
+        # sleeping bridge answers that identically, and the pin exists
+        # precisely so this host cannot see that machine's pids.
+        dead_creator = _dead_creator_bridge_ids()
         newest: dict[str, str] = {}
         for item in sessions:
             title = (item.get("title") or "").strip()
@@ -14063,22 +14101,34 @@ class PinProxy:
             sid, title = item.get("id"), (item.get("title") or "").strip()
             if not sid or not title or sid in live:
                 continue
-            if item.get("connection_status") != "connected":
-                continue
-            if item.get("status") != "archived":
-                continue
-            # A RUNNING WORKER IS A SESSION AT WORK, and the listing says so
-            # for every machine, which local pids cannot. Measured on a live
-            # roster: of three bridges passing all three conditions above, one
-            # was `running` and had no process here -- so the three conditions
-            # alone would close a bridge another machine was working on.
-            # A FOURTH NEGATIVE GUARD, in the same spirit as `sid in live`:
-            # `running` is evidence of life, `idle` is evidence of nothing (5
-            # of the 7 locally-live bridges were idle in that same sample), so
-            # only `running` may save a bridge and nothing here may condemn
-            # one. An age floor was the obvious alternative and does not work:
-            # the running bridge measured was 160 minutes old.
-            if str(item.get("worker_status") or "").lower() == "running":
+            if (item.get("connection_status") == "connected"
+                    and item.get("status") == "archived"):
+                # A RUNNING WORKER IS A SESSION AT WORK, and the listing says
+                # for every machine, which local pids cannot. Measured on a
+                # live roster: of three bridges passing all three conditions
+                # above, one was `running` and had no process here -- so the
+                # three conditions alone would close a bridge another machine
+                # was working on.
+                # A FOURTH NEGATIVE GUARD, in the same spirit as `sid in
+                # live`: `running` is evidence of life, `idle` is evidence of
+                # nothing (5 of the 7 locally-live bridges were idle in that
+                # same sample), so only `running` may save a bridge and
+                # nothing here may condemn one. An age floor was the obvious
+                # alternative and does not work: the running bridge measured
+                # was 160 minutes old.
+                if str(item.get("worker_status") or "").lower() == "running":
+                    continue
+            elif (item.get("status") == "active"
+                    and item.get("connection_status") == "disconnected"
+                    and sid in dead_creator):
+                # THE DEAD-CREATOR PATH. Archived is deliberately excluded --
+                # that is the owner's claude.ai history, kept on purpose,
+                # whatever a local record says -- and `worker_status` is
+                # ignored: a disconnected bridge whose creator is dead here
+                # carries a stale flag, and only the dead-creator record may
+                # speak for it.
+                pass
+            else:
                 continue
             if (item.get("last_event_at") or "") >= newest[title]:
                 continue  # the newest of its name — someone put this away
