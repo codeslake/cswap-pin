@@ -10102,6 +10102,7 @@ class TestFailOpenIsNotSilent:
 
         monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.3)
         provider, event = self._cold_wedged_provider(certdir)
+        holder = None
         try:
             assert pp._mint_lock_busy(provider) is None, (
                 "the lock reads busy before anything has tried to mint")
@@ -10125,7 +10126,8 @@ class TestFailOpenIsNotSilent:
             assert provider.mint_stalled() is True
         finally:
             event.set()
-            holder.join(timeout=2.0)
+            if holder is not None:
+                holder.join(timeout=2.0)
 
     def case_health_and_a_pinned_request_survive_a_cold_wedged_store(
             self, certdir, monkeypatch):

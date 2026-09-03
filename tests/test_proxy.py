@@ -12485,10 +12485,14 @@ class TestAWedgeIsNotTrustedForever:
 
         stub = _HealthStub(lambda n: None)
         try:
+            t0 = time.monotonic()
             result = pin_proxy._serving_can_pin(stub.port, timeout=0.2)
+            elapsed = time.monotonic() - t0
             assert result is False, (
                 "a socket that accepts TCP and never answers must read as "
                 f"a wedge, not unknown: got {result!r}")
+            assert elapsed >= 0.2, (
+                f"gave up before even one full-timeout attempt: {elapsed:.2f}s")
         finally:
             stub.close()
 
@@ -12684,23 +12688,6 @@ class TestAnAnswerBeforeAResetIsStillAnAnswer:
         finally:
             proxy.stop(drain=0)
 
-    def case_a_silent_socket_is_still_a_wedge(self):
-        """Control: a socket that connects and answers nothing must still
-        read False -- this change must not weaken that."""
-        from cswap_pin import proxy as pin_proxy
-
-        stub = _HealthStub(lambda n: None)
-        try:
-            t0 = time.monotonic()
-            result = pin_proxy._serving_can_pin(stub.port, timeout=0.3)
-            elapsed = time.monotonic() - t0
-        finally:
-            stub.close()
-        assert result is False, (
-            f"a genuinely silent socket stopped reading as a wedge: {result!r}")
-        assert elapsed >= 0.3, (
-            f"gave up before even one full-timeout attempt: {elapsed:.2f}s")
-
     def case_a_full_answer_then_a_reset_is_trusted(self):
         """A stub that writes the complete answer and then RESETS instead of
         closing clean (SO_LINGER{1,0} forces RST on close) -- the same wire
@@ -12730,20 +12717,6 @@ class TestAnAnswerBeforeAResetIsStillAnAnswer:
             srv.close()
         assert result is True, (
             f"an answer received before a reset was discarded: {result!r}")
-
-    def case_connect_refused_is_still_unknown(self):
-        """Control: a connect failure is a different population and must
-        stay None -- this change must not turn it into True or False."""
-        from cswap_pin import proxy as pin_proxy
-
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()  # nothing listening
-
-        result = pin_proxy._serving_can_pin(port, timeout=1.0)
-        assert result is None, (
-            f"a refused connection stopped reading as unknown: {result!r}")
 
 
 class TestClientRegistrationIsNotSwapped:

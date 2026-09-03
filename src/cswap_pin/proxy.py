@@ -5183,7 +5183,7 @@ def last_arm_cutoff() -> int | None:
 # (`oauth.try_refresh_oauth_credentials`'s default `timeout_s=10.0`) --
 # 5+10+10+5+10 = 40s worst case. Set above that, or a healthy refresh that
 # is merely slow and contended gets cut off as if it were stalled.
-_MINT_LOCK_BOUND_S = 45.0
+_MINT_LOCK_BOUND_S = 40.0
 
 
 def make_pin_token_provider(switcher, account_num: str, email: str):
