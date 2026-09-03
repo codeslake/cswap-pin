@@ -1719,6 +1719,7 @@ class TestLiveRemoteControlSessions:
         # Beside `_stop` for the same reason: `__init__` is bypassed, so the
         # loop's own wait needs naming here too.
         daemon._sweep_wake = threading.Event()
+        daemon._trace_tick_stop = threading.Event()
         daemon._accept_loop = lambda: None
         ticks: list[int] = []
         daemon.sweep_titles_once = lambda: ticks.append("titles")
@@ -1769,6 +1770,7 @@ class TestLiveRemoteControlSessions:
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._stop = False
         daemon._sweep_wake = threading.Event()
+        daemon._trace_tick_stop = threading.Event()
         daemon._accept_loop = lambda: None
         ticks: list[str] = []
         daemon.sweep_titles_once = lambda: ticks.append("titles")
@@ -1812,6 +1814,7 @@ class TestLiveRemoteControlSessions:
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._stop = False
         daemon._sweep_wake = threading.Event()
+        daemon._trace_tick_stop = threading.Event()
         daemon._accept_loop = lambda: None
         parked = threading.Event()
         daemon._trace_tick = lambda: parked.wait()

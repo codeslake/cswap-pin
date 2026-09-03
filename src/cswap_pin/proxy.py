@@ -5264,7 +5264,7 @@ def last_arm_cutoff() -> int | None:
 # (`oauth.try_refresh_oauth_credentials`'s default `timeout_s=10.0`) --
 # 5+10+10+5+10 = 40s worst case. Set above that, or a healthy refresh that
 # is merely slow and contended gets cut off as if it were stalled.
-_MINT_LOCK_BOUND_S = 40.0
+_MINT_LOCK_BOUND_S = 45.0
 
 
 def make_pin_token_provider(switcher, account_num: str, email: str):
@@ -11394,6 +11394,9 @@ class PinProxy:
         # Wakes the title sweep out of its wait so a join costs nothing. Here
         # rather than in `start()`: a caller can drive the loop without it.
         self._sweep_wake = threading.Event()
+        # Ends `_trace_tick_loop` -- set only at the end of `stop()`, never by
+        # `release_listener`'s `_stop`. See the note where the thread starts.
+        self._trace_tick_stop = threading.Event()
         # True when a supervisor handed us the listening socket. Then the port
         # is not ours to close — see start() and stop().
         self._inherited = False
@@ -11547,11 +11550,11 @@ class PinProxy:
         # as long as it parked -- and `release_listener` setting `_stop`
         # ended the tick at a handover, right when a draining process is
         # still relaying the connections it holds and still writing to the
-        # trace. Gated on its OWN event, set only at the end of `stop()`
-        # (after the drain), so the tick outlives `_stop` but not the
-        # process -- a `stop()` that never runs used to leak this thread
-        # forever, one per proxy the suite ever started.
-        self._trace_tick_stop = threading.Event()
+        # trace. Gated on its OWN event (`_trace_tick_stop`, created in
+        # `__init__`), set only at the end of `stop()` (after the drain), so
+        # the tick outlives `_stop` but not the process -- a `stop()` that
+        # never runs used to leak this thread forever, one per proxy the
+        # suite ever started.
         self._trace_tick_thread = threading.Thread(
             target=self._trace_tick_loop, daemon=True)
         self._trace_tick_thread.start()
@@ -13124,9 +13127,7 @@ class PinProxy:
         # end the tick (see the note where `_trace_tick_loop` starts): a
         # draining process still relays what it holds and still writes to
         # the trace through the whole wait this method just did.
-        tick_stop = getattr(self, "_trace_tick_stop", None)
-        if tick_stop is not None:
-            tick_stop.set()
+        self._trace_tick_stop.set()
         return cut
 
     def _close_open_connections(self) -> None:
