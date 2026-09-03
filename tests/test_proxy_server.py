@@ -10352,6 +10352,69 @@ class TestFailOpenIsNotSilent:
             event.set()
             holder.join(timeout=2.0)
 
+    def case_a_refresh_updates_the_cache_can_pin_stays_true(self, certdir):
+        """`provider()` wrote the pre-refresh (expired) credential into
+        `_cred_cache` and never wrote the rotated one back, so
+        `can_pin_cached()` -- and therefore `/health`'s `can_pin` -- kept
+        reading a permanently-expired cache after every successful mint.
+        Drives a REAL refresh through a switcher whose gate persists the
+        rotated credential the way the host's does, then checks the CACHED
+        read, not `provider()` again -- `can_pin_cached()` must never touch
+        the store."""
+        import json as _json
+        import socket as _s
+
+        from claude_swap.oauth import RefreshOutcome
+        from cswap_pin import proxy as pp
+
+        expired = _json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt"}})
+        rotated = _json.dumps({"claudeAiOauth": {
+            "accessToken": "new", "expiresAt": 4102444800000,
+            "refreshToken": "rt2"}})
+
+        class _Switcher:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return expired
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+            def consume_backup_grant(self, n, e, snap):
+                # The gate persists internally, the way the host's does; the
+                # mock only has to hand back what it rotated to.
+                return RefreshOutcome(rotated, None)
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Switcher(), "2",
+                                              "pin@example.com")
+
+        assert provider() == "new", "the refresh did not hand back the rotated token"
+        assert provider.can_pin_cached() is True, (
+            "the cache still held the expired blob after a successful refresh")
+
+        p = self._proxy(certdir, provider)
+        p.start()
+        try:
+            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+            c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(4096)
+                if not d:
+                    break
+                buf += d
+            body = buf.partition(b"\r\n\r\n")[2]
+            while not body.endswith(b"}"):
+                d = c.recv(4096)
+                if not d:
+                    break
+                body += d
+            c.close()
+            doc = _json.loads(body)
+            assert doc["can_pin"] is True, doc
+            assert doc["mint_stalled"] is False, doc
+        finally:
+            p.stop()
+
 
 class TestTheRequestPathNeverOpensTheTraceFile:
     """The shared trace handle used to be opened FROM the request thread.

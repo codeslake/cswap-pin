@@ -5479,6 +5479,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # Say that rather than nothing.
                 provider.blind_reason = (
                     f"no token after refresh for slot {num} ({mail})")
+            if rotated:
+                # HELD COPY, SAME AS THE COLD-READ WRITE ABOVE. `_cred_cache`
+                # was left holding the pre-refresh (expired) blob after a
+                # successful refresh -- `can_pin_cached()`, and therefore
+                # `/health`'s `can_pin`, kept reading a permanently-expired
+                # cache after every rotation, until the NEXT credential read
+                # happened to run.
+                _cred_cache[ckey] = rotated
             # The gate persists internally (under the slot lock, CAS on the
             # refresh-token fingerprint). Persisting again here would write
             # back OUTSIDE that lock and could clobber a racing writer's
