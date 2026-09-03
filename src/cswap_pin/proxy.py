@@ -4335,7 +4335,7 @@ def _live_bridge_ids() -> set[str]:
 _CREATOR_PID_KEY = "cswapPinCreatorPid"
 
 
-def _dead_creator_bridge_ids() -> set[str]:
+def _dead_creator_bridge_ids(stamp: bool = True) -> set[str]:
     """Bridge ids named in a job record THIS HOST wrote, whose creating
     process is CONFIRMED gone -- POSITIVE evidence only.
 
@@ -4362,36 +4362,44 @@ def _dead_creator_bridge_ids() -> set[str]:
     an unreadable one, no stamped pid, or any other errno (most of all
     ``PermissionError`` -- a reused pid now owned by someone else) all
     resolve to KEEP, never to dead.
+
+    ``stamp=False`` skips the write pass (and `_live_job_pids()` with it) and
+    reads only what is already on disk -- for a caller on the request thread,
+    where N unserialized callers sharing the sweep's one tmp filename would
+    tear a live job's `state.json`. The sweep (its own thread, serialized by
+    `_sweep_lock`) still stamps; a request-thread read of a not-yet-stamped
+    record just resolves to KEEP until the sweep gets to it.
     """
     try:
         home = require("paths").get_claude_config_home()
     except Exception:  # noqa: BLE001 — no host, nothing to enumerate
         return set()
 
-    for job, pid in _live_job_pids().items():
-        path = home / "jobs" / job / "state.json"
-        rec = _read_json(path)
-        if not isinstance(rec, dict) or not rec.get("bridgeSessionId"):
-            continue
-        if rec.get(_CREATOR_PID_KEY) == pid:
-            continue  # already agrees -- no write, no contention with CC
-        rec[_CREATOR_PID_KEY] = pid
-        tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
-        try:
-            # 0600 AT CREATION, not after -- see `_carry_job_record`'s own
-            # note on this exact pattern. `write_text` makes the file 0644
-            # under the usual umask and widens a file CC itself writes 0600
-            # (bridgeOwnerAccountUuid, resumeSessionId, the session output
-            # tail all live in it).
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(rec, fh)
-            tmp.replace(path)
-        except OSError:
+    if stamp:
+        for job, pid in _live_job_pids().items():
+            path = home / "jobs" / job / "state.json"
+            rec = _read_json(path)
+            if not isinstance(rec, dict) or not rec.get("bridgeSessionId"):
+                continue
+            if rec.get(_CREATOR_PID_KEY) == pid:
+                continue  # already agrees -- no write, no contention with CC
+            rec[_CREATOR_PID_KEY] = pid
+            tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
             try:
-                tmp.unlink(missing_ok=True)
+                # 0600 AT CREATION, not after -- see `_carry_job_record`'s own
+                # note on this exact pattern. `write_text` makes the file 0644
+                # under the usual umask and widens a file CC itself writes 0600
+                # (bridgeOwnerAccountUuid, resumeSessionId, the session output
+                # tail all live in it).
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh)
+                tmp.replace(path)
             except OSError:
-                pass  # a temp we cannot remove must not abort the whole sweep
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass  # a temp we cannot remove must not abort the whole sweep
 
     out: set[str] = set()
     for path in (home / "jobs").glob("*/state.json"):
@@ -12594,8 +12602,11 @@ class PinProxy:
         # creating process is confirmed gone, so no stream is ever coming;
         # `_dead_creator_bridge_ids` already has the positive proof, and
         # without this a session that exited stays "deaf" until the next
-        # listing pass drops it from `_connected_bridges`.
-        holding |= _dead_creator_bridge_ids()
+        # listing pass drops it from `_connected_bridges`. READ-ONLY here:
+        # this runs on the request thread, where N unserialized callers
+        # would share the sweep's one tmp filename. The sweep (its own
+        # thread) still stamps.
+        holding |= _dead_creator_bridge_ids(stamp=False)
         out = [bid for bid, last in posts.items()
                if stamp - last <= window and bid not in holding]
         # A BRIDGE THAT HAS JUST REGISTERED IS NOT YET DEAF. Its stream GET

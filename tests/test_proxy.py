@@ -18937,6 +18937,82 @@ class TestTheSpliceHoldsTheConfigLock:
             "an exited session's shutdown flush was reported deaf, or a "
             "real one was hidden with it")
 
+    def case_deaf_bridges_never_stamps_from_the_request_thread(
+            self, tmp_path, monkeypatch):
+        """`deaf_bridges` runs on the request thread (`_report_deaf_bridges`
+        at every sweep-worthy request), where N unserialized callers sharing
+        the sweep's one tmp filename per process would tear a live job's
+        `state.json`. It must take `_dead_creator_bridge_ids`'s read-only
+        path (`stamp=False`) and never touch disk -- even when a live job's
+        record still needs its very first stamp."""
+        import subprocess
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        dead_pid = proc.pid
+
+        home = tmp_path / "cfg"
+        (home / "jobs" / "j_dead").mkdir(parents=True)
+        (home / "jobs" / "j_live").mkdir(parents=True)
+        (home / "jobs" / "j_nostamp").mkdir(parents=True)
+        (home / "jobs" / "j_needstamp").mkdir(parents=True)
+        (home / "sessions").mkdir()
+        (home / "jobs" / "j_dead" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_DEAD",
+             pin_proxy._CREATOR_PID_KEY: dead_pid}))
+        (home / "jobs" / "j_live" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_LIVE",
+             pin_proxy._CREATOR_PID_KEY: os.getpid()}))
+        (home / "jobs" / "j_nostamp" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_NOSTAMP"}))
+        # NEEDS a stamp: its creator pid is live (a registry record names
+        # it below) but the record has no `cswapPinCreatorPid` yet -- the
+        # exact case the write pass exists for.
+        (home / "jobs" / "j_needstamp" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_NEEDSTAMP"}))
+        (home / "sessions" / "s1.json").write_text(json.dumps(
+            {"pid": os.getpid(), "jobId": "j_needstamp"}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
+                            lambda: home)
+
+        job_dirs = ["j_dead", "j_live", "j_nostamp", "j_needstamp"]
+        before = {j: (home / "jobs" / j / "state.json").stat()
+                  for j in job_dirs}
+
+        now = _time.monotonic()
+        me = _t.SimpleNamespace(
+            _bridge_posts={"cse_DEAD": now, "cse_LIVE": now,
+                          "cse_NOSTAMP": now, "cse_NEEDSTAMP": now},
+            held_bridge_ids=lambda: set(),
+            _connected_bridges={"cse_DEAD", "cse_LIVE", "cse_NOSTAMP",
+                                 "cse_NEEDSTAMP"})
+        assert pin_proxy.PinProxy.deaf_bridges(me, now=now) == [
+            "cse_LIVE", "cse_NEEDSTAMP", "cse_NOSTAMP"], (
+            "the verdict changed when the write pass was skipped")
+
+        for j in job_dirs:
+            after = (home / "jobs" / j / "state.json").stat()
+            b = before[j]
+            assert (after.st_mtime_ns, after.st_size) == (
+                b.st_mtime_ns, b.st_size), (
+                f"deaf_bridges wrote to {j}/state.json from the request "
+                "thread")
+            tmps = list((home / "jobs" / j).glob(".state.json.cswap-*"))
+            assert tmps == [], f"a stamp tmp file was left in {j}: {tmps}"
+
+        # CONTROL: the stamping path (the sweep's, at its default) DOES
+        # stamp the needy record on the same state.
+        pin_proxy._dead_creator_bridge_ids()
+        stamped = json.loads(
+            (home / "jobs" / "j_needstamp" / "state.json").read_text())
+        assert stamped.get(pin_proxy._CREATOR_PID_KEY) == os.getpid(), (
+            "the stamping path did not stamp a record that needed it")
+
     def case_the_carry_keeps_a_field_it_does_not_know(self, tmp_path, monkeypatch):
         """`bridgeSessionGroupingId` travels with the record whatever the pin
         does to the owner fields: the carry re-reads and rewrites the whole
