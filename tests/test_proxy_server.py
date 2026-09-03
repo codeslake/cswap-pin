@@ -9789,6 +9789,129 @@ class TestFailOpenIsNotSilent:
         finally:
             p.stop()
 
+    def _stalled_provider(self, certdir):
+        """A REAL provider whose `refresh_lock` is held forever by a helper
+        thread stuck exactly the way a stalled Keychain read is: never
+        raises, never returns, and unkillable from here (measured: `security
+        find-generic-password -w` still hung after 2d19h). The caller must
+        `event.set()` in a `finally` so the thread does not outlive the test.
+        """
+        import json as _json
+        import threading
+
+        from cswap_pin import proxy as pp
+
+        expired = _json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt"}})
+
+        class _Stuck:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return expired
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Stuck(), "2", "pin@example.com")
+        event = threading.Event()
+
+        def _hold():
+            with provider.refresh_lock:
+                event.wait()  # never set within the test: stuck forever
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        while not provider.refresh_lock.locked():
+            import time as _time
+            _time.sleep(0.001)
+        return provider, event
+
+    def case_health_never_waits_on_a_stalled_mint(self, certdir):
+        """/health must answer well inside a 5s probe even when the mint's
+        refresh lock is genuinely stuck, and say so rather than reading as a
+        dead daemon -- see `_mint_lock_busy`."""
+        import json as _json
+        import socket as _s
+        import time as _time
+
+        provider, event = self._stalled_provider(certdir)
+        try:
+            p = self._proxy(certdir, provider)
+            p.start()
+            try:
+                c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+                c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                started = _time.monotonic()
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+                body = buf.partition(b"\r\n\r\n")[2]
+                while not body.endswith(b"}"):
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    body += d
+                elapsed = _time.monotonic() - started
+                c.close()
+                assert elapsed < 1.0, (
+                    f"/health waited {elapsed:.2f}s on a stalled mint")
+                doc = _json.loads(body)
+                assert doc["mint_stalled"] is True, doc
+                assert doc["can_pin"] is True, (
+                    "busy is unknown, not a failure — reporting it broken "
+                    "is the false alarm `can_pin` exists to avoid")
+            finally:
+                p.stop()
+        finally:
+            event.set()
+
+    def case_a_pinned_request_fails_fast_on_a_stalled_mint(self, certdir,
+                                                            monkeypatch):
+        """A pinned route must not queue behind a refresh lock a stalled
+        credential store may never release. Measured: 104 requests held
+        'before headers' with a live socket answering nobody."""
+        import time as _time
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.1)
+        provider, event = self._stalled_provider(certdir)
+        try:
+            proxy = pp.PinProxy(certdir=certdir, pin_token_provider=provider,
+                                upstream=("127.0.0.1", 1))
+
+            class _FakeTLS:
+                def __init__(self):
+                    self._in = (
+                        b"POST /v1/code/sessions HTTP/1.1\r\n"
+                        b"Host: api.anthropic.com\r\n"
+                        b"Authorization: Bearer disk-bearer\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
+                    self.sent = b""
+
+                def recv(self, n):
+                    out, self._in = self._in[:n], self._in[n:]
+                    return out
+
+                def sendall(self, b):
+                    self.sent += b
+
+                def close(self):
+                    pass
+
+            tls = _FakeTLS()
+            started = _time.monotonic()
+            proxy._handle_one_request(tls)
+            elapsed = _time.monotonic() - started
+            assert elapsed < 1.0, (
+                f"the pinned request waited {elapsed:.2f}s on a stalled mint")
+            assert tls.sent.startswith(b"HTTP/1.1 503"), tls.sent
+        finally:
+            event.set()
+
 
 class TestProxyRequiresACredential:
     """The daemon listens on unauthenticated loopback and swaps the bearer of

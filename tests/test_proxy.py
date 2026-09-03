@@ -18758,6 +18758,55 @@ class TestABlindDaemonRepairsItself:
         signalled, exited = self._drive(monkeypatch, tmp_path, None)
         assert signalled == [] and exited == []
 
+    def test_a_daemon_with_a_stalled_mint_is_not_recycled(self, monkeypatch,
+                                                           tmp_path):
+        """A stalled refresh lock is not a verdict either way, and recycling
+        here hands a successor the exact same stuck credential store
+        (measured: a Keychain read still hung after 2d19h) -- the loop that
+        recycled a daemon every few minutes while nothing it tried could
+        help. THE CONTROL is `test_a_daemon_that_cannot_mint_replaces_itself`
+        above: only a CONFIRMED failure to mint may still trigger a replace.
+        """
+        import json
+        import threading
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        expired = json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt"}})
+
+        class _Stuck:
+            backup_dir = tmp_path
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return expired
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org")
+        provider = pin_proxy.make_pin_token_provider(
+            _Stuck(), "2", "pin@example.com")
+        event = threading.Event()
+
+        def _hold():
+            with provider.refresh_lock:
+                event.wait()  # never set within the test: stuck forever
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        while not provider.refresh_lock.locked():
+            time.sleep(0.001)
+
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        try:
+            signalled, exited = self._drive(monkeypatch, tmp_path, provider)
+        finally:
+            event.set()
+        assert signalled == [] and exited == [], (
+            "a daemon was recycled over a stalled lock, not a confirmed "
+            f"mint failure; signals seen: {signalled}, exits: {exited}")
+        assert any("refresh lock has been held" in m for m in said), said
+
     # -- the backoff -------------------------------------------------------
 
     def test_the_first_repair_is_immediate(self, tmp_path):
