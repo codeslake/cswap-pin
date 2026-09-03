@@ -5174,12 +5174,16 @@ def last_arm_cutoff() -> int | None:
 
 
 # HOW LONG A PINNED REQUEST WAITS ON `refresh_lock` BEFORE GIVING UP. The
-# normal cost inside that lock is one Keychain re-read (macos_keychain's own
-# `get_password` bounds that subprocess to 5s) plus, when the token is
-# expired, one refresh POST (`oauth.try_refresh_oauth_credentials`'s default
-# `timeout_s=10.0`) -- 15s worst case. Set above that, or a healthy refresh
-# that is merely slow gets cut off as if it were stalled.
-_MINT_LOCK_BOUND_S = 16.0
+# work inside that lock is the HOST's, not this module's, and a contended
+# refresh pays for all of it: a cold Keychain read (macos_keychain's own
+# `get_password` bounds that subprocess to 5s), then -- should the held
+# token be expired -- `consume_backup_grant`'s own `.consume-<n>.lock` wait
+# (`FileLock`'s default `timeout=10.0`), the switcher's `self.lock_file`
+# wait (another 10s), a Keychain RE-read (5s again) and the refresh POST
+# (`oauth.try_refresh_oauth_credentials`'s default `timeout_s=10.0`) --
+# 5+10+10+5+10 = 40s worst case. Set above that, or a healthy refresh that
+# is merely slow and contended gets cut off as if it were stalled.
+_MINT_LOCK_BOUND_S = 40.0
 
 
 def make_pin_token_provider(switcher, account_num: str, email: str):
@@ -5228,17 +5232,20 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # merely slow one, on the one probe that must never wait behind either.
     # Attached to `provider` below, once it exists.
 
-    # A STALL, not a verdict -- set atomically like `_deferred` (a same-
-    # process race between two callers' resets is the accepted looseness that
-    # attribute already lives with; see its own comment).
-    _stalled: set = set()
+    # PER-CALLING-THREAD, not a shared flag. Each request runs on its own
+    # thread, and a bare module-level flag was cleared on entry by whoever
+    # called `provider()` NEXT and read by whichever thread asked -- so one
+    # thread's genuine stall could read as cleared (a wrong fail-open) or an
+    # unrelated thread's stall could read as this one's own (a wrong 503).
+    _stalled = threading.local()
 
     def mint_stalled() -> bool:
-        """True when the LAST call returned None only because it could not
-        take `refresh_lock` within `_MINT_LOCK_BOUND_S`, not because minting
-        genuinely failed. The request path uses this to answer 503 instead of
-        going out unpinned -- see `_refuse_stalled_mint`."""
-        return 1 in _stalled
+        """True when THIS THREAD's last call returned None only because it
+        could not take `refresh_lock` within `_MINT_LOCK_BOUND_S`, not
+        because minting genuinely failed. The request path uses this to
+        answer 503 instead of going out unpinned -- see
+        `_refuse_stalled_mint`."""
+        return getattr(_stalled, "flag", False)
 
     def _consume(creds: str, num: str, mail: str) -> "oauth.RefreshOutcome":
         """Refresh through the host's interprocess gate, direct POST as
@@ -5363,7 +5370,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
 
     def provider() -> str | None:
         _deferred.discard(1)
-        _stalled.discard(1)
+        _stalled.flag = False
         target = _current_target()
         if target is None:
             return None
@@ -5401,23 +5408,20 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # store before deciding. That re-read predates this cache.
         cached = _cred_cache.get(ckey)
         if cached is not None:
+            provider.blind_reason = ""
+            token = _live_token(cached)
+            if token:
+                return token  # common path: no lock, no network
             creds = cached
         else:
-            creds = switcher.read_account_credentials(num, mail)
-            if creds:
-                _cred_cache[ckey] = creds
-        if not creds:
-            # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An empty
-            # read and a read of the WRONG slot are indistinguishable from the
-            # warning alone, and hours went into a machine where the second was
-            # never excluded. The provider is the only place that knows what it
-            # asked for.
-            provider.blind_reason = f"no credential for slot {num} ({mail})"
-            return None
-        provider.blind_reason = ""
-        token = _live_token(creds)
-        if token:
-            return token  # common path: no lock, no network
+            # COLD -- the very first read for this key, which is EVERY key on
+            # a fresh daemon (`_cred_cache` starts empty every start). This
+            # used to run right here, outside `refresh_lock` and unbounded:
+            # the same store the refresh below already treats as capable of
+            # wedging forever, invisible to `_mint_lock_busy` and therefore to
+            # `/health` and the self-heal watchdog. It goes under the same
+            # bounded lock the refresh uses, below.
+            creds = None
 
         # BOUNDED, not `with refresh_lock:`. The critical section below can
         # call into the host's Keychain read and a network refresh, and a
@@ -5427,7 +5431,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # that call. Everyone else must not queue behind it: they fail this
         # one request instead. See `_MINT_LOCK_BOUND_S`.
         if not refresh_lock.acquire(timeout=_MINT_LOCK_BOUND_S):
-            _stalled.add(1)
+            _stalled.flag = True
             provider.blind_reason = (
                 f"mint stalled: the refresh lock has been held over "
                 f"{_MINT_LOCK_BOUND_S:.0f}s for slot {num} ({mail}) -- a "
@@ -5435,8 +5439,19 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return None
         provider._lock_acquired_at = time.monotonic()
         try:
-            # Someone may have rotated it while we waited — re-read and reuse.
+            # Someone may have rotated it while we waited, or this is the
+            # cold-cache case above and this IS the first read — either way
+            # the read happens here, under the lock.
             creds = switcher.read_account_credentials(num, mail) or creds
+            if not creds:
+                # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
+                # empty read and a read of the WRONG slot are indistinguishable
+                # from the warning alone, and hours went into a machine where
+                # the second was never excluded. The provider is the only
+                # place that knows what it asked for.
+                provider.blind_reason = f"no credential for slot {num} ({mail})"
+                return None
+            provider.blind_reason = ""
             # REPLACE THE HELD COPY, or the cache keeps handing back the
             # expired blob and every later request re-enters this lock.
             _cred_cache[ckey] = creds
@@ -5509,9 +5524,31 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return True  # pin cleared: leaving every bearer alone IS the job
         return _pin_is_the_live_login(target[0])
 
+    def can_pin_cached() -> bool:
+        """Whether the pin can apply RIGHT NOW using only what is already in
+        hand -- no store read, no lock, no network. This is what `/health`
+        asks: the store read `provider()` may need to answer for real is
+        exactly the call that can wedge (see `_MINT_LOCK_BOUND_S`), and
+        `/health` must never make it -- see `_can_pin_from_cache`.
+
+        True on a no-op pin (nothing to swap) or a cached, still-live token.
+        False otherwise: a cold or expired cache, which used to be resolved
+        by calling `provider()` from the health thread itself. The daemon-
+        start warm (`_warm_mint_cache`) is what keeps this True on a healthy
+        daemon before the first real request arrives.
+        """
+        if pin_is_noop():
+            return True
+        target = _current_target()
+        if target is None:
+            return True
+        cached = _cred_cache.get(target)
+        return bool(cached and _live_token(cached))
+
     provider.pin_is_noop = pin_is_noop
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
+    provider.can_pin_cached = can_pin_cached
     provider._lock_acquired_at = None
     return provider
 
@@ -5540,10 +5577,8 @@ def _mint_lock_busy(provider) -> "float | None":
 def _can_mint(provider) -> "bool | None":
     """Whether the pinned token can be minted RIGHT NOW, or None if unaskable.
 
-    The one reader of that fact. `/health` answers from it and so does the
-    self-heal watchdog, because two copies of this expression drift the day one
-    of them is corrected — and they would then disagree about whether a daemon
-    is applying the pin, which is the whole question.
+    The self-heal watchdog's reader of that fact (`/health` reads
+    `_can_pin_from_cache` instead — see there for why).
 
     None means there is nothing to ask: no provider at all (a stand-in server
     in a test), or its refresh lock is held RIGHT NOW (`_mint_lock_busy`) — a
@@ -5560,6 +5595,24 @@ def _can_mint(provider) -> "bool | None":
         return bool(provider()) or _pin_is_noop(provider)
     except Exception:  # noqa: BLE001 — a health question is never fatal
         return False
+
+
+def _can_pin_from_cache(provider) -> bool:
+    """`/health`'s reading of whether the pin can apply, without ever calling
+    `provider()` -- the call that can wedge on a stalled credential store,
+    on the ONE probe every monitor, `cswap pin --heal` and the installer's
+    activation check use for liveness (see `_MINT_LOCK_BOUND_S`).
+
+    Uses the provider's own cached-state reading (`can_pin_cached`) when it
+    has one -- every provider `make_pin_token_provider` builds does. Falls
+    back to `_can_mint` for anything else: a bare test double with no cache
+    of its own, which carries no store access to wedge on in the first
+    place.
+    """
+    cached = getattr(provider, "can_pin_cached", None)
+    if cached is not None:
+        return cached()
+    return _can_mint(provider) is not False
 
 
 _last_mint_busy_log: dict = {"at": None}
@@ -11399,6 +11452,18 @@ class PinProxy:
         self._title_thread = threading.Thread(
             target=self._title_sweep_loop, daemon=True)
         self._title_thread.start()
+        # OWN THREAD, NOT `_stop`-GATED. `_trace_tick` used to run off
+        # `_title_sweep_loop`'s beat, so a parking tick (a stalled trace-file
+        # open) froze that thread's OTHER job, `_carry_on_login_change`, for
+        # as long as it parked -- and `release_listener` setting `_stop`
+        # ended the tick at a handover, right when a draining process is
+        # still relaying the connections it holds and still writing to the
+        # trace. Ends only when the process does, like `_watch_own_code`'s
+        # watchdog thread.
+        threading.Thread(target=self._trace_tick_loop, daemon=True).start()
+        _provider = getattr(self, "_pin_token_provider", None)
+        if getattr(_provider, "can_pin_cached", None) is not None:
+            threading.Thread(target=self._warm_mint_cache, daemon=True).start()
 
     #: How often the daemon re-checks cloud titles. The same cadence the
     #: auto-switch engine used, kept so the API cost is unchanged — this moves
@@ -11453,15 +11518,6 @@ class PinProxy:
                 # a second on the handover path for nothing.
                 self._sweep_wake.wait(0.5)
                 waited += 0.5
-                # OFF THE DRAINING GUARD, DELIBERATELY. A draining process
-                # still relays the connections it holds (see `_release`), and
-                # those still write to the trace; skipping this tick with them
-                # would mean the trace goes silent for a daemon's whole
-                # shutdown.
-                try:
-                    self._trace_tick()
-                except Exception:  # noqa: BLE001 — never take the sweep down
-                    pass
                 if this_process_is_draining():
                     continue
                 # THE LOGIN CAN MOVE INSIDE THE BEAT. Claude Code watches
@@ -11532,6 +11588,34 @@ class PinProxy:
             # session, and the pin does not decide when one restarts. The cause
             # is a policy answer fetched while the pin was not in that
             # session's path, and that is where it is fixed.
+
+    def _trace_tick_loop(self) -> None:
+        """Run `_trace_tick` on its own 0.5s beat, for the life of the
+        process -- see the note where this thread is started."""
+        while True:
+            try:
+                self._trace_tick()
+            except Exception:  # noqa: BLE001 — never take this thread down
+                pass
+            time.sleep(0.5)
+
+    def _warm_mint_cache(self) -> None:
+        """Populate the mint cache ONCE, off the request path and off
+        `/health` -- see the note where this thread is started.
+
+        `/health` now reads `can_pin` only from what is already cached
+        (`_can_pin_from_cache`), so without this a healthy daemon reports
+        it False until its first real pinned request warms the cache
+        itself. ONE call, no retry: a stalled store shows up as
+        `mint_stalled` on the very next `/health` peek (the read runs under
+        `refresh_lock`, see `_MINT_LOCK_BOUND_S`), and a failed or slow warm
+        just leaves the cache cold for the first real request to pay for
+        instead.
+        """
+        try:
+            self._pin_token_provider()
+        except Exception:  # noqa: BLE001 — a warm attempt is never fatal
+            pass
 
     def _trace_tick(self) -> None:
         """(Re)open and cap the opt-in traces off the request path.
@@ -14310,17 +14394,20 @@ class PinProxy:
         # a monitor the pin is broken on the one machine where it has nothing
         # to do.
         #
-        # NEVER WAITS ON THE MINT. `_can_mint` calls the provider, and its
-        # refresh path can be stuck for as long as the host's credential store
-        # is (measured: a Keychain read still hung after 2d19h) -- unkillable
-        # from here. This is the ONE probe every monitor, `cswap pin --heal`
-        # and the installer's activation check use for liveness, so a stalled
-        # store must never make it read as a dead daemon. Peek the refresh
-        # lock non-blocking first; only ask `_can_mint` when it is free, which
-        # is what it does today.
+        # NEVER WAITS ON THE MINT, and never CALLS the provider at all: even
+        # a free lock does not mean the provider is cheap to call -- reading
+        # the pin and resolving the account are their own store accesses,
+        # every one of which could be the thing that is stuck (measured: a
+        # Keychain read still hung after 2d19h). This is the ONE probe every
+        # monitor, `cswap pin --heal` and the installer's activation check
+        # use for liveness, so a stalled store must never make it read as a
+        # dead daemon. Peek the refresh lock non-blocking first; `can_pin`
+        # otherwise comes only from what is already cached — see
+        # `_can_pin_from_cache` and the daemon-start warm that keeps it
+        # populated on a healthy daemon.
         mint_stalled_s = _mint_lock_busy(self._pin_token_provider)
         can_pin = (True if mint_stalled_s is not None
-                   else _can_mint(self._pin_token_provider) is not False)
+                   else _can_pin_from_cache(self._pin_token_provider))
         # WHAT EGRESS IS ACTUALLY DOING, not what it is configured to do.
         # `chain` above reports the hop the relay WOULD use, so a daemon that
         # can reach no hop and is dialling DIRECT reported exactly what a

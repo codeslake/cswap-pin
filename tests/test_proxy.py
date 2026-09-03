@@ -1798,6 +1798,81 @@ class TestLiveRemoteControlSessions:
             daemon._stop = True
         assert "titles" in ticks and "carry" in ticks, ticks
 
+    def case_the_trace_tick_no_longer_runs_on_the_title_sweep_thread(
+            self, monkeypatch):
+        """`_trace_tick` used to run ON `_title_sweep_loop`'s own thread, the
+        same one `_carry_on_login_change` runs on every 0.5s -- a parking
+        tick (a stalled trace-file open) froze the login-change repair for
+        as long as it parked. Reusing the gate's own measurement shape: park
+        the tick, and the login-change count must keep advancing anyway."""
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._stop = False
+        daemon._sweep_wake = threading.Event()
+        daemon._accept_loop = lambda: None
+        parked = threading.Event()
+        daemon._trace_tick = lambda: parked.wait()
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_S", 600.0)
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_FIRST_S", 600.0)
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("acct", "org"))
+        ticks: list[int] = []
+        daemon._carry_on_login_change = lambda: ticks.append(1)
+        daemon.sweep_titles_once = lambda: None
+        daemon.sweep_policy_once = lambda: None
+        daemon.carry_live_pointers = lambda login: None
+        daemon._freshen_pin_identity = lambda: None
+        try:
+            daemon._start_accept_loop()
+            for _ in range(400):
+                if len(ticks) >= 3:
+                    break
+                time.sleep(0.01)
+            assert len(ticks) >= 3, (
+                "the login-change beat stalled behind a parked trace tick")
+        finally:
+            daemon._stop = True
+            parked.set()
+
+    def case_the_trace_tick_survives_a_stop(self, tmp_path):
+        """`release_listener` sets `_stop` for the accept and title-sweep
+        threads to drain by -- but a draining process still relays the
+        connections it still holds, and those still write to the trace, so
+        the tick must not end with `_stop`. Gated on process exit only, the
+        way `_watch_own_code`'s watchdog thread ends."""
+        from cswap_pin import proxy as pin_proxy
+
+        proxy = pin_proxy.PinProxy(certdir=tmp_path,
+                                   pin_token_provider=lambda: None)
+        calls: list[int] = []
+        real = proxy._trace_tick
+
+        def _counted():
+            calls.append(1)
+            real()
+
+        proxy._trace_tick = _counted
+        proxy.start()
+        try:
+            for _ in range(400):
+                if calls:
+                    break
+                time.sleep(0.01)
+            assert calls, "the trace tick never ran at all"
+
+            proxy.release_listener()
+            assert proxy._stop is True
+
+            before = len(calls)
+            time.sleep(1.2)
+            assert len(calls) > before, (
+                "the trace tick stopped ticking once `_stop` was set")
+        finally:
+            proxy._stop = True
+
 
 class TestRepinIsLive:
     """Switching accounts in cswap never asks you to restart a session, and

@@ -9503,6 +9503,31 @@ class TestTheKillGateIdentifiesItsTarget:
         assert pids == [], "a daemon for another backup dir was selected"
 
 
+def test_mint_lock_bound_covers_the_real_in_lock_ceiling():
+    """`_MINT_LOCK_BOUND_S` bounds a WAITER; the work the holder does inside
+    the lock belongs to the HOST, not this module -- a cold keychain read,
+    then (should the held token be expired) `consume_backup_grant`'s own
+    file lock, the switcher's file lock, a keychain re-read and the refresh
+    POST. Below their sum, a legitimate contended refresh gets cut off as
+    if it were stalled."""
+    import inspect
+
+    from claude_swap import locking, macos_keychain, oauth
+    from cswap_pin import proxy as pp
+
+    keychain = macos_keychain._TIMEOUT
+    filelock = inspect.signature(
+        locking.FileLock.__init__).parameters["timeout"].default
+    post = inspect.signature(
+        oauth.try_refresh_oauth_credentials).parameters["timeout_s"].default
+
+    ceiling = 2 * keychain + 2 * filelock + post
+    assert pp._MINT_LOCK_BOUND_S >= ceiling, (
+        f"_MINT_LOCK_BOUND_S={pp._MINT_LOCK_BOUND_S} is below the host's own "
+        f"in-lock ceiling {ceiling} (keychain={keychain}, filelock={filelock}, "
+        f"post={post})")
+
+
 class TestFailOpenIsNotSilent:
     """The token swap fails OPEN by design — a pin that cannot resolve must
     never block work. The cost is that nothing marks it: requests keep
@@ -10003,6 +10028,329 @@ class TestFailOpenIsNotSilent:
             assert tls.sent.startswith(b"HTTP/1.1 503"), tls.sent
         finally:
             event.set()
+
+    def _cold_wedged_provider(self, certdir):
+        """A REAL provider whose credential store hangs on the very FIRST
+        read -- the COLD-CACHE case (`_cred_cache` starts empty on every
+        daemon start), not the already-cached-then-stuck-refresh case
+        `_stalled_provider` drives. Never raises, never returns."""
+        from cswap_pin import proxy as pp
+
+        class _Wedged:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e):
+                event.wait()  # never set within the test: stuck forever
+                return None
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Wedged(), "2", "pin@example.com")
+        event = threading.Event()
+        return provider, event
+
+    def case_health_never_calls_the_provider_directly(self, certdir):
+        """`_serve_health` must never call `provider()` itself: a FREE lock
+        does not mean the provider is cheap to call, and with a cold, wedged
+        store the /health-handling thread would become the unkillable holder
+        (nobody bounds the HOLDER, only a waiter -- see `_MINT_LOCK_BOUND_S`).
+        Built without `.start()` so nothing else can race to the lock first
+        -- this isolates `_serve_health`'s own behaviour from the daemon-
+        start warm thread."""
+        import socket as _s
+        import time as _time
+
+        from cswap_pin import proxy as pp
+
+        provider, event = self._cold_wedged_provider(certdir)
+        try:
+            proxy = pp.PinProxy(certdir=certdir, pin_token_provider=provider,
+                                upstream=("127.0.0.1", 1))
+            server, client = _s.socketpair()
+            t = threading.Thread(target=proxy._serve_health, args=(server,),
+                                 daemon=True)
+            started = _time.monotonic()
+            t.start()
+            client.settimeout(2.0)
+            buf = b""
+            try:
+                while b"\r\n\r\n" not in buf:
+                    d = client.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+            except OSError:
+                pass
+            elapsed = _time.monotonic() - started
+            client.close()
+            assert elapsed < 1.0, (
+                f"/health waited {elapsed:.2f}s -- it called the provider "
+                "directly instead of reading only what is cached")
+        finally:
+            event.set()
+
+    def case_a_cold_read_is_bounded_by_the_mint_lock(self, certdir, monkeypatch):
+        """The COLD credential read used to run OUTSIDE `refresh_lock` --
+        unbounded, and invisible to `_mint_lock_busy` -- so a wedged store on
+        a fresh daemon (every handover, recycle and heal successor starts
+        cold) blocked `/health` and every pinned request right along with it,
+        forever. The FIRST caller becomes the holder and gets stuck inside
+        the read; a SECOND caller must not queue behind it past the bound."""
+        import time as _time
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.3)
+        provider, event = self._cold_wedged_provider(certdir)
+        try:
+            assert pp._mint_lock_busy(provider) is None, (
+                "the lock reads busy before anything has tried to mint")
+
+            holder = threading.Thread(target=provider, daemon=True)
+            holder.start()
+            deadline = _time.monotonic() + 2.0
+            while (pp._mint_lock_busy(provider) is None
+                   and _time.monotonic() < deadline):
+                _time.sleep(0.01)
+            assert pp._mint_lock_busy(provider) is not None, (
+                "a cold read in progress did not show up as the lock being "
+                "held -- it used to run outside `refresh_lock` entirely")
+
+            started = _time.monotonic()
+            result = provider()
+            elapsed = _time.monotonic() - started
+            assert result is None
+            assert elapsed < 1.0, (
+                f"a waiter behind a cold read waited {elapsed:.2f}s")
+            assert provider.mint_stalled() is True
+        finally:
+            event.set()
+            holder.join(timeout=2.0)
+
+    def case_health_and_a_pinned_request_survive_a_cold_wedged_store(
+            self, certdir, monkeypatch):
+        """End to end: a fresh daemon's cold cache read is exactly the store
+        access `/health` and a pinned request must never wait on unbounded."""
+        import json as _json
+        import socket as _s
+        import time as _time
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.3)
+        provider, event = self._cold_wedged_provider(certdir)
+        try:
+            p = self._proxy(certdir, provider)
+            p.start()
+            try:
+                # Let the daemon-start warm engage the store before probing,
+                # so this measures the bound, not a startup race.
+                deadline = _time.monotonic() + 2.0
+                while (pp._mint_lock_busy(p._pin_token_provider) is None
+                       and _time.monotonic() < deadline):
+                    _time.sleep(0.01)
+                assert pp._mint_lock_busy(p._pin_token_provider) is not None, (
+                    "the daemon-start warm never touched the store")
+
+                c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+                c.settimeout(2.0)
+                c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                started = _time.monotonic()
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+                body = buf.partition(b"\r\n\r\n")[2]
+                while not body.endswith(b"}"):
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    body += d
+                elapsed = _time.monotonic() - started
+                c.close()
+                assert elapsed < 1.0, (
+                    f"/health waited {elapsed:.2f}s on a cold, wedged store")
+                doc = _json.loads(body)
+                assert doc["mint_stalled"] is True, doc
+
+                class _FakeTLS:
+                    def __init__(self):
+                        self._in = (
+                            b"POST /v1/code/sessions HTTP/1.1\r\n"
+                            b"Host: api.anthropic.com\r\n"
+                            b"Authorization: Bearer disk-bearer\r\n"
+                            b"Content-Length: 0\r\n\r\n"
+                        )
+                        self.sent = b""
+                    def recv(self, n):
+                        out, self._in = self._in[:n], self._in[n:]
+                        return out
+                    def sendall(self, b):
+                        self.sent += b
+                    def close(self):
+                        pass
+
+                tls = _FakeTLS()
+                started = _time.monotonic()
+                p._handle_one_request(tls)
+                elapsed = _time.monotonic() - started
+                assert elapsed < 1.0, (
+                    f"the pinned request waited {elapsed:.2f}s on a cold, "
+                    "wedged store")
+                assert tls.sent.startswith(b"HTTP/1.1 503"), tls.sent
+            finally:
+                p.stop()
+        finally:
+            event.set()
+
+    def case_a_slow_cold_read_does_not_wedge_the_daemon(self, certdir):
+        """`_serving_can_pin` probes `/health` up to `_PIN_PROBE_ATTEMPTS`
+        times at `timeout` seconds each; the unlocked cold read used to pay
+        its own cost on EVERY probe (measured: 2.5s hid behind all three), so
+        a healthy but merely slow store read wedged and recycled a daemon
+        that was fine. Driven here as `/health` itself must answer it --
+        `_serving_can_pin`'s own wedge-vs-busy classification of that answer
+        is `TestAWedgeIsNotTrustedForever`'s (test_proxy.py), and a real
+        socket read past this daemon's response RSTs in this sandbox for
+        ANY provider, healthy or not -- reproduced on baseline fb874da with
+        an immediate `lambda: "TOK"` -- so this reads the safe way every
+        other case in this class already does, not through that probe."""
+        import json as _json
+        import socket as _s
+        import time as _time
+
+        from cswap_pin import proxy as pp
+
+        live = _json.dumps({"claudeAiOauth": {
+            "accessToken": "TOK", "expiresAt": 4102444800000,
+            "refreshToken": "rt"}})
+
+        class _Slow:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e):
+                _time.sleep(2.5)
+                return live
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Slow(), "2", "pin@example.com")
+        p = self._proxy(certdir, provider)
+        p.start()
+        try:
+            # Let the daemon-start warm engage the store before probing, so
+            # this measures the read's own cost, not a startup race against
+            # the warm thread.
+            deadline = _time.monotonic() + 2.0
+            while (pp._mint_lock_busy(p._pin_token_provider) is None
+                   and _time.monotonic() < deadline):
+                _time.sleep(0.01)
+            assert pp._mint_lock_busy(p._pin_token_provider) is not None, (
+                "the daemon-start warm never touched the store")
+
+            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
+            c.settimeout(1.0)
+            c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            started = _time.monotonic()
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(4096)
+                if not d:
+                    break
+                buf += d
+            body = buf.partition(b"\r\n\r\n")[2]
+            while not body.endswith(b"}"):
+                d = c.recv(4096)
+                if not d:
+                    break
+                body += d
+            elapsed = _time.monotonic() - started
+            c.close()
+            assert elapsed < 1.0, (
+                f"/health waited {elapsed:.2f}s behind a healthy 2.5s cold "
+                "read -- the same cost `_serving_can_pin` used to pay on "
+                "every one of its probes")
+            doc = _json.loads(body)
+            assert doc["can_pin"] is True, (
+                f"a healthy daemon with a 2.5s cold read was called a wedge: "
+                f"{doc}")
+        finally:
+            p.stop()
+
+    def case_mint_stalled_does_not_leak_across_threads(self, certdir,
+                                                        monkeypatch):
+        """`_stalled` used to be one flag shared by every request thread:
+        cleared on entry by whoever calls `provider()` next, and read by
+        whichever thread asks -- so a stall THIS thread caused could read as
+        cleared by an unrelated caller, or an unrelated caller's stall could
+        read as this thread's own."""
+        import json as _json
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.05)
+
+        expired = _json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt"}})
+
+        class _Switcher:
+            def current_account_number(self):
+                # Thread "B" IS the pinned account already: a no-op, no lock.
+                return "2" if threading.current_thread().name == "B" else "1"
+            def read_account_credentials(self, n, e): return expired
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Switcher(), "2",
+                                              "pin@example.com")
+        event = threading.Event()
+
+        def _hold():
+            with provider.refresh_lock:
+                event.wait()
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        while not provider.refresh_lock.locked():
+            time.sleep(0.001)
+
+        try:
+            result = {}
+            a_stalled = threading.Event()
+            b_done = threading.Event()
+
+            def _a():
+                provider()  # cold, contends for the held lock, times out
+                a_stalled.set()
+                # Let B run its own call+check to completion BEFORE this
+                # thread reads its own verdict -- the interleaving that
+                # exposed a shared flag.
+                b_done.wait(timeout=5)
+                result["a"] = provider.mint_stalled()
+
+            def _b():
+                a_stalled.wait(timeout=5)
+                provider()  # no-op: pin IS the live login, no lock touched
+                result["b"] = provider.mint_stalled()
+                b_done.set()
+
+            ta = threading.Thread(target=_a, name="A")
+            tb = threading.Thread(target=_b, name="B")
+            ta.start()
+            tb.start()
+            ta.join(timeout=6)
+            tb.join(timeout=6)
+
+            assert result.get("b") is False, (
+                "thread B's own call read a stall it never caused")
+            assert result.get("a") is True, (
+                "thread A's own stall was cleared by an unrelated thread's "
+                f"call -- `_stalled` is shared, not per-call: {result}")
+        finally:
+            event.set()
+            holder.join(timeout=2.0)
 
 
 class TestTheRequestPathNeverOpensTheTraceFile:
