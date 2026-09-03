@@ -1800,6 +1800,91 @@ class TestLiveRemoteControlSessions:
             daemon._stop = True
         assert "titles" in ticks and "carry" in ticks, ticks
 
+    def case_a_local_rename_wakes_the_sweep_before_the_beat(self, monkeypatch,
+                                                              tmp_path):
+        """A `/rename` waited up to `_TITLE_SWEEP_S` for claude.ai to catch
+        up -- measured 204s on one fleet host. The wait must end the moment
+        a live session's registry record changes name, not on the next
+        beat -- but ordinary session churn (another session starting or
+        exiting) must NOT wake it: that changes the KEY SET of
+        `live_bridge_names()`, not a name, and used to drive the beat to
+        `_RENAME_CHECK_S` on churn nothing asked for."""
+        import subprocess
+        import sys
+        import threading
+        from cswap_pin import proxy as pin_proxy
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._stop = False
+        daemon._sweep_wake = threading.Event()
+        daemon._trace_tick_stop = threading.Event()
+        daemon._accept_loop = lambda: None
+        ticks: list[str] = []
+        daemon.sweep_titles_once = lambda: ticks.append("titles")
+        daemon.sweep_policy_once = lambda: ticks.append("policy")
+        daemon.carry_live_pointers = lambda login: ticks.append("pointers")
+        daemon._carry_on_login_change = lambda: None
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_S", 600.0)
+        monkeypatch.setattr(pin_proxy.PinProxy, "_TITLE_SWEEP_FIRST_S", 600.0)
+        # 1.0, not 0.5: with a 0.5s inner tick, 0.5 would satisfy the
+        # `waited % _RENAME_CHECK_S == 0` gate on EVERY tick, so it never
+        # actually exercises the gate. 1.0 needs two ticks.
+        monkeypatch.setattr(pin_proxy.PinProxy, "_RENAME_CHECK_S", 1.0)
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("acct", "org"))
+
+        # THE REAL SIGNAL: a registry record `live_bridge_names()` itself
+        # reads, for a pid this process can prove alive to `_pid_alive`.
+        sessions = tmp_path / "claude-home" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        record = sessions / f"{os.getpid()}.json"
+        record.write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": "s", "bridgeSessionId": "cse_1",
+             "name": "dotfiles", "nameSource": "user"}))
+
+        # ANOTHER LIVE PID, so a second record is genuinely alive to
+        # `_pid_alive` and not just another file.
+        other = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            daemon._start_accept_loop()
+            try:
+                time.sleep(0.3)
+                assert ticks == [], f"swept before any rename: {ticks}"
+
+                # A SECOND SESSION APPEARS. The key SET of
+                # `live_bridge_names()` changes; no value under a key
+                # present before AND now does.
+                other_record = sessions / f"{other.pid}.json"
+                other_record.write_text(json.dumps(
+                    {"pid": other.pid, "sessionId": "s2",
+                     "bridgeSessionId": "cse_2", "name": "other",
+                     "nameSource": "user"}))
+                time.sleep(2.5)  # several `_RENAME_CHECK_S` gates
+                assert ticks == [], (
+                    "a session appearing woke the sweep before the beat: "
+                    f"{ticks}")
+
+                # THE RENAME. Nothing here calls the daemon; a real
+                # `/rename` only ever rewrites the record the sweep loop
+                # already reads.
+                record.write_text(json.dumps(
+                    {"pid": os.getpid(), "sessionId": "s",
+                     "bridgeSessionId": "cse_1", "name": "dotfiles_wmac",
+                     "nameSource": "user"}))
+                for _ in range(400):
+                    if "titles" in ticks:
+                        break
+                    time.sleep(0.01)
+            finally:
+                daemon._stop = True
+        finally:
+            other.kill()
+            other.wait()
+        assert "titles" in ticks, (
+            "a local rename did not wake the title sweep before the next "
+            "beat, so claude.ai stays wrong for up to _TITLE_SWEEP_S")
+
     def case_the_trace_tick_no_longer_runs_on_the_title_sweep_thread(
             self, monkeypatch):
         """`_trace_tick` used to run ON `_title_sweep_loop`'s own thread, the

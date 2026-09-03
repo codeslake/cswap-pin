@@ -11605,6 +11605,9 @@ class PinProxy:
     #: still repairs something.
     _TITLE_SWEEP_FIRST_S = 20.0
 
+    #: How often the wait checks `live_bridge_names()` for a rename made since the wait began.
+    _RENAME_CHECK_S = 10.0
+
     def _title_sweep_loop(self) -> None:
         """Re-check cloud titles on a cadence, because the connect hook cannot.
 
@@ -11641,6 +11644,10 @@ class PinProxy:
             waited = 0.0
             budget = self._TITLE_SWEEP_FIRST_S if first else self._TITLE_SWEEP_S
             first = False
+            try:
+                names = live_bridge_names()
+            except Exception:  # noqa: BLE001 — never take the sweep down
+                names = None
             while waited < budget and not self._stop:
                 # WAKEABLE, not a bare sleep. `release_listener` joins this
                 # thread, and a poll-only wait makes that join pay up to half
@@ -11661,8 +11668,27 @@ class PinProxy:
                 # almost never moves, so the parse runs only when it might
                 # have. The carry itself skips records that already agree, so
                 # a spurious wake writes nothing.
+                #
+                # `live_bridge_names()` runs here too, inside the same guard:
+                # an absurd `pid` in a session record can raise something
+                # `_pid_alive` does not catch, and that must not take the
+                # sweep thread down any more than a login-carry failure would.
+                #
+                # NARROWED TO A RENAME. Comparing the whole dict woke this on
+                # ANY change to the live named-bridge SET -- a second session
+                # starting or an existing one exiting -- which is ordinary
+                # churn, not a rename, and drove the beat to
+                # `_RENAME_CHECK_S` on every such event. Only a value
+                # changing under a key present BOTH before and now is a
+                # rename; a key appearing or vanishing is compared from the
+                # next check on, not this one.
                 try:
                     self._carry_on_login_change()
+                    if names is not None and waited % self._RENAME_CHECK_S == 0:
+                        cur = live_bridge_names()
+                        if any(cur[k] != v for k, v in names.items() if k in cur):
+                            break
+                        names = cur
                 except Exception:  # noqa: BLE001 — never take the sweep down
                     pass
             if self._stop:
