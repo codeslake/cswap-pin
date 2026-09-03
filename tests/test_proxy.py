@@ -18889,6 +18889,54 @@ class TestTheSpliceHoldsTheConfigLock:
             {"bridgeSessionId": "cse_OUT"}))
         assert pin_proxy.PinProxy.deaf_bridges(me, now=now) == ["cse_IN", "cse_OUT"]
 
+    def case_an_exited_sessions_shutdown_flush_is_not_a_deaf_bridge(
+            self, tmp_path, monkeypatch):
+        """A session that exited leaves its shutdown flush in
+        `_bridge_posts` and stays in the stale `_connected_bridges` set
+        until the next listing -- but nobody is coming back to open its
+        stream. `_dead_creator_bridge_ids` already knows this positively
+        (a job record's `cswapPinCreatorPid` raising `ProcessLookupError`);
+        `deaf_bridges` must consult it, the same way it already consults
+        `_outbound_only_bridge_ids`."""
+        import subprocess
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        # A REAL DEAD PID -- a subprocess that exited and was waited, so
+        # the number belongs to no process at all, never a guess.
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        dead_pid = proc.pid
+
+        home = tmp_path / "cfg"
+        (home / "jobs" / "j_dead").mkdir(parents=True)
+        (home / "jobs" / "j_live").mkdir(parents=True)
+        (home / "jobs" / "j_nostamp").mkdir(parents=True)
+        (home / "jobs" / "j_dead" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_DEAD",
+             pin_proxy._CREATOR_PID_KEY: dead_pid}))
+        (home / "jobs" / "j_live" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_LIVE",
+             pin_proxy._CREATOR_PID_KEY: os.getpid()}))
+        (home / "jobs" / "j_nostamp" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_NOSTAMP"}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
+                            lambda: home)
+
+        now = _time.monotonic()
+        me = _t.SimpleNamespace(
+            _bridge_posts={"cse_DEAD": now, "cse_LIVE": now,
+                          "cse_NOSTAMP": now},
+            held_bridge_ids=lambda: set(),
+            _connected_bridges={"cse_DEAD", "cse_LIVE", "cse_NOSTAMP"})
+        assert pin_proxy.PinProxy.deaf_bridges(me, now=now) == [
+            "cse_LIVE", "cse_NOSTAMP"], (
+            "an exited session's shutdown flush was reported deaf, or a "
+            "real one was hidden with it")
+
     def case_the_carry_keeps_a_field_it_does_not_know(self, tmp_path, monkeypatch):
         """`bridgeSessionGroupingId` travels with the record whatever the pin
         does to the owner fields: the carry re-reads and rewrites the whole

@@ -12590,6 +12590,12 @@ class PinProxy:
         # AN OUTBOUND-ONLY BRIDGE IS NOT DEAF, it never listens; see
         # `_outbound_only_bridge_ids`. Empty on this fleet today.
         holding |= _outbound_only_bridge_ids()
+        # NOR IS AN EXITED SESSION'S SHUTDOWN FLUSH. Its post is real and its
+        # creating process is confirmed gone, so no stream is ever coming;
+        # `_dead_creator_bridge_ids` already has the positive proof, and
+        # without this a session that exited stays "deaf" until the next
+        # listing pass drops it from `_connected_bridges`.
+        holding |= _dead_creator_bridge_ids()
         out = [bid for bid, last in posts.items()
                if stamp - last <= window and bid not in holding]
         # A BRIDGE THAT HAS JUST REGISTERED IS NOT YET DEAF. Its stream GET
