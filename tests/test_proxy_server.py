@@ -6551,7 +6551,9 @@ class TestDrainReportsWhatItCut:
             + repr(srv.deaf_bridges(window=60.0, now=past_grace)))
 
         # (b) a bridge whose stream WAS held and then dropped, inside its
-        # own grace -- the grace must not shield a real loss.
+        # own dwell -- a fresh loss is not yet judged (a sweep can land in
+        # the ordinary close/reopen gap), and the SAME loss still there past
+        # the dwell is judged exactly as before.
         LOST = "/v1/code/sessions/cse_LOST/worker/messages"
         LOST_STREAM = "/v1/code/sessions/cse_LOST/worker/events/stream"
         conn = object()
@@ -6567,10 +6569,15 @@ class TestDrainReportsWhatItCut:
         # negative instead of the 2.0s this loss actually aged.
         srv._stream_lost["cse_LOST"] = 2003.0
         srv._note_bridge_traffic(LOST, now=2005.0)
-        assert srv.deaf_bridges(window=60.0, now=2005.0) == ["cse_LOST"], (
-            "the startup grace shielded a bridge whose stream this daemon "
-            "watched go, which is exactly the loss the check exists to name: "
+        assert srv.deaf_bridges(window=60.0, now=2005.0) == [], (
+            "a loss only 2s old was already named deaf -- the sweep that "
+            "lands in the ordinary close/reopen gap must stay silent: "
             + repr(srv.deaf_bridges(window=60.0, now=2005.0)))
+        past_dwell = 2003.0 + pp._DEAF_STARTUP_GRACE_S + 1.0
+        srv._note_bridge_traffic(LOST, now=past_dwell)
+        assert srv.deaf_bridges(window=60.0, now=past_dwell) == ["cse_LOST"], (
+            "a loss still there past the dwell was never named: "
+            + repr(srv.deaf_bridges(window=60.0, now=past_dwell)))
 
         # (c) THE SUCCESSOR SHAPE: no create ever passed through this
         # daemon (`_last_create` stays None, as on a handover), so the
@@ -6612,6 +6619,97 @@ class TestDrainReportsWhatItCut:
             "as though it had just registered, backdating a grace that had "
             "nothing to do with it: "
             + repr(old.deaf_bridges(window=60.0, now=202.0)))
+
+    def case_a_stream_that_reopens_within_the_dwell_is_never_marked_deaf(
+            self, monkeypatch):
+        """`daemon.log` line 300 on a mac: `1 of 3 bridge(s) post but hold no
+        inbound stream ... (deaf 0s)`, followed 11 minutes later by a plain
+        clear -- the sweep landed in the ordinary gap between a stream
+        closing and Claude Code reopening it on the same connection
+        (`trace.log`: two `GET .../stream` calls ~250 of the bridge's own
+        posts apart). `deaf_for` answered a real, momentary age and the
+        report named it at once; only the dwell this case pins stops that.
+
+        A loss STILL there once the dwell has passed is reported exactly as
+        before -- the dwell delays a verdict, it does not withhold one.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._stream_lost = {}
+
+            FLICKER = "/v1/code/sessions/cse_FLICKER/worker/messages"
+            FLICKER_STREAM = (
+                "/v1/code/sessions/cse_FLICKER/worker/events/stream")
+            conn = object()
+            srv._note_bridge_traffic(FLICKER, now=1000.0)
+            srv._note_bridge_traffic(FLICKER_STREAM, now=1000.5, conn=conn)
+            srv._stream_conns.add(conn)
+            srv._open_conns.add(conn)
+            srv._forget_stream(conn)
+            # EXPLICIT, as the create-grace case above does: the rest of
+            # this case runs on the fake timeline above, not the real clock
+            # `_forget_stream` just stamped.
+            srv._stream_lost["cse_FLICKER"] = 2000.0
+            srv._note_bridge_traffic(FLICKER, now=2002.0)
+            srv._connected_bridges = {"cse_FLICKER"}
+
+            # 2s INTO THE LOSS -- the ordinary close/reopen gap, measured at
+            # age 0 on the mac. The report must claim nothing either way.
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 2002.0)
+            srv._report_deaf_bridges()
+            assert lines == [], (
+                "a loss only 2s old was already named deaf: " + repr(lines))
+
+            # THE STREAM REOPENS inside the gap the sweep must not have
+            # marked -- the pair is healthy, with no false record behind it.
+            conn2 = object()
+            srv._note_bridge_traffic(FLICKER_STREAM, now=2003.0, conn=conn2)
+            srv._stream_conns.add(conn2)
+            srv._open_conns.add(conn2)
+            assert srv.deaf_bridges(now=2004.0) == [], (
+                "the reopened bridge was still carrying a false deaf record")
+
+            # A SECOND BRIDGE, whose loss is STILL there once the dwell has
+            # passed -- the check must still name it, same as before this
+            # round.
+            STILL = "/v1/code/sessions/cse_STILLGONE/worker/messages"
+            STILL_STREAM = (
+                "/v1/code/sessions/cse_STILLGONE/worker/events/stream")
+            conn3 = object()
+            srv._note_bridge_traffic(STILL, now=3000.0)
+            srv._note_bridge_traffic(STILL_STREAM, now=3000.5, conn=conn3)
+            srv._stream_conns.add(conn3)
+            srv._open_conns.add(conn3)
+            srv._forget_stream(conn3)
+            srv._stream_lost["cse_STILLGONE"] = 3010.0
+            srv._note_bridge_traffic(STILL, now=3012.0)
+            srv._connected_bridges = {"cse_FLICKER", "cse_STILLGONE"}
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 3012.0)
+            srv._report_deaf_bridges()
+            assert lines == [], (
+                "a loss only 2s old was named deaf on its own bridge too: "
+                + repr(lines))
+
+            monkeypatch.setattr(
+                pp.time, "monotonic",
+                lambda: 3010.0 + pp._DEAF_STARTUP_GRACE_S + 1.0)
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], lines
+            assert "cse_STILLGONE" in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
 
     def case_the_owner_map_is_pruned_wherever_the_stream_set_is(self):
         """`_stream_owner` is keyed on the connection object, so it must be
@@ -7802,7 +7900,8 @@ class TestDrainReportsWhatItCut:
 
         srv = _srv()
         srv._note_bridge_traffic(WORKER, now=100.0)
-        srv._stream_lost["cse_SUPERSEDED"] = 100.0
+        # PAST THE DWELL, or the setup itself is shielded as a fresh loss.
+        srv._stream_lost["cse_SUPERSEDED"] = 100.0 - pp._DEAF_STARTUP_GRACE_S
         assert srv.deaf_bridges(window=60.0, now=101.0) == [
             "cse_SUPERSEDED"], (
             "setup: a bridge that posted and holds no stream starts out "

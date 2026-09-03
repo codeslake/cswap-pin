@@ -12626,15 +12626,26 @@ class PinProxy:
         # A BRIDGE THAT HAS JUST REGISTERED IS NOT YET DEAF. Its stream GET
         # follows its first post within seconds; this daemon judging it in
         # that gap is the state itself, not a loss, and no timer ever
-        # retracts a transition-only report. Shielded only while this daemon
-        # never saw its stream go -- a REAL loss (`deaf_for` answers a
-        # number) is reported at once, grace or not.
+        # retracts a transition-only report. Unmeasured only -- this daemon
+        # never saw its stream go -- and shielded while its first post is
+        # inside the grace.
+        #
+        # A MEASURED LOSS GETS THE SAME DWELL, not immediate judgment: a
+        # sweep can land in the ordinary gap between a stream closing and
+        # Claude Code reopening it, and `deaf_for` answers a real but
+        # momentary age there (0s, measured). Shielded while that age is
+        # still inside the grace; a loss still there once it passes is
+        # judged exactly as before.
         first_post = getattr(self, "_bridge_first_post", None) or {}
         deaf_for = getattr(self, "deaf_for", None)
-        out = [bid for bid in out
-               if not ((deaf_for is None or deaf_for(bid, now=stamp) is None)
-                       and stamp - first_post.get(bid, -1e9)
-                       < grace)]
+
+        def _too_young(bid):
+            age = None if deaf_for is None else deaf_for(bid, now=stamp)
+            if age is None:
+                return stamp - first_post.get(bid, -1e9) < grace
+            return age < grace
+
+        out = [bid for bid in out if not _too_young(bid)]
         # AND THE SERVER MUST BE HOLDING IT. Posting without a stream has two
         # readings and our own sockets cannot separate them: a bridge that
         # LOST its ear, and one claude.ai is not attached to at all -- a
