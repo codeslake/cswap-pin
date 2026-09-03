@@ -6749,6 +6749,35 @@ def _append_capped(path, line: str, fh=None, cap: int = _LOG_MAX_BYTES):
         return None
 
 
+def _write_capped_line(fh, line: str, cap: int = _LOG_MAX_BYTES):
+    """Write ``line`` to the already-open ``fh``. Never opens or closes it.
+
+    `_append_capped` opens on a first write and reopens on rotation — fine for
+    a handle only one caller touches, but `self._debug` is ONE handle shared
+    by every `_serve_client` thread. Re-arming the trace (or just crossing the
+    cap) nulls it, and every thread then races into `open(2)` at once:
+    measured as 342 `_serve_client` threads sharing one identical stack,
+    parked in that same `open()` while a stalled filesystem let everything
+    else in the daemon keep running.
+
+    So the request path only ever writes to a handle something ELSE already
+    opened (`PinProxy._trace_tick`, off a background loop) and drops the line
+    when nothing is open — or, on crossing the cap, DROPS the reference
+    (never closes it, for the same unsynchronised-threads reason
+    `_append_capped` already drops rather than closes) and leaves the
+    rotate-and-reopen to the next tick.
+
+    Never raises, same contract as `_append_capped`.
+    """
+    if fh is None or fh.closed:
+        return None
+    try:
+        fh.write(line)
+        return None if fh.tell() > cap else fh
+    except (OSError, ValueError):
+        return None
+
+
 def daemon_log_path(certdir: Path) -> Path:
     """Where the detached daemon's stderr goes.
 
@@ -11243,6 +11272,11 @@ class PinProxy:
         # Which path `_debug` is open on, so a re-armed trace does not keep
         # writing to the file it was armed on first.
         self._debug_for = None
+        # Same pair, for CSWAP_PIN_SHAPE — see `_trace_tick`.
+        self._shape = None
+        self._shape_for = None
+        # `_trace_tick` logs an open() failure once, not once per tick.
+        self._trace_open_warned: set = set()
         # Connections carrying a subscription rather than a reply. Held
         # separately because the drain must treat them the other way round:
         # every other connection is waited for, these are let go.
@@ -11419,6 +11453,15 @@ class PinProxy:
                 # a second on the handover path for nothing.
                 self._sweep_wake.wait(0.5)
                 waited += 0.5
+                # OFF THE DRAINING GUARD, DELIBERATELY. A draining process
+                # still relays the connections it holds (see `_release`), and
+                # those still write to the trace; skipping this tick with them
+                # would mean the trace goes silent for a daemon's whole
+                # shutdown.
+                try:
+                    self._trace_tick()
+                except Exception:  # noqa: BLE001 — never take the sweep down
+                    pass
                 if this_process_is_draining():
                     continue
                 # THE LOGIN CAN MOVE INSIDE THE BEAT. Claude Code watches
@@ -11489,6 +11532,61 @@ class PinProxy:
             # session, and the pin does not decide when one restarts. The cause
             # is a policy answer fetched while the pin was not in that
             # session's path, and that is where it is fixed.
+
+    def _trace_tick(self) -> None:
+        """(Re)open and cap the opt-in traces off the request path.
+
+        The only place `self._debug`/`self._shape` are opened, rotated or
+        re-targeted now. `_serve_client` and the CSWAP_PIN_SHAPE writer only
+        ever write to whatever this leaves open, or drop the line — see
+        `_write_capped_line`. Called from `_title_sweep_loop`'s inner wait, so
+        this runs at worst every 0.5s, which is not on the request path.
+
+        A line written between a re-arm (or a cap crossing) and the next tick
+        is lost. Accepted: a diagnostic gap is cheaper than the proxy parking
+        every request thread inside `open(2)` on it, which is the incident
+        this replaces.
+        """
+        debug_path = trace_target(getattr(self, "_certdir", None))
+        if debug_path != self._debug_for:
+            self._debug, self._debug_for = None, debug_path
+        if debug_path:
+            self._debug = self._reopen_trace(
+                "debug", debug_path, self._debug, _TRACE_MAX_BYTES)
+
+        shape_path = os.environ.get("CSWAP_PIN_SHAPE")
+        if shape_path != self._shape_for:
+            self._shape, self._shape_for = None, shape_path
+        if shape_path:
+            self._shape = self._reopen_trace(
+                "shape", shape_path, self._shape, _LOG_MAX_BYTES)
+
+    def _reopen_trace(self, key: str, path: str, fh, cap: int):
+        """Rotate and (re)open one trace handle. Only `_trace_tick` calls this.
+
+        Never raises: an ``open()`` that fails here leaves the handle at
+        ``None`` (so the request path keeps dropping the line, per
+        `_write_capped_line`'s contract) and says so on stderr once per `key`,
+        not once per tick — the same "once per daemon" restraint
+        `_warn_unpinnable` uses, for the same reason: a tick fires every 0.5s
+        and a line each would bury the signal.
+        """
+        try:
+            if fh is not None and not fh.closed and fh.tell() > cap:
+                fh.close()
+                fh = None
+            if fh is None or fh.closed:
+                _rotate_if_over(Path(path), cap)
+                fh = open(path, "a", buffering=1, encoding="utf-8",
+                          errors="replace")
+            return fh
+        except (OSError, ValueError) as exc:
+            if key not in self._trace_open_warned:
+                self._trace_open_warned.add(key)
+                _log_lifecycle(
+                    f"the {key} trace at {path} could not be (re)opened "
+                    f"({exc}); it stays off until this daemon is replaced")
+            return None
 
     def _note_stream_end(self, bridge: str, seconds: float, closer: str) -> None:
         """One line per bridge per minute when its inbound stream ends; the
@@ -14707,22 +14805,15 @@ class PinProxy:
         # the PREVIOUS request's send and report a wait longer than the
         # request itself.
         self._local.t_sent = None
-        debug_path = trace_target(getattr(self, "_certdir", None))
-        # THE HANDLE IS CACHED AND THE TARGET IS NOT FIXED ANY MORE.
-        # `_append_capped` keeps a descriptor across calls and reopens only on
-        # rotation, so a trace re-armed at a different path kept writing to the
-        # first one — reachable now that arming does not restart the daemon.
-        if debug_path != self._debug_for:
-            # LET GO, DO NOT CLOSE. These two fields are read and written from
-            # every connection thread with no lock, so closing here can pull
-            # the file out from under a thread already inside `_append_capped`
-            # past its `fh.closed` check — and `write`/`tell` on a closed file
-            # raises ValueError, which that helper does not catch, so it lands
-            # in the request. Dropping the reference lets refcounting close it
-            # when the last writer is done, and nothing writes to a handle
-            # nobody holds.
-            self._debug, self._debug_for = None, debug_path
-        if debug_path:
+        # THE REQUEST PATH NEVER OPENS THIS FILE. `_trace_tick` (off this
+        # thread, on `_title_sweep_loop`'s beat) is the only place that opens,
+        # rotates or re-targets `self._debug` now; this thread only writes to
+        # whatever it finds already open, or drops the line — see
+        # `_write_capped_line`. Opening from here, shared by every
+        # `_serve_client` thread, is what parked 342 of them inside one
+        # `open(2)` call while a stalled filesystem let the rest of the daemon
+        # keep working.
+        if self._debug is not None:
             hdrs = " | ".join(
                 f"{k}: {v[:60]}" for k, v in headers
                 if k.lower() in (
@@ -14730,11 +14821,10 @@ class PinProxy:
                     "sec-websocket-version", "cache-control", "content-type",
                 )
             )
-            self._debug = _append_capped(
-                debug_path,
+            self._debug = _write_capped_line(
+                self._debug,
                 f"[c{getattr(self._local, 'cid', 0)}] "
                 f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n",
-                self._debug,
                 cap=_TRACE_MAX_BYTES,
             )
 
@@ -14746,8 +14836,7 @@ class PinProxy:
         # this proxy is the only place it can be observed. Structure alone is
         # enough to locate the offending position and keeps prompt text out of
         # the log.
-        shape_path = os.environ.get("CSWAP_PIN_SHAPE")
-        if shape_path and body and path.startswith("/v1/messages"):
+        if self._shape is not None and body and path.startswith("/v1/messages"):
             try:
                 payload = json.loads(body)
                 shape = [
@@ -14756,11 +14845,9 @@ class PinProxy:
                      if isinstance(m.get("content"), list) else "str")
                     for m in (payload.get("messages") or [])
                 ]
-                # CAPPED, like the request trace and `daemon.log`. Opened per
-                # write here rather than held, so the handle is closed
-                # immediately; `_append_capped` still enforces the ceiling and
-                # rotates through `.1`/`.2`.
-                fh = _append_capped(shape_path, json.dumps({
+                # SAME HANDLE DISCIPLINE as the request trace above: write to
+                # whatever `_trace_tick` already opened, never open here.
+                self._shape = _write_capped_line(self._shape, json.dumps({
                     "cid": getattr(self._local, "cid", 0),
                     "n": len(shape),
                     "roles": [r for r, _ in shape],
@@ -14770,8 +14857,6 @@ class PinProxy:
                         "output_config" in m for m in (payload.get("messages") or [])
                     ),
                 }) + "\n")
-                if fh is not None:
-                    fh.close()
             except Exception:
                 pass
 

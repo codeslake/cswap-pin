@@ -10005,6 +10005,223 @@ class TestFailOpenIsNotSilent:
             event.set()
 
 
+class TestTheRequestPathNeverOpensTheTraceFile:
+    """The shared trace handle used to be opened FROM the request thread.
+
+    Measured on a live daemon: 342 `_serve_client` threads sharing one
+    identical stack, all parked in the SAME `open(path, "a", ...)` call while
+    a stalled filesystem let the accept loop and the trace's own already-open
+    writer keep working. `self._debug` is ONE handle every request thread
+    shares; re-arming the trace (or crossing its cap) used to null it and
+    every thread then raced into `open(2)` at once.
+
+    `PinProxy._trace_tick` (off `_title_sweep_loop`'s beat, never the request
+    path) is now the only place that opens, rotates or re-targets it;
+    `_write_capped_line` on the request path only ever writes to whatever is
+    already open, or drops the line.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _proxy(self, certdir, provider=None):
+        from cswap_pin.proxy import PinProxy
+        return PinProxy(
+            certdir=certdir,
+            pin_token_provider=provider or (lambda: None),
+            upstream=("127.0.0.1", 1),
+        )
+
+    class _FakeTLS:
+        """One GET on an unpinned route — reaches the trace append without
+        touching any bearer-swap machinery (`/v1/messages` is explicitly
+        never pinned, and a non-POST never triggers the bridge sweep)."""
+
+        def __init__(self):
+            self._in = (
+                b"GET /v1/messages HTTP/1.1\r\n"
+                b"Host: api.anthropic.com\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+            self.sent = b""
+
+        def recv(self, n):
+            out, self._in = self._in[:n], self._in[n:]
+            return out
+
+        def sendall(self, b):
+            self.sent += b
+
+        def close(self):
+            pass
+
+    def _drive_one(self, proxy):
+        try:
+            proxy._handle_one_request(self._FakeTLS())
+        except Exception:
+            pass  # the relay to the dead upstream (127.0.0.1:1) fails; unrelated
+
+    def _arm(self, certdir):
+        import cswap_pin.proxy as pp
+        trace = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(trace))
+        pp._TRACE_CACHE.clear()
+        return trace
+
+    def case_a_request_answers_within_2s_even_when_open_would_block(
+            self, certdir, monkeypatch):
+        """RED without the fix: the trace is armed, `self._debug` is unopened
+        (the ordinary state right after an arm, or after the tick drops it at
+        the cap), and `open()` on that path blocks forever. The old code
+        opened it FROM this thread; the new code must never call it, so the
+        request has to answer regardless of what `open()` on that path does.
+        """
+        import builtins
+
+        trace = self._arm(certdir)
+        never = threading.Event()
+        real_open = builtins.open
+
+        def _blocking_open(path, *a, **kw):
+            if str(path) == str(trace):
+                never.wait()  # never set: this IS the parked open(2)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", _blocking_open)
+
+        proxy = self._proxy(certdir)
+        proxy._debug = None
+
+        t = threading.Thread(target=self._drive_one, args=(proxy,), daemon=True)
+        t.start()
+        t.join(2.0)
+        assert not t.is_alive(), (
+            "the request thread is still parked after 2s — the trace append "
+            "called open(2) on the request path")
+
+    def case_the_tick_opens_the_handle_and_requests_then_write_their_line(
+            self, certdir):
+        """Control: once `_trace_tick` has run, a request DOES write."""
+        trace = self._arm(certdir)
+        proxy = self._proxy(certdir)
+        assert proxy._debug is None, "nothing has opened it yet"
+
+        proxy._trace_tick()
+        assert proxy._debug is not None, "the tick did not open the handle"
+
+        self._drive_one(proxy)
+        body = trace.read_text()
+        assert "GET /v1/messages" in body, (
+            f"the request did not reach the handle the tick opened: {body!r}")
+
+    def case_at_the_cap_the_request_nulls_and_the_tick_rotates(
+            self, certdir, monkeypatch):
+        """The write side notices the cap and drops the reference — never
+        closes it, never reopens it — and the NEXT tick is what rotates.
+
+        Also covers the tick's OTHER trigger: a handle that crossed the cap
+        without any request thread ever writing past it (so nothing nulled
+        it) still gets rotated, because the tick checks the cap itself too.
+        """
+        import cswap_pin.proxy as pp
+
+        trace = self._arm(certdir)
+        monkeypatch.setattr(pp, "_TRACE_MAX_BYTES", 200)
+
+        proxy = self._proxy(certdir)
+        proxy._trace_tick()
+        assert proxy._debug is not None
+
+        crossed = False
+        for _ in range(50):
+            self._drive_one(proxy)
+            if proxy._debug is None:
+                crossed = True
+                break
+        assert crossed, "50 requests never crossed a 200-byte cap"
+        rotated = trace.with_suffix(trace.suffix + ".1")
+        assert not rotated.exists(), (
+            "the request thread rotated the file itself — it must only drop "
+            "the handle and leave rotation to the tick")
+
+        proxy._trace_tick()
+        assert proxy._debug is not None, "the tick did not reopen after the cap"
+        assert rotated.exists(), "the tick did not rotate the over-cap file"
+
+        # AND REQUESTS KEEP ANSWERING THROUGH ALL OF IT.
+        for _ in range(5):
+            self._drive_one(proxy)
+        assert trace.exists()
+
+        # THE TICK'S OWN CAP CHECK, independent of a write ever nulling the
+        # handle first: hand it a handle that is already over cap. Retick
+        # first so we hold a known-fresh handle rather than one the loop
+        # above may already have nulled.
+        proxy._trace_tick()
+        handle = proxy._debug
+        assert handle is not None
+        handle.write("x" * 300 + "\n")
+        assert not handle.closed
+        proxy._trace_tick()
+        assert proxy._debug is not handle, (
+            "the tick kept serving an over-cap handle nobody nulled")
+
+    def case_an_open_failure_on_the_tick_warns_once_and_never_raises(
+            self, certdir, monkeypatch):
+        """`_append_capped`'s own contract: "a trace that cannot be written is
+        a diagnostic that is missing, not a proxy that stops relaying" —
+        `_reopen_trace` holds to it, and does not spam a warning every 0.5s
+        tick either."""
+        import builtins
+        import io
+        import sys as _sys
+
+        trace = self._arm(certdir)
+        real_open = builtins.open
+
+        def _raising_open(path, *a, **kw):
+            if str(path) == str(trace):
+                raise OSError("no space left on device")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", _raising_open)
+        buf = io.StringIO()
+        monkeypatch.setattr(_sys, "stderr", buf)
+
+        proxy = self._proxy(certdir)
+        proxy._trace_tick()
+        assert proxy._debug is None, "an open() that raised left a handle"
+        proxy._trace_tick()
+        assert proxy._debug is None
+
+        self._drive_one(proxy)  # must not raise into the request
+
+        warnings = buf.getvalue().count("could not be")
+        assert warnings == 1, (
+            f"expected exactly one warning across two failing ticks, got "
+            f"{warnings}: {buf.getvalue()!r}")
+
+    def case_a_write_that_races_a_close_does_not_reach_the_request(self):
+        """`_write_capped_line`'s own null-safety, direct: a handle another
+        thread let go of and closed between the caller's ``is not None``
+        check and this call raises ValueError on ``write``, not OSError —
+        the same race `_append_capped` already guards against."""
+        import cswap_pin.proxy as pp
+
+        class _ClosedUnderUs:
+            closed = False
+
+            def write(self, _):
+                raise ValueError("I/O operation on closed file")
+
+            def tell(self):
+                return 0
+
+        assert pp._write_capped_line(_ClosedUnderUs(), "x\n") is None, (
+            "a handle that went away mid-write raised out of the trace and "
+            "into the relay")
+
+
 class TestProxyRequiresACredential:
     """The daemon listens on unauthenticated loopback and swaps the bearer of
     any request matching a pinned route. Loopback carries no identity — the
