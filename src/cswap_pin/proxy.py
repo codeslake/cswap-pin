@@ -4378,10 +4378,20 @@ def _dead_creator_bridge_ids() -> set[str]:
         rec[_CREATOR_PID_KEY] = pid
         tmp = path.with_name(f".state.json.cswap-{os.getpid()}")
         try:
-            tmp.write_text(json.dumps(rec), encoding="utf-8")
+            # 0600 AT CREATION, not after -- see `_carry_job_record`'s own
+            # note on this exact pattern. `write_text` makes the file 0644
+            # under the usual umask and widens a file CC itself writes 0600
+            # (bridgeOwnerAccountUuid, resumeSessionId, the session output
+            # tail all live in it).
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh)
             tmp.replace(path)
         except OSError:
-            pass  # best-effort: the next live call tries again
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass  # a temp we cannot remove must not abort the whole sweep
 
     out: set[str] = set()
     for path in (home / "jobs").glob("*/state.json"):

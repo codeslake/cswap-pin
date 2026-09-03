@@ -16880,7 +16880,12 @@ class TestDeadCreatorBridgeIdsIsPositiveEvidenceOnly:
     def _job(self, home, job_id, state):
         d = home / "jobs" / job_id
         d.mkdir(parents=True, exist_ok=True)
-        (d / "state.json").write_text(json.dumps(state))
+        path = d / "state.json"
+        path.write_text(json.dumps(state))
+        # SEEDED 0600, the way Claude Code itself writes this file -- the
+        # mode assertion below is meaningless against a file that started
+        # at the umask's default.
+        path.chmod(0o600)
 
     def _session(self, home, sid, pid, job_id):
         (home / "sessions" / f"{sid}.json").write_text(
@@ -16890,6 +16895,8 @@ class TestDeadCreatorBridgeIdsIsPositiveEvidenceOnly:
                                                        monkeypatch):
         """The ordinary case: stamped and read back in the same call, on a
         pid this test process itself is (definitely alive)."""
+        import stat
+
         from cswap_pin import proxy as pin_proxy
 
         home = self._home(tmp_path, monkeypatch)
@@ -16897,9 +16904,32 @@ class TestDeadCreatorBridgeIdsIsPositiveEvidenceOnly:
         self._job(home, "j1", {"bridgeSessionId": "cse_1"})
         dead = pin_proxy._dead_creator_bridge_ids()
         assert "cse_1" not in dead and "session_1" not in dead, dead
-        stamped = json.loads((home / "jobs" / "j1" / "state.json").read_text())
+        state_path = home / "jobs" / "j1" / "state.json"
+        stamped = json.loads(state_path.read_text())
         assert stamped[pin_proxy._CREATOR_PID_KEY] == os.getpid(), (
             "the stamp never landed even though the job was live")
+        mode = stat.S_IMODE(state_path.stat().st_mode)
+        assert mode == 0o600, (
+            f"the stamp widened Claude Code's own file to {oct(mode)} -- "
+            "it holds bridgeOwnerAccountUuid, resumeSessionId and the "
+            "session output tail")
+
+    def case_a_failed_stamp_leaves_no_temp_file_behind(self, tmp_path,
+                                                        monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._session(home, "s7", os.getpid(), "j7")
+        self._job(home, "j7", {"bridgeSessionId": "cse_7"})
+
+        def _boom(self, target):
+            raise OSError("ENOSPC")
+
+        monkeypatch.setattr(pin_proxy.Path, "replace", _boom)
+        pin_proxy._dead_creator_bridge_ids()
+        leftovers = list((home / "jobs" / "j7").glob(".state.json.cswap-*"))
+        assert leftovers == [], (
+            f"a failed stamp left a temp file behind: {leftovers}")
 
     def case_an_absent_session_record_with_a_live_stamped_pid_is_not_dead(
             self, tmp_path, monkeypatch):
