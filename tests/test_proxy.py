@@ -12625,6 +12625,106 @@ class TestAWedgeIsNotTrustedForever:
             srv.close()
 
 
+class TestAnAnswerBeforeAResetIsStillAnAnswer:
+    """`_serve_health` sends the full body and closes with the request's
+    trailing header bytes still unread -- `_handle_client` (`_read_line`)
+    reads only the request line before dispatching to `_serve_health`, which
+    answers and `conn.close()`s with `Host: 127.0.0.1\\r\\n\\r\\n` still
+    sitting unread in the kernel's receive buffer. close(2) with unread
+    receive data emits RST, not FIN, so EVERY real daemon's `/health` ends
+    this way -- and `_serving_can_pin`'s `except OSError: continue` threw the
+    complete answer away, three times, then returned False.
+
+    Measured on a live production pin, port 36301: the full 200 OK with
+    `"can_pin": true` was received in full, then `ConnectionResetError(104)`,
+    and `_serving_can_pin` returned False -- which recycles a healthy daemon
+    on every launch, fleet-wide.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_real_daemons_health_answer_survives_its_own_reset(
+            self, tmp_path):
+        """The real `_serve_health` path, over a real socket, called exactly
+        the way `_serving_can_pin` calls it -- not a stub."""
+        from cswap_pin.proxy import PinProxy, ensure_ca, _serving_can_pin
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        ensure_ca(certdir, "api.anthropic.com")
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        proxy.start()
+        try:
+            result = _serving_can_pin(proxy.port, timeout=2.0)
+            assert result is True, (
+                "a real daemon's /health answer, discarded by its own "
+                f"trailing RST, was not trusted: got {result!r}")
+        finally:
+            proxy.stop(drain=0)
+
+    def case_a_silent_socket_is_still_a_wedge(self):
+        """Control: a socket that connects and answers nothing must still
+        read False -- this change must not weaken that."""
+        from cswap_pin import proxy as pin_proxy
+
+        stub = _HealthStub(lambda n: None)
+        try:
+            t0 = time.monotonic()
+            result = pin_proxy._serving_can_pin(stub.port, timeout=0.3)
+            elapsed = time.monotonic() - t0
+        finally:
+            stub.close()
+        assert result is False, (
+            f"a genuinely silent socket stopped reading as a wedge: {result!r}")
+        assert elapsed >= 0.3, (
+            f"gave up before even one full-timeout attempt: {elapsed:.2f}s")
+
+    def case_a_full_answer_then_a_reset_is_trusted(self):
+        """A stub that writes the complete answer and then RESETS instead of
+        closing clean (SO_LINGER{1,0} forces RST on close) -- the same wire
+        shape a real daemon produces with its unread request bytes."""
+        import struct
+
+        from cswap_pin import proxy as pin_proxy
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+
+        def _serve():
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            conn.sendall(_health_ok({"can_pin": True}))
+            conn.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            conn.close()  # SO_LINGER{1,0} makes this send RST, not FIN
+
+        threading.Thread(target=_serve, daemon=True).start()
+        try:
+            result = pin_proxy._serving_can_pin(port, timeout=1.0)
+        finally:
+            srv.close()
+        assert result is True, (
+            f"an answer received before a reset was discarded: {result!r}")
+
+    def case_connect_refused_is_still_unknown(self):
+        """Control: a connect failure is a different population and must
+        stay None -- this change must not turn it into True or False."""
+        from cswap_pin import proxy as pin_proxy
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()  # nothing listening
+
+        result = pin_proxy._serving_can_pin(port, timeout=1.0)
+        assert result is None, (
+            f"a refused connection stopped reading as unknown: {result!r}")
+
+
 class TestClientRegistrationIsNotSwapped:
     """`client/presence` registers THIS process, not who owns the session.
 

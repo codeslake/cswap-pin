@@ -5183,7 +5183,7 @@ def last_arm_cutoff() -> int | None:
 # (`oauth.try_refresh_oauth_credentials`'s default `timeout_s=10.0`) --
 # 5+10+10+5+10 = 40s worst case. Set above that, or a healthy refresh that
 # is merely slow and contended gets cut off as if it were stalled.
-_MINT_LOCK_BOUND_S = 40.0
+_MINT_LOCK_BOUND_S = 45.0
 
 
 def make_pin_token_provider(switcher, account_num: str, email: str):
@@ -8126,21 +8126,21 @@ def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
             sk = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         except OSError:
             return None
+        buf = b""
         try:
             with sk:
                 sk.settimeout(timeout)
                 sk.sendall(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                buf = b""
                 while len(buf) < 65536:
                     chunk = sk.recv(4096)
                     if not chunk:
                         break
                     buf += chunk
         except OSError:
-            continue  # connected, then nothing -- a wedge, not "nobody there"
+            pass  # a reset AFTER a full answer is still an answer -- see below
+        if b"\r\n\r\n" not in buf:
+            continue  # connected, but no full answer either -- a wedge
         parts = buf.split(b"\r\n\r\n", 1)
-        if len(parts) != 2:
-            continue  # connected, but no full answer either -- same wedge
         try:
             body = json.loads(parts[1])
         except ValueError:
@@ -11623,7 +11623,7 @@ class PinProxy:
         The only place `self._debug`/`self._shape` are opened, rotated or
         re-targeted now. `_serve_client` and the CSWAP_PIN_SHAPE writer only
         ever write to whatever this leaves open, or drop the line — see
-        `_write_capped_line`. Called from `_title_sweep_loop`'s inner wait, so
+        `_write_capped_line`. Runs on its own `_trace_tick_loop` thread, so
         this runs at worst every 0.5s, which is not on the request path.
 
         A line written between a re-arm (or a cap crossing) and the next tick
@@ -14892,10 +14892,10 @@ class PinProxy:
         # the PREVIOUS request's send and report a wait longer than the
         # request itself.
         self._local.t_sent = None
-        # THE REQUEST PATH NEVER OPENS THIS FILE. `_trace_tick` (off this
-        # thread, on `_title_sweep_loop`'s beat) is the only place that opens,
-        # rotates or re-targets `self._debug` now; this thread only writes to
-        # whatever it finds already open, or drops the line — see
+        # THE REQUEST PATH NEVER OPENS THIS FILE. `_trace_tick` (on its own
+        # `_trace_tick_loop` thread) is the only place that opens, rotates or
+        # re-targets `self._debug` now; this thread only writes to whatever
+        # it finds already open, or drops the line — see
         # `_write_capped_line`. Opening from here, shared by every
         # `_serve_client` thread, is what parked 342 of them inside one
         # `open(2)` call while a stalled filesystem let the rest of the daemon
