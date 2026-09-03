@@ -94,7 +94,8 @@ jobs:
           S="$(mktemp -d)"
           HOME="$S" XDG_DATA_HOME="$S/.local/share" \
             uv run --with pytest --with pytest-xdist --with cryptography \
-            --with claude-swap \
-            python -m pytest tests/ -q -p no:randomly \
+            --with pytest-timeout --with claude-swap \
+            python -m pytest tests/ -v -p no:randomly \
             -n "$WORKERS" \
-            -m "not needs_host_seam"
+            -m "not needs_host_seam" \
+            --timeout=300 -o faulthandler_timeout=280
