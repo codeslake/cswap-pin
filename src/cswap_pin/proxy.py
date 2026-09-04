@@ -11606,6 +11606,14 @@ class PinProxy:
         """
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
+        # CLEARED HERE, BEFORE THE THREAD EXISTS TO SEE IT. `release_listener`
+        # sets this to wake a title thread it is about to join and never
+        # clears it back — so a restart (`_resume_serving` after a handover
+        # that failed to come up) used to hand the new thread a pre-set
+        # event: its first wait returned instantly, the first-pass budget
+        # burned to zero, and the sweep hit the wire immediately instead of
+        # after its beat.
+        self._sweep_wake.clear()
         self._title_thread = threading.Thread(
             target=self._title_sweep_loop, daemon=True)
         self._title_thread.start()

@@ -11530,6 +11530,46 @@ class TestTheDaemonWatchesItsOwnCode:
             squat.close()
             srv2.stop(drain=0)
 
+    def case_a_resumed_title_sweep_waits_its_beat_instead_of_spinning(
+        self, tmp_path
+    ):
+        """`release_listener` sets `_sweep_wake` and never clears it, so the
+        NEW title thread `_resume_serving`'s `start()` launches inherits an
+        ALREADY-SET event: its first `wait(0.5)` returns at once, the
+        `_TITLE_SWEEP_FIRST_S` budget burns to zero in microseconds, and
+        `sweep_titles_once` fires immediately after a resume instead of
+        after the first-pass beat.
+
+        `_list_bridges` is stubbed, unlike the neighbouring resume case
+        above -- the bug this proves is about the CLOCK the beat is
+        supposed to enforce, not the network call the clock gates, and an
+        assertion racing a real HTTPS request would not discriminate.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = self._certdir(tmp_path)
+        calls: list[str] = []
+        srv = pin_proxy.PinProxy(certdir, lambda: "tok")
+        srv._list_bridges = lambda token: calls.append(token) or []
+        srv.start()
+        srv.release_listener()
+
+        assert pin_proxy._resume_serving(srv) is True
+        tt = srv._title_thread
+        try:
+            time.sleep(1.0)
+            assert calls == [], (
+                "a resumed title sweep spun to the wire instead of "
+                f"waiting its beat: {calls}")
+            assert not srv._sweep_wake.is_set(), (
+                "the resumed title thread's wake was already set, so its "
+                "wait is a no-op")
+        finally:
+            srv.stop(drain=0)
+        assert not tt.is_alive(), (
+            "the resumed title-sweep thread was still running after "
+            "stop()'s join budget, so nobody can join it again")
+
     def case_daemon_main_starts_the_watchdog(self):
         """The watchdog must be WIRED IN, not merely defined.
 
