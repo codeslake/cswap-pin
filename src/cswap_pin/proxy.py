@@ -11231,7 +11231,7 @@ def policy_limits_for(token: "str | None") -> "dict | None":
 
 
 #: Claude Code re-fetches its profile once `oauthAccount.profileFetchedAt` is a
-#: day old (2.1.257 `Spe`: 86400000 ms) and writes the answer into the field
+#: day old (2.1.261 `Spe`: 86400000 ms) and writes the answer into the field
 #: WHOLE, account uuid included. That fetch travels as the ACTIVE account, so
 #: on a pinned machine it is the write that moves the field off the pin. A
 #: spliced identity younger than this never opens that gate.
