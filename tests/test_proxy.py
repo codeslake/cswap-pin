@@ -17192,6 +17192,41 @@ class TestDeadCreatorBridgeIdsIsPositiveEvidenceOnly:
         dead = pin_proxy._dead_creator_bridge_ids()
         assert "cse_6" not in dead and "session_6" not in dead, dead
 
+    def case_a_removed_job_dir_is_still_dead_from_the_in_process_record(
+            self, tmp_path, monkeypatch):
+        """Claude Code deletes `jobs/<id>/` when it settles the job -- often
+        within seconds of the creator dying. Once that directory is gone the
+        stamp this function wrote is gone with it, but the pid was POSITIVE
+        evidence when it was recorded, and the pin must not forget that just
+        because the file it also wrote it to is gone."""
+        import shutil
+        import subprocess
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_creator_pid_by_bridge", {},
+                           raising=False)
+        home = self._home(tmp_path, monkeypatch)
+        proc = subprocess.Popen(["sleep", "30"])
+        self._session(home, "s8", proc.pid, "j8")
+        self._job(home, "j8", {"bridgeSessionId": "cse_8"})
+        # STAMP while the creator is still alive -- the job dir exists and
+        # `_dead_creator_bridge_ids` writes the pid into it (and, after this
+        # fix, into its own in-process record too).
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert "cse_8" not in dead and "session_8" not in dead, dead
+
+        proc.terminate()
+        proc.wait()
+        # THE JOB DIRECTORY IS REMOVED, not merely left unstamped -- the
+        # settle CC performs after killing the creator.
+        shutil.rmtree(home / "jobs" / "j8")
+
+        dead = pin_proxy._dead_creator_bridge_ids()
+        assert {"cse_8", "session_8"} & dead, (
+            f"a bridge whose creator died was not named dead once its "
+            f"job record was removed: {dead}")
+
 class TestTheSweepClosesADeadCreatorsTwin:
     """A twin THIS HOST minted, whose creating process has since died, is
     closed even while merely `disconnected` -- Claude Code may never get
@@ -19127,6 +19162,52 @@ class TestTheSpliceHoldsTheConfigLock:
             "cse_LIVE", "cse_NOSTAMP"], (
             "an exited session's shutdown flush was reported deaf, or a "
             "real one was hidden with it")
+
+    def case_a_dead_creators_removed_job_dir_is_still_not_a_deaf_bridge(
+            self, tmp_path, monkeypatch):
+        """The same shape as the case above, but Claude Code has already
+        removed `jobs/<id>/` by the time `deaf_bridges` runs -- the shape
+        measured in production, where the settle that deletes the job dir
+        lands about a second after the creator dies. Only the sweep's
+        earlier stamp (still in memory) can tell this from an ordinary
+        deaf bridge now."""
+        import shutil
+        import subprocess
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_creator_pid_by_bridge", {},
+                           raising=False)
+        home = tmp_path / "cfg"
+        (home / "jobs" / "j_dead").mkdir(parents=True)
+        (home / "jobs" / "j_dead" / "state.json").write_text(json.dumps(
+            {"bridgeSessionId": "cse_DEAD"}))
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
+                            lambda: home)
+
+        # THE SWEEP'S EARLIER PASS, while the creator and its job dir were
+        # both still there -- this is where the in-process record is born.
+        proc = subprocess.Popen(["sleep", "30"])
+        (home / "sessions").mkdir()
+        (home / "sessions" / "s1.json").write_text(json.dumps(
+            {"pid": proc.pid, "jobId": "j_dead"}))
+        pin_proxy._dead_creator_bridge_ids()
+
+        proc.terminate()
+        proc.wait()
+        shutil.rmtree(home / "jobs" / "j_dead")  # the settle CC runs on kill
+
+        now = _time.monotonic()
+        me = _t.SimpleNamespace(
+            _bridge_posts={"cse_DEAD": now},
+            held_bridge_ids=lambda: set(),
+            _connected_bridges={"cse_DEAD"})
+        assert pin_proxy.PinProxy.deaf_bridges(me, now=now) == [], (
+            "a dead creator's bridge was reported deaf once its job "
+            "directory was removed")
 
     def case_deaf_bridges_never_stamps_from_the_request_thread(
             self, tmp_path, monkeypatch):

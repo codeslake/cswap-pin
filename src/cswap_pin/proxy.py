@@ -4320,6 +4320,14 @@ def _live_bridge_ids() -> set[str]:
 #: one before it can ever read one back.
 _CREATOR_PID_KEY = "cswapPinCreatorPid"
 
+#: The same binding, kept IN MEMORY. Claude Code removes `jobs/<id>/`
+#: whole once it settles a job -- sometimes inside a second of the creator
+#: dying -- taking the file-only stamp with it before anything ever reads
+#: it back. This copy is what survives that removal; it does not survive a
+#: restart of THIS process, so a successor after a handover still depends
+#: on the file for whatever job records it inherits.
+_creator_pid_by_bridge: dict[str, int] = {}
+
 
 def _dead_creator_bridge_ids(stamp: bool = True) -> set[str]:
     """Bridge ids named in a job record THIS HOST wrote, whose creating
@@ -4367,6 +4375,7 @@ def _dead_creator_bridge_ids(stamp: bool = True) -> set[str]:
             rec = _read_json(path)
             if not isinstance(rec, dict) or not rec.get("bridgeSessionId"):
                 continue
+            _creator_pid_by_bridge[str(rec["bridgeSessionId"])] = pid
             if rec.get(_CREATOR_PID_KEY) == pid:
                 continue  # already agrees -- no write, no contention with CC
             rec[_CREATOR_PID_KEY] = pid
@@ -4388,17 +4397,35 @@ def _dead_creator_bridge_ids(stamp: bool = True) -> set[str]:
                     pass  # a temp we cannot remove must not abort the whole sweep
 
     out: set[str] = set()
+    seen: set[str] = set()
     for path in (home / "jobs").glob("*/state.json"):
         rec = _read_json(path)
         if not isinstance(rec, dict):
             continue
         bridge, pid = rec.get("bridgeSessionId"), rec.get(_CREATOR_PID_KEY)
-        if not bridge or not isinstance(pid, int):
+        if not bridge:
+            continue
+        seen.add(str(bridge))
+        if not isinstance(pid, int):
             continue
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             out.update(_both_spellings(str(bridge)))
+        except Exception:  # noqa: BLE001 — unknown resolves to KEEP
+            continue
+
+    # THE JOB DIRECTORY CAN BE GONE BY NOW -- see `_creator_pid_by_bridge`.
+    # A bridge whose job record still exists was already judged above and
+    # is skipped here; this only covers the ones the file-only pass can no
+    # longer see at all.
+    for bridge, pid in _creator_pid_by_bridge.items():
+        if bridge in seen:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            out.update(_both_spellings(bridge))
         except Exception:  # noqa: BLE001 — unknown resolves to KEEP
             continue
     return out
