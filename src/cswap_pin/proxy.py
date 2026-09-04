@@ -4425,7 +4425,7 @@ def _dead_creator_bridge_ids(stamp: bool = True) -> set[str]:
     # A bridge whose job record still exists was already judged above and
     # is skipped here; this only covers the ones the file-only pass can no
     # longer see at all.
-    for bridge, pid in _creator_pid_by_bridge.items():
+    for bridge, pid in list(_creator_pid_by_bridge.items()):
         if bridge in seen:
             continue
         try:

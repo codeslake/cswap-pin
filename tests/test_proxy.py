@@ -17227,6 +17227,32 @@ class TestDeadCreatorBridgeIdsIsPositiveEvidenceOnly:
             f"a bridge whose creator died was not named dead once its "
             f"job record was removed: {dead}")
 
+    def case_a_concurrent_insert_during_the_fallback_loop_does_not_raise(
+            self, tmp_path, monkeypatch):
+        """The fallback loop over `_creator_pid_by_bridge` (line 4428) is
+        what a request-thread caller (`stamp=False`) runs when a bridge's
+        job record is already gone. The sweep thread inserts into that same
+        dict at line 4384 -- unserialized, on its own thread -- so a plain
+        `.items()` iteration here can see the dict change size mid-loop and
+        raise RuntimeError, which `_report_deaf_bridges`'s own try/except
+        then swallows as a dropped report cycle rather than a crash."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        monkeypatch.setattr(pin_proxy, "_creator_pid_by_bridge",
+                           {"cse_A": 111111, "cse_B": 222222}, raising=False)
+
+        def _kill(pid, sig):
+            if pid == 111111:
+                # THE SWEEP THREAD, landing mid-loop: a fresh stamp changes
+                # the dict's size while this loop is still iterating it.
+                pin_proxy._creator_pid_by_bridge["cse_C"] = 333333
+            raise ProcessLookupError()
+
+        monkeypatch.setattr(pin_proxy.os, "kill", _kill)
+        dead = pin_proxy._dead_creator_bridge_ids(stamp=False)
+        assert {"cse_A", "session_A"} & dead, dead
+
 class TestTheSweepClosesADeadCreatorsTwin:
     """A twin THIS HOST minted, whose creating process has since died, is
     closed even while merely `disconnected` -- Claude Code may never get
