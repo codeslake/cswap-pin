@@ -2703,6 +2703,12 @@ _WORKER_SUBTREE = re.compile(r"^/v1/(code/)?sessions/[^/]+/worker(/|$|\?)")
 # GET held open for the life of the session, so it cannot migrate on
 # `Connection: close` the way a reply does — it has to be closed.
 _EVENT_STREAM = re.compile(r"/worker/events/stream")
+# A PIN-BROKERED RE-REGISTRATION IS A BIRTH TOO. `POST .../<id>/bridge`
+# mints the id again exactly as a create does, but matches neither pattern
+# above, so `_note_bridge_traffic` dropped it before the startup grace ever
+# saw it -- unreachable for an id whose create predates this daemon (a
+# handover, or one this daemon never served at all).
+_BRIDGE_REGISTER = re.compile(r"^/v1/(code/)?sessions/[^/]+/bridge(/|$|\?)")
 
 # The session id inside a worker path, which is the bridge the call belongs
 # to. Same shape as the routes above, captured rather than merely matched.
@@ -12253,13 +12259,13 @@ class PinProxy:
     def _reset_bridge_traffic(self) -> None:
         """Start the per-bridge accounting. Safe to call more than once."""
         self._bridge_posts: dict = {}
-        #: bridge id -> monotonic instant of the FIRST post this daemon saw
-        #: from it, never overwritten, and set ONLY for a bridge whose
-        #: create THIS daemon served within the startup grace. A bridge
-        #: inherited on a handover, or one whose create predates this
-        #: daemon's own `_last_create`, never gets an entry and is judged
-        #: at once. `deaf_bridges` uses this to give a just-registered
-        #: bridge time to open its stream.
+        #: bridge id -> monotonic instant of its most recent birth here:
+        #: either a create THIS daemon served within the startup grace, or
+        #: a pin-brokered `.../bridge` re-registration (always, and
+        #: REASSIGNED on each one, since a re-registration is a new birth).
+        #: A bridge inherited on a handover, with neither, never gets an
+        #: entry and is judged at once. `deaf_bridges` uses this to give a
+        #: just-registered bridge time to open its stream.
         self._bridge_first_post: dict = {}
         #: monotonic instant of the last `POST /v1/code/sessions` this
         #: daemon itself served, or None. Tells a bridge born here from one
@@ -12286,12 +12292,23 @@ class PinProxy:
         failure here would cost a request rather than a statistic.
         """
         try:
-            if not (_WORKER_SUBTREE.search(path) or _EVENT_STREAM.search(path)):
+            is_register = _BRIDGE_REGISTER.search(path)
+            if not (is_register or _WORKER_SUBTREE.search(path)
+                    or _EVENT_STREAM.search(path)):
                 return
             bid = _BRIDGE_ID.search(path)
             if not bid:
                 return
             stamp = time.monotonic() if now is None else now
+            if is_register:
+                # A NEW BIRTH, so an ASSIGNMENT, not `setdefault`: a
+                # re-registration replaces whatever grace an earlier life
+                # of this id earned, exactly as a fresh create would.
+                # `_bridge_posts` is untouched -- the register itself is
+                # not a worker post, and `deaf_bridges` must still judge
+                # this id only once it has actually posted.
+                self._bridge_first_post[bid.group(1)] = stamp
+                return
             if _EVENT_STREAM.search(path):
                 if conn is not None:
                     self._stream_owner[conn] = bid.group(1)

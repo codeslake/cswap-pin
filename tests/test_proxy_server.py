@@ -6620,6 +6620,82 @@ class TestDrainReportsWhatItCut:
             "nothing to do with it: "
             + repr(old.deaf_bridges(window=60.0, now=202.0)))
 
+    def case_a_bridge_reregistered_through_bridge_is_not_yet_deaf(self):
+        """A pin-brokered re-registration is a birth too, not only a create.
+
+        Measured after the 0.1.245 fix above: `pin=cse_X`'s worker POST hit
+        `deaf_bridges` a second after `POST .../<id>/bridge 200`, because
+        `/bridge` matches neither `_WORKER_SUBTREE` nor `_EVENT_STREAM` and
+        was dropped by `_note_bridge_traffic`'s own guard before it ever
+        reached the accounting -- no create had run in this daemon's life
+        either, so the startup grace (case above) never applied. The fix
+        must record `/bridge` as a birth of its own.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._reset_bridge_traffic()
+        srv._live_lock = threading.Lock()
+        srv._stream_conns = set()
+        srv._open_conns = set()
+        srv._stream_lost = {}
+        srv._connected_bridges = {"cse_X"}
+
+        REGISTER = "/v1/code/sessions/cse_X/bridge"
+        EVENTS = "/v1/code/sessions/cse_X/worker/events"
+
+        # NO CREATE EVER SERVED: `_last_create` stays None, so the only
+        # thing that can shield cse_X is the `/bridge` registration itself.
+        srv._note_bridge_traffic(REGISTER, now=100.0)
+        srv._note_bridge_traffic(EVENTS, now=100.5)
+        assert srv.deaf_bridges(now=101.0) == [], (
+            "a bridge re-registered through the pin's own /bridge route "
+            "was named deaf before its stream GET had a chance to arrive: "
+            + repr(srv.deaf_bridges(now=101.0)))
+        past_grace = 100.0 + pp._DEAF_STARTUP_GRACE_S + 1.0
+        assert srv.deaf_bridges(now=past_grace) == ["cse_X"], (
+            "the grace never expires, so a re-registered bridge that truly "
+            "never opened its ear is never reported: "
+            + repr(srv.deaf_bridges(now=past_grace)))
+
+        # THE 409 INTERACTION. A worker POST superseded by a 409 pops both
+        # `_bridge_posts` and `_bridge_first_post` (`_note_bridge_superseded`).
+        # A re-registration AFTER that pop must still earn a fresh grace; a
+        # 409 with no re-registration must never resurrect the id.
+        srv2 = pp.PinProxy.__new__(pp.PinProxy)
+        srv2._reset_bridge_traffic()
+        srv2._live_lock = threading.Lock()
+        srv2._stream_conns = set()
+        srv2._open_conns = set()
+        srv2._stream_lost = {}
+        srv2._connected_bridges = {"cse_Y"}
+        REGISTER_Y = "/v1/code/sessions/cse_Y/bridge"
+        WORKER_Y = "/v1/code/sessions/cse_Y/worker/events"
+
+        srv2._note_bridge_traffic(REGISTER_Y, now=200.0)
+        srv2._note_bridge_traffic(WORKER_Y, now=200.5)
+        srv2._note_bridge_superseded(WORKER_Y, b"HTTP/1.1 409 Conflict")
+        assert srv2.deaf_bridges(now=201.0) == [], (
+            "a 409 with no re-registration must not resurrect the id: "
+            + repr(srv2.deaf_bridges(now=201.0)))
+        assert "cse_Y" not in srv2._bridge_first_post, (
+            "the 409 must clear the birth stamp along with the post, or a "
+            "later unrelated post inherits a grace that is not its own")
+
+        # NOW RE-REGISTER, and the fresh `/bridge` must earn a fresh grace
+        # rather than staying judged from the stale, popped birth.
+        srv2._note_bridge_traffic(REGISTER_Y, now=202.0)
+        srv2._note_bridge_traffic(WORKER_Y, now=202.5)
+        assert srv2.deaf_bridges(now=203.0) == [], (
+            "a re-registration after a 409 was not graced: "
+            + repr(srv2.deaf_bridges(now=203.0)))
+        past_grace_y = 202.0 + pp._DEAF_STARTUP_GRACE_S + 1.0
+        assert srv2.deaf_bridges(now=past_grace_y) == ["cse_Y"], (
+            "the re-registration's own grace never expired: "
+            + repr(srv2.deaf_bridges(now=past_grace_y)))
+
     def case_a_stream_that_reopens_within_the_dwell_is_never_marked_deaf(
             self, monkeypatch):
         """`daemon.log` line 300 on a mac: `1 of 3 bridge(s) post but hold no
