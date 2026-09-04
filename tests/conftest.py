@@ -402,6 +402,22 @@ def _short_hop_budgets(monkeypatch):
     monkeypatch.setattr(_p, "_CHAIN_HEAL_POLL_S", 0.05, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _creator_pid_by_bridge_starts_empty(monkeypatch):
+    """Reset the sweep's in-process `bridge -> creator pid` record before
+    every test.
+
+    A few cases stamp real pids into it directly (bypassing the job-record
+    read) to exercise the in-process fallback in `_dead_creator_bridge_ids`.
+    Without a reset that dict is the real module global, so a stamp one
+    case leaves behind is still there for the next one to read -- order-
+    fragile, since only distinct bridge ids across cases hide it today.
+    """
+    from cswap_pin import proxy as _p
+
+    monkeypatch.setattr(_p, "_creator_pid_by_bridge", {}, raising=False)
+
+
 _STANDBY_ARG = "--standby"
 
 
