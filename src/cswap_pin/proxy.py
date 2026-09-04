@@ -11271,11 +11271,15 @@ def profile_identity_from(doc, now_ms=None) -> "dict | None":
         "claudeCodeTrialDurationDays": org.get("claude_code_trial_duration_days"),
         "seatTier": org.get("seat_tier"),
         "profileFetchedAt": int(time.time() * 1000 if now_ms is None else now_ms),
-        # No `??` on CC's side for this one: a server null is stored as JSON
-        # `null`, not omitted, or CC's gate (`!== void 0`) reads the omission
-        # as unset and re-fetches.
-        "accountCreatedAt": acct.get("created_at"),
     }
+    # No `??` on CC's side for `created_at`: a server null is stored as JSON
+    # `null`, not omitted, or CC's gate (`!== void 0`) reads the omission as
+    # unset and re-fetches. But `acct.get(...)` cannot tell that null apart
+    # from an absent key, and an absent key IS what CC's own writer produces
+    # (`JSON.stringify` drops the `undefined` property) -- so the key itself
+    # tracks presence in `acct`, not just its value.
+    if "created_at" in acct:
+        out["accountCreatedAt"] = acct.get("created_at")
     # `?? void 0` on CC's side: absent when the server sends nothing, never null.
     for key, val in (("emailAddress", acct.get("email")),
                      ("organizationUuid", org.get("uuid")),
