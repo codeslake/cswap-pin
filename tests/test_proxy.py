@@ -18885,6 +18885,37 @@ class TestTheSpliceHoldsTheConfigLock:
         doc["account"]["uuid"] = ""
         assert pin_proxy.profile_identity_from(doc, now_ms=1) is None
 
+    def case_a_null_account_created_at_round_trips_as_null_not_absent(self):
+        """CC's writer has no `?? void 0` on `accountCreatedAt` (unlike
+        `billingType`/`subscriptionCreatedAt`, which do): a server null is
+        stored as JSON `null`, and CC's re-fetch gate reads `null !== void 0`
+        as true, so the gate stays shut. Omitting the key here instead makes
+        CC read `void 0` and re-fetch -- which is the write that moves the
+        identity off the pin."""
+        from cswap_pin import proxy as pin_proxy
+
+        doc = {"account": {"uuid": "PIN", "email": "p@x", "created_at": None},
+               "organization": {"uuid": "ORG", "billing_type": "stripe",
+                                "subscription_created_at": "2026-02-10",
+                                "cc_onboarding_flags": None,
+                                "seat_tier": None,
+                                "has_extra_usage_enabled": None}}
+        got = pin_proxy.profile_identity_from(doc, now_ms=1)
+        assert "accountCreatedAt" in got, got
+        assert got["accountCreatedAt"] is None, got
+        # CONTROL: a non-null value still round-trips unchanged.
+        doc["account"]["created_at"] = "2026-02-08"
+        got2 = pin_proxy.profile_identity_from(doc, now_ms=1)
+        assert got2["accountCreatedAt"] == "2026-02-08", got2
+        # CONTROL: the deliberate asymmetry stands -- billingType and
+        # subscriptionCreatedAt stay ABSENT on a server null, unlike
+        # accountCreatedAt above.
+        doc["organization"]["billing_type"] = None
+        doc["organization"]["subscription_created_at"] = None
+        got3 = pin_proxy.profile_identity_from(doc, now_ms=1)
+        assert "billingType" not in got3, got3
+        assert "subscriptionCreatedAt" not in got3, got3
+
     def case_remembering_never_downgrades_a_fresher_profile(self, tmp_path):
         """The host hands over the pinned slot's stored config; the daemon
         refreshes the file from the server. Same account, newer stamp on disk:
