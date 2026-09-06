@@ -7801,7 +7801,9 @@ class TestDrainReportsWhatItCut:
 
         lines = []
         real_log = pp._log_lifecycle
+        real_pids = pp._pin_daemon_pids
         pp._log_lifecycle = lines.append
+        pp._pin_daemon_pids = lambda _c: [os.getpid()]
         try:
             srv = pp.PinProxy.__new__(pp.PinProxy)
             srv._reset_bridge_traffic()
@@ -7848,6 +7850,7 @@ class TestDrainReportsWhatItCut:
                 f"draining, must still get the ordinary MARK: {lines[-1]!r}")
         finally:
             pp._log_lifecycle = real_log
+            pp._pin_daemon_pids = real_pids
 
     def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
         """Nothing recorded whether a claude.ai attachment ever downloaded.
