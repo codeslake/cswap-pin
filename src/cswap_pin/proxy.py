@@ -16563,9 +16563,12 @@ def _relay_response(
     # token gives the client's own oauth-refresh recovery exactly 2 tries
     # before it gives up hard, so synthesizing a 401 when nothing actually
     # moved would turn a rate limit into a dead session.
-    if (status_line.startswith(b"HTTP/1.1 429")
-            and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
-            and _switch_off_walled_account()):
+    _walled_401 = (
+        status_line.startswith(b"HTTP/1.1 429")
+        and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
+        and _switch_off_walled_account()
+    )
+    if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
                 f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
@@ -16621,6 +16624,16 @@ def _relay_response(
             chunked = True
         elif kl == b"connection" and b"close" in vl:
             keep = False
+        if _walled_401 and kl in (
+            b"retry-after", b"anthropic-ratelimit-unified-reset"
+        ):
+            # BOTH ARE WRONG ON A 401. `retry-after` above 60s makes the
+            # client's own auth-recovery throw `api_request_retry_after_too_long`
+            # and kill the turn outright — a rate limit's retry-after is
+            # routinely well above that, so leaving it in place turns a
+            # 44-minute stall into a dead one. The reset header is simply
+            # meaningless here; drop it so it cannot be mistaken for one.
+            continue
         if kl in _HOP_BY_HOP_BYTES:
             continue
         out.append(line)

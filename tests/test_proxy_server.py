@@ -11741,6 +11741,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         run_cases(self, request, tmp_path_factory)
 
     RESET_HEADER = b"anthropic-ratelimit-unified-reset: 9999999999"
+    RETRY_AFTER = b"retry-after: 3600"
 
     @staticmethod
     def _wire(monkeypatch, switched):
@@ -11776,6 +11777,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             up_b.sendall(
                 b"HTTP/1.1 429 Too Many Requests\r\n"
                 + cls.RESET_HEADER + b"\r\n"
+                + cls.RETRY_AFTER + b"\r\n"
                 b"Content-Length: 2\r\n\r\nno")
             up_b.shutdown(_s.SHUT_WR)
             pp._relay_response(up_a, cl_a, 0, method="POST", path=path)
@@ -11794,6 +11796,21 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             f"re-reads the credential file on a client rebuild, and a rate "
             f"limit alone never triggers one: {got!r}")
 
+    def case_a_401_carries_neither_rate_limit_header(self, monkeypatch):
+        """`retry-after` above 60s makes CC's own auth recovery throw
+        `api_request_retry_after_too_long` and kill the turn outright — a
+        rate limit's retry-after is routinely well above that, so leaving it
+        on a synthesized 401 turns a 44-minute stall into a dead one. The
+        reset header is simply meaningless on an auth response."""
+        self._wire(monkeypatch, switched=True)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got
+        assert b"retry-after" not in got.lower(), (
+            f"a 401 with retry-after: 3600 kills the client's turn outright: "
+            f"{got!r}")
+        assert self.RESET_HEADER not in got, (
+            f"a rate-limit header on an auth response: {got!r}")
+
     def case_no_headroom_anywhere_relays_the_429_untouched(self, monkeypatch):
         self._wire(monkeypatch, switched=False)
         got = self._relay()
@@ -11805,6 +11822,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.RESET_HEADER in got, (
             f"the reset header must be byte-identical when nothing was "
             f"walled: {got!r}")
+        assert self.RETRY_AFTER in got, (
+            f"retry-after must be byte-identical when nothing was walled: "
+            f"{got!r}")
 
     def case_a_second_429_on_the_same_wall_is_relayed_untouched(self, monkeypatch):
         """THE AMENDMENT. A retry that reused the stale bearer, or a second
