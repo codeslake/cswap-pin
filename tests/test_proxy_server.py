@@ -7896,7 +7896,12 @@ class TestDrainReportsWhatItCut:
             srv._connected_bridges = {"cse_ABORT"}
             # A REAL, MEASURED AGE: this process itself once held the stream
             # and lost it, so `deaf_for` answers a number, never None.
-            srv._stream_lost["cse_ABORT"] = time.monotonic() - 42
+            # -42.4, NOT -42: `int(age)` truncates in `_with_deaf_age`, and
+            # the I/O between this stamp and the read (announce_draining's
+            # own `_collect_dead_markers` scan) only adds time, never
+            # removes it. The 0.6s of headroom below the 43s rounding
+            # boundary is what a loaded runner needs to still read 42.
+            srv._stream_lost["cse_ABORT"] = time.monotonic() - 42.4
 
             # THE DRAIN STARTS, and while it runs this bridge looks deaf.
             done = pp.announce_draining(certdir, os.getpid())
