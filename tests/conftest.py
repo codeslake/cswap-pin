@@ -492,7 +492,10 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
 
     Matched on the certdir being the LAST argv token, which is how the product
     identifies its own daemons — so a test certdir can never select the live
-    pin, whose certdir is the real backup dir.
+    pin, whose certdir is the real backup dir. The match is "equal to, or
+    under, this path": passing a crashed run's ROOT here (rather than one
+    certdir) reaps everything under it, since that root's own certdir is
+    gone from the CURRENT run's target set (a fresh ``tmp_path`` every time).
     """
     import os
     import subprocess
@@ -531,7 +534,8 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
             pid_s, _, cmd = line.strip().partition(" ")
             if "cswap_pin.proxy" not in cmd:
                 continue
-            if not any(cmd.rstrip().endswith(" " + t) for t in targets):
+            tail = cmd.rstrip().rpartition(" ")[2]
+            if not any(tail == t or tail.startswith(t + "/") for t in targets):
                 continue
             try:
                 pid = int(pid_s)
@@ -580,6 +584,104 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
                     pass
             return
         time.sleep(0.2)
+
+
+def _root_owner_alive(root) -> bool:
+    """Whether ``root`` is CLAIMED by a session this sweep must not touch.
+
+    Every numbered root pytest makes for a session (``.../pytest-of-<user>/
+    pytest-N``) carries a ``.lock`` file stamped with that session's own pid
+    (`_pytest.pathlib.create_cleanup_lock`), held for the session's whole
+    life and unlinked only on a clean exit. Reading that pid and asking the
+    kernel whether it still exists is a measurement, not an age guess — a
+    crashed run leaves the lock behind with a pid that is already gone, and a
+    live sibling run's lock names a pid that answers.
+
+    NO LOCK, NO CLAIM — and an unreadable claim must fail toward LEAVING THE
+    PROCESS ALONE, so a root with no ``.lock``, or one this can't parse,
+    reads as owned (True) rather than dead. This matters under xdist: a
+    worker's own root is ``<pytest-N>/popen-gwK``, and its sibling
+    ``popen-gw*`` roots (the OTHER workers of the same run) carry no
+    ``.lock`` at all — reading that as "dead" would make one worker reap the
+    other three's live daemons mid-run. A crashed run's root still HAS its
+    lock, naming a pid that's gone (the lock is `atexit`-removed, which
+    `os._exit` skips) — that case still returns False and is still reaped.
+
+    Liveness is read inline with ``os.kill(pid, 0)`` rather than via
+    ``cswap_pin.proxy._pid_alive`` — this file already calls ``os.kill``
+    directly elsewhere, and importing the product here would move that
+    import from collection into this hook, which has no exception guard: a
+    missing host would then abort the whole session (`INTERNALERROR`, zero
+    tests) instead of failing at collection, which is the documented
+    signature for that case.
+
+    A pid the kernel rejects as absent (``ProcessLookupError``) is dead:
+    sweepable. ``PermissionError`` (EPERM) means the pid EXISTS, owned by
+    someone else — the opposite of ``_pid_alive``'s reading, which returns
+    False on EPERM; correct for the product deciding whether IT can signal a
+    pid, wrong for a reaper deciding whether to touch one. Anything else this
+    can raise (a malformed or oversized pid: ``OverflowError``,
+    ``ValueError``) is not a usable claim either way, so it also reads as
+    owned.
+    """
+    import os
+
+    lock = pathlib.Path(root) / ".lock"
+    try:
+        pid = int(lock.read_text().strip())
+    except (OSError, ValueError):
+        return True
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def pytest_sessionstart(session) -> None:
+    """Reap a crashed run's pin daemons before this run spawns any of its own.
+
+    `_reap_pin_processes` only ever matched one exact certdir, which is
+    always the CURRENT run's — a run that died before its `finally` (a
+    leaked daemon thread reaching `os._exit`, or a SIGKILL) leaves its
+    daemons for nobody, because the next run's fresh `tmp_path` can never
+    equal the dead run's.
+
+    NEVER SWEEP A SIBLING THAT IS STILL RUNNING. Two suites can share one
+    `/tmp/pytest-of-<user>` prefix, and a sweep that reaps every root under
+    it regardless of ownership is a fleet-wide `pkill` wearing a guard's
+    clothes — so only a root whose OWNER has already exited is touched
+    (`_root_owner_alive`), which itself fails toward "owned" on anything it
+    can't read.
+    """
+    # ponytail: two ceilings from that same "fail toward owned" rule, both
+    # acceptable: (1) under xdist (this project's default, `-n 4`) each
+    # WORKER's own sweep is a no-op — its siblings are unlocked `popen-gw*`
+    # dirs — but the CONTROLLER process also loads this file and sweeps the
+    # real basetemp parent, so the feature still runs, through the
+    # controller; (2) this only sees roots `iterdir()` can still find, and
+    # pytest prunes all but the last three at every CLEAN exit — a daemon
+    # under an already-pruned root is invisible. Next crash is always
+    # covered (swept before pytest gets to prune it); upgrade path if either
+    # bites: track daemon pids outside the tmp tree.
+    own_root = session.config._tmp_path_factory.getbasetemp()
+    prefix = own_root.parent
+    for sibling in prefix.iterdir():
+        if sibling == own_root or not sibling.is_dir():
+            continue
+        if _root_owner_alive(sibling):
+            continue
+        _reap_pin_processes(sibling, timeout=5.0)
+
+
+def pytest_sessionfinish(session) -> None:
+    """Sweep whatever THIS run's own root leaves behind; nothing else owns it."""
+    own_root = session.config._tmp_path_factory.getbasetemp()
+    _reap_pin_processes(own_root, timeout=5.0)
 
 
 # --- the provenance stamp every lifecycle line carries -----------------------

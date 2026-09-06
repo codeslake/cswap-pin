@@ -9,6 +9,11 @@ and four of the six were red by the time anyone looked.
 They live here because this file IS collected. `conftest.py` is still a normal
 module, so what they need comes from it by import.
 """
+import os
+from types import SimpleNamespace
+
+import pytest
+
 from conftest import run_cases  # noqa: F401  — used by the driver guard
 
 
@@ -384,3 +389,171 @@ def test_no_blocking_socket_call_is_unbounded():
         + "\n\nPass timeout=, or mark the line `# noqa: unbounded` if the "
         "block is the point of the test."
     )
+
+
+def _session(root):
+    """Just enough of `Session` for `pytest_sessionstart`/`_sessionfinish`.
+
+    Real pytest passes its own `Session`, whose `.config._tmp_path_factory`
+    is what `getbasetemp()` hangs off. Faking it lets these tests drive the
+    hook directly instead of shelling out a second pytest process.
+    """
+    return SimpleNamespace(config=SimpleNamespace(
+        _tmp_path_factory=SimpleNamespace(getbasetemp=lambda: root)))
+
+
+@pytest.mark.parametrize("owner_alive, survives", [(False, False), (True, True)])
+def test_a_run_root_is_reaped_only_if_its_owner_is_dead(tmp_path, owner_alive, survives):
+    """A CRASHED RUN'S DAEMONS MUST NOT OUTLIVE IT — AND A LIVE ONE'S MUST.
+
+    `_reap_pin_processes` is a plain helper called from `finally` blocks, so
+    a run that never reaches its `finally` — `os._exit` in a leaked daemon
+    thread, or a SIGKILL — leaves its processes for nobody. The certdir gate
+    it matches on is a fresh `tmp_path` every run, so a survivor of run N is
+    outside run N+1's target set by construction: nothing sweeps it.
+
+    This drives `pytest_sessionstart` directly against a constructed sibling
+    root that carries a `.lock` naming either a pid that has already exited
+    (the shape a crashed run leaves under `/tmp/pytest-of-<user>`) or a pid
+    that is still alive (a concurrent suite's own root) — the NEGATIVE
+    control, without which the crashed-run case would be satisfied by a
+    sweep that kills every sibling regardless of ownership.
+
+    A process SHAPED like a pin daemon (argv `_mine()` matches), not a real
+    `cswap_pin.proxy` — the selector is what is under test.
+    """
+    import subprocess
+    import sys
+    import time
+
+    import conftest
+
+    prefix = tmp_path / "pytest-of-x"
+    own_root = prefix / "pytest-100"
+    own_root.mkdir(parents=True)
+    sibling_root = prefix / "pytest-1"
+    certdir = sibling_root / "c0"
+    certdir.mkdir(parents=True)
+
+    if owner_alive:
+        # This test's own pid: alive for the whole test, the same way a
+        # live pytest session's own pid is alive for the whole run.
+        (sibling_root / ".lock").write_text(str(os.getpid()))
+    else:
+        # A pid that is now provably dead: start it, wait for it to exit,
+        # then stamp its (now-free) number into the lock file — the shape
+        # `_root_owner_alive` must read as "nobody home".
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        (sibling_root / ".lock").write_text(str(dead.pid))
+
+    fake = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "cswap_pin.proxy", str(certdir)])
+    try:
+        time.sleep(0.3)
+        assert fake.poll() is None, "the fake daemon exited on its own"
+
+        conftest.pytest_sessionstart(_session(own_root))
+
+        if survives:
+            # Signal delivery is asynchronous; give it a moment to arrive.
+            time.sleep(0.5)
+            assert fake.poll() is None, (
+                "a daemon under a root a LIVE process still owns was "
+                "reaped — a concurrent suite's daemons are not this run's "
+                "to kill")
+        else:
+            fake.wait(timeout=10)
+            assert fake.returncode is not None, (
+                "a daemon under a stale pytest-NNN root (dead lock owner) "
+                "survived session start — the sweep still matches only the "
+                "exact certdir of the CURRENT run, never a crashed run's "
+                "root")
+    finally:
+        if fake.poll() is None:
+            fake.kill()
+            fake.wait()
+
+
+def test_a_root_with_no_lock_is_not_reaped_at_session_start(tmp_path):
+    """NO LOCK, NO CLAIM — but no claim must fail toward LEAVING IT ALONE.
+
+    Under xdist a worker's sibling `popen-gw*` roots carry no `.lock` at all
+    (only the numbered `pytest-N` root does), and reading "no lock" as "dead"
+    would make one worker reap the other three's live daemons mid-run.
+    `_root_owner_alive` must answer True (owned, do not touch) when there is
+    nothing to read, regardless of what the sibling happens to be named.
+    """
+    import subprocess
+    import sys
+    import time
+
+    import conftest
+
+    prefix = tmp_path / "pytest-of-x"
+    own_root = prefix / "pytest-100"
+    own_root.mkdir(parents=True)
+    unclaimed_root = prefix / "pytest-3"
+    certdir = unclaimed_root / "c0"
+    certdir.mkdir(parents=True)
+
+    fake = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "cswap_pin.proxy", str(certdir)])
+    try:
+        time.sleep(0.3)
+        assert fake.poll() is None, "the fake daemon exited on its own"
+
+        conftest.pytest_sessionstart(_session(own_root))
+
+        time.sleep(0.5)
+        assert fake.poll() is None, (
+            "a root with no lock file at all was reaped — no claim must "
+            "fail toward leaving the process alone, not toward killing it")
+    finally:
+        fake.kill()
+        fake.wait()
+
+
+def test_a_lock_naming_an_unreadable_pid_is_not_reaped_at_session_start(tmp_path):
+    """A PID THE LIVENESS READ CANNOT ANSWER IS NOT A CLAIM OF DEATH.
+
+    A `.lock` naming a value wider than a C `pid_t` makes `os.kill` raise
+    `OverflowError`, which is neither "the process is gone"
+    (`ProcessLookupError`) nor a parse failure caught earlier — it is a
+    third outcome that must fail toward the same answer as the other two:
+    owned, do not touch. Reading it as "dead" would reap a live sibling on
+    the strength of a lock file this sweep never actually managed to check.
+    """
+    import subprocess
+    import sys
+    import time
+
+    import conftest
+
+    prefix = tmp_path / "pytest-of-x"
+    own_root = prefix / "pytest-100"
+    own_root.mkdir(parents=True)
+    sibling_root = prefix / "pytest-9"
+    certdir = sibling_root / "c0"
+    certdir.mkdir(parents=True)
+    (sibling_root / ".lock").write_text(str(2**63))
+
+    fake = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "cswap_pin.proxy", str(certdir)])
+    try:
+        time.sleep(0.3)
+        assert fake.poll() is None, "the fake daemon exited on its own"
+
+        conftest.pytest_sessionstart(_session(own_root))
+
+        time.sleep(0.5)
+        assert fake.poll() is None, (
+            "a lock naming a pid too wide for os.kill (OverflowError) was "
+            "read as dead and reaped — an unusable claim must fail toward "
+            "leaving the process alone")
+    finally:
+        fake.kill()
+        fake.wait()
