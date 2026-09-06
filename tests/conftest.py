@@ -606,15 +606,40 @@ def _root_owner_alive(root) -> bool:
     other three's live daemons mid-run. A crashed run's root still HAS its
     lock, naming a pid that's gone (the lock is `atexit`-removed, which
     `os._exit` skips) — that case still returns False and is still reaped.
+
+    Liveness is read inline with ``os.kill(pid, 0)`` rather than via
+    ``cswap_pin.proxy._pid_alive`` — this file already calls ``os.kill``
+    directly elsewhere, and importing the product here would move that
+    import from collection into this hook, which has no exception guard: a
+    missing host would then abort the whole session (`INTERNALERROR`, zero
+    tests) instead of failing at collection, which is the documented
+    signature for that case.
+
+    A pid the kernel rejects as absent (``ProcessLookupError``) is dead:
+    sweepable. ``PermissionError`` (EPERM) means the pid EXISTS, owned by
+    someone else — the opposite of ``_pid_alive``'s reading, which returns
+    False on EPERM; correct for the product deciding whether IT can signal a
+    pid, wrong for a reaper deciding whether to touch one. Anything else this
+    can raise (a malformed or oversized pid: ``OverflowError``,
+    ``ValueError``) is not a usable claim either way, so it also reads as
+    owned.
     """
-    import cswap_pin.proxy as pin_proxy
+    import os
 
     lock = pathlib.Path(root) / ".lock"
     try:
         pid = int(lock.read_text().strip())
     except (OSError, ValueError):
         return True
-    return pin_proxy._pid_alive(pid)
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+    return True
 
 
 def pytest_sessionstart(session) -> None:
@@ -634,13 +659,15 @@ def pytest_sessionstart(session) -> None:
     can't read.
     """
     # ponytail: two ceilings from that same "fail toward owned" rule, both
-    # acceptable and neither hit by this project (`-n 0`, see repo.conf):
-    # (1) under xdist a worker's siblings are unlocked `popen-gw*` dirs, so
-    # the sweep is a no-op for the whole run; (2) this only sees roots
-    # `iterdir()` can still find, and pytest prunes all but the last three at
-    # every CLEAN exit — a daemon under an already-pruned root is invisible.
-    # Next crash is always covered (swept before pytest gets to prune it);
-    # upgrade path if either bites: track daemon pids outside the tmp tree.
+    # acceptable: (1) under xdist (this project's default, `-n 4`) each
+    # WORKER's own sweep is a no-op — its siblings are unlocked `popen-gw*`
+    # dirs — but the CONTROLLER process also loads this file and sweeps the
+    # real basetemp parent, so the feature still runs, through the
+    # controller; (2) this only sees roots `iterdir()` can still find, and
+    # pytest prunes all but the last three at every CLEAN exit — a daemon
+    # under an already-pruned root is invisible. Next crash is always
+    # covered (swept before pytest gets to prune it); upgrade path if either
+    # bites: track daemon pids outside the tmp tree.
     own_root = session.config._tmp_path_factory.getbasetemp()
     prefix = own_root.parent
     for sibling in prefix.iterdir():

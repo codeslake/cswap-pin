@@ -514,3 +514,46 @@ def test_a_root_with_no_lock_is_not_reaped_at_session_start(tmp_path):
     finally:
         fake.kill()
         fake.wait()
+
+
+def test_a_lock_naming_an_unreadable_pid_is_not_reaped_at_session_start(tmp_path):
+    """A PID THE LIVENESS READ CANNOT ANSWER IS NOT A CLAIM OF DEATH.
+
+    A `.lock` naming a value wider than a C `pid_t` makes `os.kill` raise
+    `OverflowError`, which is neither "the process is gone"
+    (`ProcessLookupError`) nor a parse failure caught earlier — it is a
+    third outcome that must fail toward the same answer as the other two:
+    owned, do not touch. Reading it as "dead" would reap a live sibling on
+    the strength of a lock file this sweep never actually managed to check.
+    """
+    import subprocess
+    import sys
+    import time
+
+    import conftest
+
+    prefix = tmp_path / "pytest-of-x"
+    own_root = prefix / "pytest-100"
+    own_root.mkdir(parents=True)
+    sibling_root = prefix / "pytest-9"
+    certdir = sibling_root / "c0"
+    certdir.mkdir(parents=True)
+    (sibling_root / ".lock").write_text(str(2**63))
+
+    fake = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "cswap_pin.proxy", str(certdir)])
+    try:
+        time.sleep(0.3)
+        assert fake.poll() is None, "the fake daemon exited on its own"
+
+        conftest.pytest_sessionstart(_session(own_root))
+
+        time.sleep(0.5)
+        assert fake.poll() is None, (
+            "a lock naming a pid too wide for os.kill (OverflowError) was "
+            "read as dead and reaped — an unusable claim must fail toward "
+            "leaving the process alone")
+    finally:
+        fake.kill()
+        fake.wait()
