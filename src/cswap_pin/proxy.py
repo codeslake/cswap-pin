@@ -16462,6 +16462,10 @@ def _switch_off_walled_account(reset: bytes) -> bool:
     with no such symbol) must not burn the wall's only attempt forever.
     """
     if not reset:
+        _log_lifecycle(
+            "429 on /v1/messages — no reset header, not an account-level "
+            "wall, relaying the 429 unchanged"
+        )
         return False
     with _walled_switch_lock:
         if reset in _walled_switch_seen:
@@ -16640,12 +16644,16 @@ def _relay_response(
         elif kl == b"connection" and b"close" in vl:
             keep = False
         if _walled_401 and (
-            kl == b"retry-after" or kl.startswith(b"anthropic-ratelimit-")
+            kl in (b"retry-after", b"x-should-retry")
+            or kl.startswith(b"anthropic-ratelimit-")
         ):
             # `retry-after` > 60s on a 401 throws
             # `api_request_retry_after_too_long`; every rate-limit header
             # (unified-status/-remaining/-limit and the requests/tokens-*
             # family) is meaningless, or misleading, on a 401.
+            # `x-should-retry: true` would have the SDK retry internally on
+            # the same client without ever rebuilding it — no credential
+            # re-read, the whole point of the 401 defeated silently.
             continue
         if kl in _HOP_BY_HOP_BYTES:
             continue

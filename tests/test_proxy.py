@@ -19757,7 +19757,10 @@ class TestAHandoverIsNotAFailure:
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
                             lambda *_a: spawned.append("spawn") or 41000)
         slept = []
-        monkeypatch.setattr(pin_proxy.time, "sleep", lambda s: slept.append(s))
+        me = threading.get_ident()
+        monkeypatch.setattr(
+            pin_proxy.time, "sleep",
+            lambda s: slept.append(s) if threading.get_ident() == me else None)
         self._drive(pin_proxy, monkeypatch, tmp_path)
         assert spawned == ["spawn"], "did not spawn when nothing was coming"
         assert slept == [], (

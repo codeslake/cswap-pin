@@ -11744,6 +11744,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     RESET_HEADER_2 = b"anthropic-ratelimit-unified-reset: 8888888888"
     RETRY_AFTER = b"retry-after: 3600"
     UNIFIED_STATUS = b"anthropic-ratelimit-unified-status: allowed_warning"
+    SHOULD_RETRY = b"x-should-retry: true"
 
     @staticmethod
     def _wire(monkeypatch, switched, raises_once=None, needs_login=False):
@@ -11779,8 +11780,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             head = b"HTTP/1.1 " + status + b"\r\n"
             if reset is not False:  # False omits the header entirely
                 head += (reset or cls.RESET_HEADER) + b"\r\n"
-            head += (cls.RETRY_AFTER + b"\r\n" + cls.UNIFIED_STATUS
-                     + b"\r\nContent-Length: 2\r\n\r\nno")
+            head += (cls.RETRY_AFTER + b"\r\n" + cls.UNIFIED_STATUS + b"\r\n"
+                     + cls.SHOULD_RETRY + b"\r\nContent-Length: 2\r\n\r\nno")
             up_b.sendall(head)
             up_b.shutdown(_s.SHUT_WR)
             pp._relay_response(up_a, cl_a, 0, method="POST", path=path)
@@ -11800,12 +11801,15 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         """`retry-after` above 60s throws `api_request_retry_after_too_long`
         and kills the client's turn outright; the whole
         `anthropic-ratelimit-*` family (unified-status included) is
-        meaningless, or misleading, on an auth response."""
+        meaningless, or misleading, on an auth response; `x-should-retry:
+        true` would have the SDK retry internally on the same client,
+        defeating the whole point of the 401 silently."""
         self._wire(monkeypatch, switched=True)
         got = self._relay()
         assert b"retry-after" not in got.lower(), got[:80]
         assert self.RESET_HEADER not in got, got[:80]
         assert self.UNIFIED_STATUS not in got, got[:80]
+        assert self.SHOULD_RETRY not in got, got[:80]
 
     def case_no_headroom_anywhere_relays_the_429_untouched(self, monkeypatch):
         calls = self._wire(monkeypatch, switched=False)
@@ -11813,6 +11817,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
         assert self.RESET_HEADER in got, got[:80]
         assert self.UNIFIED_STATUS in got, got[:80]
+        assert self.SHOULD_RETRY in got, got[:80]
         assert len(calls) == 1, len(calls)
 
     def case_a_raising_switch_releases_the_slot_for_a_retry(self, monkeypatch):
@@ -11864,6 +11869,17 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._wire(monkeypatch, switched=False)
         self._relay(reset=self.RESET_HEADER_2)
         assert logged, "a no-headroom switch attempt went unlogged"
+
+    def case_an_absent_reset_header_is_also_logged(self, monkeypatch):
+        """Without this, a daemon declining every header-less 429 produces a
+        daemon.log identical to one this release never reached — "verify
+        what is serving, not what is installed" needs a line to read."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch, switched=True)
+        self._relay(reset=False)
+        assert logged, "a header-less 429 decline went unlogged"
 
     def case_a_second_429_on_the_same_wall_is_relayed_untouched(self, monkeypatch):
         """A retry that reused the stale bearer, or a second concurrent
