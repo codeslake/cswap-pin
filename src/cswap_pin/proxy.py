@@ -12635,6 +12635,21 @@ class PinProxy:
                     "pre-existing session: pid "
                     + " ".join(str(p) for p in mute)
                 )
+            elif now and this_process_is_draining():
+                # THE SAME BLINDNESS AS `mute`, one hop closer to home: a
+                # draining process's OWN streams migrate to its successor
+                # exactly like a predecessor's do, so a bridge that looks
+                # streamless here may already be held there. Emitting
+                # DEAF_REPORT_MARK's "only a NEW PROCESS clears it" is then a
+                # promise already kept -- the successor IS that new process --
+                # and this predicate is checked fresh on every call rather
+                # than cached, because a handover can start between sweeps.
+                _log_lifecycle(
+                    f"{DEAF_REPORT_BLIND} — this process is draining, so its "
+                    "own held-bridge view is partial by construction and a "
+                    "bridge that looks streamless here may already be held "
+                    "by the successor: " + " ".join(now)
+                )
             elif now:
                 _log_lifecycle(
                     f"{len(now)} of {posted} bridge(s) {DEAF_REPORT_MARK} — "
