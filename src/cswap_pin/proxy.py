@@ -16431,7 +16431,6 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
 # ponytail: a single process-wide episode map, not one per account store —
 # this daemon serves one machine's live login at a time, so a dict keyed on
 # (email, org) costs nothing and survives a login that changes underneath it.
-_WALLED_RESET_SECONDS = 10  # comfortably under CC's fast-mode floor (>=20s -> 10 minutes)
 _WALLED_SWITCH_WINDOW_S = 60
 _walled_switch_lock = threading.Lock()
 _walled_switch_at: dict = {}
@@ -16440,7 +16439,7 @@ _walled_switch_at: dict = {}
 def _switch_off_walled_account() -> bool:
     """Switch cswap off the account that just 429'd, at most once per episode.
 
-    True only means "shorten the header the client will see"; False (no
+    True only means "turn the 429 the client will see into a 401"; False (no
     headroom anywhere, or a second 429 for the same wall) means relay the
     429 untouched.
 
@@ -16549,12 +16548,32 @@ def _relay_response(
     # UNCONDITIONAL, not gated on `swapped`/`reject_on_auth_error`: the take-
     # back above only fires on requests the pin actually swapped, and
     # `/v1/messages` is explicitly not a pinned route — a guard beside it
-    # would be dead for the one path a client actually sleeps on.
-    _shorten_429_reset = (
-        status_line.startswith(b"HTTP/1.1 429")
-        and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
-        and _switch_off_walled_account()
-    )
+    # would be dead for the one path a client actually sleeps on. It also
+    # cannot re-trigger that take-back: this checks the ORIGINAL status
+    # (429), which never matches the 401/403/404 the take-back tests, so a
+    # 429 always falls through to here regardless of `reject_on_auth_error`.
+    #
+    # A STATUS REWRITE, NOT A HEADER ONE. CC's SDK only re-reads the
+    # credential file when it rebuilds its client, and 429 is not one of the
+    # triggers that rebuild does (a stale socket, mTLS reload, or 401/403 —
+    # never a rate limit); a shortened `anthropic-ratelimit-unified-reset`
+    # still wakes the SAME sleeping client into a retry on the SAME cached
+    # bearer. 401 IS a rebuild trigger, and the rebuild is what re-reads the
+    # file cswap's switch just moved. Gated on `switched: true`: an unchanged
+    # token gives the client's own oauth-refresh recovery exactly 2 tries
+    # before it gives up hard, so synthesizing a 401 when nothing actually
+    # moved would turn a rate limit into a dead session.
+    if (status_line.startswith(b"HTTP/1.1 429")
+            and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
+            and _switch_off_walled_account()):
+        if _TRACE is not None:
+            _TRACE.write(
+                f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
+                " (account walled off — relayed as 401 so the client"
+                " rebuilds its credential instead of sleeping on it)\n"
+            )
+            _TRACE.flush()
+        status_line = b"HTTP/1.1 401 Unauthorized"
     if (status_line.startswith(b"HTTP/1.1 404")
             and _STREAM_ROUTE.search(path or "")
             and (_stream_404_is_spurious(path, certdir)
@@ -16602,13 +16621,6 @@ def _relay_response(
             chunked = True
         elif kl == b"connection" and b"close" in vl:
             keep = False
-        elif kl == b"anthropic-ratelimit-unified-reset" and _shorten_429_reset:
-            # CC reads this header only (never the body) to arm its sleep;
-            # rewriting its value is the whole fix. Seconds, not millis — the
-            # client does `r*1000-Date.now()`.
-            line = k + b": " + str(
-                int(time.time()) + _WALLED_RESET_SECONDS
-            ).encode("ascii")
         if kl in _HOP_BY_HOP_BYTES:
             continue
         out.append(line)
