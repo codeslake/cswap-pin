@@ -11743,17 +11743,22 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     RESET_HEADER = b"anthropic-ratelimit-unified-reset: 9999999999"
     RESET_HEADER_2 = b"anthropic-ratelimit-unified-reset: 8888888888"
     RETRY_AFTER = b"retry-after: 3600"
+    UNIFIED_STATUS = b"anthropic-ratelimit-unified-status: allowed_warning"
 
     @staticmethod
-    def _wire(monkeypatch, switched):
+    def _wire(monkeypatch, switched, raises_once=None, needs_login=False):
         """Stub claude_swap's switcher so no real account store is touched."""
         from cswap_pin import proxy as pp
 
         calls = []
+        state = {"raised": False}
 
         def _switch_off(sw):
             calls.append(sw)
-            return {"switched": switched,
+            if raises_once is not None and not state["raised"]:
+                state["raised"] = True
+                raise raises_once
+            return {"switched": switched, "needsLogin": needs_login,
                     "reason": None if switched else "candidates-exhausted"}
 
         fake_module = type("M", (), {
@@ -11765,17 +11770,18 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         return calls
 
     @classmethod
-    def _relay(cls, path="/v1/messages", reset=None):
+    def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests"):
         import socket as _s
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
         cl_a, cl_b = _s.socketpair()
         try:
-            up_b.sendall(
-                b"HTTP/1.1 429 Too Many Requests\r\n"
-                + (reset or cls.RESET_HEADER) + b"\r\n"
-                + cls.RETRY_AFTER + b"\r\n"
-                b"Content-Length: 2\r\n\r\nno")
+            head = b"HTTP/1.1 " + status + b"\r\n"
+            if reset is not False:  # False omits the header entirely
+                head += (reset or cls.RESET_HEADER) + b"\r\n"
+            head += (cls.RETRY_AFTER + b"\r\n" + cls.UNIFIED_STATUS
+                     + b"\r\nContent-Length: 2\r\n\r\nno")
+            up_b.sendall(head)
             up_b.shutdown(_s.SHUT_WR)
             pp._relay_response(up_a, cl_a, 0, method="POST", path=path)
             cl_a.shutdown(_s.SHUT_WR)
@@ -11790,19 +11796,74 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
 
-    def case_a_401_carries_neither_rate_limit_header(self, monkeypatch):
+    def case_a_401_carries_no_rate_limit_header(self, monkeypatch):
         """`retry-after` above 60s throws `api_request_retry_after_too_long`
-        and kills the client's turn outright."""
+        and kills the client's turn outright; the whole
+        `anthropic-ratelimit-*` family (unified-status included) is
+        meaningless, or misleading, on an auth response."""
         self._wire(monkeypatch, switched=True)
         got = self._relay()
-        assert b"retry-after" not in got.lower(), got[:60]
-        assert self.RESET_HEADER not in got, got[:60]
+        assert b"retry-after" not in got.lower(), got[:80]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert self.UNIFIED_STATUS not in got, got[:80]
 
     def case_no_headroom_anywhere_relays_the_429_untouched(self, monkeypatch):
-        self._wire(monkeypatch, switched=False)
+        calls = self._wire(monkeypatch, switched=False)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER in got, got[:60]
+        assert self.RESET_HEADER in got, got[:80]
+        assert self.UNIFIED_STATUS in got, got[:80]
+        assert len(calls) == 1, len(calls)
+
+    def case_a_raising_switch_releases_the_slot_for_a_retry(self, monkeypatch):
+        """A transient failure (this daemon's own config lock held
+        elsewhere, or an older claude-swap with no such symbol) must not
+        burn the wall's only attempt forever."""
+        calls = self._wire(monkeypatch, switched=True, raises_once=OSError("locked"))
+        first = self._relay()
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        second = self._relay()
+        assert second.startswith(b"HTTP/1.1 401"), second[:40]
+        assert len(calls) == 2, len(calls)
+
+    def case_needs_login_is_not_a_usable_switch(self, monkeypatch):
+        """switched=True with needsLogin=True means the credential is gone,
+        not moved to a usable one — a 401 here dies on auth instead of
+        surviving a wait it could have survived."""
+        self._wire(monkeypatch, switched=True, needs_login=True)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+
+    def case_an_absent_reset_header_is_never_walled(self, monkeypatch):
+        """No header is no evidence of an account-level unified wall (an
+        edge/gateway 429, or an org/key-scoped limit `switch()` cannot
+        fix) — must not switch, and must not debounce future header-less
+        429s against one shared empty key."""
+        calls = self._wire(monkeypatch, switched=True)
+        got = self._relay(reset=False)
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert not calls, len(calls)
+
+    def case_a_non_429_on_messages_is_never_touched(self, monkeypatch):
+        calls = self._wire(monkeypatch, switched=True)
+        got = self._relay(status=b"200 OK")
+        assert got.startswith(b"HTTP/1.1 200"), got[:40]
+        assert not calls, len(calls)
+
+    def case_the_switch_outcome_is_logged_both_ways(self, monkeypatch):
+        """`_TRACE` is off on a daemon that is already serving, which is
+        every daemon this runs on — `_log_lifecycle` (daemon.log) is the
+        only record that survives, on success AND on a no-headroom no-op."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch, switched=True)
+        self._relay()
+        assert logged, "a successful switch went unlogged"
+        logged.clear()
+        self._wire(monkeypatch, switched=False)
+        self._relay(reset=self.RESET_HEADER_2)
+        assert logged, "a no-headroom switch attempt went unlogged"
 
     def case_a_second_429_on_the_same_wall_is_relayed_untouched(self, monkeypatch):
         """A retry that reused the stale bearer, or a second concurrent

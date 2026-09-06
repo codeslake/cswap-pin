@@ -16438,14 +16438,18 @@ def _switch_off_walled_account(reset: bytes) -> bool:
 
     ``reset`` is the wall's own ``anthropic-ratelimit-unified-reset`` value —
     unique per (account, window) already, so it needs no identity lookup and
-    no expiry: an epoch never recurs. A bounded deque, not one slot, because
-    a straggler request from a wall we already left (A -> switched to B ->
-    B also walled -> switched to C) must not re-trigger on A's now-stale
-    value.
+    no expiry: an epoch never recurs. Empty means this 429 is not an
+    account-level unified wall (an edge/gateway 429, or an org/key-scoped
+    limit) — nothing to key on and nothing `switch()` can fix, so relay it
+    untouched rather than debounce every header-less 429 against one shared
+    empty key. A bounded deque (``maxlen=8``: this many walls in flight is
+    already unusual), not one slot, because a straggler request from a wall
+    we already left (A -> switched to B -> B also walled -> switched to C)
+    must not re-trigger on A's now-stale value.
 
     True only means "turn the 429 the client will see into a 401"; False (no
-    headroom anywhere, or a second 429 for the same wall) means relay the
-    429 untouched.
+    headroom anywhere, ``switch()`` raised, or a second 429 for the same
+    wall) means relay the 429 untouched.
 
     Storm control and per-wall debounce are the SAME guard: the wall claims
     its slot here, before ``switch()`` returns — so concurrent 429s on one
@@ -16453,18 +16457,44 @@ def _switch_off_walled_account(reset: bytes) -> bool:
     that reused the same stale bearer both find the slot already claimed and
     are relayed untouched, instead of each taking three cross-process locks
     and a usage fetch, or re-walling the account ``switch()`` just moved
-    onto.
+    onto. The slot is released on a raise: a transient failure (this
+    daemon's own `claude_config_lock` held elsewhere, or an older claude-swap
+    with no such symbol) must not burn the wall's only attempt forever.
     """
+    if not reset:
+        return False
     with _walled_switch_lock:
         if reset in _walled_switch_seen:
             return False
         _walled_switch_seen.append(reset)
     try:
-        sw = require("switcher").ClaudeAccountSwitcher()
-        result = require("switcher").switch_off_at_limit_account(sw)
-    except Exception:  # noqa: BLE001 — never let this break the relay
+        switcher = require("switcher")
+        result = switcher.switch_off_at_limit_account(
+            switcher.ClaudeAccountSwitcher()
+        )
+    except Exception as exc:  # noqa: BLE001 — never let this break the relay
+        with _walled_switch_lock:
+            try:
+                _walled_switch_seen.remove(reset)
+            except ValueError:
+                pass
+        _log_lifecycle(
+            f"429 on /v1/messages — switch_off_at_limit_account raised "
+            f"{exc.__class__.__name__}, relaying the 429 unchanged"
+        )
         return False
-    return bool(result and result.get("switched"))
+    switched = bool(
+        result and result.get("switched") and not result.get("needsLogin")
+    )
+    _log_lifecycle(
+        "429 on /v1/messages — walled account switched off, relaying a 401"
+        if switched else
+        f"429 on /v1/messages — switch() reported switched="
+        f"{result.get('switched') if result else None} needsLogin="
+        f"{result.get('needsLogin') if result else None}, relaying the 429 "
+        f"unchanged"
+    )
+    return switched
 
 
 def _relay_response(
@@ -16609,12 +16639,13 @@ def _relay_response(
             chunked = True
         elif kl == b"connection" and b"close" in vl:
             keep = False
-        if _walled_401 and kl in (
-            b"retry-after", b"anthropic-ratelimit-unified-reset"
+        if _walled_401 and (
+            kl == b"retry-after" or kl.startswith(b"anthropic-ratelimit-")
         ):
             # `retry-after` > 60s on a 401 throws
-            # `api_request_retry_after_too_long`; the reset header is
-            # meaningless on a 401.
+            # `api_request_retry_after_too_long`; every rate-limit header
+            # (unified-status/-remaining/-limit and the requests/tokens-*
+            # family) is meaningless, or misleading, on a 401.
             continue
         if kl in _HOP_BY_HOP_BYTES:
             continue
