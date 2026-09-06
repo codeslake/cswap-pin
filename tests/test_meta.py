@@ -384,3 +384,130 @@ def test_no_blocking_socket_call_is_unbounded():
         + "\n\nPass timeout=, or mark the line `# noqa: unbounded` if the "
         "block is the point of the test."
     )
+
+
+class _FakeTmpPathFactory:
+    """Stands in for pytest's own factory: one root, nothing else."""
+
+    def __init__(self, base):
+        self._base = base
+
+    def getbasetemp(self):
+        return self._base
+
+
+class _FakeSession:
+    """Just enough of `Session` for `pytest_sessionstart`/`_sessionfinish`.
+
+    Real pytest passes its own `Session`, whose `.config._tmp_path_factory`
+    is what `getbasetemp()` hangs off. Faking it lets these tests drive the
+    hook directly instead of shelling out a second pytest process.
+    """
+
+    def __init__(self, base):
+        self.config = type("Config", (), {
+            "_tmp_path_factory": _FakeTmpPathFactory(base)})()
+
+
+def test_a_stale_run_root_is_reaped_at_session_start(tmp_path):
+    """A CRASHED RUN'S DAEMONS MUST NOT OUTLIVE IT.
+
+    `_reap_pin_processes` is a plain helper called from `finally` blocks, so
+    a run that never reaches its `finally` — `os._exit` in a leaked daemon
+    thread, or a SIGKILL — leaves its processes for nobody. The certdir gate
+    it matches on is a fresh `tmp_path` every run, so a survivor of run N is
+    outside run N+1's target set by construction: nothing sweeps it.
+
+    This drives `pytest_sessionstart` directly against a constructed sibling
+    root that carries a `.lock` naming a pid that has already exited — the
+    same shape a crashed run leaves under `/tmp/pytest-of-<user>`, since
+    pytest writes that lock once per session and only removes it on a clean
+    exit.
+
+    A process SHAPED like a pin daemon (argv `_mine()` matches), not a real
+    `cswap_pin.proxy` — the selector is what is under test.
+    """
+    import subprocess
+    import sys
+    import time
+
+    import conftest
+
+    prefix = tmp_path / "pytest-of-x"
+    own_root = prefix / "pytest-100"
+    own_root.mkdir(parents=True)
+    stale_root = prefix / "pytest-1"
+    certdir = stale_root / "c0"
+    certdir.mkdir(parents=True)
+
+    # A pid that is now provably dead: start it, wait for it to exit, then
+    # stamp its (now-free) number into the stale root's lock file — the
+    # shape `_root_owner_alive` must read as "nobody home".
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    (stale_root / ".lock").write_text(str(dead.pid))
+
+    fake = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "cswap_pin.proxy", str(certdir)])
+    try:
+        time.sleep(0.3)
+        assert fake.poll() is None, "the fake daemon exited on its own"
+
+        conftest.pytest_sessionstart(_FakeSession(own_root))
+
+        fake.wait(timeout=10)
+        assert fake.returncode is not None, (
+            "a daemon under a stale pytest-NNN root (dead lock owner) "
+            "survived session start — the sweep still matches only the "
+            "exact certdir of the CURRENT run, never a crashed run's root")
+    finally:
+        if fake.poll() is None:
+            fake.kill()
+            fake.wait()
+
+
+def test_a_live_owned_run_root_is_not_reaped_at_session_start(tmp_path):
+    """THE NEGATIVE CONTROL: a concurrent suite's daemons are not this run's.
+
+    Two sibling suites can share one `/tmp/pytest-of-<user>` prefix. A sweep
+    that reaps every root under it on `pytest_sessionstart` would kill an
+    unrelated in-flight run's daemons — a fleet-wide `pkill` wearing a
+    guard's clothes. Without this, the RED test above would be satisfied by
+    exactly that: sweeping every sibling regardless of ownership.
+
+    The root here carries a `.lock` naming this test's own pid — alive for
+    the whole test, the same way a live pytest session's own pid is alive
+    for the whole run.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+
+    import conftest
+
+    prefix = tmp_path / "pytest-of-x"
+    own_root = prefix / "pytest-100"
+    own_root.mkdir(parents=True)
+    live_root = prefix / "pytest-2"
+    certdir = live_root / "c0"
+    certdir.mkdir(parents=True)
+    (live_root / ".lock").write_text(str(os.getpid()))
+
+    fake = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "cswap_pin.proxy", str(certdir)])
+    try:
+        time.sleep(0.3)
+        assert fake.poll() is None, "the fake daemon exited on its own"
+
+        conftest.pytest_sessionstart(_FakeSession(own_root))
+
+        time.sleep(0.5)
+        assert fake.poll() is None, (
+            "a daemon under a root a LIVE process still owns was reaped — "
+            "a concurrent suite's daemons are not this run's to kill")
+    finally:
+        fake.kill()
+        fake.wait()

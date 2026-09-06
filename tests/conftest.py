@@ -475,7 +475,7 @@ def signal_if_still_ours(pid: int, certdir, sig: int) -> bool:
     return True
 
 
-def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
+def _reap_pin_processes(certdir, timeout: float = 20.0, *, prefix: bool = False) -> None:
     """Kill every pin process serving ``certdir``, PARENTS FIRST, and WAIT.
 
     Two things make this less obvious than it looks, both measured here:
@@ -493,6 +493,11 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
     Matched on the certdir being the LAST argv token, which is how the product
     identifies its own daemons — so a test certdir can never select the live
     pin, whose certdir is the real backup dir.
+
+    ``prefix=True`` widens that match from equality to "under this root": a
+    crashed run's own certdir is gone from the CURRENT run's target set (a
+    fresh ``tmp_path`` every time), so nothing sweeps its leftovers unless the
+    caller passes the crashed run's ROOT here instead of one certdir.
     """
     import os
     import subprocess
@@ -531,7 +536,12 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
             pid_s, _, cmd = line.strip().partition(" ")
             if "cswap_pin.proxy" not in cmd:
                 continue
-            if not any(cmd.rstrip().endswith(" " + t) for t in targets):
+            tail = cmd.rstrip().rpartition(" ")[2]
+            if prefix:
+                if not any(tail == t or tail.startswith(t.rstrip("/") + "/")
+                           for t in targets):
+                    continue
+            elif not any(cmd.rstrip().endswith(" " + t) for t in targets):
                 continue
             try:
                 pid = int(pid_s)
@@ -580,6 +590,68 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
                     pass
             return
         time.sleep(0.2)
+
+
+def _root_owner_alive(root) -> bool:
+    """Whether the pytest session that OWNS ``root`` is still alive.
+
+    Every numbered root pytest makes for a session (``.../pytest-of-<user>/
+    pytest-N``) carries a ``.lock`` file stamped with that session's own pid
+    (`_pytest.pathlib.create_cleanup_lock`), held for the session's whole
+    life and unlinked only on a clean exit. Reading that pid and asking the
+    kernel whether it still exists is a measurement, not an age guess — a
+    crashed run leaves the lock behind with a pid that is already gone, and a
+    live sibling run's lock names a pid that answers.
+    """
+    import cswap_pin.proxy as pin_proxy
+
+    lock = pathlib.Path(root) / ".lock"
+    try:
+        pid = int(lock.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return pin_proxy._pid_alive(pid)
+
+
+def pytest_sessionstart(session) -> None:
+    """Reap a crashed run's pin daemons before this run spawns any of its own.
+
+    `_reap_pin_processes` only ever matched one exact certdir, which is
+    always the CURRENT run's — a run that died before its `finally` (a
+    leaked daemon thread reaching `os._exit`, or a SIGKILL) leaves its
+    daemons for nobody, because the next run's fresh `tmp_path` can never
+    equal the dead run's.
+
+    NEVER SWEEP A SIBLING THAT IS STILL RUNNING. Two suites can share one
+    `/tmp/pytest-of-<user>` prefix, and a sweep that reaps every root under
+    it regardless of ownership is a fleet-wide `pkill` wearing a guard's
+    clothes — so only a root whose OWNER has already exited is touched
+    (`_root_owner_alive`).
+    """
+    try:
+        own_root = pathlib.Path(session.config._tmp_path_factory.getbasetemp())
+    except Exception:
+        return
+    prefix = own_root.parent
+    if not prefix.is_dir():
+        return
+    for sibling in prefix.iterdir():
+        if sibling == own_root or not sibling.is_dir():
+            continue
+        if not sibling.name.startswith("pytest-"):
+            continue
+        if _root_owner_alive(sibling):
+            continue
+        _reap_pin_processes(sibling, timeout=5.0, prefix=True)
+
+
+def pytest_sessionfinish(session) -> None:
+    """Sweep whatever THIS run's own root leaves behind; nothing else owns it."""
+    try:
+        own_root = session.config._tmp_path_factory.getbasetemp()
+    except Exception:
+        return
+    _reap_pin_processes(own_root, timeout=5.0, prefix=True)
 
 
 # --- the provenance stamp every lifecycle line carries -----------------------
