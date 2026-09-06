@@ -11928,6 +11928,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
+        pp._walled_switch_ok.clear()
         return calls
 
     @classmethod
@@ -12041,23 +12042,68 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._relay(reset=False)
         assert logged, "a header-less 429 decline went unlogged"
 
-    def case_a_second_429_on_the_same_wall_is_relayed_untouched(self, monkeypatch):
+    def case_an_absent_reset_header_log_carries_the_retry_after(self, monkeypatch):
+        """A header-less 429's own sleep is capped at 6h client-side and
+        unguarded against a throw — instrumentation only, no behaviour keyed
+        on it, but unmeasurable unless the value is on the line."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch, switched=True)
+        self._relay(reset=False)
+        assert any(b"3600" in m.encode() for m in logged), logged
+
+    def case_the_debounce_hit_is_logged_with_the_reset_epoch(self, monkeypatch):
+        """This branch was invisible in daemon.log before the fix, which is
+        why a repeat wall could only be reconstructed from the CC bundle;
+        the new `session_limit_watch` monitor reads this line."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch, switched=True)
+        self._relay()
+        logged.clear()
+        self._relay()
+        assert any(b"9999999999" in m.encode() for m in logged), logged
+
+    def case_a_second_429_on_the_same_wall_still_gets_the_401(self, monkeypatch):
         """A retry that reused the stale bearer, or a second concurrent
         connection on the same wall, must not re-attempt the switch — that
         would either churn accounts or dogpile the cross-process locks ten
-        at once."""
+        at once. But the account for THIS wall is already switched off, so
+        the client must still see the 401, not the wall 429 relayed
+        verbatim — a debounced switch is not a debounced conversion."""
         calls = self._wire(monkeypatch, switched=True)
         first = self._relay()
         assert first.startswith(b"HTTP/1.1 401"), first[:40]
         second = self._relay()
+        assert second.startswith(b"HTTP/1.1 401"), second[:40]
+        assert b"retry-after" not in second.lower(), second[:80]
+        assert self.RESET_HEADER not in second, second[:80]
+        assert self.UNIFIED_STATUS not in second, second[:80]
+        assert self.SHOULD_RETRY not in second, second[:80]
+        assert len(calls) == 1, len(calls)
+
+    def case_a_debounced_failed_switch_still_relays_the_429(self, monkeypatch):
+        """The deque slot is claimed whether or not the switch succeeded —
+        it also has to stop a storm of retries on a wall with no headroom
+        anywhere. A debounce hit must only forge a 401 for a wall this
+        daemon actually switched off; one that never succeeded must keep
+        relaying the 429 untouched on every repeat, not just the first."""
+        calls = self._wire(monkeypatch, switched=False)
+        first = self._relay()
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert self.RESET_HEADER in second, second[:80]
         assert len(calls) == 1, len(calls)
 
     def case_a_different_wall_switches_again(self, monkeypatch):
         """The debounce keys on the WALL's own reset value, not on a time
         window or the account identity: a different wall must switch again
         even seconds later, and a wall already seen must never re-switch no
-        matter how long it persists."""
+        matter how long it persists — but its already-converted 401 is what
+        every later repeat of it sees."""
         calls = self._wire(monkeypatch, switched=True)
         first = self._relay(reset=self.RESET_HEADER)
         assert first.startswith(b"HTTP/1.1 401"), first[:40]
@@ -12065,7 +12111,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert second.startswith(b"HTTP/1.1 401"), second[:40]
         assert len(calls) == 2, len(calls)
         third = self._relay(reset=self.RESET_HEADER)
-        assert third.startswith(b"HTTP/1.1 429"), third[:40]
+        assert third.startswith(b"HTTP/1.1 401"), third[:40]
         assert len(calls) == 2, len(calls)
 
     def case_a_429_off_messages_is_never_touched(self, monkeypatch):

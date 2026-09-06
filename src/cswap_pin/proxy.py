@@ -16453,9 +16453,15 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
 
 _walled_switch_lock = threading.Lock()
 _walled_switch_seen = collections.deque(maxlen=8)
+# Subset of `_walled_switch_seen`: only the walls the switch actually
+# succeeded on. The debounce claims a slot whether or not `switch()` found
+# headroom, so `reset in _walled_switch_seen` alone cannot tell a repeat of a
+# converted wall from a repeat of one that never switched — this is what
+# does.
+_walled_switch_ok = collections.deque(maxlen=8)
 
 
-def _switch_off_walled_account(reset: bytes) -> bool:
+def _switch_off_walled_account(reset: bytes, retry_after: bytes = b"") -> bool:
     """Switch cswap off the account that just 429'd, at most once per wall.
 
     ``reset`` is the wall's own ``anthropic-ratelimit-unified-reset`` value —
@@ -16469,29 +16475,45 @@ def _switch_off_walled_account(reset: bytes) -> bool:
     we already left (A -> switched to B -> B also walled -> switched to C)
     must not re-trigger on A's now-stale value.
 
-    True only means "turn the 429 the client will see into a 401"; False (no
-    headroom anywhere, ``switch()`` raised, or a second 429 for the same
-    wall) means relay the 429 untouched.
+    True means "turn the 429 the client will see into a 401" — because either
+    this call switched the account off, or an earlier call for this same
+    wall already did. False (no headroom anywhere, ``switch()`` raised, or a
+    repeat of a wall that never switched) means relay the 429 untouched.
 
     Storm control and per-wall debounce are the SAME guard: the wall claims
     its slot here, before ``switch()`` returns — so concurrent 429s on one
     wall (measured: ten in a cycle, each its own MITM thread) and a retry
     that reused the same stale bearer both find the slot already claimed and
-    are relayed untouched, instead of each taking three cross-process locks
-    and a usage fetch, or re-walling the account ``switch()`` just moved
-    onto. The slot is released on a raise: a transient failure (this
-    daemon's own `claude_config_lock` held elsewhere, or an older claude-swap
-    with no such symbol) must not burn the wall's only attempt forever.
+    skip re-attempting the switch, instead of each taking three
+    cross-process locks and a usage fetch, or re-walling the account
+    ``switch()`` just moved onto. A debounce hit must not also debounce the
+    CONVERSION: the account for that wall is already switched off (or never
+    was), and the client's answer follows that fact, not the fact that this
+    call is a repeat. The slot is released on a raise: a transient failure
+    (this daemon's own `claude_config_lock` held elsewhere, or an older
+    claude-swap with no such symbol) must not burn the wall's only attempt
+    forever.
     """
     if not reset:
         _log_lifecycle(
             "429 on /v1/messages — no reset header, not an account-level "
             "wall, relaying the 429 unchanged"
+            + (f" (retry-after={retry_after.decode('latin1', 'replace')})"
+               if retry_after else "")
         )
         return False
     with _walled_switch_lock:
         if reset in _walled_switch_seen:
-            return False
+            ok = reset in _walled_switch_ok
+            _log_lifecycle(
+                "429 on /v1/messages — debounced repeat of wall reset="
+                f"{reset.decode('latin1', 'replace')}, relaying a 401"
+                if ok else
+                "429 on /v1/messages — debounced repeat of wall reset="
+                f"{reset.decode('latin1', 'replace')}, relaying the 429 "
+                "unchanged"
+            )
+            return ok
         _walled_switch_seen.append(reset)
     try:
         switcher = require("switcher")
@@ -16512,6 +16534,9 @@ def _switch_off_walled_account(reset: bytes) -> bool:
     switched = bool(
         result and result.get("switched") and not result.get("needsLogin")
     )
+    if switched:
+        with _walled_switch_lock:
+            _walled_switch_ok.append(reset)
     _log_lifecycle(
         "429 on /v1/messages — walled account switched off, relaying a 401"
         if switched else
@@ -16608,7 +16633,12 @@ def _relay_response(
              if l.lower().startswith(b"anthropic-ratelimit-unified-reset:")),
             b"",
         )
-        _walled_401 = _switch_off_walled_account(reset)
+        retry_after = next(
+            (l.split(b":", 1)[1].strip() for l in lines[1:]
+             if l.lower().startswith(b"retry-after:")),
+            b"",
+        )
+        _walled_401 = _switch_off_walled_account(reset, retry_after)
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
