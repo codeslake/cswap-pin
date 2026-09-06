@@ -7780,6 +7780,166 @@ class TestDrainReportsWhatItCut:
             pp._pin_daemon_pids = real_pids
             pp.is_draining = real_draining
 
+    def case_a_draining_process_must_not_claim_a_deaf_bridge_is_fresh(
+            self, certdir):
+        """The predecessor in the incident stood down at 01:18:28Z and still
+        logged `9 of 9 bridge(s) post but hold no inbound stream` at
+        01:42:33Z, `only a NEW PROCESS clears it`, while a successor already
+        held those very streams — 66 and 39 established connections against
+        its own 2 and 1. `_report_deaf_bridges` asks OTHER draining pids what
+        they hold (the case above), but never asks whether IT is the one
+        draining, so a bridge whose stream migrated away from it reads
+        exactly like one that lost its stream for good.
+
+        `this_process_is_draining()`, not `is_draining(certdir, pid)`: the
+        marker lags the first beat, which is the whole width of this window.
+        """
+        import os
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        real_pids = pp._pin_daemon_pids
+        pp._log_lifecycle = lines.append
+        pp._pin_daemon_pids = lambda _c: [os.getpid()]
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._certdir = certdir
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_MIGRATED/worker/messages")
+            srv._connected_bridges = {"cse_MIGRATED"}
+
+            done = pp.announce_draining(certdir, os.getpid())
+            # THE DISCRIMINATING CASE. The marker file is gone, so a
+            # regression to `is_draining(certdir, os.getpid())` would read
+            # this process as NOT draining and MARK cse_MIGRATED instead —
+            # `this_process_is_draining()` must still answer True from the
+            # in-memory depth map alone.
+            pp.draining_marker_path(certdir, os.getpid()).unlink()
+            try:
+                srv._report_deaf_bridges()
+            finally:
+                done()
+            assert lines, (
+                "it went silent while draining; a reader cannot tell a "
+                "suppressed report from a check that never ran")
+            assert pp.DEAF_REPORT_MARK not in lines[-1], (
+                "a draining process claimed a bridge is deaf although its "
+                f"own view cannot see where the stream went: {lines[-1]!r}")
+            assert "only a NEW PROCESS" not in lines[-1], (
+                "it promised a remedy that already happened — the successor "
+                f"holding the stream IS the new process: {lines[-1]!r}")
+            assert pp.DEAF_REPORT_BLIND in lines[-1], (
+                f"the refusal is not verbatim, so no watcher can match it: "
+                f"{lines[-1]!r}")
+            assert "cse_MIGRATED" in lines[-1], (
+                "it does not name the bridge, so a reader cannot check "
+                f"whether it is really gone: {lines[-1]!r}")
+
+            # THE CONTROL. The same bridge, the same daemon, NOT draining —
+            # the report must still name it deaf, or the fix silenced the
+            # alarm instead of correcting its wording.
+            before = len(lines)
+            srv._last_deaf = None
+            srv._report_deaf_bridges()
+            assert len(lines) > before, (
+                "a non-draining process with the same deaf bridge produced "
+                "no line")
+            assert pp.DEAF_REPORT_MARK in lines[-1], (
+                "a genuinely deaf bridge, reported by a process that is not "
+                f"draining, must still get the ordinary MARK: {lines[-1]!r}")
+        finally:
+            pp._log_lifecycle = real_log
+            pp._pin_daemon_pids = real_pids
+
+    def case_a_drain_that_aborts_does_not_silence_the_bridge_forever(
+            self, certdir):
+        """The reviewer's trace: the watchdog handover announces the drain,
+        `_spawn_daemon` times out waiting for a successor, `done_draining()`
+        fires, and this process keeps serving as the live pid. The deaf set
+        never changed, so `now == prev` alone would dedupe the MARK away —
+        for the rest of this process's life, once a BLIND for it was ever
+        latched into `_last_deaf` while draining. Every consumer of the MARK
+        line would go permanently quiet on a bridge that is genuinely deaf.
+
+        `_with_deaf_age` is the same field that separated the incident's own
+        migration burst from a real loss (`deaf 156s-162s` on nine ids was
+        nine SSE legs closing in ~6s, not nine losses) — it belongs on the
+        BLIND line exactly as much as on the MARK it replaces.
+        """
+        import os
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        real_pids = pp._pin_daemon_pids
+        pp._log_lifecycle = lines.append
+        pp._pin_daemon_pids = lambda _c: [os.getpid()]
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._stream_lost = {}
+            srv._certdir = certdir
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_ABORT/worker/messages")
+            srv._connected_bridges = {"cse_ABORT"}
+            # A REAL, MEASURED AGE: this process itself once held the stream
+            # and lost it, so `deaf_for` answers a number, never None.
+            # -42.4, NOT -42: `int(age)` truncates in `_with_deaf_age`, and
+            # the I/O between this stamp and the read (announce_draining's
+            # own `_collect_dead_markers` scan) only adds time, never
+            # removes it. The 0.6s of headroom below the 43s rounding
+            # boundary is what a loaded runner needs to still read 42.
+            srv._stream_lost["cse_ABORT"] = time.monotonic() - 42.4
+
+            # THE DRAIN STARTS, and while it runs this bridge looks deaf.
+            done = pp.announce_draining(certdir, os.getpid())
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_BLIND in lines[-1], (
+                f"a genuinely-aged loss while draining was not BLIND: {lines}")
+            assert "(deaf 42s)" in lines[-1], (
+                "the BLIND line drops the one field that tells a migration "
+                f"burst from a real loss: {lines[-1]!r}")
+
+            # THE DRAIN ABORTS (the successor never came up) and this
+            # process keeps serving — `announce_draining`'s own release.
+            done()
+
+            # THE SAME DEAF SET, one sweep later: the dedupe must not let
+            # the stale draining-BLIND stand forever now that this process
+            # is no longer draining.
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) > before, (
+                "the aborted drain's BLIND latched permanently — no MARK "
+                "ever followed for a bridge that is genuinely still deaf")
+            assert pp.DEAF_REPORT_MARK in lines[-1], (
+                "a drain that aborted and left this process serving must "
+                f"MARK an unchanged deaf set: {lines[-1]!r}")
+
+            # THE CONTROL. Once the MARK itself stands with nothing changed,
+            # the ordinary dedupe still applies — this fix must not turn
+            # every sweep into a fresh log line.
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) == before, (
+                "an ordinary unchanged MARK was re-logged; the fix for the "
+                "stale-BLIND case must not defeat the dedupe generally")
+        finally:
+            pp._log_lifecycle = real_log
+            pp._pin_daemon_pids = real_pids
+
     def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
         """Nothing recorded whether a claude.ai attachment ever downloaded.
 
