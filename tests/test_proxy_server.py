@@ -11727,6 +11727,104 @@ class TestASpuriousStream404DoesNotEndTheSession:
         assert got.startswith(b"HTTP/1.1 200"), got[:40]
 
 
+class TestA429OnMessagesGetsItsSleepShortenedAtMostOncePerWall:
+    """A 429 on /v1/messages sleeps the client for the WHOLE reset window of
+    the account it walled, and a credential swap underneath that sleep does
+    not shorten it — measured live at 45m44s beside an account with 4h of
+    headroom. See `_switch_off_walled_account`.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    FAR_FUTURE = b"9999999999"  # epoch seconds; nowhere near "soon" in a test run
+
+    @staticmethod
+    def _wire(monkeypatch, switched):
+        """Stub claude_swap's switcher so no real account store is touched."""
+        from cswap_pin import proxy as pp
+
+        class _FakeSwitcher:
+            def _live_login_identity(self, *, ask_server=False):
+                return ("a@example.com", "org-1")
+
+        calls = []
+
+        def _switch_off(sw):
+            calls.append(sw)
+            return {"switched": switched,
+                    "reason": None if switched else "candidates-exhausted"}
+
+        fake_module = type("M", (), {
+            "ClaudeAccountSwitcher": _FakeSwitcher,
+            "switch_off_at_limit_account": staticmethod(_switch_off),
+        })()
+        monkeypatch.setattr(pp, "require", lambda n: fake_module)
+        getattr(pp, "_walled_switch_at", {}).clear()
+        return calls
+
+    @classmethod
+    def _relay(cls, path="/v1/messages", reset=None):
+        import socket as _s
+        from cswap_pin import proxy as pp
+        reset = reset or cls.FAR_FUTURE
+        up_a, up_b = _s.socketpair()
+        cl_a, cl_b = _s.socketpair()
+        try:
+            up_b.sendall(
+                b"HTTP/1.1 429 Too Many Requests\r\n"
+                b"anthropic-ratelimit-unified-reset: " + reset + b"\r\n"
+                b"Content-Length: 2\r\n\r\nno")
+            up_b.shutdown(_s.SHUT_WR)
+            pp._relay_response(up_a, cl_a, 0, method="POST", path=path)
+            cl_a.shutdown(_s.SHUT_WR)
+            return cl_b.recv(4096)
+        finally:
+            for x in (up_a, up_b, cl_a, cl_b):
+                try: x.close()
+                except OSError: pass
+
+    def case_a_successful_switch_shortens_the_header(self, monkeypatch):
+        self._wire(monkeypatch, switched=True)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:60]
+        m = re.search(rb"anthropic-ratelimit-unified-reset: (\d+)", got)
+        assert m, f"header missing from the forwarded response: {got!r}"
+        remaining = int(m.group(1)) - time.time()
+        assert 0 < remaining < 20, (
+            f"forwarded reset is {remaining:.0f}s out — CC's fast-mode floor "
+            f"raises anything >=20s to 10 minutes, so this must stay under it")
+
+    def case_no_headroom_anywhere_relays_the_429_untouched(self, monkeypatch):
+        self._wire(monkeypatch, switched=False)
+        got = self._relay()
+        assert (b"anthropic-ratelimit-unified-reset: " + self.FAR_FUTURE) in got, (
+            f"switch() reported no headroom, so the header must be relayed "
+            f"byte-identical: {got!r}")
+
+    def case_a_second_429_on_the_same_wall_is_relayed_untouched(self, monkeypatch):
+        """THE AMENDMENT. A retry that reused the stale bearer, or a second
+        concurrent connection on the same wall, must not re-attempt the
+        switch — that would either churn accounts (a switch back onto the
+        one we just left) or dogpile the cross-process locks ten at once."""
+        calls = self._wire(monkeypatch, switched=True)
+        first = self._relay()
+        assert self.FAR_FUTURE not in first
+        second = self._relay()
+        assert (b"anthropic-ratelimit-unified-reset: " + self.FAR_FUTURE) in second, (
+            f"a second 429 for the same wall must take the real sleep, not "
+            f"a re-shortened one: {second!r}")
+        assert len(calls) == 1, (
+            f"switch() was attempted {len(calls)} times for one wall; the "
+            f"episode guard exists to keep this at one")
+
+    def case_a_429_off_messages_is_never_touched(self, monkeypatch):
+        calls = self._wire(monkeypatch, switched=True)
+        got = self._relay(path="/v1/other")
+        assert (b"anthropic-ratelimit-unified-reset: " + self.FAR_FUTURE) in got, got
+        assert not calls, "the switch must only ever be tried for /v1/messages"
+
+
 class TestTheEvidenceSurvivesAHandover:
     """THE DEFECT THE IN-MEMORY MAP HAD, and it is not a tuning problem.
 

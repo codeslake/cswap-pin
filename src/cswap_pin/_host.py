@@ -6,7 +6,7 @@ So it needs part of cswap's internals — but "needs part of" is exactly the
 coupling that made splitting the two hard in the first place, and an import
 scattered across 2800 lines is a dependency nobody can see the shape of.
 
-This module IS that shape. Seven symbols, six modules, listed once:
+This module IS that shape. Eight symbols, six modules, listed once:
 
     paths.get_global_config_path      where the env block lives
     paths.get_claude_config_home      the config dir root
@@ -14,6 +14,7 @@ This module IS that shape. Seven symbols, six modules, listed once:
     exceptions.AccountNotFoundError   pin resolution failures
     exceptions.ConfigError            ...
     switcher.ClaudeAccountSwitcher    the account store
+    switcher.switch_off_at_limit_account   walls the account a 429 just hit
     oauth                             token extraction and refresh
     claude_locks.claude_config_lock   serialize config rewrites
 

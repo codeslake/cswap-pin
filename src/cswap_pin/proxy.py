@@ -16428,6 +16428,49 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
     return -_STREAM_LIVE_SECONDS <= (now - seen) <= _STREAM_LIVE_SECONDS
 
 
+# ponytail: a single process-wide episode map, not one per account store —
+# this daemon serves one machine's live login at a time, so a dict keyed on
+# (email, org) costs nothing and survives a login that changes underneath it.
+_WALLED_RESET_SECONDS = 10  # comfortably under CC's fast-mode floor (>=20s -> 10 minutes)
+_WALLED_SWITCH_WINDOW_S = 60
+_walled_switch_lock = threading.Lock()
+_walled_switch_at: dict = {}
+
+
+def _switch_off_walled_account() -> bool:
+    """Switch cswap off the account that just 429'd, at most once per episode.
+
+    True only means "shorten the header the client will see"; False (no
+    headroom anywhere, or a second 429 for the same wall) means relay the
+    429 untouched.
+
+    Storm control and episode debounce are the SAME guard: the walled
+    account claims its slot here, before ``switch()`` returns — so
+    concurrent 429s on one wall (measured: ten in a cycle, each its own MITM
+    thread) and a retry that reused the same stale bearer both find the slot
+    already claimed and are relayed untouched, instead of each taking three
+    cross-process locks and a usage fetch, or re-walling the account
+    ``switch()`` just moved onto.
+    """
+    try:
+        ClaudeAccountSwitcher = require("switcher").ClaudeAccountSwitcher
+        sw = ClaudeAccountSwitcher()
+        key = sw._live_login_identity(ask_server=False)
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return False
+    now = time.monotonic()
+    with _walled_switch_lock:
+        last = _walled_switch_at.get(key)
+        if last is not None and now - last < _WALLED_SWITCH_WINDOW_S:
+            return False
+        _walled_switch_at[key] = now
+    try:
+        result = require("switcher").switch_off_at_limit_account(sw)
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return False
+    return bool(result and result.get("switched"))
+
+
 def _relay_response(
     up: ssl.SSLSocket,
     client: ssl.SSLSocket,
@@ -16503,6 +16546,15 @@ def _relay_response(
         return _AUTH_REJECTED
     _note_worker_status(path, status_line, certdir)
     _note_hop_trouble(status_line)
+    # UNCONDITIONAL, not gated on `swapped`/`reject_on_auth_error`: the take-
+    # back above only fires on requests the pin actually swapped, and
+    # `/v1/messages` is explicitly not a pinned route — a guard beside it
+    # would be dead for the one path a client actually sleeps on.
+    _shorten_429_reset = (
+        status_line.startswith(b"HTTP/1.1 429")
+        and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
+        and _switch_off_walled_account()
+    )
     if (status_line.startswith(b"HTTP/1.1 404")
             and _STREAM_ROUTE.search(path or "")
             and (_stream_404_is_spurious(path, certdir)
@@ -16550,6 +16602,13 @@ def _relay_response(
             chunked = True
         elif kl == b"connection" and b"close" in vl:
             keep = False
+        elif kl == b"anthropic-ratelimit-unified-reset" and _shorten_429_reset:
+            # CC reads this header only (never the body) to arm its sleep;
+            # rewriting its value is the whole fix. Seconds, not millis — the
+            # client does `r*1000-Date.now()`.
+            line = k + b": " + str(
+                int(time.time()) + _WALLED_RESET_SECONDS
+            ).encode("ascii")
         if kl in _HOP_BY_HOP_BYTES:
             continue
         out.append(line)
