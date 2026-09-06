@@ -17,6 +17,7 @@ not a dependency.
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import datetime as _dt
 import glob
@@ -16428,42 +16429,38 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
     return -_STREAM_LIVE_SECONDS <= (now - seen) <= _STREAM_LIVE_SECONDS
 
 
-# ponytail: a single process-wide episode map, not one per account store —
-# this daemon serves one machine's live login at a time, so a dict keyed on
-# (email, org) costs nothing and survives a login that changes underneath it.
-_WALLED_SWITCH_WINDOW_S = 60
 _walled_switch_lock = threading.Lock()
-_walled_switch_at: dict = {}
+_walled_switch_seen = collections.deque(maxlen=8)
 
 
-def _switch_off_walled_account() -> bool:
-    """Switch cswap off the account that just 429'd, at most once per episode.
+def _switch_off_walled_account(reset: bytes) -> bool:
+    """Switch cswap off the account that just 429'd, at most once per wall.
+
+    ``reset`` is the wall's own ``anthropic-ratelimit-unified-reset`` value —
+    unique per (account, window) already, so it needs no identity lookup and
+    no expiry: an epoch never recurs. A bounded deque, not one slot, because
+    a straggler request from a wall we already left (A -> switched to B ->
+    B also walled -> switched to C) must not re-trigger on A's now-stale
+    value.
 
     True only means "turn the 429 the client will see into a 401"; False (no
     headroom anywhere, or a second 429 for the same wall) means relay the
     429 untouched.
 
-    Storm control and episode debounce are the SAME guard: the walled
-    account claims its slot here, before ``switch()`` returns — so
-    concurrent 429s on one wall (measured: ten in a cycle, each its own MITM
-    thread) and a retry that reused the same stale bearer both find the slot
-    already claimed and are relayed untouched, instead of each taking three
-    cross-process locks and a usage fetch, or re-walling the account
-    ``switch()`` just moved onto.
+    Storm control and per-wall debounce are the SAME guard: the wall claims
+    its slot here, before ``switch()`` returns — so concurrent 429s on one
+    wall (measured: ten in a cycle, each its own MITM thread) and a retry
+    that reused the same stale bearer both find the slot already claimed and
+    are relayed untouched, instead of each taking three cross-process locks
+    and a usage fetch, or re-walling the account ``switch()`` just moved
+    onto.
     """
-    try:
-        ClaudeAccountSwitcher = require("switcher").ClaudeAccountSwitcher
-        sw = ClaudeAccountSwitcher()
-        key = sw._live_login_identity(ask_server=False)
-    except Exception:  # noqa: BLE001 — never let this break the relay
-        return False
-    now = time.monotonic()
     with _walled_switch_lock:
-        last = _walled_switch_at.get(key)
-        if last is not None and now - last < _WALLED_SWITCH_WINDOW_S:
+        if reset in _walled_switch_seen:
             return False
-        _walled_switch_at[key] = now
+        _walled_switch_seen.append(reset)
     try:
+        sw = require("switcher").ClaudeAccountSwitcher()
         result = require("switcher").switch_off_at_limit_account(sw)
     except Exception:  # noqa: BLE001 — never let this break the relay
         return False
@@ -16545,29 +16542,17 @@ def _relay_response(
         return _AUTH_REJECTED
     _note_worker_status(path, status_line, certdir)
     _note_hop_trouble(status_line)
-    # UNCONDITIONAL, not gated on `swapped`/`reject_on_auth_error`: the take-
-    # back above only fires on requests the pin actually swapped, and
-    # `/v1/messages` is explicitly not a pinned route — a guard beside it
-    # would be dead for the one path a client actually sleeps on. It also
-    # cannot re-trigger that take-back: this checks the ORIGINAL status
-    # (429), which never matches the 401/403/404 the take-back tests, so a
-    # 429 always falls through to here regardless of `reject_on_auth_error`.
-    #
-    # A STATUS REWRITE, NOT A HEADER ONE. CC's SDK only re-reads the
-    # credential file when it rebuilds its client, and 429 is not one of the
-    # triggers that rebuild does (a stale socket, mTLS reload, or 401/403 —
-    # never a rate limit); a shortened `anthropic-ratelimit-unified-reset`
-    # still wakes the SAME sleeping client into a retry on the SAME cached
-    # bearer. 401 IS a rebuild trigger, and the rebuild is what re-reads the
-    # file cswap's switch just moved. Gated on `switched: true`: an unchanged
-    # token gives the client's own oauth-refresh recovery exactly 2 tries
-    # before it gives up hard, so synthesizing a 401 when nothing actually
-    # moved would turn a rate limit into a dead session.
-    _walled_401 = (
-        status_line.startswith(b"HTTP/1.1 429")
-        and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
-        and _switch_off_walled_account()
-    )
+    # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
+    # above cannot see it; 401 is a rebuild trigger, 429 is not.
+    _walled_401 = False
+    if (status_line.startswith(b"HTTP/1.1 429")
+            and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"):
+        reset = next(
+            (l.split(b":", 1)[1].strip() for l in lines[1:]
+             if l.lower().startswith(b"anthropic-ratelimit-unified-reset:")),
+            b"",
+        )
+        _walled_401 = _switch_off_walled_account(reset)
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
@@ -16627,12 +16612,9 @@ def _relay_response(
         if _walled_401 and kl in (
             b"retry-after", b"anthropic-ratelimit-unified-reset"
         ):
-            # BOTH ARE WRONG ON A 401. `retry-after` above 60s makes the
-            # client's own auth-recovery throw `api_request_retry_after_too_long`
-            # and kill the turn outright — a rate limit's retry-after is
-            # routinely well above that, so leaving it in place turns a
-            # 44-minute stall into a dead one. The reset header is simply
-            # meaningless here; drop it so it cannot be mistaken for one.
+            # `retry-after` > 60s on a 401 throws
+            # `api_request_retry_after_too_long`; the reset header is
+            # meaningless on a 401.
             continue
         if kl in _HOP_BY_HOP_BYTES:
             continue
