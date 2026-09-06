@@ -12615,8 +12615,17 @@ class PinProxy:
             # `4 of 1 bridge(s)`, a numerator above its denominator, from two
             # counts of the same set taken seconds apart.
             posted = self._posting_now()
+            draining_now = this_process_is_draining()
             prev = getattr(self, "_last_deaf", None)
-            if now == prev:
+            # A BLIND EMITTED BECAUSE *THIS* PROCESS WAS DRAINING must not
+            # latch forever once the drain aborts and this process keeps
+            # serving: `now == prev` alone would otherwise dedupe away the
+            # MARK for an unchanged deaf set for the rest of this process's
+            # life, silencing every consumer of it. Only that one direction
+            # forces a re-emit; an ordinary unchanged set still dedupes.
+            stale_blind = (getattr(self, "_last_deaf_blind_draining", False)
+                           and not draining_now)
+            if now == prev and not stale_blind:
                 return
             # SAME GUARD AS THE CHEAP BRANCH, for the same reason: a mute
             # tuple is not a clear (nothing was judged, `DEAF_REPORT_BLIND`
@@ -12627,6 +12636,7 @@ class PinProxy:
                                                             grace=0.0):
                 return
             self._last_deaf = now
+            self._last_deaf_blind_draining = False
             if mute:
                 _log_lifecycle(
                     f"{DEAF_REPORT_BLIND} — {len(mute)} draining predecessor(s) "
@@ -12635,15 +12645,17 @@ class PinProxy:
                     "pre-existing session: pid "
                     + " ".join(str(p) for p in mute)
                 )
-            elif now and this_process_is_draining():
+            elif now and draining_now:
                 # The in-memory depth map, not is_draining(certdir, os.getpid()):
                 # the marker lags the first beat, and the first beat is the
                 # whole window.
+                self._last_deaf_blind_draining = True
                 _log_lifecycle(
                     f"{DEAF_REPORT_BLIND} — this process is draining, so its "
                     "own held-bridge view is partial by construction and a "
                     "bridge that looks streamless here may already be held "
-                    "by the successor: " + " ".join(now)
+                    "by the successor: "
+                    + " ".join(self._with_deaf_age(b) for b in now)
                 )
             elif now:
                 _log_lifecycle(
