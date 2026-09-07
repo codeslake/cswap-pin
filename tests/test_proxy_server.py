@@ -8258,6 +8258,58 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_registered_worker_leaves_one_line(self, certdir):
+        """The other half of the same event: who WON the worker subtree.
+
+        `_note_bridge_superseded` already records who LOST it on a 409; a
+        2xx on the same register path, on the same status-line hook, is the
+        registrant. No new hook, once per registration (each one is an
+        event, so no once-per-life guard here).
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._reset_bridge_traffic()
+            srv._stream_lost = {}
+
+            REGISTER = "/v1/code/sessions/cse_NEWWORKER/bridge"
+            srv._note_bridge_superseded(
+                "POST", REGISTER, b"HTTP/1.1 201 Created")
+            assert len(lines) == 1, (
+                "a 2xx on the register POST left "
+                f"{len(lines)}: {lines!r}")
+            assert "cse_NEWWORKER" in lines[-1], lines[-1]
+            assert "registered" in lines[-1], lines[-1]
+            assert "201" in lines[-1], lines[-1]
+            assert "POST" in lines[-1], lines[-1]
+            assert REGISTER in lines[-1], lines[-1]
+
+            # A 2xx ON A NON-REGISTER WORKER PATH is not a registration.
+            WORKER = "/v1/code/sessions/cse_NEWWORKER/worker/events"
+            before = len(lines)
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 200 OK")
+            assert len(lines) == before, (
+                "a 2xx on a non-register worker path logged as a "
+                "registration: " + repr(lines))
+
+            # THE 409 CASES ARE UNCHANGED, still reached and still gated.
+            srv._note_bridge_superseded(
+                "POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == before + 1, (
+                "a 409 stopped logging once the register branch was added: "
+                + repr(lines))
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_the_carry_is_reachable_without_a_daemon(self, certdir):
         """A switch must be able to carry pointers with no daemon running.
 
