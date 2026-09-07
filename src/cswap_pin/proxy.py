@@ -16859,7 +16859,7 @@ def _relay_response(
     # AFTER THE TAKE-BACK, deliberately. A swap the upstream refused returns
     # above and is retried unswapped, so reporting here would name a failure
     # the user never saw. This is the status that reaches the client.
-    if on_status is not None:
+    if on_status is not None and not _is_interim(status_line):
         try:
             on_status(status_line)
         except Exception:  # noqa: BLE001 — never let a statistic break a reply
@@ -16950,12 +16950,14 @@ def _relay_response(
             return _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
-                on_headers=None, path=path, certdir=certdir,
+                on_headers=None, on_status=on_status, path=path,
+                certdir=certdir,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
-            on_headers=None, path=path, certdir=certdir,
+            on_headers=None, on_status=on_status, path=path,
+            certdir=certdir,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send

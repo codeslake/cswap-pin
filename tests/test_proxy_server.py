@@ -6060,6 +6060,58 @@ class TestDrainReportsWhatItCut:
                 try: s_.close()
                 except OSError: pass
 
+    def case_on_status_reaches_the_final_line_behind_an_interim(self, certdir):
+        """An interim response must not swallow `on_status` for the real one.
+
+        The two 1xx recursions dropped `on_status` entirely (`on_headers=None`,
+        no `on_status=`), so a takeover 409 behind a 103 Early Hints reached
+        `_note_bridge_superseded` never: the callback fired once for the 103
+        itself (a no-op there) and then had nothing to call for the real
+        answer, because the recursion that reads it did not carry it.
+        """
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import _relay_response
+
+        up_a, up_b = socket.socketpair()
+        cl_a, cl_b = socket.socketpair()
+        calls = []
+        try:
+            def _send():
+                try:
+                    up_b.sendall(b"HTTP/1.1 103 Early Hints\r\n\r\n")
+                    time.sleep(0.05)
+                    up_b.sendall(
+                        b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n")
+                    up_b.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+            threading.Thread(target=_send, daemon=True).start()
+            _relay_response(
+                up_a, cl_a, 0, method="POST",
+                path="/v1/code/sessions/cse_X/worker/events",
+                on_status=lambda st: calls.append(st))
+
+            cl_a.shutdown(socket.SHUT_WR)
+            got = b""
+            while True:
+                chunk = cl_b.recv(4096)
+                if not chunk:
+                    break
+                got += chunk
+            assert b"409" in got, got[:120]
+            assert len(calls) == 1, (
+                f"on_status fired {len(calls)} time(s) behind an interim "
+                f"response, wanted exactly 1 for the final line: {calls!r}")
+            assert calls[0].startswith(b"HTTP/1.1 409"), calls
+        finally:
+            for s_ in (up_a, up_b, cl_a, cl_b):
+                try: s_.close()
+                except OSError: pass
+
     def case_the_orphan_sweep_spares_a_daemon_that_is_draining(self, certdir):
         """THE FIFTH CAUSE, and it is two of my own fixes in direct opposition.
 
