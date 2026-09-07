@@ -12848,7 +12848,8 @@ class PinProxy:
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
-    def _note_bridge_superseded(self, path: str, status_line: bytes) -> None:
+    def _note_bridge_superseded(self, method: str, path: str,
+                                 status_line: bytes) -> None:
         """A worker POST refused with 409 is not a bridge gone quiet.
 
         `_note_bridge_traffic` records only the REQUEST, so a bridge the
@@ -12858,6 +12859,12 @@ class PinProxy:
         it" — both false for one whose every worker POST comes back 409.
         `sweep_superseded_bridges` clears the same id eventually, driven by
         a listing poll, but always later than the 409 that already told us.
+
+        The takeover itself is logged too, once per bridge life: this is the
+        only site in the fleet that ever sees the 409 that names it, and a
+        Remote Control session dropped by it has nothing else to point at.
+        Gated on the eviction actually removing the id, so a burst of 409s
+        against one dead worker logs once rather than once per retry.
 
         Never raises: a statistic must not cost a request.
         """
@@ -12870,11 +12877,16 @@ class PinProxy:
             if not bid:
                 return
             b = bid.group(1)
+            was_posting = b in self._bridge_posts
             self._bridge_posts.pop(b, None)
             self._bridge_first_post.pop(b, None)
             stream_lost = getattr(self, "_stream_lost", None)
             if stream_lost is not None:
                 stream_lost.pop(b, None)
+            if was_posting:
+                _log_lifecycle(
+                    f"bridge {b} superseded by a newer worker registration "
+                    f"— 409 on {method} {path}")
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
@@ -15416,7 +15428,7 @@ class PinProxy:
                 on_status=lambda st: (
                     self._note_attachment(path, st),
                     self._note_rename(method, path, st),
-                    self._note_bridge_superseded(path, st),
+                    self._note_bridge_superseded(method, path, st),
                     self._tunnel_trace(
                         f"    <- {st.decode('latin1', 'replace').strip()}"
                         f"  {method} {path}  ua={_ua}"),

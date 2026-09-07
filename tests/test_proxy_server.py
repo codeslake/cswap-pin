@@ -6676,7 +6676,7 @@ class TestDrainReportsWhatItCut:
 
         srv2._note_bridge_traffic(REGISTER_Y, now=200.0)
         srv2._note_bridge_traffic(WORKER_Y, now=200.5)
-        srv2._note_bridge_superseded(WORKER_Y, b"HTTP/1.1 409 Conflict")
+        srv2._note_bridge_superseded("POST", WORKER_Y, b"HTTP/1.1 409 Conflict")
         assert srv2.deaf_bridges(now=201.0) == [], (
             "a 409 with no re-registration must not resurrect the id: "
             + repr(srv2.deaf_bridges(now=201.0)))
@@ -8143,7 +8143,7 @@ class TestDrainReportsWhatItCut:
             "setup: a bridge that posted and holds no stream starts out "
             "deaf")
 
-        srv._note_bridge_superseded(WORKER, b"HTTP/1.1 409 Conflict")
+        srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
         assert srv.deaf_bridges(window=60.0, now=101.0) == [], (
             "a 409 to its own worker POST means the server already "
             "superseded this bridge; `deaf_bridges` must stop naming it")
@@ -8154,7 +8154,7 @@ class TestDrainReportsWhatItCut:
         # CONTROL: a 200 on the same route leaves the bridge exactly posted.
         srv = _srv()
         srv._note_bridge_traffic(WORKER, now=100.0)
-        srv._note_bridge_superseded(WORKER, b"HTTP/1.1 200 OK")
+        srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 200 OK")
         assert srv.deaf_bridges(window=60.0, now=101.0) == [
             "cse_SUPERSEDED"], (
             "a 200 must not touch the bridge's posting record")
@@ -8164,7 +8164,7 @@ class TestDrainReportsWhatItCut:
         # server rejected THIS bridge.
         srv = _srv()
         srv._note_bridge_traffic(WORKER, now=100.0)
-        srv._note_bridge_superseded(NON_WORKER, b"HTTP/1.1 409 Conflict")
+        srv._note_bridge_superseded("POST", NON_WORKER, b"HTTP/1.1 409 Conflict")
         assert srv.deaf_bridges(window=60.0, now=101.0) == [
             "cse_SUPERSEDED"], (
             "a 409 on a non-worker route must not clear the bridge")
@@ -8174,7 +8174,7 @@ class TestDrainReportsWhatItCut:
         srv = _srv()
         srv._note_bridge_traffic(WORKER, now=time.monotonic())
         assert srv._posting_now() == 1
-        srv._note_bridge_superseded(WORKER, b"HTTP/1.1 409 Conflict")
+        srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
         assert srv._posting_now() == 0, (
             "the superseded bridge still counted toward the denominator "
             "`_report_deaf_bridges` divides by")
@@ -8187,6 +8187,60 @@ class TestDrainReportsWhatItCut:
         assert "_note_bridge_superseded" in wired, (
             "nothing calls the notifier, so a superseded bridge is still "
             "reported deaf until the window or a sweep clears it")
+
+    def case_a_superseded_bridges_409_leaves_one_durable_line(self, certdir):
+        """The takeover 409 is the only record of it anywhere in the fleet.
+
+        `_note_bridge_superseded` evicts the id from `_bridge_posts` but logs
+        nothing, so the one place that saw the server hand a bridge's worker
+        subtree to a newer registration leaves no trace once `daemon.log`
+        rotates. A durable line, once per bridge life, is the fix.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._reset_bridge_traffic()
+            srv._stream_lost = {}
+
+            WORKER = "/v1/code/sessions/cse_SUPERSEDED/worker/events"
+            srv._note_bridge_traffic(WORKER, now=100.0)
+
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == 1, (
+                "a superseded worker's 409 is the only record of the "
+                f"takeover, and it left {len(lines)}: {lines!r}")
+            assert "cse_SUPERSEDED" in lines[-1], lines[-1]
+            assert WORKER in lines[-1], lines[-1]
+            assert "409" in lines[-1], lines[-1]
+            assert "superseded" in lines[-1], lines[-1]
+
+            # A SECOND 409 on the same already-evicted bridge must not log
+            # again -- a stuck retry loop hammers the dead worker and would
+            # otherwise bury the one line that mattered under its repeats.
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == 1, (
+                "a second 409 for the same bridge logged again: " + repr(lines))
+
+            # A 409 ON A NON-WORKER PATH is not this bridge's takeover.
+            srv._note_bridge_traffic(WORKER, now=101.0)
+            before = len(lines)
+            srv._note_bridge_superseded(
+                "PUT", "/v1/code/sessions/cse_SUPERSEDED/rename",
+                b"HTTP/1.1 409 Conflict")
+            assert len(lines) == before, (
+                "a 409 on a non-worker route logged as a takeover: "
+                + repr(lines))
+        finally:
+            pp._log_lifecycle = real_log
 
     def case_the_carry_is_reachable_without_a_daemon(self, certdir):
         """A switch must be able to carry pointers with no daemon running.
