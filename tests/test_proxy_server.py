@@ -12146,7 +12146,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.RESET_HEADER in got, got[:80]
         assert self.RETRY_AFTER in got, got[:80]
         assert sum(
-            "did not validate the landing credential" in m for m in logged
+            "did not validate the landing credential (validated absent), "
+            "relaying the 429 unchanged" in m for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
@@ -12167,7 +12168,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.RESET_HEADER in got, got[:80]
         assert self.RETRY_AFTER in got, got[:80]
         assert sum(
-            "did not validate the landing credential" in m for m in logged
+            "did not validate the landing credential (validated False), "
+            "relaying the 429 unchanged" in m for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]

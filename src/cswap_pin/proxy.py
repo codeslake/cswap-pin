@@ -16541,11 +16541,14 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
         )
-        ok = landed and result.get("validated") is True
+        validated = result.get("validated")
+        ok = landed and validated is True
         if landed and not ok:
             _log_lifecycle(
                 "429 on /v1/messages — switch landed but the host did not "
-                "validate the landing credential, relaying the 429 unchanged"
+                "validate the landing credential "
+                f"(validated {'absent' if validated is None else validated}), "
+                "relaying the 429 unchanged"
             )
         else:
             _log_lifecycle(
