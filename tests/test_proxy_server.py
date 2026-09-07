@@ -11296,7 +11296,8 @@ class TestFailOpenIsNotSilent:
             event.set()
             holder.join(timeout=2.0)
 
-    def case_a_refresh_updates_the_cache_can_pin_stays_true(self, certdir):
+    def case_a_refresh_updates_the_cache_can_pin_stays_true(
+            self, certdir, monkeypatch):
         """`provider()` wrote the pre-refresh (expired) credential into
         `_cred_cache` and never wrote the rotated one back, so
         `can_pin_cached()` -- and therefore `/health`'s `can_pin` -- kept
@@ -11310,6 +11311,12 @@ class TestFailOpenIsNotSilent:
 
         from claude_swap.oauth import RefreshOutcome
         from cswap_pin import proxy as pp
+
+        # R11: the suite must never dial api.anthropic.com. The mint-time
+        # identity probe verifies the rotated token as the pin's own.
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
 
         expired = _json.dumps({"claudeAiOauth": {
             "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt"}})
