@@ -359,7 +359,9 @@ Control requests, and Claude Code renders that as "Please run /login" (measured
 the opt-in the pin answers `503 Service Unavailable` with `Retry-After: 2` and
 logs `egress REFUSED` once per outage; the client retries, nothing is asked to
 log in. A host with no chain configured is unaffected and dials direct as
-before.
+before. The daemon reads the opt-in from ITS OWN environment, fixed at exec,
+so a running daemon never sees a later export: set it in the shell that starts
+the next daemon (`export CSWAP_PIN_ALLOW_DIRECT=1; cswap pin --heal`).
 
 `CSWAP_PIN_EXIT_WITH_PARENT=1` makes the holder die when the process that
 started it dies. **Do not set this.** A holder is meant to outlive its
