@@ -8426,6 +8426,19 @@ _STANDBY_RELEASE_BOUND_S = 3.0
 # outlast a broken credential store, and a launch must never hang on this.
 _PIN_WAIT_TRIES = 3
 _PIN_WAIT_S = 0.3
+
+
+class _BlindMintRefusal(Exception):
+    """Raised by `_wait_for_pin_token` when a bridge-create route hit a REAL
+    failed mint (`blind_reason` set, not a stall, not a no-op) rather than
+    relaying it on whatever bearer is live. Caught beside each of the two
+    routes that call `_wait_for_pin_token` and turned into the same 503
+    `_refuse_stalled_mint` already answers a stalled mint with."""
+
+    def __init__(self, method: str, path: str) -> None:
+        super().__init__(f"{method} {path}")
+        self.method = method
+        self.path = path
 # The ladder a daemon that keeps dying costs: one attempt every ~5s rather than
 # four a second, so a persistently broken build does not spin the box while the
 # port it holds stays answering.
@@ -14523,6 +14536,16 @@ class PinProxy:
                 self._plain_relay(line, conn)
                 return
             conn.close()
+        except _BlindMintRefusal as e:
+            # Raised by `_plain_relay`'s own `_wait_for_pin_token` call
+            # (absolute-form bridge create). Same 503, no keep-alive loop to
+            # feed it back into on this path — the request line is answered
+            # and the connection ends, same as every other refusal here.
+            self._refuse_stalled_mint(conn, e.method, e.path)
+            try:
+                conn.close()
+            except OSError:
+                pass
         except Exception:
             try:
                 conn.close()
@@ -14579,6 +14602,24 @@ class PinProxy:
             token = self._pin_token_provider()
             if token:
                 return token
+        # BLIND, NOT STALLED, NOT A NO-OP: the mint was actually asked and
+        # actually failed (see the sites that set `blind_reason` above
+        # `make_pin_token_provider`'s `provider()`), so relaying below on
+        # whatever bearer is live would fix this bridge's owner PERMANENTLY
+        # under the wrong account. A stall (`mint_stalled()`) already gets its
+        # own 503 before this function is ever called; a no-op means there is
+        # nothing to swap. Neither of those belongs here.
+        provider = self._pin_token_provider
+        blind_reason = getattr(provider, "blind_reason", "")
+        mint_stalled = getattr(provider, "mint_stalled", None)
+        if blind_reason and not (mint_stalled and mint_stalled()) \
+                and not _pin_is_noop(provider):
+            _log_lifecycle(
+                f"{method} {path} refused: the pinned token could not be "
+                f"minted ({blind_reason}) -- relaying this bridge create "
+                "would give it away to the wrong account for good"
+            )
+            raise _BlindMintRefusal(method, path)
         _log_lifecycle(
             "a bridge was created without the pin: the token could not be "
             "minted in time, so this session belongs to the active account "
@@ -14819,7 +14860,14 @@ class PinProxy:
              # see the note above `mint_stalled_s` is computed from.
              "mint_stalled": mint_stalled_s is not None,
              "mint_stalled_s": (round(mint_stalled_s, 1)
-                                 if mint_stalled_s is not None else None)}
+                                 if mint_stalled_s is not None else None),
+             # ADDITIVE: the ONE view an operator has of a daemon that is
+             # failing bridge-creates closed instead of relaying them (see
+             # `_wait_for_pin_token`) — /health never published this before.
+             # Never CALLS the provider; reads the field its last real mint
+             # attempt already left set (blank on a live or no-op pin).
+             "blind_reason": getattr(
+                 self._pin_token_provider, "blind_reason", "") or None}
         )
         try:
             conn.sendall(
@@ -15101,7 +15149,12 @@ class PinProxy:
                         # `deaf_bridges` read this session as HOLDING a stream
                         # after its stream ended — a false negative in the
                         # check, worse than the leak.
-                got_one = self._handle_one_request(tls, conn)
+                try:
+                    got_one = self._handle_one_request(tls, conn)
+                except _BlindMintRefusal as e:
+                    # Same 503 a stalled mint already answers with, and the
+                    # same keep-alive: the swap failed, not the connection.
+                    got_one = self._refuse_stalled_mint(tls, e.method, e.path)
                 self._local.up_idle_since = time.monotonic()
                 served_one = True
                 if not got_one:

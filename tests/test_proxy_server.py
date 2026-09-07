@@ -3328,6 +3328,210 @@ class TestChainRediscovery:
                 proxy.stop()
             chain.stop()
 
+    def _blind_provider(self, blind_reason="", stalled=False, noop=False):
+        """A pin-token provider shaped like `make_pin_token_provider`'s real
+        one for the three states `_wait_for_pin_token`'s guard reads:
+        `blind_reason` (a REAL failed mint), `mint_stalled()` (a stall, not a
+        failure) and `pin_is_noop()` (nothing to swap). Always mints None —
+        none of these three cases has a token to give."""
+        def provider():
+            return None
+        provider.blind_reason = blind_reason
+        provider.mint_stalled = lambda: stalled
+        provider.pin_is_noop = lambda: noop
+        return provider
+
+    def case_a_blind_mint_refuses_the_bridge_create_instead_of_relaying(
+        self, certdir
+    ):
+        """A REAL failed mint (`blind_reason` set, not a stall, not a no-op)
+        on a bridge-create route must answer 503 and never reach the chain —
+        relaying here gives the bridge to the ACTIVE account for good, which
+        is exactly the defect this round exists to close."""
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        provider = self._blind_provider(
+            blind_reason="no credential for slot 1 (a@example.com)")
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            got = b""
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+            finally:
+                c.close()
+
+            assert got.startswith(b"HTTP/1.1 503"), (
+                f"a blind mint was relayed instead of refused: {got[:60]!r}")
+            time.sleep(0.5)  # the relay this must never run needs a beat
+            assert chain.seen == [], (
+                "the bridge create reached the chain on a blind mint — this "
+                "bridge is now owned by the ACTIVE account permanently")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
+    def case_a_noop_pin_still_relays_unpinned_not_503(self, certdir):
+        """A no-op pin (`pin_is_noop()` True — the pinned account IS the
+        active one, or the pin is cleared) has nothing to swap; today's
+        fail-open relay must still run, unrefused. Without this the new
+        guard is indistinguishable from 'always refuse'."""
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        provider = self._blind_provider(
+            blind_reason="no credential for slot 1 (a@example.com)", noop=True)
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            got = b""
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+            finally:
+                c.close()
+
+            assert got.startswith(b"HTTP/1.1 200"), (
+                f"a no-op pin was refused instead of relayed: {got[:60]!r}")
+            assert chain.seen and b"Bearer ACTIVE" in chain.seen[0], (
+                "the no-op case did not take today's unpinned relay path")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
+    def case_a_stalled_mint_still_relays_unpinned_not_503(self, certdir):
+        """A stalled mint (`mint_stalled()` True) is a wedge, not a failure —
+        it already gets its own 503 before `_wait_for_pin_token` runs on the
+        MITM path, and on this path it must still take today's fail-open
+        relay rather than the new guard's refusal, which is for a REAL
+        failed mint only."""
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        import base64
+
+        secret = ensure_proxy_secret(certdir)
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        provider = self._blind_provider(
+            blind_reason="mint stalled: the refresh lock has been held over "
+                         "45s for slot 1 (a@example.com)",
+            stalled=True)
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             rediscover_chain=True)
+            proxy.start()
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            got = b""
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+            finally:
+                c.close()
+
+            assert got.startswith(b"HTTP/1.1 200"), (
+                f"a stalled mint was refused by the blind-mint guard instead "
+                f"of taking today's fail-open path: {got[:60]!r}")
+            assert chain.seen and b"Bearer ACTIVE" in chain.seen[0], (
+                "the stalled case did not take today's unpinned relay path")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
+    def case_health_publishes_blind_reason_only_while_blind(self, certdir):
+        """/health never published `blind_reason` before this round — the
+        operator's only view of a daemon refusing bridge creates closed."""
+        import json as _json
+
+        from cswap_pin.proxy import PinProxy
+
+        def _get_health(proxy):
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            try:
+                raw.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                raw.settimeout(5)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                body = resp.split(b"\r\n\r\n", 1)[1]
+                try:
+                    body += raw.recv(4096)
+                except OSError:
+                    pass
+            finally:
+                raw.close()
+            return _json.loads(body.decode() or "{}")
+
+        provider = self._blind_provider()  # clear: blind_reason == ""
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", 1))
+        proxy.start()
+        try:
+            clear = _get_health(proxy)
+            assert "blind_reason" in clear, (
+                "/health dropped the blind_reason KEY")
+            assert clear["blind_reason"] is None, (
+                f"a clear pin published blind_reason={clear['blind_reason']!r}")
+
+            provider.blind_reason = "no credential for slot 1 (a@example.com)"
+            blind = _get_health(proxy)
+            assert blind["blind_reason"] == provider.blind_reason, (
+                f"/health did not carry the real blind_reason: {blind!r}")
+        finally:
+            proxy.stop()
+
     def case_a_refused_swap_is_taken_back_on_the_absolute_form_path(
         self, certdir
     ):
