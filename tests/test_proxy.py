@@ -4082,7 +4082,7 @@ class TestMakePinTokenProvider:
         assert "answers as someone-else@example.com" in provider.blind_reason
         # M4: THIS CALL's own flag, read by `_can_mint`/`_warn_unpinnable` --
         # never the sticky `identity_mismatch` dict above.
-        assert provider._foreign_this_call is True
+        assert provider._tls.foreign is True
 
     def case_a_later_unrelated_failure_is_not_masked_by_an_earlier_foreign_one(
             self, monkeypatch):
@@ -4096,10 +4096,10 @@ class TestMakePinTokenProvider:
         provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
         # Simulate "a prior call was foreign" without needing a whole
         # separate mint to set it up.
-        provider._foreign_this_call = True
+        provider._tls.foreign = True
 
         assert provider() is None, "an unreadable store is still a failure"
-        assert provider._foreign_this_call is False, (
+        assert provider._tls.foreign is False, (
             "reset at the top of every call -- an unrelated failure must "
             "never read as the previous call's foreign verdict")
         assert "no credential" in provider.blind_reason
@@ -4321,6 +4321,80 @@ class TestMakePinTokenProvider:
             "self-heal watchdog's recycle signal")
         assert provider.identity_mismatch is not None
 
+    def case_a_concurrent_call_cannot_clear_another_threads_foreign_verdict(
+            self, monkeypatch):
+        """C1: `_foreign_this_call` lived on the shared provider FUNCTION
+        OBJECT, one object every calling thread shares, and `provider()`
+        resets it unconditionally on ENTRY -- before its own identity probe
+        even starts. Sequence from the gate: T1 settles a foreign verdict;
+        T2 (a different thread, calling the SAME provider) enters and resets
+        the flag while ITS OWN probe is still in flight; a reader on T1
+        (`_can_mint`/`_warn_unpinnable`) landing in that window saw T2's
+        reset, not T1's own verdict -- a live bridge lost, or a real store
+        failure recorded as a benign foreign one. `_tls`, a per-thread
+        `threading.local()`, must give T1's read its own slot, untouched by
+        what T2 is doing on its own."""
+        import json
+        import threading
+
+        from claude_swap.oauth import RefreshOutcome
+        from cswap_pin import proxy as pin_proxy
+
+        # ALWAYS "expired" (well inside `is_oauth_token_expired`'s 5-minute
+        # buffer): every call, T1's and T2's alike, re-refreshes rather than
+        # hitting the fast path's settled-verdict cache -- which never
+        # re-probes a token it has already judged, and would otherwise let
+        # T2 short-circuit straight to T1's cached "foreign" answer without
+        # ever calling `pin_profile_for` again.
+        stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "dead", "expiresAt": 1, "refreshToken": "rt"}})
+        minted = {"n": 0}
+
+        def fake_refresh(_creds):
+            minted["n"] += 1
+            tok = f"foreign-tok-{minted['n']}"
+            return RefreshOutcome(json.dumps({"claudeAiOauth": {
+                "accessToken": tok, "expiresAt": 1,
+                "refreshToken": f"rt-{minted['n']}"}}), None)
+
+        probing = threading.Event()
+        release = threading.Event()
+
+        def fake_profile(token):
+            if token == "foreign-tok-2":
+                probing.set()
+                assert release.wait(timeout=5), "T1 never took its read"
+            return {"accountUuid": "foreign-uuid",
+                    "emailAddress": "someone-else@example.com"}
+
+        monkeypatch.setattr(pin_proxy, "pin_profile_for", fake_profile)
+        monkeypatch.setattr(
+            pin_proxy.oauth, "try_refresh_oauth_credentials", fake_refresh)
+
+        sw = _FakeSwitcher(active_num="1", backups={"2": stored})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        # T1: settles a foreign verdict for "foreign-tok-1".
+        assert provider() is None
+        assert provider._tls.foreign is True
+
+        t2 = threading.Thread(target=provider)
+        t2.start()
+        assert probing.wait(timeout=5), "T2 never reached its identity probe"
+
+        # T1's OWN reader, exactly what `_can_mint`/`_warn_unpinnable` do --
+        # taken while T2 has already reset the flag on entry and is still
+        # mid-probe, deciding its own verdict.
+        try:
+            assert provider._tls.foreign is True, (
+                "T2's concurrent call cleared T1's own foreign verdict "
+                "before T1's reader got to it -- the flag lived on the "
+                "shared provider object, not a per-thread slot"
+            )
+        finally:
+            release.set()
+            t2.join(timeout=5)
+
 
 class TestRefreshGoesThroughTheInterprocessGate:
     """A refresh token is one-time-use, and this daemon is not the only
@@ -4457,6 +4531,37 @@ class TestRefreshGoesThroughTheInterprocessGate:
         assert provider() == "fresh"
         # No gate to persist for us, so the pin must do it itself.
         assert sw.persisted == [("2", "pin@example.com", rotated)]
+
+    def case_a_foreign_rotation_is_never_persisted(self, monkeypatch):
+        """I1: the fallback persist path (no `consume_backup_grant`) used to
+        write `rotated` back BEFORE any identity verdict existed. A refresh
+        on a foreign bearer -- the store answering as someone else's account
+        under this slot -- must be neither cached as ok NOR persisted: that
+        would write the foreign lineage into the backup store under this
+        slot, reinforcing the exact corruption this branch exists to stop.
+        The positive control (`case_an_older_host_without_the_gate_still_
+        refreshes`) already covers the ok verdict still persisting."""
+        from cswap_pin import proxy as pin_proxy
+        from claude_swap.oauth import RefreshOutcome
+
+        rotated = self._rotated()
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "foreign-uuid",
+                           "emailAddress": "someone-else@example.com"})
+        monkeypatch.setattr(
+            pin_proxy.oauth, "try_refresh_oauth_credentials",
+            lambda _c: RefreshOutcome(rotated, None))
+
+        sw = _FakeSwitcher(active_num="1", backups={"2": self._expired()})
+        assert not hasattr(sw, "consume_backup_grant")
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() is None, "a foreign bearer must never be spliced"
+        assert sw.persisted == [], (
+            "a foreign verdict's rotated bytes were written back to the "
+            "backup store under this slot"
+        )
 
 
 class TestPinStore:
@@ -20108,7 +20213,8 @@ class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
 
         class _Provider:
             def __init__(self, foreign):
-                self._foreign_this_call = foreign
+                self._tls = threading.local()
+                self._tls.foreign = foreign
 
         foreign = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         foreign._certdir = "/nowhere"

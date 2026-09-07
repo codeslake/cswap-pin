@@ -10781,6 +10781,45 @@ class TestFailOpenIsNotSilent:
         assert self._drive_pinned_request(p) is None
         assert "UNPINNED" in buf.getvalue(), "went silent on a real fail-open"
 
+    def case_a_foreign_verdict_does_not_mask_a_later_real_failure(
+            self, certdir, monkeypatch):
+        """I2: the once-per-daemon latch used to be set on a foreign call
+        too -- `_warn_unpinnable` only skipped `mark_daemon_unpinnable` for
+        it, not the latch above that -- so ONE foreign episode silenced the
+        warning AND the record for every later, genuinely unreadable store
+        on this daemon for the rest of its life. The splice-site guard must
+        keep a foreign call from reaching `_warn_unpinnable` at all, so the
+        latch stays open for the failure it exists to report."""
+        import io
+        import sys as _sys
+        import threading
+
+        def foreign_provider():
+            return None
+
+        foreign_provider._tls = threading.local()
+        foreign_provider._tls.foreign = True
+
+        buf = io.StringIO()
+        monkeypatch.setattr(_sys, "stderr", buf)
+        p = self._proxy(certdir, foreign_provider)
+
+        assert self._drive_pinned_request(p) is None
+        assert "UNPINNED" not in buf.getvalue(), (
+            "a foreign bearer warned with the wrong (keychain) advice")
+        assert getattr(p, "_warned_unpinnable", False) is False, (
+            "a foreign episode consumed the once-per-daemon latch, which "
+            "would silence a LATER real failure on the same daemon"
+        )
+
+        # The SAME daemon, now genuinely unable to read the store -- the
+        # case the warning exists for.
+        p._pin_token_provider = lambda: None
+        assert self._drive_pinned_request(p) is None
+        assert "UNPINNED" in buf.getvalue(), (
+            "the earlier foreign episode masked this later, real failure"
+        )
+
     def case_a_noop_pin_reports_can_pin_on_health(self, certdir):
         """/health must not call a pin broken on the machine where it is a no-op.
 

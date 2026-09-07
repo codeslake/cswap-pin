@@ -5592,7 +5592,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 verdict, bearer_ref, now + _IDENTITY_PROBE_BACKOFF_S)
         if verdict == "foreign":
             _set_identity({"pinned": _ref(mail), "bearer": bearer_ref})
-            provider._foreign_this_call = True
+            provider._tls.foreign = True
             who = (bearer_ref or {}).get("email") or (bearer_ref or {}).get("uuid")
             provider.blind_reason = (
                 f"the pinned slot's credential answers as {who}, not "
@@ -5629,7 +5629,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # instead of the sticky `identity_mismatch` dict, so a LATER,
         # unrelated failure (the store going unreadable) is never masked by
         # a foreign verdict this same provider gave on some earlier call.
-        provider._foreign_this_call = False
+        provider._tls.foreign = False
         target = _current_target()
         if target is None:
             return None
@@ -5693,6 +5693,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return None
         provider._lock_acquired_at = time.monotonic()
         token = None
+        rotated = None
         try:
             # Someone may have rotated it while we waited, or this is the
             # cold-cache case above and this IS the first read — either way
@@ -5744,15 +5745,21 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # would write back OUTSIDE that lock and could clobber a
                 # racing writer's newer lineage — the exact failure the
                 # gate exists to prevent.
-                if rotated and not hasattr(switcher, "consume_backup_grant"):
-                    switcher.persist_backup_credentials(num, mail, rotated)
         finally:
             provider._lock_acquired_at = None
             refresh_lock.release()
         # THE PROBE RUNS OUTSIDE THE LOCK: it only needs the token string,
         # and every OTHER pinned thread must not queue behind a network call
         # this one is making for itself.
-        return token if token and _identity_ok(token, mail) else None
+        ok = bool(token) and _identity_ok(token, mail)
+        # NEVER PERSIST A FOREIGN VERDICT'S ROTATION: this fallback path is
+        # for a switcher that predates `consume_backup_grant` (the gated one
+        # persists internally, above); it must not write a foreign bearer's
+        # rotated bytes back under this slot -- would reinforce the exact
+        # corruption this branch exists to stop.
+        if ok and rotated and not hasattr(switcher, "consume_backup_grant"):
+            switcher.persist_backup_credentials(num, mail, rotated)
+        return token if ok else None
 
     def pin_is_noop() -> bool:
         """True when returning no token is the CORRECT answer, not a failure.
@@ -5827,7 +5834,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # gate; see `_identity_ok`'s docstring for `_foreign_this_call`, which
     # is that gate.
     provider.identity_mismatch = None
-    provider._foreign_this_call = False
+    provider._tls = threading.local()
     provider.note_verdict = _note_verdict
     return provider
 
@@ -5880,7 +5887,7 @@ def _can_mint(provider) -> "bool | None":
         # recycle cannot repair a cross-wired credential store, since a
         # fresh process reads the very same one. THIS CALL'S OWN flag, not
         # the sticky `identity_mismatch` -- see `_identity_ok`.
-        if getattr(provider, "_foreign_this_call", False):
+        if getattr(getattr(provider, "_tls", None), "foreign", False):
             return True
         return _pin_is_noop(provider)
     except Exception:  # noqa: BLE001 — a health question is never fatal
@@ -14826,8 +14833,8 @@ class PinProxy:
         # the same recycle-on-a-symptom-a-respawn-cannot-fix hazard `can_pin`
         # itself had to avoid for a foreign bearer. The stderr line below
         # still prints either way; only the mark is conditional.
-        if not getattr(getattr(self, "_pin_token_provider", None),
-                       "_foreign_this_call", False):
+        if not getattr(getattr(getattr(self, "_pin_token_provider", None),
+                                "_tls", None), "foreign", False):
             try:
                 mark_daemon_unpinnable(self._certdir)
             except Exception:  # noqa: BLE001 — advisory; never break a request
@@ -15449,7 +15456,9 @@ class PinProxy:
                 # the active one there is nothing to swap, and warning then
                 # trains the reader to disbelieve the warning (see
                 # ``pin_is_noop``).
-                if not _pin_is_noop(self._pin_token_provider):
+                if not _pin_is_noop(self._pin_token_provider) and not getattr(
+                        getattr(self._pin_token_provider, "_tls", None),
+                        "foreign", False):
                     self._warn_unpinnable()
         # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
         # inside `_forward`'s status hook, and it takes no arguments from
