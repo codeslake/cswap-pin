@@ -17,7 +17,6 @@ not a dependency.
 from __future__ import annotations
 
 import base64
-import collections
 import contextlib
 import datetime as _dt
 import glob
@@ -16452,16 +16451,14 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
 
 
 _walled_switch_lock = threading.Lock()
-_walled_switch_seen = collections.deque(maxlen=8)
-# Subset of `_walled_switch_seen`: only the walls the switch actually
-# succeeded on. The debounce claims a slot whether or not `switch()` found
-# headroom, so `reset in _walled_switch_seen` alone cannot tell a repeat of a
-# converted wall from a repeat of one that never switched — this is what
-# does.
-_walled_switch_ok = collections.deque(maxlen=8)
+# reset -> ok. Insertion-ordered, capped at 8 (this many walls in flight is
+# already unusual); a straggler request from a wall we already left (A ->
+# switched to B -> B also walled -> switched to C) must not re-trigger on
+# A's now-stale value, so the oldest entry is dropped once the cap is hit.
+_walled_switch_seen: dict[bytes, bool] = {}
 
 
-def _switch_off_walled_account(reset: bytes, retry_after: bytes = b"") -> bool:
+def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     """Switch cswap off the account that just 429'd, at most once per wall.
 
     ``reset`` is the wall's own ``anthropic-ratelimit-unified-reset`` value —
@@ -16470,29 +16467,29 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes = b"") -> bool:
     account-level unified wall (an edge/gateway 429, or an org/key-scoped
     limit) — nothing to key on and nothing `switch()` can fix, so relay it
     untouched rather than debounce every header-less 429 against one shared
-    empty key. A bounded deque (``maxlen=8``: this many walls in flight is
-    already unusual), not one slot, because a straggler request from a wall
-    we already left (A -> switched to B -> B also walled -> switched to C)
-    must not re-trigger on A's now-stale value.
+    empty key.
 
     True means "turn the 429 the client will see into a 401" — because either
-    this call switched the account off, or an earlier call for this same
-    wall already did. False (no headroom anywhere, ``switch()`` raised, or a
-    repeat of a wall that never switched) means relay the 429 untouched.
+    this call switched the account off onto a credential the host confirmed
+    is LIVE, or an earlier call for this same wall already did. False (no
+    headroom anywhere, `switch()` raised, `switch()` landed a credential it
+    never validated, or a repeat of a wall that never earned a 401) means
+    relay the 429 untouched — a relayed wall 429 costs a sleep the client
+    can abandon; a 401 onto a credential nobody confirmed is alive is worse
+    than the wall itself, because CC rebuilds onto it.
 
-    Storm control and per-wall debounce are the SAME guard: the wall claims
-    its slot here, before ``switch()`` returns — so concurrent 429s on one
-    wall (measured: ten in a cycle, each its own MITM thread) and a retry
-    that reused the same stale bearer both find the slot already claimed and
-    skip re-attempting the switch, instead of each taking three
-    cross-process locks and a usage fetch, or re-walling the account
-    ``switch()`` just moved onto. A debounce hit must not also debounce the
-    CONVERSION: the account for that wall is already switched off (or never
-    was), and the client's answer follows that fact, not the fact that this
-    call is a repeat. The slot is released on a raise: a transient failure
-    (this daemon's own `claude_config_lock` held elsewhere, or an older
-    claude-swap with no such symbol) must not burn the wall's only attempt
-    forever.
+    Storm control and per-wall debounce are the SAME guard, and the lock is
+    held ACROSS `switch()`: the wall claims its slot and every waiter blocks
+    on the one call actually doing the work, rather than reading a
+    seen-but-not-yet-decided slot and relaying the wall 429 while the first
+    caller's switch is still landing. Concurrent 429s on one wall (measured:
+    ten in a cycle, each its own MITM thread) and a retry that reused the
+    same stale bearer all block here and then read the single settled
+    answer, instead of each taking three cross-process locks and a usage
+    fetch, or re-walling the account `switch()` just moved onto. A raise
+    records nothing, so a transient failure (this daemon's own
+    `claude_config_lock` held elsewhere, or an older claude-swap with no
+    such symbol) does not burn the wall's only attempt forever.
     """
     if not reset:
         _log_lifecycle(
@@ -16504,48 +16501,47 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes = b"") -> bool:
         return False
     with _walled_switch_lock:
         if reset in _walled_switch_seen:
-            ok = reset in _walled_switch_ok
+            ok = _walled_switch_seen[reset]
             _log_lifecycle(
                 "429 on /v1/messages — debounced repeat of wall reset="
-                f"{reset.decode('latin1', 'replace')}, relaying a 401"
-                if ok else
-                "429 on /v1/messages — debounced repeat of wall reset="
-                f"{reset.decode('latin1', 'replace')}, relaying the 429 "
-                "unchanged"
+                f"{reset.decode('latin1', 'replace')}, relaying "
+                f"{'a 401' if ok else 'the 429 unchanged'}"
             )
             return ok
-        _walled_switch_seen.append(reset)
-    try:
-        switcher = require("switcher")
-        result = switcher.switch_off_at_limit_account(
-            switcher.ClaudeAccountSwitcher()
+        try:
+            switcher = require("switcher")
+            result = switcher.switch_off_at_limit_account(
+                switcher.ClaudeAccountSwitcher()
+            )
+        except Exception as exc:  # noqa: BLE001 — never let this break the relay
+            _log_lifecycle(
+                f"429 on /v1/messages — switch_off_at_limit_account raised "
+                f"{exc.__class__.__name__}, relaying the 429 unchanged"
+            )
+            return False
+        landed = bool(
+            result and result.get("switched") and not result.get("needsLogin")
         )
-    except Exception as exc:  # noqa: BLE001 — never let this break the relay
-        with _walled_switch_lock:
-            try:
-                _walled_switch_seen.remove(reset)
-            except ValueError:
-                pass
-        _log_lifecycle(
-            f"429 on /v1/messages — switch_off_at_limit_account raised "
-            f"{exc.__class__.__name__}, relaying the 429 unchanged"
-        )
-        return False
-    switched = bool(
-        result and result.get("switched") and not result.get("needsLogin")
-    )
-    if switched:
-        with _walled_switch_lock:
-            _walled_switch_ok.append(reset)
-    _log_lifecycle(
-        "429 on /v1/messages — walled account switched off, relaying a 401"
-        if switched else
-        f"429 on /v1/messages — switch() reported switched="
-        f"{result.get('switched') if result else None} needsLogin="
-        f"{result.get('needsLogin') if result else None}, relaying the 429 "
-        f"unchanged"
-    )
-    return switched
+        ok = landed and result.get("validated") is True
+        if landed and not ok:
+            _log_lifecycle(
+                "429 on /v1/messages — switch landed but the host did not "
+                "validate the landing credential, relaying the 429 unchanged"
+            )
+        else:
+            _log_lifecycle(
+                "429 on /v1/messages — walled account switched off, relaying "
+                "a 401"
+                if ok else
+                f"429 on /v1/messages — switch() reported switched="
+                f"{result.get('switched') if result else None} needsLogin="
+                f"{result.get('needsLogin') if result else None}, relaying "
+                f"the 429 unchanged"
+            )
+        _walled_switch_seen[reset] = ok
+        if len(_walled_switch_seen) > 8:
+            del _walled_switch_seen[next(iter(_walled_switch_seen))]
+        return ok
 
 
 def _relay_response(

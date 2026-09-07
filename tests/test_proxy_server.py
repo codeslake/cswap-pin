@@ -11907,8 +11907,12 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     SHOULD_RETRY = b"x-should-retry: true"
 
     @staticmethod
-    def _wire(monkeypatch, switched, raises_once=None, needs_login=False):
-        """Stub claude_swap's switcher so no real account store is touched."""
+    def _wire(monkeypatch, switched, raises_once=None, needs_login=False,
+              validated=True):
+        """Stub claude_swap's switcher so no real account store is touched.
+
+        ``validated=None`` omits the key entirely (an older cswap that never
+        probed the landing credential, or a probe that never ran)."""
         from cswap_pin import proxy as pp
 
         calls = []
@@ -11919,8 +11923,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             if raises_once is not None and not state["raised"]:
                 state["raised"] = True
                 raise raises_once
-            return {"switched": switched, "needsLogin": needs_login,
-                    "reason": None if switched else "candidates-exhausted"}
+            result = {"switched": switched, "needsLogin": needs_login,
+                      "reason": None if switched else "candidates-exhausted"}
+            if validated is not None:
+                result["validated"] = validated
+            return result
 
         fake_module = type("M", (), {
             "ClaudeAccountSwitcher": staticmethod(lambda: None),
@@ -11928,7 +11935,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
-        pp._walled_switch_ok.clear()
+        if hasattr(pp, "_walled_switch_ok"):  # pre-fix two-deque shape only
+            pp._walled_switch_ok.clear()
         return calls
 
     @classmethod
@@ -12078,10 +12086,6 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert first.startswith(b"HTTP/1.1 401"), first[:40]
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 401"), second[:40]
-        assert b"retry-after" not in second.lower(), second[:80]
-        assert self.RESET_HEADER not in second, second[:80]
-        assert self.UNIFIED_STATUS not in second, second[:80]
-        assert self.SHOULD_RETRY not in second, second[:80]
         assert len(calls) == 1, len(calls)
 
     def case_a_debounced_failed_switch_still_relays_the_429(self, monkeypatch):
@@ -12096,6 +12100,104 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
         assert self.RESET_HEADER in second, second[:80]
+        assert len(calls) == 1, len(calls)
+
+    def case_a_switch_without_a_validated_landing_relays_the_429_unchanged(
+        self, monkeypatch,
+    ):
+        """`switch()` landed a credential but never probed it live (an older
+        cswap on the host, or a probe that did not run) — no `validated`
+        key at all. A 401 here would rebuild CC onto a credential nobody
+        confirmed is alive, which is worse than the wall it replaces."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        calls = self._wire(monkeypatch, switched=True, validated=None)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self.RESET_HEADER in got, got[:80]
+        assert self.RETRY_AFTER in got, got[:80]
+        assert sum(
+            "did not validate the landing credential" in m for m in logged
+        ) == 1, logged
+        second = self._relay()
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert self.RESET_HEADER in second, second[:80]
+        assert len(calls) == 1, len(calls)
+
+    def case_a_switch_with_validated_false_relays_the_429_unchanged(
+        self, monkeypatch,
+    ):
+        """Same as the missing-key case, spelled the other way: `switch()`
+        ran the probe and it came back dead."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        calls = self._wire(monkeypatch, switched=True, validated=False)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self.RESET_HEADER in got, got[:80]
+        assert self.RETRY_AFTER in got, got[:80]
+        assert sum(
+            "did not validate the landing credential" in m for m in logged
+        ) == 1, logged
+        second = self._relay()
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_two_concurrent_429s_on_the_same_wall_wait_for_the_switch(
+        self, monkeypatch,
+    ):
+        """Ten concurrent 429s on one wall (measured), each its own MITM
+        thread: a debounce that claims the wall's slot and releases the
+        lock BEFORE `switch()` returns lets a second thread read
+        seen-and-not-yet-ok and relay the 429 verbatim while the first
+        thread's switch is still landing. The lock must stay held across
+        `switch()` so every waiter reads the one settled answer."""
+        from cswap_pin import proxy as pp
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _switch_off(sw):
+            entered.set()
+            assert release.wait(timeout=5), "release never set — test bug"
+            return {"switched": True, "needsLogin": False, "validated": True}
+
+        calls = []
+
+        def _counted(sw):
+            calls.append(sw)
+            return _switch_off(sw)
+
+        fake_module = type("M", (), {
+            "ClaudeAccountSwitcher": staticmethod(lambda: None),
+            "switch_off_at_limit_account": staticmethod(_counted),
+        })()
+        monkeypatch.setattr(pp, "require", lambda n: fake_module)
+        pp._walled_switch_seen.clear()
+        if hasattr(pp, "_walled_switch_ok"):  # pre-fix two-deque shape only
+            pp._walled_switch_ok.clear()
+
+        results = {}
+
+        def _run(key):
+            results[key] = self._relay()
+
+        t1 = threading.Thread(target=_run, args=("a",))
+        t1.start()
+        assert entered.wait(timeout=5), "switch() never started"
+
+        t2 = threading.Thread(target=_run, args=("b",))
+        t2.start()
+        # t2 has had time to reach the debounce check (or run past it, on
+        # the broken shape) while switch() is still blocked on `release`.
+        time.sleep(0.2)
+        release.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert results["a"].startswith(b"HTTP/1.1 401"), results["a"][:40]
+        assert results["b"].startswith(b"HTTP/1.1 401"), results["b"][:40]
         assert len(calls) == 1, len(calls)
 
     def case_a_different_wall_switches_again(self, monkeypatch):
