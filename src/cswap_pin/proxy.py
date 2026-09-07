@@ -12909,9 +12909,7 @@ class PinProxy:
                     and _BRIDGE_REGISTER.search(path)):
                 bid = _BRIDGE_ID.search(path)
                 if bid:
-                    parts = status_line.split(b" ")
-                    code = (parts[1].decode("latin1", "replace")
-                            if len(parts) > 1 else "?")
+                    code = status_line[9:12].decode("latin1", "replace")
                     _log_lifecycle(
                         f"bridge {bid.group(1)} registered a new worker "
                         f"— {code} on {method} {path}")
