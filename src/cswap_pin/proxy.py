@@ -15725,13 +15725,6 @@ class PinProxy:
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
                 certdir=getattr(self, "_certdir", None),
-                # FROM THE REQUEST, WHICH THE RELAY NEVER SEES. A 429 the
-                # relay turns into a 401 asks the client to retry, and only
-                # the model this request asked for says whether that retry
-                # can land — see `_switch_off_walled_account`. The body is
-                # already materialized whole here, so it costs one
-                # `json.loads` on `/v1/messages` and nothing anywhere else.
-                model=_requested_model(path, body),
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
                 # client has received nothing and the SDK retries; after it,
                 # part of an answer is already delivered.
@@ -16841,15 +16834,15 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
 
 
 _walled_switch_lock = threading.Lock()
-# (reset, model) -> (ok, retry_at). Insertion-ordered, capped at 8 — a bounded
-# memo, not a bound on how many walls can be in flight: once the cap is hit the
+# reset -> (ok, retry_at). Insertion-ordered, capped at 8 — a bounded memo,
+# not a bound on how many walls can be in flight: once the cap is hit the
 # OLDEST entry is dropped, so a straggler request from a wall we already
 # left (A -> switched to B -> B also walled -> switched to C) can re-run the
 # switch once, the pre-existing behaviour. `retry_at` is None for a settled
 # switch (never re-tried) and a monotonic deadline for a raise (retried
 # after `_WALLED_SWITCH_RAISE_TTL`, so a raise still debounces a storm
 # instead of recording nothing).
-_walled_switch_seen: dict[tuple[bytes, str], tuple[bool, float | None]] = {}
+_walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
 
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
 # enough that a storm on one wall does not re-attempt for every repeat,
@@ -16858,61 +16851,7 @@ _walled_switch_seen: dict[tuple[bytes, str], tuple[bool, float | None]] = {}
 _WALLED_SWITCH_RAISE_TTL = 30.0
 
 
-def _requested_model(path: str | None, body: bytes) -> str:
-    """The model a ``/v1/messages`` request asks for, or ``""``.
-
-    The body is already materialized whole (`_read_body`), so this costs one
-    `json.loads` and no new buffering — and the body is the only place the
-    model appears: the route carries no model header.
-    """
-    if (path or "").split("?", 1)[0].rstrip("/") != "/v1/messages":
-        return ""
-    try:
-        model = json.loads(body).get("model")
-    except (ValueError, TypeError, AttributeError):
-        return ""
-    return model if isinstance(model, str) else ""
-
-
-def _model_limit_basis(account_switcher, model: str) -> tuple[str, ...] | None:
-    """The ``models=`` basis that makes a switch honour ``model``'s own weekly
-    window, or ``None`` when this daemon cannot prove that it would.
-
-    THE WINDOW DATA NAMES THE MODELS, so nothing here is a table that goes
-    stale the day a model ships: a per-model weekly window carries the
-    family's display name ("Fable") and that family is a component of the
-    model id ("claude-fable-5-1"), so the basis is whichever reported window
-    name the id contains.
-
-    ``()`` when no account reports a scoped window at all — there is then no
-    per-model gate to miss, and 5h/7d is the whole ranking. ``None`` when
-    scoped windows exist and none of them names this model: the derivation is
-    unproven, and ranking on 5h/7d anyway is exactly what moved three
-    subagents onto a Fable-100% account and killed them.
-
-    A pure store read (``fetch=set()``) — no usage fetch and no network on the
-    response path.
-    """
-    oauth = require("oauth")
-    names = {
-        name
-        for account in account_switcher.accounts_snapshot(fetch=set()).accounts
-        for name, _pct, _resets_at in oauth.relevant_windows(
-            account.usage.decision_value(), ("all",)
-        )
-    } - {"5h", "7d"}
-    if not names:
-        return ()
-    low = model.lower()
-    # sorted() only so a model id containing two window names picks the same
-    # one every time; nothing depends on which.
-    match = next((n for n in sorted(names) if n.lower() in low), None)
-    return None if match is None else (match,)
-
-
-def _switch_off_walled_account(
-    reset: bytes, retry_after: bytes, model: str
-) -> bool:
+def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     """Switch cswap off the account that just 429'd, at most once per wall.
 
     ``reset`` is the wall's own ``anthropic-ratelimit-unified-reset`` value —
@@ -16923,19 +16862,17 @@ def _switch_off_walled_account(
     untouched rather than debounce every header-less 429 against one shared
     empty key.
 
-    ``model`` IS WHAT MAKES THE 401 SAFE, and without it there is no 401. A
-    401 asks Claude Code to rebuild its client and RETRY; the retry has to
-    land somewhere with room for THIS model, and 5h/7d headroom does not say
-    that. On 2026-09-07 it did not: account 2 walled, the failover moved to
-    account 4, account 4 was Fable 100%, every rebuilt retry walled again and
-    the loop exhausted into `authentication_failed` — which is NOT in Claude
-    Code's partial-result set, so three fable subagents lost their context
-    outright instead of sleeping. The model's own weekly window is therefore
-    folded into the ranking (`_model_limit_basis`), and anything that leaves
-    the basis unproven — no model in the body, a body that is not JSON,
-    scoped windows that name no model this request could be — relays the 429
-    untouched. A relayed wall is a sleep the client can abandon; a 401 whose
-    retry cannot land is a killed subagent.
+    A 401 ASKS THE CLIENT TO RETRY, so it is only ever right when the retry
+    has somewhere to land, and 5h/7d headroom does not say that. On 2026-09-07
+    (~18:1xZ) it did not: account 2 walled, the failover moved to account 4,
+    account 4 was Fable 100%, every rebuilt retry walled again, and the loop
+    exhausted into `authentication_failed` — a reason absent from Claude
+    Code's partial-result set {rate_limit, overloaded, server_error}, so three
+    fable subagents lost their context outright instead of sleeping
+    (req_011Cepk7iQtQCjPtKjVxCxna and two siblings in the same minute). The
+    switch below therefore ranks with every per-model weekly window folded in,
+    which is what makes a full one able to answer "nowhere to land" and keep
+    the wall a wall.
 
     True means "turn the 429 the client will see into a 401" — because either
     this call switched the account off onto a credential the host confirmed
@@ -16969,19 +16906,9 @@ def _switch_off_walled_account(
                if retry_after else "")
         )
         return False
-    if not model:
-        _log_lifecycle(
-            "429 on /v1/messages — the request names no model, so no switch "
-            "can be proved to have room for it, relaying the 429 unchanged"
-        )
-        return False
-    # PER (WALL, MODEL), not per wall: one wall walls every model at once, and
-    # the answer differs per model — a fable turn that found no room must not
-    # settle the question for the opus turn behind it.
-    key = (reset, model)
     with _walled_switch_lock:
-        if key in _walled_switch_seen:
-            ok, retry_at = _walled_switch_seen[key]
+        if reset in _walled_switch_seen:
+            ok, retry_at = _walled_switch_seen[reset]
             if retry_at is None or time.monotonic() < retry_at:
                 _log_lifecycle(
                     "429 on /v1/messages — debounced repeat of wall reset="
@@ -16992,34 +16919,33 @@ def _switch_off_walled_account(
             # The raise's short expiry passed: treat this wall as unseen.
         try:
             switcher = require("switcher")
-            account_switcher = switcher.ClaudeAccountSwitcher()
-            models = _model_limit_basis(account_switcher, model)
-            if models is None:
-                _log_lifecycle(
-                    "429 on /v1/messages — no reported usage window names "
-                    f"{model}, so a switch cannot be proved to leave room for "
-                    "it, relaying the 429 unchanged"
-                )
-                _walled_switch_seen[key] = (False, None)
-                if len(_walled_switch_seen) > 8:
-                    del _walled_switch_seen[next(iter(_walled_switch_seen))]
-                return False
-            # NOT `switch_off_at_limit_account`, which takes no `models` and so
-            # ranks on 5h/7d alone — the very blindness this call exists to
-            # remove. Its other job, being the capability probe for an older
-            # claude-swap, survives unchanged: an older `switch()` has no
-            # `models` parameter and an older switcher no `accounts_snapshot`,
-            # and either raise lands in the except below and relays the 429.
-            result = account_switcher.switch(
+            # NOT `switch_off_at_limit_account`, which passes no `models` and
+            # so ranks on 5h/7d alone. `("all",)` is `oauth.relevant_windows`'
+            # sentinel for "fold in EVERY per-model weekly window this account
+            # reports": a candidate sitting at 100% on one of them scores 0
+            # headroom, loses `best > current` against the walled account
+            # `current_at_limit` already pins to 0.0, and the wall is relayed.
+            #
+            # It overrides a user's `autoswitch.model`, deliberately (`switch()`
+            # reads that only when `models is None`): `all` is a superset of any
+            # setting's windows, so headroom under it is <= headroom under
+            # theirs and the override can only ever relay MORE walls, never
+            # convert one the setting would have refused.
+            #
+            # The symbol's other job — being the capability probe for an older
+            # claude-swap — survives unchanged: an older `switch()` has no
+            # `models` parameter, so the TypeError lands in the except below
+            # and relays the 429, exactly as a missing symbol did.
+            result = switcher.ClaudeAccountSwitcher().switch(
                 strategy="best", json_output=True,
-                current_at_limit=True, models=models,
+                current_at_limit=True, models=("all",),
             )
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
                 f"429 on /v1/messages — the at-limit switch raised "
                 f"{exc.__class__.__name__}, relaying the 429 unchanged"
             )
-            _walled_switch_seen[key] = (
+            _walled_switch_seen[reset] = (
                 False, time.monotonic() + _WALLED_SWITCH_RAISE_TTL
             )
             if len(_walled_switch_seen) > 8:
@@ -17047,7 +16973,7 @@ def _switch_off_walled_account(
                 f"{result.get('needsLogin') if result else None}, relaying "
                 f"the 429 unchanged"
             )
-        _walled_switch_seen[key] = (ok, None)
+        _walled_switch_seen[reset] = (ok, None)
         if len(_walled_switch_seen) > 8:
             del _walled_switch_seen[next(iter(_walled_switch_seen))]
         return ok
@@ -17063,7 +16989,6 @@ def _relay_response(
     on_status=None,
     path: str | None = None,
     certdir=None,
-    model: str = "",
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -17144,7 +17069,7 @@ def _relay_response(
              if l.lower().startswith(b"retry-after:")),
             b"",
         )
-        _walled_401 = _switch_off_walled_account(reset, retry_after, model)
+        _walled_401 = _switch_off_walled_account(reset, retry_after)
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
@@ -17267,13 +17192,13 @@ def _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
                 on_headers=None, on_status=on_status, path=path,
-                certdir=certdir, model=model,
+                certdir=certdir,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
             on_headers=None, on_status=on_status, path=path,
-            certdir=certdir, model=model,
+            certdir=certdir,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
