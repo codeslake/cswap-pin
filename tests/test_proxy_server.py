@@ -11935,8 +11935,6 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
-        if hasattr(pp, "_walled_switch_ok"):  # pre-fix two-deque shape only
-            pp._walled_switch_ok.clear()
         return calls
 
     @classmethod
@@ -12175,8 +12173,6 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
-        if hasattr(pp, "_walled_switch_ok"):  # pre-fix two-deque shape only
-            pp._walled_switch_ok.clear()
 
         results = {}
 
