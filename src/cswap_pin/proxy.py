@@ -5507,6 +5507,53 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # condemn this daemon". A set is used only for its atomic add/discard.
     _deferred: set[int] = set()
 
+    # True while the pinned slot's last verified mint answered as some other
+    # account -- so the transition log (below) fires once, not on every mint
+    # while it stands.
+    _identity_state = {"foreign": False}
+
+    def _note_identity(foreign: bool, num: str, mail: str, bearer) -> None:
+        was = _identity_state["foreign"]
+        _identity_state["foreign"] = foreign
+        if foreign == was:
+            return  # no transition -- the common case, every mint but two
+        if foreign:
+            _log_lifecycle(
+                f"the pinned slot {num} ({mail}) answers as "
+                f"{str(bearer)[:40]} -- refusing to splice a foreign "
+                "bearer, treating this exactly like an empty read")
+        else:
+            _log_lifecycle(
+                f"the pinned slot {num} ({mail}) answers as itself again -- "
+                "resuming normal pin splicing")
+
+    def _identity_ok(token: str, num: str, mail: str) -> bool:
+        """True unless `token` is CONFIRMED to answer as some other account.
+
+        THE INVARIANT: the pin never splices a bearer whose identity is not
+        the pin's. Checked once per fresh mint -- both call sites are inside
+        the locked, freshly-read branch below, never the outside-the-lock
+        cache-hit path every other request takes -- with the same profile
+        call `_freshen_pin_identity` already makes at its 12h beat. Fails
+        OPEN on an unreachable profile (a flaky network call must not
+        condemn a good token); fails CLOSED only on a bearer that names a
+        different account than the one asked of the store, which is then
+        never cached and never spliced -- an empty read of the wrong slot,
+        indistinguishable in effect from an empty read of no slot at all.
+        """
+        fresh = pin_profile_for(token)
+        bearer = (fresh or {}).get("emailAddress") or (fresh or {}).get(
+            "accountUuid")
+        foreign = bool(fresh) and bool(bearer) and (
+            str(bearer).lower() != (mail or "").lower())
+        _note_identity(foreign, num, mail, bearer)
+        if foreign:
+            provider.identity_mismatch = {"pinned": mail, "bearer": str(bearer)}
+            _cred_cache.pop((num, mail), None)
+            return False
+        provider.identity_mismatch = None
+        return True
+
     def provider() -> str | None:
         _deferred.discard(1)
         _stalled.flag = False
@@ -5596,7 +5643,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             _cred_cache[ckey] = creds
             token = _live_token(creds)
             if token:
-                return token
+                return token if _identity_ok(token, num, mail) else None
             # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error` already
             # classifies this -- `invalid_grant` means the lineage is dead and
             # only a person can fix it, `transient` means try again -- and it
@@ -5618,6 +5665,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # Say that rather than nothing.
                 provider.blind_reason = (
                     f"no token after refresh for slot {num} ({mail})")
+            if token and not _identity_ok(token, num, mail):
+                # NEITHER CACHED NOR PERSISTED. `_identity_ok` already popped
+                # the pre-refresh blob `_cred_cache` held; a rotated-but-
+                # foreign credential must not replace it or be written back
+                # to the store either -- that would reinforce the exact
+                # corruption this check exists to catch.
+                return None
             if rotated:
                 # HELD COPY, SAME AS THE COLD-READ WRITE ABOVE. `_cred_cache`
                 # was left holding the pre-refresh (expired) blob after a
@@ -5697,6 +5751,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
     provider._lock_acquired_at = None
+    # None: the last verified mint answered as the pin. A dict
+    # ({"pinned": ..., "bearer": ...}) while it does not -- set by
+    # `_identity_ok` above and, at its 12h beat, by `_freshen_pin_identity`,
+    # which also calls `forget()` to drop whatever this cached so the next
+    # request re-verifies rather than serving the poisoned entry.
+    provider.identity_mismatch = None
+    provider.forget = _cred_cache.clear
     return provider
 
 
@@ -13571,7 +13632,25 @@ class PinProxy:
                     f"the pin's profile stamp is {age_s / 3600:.0f}h old and "
                     f"could not be refreshed: {why} — Claude Code re-fetches "
                     "it as the active account on the next session start")
+            if fresh:
+                # A CONFIRMED foreign answer (the other two `why` cases are
+                # "could not ask", not "asked and it was someone else") --
+                # feed the SAME state `_identity_ok` uses at mint time,
+                # instead of only logging: the provider's own cache may still
+                # hold this bearer from before it turned foreign, and
+                # `forget()` is what stops it being served again.
+                provider = getattr(self, "_pin_token_provider", None)
+                if provider is not None:
+                    provider.identity_mismatch = {
+                        "pinned": ident.get("accountUuid"),
+                        "bearer": fresh.get("accountUuid")}
+                    forget = getattr(provider, "forget", None)
+                    if forget:
+                        forget()
             return False
+        provider = getattr(self, "_pin_token_provider", None)
+        if provider is not None:
+            provider.identity_mismatch = None
         remember_pin_identity(certdir, {**ident, **fresh})
         _log_lifecycle("refreshed the pin's profile from the server, so the "
                        "live config stays inside Claude Code's fetch window")
@@ -14763,8 +14842,17 @@ class PinProxy:
         # `_can_pin_from_cache` and the daemon-start warm that keeps it
         # populated on a healthy daemon.
         mint_stalled_s = _mint_lock_busy(self._pin_token_provider)
-        can_pin = (True if mint_stalled_s is not None
-                   else _can_pin_from_cache(self._pin_token_provider))
+        # SET BY `_identity_ok` (at mint) and `_freshen_pin_identity` (at its
+        # 12h beat) -- see `make_pin_token_provider`. `can_pin` reads it
+        # directly rather than trusting the cache to be empty, because the
+        # only guarantee that gives is "this daemon has not minted since the
+        # 12h beat's `forget()`" -- true right up until the next request
+        # re-mints and re-populates it.
+        pin_identity_mismatch = getattr(
+            self._pin_token_provider, "identity_mismatch", None)
+        can_pin = (pin_identity_mismatch is None) and (
+            True if mint_stalled_s is not None
+            else _can_pin_from_cache(self._pin_token_provider))
         # WHAT EGRESS IS ACTUALLY DOING, not what it is configured to do.
         # `chain` above reports the hop the relay WOULD use, so a daemon that
         # can reach no hop and is dialling DIRECT reported exactly what a
@@ -14808,7 +14896,8 @@ class PinProxy:
              # about code that may not be serving. Readers deciding whether a
              # behaviour is present need this one.
              "version": _own_version(),
-             "can_pin": can_pin, "egress": egress,
+             "can_pin": can_pin, "pin_identity_mismatch": pin_identity_mismatch,
+             "egress": egress,
              "holder_pid": holder_pid,
              "direct_last": _iso_utc(self._egress_direct_last),
              "refused_last": _iso_utc(self._egress_refused_last),

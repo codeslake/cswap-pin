@@ -4016,6 +4016,125 @@ class TestMakePinTokenProvider:
         # Rotation persisted back to the backup store (refresh tokens rotate).
         assert sw.persisted == [("2", "pin@example.com", rotated)]
 
+    def case_a_foreign_bearer_is_treated_as_an_empty_read(self, monkeypatch):
+        """THE INVARIANT: the pin never splices a bearer whose identity is
+        not the pin's. A credential read for the pinned slot that answers as
+        another account -- reproduced live: the store kept handing back a
+        token that answered `/api/oauth/profile` as account 21e08589-cad
+        while cswap's own account changed underneath it three times -- must
+        be treated exactly like the empty-store-read case already covered by
+        `case_an_unreadable_store_is_still_a_failure`: no token, nothing
+        cached, and the mismatch is visible on the provider for /health.
+        """
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "foreign-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "foreign-uuid",
+                           "emailAddress": "someone-else@example.com"})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() is None, "a foreign bearer must never be spliced"
+        assert provider.identity_mismatch == {
+            "pinned": "pin@example.com", "bearer": "someone-else@example.com"
+        }
+        assert provider.pin_is_noop() is False, (
+            "a foreign bearer is a failure to pin, not nothing-to-do")
+        assert provider.can_pin_cached() is False
+        assert provider() is None, "the second call must not serve a cached copy"
+
+    def case_a_bearer_that_matches_the_pin_is_unchanged(self, monkeypatch):
+        """The positive control for the case above: the same profile check,
+        answering as the account we actually asked for, must change nothing."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "pin-uuid",
+                           "emailAddress": "pin@example.com"})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "pin-tok"
+        assert provider.identity_mismatch is None
+        assert provider.can_pin_cached() is True
+
+    def case_a_foreign_bearer_fails_open_not_like_a_stalled_mint(self, monkeypatch):
+        """Rule 0: no refusal may reach the client over this change. The one
+        refusal this daemon is allowed to answer with is 503 (`mint_stalled`,
+        `_refuse_stalled_mint`) -- an identity mismatch must not look like
+        that, or a foreign bearer would turn into a client-visible refusal
+        instead of the existing silent fail-open (the request still goes out,
+        on the disk bearer)."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "foreign-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "foreign-uuid",
+                           "emailAddress": "someone-else@example.com"})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() is None
+        assert provider.mint_stalled() is False, (
+            "an identity mismatch must fail OPEN, never read as a stalled "
+            "mint -- that path answers the client with a 503")
+
+    def case_the_transition_logs_once_not_on_the_next_mint(self, monkeypatch):
+        """The credential store never caches a foreign token (see the case
+        above), so a persistent mismatch re-enters this check on every mint
+        -- and must log the transition once, not repeat while it stands."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "foreign-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "foreign-uuid",
+                           "emailAddress": "someone-else@example.com"})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        provider()
+        provider()
+        provider()
+        foreign_lines = [
+            line for line in lines if "refusing to splice a foreign" in line]
+        assert len(foreign_lines) == 1, (
+            f"logged the transition {len(foreign_lines)} times: {lines!r}")
+
+        # Clean again: the transition back logs once too.
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "pin-uuid",
+                           "emailAddress": "pin@example.com"})
+        provider()
+        provider()
+        resumed_lines = [line for line in lines if "answers as itself again" in line]
+        assert len(resumed_lines) == 1, (
+            f"logged the recovery {len(resumed_lines)} times: {lines!r}")
+
 
 class TestRefreshGoesThroughTheInterprocessGate:
     """A refresh token is one-time-use, and this daemon is not the only
