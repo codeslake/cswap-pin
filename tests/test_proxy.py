@@ -3923,7 +3923,8 @@ class TestMakePinTokenProvider:
         assert provider() is None
         assert provider.pin_is_noop() is True, "pin == active is a no-op, not a failure"
 
-    def case_our_own_splice_must_not_read_as_the_pin_being_active(self):
+    def case_our_own_splice_must_not_read_as_the_pin_being_active(
+            self, monkeypatch):
         """THE ROOT CAUSE, and it is a loop: the pin disables its own swap.
 
         `~/.claude.json`'s `oauthAccount` is rewritten to the PINNED identity
@@ -3940,7 +3941,14 @@ class TestMakePinTokenProvider:
         branch that is not merged. The pin's own swap must not depend on that.
         """
         import json
+        from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import make_pin_token_provider
+        # The suite must never dial api.anthropic.com: stub the mint-time
+        # identity probe to vouch for this token (this case is not about
+        # identity, so the vouch must be unconditional).
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
         creds = json.dumps({"claudeAiOauth": {
             "accessToken": "pin-live", "expiresAt": 10_000_000_000_000,
             "refreshToken": "rt"}})
@@ -3987,9 +3995,13 @@ class TestMakePinTokenProvider:
         assert provider() is None
         assert provider.pin_is_noop() is False, "unreadable credential must still warn"
 
-    def case_returns_backup_token_when_pin_inactive(self):
+    def case_returns_backup_token_when_pin_inactive(self, monkeypatch):
         import json
+        from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import make_pin_token_provider
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
         creds = json.dumps({"claudeAiOauth": {
             "accessToken": "pin-live", "expiresAt": 10_000_000_000_000,
             "refreshToken": "rt"}})
@@ -4008,6 +4020,9 @@ class TestMakePinTokenProvider:
             "accessToken": "fresh", "expiresAt": 10_000_000_000_000,
             "refreshToken": "rt-2"}})
         monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        monkeypatch.setattr(
             pin_proxy.oauth, "try_refresh_oauth_credentials",
             lambda _c: RefreshOutcome(rotated, None))
         sw = _FakeSwitcher(active_num="1", backups={"2": old})
@@ -4015,6 +4030,237 @@ class TestMakePinTokenProvider:
         assert provider() == "fresh"
         # Rotation persisted back to the backup store (refresh tokens rotate).
         assert sw.persisted == [("2", "pin@example.com", rotated)]
+
+    def case_a_foreign_bearer_is_treated_as_an_empty_read(self, monkeypatch):
+        """THE INVARIANT: the pin never splices a bearer whose identity is
+        not the pin's. A credential read for the pinned slot that answers as
+        another account -- reproduced live: the store kept handing back a
+        token that answered `/api/oauth/profile` as account 21e08589-cad
+        while cswap's own account changed underneath it three times -- must
+        be treated exactly like the empty-store-read case already covered by
+        `case_an_unreadable_store_is_still_a_failure`: no token, nothing
+        cached, and the mismatch is visible on the provider for /health.
+        """
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "foreign-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "foreign-uuid",
+                           "emailAddress": "someone-else@example.com"})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() is None, "a foreign bearer must never be spliced"
+        # R12: one shape from both writers -- {"email":..., "uuid":...} refs.
+        assert provider.identity_mismatch == {
+            "pinned": {"email": "pin@example.com", "uuid": None},
+            "bearer": {"email": "someone-else@example.com",
+                       "uuid": "foreign-uuid"},
+        }
+        assert provider.pin_is_noop() is False, (
+            "a foreign bearer is a failure to pin, not nothing-to-do")
+        # R8: NOT false. A foreign bearer is a DECLINED splice, not a failed
+        # mint -- the store answered fine. `can_pin` feeds
+        # `_read_alive_port`'s recycle-on-False check, and a fresh daemon
+        # cannot repair a cross-wired credential store; `identity_mismatch`
+        # alone (asserted above) is what carries the real state.
+        assert provider.can_pin_cached() is True
+        # Rule 0: no refusal may reach the client over this change. The one
+        # refusal this daemon is allowed to answer with is 503
+        # (`mint_stalled`/`_refuse_stalled_mint`) -- a mismatch must not look
+        # like that, or it would turn into a client-visible refusal instead
+        # of the existing silent fail-open (the request still goes out, on
+        # the disk bearer).
+        assert provider.mint_stalled() is False
+        # m1: the fail-open path's `_warn_unpinnable` must not print "reason
+        # unrecorded" for the one fault it exists to name.
+        assert "answers as someone-else@example.com" in provider.blind_reason
+
+    def case_a_bearer_that_matches_the_pin_is_unchanged(self, monkeypatch):
+        """The positive control for the case above: the same profile check,
+        answering as the account we actually asked for, must change nothing."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "pin-uuid",
+                           "emailAddress": "pin@example.com"})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "pin-tok"
+        assert provider.identity_mismatch is None
+        assert provider.can_pin_cached() is True
+
+    def case_the_transition_logs_once_not_on_the_next_mint(self, monkeypatch):
+        """A settled verdict never re-probes the SAME token (R1), so a
+        persistent mismatch re-enters this check on every mint without
+        re-dialling -- and must log the transition once, not repeat while it
+        stands. Recovery is modelled the way it actually happens: the store
+        starts answering a DIFFERENT token (a repair), not the same string
+        suddenly meaning something else."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        foreign_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "foreign-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        fixed_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "fixed-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+        profiles = {"foreign-tok": {"accountUuid": "foreign-uuid",
+                                    "emailAddress": "someone-else@example.com"},
+                    "fixed-tok": {"accountUuid": "pin-uuid",
+                                  "emailAddress": "pin@example.com"}}
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for", lambda token: profiles[token])
+        sw = _FakeSwitcher(active_num="1", backups={"2": foreign_creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        provider()
+        provider()
+        provider()
+        foreign_lines = [
+            line for line in lines if "refusing to splice a foreign" in line]
+        assert len(foreign_lines) == 1, (
+            f"logged the transition {len(foreign_lines)} times: {lines!r}")
+
+        # The store is repaired: a NEW token, not the same one re-judged.
+        sw.backups["2"] = fixed_creds
+        provider()
+        provider()
+        resumed_lines = [line for line in lines if "answers as itself again" in line]
+        assert len(resumed_lines) == 1, (
+            f"logged the recovery {len(resumed_lines)} times: {lines!r}")
+
+    def case_an_unverifiable_profile_neither_vouches_nor_condemns(
+            self, monkeypatch):
+        """R1: UNKNOWN never vouches and never flips. An exception, a
+        timeout, or any non-dict answer from `pin_profile_for` must not cache
+        the token as "ok" (that would let a genuinely foreign store through
+        on the next blip-free probe -- no, wait, the risk is the opposite: it
+        must not vouch for a bad token) NOR overwrite a mismatch already on
+        record. The token is still served (today's fail-open), but nothing
+        about the identity state changes and nothing is logged as a
+        transition."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: (_ for _ in ()).throw(TimeoutError("slow")))
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "tok", "an unverifiable profile must fail open"
+        assert provider.identity_mismatch is None
+        assert lines == [], f"an inconclusive probe must never log: {lines!r}"
+
+    def case_an_unknown_verdict_reprobes_after_its_backoff(self, monkeypatch):
+        """R7: `_cred_cache` must never let an "unknown" verdict sit behind
+        the lock-free fast path -- that would make the 60s backoff a dead
+        comment. Three calls: probe (cold), none (inside the backoff, same
+        clock), probe again (past it)."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        probes = []
+
+        def flaky(token):
+            probes.append(token)
+            raise TimeoutError("slow")
+
+        monkeypatch.setattr(pin_proxy, "pin_profile_for", flaky)
+        now = [0.0]
+        monkeypatch.setattr(pin_proxy.time, "monotonic", lambda: now[0])
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "tok"
+        assert len(probes) == 1, "the cold mint must probe"
+        now[0] += 1.0  # well inside _IDENTITY_PROBE_BACKOFF_S
+        assert provider() == "tok"
+        assert len(probes) == 1, "inside the backoff must not re-probe"
+        now[0] += pin_proxy._IDENTITY_PROBE_BACKOFF_S
+        assert provider() == "tok"
+        assert len(probes) == 2, "past the backoff must re-probe"
+
+    def case_a_repin_does_not_inherit_the_old_slots_verdict(self, monkeypatch):
+        """R9: the verdict cache is keyed on (token, mail), not the token
+        alone -- the shape `TestTheCredentialReadIsNotPaidPerRequest.
+        case_a_repin_is_still_seen` already exercises for the credential
+        cache. A cross-wired store answering the SAME token string for two
+        different pinned mails must not let one mail's "ok" vouch for the
+        other's "foreign"."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "shared-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "a@example.com"})
+        sw_a = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider_a = pin_proxy.make_pin_token_provider(
+            sw_a, "2", "a@example.com")
+        assert provider_a() == "shared-tok", "the true pin must still mint"
+
+        sw_b = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider_b = pin_proxy.make_pin_token_provider(
+            sw_b, "2", "b@example.com")
+        assert provider_b() is None, (
+            "a token verified for a@example.com must not vouch for "
+            "b@example.com just because the store handed back the same "
+            "string")
+        assert provider_b.identity_mismatch is not None
+
+    def case_a_foreign_verdict_never_recycles_the_daemon(self, monkeypatch):
+        """R8, pin-side: `_can_mint` is what the self-heal watchdog reads as
+        `is False` -> recycle. A foreign bearer is a declined splice, not a
+        failed mint -- a fresh daemon reads the same cross-wired store, so
+        recycling here is a Rule 0 hazard for no repair."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "foreign-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "someone-else@example.com"})
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert pin_proxy._can_mint(provider) is True, (
+            "a foreign verdict must not read as `is False` -- that is the "
+            "self-heal watchdog's recycle signal")
+        assert provider.identity_mismatch is not None
 
 
 class TestRefreshGoesThroughTheInterprocessGate:
@@ -4054,6 +4300,9 @@ class TestRefreshGoesThroughTheInterprocessGate:
         rotated = self._rotated()
         direct_posts = []
         monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        monkeypatch.setattr(
             pin_proxy.oauth, "try_refresh_oauth_credentials",
             lambda _c: direct_posts.append(_c) or RefreshOutcome(rotated, None))
 
@@ -4077,7 +4326,7 @@ class TestRefreshGoesThroughTheInterprocessGate:
             "a direct POST can consume a grant another process is consuming"
         )
 
-    def case_the_gate_persists_so_the_pin_must_not_write_again(self):
+    def case_the_gate_persists_so_the_pin_must_not_write_again(self, monkeypatch):
         """A second write would land OUTSIDE the slot lock.
 
         The gate persists under that lock and CASes on the refresh-token
@@ -4087,6 +4336,9 @@ class TestRefreshGoesThroughTheInterprocessGate:
         from cswap_pin import proxy as pin_proxy
         from claude_swap.oauth import RefreshOutcome
 
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
         rotated = self._rotated()
 
         class _GatedSwitcher(_FakeSwitcher):
@@ -4132,6 +4384,9 @@ class TestRefreshGoesThroughTheInterprocessGate:
         from claude_swap.oauth import RefreshOutcome
 
         rotated = self._rotated()
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
         monkeypatch.setattr(
             pin_proxy.oauth, "try_refresh_oauth_credentials",
             lambda _c: RefreshOutcome(rotated, None))
@@ -18112,6 +18367,11 @@ class TestTheCredentialReadIsNotPaidPerRequest:
 
         monkeypatch.setattr(pin_proxy, "load_pin",
                             lambda root: ("a@example.com", "org"))
+        # R11: the suite must never dial api.anthropic.com. Every case here
+        # mints a live token, which now runs the mint-time identity probe.
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": "a@example.com"})
         return pin_proxy.make_pin_token_provider(_Switcher(), "1",
                                                  "a@example.com")
 
@@ -19016,6 +19276,42 @@ class TestTheSpliceHoldsTheConfigLock:
         with contextlib.redirect_stderr(err):
             assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
         assert "no bearer to ask with" in err.getvalue(), err.getvalue()
+
+    def case_the_beats_finding_feeds_the_same_verdict_cache(self, monkeypatch):
+        """R10/R12: `note_verdict` -- the surface `_freshen_pin_identity`
+        calls -- writes into the SAME cache a mint's own `_identity_ok`
+        reads, keyed the same way. Once it has recorded "foreign" for a
+        token, that mint must decline it WITHOUT a new probe (a later
+        "unknown" -- a timeout, a 401 -- must never re-open a settled
+        finding), and in the shape R12 asks for."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "PINTOKEN", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        probes = []
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: probes.append(token) or (_ for _ in ()).throw(
+                TimeoutError("must not be called again")))
+        sw = _FakeSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        provider.note_verdict(
+            "PINTOKEN", "pin@example.com", "foreign",
+            {"email": "pin@example.com", "uuid": "PIN"},
+            {"email": None, "uuid": "SOMEONE-ELSE"})
+        assert provider.identity_mismatch == {
+            "pinned": {"email": "pin@example.com", "uuid": "PIN"},
+            "bearer": {"email": None, "uuid": "SOMEONE-ELSE"},
+        }
+
+        assert provider() is None, (
+            "a token the beat already confirmed foreign must never mint")
+        assert probes == [], (
+            "a settled foreign verdict must not re-probe on the next mint")
 
     def case_the_beat_freshens_and_re_asserts_the_pin(self):
         """The wiring the cases above assume: the periodic beat is where the

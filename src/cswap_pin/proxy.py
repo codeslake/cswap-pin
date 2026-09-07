@@ -5324,6 +5324,16 @@ def last_arm_cutoff() -> int | None:
 # is merely slow and contended gets cut off as if it were stalled.
 _MINT_LOCK_BOUND_S = 45.0
 
+# HOW LONG AN "UNKNOWN" IDENTITY VERDICT IS TRUSTED BEFORE THE NEXT MINT
+# RE-ASKS. A settled verdict ("ok"/"foreign") never re-probes for the same
+# token string; an inconclusive one (a timed-out or errored profile call, or
+# a profile with no comparable field) would otherwise either be trusted
+# forever (masking a store that turned foreign right after the blip) or
+# re-dialled on every single mint (the per-request cost this whole check
+# exists to avoid). One short backoff bounds the exposure to one blip plus
+# one wait, never until the token's own expiry.
+_IDENTITY_PROBE_BACKOFF_S = 60.0
+
 
 def make_pin_token_provider(switcher, account_num: str, email: str):
     """Build the ``pin_token_provider`` callable for :class:`PinProxy`.
@@ -5507,6 +5517,126 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # condemn this daemon". A set is used only for its atomic add/discard.
     _deferred: set[int] = set()
 
+    # UNKNOWN NEVER VOUCHES AND NEVER FLIPS. A per-(token, mail) verdict --
+    # NOT token alone: the store can answer one string for two different
+    # pinned slots across a re-pin, and a slot's own OK must never vouch for
+    # a different slot's bearer. "ok"/"foreign" are settled and never
+    # re-probed (a store repair or a re-pin mints a new pair); "unknown" --
+    # an exception, a timeout, a non-dict answer, or no comparable field on
+    # either side -- re-probes after one backoff instead of being cached
+    # indefinitely (a single blip must not stand in for expiry) or trusted
+    # immediately (that is the fail-open a foreign store also gets for
+    # free). {(token, mail): (verdict, bearer_ref, next_probe_at)}. Shared
+    # with `_freshen_pin_identity`'s own (uuid-based) finding via
+    # `note_verdict`, so a settled foreign answer there is never re-opened
+    # by a mint's later "unknown" probe.
+    _identity_cache: dict = {}
+
+    def _ref(email=None, uuid=None) -> dict:
+        """One shape for "who", from either writer: the mint check only
+        ever has an email (no certdir here to reach a pin uuid); the 12h
+        beat only ever has uuids. Either half absent reads as null."""
+        return {"email": email, "uuid": uuid}
+
+    def _record_verdict(key, verdict: str, pinned_ref=None,
+                         bearer_ref=None) -> None:
+        _identity_cache[key] = (
+            verdict, bearer_ref, time.monotonic() + _IDENTITY_PROBE_BACKOFF_S)
+        if verdict == "foreign":
+            _set_identity({"pinned": pinned_ref, "bearer": bearer_ref})
+        elif verdict == "ok":
+            _set_identity(None)
+
+    def _identity_verdict(token: str, mail: str) -> "tuple[str, dict | None]":
+        key = (token, mail)
+        now = time.monotonic()
+        cached = _identity_cache.get(key)
+        if cached and (cached[0] != "unknown" or now < cached[2]):
+            return cached[0], cached[1]
+        verdict, bearer_ref = "unknown", None
+        try:
+            fresh = pin_profile_for(token)
+        except Exception:  # noqa: BLE001 — a flaky probe must not crash a mint
+            fresh = None
+        # COMPARE EMAIL, THE ONLY FIELD THIS SCOPE HAS GROUND TRUTH FOR.
+        # There is no certdir here (see `make_pin_token_provider`'s
+        # docstring), so no pin uuid to fall back to when the profile omits
+        # an email -- that comparison belongs to `_freshen_pin_identity`,
+        # which has one. Without a comparable field on both sides this stays
+        # "unknown", never "foreign".
+        if isinstance(fresh, dict):
+            pin_email = (mail or "").lower()
+            bearer_email = fresh.get("emailAddress")
+            if bearer_email and pin_email:
+                verdict = ("ok" if str(bearer_email).lower() == pin_email
+                           else "foreign")
+                bearer_ref = _ref(str(bearer_email), fresh.get("accountUuid"))
+        _record_verdict(key, verdict, _ref(mail), bearer_ref)
+        return verdict, bearer_ref
+
+    def _set_identity(mismatch: "dict | None") -> None:
+        """The one place a transition logs -- shared with
+        `_freshen_pin_identity` via `note_verdict`, so its clean/foreign
+        finding cannot desync from this closure's log state (measured:
+        freshen cleared the field directly once, so the next foreign mint
+        here saw no transition and logged nothing)."""
+        was = provider.identity_mismatch
+        provider.identity_mismatch = mismatch
+        if bool(mismatch) == bool(was):
+            return
+        if mismatch:
+            pinned, bearer = mismatch["pinned"], mismatch["bearer"]
+            who = lambda r: (r or {}).get("email") or (r or {}).get("uuid")
+            _log_lifecycle(
+                f"the pin ({who(pinned)}) answers as {who(bearer)} -- "
+                "refusing to splice a foreign bearer, treating this "
+                "exactly like an empty read")
+        else:
+            _log_lifecycle(
+                "the pin answers as itself again -- resuming normal "
+                "pin splicing")
+
+    def _note_verdict(token: "str | None", mail: str, verdict: str,
+                       pinned_ref=None, bearer_ref=None) -> None:
+        """`_freshen_pin_identity`'s own (uuid-based) finding, fed into the
+        SAME verdict cache `_identity_verdict` consults -- a mint's later
+        probe on this same token answering "unknown" (a timeout, a 401)
+        must never read as if nothing were known, while freshen's own
+        confirmed finding stands. A foreign finding also drops `_cred_cache`
+        entirely (unlike a mint's own targeted pop, freshen does not know
+        which (num, mail) pair minted this token) -- or a still-valid,
+        already-cached copy would keep answering the lock-free fast path
+        with no verdict ever consulted again."""
+        if token:
+            _record_verdict((token, mail), verdict, pinned_ref, bearer_ref)
+        elif verdict == "foreign":
+            _set_identity({"pinned": pinned_ref, "bearer": bearer_ref})
+        else:
+            _set_identity(None)
+        if verdict == "foreign":
+            _cred_cache.clear()
+
+    def _identity_ok(token: str, num: str, mail: str) -> "str":
+        """The verdict for `token` -- see `_identity_verdict`. Returns the
+        raw string ("ok"/"foreign"/"unknown") so callers can decide whether
+        THIS credential is safe to keep behind the lock-free fast path
+        (only "ok" is: an "unknown" one must not bypass its own next probe
+        once the backoff passes -- see the two call sites below).
+
+        THE INVARIANT: the pin never splices a bearer whose identity is not
+        the pin's. A foreign verdict is never cached and never spliced -- an
+        empty read of the wrong slot, indistinguishable in effect from an
+        empty read of no slot at all.
+        """
+        verdict, bearer_ref = _identity_verdict(token, mail)
+        if verdict == "foreign":
+            _cred_cache.pop((num, mail), None)
+            who = (bearer_ref or {}).get("email") or (bearer_ref or {}).get("uuid")
+            provider.blind_reason = (
+                f"the pinned slot's credential answers as {who}, not "
+                f"the pin ({mail})")
+        return verdict
+
     def provider() -> str | None:
         _deferred.discard(1)
         _stalled.flag = False
@@ -5596,6 +5726,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             _cred_cache[ckey] = creds
             token = _live_token(creds)
             if token:
+                verdict = _identity_ok(token, num, mail)
+                if verdict == "foreign":
+                    return None
+                if verdict == "unknown":
+                    # R7: an unknown verdict must not sit behind the
+                    # lock-free fast path above -- that would skip its own
+                    # next probe forever, once the backoff passes.
+                    _cred_cache.pop(ckey, None)
                 return token
             # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error` already
             # classifies this -- `invalid_grant` means the lineage is dead and
@@ -5618,13 +5756,22 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # Say that rather than nothing.
                 provider.blind_reason = (
                     f"no token after refresh for slot {num} ({mail})")
-            if rotated:
+            verdict = _identity_ok(token, num, mail) if token else None
+            if verdict == "foreign":
+                # NEITHER CACHED NOR PERSISTED. `_identity_ok` already popped
+                # the pre-refresh blob `_cred_cache` held; a rotated-but-
+                # foreign credential must not replace it or be written back
+                # to the store either -- that would reinforce the exact
+                # corruption this check exists to catch.
+                return None
+            if rotated and verdict != "unknown":
                 # HELD COPY, SAME AS THE COLD-READ WRITE ABOVE. `_cred_cache`
                 # was left holding the pre-refresh (expired) blob after a
                 # successful refresh -- `can_pin_cached()`, and therefore
                 # `/health`'s `can_pin`, kept reading a permanently-expired
                 # cache after every rotation, until the NEXT credential read
-                # happened to run.
+                # happened to run. An "unknown" verdict skips this for the
+                # same reason the cold-read site does (R7).
                 _cred_cache[ckey] = rotated
             # The gate persists internally (under the slot lock, CAS on the
             # refresh-token fingerprint). Persisting again here would write
@@ -5686,6 +5833,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         """
         if pin_is_noop():
             return True
+        if provider.identity_mismatch is not None:
+            # R8: a foreign bearer is a DECLINED splice, not a failed mint
+            # -- the store answered, this daemon just must not use it.
+            # `can_pin` feeds `_read_alive_port`'s recycle-on-False check
+            # (`ensure_proxy`), and a fresh process reads the same
+            # cross-wired store, so recycling here is a Rule 0 hazard for
+            # no repair. `pin_identity_mismatch` is what carries the state.
+            return True
         target = _current_target()
         if target is None:
             return True
@@ -5697,6 +5852,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
     provider._lock_acquired_at = None
+    # None: the last verified mint answered as the pin. A dict
+    # ({"pinned": ..., "bearer": ...}) while it does not -- set through
+    # `note_verdict` by `_identity_ok` above (via `_record_verdict`) and, at
+    # its 12h beat, by `_freshen_pin_identity`.
+    provider.identity_mismatch = None
+    provider.note_verdict = _note_verdict
     return provider
 
 
@@ -5739,7 +5900,18 @@ def _can_mint(provider) -> "bool | None":
     if _mint_lock_busy(provider) is not None:
         return None
     try:
-        return bool(provider()) or _pin_is_noop(provider)
+        token = provider()
+        if token:
+            return True
+        # R8: A FOREIGN VERDICT IS A DECLINED SPLICE, NOT A FAILED MINT. The
+        # store answered; this daemon just must not use what it said. The
+        # self-heal watchdog reads `is False` as "recycle me" -- and a
+        # recycle cannot repair a cross-wired credential store, since a
+        # fresh process reads the very same one. Not blind, no marker, no
+        # recycle; `identity_mismatch` is what carries the state.
+        if getattr(provider, "identity_mismatch", None) is not None:
+            return True
+        return _pin_is_noop(provider)
     except Exception:  # noqa: BLE001 — a health question is never fatal
         return False
 
@@ -13568,7 +13740,8 @@ class PinProxy:
         # answers None then -- there is nothing to swap -- but that token IS
         # the pin's, and the uuid check below is what keeps a foreign answer
         # out. Same fallback `sweep_policy_once` makes.
-        token = self._pin_token_provider() or _active_oauth_token()
+        provider_token = self._pin_token_provider()
+        token = provider_token or _active_oauth_token()
         fresh = pin_profile_for(token) if token else None
         if not fresh or fresh.get("accountUuid") != ident.get("accountUuid"):
             # SAY WHY, or a stale stamp on one host and a fresh one on another
@@ -13585,7 +13758,27 @@ class PinProxy:
                     f"the pin's profile stamp is {age_s / 3600:.0f}h old and "
                     f"could not be refreshed: {why} — Claude Code re-fetches "
                     "it as the active account on the next session start")
+            # ONLY A provider()-SOURCED TOKEN FEEDS THE MINT-TIME STATE. The
+            # `_active_oauth_token()` fallback answers for the pin==active
+            # no-op case; judging THAT bearer would read a merely deferred or
+            # stalled provider (also None) as a confirmed foreign identity,
+            # overriding /health's deliberate can_pin=True for that case.
+            if fresh and provider_token:
+                note_verdict = getattr(
+                    self._pin_token_provider, "note_verdict", None)
+                if note_verdict:
+                    note_verdict(
+                        provider_token, ident.get("emailAddress"), "foreign",
+                        {"email": ident.get("emailAddress"),
+                         "uuid": ident.get("accountUuid")},
+                        {"email": fresh.get("emailAddress"),
+                         "uuid": fresh.get("accountUuid")})
             return False
+        if provider_token:
+            note_verdict = getattr(
+                self._pin_token_provider, "note_verdict", None)
+            if note_verdict:
+                note_verdict(provider_token, ident.get("emailAddress"), "ok")
         remember_pin_identity(certdir, {**ident, **fresh})
         _log_lifecycle("refreshed the pin's profile from the server, so the "
                        "live config stays inside Claude Code's fetch window")
@@ -14815,6 +15008,17 @@ class PinProxy:
         # `_can_pin_from_cache` and the daemon-start warm that keeps it
         # populated on a healthy daemon.
         mint_stalled_s = _mint_lock_busy(self._pin_token_provider)
+        # SET BY `_identity_ok` (at mint) and `_freshen_pin_identity` (at its
+        # 12h beat) -- see `make_pin_token_provider`. ADDITIVE, never ANDed
+        # into `can_pin` below (R8): a foreign bearer is a daemon that CAN
+        # mint and has chosen not to splice, so it is not what `can_pin`
+        # answers -- `_read_alive_port`'s `_serving_can_pin(...) is False`
+        # check recycles on a false `can_pin`, and a fresh daemon cannot
+        # repair a cross-wired credential store. This field alone carries
+        # the foreign state; `can_pin_cached()` already reads it too (so a
+        # mint that popped its own cache on "foreign" still reports true).
+        pin_identity_mismatch = getattr(
+            self._pin_token_provider, "identity_mismatch", None)
         can_pin = (True if mint_stalled_s is not None
                    else _can_pin_from_cache(self._pin_token_provider))
         # WHAT EGRESS IS ACTUALLY DOING, not what it is configured to do.
@@ -14860,7 +15064,8 @@ class PinProxy:
              # about code that may not be serving. Readers deciding whether a
              # behaviour is present need this one.
              "version": _own_version(),
-             "can_pin": can_pin, "egress": egress,
+             "can_pin": can_pin, "pin_identity_mismatch": pin_identity_mismatch,
+             "egress": egress,
              "holder_pid": holder_pid,
              "direct_last": _iso_utc(self._egress_direct_last),
              "refused_last": _iso_utc(self._egress_refused_last),
@@ -15338,7 +15543,14 @@ class PinProxy:
                 # the active one there is nothing to swap, and warning then
                 # trains the reader to disbelieve the warning (see
                 # ``pin_is_noop``).
-                if not _pin_is_noop(self._pin_token_provider):
+                # R8: a foreign bearer already logged its own transition
+                # (`_set_identity`) and must never reach
+                # `mark_daemon_unpinnable` -- that mark makes
+                # `_read_alive_port` recycle a daemon a fresh process
+                # cannot fix any better, on the incident state itself.
+                if (not _pin_is_noop(self._pin_token_provider)
+                        and getattr(self._pin_token_provider,
+                                    "identity_mismatch", None) is None):
                     self._warn_unpinnable()
         # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
         # inside `_forward`'s status hook, and it takes no arguments from
