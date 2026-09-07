@@ -14735,7 +14735,8 @@ class PinProxy:
             # (absolute-form bridge create). Same 503, no keep-alive loop to
             # feed it back into on this path — the request line is answered
             # and the connection ends, same as every other refusal here.
-            self._refuse_stalled_mint(conn, e.method, e.path, e.reason)
+            self._refuse_stalled_mint(conn, e.method, e.path, e.reason,
+                                      close=True)
             try:
                 conn.close()
             except OSError:
@@ -14841,15 +14842,23 @@ class PinProxy:
             pass
 
     def _refuse_stalled_mint(self, tls, method: str, path: str,
-                              reason: str | None = None) -> bool:
+                              reason: str | None = None,
+                              close: bool = False) -> bool:
         """Answer a pinned request 503 rather than queue it behind a refresh
         lock a stalled credential store may never release.
 
-        Keeps the connection alive (``Connection: keep-alive``) like an
-        ordinary reply: the swap being unavailable this once says nothing
-        about the connection, and closing it would cost every OTHER request
-        pipelined on it too (see ``_forward``'s note on Remote Control's
-        worker connection).
+        Keeps the connection alive (``Connection: keep-alive``) by default,
+        like an ordinary reply: the swap being unavailable this once says
+        nothing about the connection, and closing it would cost every OTHER
+        request pipelined on it too (see ``_forward``'s note on Remote
+        Control's worker connection). That is true on the MITM path, which
+        loops right back into serving the next request on the SAME socket —
+        but the absolute-form callers hand this a connection they are about
+        to close themselves (`_handle_client` has no keep-alive loop of its
+        own here), so advertising keep-alive there just races the caller's
+        own FIN with whatever reused the socket believing it. ``close=True``
+        is for those callers, matching the ``Connection: close`` its
+        neighbour ``_refuse_unauthorized`` already sends on the same path.
 
         Rate-limited like ``_note_mint_busy`` and ``_note_busy_slot`` — a
         session retrying a pinned route against a stuck store would
@@ -14878,7 +14887,8 @@ class PinProxy:
         try:
             tls.sendall(
                 b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
-                b"Connection: keep-alive\r\n\r\n"
+                + (b"Connection: close\r\n\r\n" if close
+                   else b"Connection: keep-alive\r\n\r\n")
             )
         except OSError:
             pass
@@ -15184,8 +15194,22 @@ class PinProxy:
                        if h.split(":", 1)[0].strip().lower() == "user-agent"),
                       "")
             if is_pinned_route(rel, ua):
-                token = self._wait_for_pin_token(
-                    method, rel, self._pin_token_provider())
+                token = self._pin_token_provider()
+                # THE SAME PRE-CHECK THE MITM PATH MAKES (see its own note
+                # above `_wait_for_pin_token`'s call there). Without it, a
+                # stalled credential store pays this thread's own
+                # `provider()` call PLUS `_wait_for_pin_token`'s three
+                # retries, each blockable up to `_MINT_LOCK_BOUND_S` on
+                # `refresh_lock` -- on a thread-per-connection server with no
+                # cap, and now repeated every respawn once a blind mint 503s
+                # the bridge worker into backing off and retrying.
+                if token is None and getattr(
+                        self._pin_token_provider, "mint_stalled", None
+                ) and self._pin_token_provider.mint_stalled():
+                    self._refuse_stalled_mint(conn, method, rel, close=True)
+                    conn.close()
+                    return
+                token = self._wait_for_pin_token(method, rel, token)
                 if token and any(h.split(":", 1)[0].strip().lower()
                                  == "authorization" for h in headers):
                     # ARMED ONLY WHEN THE SWAP HAPPENED. With no token nothing

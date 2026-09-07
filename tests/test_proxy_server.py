@@ -3447,25 +3447,39 @@ class TestChainRediscovery:
                 proxy.stop()
             chain.stop()
 
-    def _blind_provider(self, blind_reason="", noop=False, noop_after_calls=None):
+    def _blind_provider(self, blind_reason="", noop=False, noop_after_calls=None,
+                         stalled=False):
         """A pin-token provider shaped like `make_pin_token_provider`'s real
-        one for the two states `_wait_for_pin_token`'s guard reads:
-        `blind_reason` (a REAL failed mint, a stall included — see the
-        guard's own comment) and `pin_is_noop()` (nothing to swap). Always
-        mints None — neither case has a token to give.
+        one for the states `_wait_for_pin_token`'s guard reads: `blind_reason`
+        (a REAL failed mint, a stall included — see the guard's own comment),
+        `pin_is_noop()` (nothing to swap) and `can_pin_cached` (present on
+        every real provider — its absence here used to silently disable
+        `_warm_mint_cache`, the daemon-start thread that calls `provider()`
+        once off the request path; giving the fixture the REAL row shape
+        means that thread runs exactly like it does in production). Always
+        mints None — none of these states has a token to give.
 
         `noop_after_calls`: `pin_is_noop()` answers True only once `provider`
         has been called at least this many times. Real `_deferred` (the
         consume-busy flag `pin_is_noop` reads) flips mid-retry, not before
         the first call — a fixture that starts noop=True never reaches the
         code past `_wait_for_pin_token`'s entry check, which is exactly the
-        vacuous test this guards against.
+        vacuous test this guards against. Set high enough (4) that even the
+        warm thread's own extra call can't trip it before the retry loop
+        has actually run.
+
+        `stalled`: `mint_stalled()` answers True — the PRE-check both
+        `_plain_relay` and the MITM path make before ever calling
+        `_wait_for_pin_token`, so a stalled store is refused fast instead of
+        paying the retry loop's own `provider()` calls first.
         """
         def provider():
             provider.calls += 1
             return None
         provider.calls = 0
         provider.blind_reason = blind_reason
+        provider.can_pin_cached = lambda: False
+        provider.mint_stalled = lambda: stalled
         if noop_after_calls is not None:
             provider.pin_is_noop = lambda: provider.calls >= noop_after_calls
         else:
@@ -3542,34 +3556,57 @@ class TestChainRediscovery:
     def case_a_noop_pin_still_relays_unpinned_not_503(self, certdir):
         """A no-op pin (`pin_is_noop()` True — the pinned account IS the
         active one, or the pin is cleared) has nothing to swap; today's
-        fail-open relay must still run, unrefused. `noop_after_calls=2`
-        keeps the entry check (after the caller's own first `provider()`
-        call) from short-circuiting before the retry loop and the guard
-        this actually has to exercise — see `_blind_provider`."""
+        fail-open relay must still run, unrefused. `noop_after_calls=4` is
+        higher than the entry check can ever see on its own (the caller's
+        first `provider()` call, plus at most one extra from the daemon's
+        own `_warm_mint_cache` thread — see `_blind_provider`), so the entry
+        check cannot short-circuit before the retry loop runs; the assertion
+        on `provider.calls` proves that loop actually ran rather than taking
+        the vacuous path a lower count would let it take by accident."""
         provider = self._blind_provider(
             blind_reason="no credential for slot 1 (a@example.com)",
-            noop_after_calls=2)
+            noop_after_calls=4)
         got, seen = self._post_bridge_create(certdir, provider)
         assert got.startswith(b"HTTP/1.1 200"), (
             f"a no-op pin was refused instead of relayed: {got[:60]!r}")
         assert any(b"Bearer ACTIVE" in s for s in seen), (
             f"the no-op case did not take today's unpinned relay path: {seen!r}")
+        assert provider.calls >= 4, (
+            f"only {provider.calls} provider() call(s) — the retry loop "
+            "this case must exercise never ran, so the guard's noop "
+            "exclusion is untested")
 
-    def case_a_stalled_mint_is_refused_too_not_relayed(self, certdir):
-        """A stall sets `blind_reason` exactly like any other real failure
-        (see the lock-timeout site above `_wait_for_pin_token`), and on THIS
-        path — absolute-form, no MITM-style pre-check ahead of it — nothing
-        else stands between a stalled mint and relaying the bridge create on
-        the ACTIVE bearer for good. The guard must refuse it too."""
+    def case_a_stalled_mint_is_refused_fast_not_relayed(self, certdir):
+        """`_plain_relay` now makes the same `mint_stalled()` PRE-check the
+        MITM path already made (round 4) — refused immediately, before
+        `_wait_for_pin_token`'s own retry loop ever runs. Without this a
+        stalled store cost `provider()` plus 3 retries, each blockable up to
+        `_MINT_LOCK_BOUND_S` (45s) on `refresh_lock`, on a thread-per-
+        connection server with no cap — paid ONCE before this whole round,
+        but every backoff respawn since the guard 503s the bridge worker
+        instead of relaying. `provider.calls == 1` proves the retry loop
+        never ran; `Connection: close` matches the neighbouring
+        `_refuse_unauthorized` on this same non-keep-alive path."""
         provider = self._blind_provider(
             blind_reason="mint stalled: the refresh lock has been held over "
-                         "45s for slot 1 (a@example.com)")
+                         "45s for slot 1 (a@example.com)",
+            stalled=True)
         got, seen = self._post_bridge_create(certdir, provider)
         assert got.startswith(b"HTTP/1.1 503"), (
             f"a stalled mint was relayed instead of refused: {got[:60]!r}")
+        assert b"Connection: close" in got, (
+            f"a closed connection advertised keep-alive: {got!r}")
         assert not any(b"Bearer ACTIVE" in s for s in seen), (
             "a stalled mint reached the chain — the same permanent give-away "
             f"a plain failed mint would cause: {seen!r}")
+        # <=2: this request's own entry call, plus at most one extra from
+        # the daemon's own background `_warm_mint_cache` warm-up (see
+        # `_blind_provider`). The retry loop this must NOT enter would push
+        # this to >=4 (1 entry + 3 retries), so the two shapes stay apart
+        # even with that extra call in the count.
+        assert provider.calls <= 2, (
+            f"{provider.calls} provider() call(s) — the retry loop ran "
+            "instead of the fast pre-check refusing immediately")
 
     def case_a_blind_mint_refuses_the_bridge_create_on_the_mitm_path_too(
         self, certdir
