@@ -8226,9 +8226,25 @@ class TestDrainReportsWhatItCut:
             # A SECOND 409 on the same already-evicted bridge must not log
             # again -- a stuck retry loop hammers the dead worker and would
             # otherwise bury the one line that mattered under its repeats.
+            # The retry itself is a request, and `_handle_one_request` notes
+            # every request's traffic BEFORE forwarding it, so the id is
+            # back in `_bridge_posts` by the time the 409 arrives: exactly
+            # what a real retry does, not a bare second call.
+            srv._note_bridge_traffic(WORKER, now=100.5)
             srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
             assert len(lines) == 1, (
                 "a second 409 for the same bridge logged again: " + repr(lines))
+
+            # A RE-REGISTRATION is a new life: the daemon assigns the
+            # session id to another worker, which then also gets 409'd, and
+            # that IS a second takeover worth its own line.
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_SUPERSEDED/bridge", now=102.0)
+            srv._note_bridge_traffic(WORKER, now=102.5)
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == 2, (
+                "a 409 after a re-registration of the same id is a new "
+                "life and must log again: " + repr(lines))
 
             # A 409 ON A NON-WORKER PATH is not this bridge's takeover.
             srv._note_bridge_traffic(WORKER, now=101.0)

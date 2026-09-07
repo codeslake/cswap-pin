@@ -12287,6 +12287,12 @@ class PinProxy:
         #: this daemon only inherited on a handover, which never posted a
         #: create to it at all.
         self._last_create: "float | None" = None
+        #: bridge ids `_note_bridge_superseded` has already logged for their
+        #: CURRENT life. A retry against a dead worker re-adds the id to
+        #: `_bridge_posts` before the 409 comes back, so presence there
+        #: cannot gate the line; this is cleared on re-registration, which
+        #: is when the id starts a new life worth its own line.
+        self._bridge_superseded_logged: set = set()
         # conn -> bridge id, for connections carrying that bridge's inbound
         # stream. NOT "when a stream was last opened": the stream is issued
         # once and held for the life of the session, so a recency stamp ages
@@ -12323,6 +12329,9 @@ class PinProxy:
                 # not a worker post, and `deaf_bridges` must still judge
                 # this id only once it has actually posted.
                 self._bridge_first_post[bid.group(1)] = stamp
+                # A NEW LIFE: a takeover this id suffered before is not
+                # this one's, so it is due its own line if it is 409'd too.
+                self._bridge_superseded_logged.discard(bid.group(1))
                 return
             if _EVENT_STREAM.search(path):
                 if conn is not None:
@@ -12863,8 +12872,9 @@ class PinProxy:
         The takeover itself is logged too, once per bridge life: this is the
         only site in the fleet that ever sees the 409 that names it, and a
         Remote Control session dropped by it has nothing else to point at.
-        Gated on the eviction actually removing the id, so a burst of 409s
-        against one dead worker logs once rather than once per retry.
+        Gated on `_bridge_superseded_logged`, not on the eviction: a retry
+        against the same dead worker re-adds the id before its own 409
+        arrives, so a burst of them logs once rather than once per retry.
 
         Never raises: a statistic must not cost a request.
         """
@@ -12877,13 +12887,19 @@ class PinProxy:
             if not bid:
                 return
             b = bid.group(1)
-            was_posting = b in self._bridge_posts
             self._bridge_posts.pop(b, None)
             self._bridge_first_post.pop(b, None)
             stream_lost = getattr(self, "_stream_lost", None)
             if stream_lost is not None:
                 stream_lost.pop(b, None)
-            if was_posting:
+            # NOT `was_posting = b in self._bridge_posts`, which reads True
+            # on every retry: `_handle_one_request` notes traffic for a path
+            # BEFORE forwarding it, so a stuck retry re-adds `b` here ahead
+            # of each 409 that follows. This set is what makes the line
+            # once-per-life instead of once-per-retry.
+            already_logged = b in self._bridge_superseded_logged
+            self._bridge_superseded_logged.add(b)
+            if not already_logged:
                 _log_lifecycle(
                     f"bridge {b} superseded by a newer worker registration "
                     f"— 409 on {method} {path}")
