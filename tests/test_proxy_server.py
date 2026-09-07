@@ -389,11 +389,20 @@ class TestPinProxyServer:
             proxy.stop()
             upstream.stop()
 
-    def _bridge_post_with_foreign_verdict(self, certdir, seed_verdict):
+    def _bridge_post(self, certdir, monkeypatch, seed_verdict, expect_swapped,
+                      profile_answer=lambda token: {
+                          "emailAddress": "pin@example.com"}):
         """Drives a REAL `make_pin_token_provider` through the actual HTTP
         egress path (`PinProxy` end to end, real upstream TLS) for a pinned
-        `.../bridge` POST, with `seed_verdict(provider, switcher)` making the
-        identity check land on "foreign" before the request fires.
+        `.../bridge` POST. `seed_verdict(pp, provider)` seeds whatever the
+        case is testing before the request fires (or does nothing, for the
+        healthy/positive-control case). `profile_answer` stands in for the
+        mint-time `pin_profile_for` probe and is ALWAYS patched -- a foreign-
+        verdict case that forgot to override it must still never dial
+        api.anthropic.com, it must just get an "ok" verdict from the
+        default. `expect_swapped` picks which invariant this drive proves:
+        `swapped=True` (a healthy verdict DOES splice) or `swapped=False`
+        (a foreign one never does).
 
         Not the provider in isolation: a provider-level-only test would still
         pass if a future splice site read the credential store directly
@@ -402,6 +411,8 @@ class TestPinProxyServer:
         import json as _json
 
         from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "pin_profile_for", profile_answer)
 
         live = _json.dumps({"claudeAiOauth": {
             "accessToken": "pin-live-token", "expiresAt": 4102444800000,
@@ -435,42 +446,66 @@ class TestPinProxyServer:
                 "/v1/code/sessions/SID123/bridge", bearer="client-own-token",
             )
             assert status == 200
-            assert upstream.seen_auth == "Bearer client-own-token", (
-                "the foreign-verdict provider's token reached the upstream "
-                f"anyway: {upstream.seen_auth!r}")
+            want = "Bearer pin-live-token" if expect_swapped else "Bearer client-own-token"
+            assert upstream.seen_auth == want, (
+                f"expected {want!r}, upstream saw {upstream.seen_auth!r}")
             # ALSO the pinned-ness, or this goes green on a broken pin the
             # moment `.../bridge` ever drops off the pinned route table --
-            # `swapped=False` alone cannot tell "correctly refused" from
-            # "never tried".
-            assert "/bridge pinned=True swapped=False" in trace.read_text()
+            # `swapped=` alone cannot tell "correctly decided" from "never
+            # reached the decision at all".
+            assert f"/bridge pinned=True swapped={expect_swapped}" in trace.read_text()
         finally:
             proxy.stop()
             upstream.stop()
+
+    def case_a_healthy_verdict_still_swaps_the_bridge_post(
+            self, certdir, monkeypatch):
+        """Positive control for the two foreign-verdict cases below. Without
+        this, at least four ways the shared fixture could quietly decay --
+        `load_pin` no longer parsing what `save_pin` writes, so
+        `_current_target()` reads None; `read_account_credentials` moving
+        off the stub's `(n, e)` shape, so `not creds`; `extract_oauth_data`
+        no longer accepting this `claudeAiOauth` blob, so `_live_token`
+        reads None; or the stub's "1"/"2" ever agreeing, so
+        `_pin_is_the_live_login` short-circuits -- would make BOTH
+        foreign-verdict cases pass for a reason that is not the guard,
+        silently. If the fixture decays, THIS case reds and says why."""
+        self._bridge_post(
+            certdir, monkeypatch,
+            seed_verdict=lambda pp, provider: None,
+            expect_swapped=True,
+        )
 
     def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
             self, certdir, monkeypatch):
         """A foreign verdict from the MINT-time probe (`_identity_ok`, via
         `pin_profile_for`) must never splice -- see `_identity_ok`'s
         invariant."""
-        import cswap_pin.proxy as pp
-        monkeypatch.setattr(
-            pp, "pin_profile_for",
-            lambda token: {"emailAddress": "someone-else@example.com"})
-        self._bridge_post_with_foreign_verdict(
-            certdir, lambda _pp, _provider: None)
+        self._bridge_post(
+            certdir, monkeypatch,
+            seed_verdict=lambda pp, provider: None,
+            expect_swapped=False,
+            profile_answer=lambda token: {
+                "emailAddress": "someone-else@example.com"},
+        )
 
     def case_a_foreign_verdict_from_the_identity_beat_leaves_the_bridge_post_unswapped(
-            self, certdir):
+            self, certdir, monkeypatch):
         """The INCIDENT's own path: the 12h identity beat
         (`_freshen_pin_identity`) reports a foreign verdict through
         `provider.note_verdict`, not through a mint-time `pin_profile_for`
         probe. Both land in the same `_identity_cache` today, but that is an
         implementation detail one refactor could break -- this case reaches
-        the splice guard the way wmac's incident actually did."""
-        self._bridge_post_with_foreign_verdict(
-            certdir,
-            lambda pp, provider: provider.note_verdict(
+        the splice guard the way wmac's incident actually did. `profile_answer`
+        stays the healthy default: if the cache key shape ever moved and the
+        mint fell through to a real probe, this case must still never dial
+        out, and a healthy answer there is also the correct one -- the
+        provider ignores it while its own foreign verdict stands."""
+        self._bridge_post(
+            certdir, monkeypatch,
+            seed_verdict=lambda pp, provider: provider.note_verdict(
                 "pin-live-token", "pin@example.com", "foreign"),
+            expect_swapped=False,
         )
 
 
