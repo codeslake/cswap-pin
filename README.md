@@ -350,6 +350,17 @@ restart above and the self-upgrade below — for when you are debugging the
 daemon and a respawner fighting you is worse than a dead port. `cswap pin
 --heal` and a launch still repair, because those are you asking.
 
+`CSWAP_PIN_ALLOW_DIRECT=1` restores the old fall-through to a DIRECT dial when
+every configured hop is unusable. Off by default since 0.1.251: on the machines
+that configure a chain, the direct route is the corporate TLS-inspecting proxy,
+which answers 403 "Access restricted by network policy" to API and Remote
+Control requests, and Claude Code renders that as "Please run /login" (measured
+2026-09-07, 49 direct dials in 22 minutes, one fleet-wide login wave). Without
+the opt-in the pin answers `503 Service Unavailable` with `Retry-After: 2` and
+logs `egress REFUSED` once per outage; the client retries, nothing is asked to
+log in. A host with no chain configured is unaffected and dials direct as
+before.
+
 `CSWAP_PIN_EXIT_WITH_PARENT=1` makes the holder die when the process that
 started it dies. **Do not set this.** A holder is meant to outlive its
 launcher — `cswap pin` spawns it and exits, a shell backgrounds it and the

@@ -2679,6 +2679,27 @@ def _dial_with_no_chain(upstream: tuple[str, int], timeout: float = 15):
     return socket.create_connection(upstream, timeout=timeout)
 
 
+_ALLOW_DIRECT_ENV = "CSWAP_PIN_ALLOW_DIRECT"
+
+
+class NoChainHopError(OSError):
+    """Every configured hop is unusable and this host must not dial direct.
+
+    Measured 2026-09-07 04:11-04:33Z on a corporate host: when the local hops
+    stopped accepting under load, the fall-through direct dial reached the
+    TLS-inspecting proxy 49 times, which answered 403 "Access restricted by
+    network policy" to every API and Remote Control request, and Claude Code
+    renders a 403 as "Please run /login", clears goals and kills subagents.
+    A 503 with Retry-After is retried; a 403 is terminal. A host with NO
+    chain configured never sees this: there direct is the normal path.
+    """
+
+
+def _direct_allowed() -> bool:
+    """The old fall-through, opt-in: hosts whose direct route is harmless."""
+    return os.environ.get(_ALLOW_DIRECT_ENV, "") == "1"
+
+
 def _connect_ok(status: "str | None") -> bool:
     """Whether a CONNECT status line reports success.
 
@@ -11355,12 +11376,17 @@ class PinProxy:
         # Whether egress is currently bypassing the chain, and through which
         # hop when it is not — see _note_egress.
         self._egress_direct = False
+        self._egress_refused = False
         self._egress_hop: "tuple[str, int] | None" = None
         # STICKY, unlike the two above. They are the state right now, so a
         # chain that breaks and recovers reads green to every probe that
         # arrives after it — and every probe arrives after it, because nobody
         # is watching at the instant it breaks. See `direct_last`.
         self._egress_direct_last: "float | None" = None
+        # STICKY, same reason: `_egress_refused` resets the moment a hop
+        # returns, so without this a refused outage that healed before the
+        # next probe would leave no trace at all. See `direct_last`.
+        self._egress_refused_last: "float | None" = None
         # DEGRADED, not abandoned — see `hop_degraded_last`. Separate from the
         # one above because falling to a LATER hop is still egress through a
         # configured proxy, so `direct` stays False and that stamp never runs.
@@ -14742,6 +14768,7 @@ class PinProxy:
              "can_pin": can_pin, "egress": egress,
              "holder_pid": holder_pid,
              "direct_last": _iso_utc(self._egress_direct_last),
+             "refused_last": _iso_utc(self._egress_refused_last),
              "hop_degraded_last": _iso_utc(self._hop_degraded_last),
              # ADDITIVE, never a replacement for `can_pin`: whether the mint
              # check itself is currently busy behind a refresh in progress
@@ -15235,20 +15262,36 @@ class PinProxy:
             except Exception:
                 pass
 
-        keep = self._forward(method, path, headers, body, tls, swapped=swapped)
-        if keep is _AUTH_REJECTED:
-            # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
-            # 401/403/404 is terminal to the client — SSETransport treats those
-            # as permanent (M7y = new Set([401,403,404])), sets state="closed",
-            # and never reconnects, so one misrouted request kills Remote
-            # Control for the life of the process. That makes route
-            # classification a single point of permanent failure, and no amount
-            # of care in the predicate removes the risk. Retrying without the
-            # swap turns "I guessed wrong about this route" into "this request
-            # went out unpinned", which is the failure mode the whole module is
-            # already built to tolerate.
-            self._drop_upstream()
-            keep = self._forward(method, path, original_headers, body, tls)
+        try:
+            keep = self._forward(method, path, headers, body, tls, swapped=swapped)
+            if keep is _AUTH_REJECTED:
+                # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
+                # 401/403/404 is terminal to the client — SSETransport treats
+                # those as permanent (M7y = new Set([401,403,404])), sets
+                # state="closed", and never reconnects, so one misrouted
+                # request kills Remote Control for the life of the process.
+                # That makes route classification a single point of permanent
+                # failure, and no amount of care in the predicate removes the
+                # risk. Retrying without the swap turns "I guessed wrong about
+                # this route" into "this request went out unpinned", which is
+                # the failure mode the whole module is already built to
+                # tolerate. Inside the same try as the first `_forward`: a
+                # chain that dies between the two calls is a NoChainHopError
+                # here too, and it must answer 503, not escape as a bare
+                # OSError to the connection's `finally`.
+                self._drop_upstream()
+                keep = self._forward(method, path, original_headers, body, tls)
+        except NoChainHopError:
+            # No hop and no direct: a retryable answer, not a dropped
+            # connection and never the inspector's 403.
+            try:
+                tls.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
+                    b"Content-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                )
+            except OSError:
+                return False
+            return True
         # A client that asked to close gets closed regardless of the upstream.
         for k, v in headers:
             if k.lower() == "connection" and "close" in v.lower():
@@ -15586,8 +15629,18 @@ class PinProxy:
                     break
                 time.sleep(_CHAIN_HEAL_POLL_S)
         # Every hop is still unusable after the grace period (or there was
-        # never a hop): fall through to the unchained dial, which is what this
-        # method has always ended in.
+        # never a hop). A host WITH a chain configured no longer falls through
+        # to the unchained dial: on the machines that configure one, direct is
+        # the corporate inspector and its 403 reads as a login failure
+        # (NoChainHopError; the request path answers 503 + Retry-After).
+        # CSWAP_PIN_ALLOW_DIRECT=1 restores the fall-through where direct is
+        # known to be harmless. A host with no chain dials direct as before.
+        if candidates and not _direct_allowed():
+            self._note_egress_refused()
+            raise NoChainHopError(
+                "no chain hop reachable and direct egress is refused on this "
+                f"host ({_ALLOW_DIRECT_ENV}=1 allows it)"
+            )
         sock = _dial_with_no_chain(self._upstream)
         sock.settimeout(None)
         self._note_egress(direct=True, configured=bool(candidates))
@@ -15656,6 +15709,22 @@ class PinProxy:
         # distinction to make — see `_note_egress(configured=...)`.
         return None
 
+    def _note_egress_refused(self) -> None:
+        """Log once per outage that every hop is down and direct is refused.
+
+        Reset by :meth:`_note_egress` the moment a hop carries a request
+        again, so a flapping chain costs one line per outage, not per
+        connection.
+        """
+        if self._egress_refused:
+            return
+        self._egress_refused = True
+        self._egress_refused_last = time.time()
+        _log_lifecycle(
+            "egress REFUSED — no chain hop reachable and direct egress is not "
+            "allowed on this host; answering 503 Retry-After until a hop returns"
+        )
+
     def _note_hop_unusable(self, hop: "tuple[str, int]", why: str) -> None:
         """Log WHY a hop was skipped, once per (hop, reason) transition.
 
@@ -15708,6 +15777,8 @@ class PinProxy:
         machine is".
         """
         state = None if direct else hop
+        if not direct:
+            self._egress_refused = False
         if direct == self._egress_direct and state == self._egress_hop:
             return
         self._egress_direct, self._egress_hop = direct, state
@@ -15910,7 +15981,8 @@ class PinProxy:
         # let the chain be the only answer. A filtering proxy (per-domain
         # forwards, a corporate MITM) may refuse the ingress host outright, and
         # closing here made that refusal invisible.
-        for chain in self._chain_candidates():
+        candidates = self._chain_candidates()
+        for chain in candidates:
             try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
                 up.sendall(
@@ -15951,6 +16023,21 @@ class PinProxy:
         elif up is not None:
             up = carrying  # the peeked byte, pushed back in front of the stream
         if up is None:
+            # Every hop failed (down, or refused this host outright). A host
+            # WITH a chain configured must not fall through to a direct dial
+            # here either — see NoChainHopError above; this is the same rule,
+            # at the CONNECT path Remote Control's WebSocket takes.
+            if candidates and not _direct_allowed():
+                self._note_egress_refused()
+                try:
+                    conn.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
+                        b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                except OSError:
+                    pass
+                conn.close()
+                return
             try:
                 up = socket.create_connection((host, port), timeout=15)
             except OSError:

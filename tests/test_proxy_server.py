@@ -1328,7 +1328,7 @@ class TestLoopbackChainTrust:
             upstream.stop()
 
     def case_a_dead_loopback_chain_does_not_disarm_verification(
-        self, certdir, tmp_path
+        self, certdir, tmp_path, monkeypatch
     ):
         """Skipping verification is a property of the HOP, not of the hint.
 
@@ -1340,6 +1340,10 @@ class TestLoopbackChainTrust:
         """
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
+        # Since 0.1.251 a host with a configured chain refuses the direct
+        # dial (NoChainHopError -> 503); the fall-through this case measures
+        # exists only behind the opt-in.
+        monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
         foreign = tmp_path / "foreign"
         foreign.mkdir()
         ensure_ca(foreign, "api.anthropic.com")
@@ -1703,11 +1707,17 @@ class TestChainRediscovery:
         write_upstream_hint(certdir, url)
         assert _recorded_upstream(certdir) == url
 
-    def case_falls_back_to_direct_when_the_recorded_chain_is_gone(
-        self, certdir, tmp_path
+    def case_a_dead_recorded_chain_answers_503_by_default(
+        self, certdir, tmp_path, monkeypatch
     ):
         """The hint cannot expire on its own (see above), so a chain that dies
-        must not wedge every request — the relay dials direct instead."""
+        must not wedge every request. Since 2026-09-07 the answer is a 503
+        with Retry-After, NOT a direct dial: on the hosts that configure a
+        chain, direct is the corporate inspector and its 403 reads as
+        "Please run /login" (49 direct dials, one fleet-wide login wave).
+        `CSWAP_PIN_ALLOW_DIRECT=1` is the opt-in that restores the old
+        fall-through, and the second half of this case proves the walk still
+        reaches it."""
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         upstream = _FakeUpstream(certdir)
@@ -1729,7 +1739,18 @@ class TestChainRediscovery:
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
             )
-            assert status == 200, "a dead chain wedged the request"
+            assert status == 503, (
+                f"a dead chain must answer 503 Retry-After, never wedge and "
+                f"never dial direct: got {status!r}"
+            )
+            monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t",
+            )
+            assert status == 200, (
+                "CONTROL FAILED: with the opt-in a dead chain no longer "
+                f"falls through to the direct dial: got {status!r}"
+            )
         finally:
             proxy.stop()
             upstream.stop()
@@ -1864,6 +1885,162 @@ class TestChainRediscovery:
             f"CONTROL FAILED: dropping the loop also dropped the real hop: "
             f"{dialled}"
         )
+
+    def case_a_chained_host_refuses_direct_when_every_hop_is_down(
+        self, certdir, monkeypatch
+    ):
+        """A configured chain whose hops are all down is a 503, never DIRECT.
+
+        MEASURED 2026-09-07 04:11-04:33Z on the linux host: the local hops
+        (cache proxy 9901, privoxy 8118) stopped accepting under a load storm,
+        `_connect_upstream` fell through to `_dial_with_no_chain` 49 times, the
+        direct route was the corporate TLS-inspecting proxy, and it answered
+        403 "Access restricted by network policy" to every API and Remote
+        Control request. Claude Code renders a 403 as "Please run /login",
+        clears goals and kills subagents. A 503 with Retry-After is retried.
+
+        The opt-in `CSWAP_PIN_ALLOW_DIRECT=1` is the CONTROL: with it the old
+        fall-through dials direct, which proves the refusal is the only thing
+        that changed and the chain walk still ran.
+        """
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import NoChainHopError, PinProxy, write_upstream_hint
+
+        # A configured hop nothing listens on: port 1 refuses instantly.
+        write_upstream_hint(certdir, "http://127.0.0.1:1")
+        monkeypatch.setattr(pin_proxy, "_CHAIN_HEAL_GRACE_S", 0.2)
+        monkeypatch.setattr(pin_proxy, "_CHAIN_HEAL_POLL_S", 0.05)
+        dialled = []
+
+        def _direct(upstream, timeout=15):
+            dialled.append(upstream)
+            raise OSError("the direct dial is the thing under test")
+
+        monkeypatch.setattr(pin_proxy, "_dial_with_no_chain", _direct)
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            rediscover_chain=True,
+        )
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+
+        with pytest.raises(NoChainHopError):
+            proxy._connect_upstream()
+        assert dialled == [], (
+            f"a host with a configured chain dialled DIRECT: {dialled}"
+        )
+        assert proxy._egress_refused is True, "the refusal was not noted"
+        assert proxy._egress_refused_last is not None, (
+            "the refusal left no sticky timestamp — a probe arriving after "
+            "the chain heals would see nothing happened"
+        )
+
+        # CONTROL: the opt-in restores the fall-through, same walk, same hops.
+        monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+        with pytest.raises(OSError):
+            proxy._connect_upstream()
+        assert dialled == [("127.0.0.1", 1)], (
+            f"CONTROL FAILED: the opt-in did not reach the direct dial: {dialled}"
+        )
+
+    def case_a_chained_host_refuses_the_connect_tunnel_when_every_hop_is_down(
+        self, certdir, monkeypatch
+    ):
+        """The same rule at the CONNECT path: Remote Control's WebSocket
+        receives over a tunnel to the ingress host, not the MITM'd
+        api.anthropic.com, so it is `_blind_tunnel` and not `_connect_upstream`
+        that dials on that host's behalf. MEASURED 2026-09-07 04:11-04:33Z on
+        the linux host: this is the path that reached the corporate
+        TLS-inspecting proxy directly when every configured hop was down.
+        """
+        import socket as socket_module
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        # A configured hop nothing listens on: port 1 refuses instantly.
+        write_upstream_hint(certdir, "http://127.0.0.1:1")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        real_create_connection = socket_module.create_connection
+        dialled = []
+
+        def _create_connection(address, *a, **kw):
+            if address == ("127.0.0.1", 1):
+                # The hop dial itself: real, so the walk exhausts it exactly
+                # as it would in production and lands on the fall-through
+                # under test.
+                return real_create_connection(address, *a, **kw)
+            dialled.append(address)
+            raise OSError("the direct dial is the thing under test")
+
+        monkeypatch.setattr(
+            pin_proxy.socket, "create_connection", _create_connection
+        )
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            rediscover_chain=True,
+        )
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+        proxy.start()
+        try:
+            raw = socket_module.socket(
+                socket_module.AF_INET, socket_module.SOCK_STREAM
+            )
+            raw.settimeout(10)
+            raw.connect(("127.0.0.1", proxy.port))
+            raw.sendall(
+                b"CONNECT rc-ingress.example.test:443 HTTP/1.1\r\n"
+                b"Host: rc-ingress.example.test:443\r\n\r\n"
+            )
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            raw.close()
+
+            assert resp.split(b"\r\n")[0] == b"HTTP/1.1 503 Service Unavailable", (
+                f"a chained host must answer 503, never dial direct on the "
+                f"CONNECT path: {resp[:120]!r}"
+            )
+            assert dialled == [], (
+                f"a host with a configured chain dialled DIRECT: {dialled}"
+            )
+            assert proxy._egress_refused is True, "the refusal was not noted"
+
+            # CONTROL: the opt-in restores the fall-through, same walk, same
+            # target — proves the refusal is what changed, not the tunnel.
+            monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+            raw = socket_module.socket(
+                socket_module.AF_INET, socket_module.SOCK_STREAM
+            )
+            raw.settimeout(10)
+            raw.connect(("127.0.0.1", proxy.port))
+            raw.sendall(
+                b"CONNECT rc-ingress.example.test:443 HTTP/1.1\r\n"
+                b"Host: rc-ingress.example.test:443\r\n\r\n"
+            )
+            resp2 = raw.recv(4096)
+            raw.close()
+
+            # Asserted BEFORE stop(): stop() wakes its own accept() loop with
+            # a loopback self-connect, which is a real call to the same
+            # patched name and would otherwise show up as a second entry.
+            assert resp2 == b"", (
+                "CONTROL FAILED: the closed direct dial should drop the "
+                f"tunnel with no response, got {resp2!r}"
+            )
+            assert dialled == [("rc-ingress.example.test", 443)], (
+                f"CONTROL FAILED: the opt-in did not reach the direct dial: "
+                f"{dialled}"
+            )
+        finally:
+            proxy.stop()
 
     def case_a_host_with_no_chain_pays_nothing_for_the_heal_grace(self, certdir):
         """The grace is for a hop that is RESTARTING, not for having no hop.
@@ -2438,7 +2615,8 @@ class TestChainRediscovery:
                 l for l in buf.getvalue().splitlines() if "egress" in l
             ], "an unchanged chain logged again"
 
-            # And with no hop left, the downgrade is named.
+            # And with no hop left, the refusal is named (direct is not
+            # dialled on a host with a chain; see NoChainHopError).
             relay._chain_candidates = lambda: [
                 pin_proxy._as_chain(("127.0.0.1", dead_port))
             ]
@@ -2450,7 +2628,7 @@ class TestChainRediscovery:
                 except OSError:
                     pass
             assert any(
-                "DIRECT" in l for l in buf.getvalue().splitlines()
+                "REFUSED" in l for l in buf.getvalue().splitlines()
             ), buf.getvalue()
         finally:
             good.close()
@@ -4520,15 +4698,24 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def case_direct_dial_when_the_chain_refuses_the_ingress_host(
-        self, certdir, tmp_path
+    def case_a_refusing_chain_answers_503_not_a_direct_dial(
+        self, certdir, tmp_path, monkeypatch
     ):
+        """Since 2026-09-07 a chain that refuses every hop is the same "every
+        hop failed" case `_blind_tunnel` answers with 503 — the chain
+        REFUSING and the chain being DOWN converge on `up is None`, and a
+        direct dial from a chained host is what reached the corporate
+        TLS-inspecting proxy 49 times (see TestChainRediscovery). The class
+        docstring's "same session received normally" measurement was on a
+        host where direct is harmless; `CSWAP_PIN_ALLOW_DIRECT=1` is that
+        opt-in and is the CONTROL below.
+        """
         import cswap_pin.proxy as pp
 
         chain = self._refusing_chain()
 
-        # Stands in for the ingress host: accepts and echoes, proving the
-        # tunnel reached it directly rather than dying at the chain.
+        # Stands in for the ingress host: accepts and echoes, reached only
+        # under the opt-in.
         peer = socket.socket()
         peer.bind(("127.0.0.1", 0))
         peer.listen(2)
@@ -4550,6 +4737,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
 
         threading.Thread(target=serve_peer, daemon=True).start()
 
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
         pp._TRACE = open(log, "a")
@@ -4568,14 +4756,36 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
                     f"CONNECT 127.0.0.1:{peer_port} HTTP/1.1\r\n"
                     f"Host: 127.0.0.1:{peer_port}\r\n\r\n".encode()
                 )
-                resp = b""
-                while b"\r\n\r\n" not in resp:
+                resp = raw.recv(4096)
+                raw.close()
+                assert resp.split(b"\r\n")[0] == b"HTTP/1.1 503 Service Unavailable", (
+                    f"a refusing chain must answer 503, never dial direct: "
+                    f"{resp[:80]!r}"
+                )
+                assert not reached.is_set(), (
+                    "a refusing chain reached the ingress host directly"
+                )
+
+                # CONTROL: the opt-in restores the old fall-through.
+                monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+                raw.sendall(
+                    f"CONNECT 127.0.0.1:{peer_port} HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{peer_port}\r\n\r\n".encode()
+                )
+                resp2 = b""
+                while b"\r\n\r\n" not in resp2:
                     chunk = raw.recv(4096)
-                    assert chunk, "proxy closed instead of falling back to a direct dial"
-                    resp += chunk
-                assert b"200" in resp.split(b"\r\n")[0], resp[:80]
+                    assert chunk, (
+                        "CONTROL FAILED: proxy closed instead of falling "
+                        "back to a direct dial"
+                    )
+                    resp2 += chunk
+                assert b"200" in resp2.split(b"\r\n")[0], resp2[:80]
                 raw.sendall(b"PING")
-                assert raw.recv(16) == b"PONG", "tunnel did not reach the host"
+                assert raw.recv(16) == b"PONG", (
+                    "CONTROL FAILED: tunnel did not reach the host"
+                )
                 raw.close()
             finally:
                 proxy.stop()
@@ -4586,7 +4796,7 @@ class TestBlindTunnelFallsBackWhenChainRefuses:
             pp._TRACE.close()
             pp._TRACE = prev
 
-        assert reached.is_set(), "the ingress host was never dialled"
+        assert reached.is_set(), "CONTROL FAILED: the ingress host was never dialled"
         assert "chain refused" in log.read_text(), log.read_text()
 
 
@@ -9634,7 +9844,17 @@ class TestOptimisticConnectIsDetected:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def case_falls_back_when_the_200_tunnel_is_already_eof(self, certdir, tmp_path):
+    def case_falls_back_when_the_200_tunnel_is_already_eof(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """Since 2026-09-07 an optimistic-then-EOF chain is the same "every
+        hop failed" case `_blind_tunnel` answers with 503 by default — a
+        chain that ACCEPTED and died and a chain that never accepted at all
+        both leave `up is None`, and a direct dial from a chained host is
+        what reached the corporate TLS-inspecting proxy 49 times (see
+        TestChainRediscovery). `CSWAP_PIN_ALLOW_DIRECT=1` restores the old
+        re-dial and is the CONTROL below.
+        """
         import cswap_pin.proxy as pp
 
         chain = self._optimistic_chain()
@@ -9659,6 +9879,7 @@ class TestOptimisticConnectIsDetected:
 
         threading.Thread(target=serve_peer, daemon=True).start()
 
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
         log = tmp_path / "trace.log"
         prev = pp._TRACE
         pp._TRACE = open(log, "a")
@@ -9676,15 +9897,33 @@ class TestOptimisticConnectIsDetected:
                     f"CONNECT 127.0.0.1:{peer_port} HTTP/1.1\r\n"
                     f"Host: 127.0.0.1:{peer_port}\r\n\r\n".encode()
                 )
-                resp = b""
-                while b"\r\n\r\n" not in resp:
+                resp = raw.recv(4096)
+                raw.close()
+                assert resp.split(b"\r\n")[0] == b"HTTP/1.1 503 Service Unavailable", (
+                    f"a dead-tunnel chain must answer 503, never dial direct: "
+                    f"{resp[:80]!r}"
+                )
+                assert not reached.is_set(), (
+                    "an optimistic chain reached the host directly"
+                )
+
+                # CONTROL: the opt-in restores the old re-dial.
+                monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+                raw.sendall(
+                    f"CONNECT 127.0.0.1:{peer_port} HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{peer_port}\r\n\r\n".encode()
+                )
+                resp2 = b""
+                while b"\r\n\r\n" not in resp2:
                     chunk = raw.recv(4096)
-                    assert chunk, "proxy closed instead of re-dialling"
-                    resp += chunk
-                assert b"200" in resp.split(b"\r\n")[0], resp[:80]
+                    assert chunk, "CONTROL FAILED: proxy closed instead of re-dialling"
+                    resp2 += chunk
+                assert b"200" in resp2.split(b"\r\n")[0], resp2[:80]
                 raw.sendall(b"PING")
                 assert raw.recv(16) == b"PONG", (
-                    "the tunnel was the chain's dead socket, not the host"
+                    "CONTROL FAILED: the tunnel was the chain's dead socket, "
+                    "not the host"
                 )
                 raw.close()
             finally:
@@ -9696,7 +9935,7 @@ class TestOptimisticConnectIsDetected:
             pp._TRACE.close()
             pp._TRACE = prev
 
-        assert reached.is_set(), "the host was never dialled directly"
+        assert reached.is_set(), "CONTROL FAILED: the host was never dialled directly"
         # THE CONTRACT, NOT THE BRANCH THAT DELIVERED IT. This used to assert
         # `"already EOF" in log`, which names one internal path. Measured on
         # macOS CI 2026-08-18: the two behavioural assertions above BOTH passed
