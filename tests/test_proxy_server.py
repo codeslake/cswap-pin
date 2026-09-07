@@ -53,11 +53,15 @@ class _FakeUpstream:
     and replies 200. Uses the same leaf cert the proxy MITMs with, so the
     proxy's own upstream TLS (servername api.anthropic.com) validates it."""
 
-    def __init__(self, certdir: Path, reject_bearer: str | None = None):
+    def __init__(self, certdir: Path, reject_bearer: str | None = None,
+                 reply: bytes | None = None):
         # reject_bearer: answer 403 to exactly this credential, 200 to any
         # other. Models an endpoint the pinned account may not use — the shape
         # that makes a misrouted swap terminal for the client.
+        # reply: the whole response to send instead of the 200, for a case
+        # that needs the origin to answer something the pin then rewrites.
         self.reject_bearer = reject_bearer
+        self.reply = reply
         self.seen_auth: str | None = None
         self.seen_path: str | None = None
         self.seen_body: bytes = b""
@@ -115,10 +119,10 @@ class _FakeUpstream:
                     )
                     tls.close()
                     continue
-                tls.sendall(
+                tls.sendall(self.reply or (
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
                     b"Content-Type: application/json\r\n\r\n{}"
-                )
+                ))
                 tls.close()
             except Exception:
                 pass
@@ -210,7 +214,8 @@ class _RecordingChain:
 
 
 def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: str,
-                           ua: str | None = None):
+                           ua: str | None = None, body: str = "{}",
+                           extra_headers: dict | None = None):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
     trusting the proxy's CA. Returns the response status."""
     ctx = ssl.create_default_context(cafile=str(ca_path))
@@ -225,7 +230,8 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
     headers = {"Authorization": f"Bearer {bearer}"}
     if ua is not None:
         headers["User-Agent"] = ua
-    conn.request("POST", path, body="{}", headers=headers)
+    headers.update(extra_headers or {})
+    conn.request("POST", path, body=body, headers=headers)
     resp = conn.getresponse()
     resp.read()
     conn.close()
@@ -12639,39 +12645,91 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     UNIFIED_STATUS = b"anthropic-ratelimit-unified-status: allowed_warning"
     SHOULD_RETRY = b"x-should-retry: true"
 
+    MODEL = "claude-fable-5-1"
+
     @staticmethod
-    def _wire(monkeypatch, switched, raises_once=None, needs_login=False,
-              validated=True):
+    def _usage(scoped, five_hour=0.0, seven_day=0.0):
+        """One account's normalized usage in `oauth.relevant_windows` shape.
+
+        ``scoped`` is {per-model weekly window display name: pct}; empty means
+        the account reports no per-model window at all."""
+        out = {"five_hour": {"pct": five_hour}, "seven_day": {"pct": seven_day}}
+        if scoped:
+            out["scoped"] = [{"name": n, "pct": p} for n, p in scoped.items()]
+        return out
+
+    @classmethod
+    def _wire(cls, monkeypatch, switched, raises_once=None, needs_login=False,
+              validated=True, scoped=None, target=None, before=None):
         """Stub claude_swap's switcher so no real account store is touched.
 
         ``validated=None`` omits the key entirely (an older cswap that never
-        probed the landing credential, or a probe that never ran)."""
+        probed the landing credential, or a probe that never ran).
+
+        ``scoped`` are the per-model weekly windows the managed accounts
+        report — what `_model_limit_basis` derives the `models=` basis from.
+        ``target`` is the usage of the account the switch would land on
+        (default: the same windows, all at 0%). ``before`` runs at the top of
+        `switch()`, for a case that needs to block or fail inside it.
+
+        The returned list holds the `models=` basis of each `switch()` call,
+        so `len(calls)` still counts calls AND a case can assert WHICH window
+        the ranking was given.
+        """
+        import claude_swap.oauth as _oauth
         from cswap_pin import proxy as pp
 
+        if scoped is None:
+            scoped = {"Fable": 0.0}
+        if target is None:
+            target = cls._usage(scoped)
         calls = []
         state = {"raised": False}
 
-        def _switch_off(sw):
-            calls.append(sw)
+        def _switch(strategy=None, json_output=False, models=None,
+                    current_at_limit=False, **_):
+            calls.append(models)
+            if before is not None:
+                before()
             if raises_once is not None and not state["raised"]:
                 state["raised"] = True
                 raise raises_once
-            result = {"switched": switched, "needsLogin": needs_login,
-                      "reason": None if switched else "candidates-exhausted"}
+            # `_select_best_switchable`'s own arithmetic: `current_at_limit`
+            # pins the walled account to 0.0, so a target with no headroom on
+            # the basis loses `best > current` and the switch stays put. With
+            # no basis the scoped window is invisible and it lands anyway —
+            # the shape that walled three subagents onto a Fable-100% account.
+            room = _oauth.account_headroom(target, tuple(models or ()))
+            landed = switched and (room is None or room > 0.0)
+            result = {"switched": landed, "needsLogin": needs_login,
+                      "reason": None if landed else "candidates-exhausted"}
             if validated is not None:
                 result["validated"] = validated
             return result
 
+        account_switcher = types.SimpleNamespace(
+            switch=_switch,
+            accounts_snapshot=lambda fetch=None: types.SimpleNamespace(
+                accounts=(types.SimpleNamespace(
+                    usage=types.SimpleNamespace(
+                        decision_value=lambda: cls._usage(scoped))),)),
+        )
         fake_module = type("M", (), {
-            "ClaudeAccountSwitcher": staticmethod(lambda: None),
-            "switch_off_at_limit_account": staticmethod(_switch_off),
+            "ClaudeAccountSwitcher": staticmethod(lambda: account_switcher),
+            # KEPT FOR THE FAULT INJECTION. Nothing calls it now; restoring
+            # the pre-fix call site must still reach a working stub, or the
+            # injection goes red on an AttributeError instead of on the
+            # missing model basis, which proves nothing.
+            "switch_off_at_limit_account": staticmethod(lambda sw: _switch()),
         })()
-        monkeypatch.setattr(pp, "require", lambda n: fake_module)
+        modules = {"switcher": fake_module, "oauth": _oauth}
+        monkeypatch.setattr(pp, "require", lambda n: modules[n])
         pp._walled_switch_seen.clear()
         return calls
 
     @classmethod
-    def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests"):
+    def _relay(cls, path="/v1/messages", reset=None,
+               status=b"429 Too Many Requests", model=None):
         import socket as _s
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
@@ -12684,7 +12742,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                      + cls.SHOULD_RETRY + b"\r\nContent-Length: 2\r\n\r\nno")
             up_b.sendall(head)
             up_b.shutdown(_s.SHUT_WR)
-            pp._relay_response(up_a, cl_a, 0, method="POST", path=path)
+            pp._relay_response(up_a, cl_a, 0, method="POST", path=path,
+                               model=cls.MODEL if model is None else model)
             cl_a.shutdown(_s.SHUT_WR)
             return cl_b.recv(4096)
         finally:
@@ -12741,20 +12800,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         serialized N real `switch()` calls — each blocking the lock for the
         full config-lock timeout — instead of one. A raise must debounce
         like any other outcome, for its own short expiry."""
-        from cswap_pin import proxy as pp
-
-        calls = []
-
-        def _switch_off(sw):
-            calls.append(sw)
+        def _always_raises():
             raise OSError("locked")
 
-        fake_module = type("M", (), {
-            "ClaudeAccountSwitcher": staticmethod(lambda: None),
-            "switch_off_at_limit_account": staticmethod(_switch_off),
-        })()
-        monkeypatch.setattr(pp, "require", lambda n: fake_module)
-        pp._walled_switch_seen.clear()
+        calls = self._wire(monkeypatch, switched=True, before=_always_raises)
 
         for _ in range(10):
             got = self._relay()
@@ -12917,27 +12966,14 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         seen-and-not-yet-ok and relay the 429 verbatim while the first
         thread's switch is still landing. The lock must stay held across
         `switch()` so every waiter reads the one settled answer."""
-        from cswap_pin import proxy as pp
         entered = threading.Event()
         release = threading.Event()
 
-        def _switch_off(sw):
+        def _block():
             entered.set()
             assert release.wait(timeout=5), "release never set — test bug"
-            return {"switched": True, "needsLogin": False, "validated": True}
 
-        calls = []
-
-        def _counted(sw):
-            calls.append(sw)
-            return _switch_off(sw)
-
-        fake_module = type("M", (), {
-            "ClaudeAccountSwitcher": staticmethod(lambda: None),
-            "switch_off_at_limit_account": staticmethod(_counted),
-        })()
-        monkeypatch.setattr(pp, "require", lambda n: fake_module)
-        pp._walled_switch_seen.clear()
+        calls = self._wire(monkeypatch, switched=True, before=_block)
 
         results = {}
 
@@ -12985,6 +13021,190 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(path="/v1/other")
         assert got.startswith(b"HTTP/1.1 429"), got
         assert not calls, "the switch must only ever be tried for /v1/messages"
+
+    # -- the 401 only fires when the retry it asks for can land -------------
+
+    def case_a_target_with_no_room_for_the_model_relays_the_429(
+        self, monkeypatch,
+    ):
+        """THE EVENT, 2026-09-07 ~18:1xZ. Account-2 walled, the failover moved
+        to Account-4, Account-4 was Fable 100%. The switch LANDED and was
+        validated, so the pin answered 401; Claude Code rebuilt its client,
+        retried on Account-4, walled again, and the retry loop exhausted into
+        `authentication_failed` — which is not in its partial-result set, so
+        three fable team leads lost their context outright
+        (req_011Cepk7iQtQCjPtKjVxCxna and two siblings in the same minute).
+        5h/7d headroom said the target was fine; the model's own weekly window
+        said it was full, and only the second one gates the retry."""
+        calls = self._wire(
+            monkeypatch, switched=True,
+            scoped={"Fable": 0.0},
+            target=self._usage({"Fable": 100.0}),
+        )
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), (
+            "the pin converted a wall into a 401 whose retry has nowhere to "
+            f"land — the shape that killed three subagents; got {got[:40]!r}")
+        # THE DISCRIMINATING HALF: both branches can now emit a 429 prefix,
+        # so the relayed wall must be the UNTOUCHED one, headers and all.
+        assert self.RESET_HEADER in got, got[:120]
+        assert self.RETRY_AFTER in got, got[:120]
+        assert self.UNIFIED_STATUS in got, got[:120]
+        assert self.SHOULD_RETRY in got, got[:120]
+        assert calls == [("Fable",)], (
+            "the ranking was not given the model's own weekly window, so it "
+            f"could not see the target was full: {calls}")
+
+    def case_a_target_with_room_for_the_model_still_gets_the_401(
+        self, monkeypatch,
+    ):
+        """The other side of the same conjunct: the window the request's model
+        is gated by has room on the target, so the retry lands and the 401 is
+        the right answer — with every rate-limit header stripped, because a
+        `retry-after` over 60s on a 401 throws
+        `api_request_retry_after_too_long` and kills the turn anyway."""
+        calls = self._wire(
+            monkeypatch, switched=True,
+            scoped={"Fable": 0.0, "Opus": 100.0},
+            target=self._usage({"Fable": 12.0, "Opus": 100.0}),
+        )
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert b"retry-after" not in got.lower(), got[:120]
+        assert self.RESET_HEADER not in got, got[:120]
+        assert self.UNIFIED_STATUS not in got, got[:120]
+        assert self.SHOULD_RETRY not in got, got[:120]
+        assert calls == [("Fable",)], (
+            "a fable request must be ranked on the Fable window, not on the "
+            f"Opus one it never touches: {calls}")
+
+    def case_a_request_naming_no_model_relays_the_429_untouched(
+        self, monkeypatch,
+    ):
+        """FAIL CLOSED. No model means no way to prove the retry can land, and
+        a guard that cannot parse must refuse. A relayed wall costs a sleep
+        the client can abandon; a 401 whose retry dies costs the context."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        calls = self._wire(monkeypatch, switched=True)
+        got = self._relay(model="")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self.RESET_HEADER in got, got[:120]
+        assert self.SHOULD_RETRY in got, got[:120]
+        assert not calls, "nothing may be switched on an unprovable request"
+        assert any("names no model" in m for m in logged), logged
+
+    def case_a_model_no_reported_window_names_relays_the_429_untouched(
+        self, monkeypatch,
+    ):
+        """The accounts report per-model windows but none of them names this
+        model, so the derivation is unproven — refuse rather than fall back to
+        5h/7d, which is precisely the blindness the conjunct removes."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        calls = self._wire(monkeypatch, switched=True, scoped={"Opus": 0.0})
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self.RESET_HEADER in got, got[:120]
+        assert not calls, "no switch may run on a basis we cannot derive"
+        assert any("no reported usage window names" in m for m in logged), logged
+
+    def case_no_per_model_window_anywhere_still_converts(self, monkeypatch):
+        """AND THE GUARD MUST NOT EAT THE FEATURE. When no account reports a
+        scoped window at all, the window data itself says there is no per-model
+        gate to miss: 5h/7d is the whole ranking, the basis is empty, and the
+        401 is as safe as it ever was. Refusing here would silently disable the
+        conversion for every account that has no per-model weekly limit."""
+        calls = self._wire(monkeypatch, switched=True, scoped={})
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert calls == [()], calls
+
+    def case_one_models_answer_does_not_settle_anothers(self, monkeypatch):
+        """The memo keys on (wall, model), not on the wall. One wall walls
+        every model at once and the answer differs per model — the incident's
+        own shape, three fable leads beside an opus REPL. A fable turn that
+        found no room must not hand its 429 to the opus turn behind it."""
+        calls = self._wire(
+            monkeypatch, switched=True,
+            scoped={"Fable": 0.0, "Opus": 0.0},
+            target=self._usage({"Fable": 100.0, "Opus": 3.0}),
+        )
+        fable = self._relay(model="claude-fable-5-1")
+        assert fable.startswith(b"HTTP/1.1 429"), fable[:40]
+        opus = self._relay(model="claude-opus-4-5")
+        assert opus.startswith(b"HTTP/1.1 401"), (
+            "the fable turn's refusal was reused for a model it says nothing "
+            f"about; got {opus[:40]!r}")
+        assert calls == [("Fable",), ("Opus",)], calls
+
+    def case_the_model_reaches_the_relay_from_a_real_request(
+        self, monkeypatch, certdir,
+    ):
+        """END TO END THROUGH THE MITM, because the two halves live in
+        different methods: the body is read in `_handle_one_request_inner` and
+        the relay is called from `_forward`. Wiring `model=` to a name the
+        call site cannot see raises NameError on EVERY request and the daemon
+        answers nothing at all — measured while writing this fix, and the
+        suite went red in ten classes without one of them naming a model. The
+        cases next door drive `_relay_response` directly and cannot see it.
+
+        A subagent's request is shaped like any other; the
+        `x-claude-code-agent-id` it carries is not what the pin reads, and
+        must not need to be."""
+        from cswap_pin.proxy import PinProxy
+
+        calls = self._wire(
+            monkeypatch, switched=True,
+            scoped={"Fable": 0.0},
+            target=self._usage({"Fable": 100.0}),
+        )
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 429 Too Many Requests\r\n" + self.RESET_HEADER
+            + b"\r\n" + self.RETRY_AFTER + b"\r\nContent-Length: 0\r\n"
+            b"Connection: close\r\n\r\n"))
+        proxy = PinProxy(certdir=certdir,
+                         pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages",
+                bearer="disk-token",
+                body=json.dumps({"model": self.MODEL, "max_tokens": 4}),
+                extra_headers={"x-claude-code-agent-id": "agent_01"},
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert calls == [("Fable",)], (
+            "the model never reached the relay, so the ranking was blind to "
+            f"the target's own Fable window: {calls}")
+        assert status == 429, (
+            "a wall whose retry has nowhere to land was converted to a 401 "
+            f"on the real request path; got {status}")
+
+    def case_the_model_comes_from_the_request_body_or_nothing_does(self):
+        """`/v1/messages` carries the model in the JSON body and nowhere else —
+        no header names it — and the body is already materialized whole, so
+        reading it costs one `json.loads`. A subagent's request is shaped like
+        any other; the `x-claude-code-agent-id` header it carries is not what
+        this reads, and must not need to be."""
+        from cswap_pin import proxy as pp
+        body = json.dumps(
+            {"model": "claude-fable-5-1", "max_tokens": 4}).encode()
+        assert pp._requested_model("/v1/messages", body) == "claude-fable-5-1"
+        assert pp._requested_model("/v1/messages?beta=true", body) == \
+            "claude-fable-5-1"
+        # Fail closed on every shape that cannot answer.
+        assert pp._requested_model("/v1/messages", b"not json at all") == ""
+        assert pp._requested_model("/v1/messages", b"{}") == ""
+        assert pp._requested_model("/v1/messages", b'{"model": 7}') == ""
+        assert pp._requested_model("/v1/messages", b"") == ""
+        assert pp._requested_model("/v1/other", body) == ""
+        assert pp._requested_model(None, body) == ""
 
 
 class TestTheEvidenceSurvivesAHandover:
