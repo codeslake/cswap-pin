@@ -3093,6 +3093,98 @@ class TestChainRediscovery:
                 proxy.stop()
             inner.stop()
 
+    def case_a_refusing_chain_answers_503_not_a_direct_dial_on_the_absolute_form_path(
+        self, certdir, monkeypatch
+    ):
+        """The third egress path — `claude remote-control`'s bridge client
+        speaks absolute-form and lands in `_plain_relay` (see its docstring
+        and D4 above). `_connect_upstream` and `_blind_tunnel` both refuse a
+        direct dial when every configured hop is down; `_plain_relay`'s own
+        `dial()` still fell through to `socket.create_connection` at the
+        ORIGIN. On a corporate host that handshake succeeds against the
+        TLS-inspecting inspector, which answers 403 "Access restricted by
+        network policy", and the plain relay relayed that 403 straight to
+        the client — the login wave through an unguarded path.
+        """
+        import socket as socket_module
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+
+        secret = ensure_proxy_secret(certdir)
+        # A configured hop nothing listens on: port 1 refuses instantly, and
+        # `_chain_candidates()` is non-empty — the premise the guard is on.
+        write_upstream_hint(certdir, "http://127.0.0.1:1")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        real_create_connection = socket_module.create_connection
+        dialled = []
+
+        def _create_connection(address, *a, **kw):
+            if address == ("127.0.0.1", 1):
+                # The hop dial itself: real, so the walk exhausts it exactly
+                # as production would and lands on the fall-through under
+                # test.
+                return real_create_connection(address, *a, **kw)
+            dialled.append(address)
+            raise OSError("the direct dial is the thing under test")
+
+        monkeypatch.setattr(
+            pin_proxy.socket, "create_connection", _create_connection
+        )
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+            rediscover_chain=True,
+        )
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+        proxy.start()
+        try:
+            import base64
+
+            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
+
+            def _send():
+                raw = socket_module.socket(
+                    socket_module.AF_INET, socket_module.SOCK_STREAM
+                )
+                raw.settimeout(10)
+                raw.connect(("127.0.0.1", proxy.port))
+                raw.sendall(
+                    b"GET http://example.com/x HTTP/1.1\r\n"
+                    b"Host: example.com\r\n"
+                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                )
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                raw.close()
+                return resp
+
+            resp = _send()
+            assert resp.split(b"\r\n")[0] == b"HTTP/1.1 503 Service Unavailable", (
+                f"a chained host must answer 503, never dial direct on the "
+                f"absolute-form path: {resp[:120]!r}"
+            )
+            assert dialled == [], (
+                f"a host with a configured chain dialled DIRECT: {dialled}"
+            )
+            assert proxy._egress_refused is True, "the refusal was not noted"
+
+            # CONTROL: the opt-in restores the fall-through, same walk, same
+            # target — proves the refusal is what changed, not the relay.
+            monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+            _send()
+            assert dialled == [("example.com", 80)], (
+                f"CONTROL FAILED: the opt-in did not reach the direct dial: "
+                f"{dialled}"
+            )
+        finally:
+            proxy.stop()
+
     def case_the_absolute_form_path_swaps_a_pinned_route_too(
         self, certdir, monkeypatch
     ):

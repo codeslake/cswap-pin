@@ -14914,20 +14914,40 @@ class PinProxy:
         # that is not a downgrade, it is a failure. This is the auto-updater's
         # and telemetry's path.
         def dial(hdrs):
-            """`(socket, head)` for one attempt, or `(None, None)`."""
-            for chain in self._chain_candidates():
+            """`(socket, head)` for one attempt, or `(None, None)`.
+
+            Raises :class:`NoChainHopError` when every hop failed and this
+            host must not fall through to a direct dial — the same rule
+            `_connect_upstream` and `_blind_tunnel` already enforce for the
+            MITM and CONNECT paths.
+            """
+            candidates = self._chain_candidates()
+            for chain in candidates:
                 try:
                     sock = _dial_chain(chain, extra_ca=self._chain_ca())
                 except (OSError, ssl.SSLError):
                     continue
                 # A plain proxy takes the absolute-form line as-is. Our own
                 # credential for the chain rides here, not the client's.
+                self._egress_refused = False
                 return sock, (
                     f"{method} {url} HTTP/1.1\r\n"
                     + "\r\n".join(hdrs)
                     + "\r\n"
                     + chain.connect_headers()
                     + "\r\n"
+                )
+            # EVERY HOP FAILED. A host WITH a chain configured must not fall
+            # through to a direct dial here either — see NoChainHopError
+            # above; this is the same rule, at the third egress path
+            # (`claude remote-control`'s bridge client, and the
+            # auto-updater/telemetry). CSWAP_PIN_ALLOW_DIRECT=1 restores the
+            # old fall-through.
+            if candidates and not _direct_allowed():
+                self._note_egress_refused()
+                raise NoChainHopError(
+                    "no chain hop reachable and direct egress is refused on "
+                    f"this host ({_ALLOW_DIRECT_ENV}=1 allows it)"
                 )
             try:
                 sock = socket.create_connection((host, port), timeout=15)
@@ -14954,7 +14974,22 @@ class PinProxy:
                             (unswapped, False)):
             if hdrs is None:
                 break
-            up, head = dial(hdrs)
+            try:
+                up, head = dial(hdrs)
+            except NoChainHopError:
+                # Nothing has reached the client yet on this path — the
+                # request line and headers were only ever read, never
+                # answered. A retryable 503, not a dropped connection and
+                # never the inspector's 403.
+                try:
+                    conn.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
+                        b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                except OSError:
+                    pass
+                conn.close()
+                return
             if up is None:
                 conn.close()
                 return
@@ -16021,6 +16056,12 @@ class PinProxy:
             up.close()
             up = None
         elif up is not None:
+            # A hop just CARRIED this tunnel. `_egress_refused` is otherwise
+            # cleared only by `_note_egress`, which the MITM path alone
+            # calls — so on tunnel-only traffic a past outage's flag (and
+            # `/health.refused_last`) never resets. Same condition
+            # `_note_egress` uses (direct=False).
+            self._egress_refused = False
             up = carrying  # the peeked byte, pushed back in front of the stream
         if up is None:
             # Every hop failed (down, or refused this host outright). A host
