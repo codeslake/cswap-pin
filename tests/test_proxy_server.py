@@ -389,32 +389,19 @@ class TestPinProxyServer:
             proxy.stop()
             upstream.stop()
 
+    def _bridge_post_with_foreign_verdict(self, certdir, seed_verdict):
+        """Drives a REAL `make_pin_token_provider` through the actual HTTP
+        egress path (`PinProxy` end to end, real upstream TLS) for a pinned
+        `.../bridge` POST, with `seed_verdict(provider, switcher)` making the
+        identity check land on "foreign" before the request fires.
 
-class TestAPinnedBridgePostNeverCarriesAForeignBearer:
-    """A pinned `.../bridge` POST must go out with the CLIENT's own bearer
-    when the token provider's identity check says the pinned slot's
-    credential answers as someone else -- see `_identity_ok`.
-
-    Drives a REAL `make_pin_token_provider` through the actual HTTP egress
-    path (`PinProxy` end to end, real upstream TLS), not the provider in
-    isolation: a provider-level-only test would still pass if a future
-    splice site read the credential store directly instead of calling the
-    provider.
-    """
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
-
-    def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
-            self, certdir, monkeypatch):
+        Not the provider in isolation: a provider-level-only test would still
+        pass if a future splice site read the credential store directly
+        instead of calling the provider.
+        """
         import json as _json
 
         from cswap_pin import proxy as pp
-
-        # The pin's own bearer verifies as someone ELSE's account.
-        monkeypatch.setattr(
-            pp, "pin_profile_for",
-            lambda token: {"emailAddress": "someone-else@example.com"})
 
         live = _json.dumps({"claudeAiOauth": {
             "accessToken": "pin-live-token", "expiresAt": 4102444800000,
@@ -427,7 +414,9 @@ class TestAPinnedBridgePostNeverCarriesAForeignBearer:
             def resolve_account(self, i): return ("2", "pin@example.com", "org")
 
         pp.save_pin(certdir, "pin@example.com", "org")
-        provider = pp.make_pin_token_provider(_Switcher(), "2", "pin@example.com")
+        switcher = _Switcher()
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+        seed_verdict(pp, provider)
 
         upstream = _FakeUpstream(certdir)
         proxy = pp.PinProxy(
@@ -449,13 +438,40 @@ class TestAPinnedBridgePostNeverCarriesAForeignBearer:
             assert upstream.seen_auth == "Bearer client-own-token", (
                 "the foreign-verdict provider's token reached the upstream "
                 f"anyway: {upstream.seen_auth!r}")
-            body = trace.read_text()
-            assert "swapped=False" in body, (
-                f"trace did not record the bridge POST as unswapped: {body!r}")
-            assert "swapped=True" not in body, body
+            # ALSO the pinned-ness, or this goes green on a broken pin the
+            # moment `.../bridge` ever drops off the pinned route table --
+            # `swapped=False` alone cannot tell "correctly refused" from
+            # "never tried".
+            assert "/bridge pinned=True swapped=False" in trace.read_text()
         finally:
             proxy.stop()
             upstream.stop()
+
+    def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
+            self, certdir, monkeypatch):
+        """A foreign verdict from the MINT-time probe (`_identity_ok`, via
+        `pin_profile_for`) must never splice -- see `_identity_ok`'s
+        invariant."""
+        import cswap_pin.proxy as pp
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "someone-else@example.com"})
+        self._bridge_post_with_foreign_verdict(
+            certdir, lambda _pp, _provider: None)
+
+    def case_a_foreign_verdict_from_the_identity_beat_leaves_the_bridge_post_unswapped(
+            self, certdir):
+        """The INCIDENT's own path: the 12h identity beat
+        (`_freshen_pin_identity`) reports a foreign verdict through
+        `provider.note_verdict`, not through a mint-time `pin_profile_for`
+        probe. Both land in the same `_identity_cache` today, but that is an
+        implementation detail one refactor could break -- this case reaches
+        the splice guard the way wmac's incident actually did."""
+        self._bridge_post_with_foreign_verdict(
+            certdir,
+            lambda pp, provider: provider.note_verdict(
+                "pin-live-token", "pin@example.com", "foreign"),
+        )
 
 
 class _StreamingUpstream:
