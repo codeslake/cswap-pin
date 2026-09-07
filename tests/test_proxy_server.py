@@ -390,6 +390,74 @@ class TestPinProxyServer:
             upstream.stop()
 
 
+class TestAPinnedBridgePostNeverCarriesAForeignBearer:
+    """A pinned `.../bridge` POST must go out with the CLIENT's own bearer
+    when the token provider's identity check says the pinned slot's
+    credential answers as someone else -- see `_identity_ok`.
+
+    Drives a REAL `make_pin_token_provider` through the actual HTTP egress
+    path (`PinProxy` end to end, real upstream TLS), not the provider in
+    isolation: a provider-level-only test would still pass if a future
+    splice site read the credential store directly instead of calling the
+    provider.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
+            self, certdir, monkeypatch):
+        import json as _json
+
+        from cswap_pin import proxy as pp
+
+        # The pin's own bearer verifies as someone ELSE's account.
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "someone-else@example.com"})
+
+        live = _json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-live-token", "expiresAt": 4102444800000,
+            "refreshToken": "rt"}})
+
+        class _Switcher:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return live
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(_Switcher(), "2", "pin@example.com")
+
+        upstream = _FakeUpstream(certdir)
+        proxy = pp.PinProxy(
+            certdir=certdir,
+            pin_token_provider=provider,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        trace = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(trace))
+        pp._TRACE_CACHE.clear()
+        proxy.start()
+        try:
+            proxy._trace_tick()  # the only thing that opens the handle
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/SID123/bridge", bearer="client-own-token",
+            )
+            assert status == 200
+            assert upstream.seen_auth == "Bearer client-own-token", (
+                "the foreign-verdict provider's token reached the upstream "
+                f"anyway: {upstream.seen_auth!r}")
+            body = trace.read_text()
+            assert "swapped=False" in body, (
+                f"trace did not record the bridge POST as unswapped: {body!r}")
+            assert "swapped=True" not in body, body
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+
 class _StreamingUpstream:
     """A TLS server that sends response headers + a first SSE event, then
     BLOCKS on ``release`` before sending the second event. Lets a test prove
