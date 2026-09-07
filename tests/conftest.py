@@ -41,6 +41,23 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_profile_never_dials_out(monkeypatch):
+    """No test may reach api.anthropic.com. `make_pin_token_provider`'s
+    mint-time identity check calls `pin_profile_for` on every fresh mint, so
+    any case that mints a real token now makes that call unless it stubs
+    one -- and most do not need to, they are testing something else. Default
+    to the same "could not ask" answer a real network failure produces (the
+    provider's own fail-open, no crash, no wait); a case that DOES want to
+    assert identity behaviour overrides this with its own
+    `monkeypatch.setattr(pin_proxy, "pin_profile_for", ...)`, layered on top
+    and winning for that test.
+    """
+    from cswap_pin import proxy as _p
+
+    monkeypatch.setattr(_p, "pin_profile_for", lambda token: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_daemon_thread_outlives_its_test():
     """A daemon thread that outlives its test runs against the NEXT test.
 
