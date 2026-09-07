@@ -239,6 +239,7 @@ def _redirect_everything_to(tmp_path, monkeypatch):
                  # with its launcher, which is the production failure the
                  # opt-in exists to prevent.
                  "CSWAP_PIN_EXIT_WITH_PARENT",
+                 "CSWAP_PIN_ALLOW_DIRECT",
                  # The standby's hand-down source. Same hazard as the two
                  # LISTEN vars above: a stale value from a shell makes a test
                  # adopt a descriptor that is not the one under test.
