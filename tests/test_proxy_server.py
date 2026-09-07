@@ -12662,8 +12662,12 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         calls = []
         state = {"raised": False}
 
+        # NO `**_`: the fake's signature IS the contract. Swallowing an
+        # unknown kwarg would keep every case green while each real host
+        # raised TypeError into the relay's except and silently stopped
+        # converting any wall at all.
         def _switch(strategy=None, json_output=False, models=None,
-                    current_at_limit=False, **_):
+                    current_at_limit=False):
             calls.append(models)
             if before is not None:
                 before()

@@ -16927,10 +16927,20 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
             # `current_at_limit` already pins to 0.0, and the wall is relayed.
             #
             # It overrides a user's `autoswitch.model`, deliberately (`switch()`
-            # reads that only when `models is None`): `all` is a superset of any
-            # setting's windows, so headroom under it is <= headroom under
-            # theirs and the override can only ever relay MORE walls, never
-            # convert one the setting would have refused.
+            # reads that only when `models is None`), AND THAT IS SAFE ONLY
+            # UNDER A PRECONDITION worth naming rather than assuming. For an
+            # account reporting a 5h or 7d window, `all` folds in a superset of
+            # any setting's windows, so headroom under it is <= headroom under
+            # theirs and this can only relay MORE walls. For an account
+            # reporting ONLY scoped windows — permitted, because
+            # `oauth.py:541-555` writes `five_hour`/`seven_day` conditionally
+            # and the API does send null siblings — the empty basis gives
+            # `account_headroom` None, which `_select_best_switchable` excludes
+            # from `known` as "unknown, never auto-skipped"; `all` gives it a
+            # number instead, so that account can become a switch target where
+            # `no-comparison` would have kept us put. Unobserved on this fleet
+            # (8 store rows, none in that shape) and the fix belongs in
+            # `account_headroom`, which is cswap's, not here.
             #
             # The symbol's other job — being the capability probe for an older
             # claude-swap — survives unchanged: an older `switch()` has no
