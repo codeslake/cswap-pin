@@ -12116,56 +12116,6 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert second.startswith(b"HTTP/1.1 401"), second[:40]
         assert len(calls) == 1, len(calls)
 
-    def case_a_memo_hit_relays_the_429_when_the_active_credential_is_struck(
-        self, monkeypatch, tmp_path,
-    ):
-        """The memo's `True` is a `validated` reading taken once, at the
-        first switch, with no bound on how old it is: a client still
-        holding the old bearer can retry the same wall long after the
-        landing account was quarantined for a refresh failure that touched
-        nothing else here. A memo hit must ask cswap's own offline record
-        before forging another 401 onto a credential it now calls dead."""
-        from cswap_pin import proxy as pp
-
-        class _Switcher:
-            def current_account_number(self):
-                return "2"
-
-            def _slot_token_dead(self, num, email):
-                assert num == "2", num
-                assert email == "b@example.com", email
-                return True
-
-        switcher_mod = type("SW", (), {
-            "ClaudeAccountSwitcher": staticmethod(lambda: _Switcher()),
-            "switch_off_at_limit_account": staticmethod(lambda sw: {
-                "switched": True, "needsLogin": False, "validated": True,
-            }),
-        })()
-        real_require = pp.require
-        cfg = real_require("paths").get_global_config_path()
-        cfg.write_text(json.dumps({"oauthAccount": {"email": "b@example.com"}}),
-                        encoding="utf-8")
-        monkeypatch.setattr(
-            pp, "require",
-            lambda n: switcher_mod if n == "switcher" else real_require(n),
-        )
-        pp._walled_switch_seen.clear()
-        logged = []
-        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
-
-        first = self._relay()
-        assert first.startswith(b"HTTP/1.1 401"), first[:40]
-
-        logged.clear()
-        second = self._relay()
-        assert second.startswith(b"HTTP/1.1 429"), second[:40]
-        assert self.RESET_HEADER in second, second[:80]
-        assert pp._walled_switch_seen[b"9999999999"][0] is True
-        assert any(
-            "relaying the 429 unchanged" in m and "struck" in m for m in logged
-        ), logged
-
     def case_a_debounced_failed_switch_still_relays_the_429(self, monkeypatch):
         """The deque slot is claimed whether or not the switch succeeded —
         it also has to stop a storm of retries on a wall with no headroom

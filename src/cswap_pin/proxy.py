@@ -16468,38 +16468,6 @@ _walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
 _WALLED_SWITCH_RAISE_TTL = 30.0
 
 
-def _walled_credential_is_dead() -> bool:
-    """Is the account cswap has active RIGHT NOW struck dead in its own
-    offline usage record?
-
-    Asked only on a memo hit that still reads ``True`` — a `validated`
-    reading taken once, at the first switch, with no bound on how old it
-    is. A landing account can be quarantined for a refresh failure long
-    after, with nothing else touching this wall again to notice, and a
-    client still holding the old bearer would otherwise get another forged
-    401 onto a credential cswap itself now calls dead.
-
-    No network, no lock beyond the one already held: `_slot_token_dead` is
-    cswap's own offline usage-store read. Missing on the switcher (an older
-    cswap), an unreadable config or any other exception all answer "not
-    known dead" — an older cswap must not turn every debounced repeat into
-    a live probe.
-    """
-    try:
-        switcher = require("switcher")
-        sw = switcher.ClaudeAccountSwitcher()
-        dead = getattr(sw, "_slot_token_dead", None)
-        if dead is None:
-            return False
-        num = sw.current_account_number()
-        cfg = require("paths").get_global_config_path()
-        email = json.loads(cfg.read_text(encoding="utf-8")).get(
-            "oauthAccount", {}).get("email", "")
-        return dead(num, email) is True
-    except Exception:  # noqa: BLE001 — unknown must never read as "dead"
-        return False
-
-
 def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     """Switch cswap off the account that just 429'd, at most once per wall.
 
@@ -16547,14 +16515,6 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
         if reset in _walled_switch_seen:
             ok, retry_at = _walled_switch_seen[reset]
             if retry_at is None or time.monotonic() < retry_at:
-                if ok and _walled_credential_is_dead():
-                    _log_lifecycle(
-                        "429 on /v1/messages — debounced repeat of wall "
-                        f"reset={reset.decode('latin1', 'replace')}, but "
-                        "the active credential is struck, relaying the "
-                        "429 unchanged"
-                    )
-                    return False
                 _log_lifecycle(
                     "429 on /v1/messages — debounced repeat of wall reset="
                     f"{reset.decode('latin1', 'replace')}, relaying "
