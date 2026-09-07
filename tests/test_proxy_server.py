@@ -8612,6 +8612,83 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_worker_register_2xx_is_also_a_registration(self, certdir):
+        """The OTHER mint for an existing session: `POST .../worker/register`.
+
+        `_BRIDGE_REGISTER` only matches the REPL's `/bridge` mint; a
+        takeover through THIS pin can also land as a 2xx on
+        `<worker subtree>/register`, and that is exactly the takeover
+        class this round exists to record. Same f-string, same hook, and
+        it clears the once-per-life guard the way the `/bridge` mint's
+        request-path register branch already does.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._reset_bridge_traffic()
+            srv._stream_lost = {}
+
+            WORKER = "/v1/code/sessions/cse_TAKEOVER/worker/events"
+            REGISTER = "/v1/code/sessions/cse_TAKEOVER/worker/register"
+
+            # A PRIOR LIFE, already 409'd and logged once.
+            srv._note_bridge_traffic(WORKER, now=100.0)
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == 1, lines
+
+            # THE REGISTRATION ITSELF: one line.
+            srv._note_bridge_superseded("POST", REGISTER, b"HTTP/1.1 200 OK")
+            assert len(lines) == 2, (
+                "a 2xx on the worker/register POST left "
+                f"{len(lines)}: {lines!r}")
+            assert "cse_TAKEOVER" in lines[-1], lines[-1]
+            assert "registered" in lines[-1], lines[-1]
+            assert "200" in lines[-1], lines[-1]
+            assert REGISTER in lines[-1], lines[-1]
+
+            # THE GUARD IS CLEARED: a following 409 for the same id logs
+            # again, as this new life's own takeover.
+            srv._note_bridge_traffic(WORKER, now=101.0)
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == 3, (
+                "the register branch did not clear the once-per-life "
+                "guard: " + repr(lines))
+            assert "superseded" in lines[-1], lines[-1]
+
+            # A 2xx ON A NON-REGISTER WORKER PATH is still not a
+            # registration.
+            before = len(lines)
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 200 OK")
+            assert len(lines) == before, (
+                "a 2xx on a non-register worker path logged as a "
+                "registration: " + repr(lines))
+
+            # A 409 ON worker/register IS the losing registration,
+            # unchanged: it is still `_WORKER_SUBTREE`, no new code for it.
+            # A FRESH id, so the once-per-life guard from above cannot
+            # gate this away.
+            OTHER_REGISTER = "/v1/code/sessions/cse_OTHER/worker/register"
+            srv._note_bridge_traffic(OTHER_REGISTER, now=102.0)
+            before = len(lines)
+            srv._note_bridge_superseded(
+                "POST", OTHER_REGISTER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == before + 1, (
+                "a 409 on worker/register did not log as a takeover: "
+                + repr(lines))
+            assert OTHER_REGISTER in lines[-1], lines[-1]
+            assert "superseded" in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_the_carry_is_reachable_without_a_daemon(self, certdir):
         """A switch must be able to carry pointers with no daemon running.
 

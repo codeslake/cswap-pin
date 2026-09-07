@@ -12905,15 +12905,22 @@ class PinProxy:
         Never raises: a statistic must not cost a request.
         """
         try:
-            if (method == "POST" and status_line.startswith(b"HTTP/1.1 2")
-                    and _BRIDGE_REGISTER.search(path)):
-                bid = _BRIDGE_ID.search(path)
-                if bid:
-                    code = status_line[9:12].decode("latin1", "replace")
-                    _log_lifecycle(
-                        f"bridge {bid.group(1)} registered a new worker "
-                        f"— {code} on {method} {path}")
-                return
+            if method == "POST" and status_line.startswith(b"HTTP/1.1 2"):
+                is_bridge_mint = _BRIDGE_REGISTER.search(path)
+                is_worker_register = (
+                    not is_bridge_mint and _WORKER_SUBTREE.search(path)
+                    and path.split("?", 1)[0].endswith("/register"))
+                if is_bridge_mint or is_worker_register:
+                    bid = _BRIDGE_ID.search(path)
+                    if bid:
+                        code = status_line[9:12].decode("latin1", "replace")
+                        _log_lifecycle(
+                            f"bridge {bid.group(1)} registered a new worker "
+                            f"— {code} on {method} {path}")
+                        if is_worker_register:
+                            self._bridge_superseded_logged.discard(
+                                bid.group(1))
+                    return
             if not status_line.startswith(b"HTTP/1.1 409"):
                 return
             if not _WORKER_SUBTREE.search(path) or _EVENT_STREAM.search(path):
