@@ -4563,6 +4563,37 @@ class TestRefreshGoesThroughTheInterprocessGate:
             "backup store under this slot"
         )
 
+    def case_a_successful_refresh_with_no_access_token_still_persists(
+            self, monkeypatch):
+        """B1: `ok = bool(token) and _identity_ok(...)` gated the persist on
+        the access token extracting cleanly. A refresh that SUCCEEDS (no
+        error) but whose rotated blob carries no `accessToken` -- a host
+        quirk, not a foreign bearer -- must still persist the rotation: the
+        one-time refresh token on disk is spent either way, and skipping the
+        write strands the successor generation in `_cred_cache` alone, dead
+        the moment this daemon restarts (invalid_grant, human-only repair)."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+        from claude_swap.oauth import RefreshOutcome
+
+        rotated = json.dumps({"claudeAiOauth": {
+            "expiresAt": 10_000_000_000_000, "refreshToken": "rt-2"}})
+        monkeypatch.setattr(
+            pin_proxy.oauth, "try_refresh_oauth_credentials",
+            lambda _c: RefreshOutcome(rotated, None))
+
+        sw = _FakeSwitcher(active_num="1", backups={"2": self._expired()})
+        assert not hasattr(sw, "consume_backup_grant")
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() is None, "no accessToken means nothing to hand back"
+        assert sw.persisted == [("2", "pin@example.com", rotated)], (
+            "a successful refresh with no accessToken must still persist "
+            "the rotation -- the refresh token it consumed is spent "
+            "either way"
+        )
+
 
 class TestPinStore:
     """The pin lives in settings.json's remoteControl section (identity by

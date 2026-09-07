@@ -5750,16 +5750,23 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             refresh_lock.release()
         # THE PROBE RUNS OUTSIDE THE LOCK: it only needs the token string,
         # and every OTHER pinned thread must not queue behind a network call
-        # this one is making for itself.
-        ok = bool(token) and _identity_ok(token, mail)
+        # this one is making for itself. NO TOKEN AT ALL (a refresh that
+        # succeeded but whose rotated blob carries no `accessToken`) means
+        # there is nothing to probe with, and defaults to "not foreign" --
+        # a missing accessToken is a host quirk, not the store answering as
+        # someone else, and must not gate the persist below.
+        foreign = bool(token) and not _identity_ok(token, mail)
         # NEVER PERSIST A FOREIGN VERDICT'S ROTATION: this fallback path is
         # for a switcher that predates `consume_backup_grant` (the gated one
         # persists internally, above); it must not write a foreign bearer's
         # rotated bytes back under this slot -- would reinforce the exact
-        # corruption this branch exists to stop.
-        if ok and rotated and not hasattr(switcher, "consume_backup_grant"):
+        # corruption this branch exists to stop. GATED ON THE FOREIGN
+        # VERDICT ALONE, not on `bool(token)`: the one-time refresh token is
+        # spent the moment `rotated` exists, whether or not the blob it
+        # produced happens to carry an `accessToken`, and skipping the write
+        if rotated and not foreign and not hasattr(switcher, "consume_backup_grant"):
             switcher.persist_backup_credentials(num, mail, rotated)
-        return token if ok else None
+        return token if (token and not foreign) else None
 
     def pin_is_noop() -> bool:
         """True when returning no token is the CORRECT answer, not a failure.
@@ -14821,24 +14828,29 @@ class PinProxy:
         """
         if getattr(self, "_warned_unpinnable", False):
             return
+        # A FOREIGN VERDICT NEVER REACHES THE LATCH, checked HERE rather than
+        # only at the call site -- a second caller added later that skips a
+        # guard it never knew to duplicate would otherwise consume this
+        # once-per-daemon budget on a declined splice, silencing the warning
+        # (and the record) for a LATER, genuinely unreadable store on the
+        # same daemon (I2). The advice below — "re-run `cswap pin` from a
+        # normal terminal" — is also wrong for this case, so nothing here
+        # fires for it: not the latch, not `mark_daemon_unpinnable`, not the
+        # stderr line.
+        if getattr(getattr(getattr(self, "_pin_token_provider", None),
+                            "_tls", None), "foreign", False):
+            return
         self._warned_unpinnable = True
-        # RECORD IT, do not only say it -- EXCEPT for a foreign bearer. The
-        # advice this prints — "re-run `cswap pin` from a normal terminal" —
-        # cannot work on its own: ensure_proxy reuses any daemon whose
-        # fingerprint matches, so the re-run finds this same blind daemon
-        # and returns it. Written to the state file so the NEXT ensure_proxy
-        # can see what only this process could learn, and recycle instead of
-        # reusing. But `_read_alive_port` refuses ANY daemon carrying this
-        # mark outright (`st.get("unpinnable")`), independent of `can_pin` --
-        # the same recycle-on-a-symptom-a-respawn-cannot-fix hazard `can_pin`
-        # itself had to avoid for a foreign bearer. The stderr line below
-        # still prints either way; only the mark is conditional.
-        if not getattr(getattr(getattr(self, "_pin_token_provider", None),
-                                "_tls", None), "foreign", False):
-            try:
-                mark_daemon_unpinnable(self._certdir)
-            except Exception:  # noqa: BLE001 — advisory; never break a request
-                pass
+        # RECORD IT, do not only say it. Written to the state file so the
+        # NEXT ensure_proxy can see what only this process could learn, and
+        # recycle instead of reusing (`ensure_proxy` reuses any daemon whose
+        # fingerprint matches). `_read_alive_port` refuses ANY daemon
+        # carrying this mark outright (`st.get("unpinnable")`), independent
+        # of `can_pin`.
+        try:
+            mark_daemon_unpinnable(self._certdir)
+        except Exception:  # noqa: BLE001 — advisory; never break a request
+            pass
         # THE HOLDER IS NOT RETIRED HERE, and the reason is measured. Doing
         # that manufactures the orphan condition on the very next tick, and the
         # orphan branch of the code watchdog has no backoff -- so a machine
@@ -15456,9 +15468,7 @@ class PinProxy:
                 # the active one there is nothing to swap, and warning then
                 # trains the reader to disbelieve the warning (see
                 # ``pin_is_noop``).
-                if not _pin_is_noop(self._pin_token_provider) and not getattr(
-                        getattr(self._pin_token_provider, "_tls", None),
-                        "foreign", False):
+                if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
         # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
         # inside `_forward`'s status hook, and it takes no arguments from
