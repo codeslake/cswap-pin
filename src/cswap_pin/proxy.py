@@ -12355,9 +12355,6 @@ class PinProxy:
                 # not a worker post, and `deaf_bridges` must still judge
                 # this id only once it has actually posted.
                 self._bridge_first_post[bid.group(1)] = stamp
-                # A NEW LIFE: a takeover this id suffered before is not
-                # this one's, so it is due its own line if it is 409'd too.
-                self._bridge_superseded_logged.discard(bid.group(1))
                 return
             if _EVENT_STREAM.search(path):
                 if conn is not None:
@@ -12917,9 +12914,11 @@ class PinProxy:
                         _log_lifecycle(
                             f"bridge {bid.group(1)} registered a new worker "
                             f"— {code} on {method} {path}")
-                        if is_worker_register:
-                            self._bridge_superseded_logged.discard(
-                                bid.group(1))
+                        # A NEW LIFE, on the CONFIRMED outcome: a mint that
+                        # never got a 2xx never became a registration, so a
+                        # failed-mint + worker-409 retry loop must not clear
+                        # the guard on every retry.
+                        self._bridge_superseded_logged.discard(bid.group(1))
                     return
             if not status_line.startswith(b"HTTP/1.1 409"):
                 return

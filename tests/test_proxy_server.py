@@ -8535,12 +8535,15 @@ class TestDrainReportsWhatItCut:
 
         # AND SOMETHING MUST WIRE IT: `_forward`'s `on_status` is the only
         # site that sees the worker POST's path and its response status
-        # together.
+        # together. The exact call-site text, not just the name, so a
+        # `(path, method, st)` argument swap goes red instead of passing a
+        # grep that only checks the callee is mentioned somewhere.
         import inspect
         wired = inspect.getsource(pp.PinProxy._forward)
-        assert "_note_bridge_superseded" in wired, (
-            "nothing calls the notifier, so a superseded bridge is still "
-            "reported deaf until the window or a sweep clears it")
+        assert "self._note_bridge_superseded(method, path, st)" in wired, (
+            "nothing calls the notifier with (method, path, st), in that "
+            "order, so a superseded bridge is still reported deaf until "
+            "the window or a sweep clears it")
 
     def case_a_superseded_bridges_409_leaves_one_durable_line(self, certdir):
         """The takeover 409 is the only record of it anywhere in the fleet.
@@ -8589,22 +8592,44 @@ class TestDrainReportsWhatItCut:
             assert len(lines) == 1, (
                 "a second 409 for the same bridge logged again: " + repr(lines))
 
-            # A RE-REGISTRATION is a new life: the daemon assigns the
-            # session id to another worker, which then also gets 409'd, and
-            # that IS a second takeover worth its own line.
-            srv._note_bridge_traffic(
-                "/v1/code/sessions/cse_SUPERSEDED/bridge", now=102.0)
-            srv._note_bridge_traffic(WORKER, now=102.5)
-            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
-            assert len(lines) == 2, (
-                "a 409 after a re-registration of the same id is a new "
-                "life and must log again: " + repr(lines))
+            REGISTER = "/v1/code/sessions/cse_SUPERSEDED/bridge"
 
-            # A 409 ON A NON-WORKER PATH is not this bridge's takeover.
-            srv._note_bridge_traffic(WORKER, now=101.0)
+            # A FAILED MINT must not start a new life: the guard clears
+            # only on a CONFIRMED registration (a 2xx on the register
+            # path), not on the bare request -- a mint-fail + worker-409
+            # retry loop must not log once per retry either.
+            srv._note_bridge_superseded(
+                "POST", REGISTER, b"HTTP/1.1 500 Internal Server Error")
+            before = len(lines)
+            srv._note_bridge_traffic(WORKER, now=101.7)
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == before, (
+                "a failed mint (non-2xx) started a new life: " + repr(lines))
+
+            # A RE-REGISTRATION is a new life ONLY once CONFIRMED (a 2xx
+            # on the register path): the daemon assigns the session id to
+            # another worker, which then also gets 409'd, and that IS a
+            # second takeover worth its own line.
             before = len(lines)
             srv._note_bridge_superseded(
-                "PUT", "/v1/code/sessions/cse_SUPERSEDED/rename",
+                "POST", REGISTER, b"HTTP/1.1 201 Created")
+            assert len(lines) == before + 1, (
+                "a 2xx re-registration did not leave its own line: "
+                + repr(lines))
+            srv._note_bridge_traffic(WORKER, now=102.5)
+            srv._note_bridge_superseded("POST", WORKER, b"HTTP/1.1 409 Conflict")
+            assert len(lines) == before + 2, (
+                "a 409 after a CONFIRMED re-registration of the same id "
+                "is a new life and must log again: " + repr(lines))
+
+            # A 409 ON A NON-WORKER PATH is not this bridge's takeover.
+            # A FRESH id: `cse_SUPERSEDED` is already in
+            # `_bridge_superseded_logged` by this point, so reusing it would
+            # pass even with the `_WORKER_SUBTREE`/`_EVENT_STREAM` guard
+            # deleted -- the once-per-life gate alone would still block it.
+            before = len(lines)
+            srv._note_bridge_superseded(
+                "PUT", "/v1/code/sessions/cse_RENAMEONLY/rename",
                 b"HTTP/1.1 409 Conflict")
             assert len(lines) == before, (
                 "a 409 on a non-worker route logged as a takeover: "
