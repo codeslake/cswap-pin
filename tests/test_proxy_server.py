@@ -11990,13 +11990,43 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     def case_a_raising_switch_releases_the_slot_for_a_retry(self, monkeypatch):
         """A transient failure (this daemon's own config lock held
         elsewhere, or an older claude-swap with no such symbol) must not
-        burn the wall's only attempt forever."""
+        burn the wall's only attempt forever — once its short memo expiry
+        has passed."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
         calls = self._wire(monkeypatch, switched=True, raises_once=OSError("locked"))
         first = self._relay()
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 401"), second[:40]
         assert len(calls) == 2, len(calls)
+
+    def case_a_raise_is_remembered_briefly_so_a_storm_does_not_serialize(
+        self, monkeypatch,
+    ):
+        """The raise path used to record nothing, so a storm on one wall
+        serialized N real `switch()` calls — each blocking the lock for the
+        full config-lock timeout — instead of one. A raise must debounce
+        like any other outcome, for its own short expiry."""
+        from cswap_pin import proxy as pp
+
+        calls = []
+
+        def _switch_off(sw):
+            calls.append(sw)
+            raise OSError("locked")
+
+        fake_module = type("M", (), {
+            "ClaudeAccountSwitcher": staticmethod(lambda: None),
+            "switch_off_at_limit_account": staticmethod(_switch_off),
+        })()
+        monkeypatch.setattr(pp, "require", lambda n: fake_module)
+        pp._walled_switch_seen.clear()
+
+        for _ in range(10):
+            got = self._relay()
+            assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
 
     def case_needs_login_is_not_a_usable_switch(self, monkeypatch):
         """switched=True with needsLogin=True means the credential is gone,
@@ -12085,6 +12115,56 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 401"), second[:40]
         assert len(calls) == 1, len(calls)
+
+    def case_a_memo_hit_relays_the_429_when_the_active_credential_is_struck(
+        self, monkeypatch, tmp_path,
+    ):
+        """The memo's `True` is a `validated` reading taken once, at the
+        first switch, with no bound on how old it is: a client still
+        holding the old bearer can retry the same wall long after the
+        landing account was quarantined for a refresh failure that touched
+        nothing else here. A memo hit must ask cswap's own offline record
+        before forging another 401 onto a credential it now calls dead."""
+        from cswap_pin import proxy as pp
+
+        class _Switcher:
+            def current_account_number(self):
+                return "2"
+
+            def _slot_token_dead(self, num, email):
+                assert num == "2", num
+                assert email == "b@example.com", email
+                return True
+
+        switcher_mod = type("SW", (), {
+            "ClaudeAccountSwitcher": staticmethod(lambda: _Switcher()),
+            "switch_off_at_limit_account": staticmethod(lambda sw: {
+                "switched": True, "needsLogin": False, "validated": True,
+            }),
+        })()
+        real_require = pp.require
+        cfg = real_require("paths").get_global_config_path()
+        cfg.write_text(json.dumps({"oauthAccount": {"email": "b@example.com"}}),
+                        encoding="utf-8")
+        monkeypatch.setattr(
+            pp, "require",
+            lambda n: switcher_mod if n == "switcher" else real_require(n),
+        )
+        pp._walled_switch_seen.clear()
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+
+        first = self._relay()
+        assert first.startswith(b"HTTP/1.1 401"), first[:40]
+
+        logged.clear()
+        second = self._relay()
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert self.RESET_HEADER in second, second[:80]
+        assert pp._walled_switch_seen[b"9999999999"][0] is True
+        assert any(
+            "relaying the 429 unchanged" in m and "struck" in m for m in logged
+        ), logged
 
     def case_a_debounced_failed_switch_still_relays_the_429(self, monkeypatch):
         """The deque slot is claimed whether or not the switch succeeded —
@@ -12188,6 +12268,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         # t2 has had time to reach the debounce check (or run past it, on
         # the broken shape) while switch() is still blocked on `release`.
         time.sleep(0.2)
+        # On the broken shape (lock released before `switch()` returns) t2
+        # has already written its 429 by now, before switch() ever settles.
+        assert "b" not in results, results
         release.set()
         t1.join(timeout=5)
         t2.join(timeout=5)

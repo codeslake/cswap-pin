@@ -16451,11 +16451,53 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
 
 
 _walled_switch_lock = threading.Lock()
-# reset -> ok. Insertion-ordered, capped at 8 (this many walls in flight is
-# already unusual); a straggler request from a wall we already left (A ->
-# switched to B -> B also walled -> switched to C) must not re-trigger on
-# A's now-stale value, so the oldest entry is dropped once the cap is hit.
-_walled_switch_seen: dict[bytes, bool] = {}
+# reset -> (ok, retry_at). Insertion-ordered, capped at 8 — a bounded memo,
+# not a bound on how many walls can be in flight: once the cap is hit the
+# OLDEST entry is dropped, so a straggler request from a wall we already
+# left (A -> switched to B -> B also walled -> switched to C) can re-run the
+# switch once, the pre-existing behaviour. `retry_at` is None for a settled
+# switch (never re-tried) and a monotonic deadline for a raise (retried
+# after `_WALLED_SWITCH_RAISE_TTL`, so a raise still debounces a storm
+# instead of recording nothing).
+_walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
+
+# ~ the cross-process lock timeouts this daemon and cswap itself use: long
+# enough that a storm on one wall does not re-attempt for every repeat,
+# short enough that a genuinely transient failure (the config lock held by
+# an install or a TUI swap) gets a fresh attempt well inside the wall.
+_WALLED_SWITCH_RAISE_TTL = 30.0
+
+
+def _walled_credential_is_dead() -> bool:
+    """Is the account cswap has active RIGHT NOW struck dead in its own
+    offline usage record?
+
+    Asked only on a memo hit that still reads ``True`` — a `validated`
+    reading taken once, at the first switch, with no bound on how old it
+    is. A landing account can be quarantined for a refresh failure long
+    after, with nothing else touching this wall again to notice, and a
+    client still holding the old bearer would otherwise get another forged
+    401 onto a credential cswap itself now calls dead.
+
+    No network, no lock beyond the one already held: `_slot_token_dead` is
+    cswap's own offline usage-store read. Missing on the switcher (an older
+    cswap), an unreadable config or any other exception all answer "not
+    known dead" — an older cswap must not turn every debounced repeat into
+    a live probe.
+    """
+    try:
+        switcher = require("switcher")
+        sw = switcher.ClaudeAccountSwitcher()
+        dead = getattr(sw, "_slot_token_dead", None)
+        if dead is None:
+            return False
+        num = sw.current_account_number()
+        cfg = require("paths").get_global_config_path()
+        email = json.loads(cfg.read_text(encoding="utf-8")).get(
+            "oauthAccount", {}).get("email", "")
+        return dead(num, email) is True
+    except Exception:  # noqa: BLE001 — unknown must never read as "dead"
+        return False
 
 
 def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
@@ -16487,9 +16529,11 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     same stale bearer all block here and then read the single settled
     answer, instead of each taking three cross-process locks and a usage
     fetch, or re-walling the account `switch()` just moved onto. A raise
-    records nothing, so a transient failure (this daemon's own
+    records `False` for `_WALLED_SWITCH_RAISE_TTL` — not nothing, and not
+    forever — so a transient failure (this daemon's own
     `claude_config_lock` held elsewhere, or an older claude-swap with no
-    such symbol) does not burn the wall's only attempt forever.
+    such symbol) still debounces a storm, and a fresh attempt is due well
+    inside the wall rather than never.
     """
     if not reset:
         _log_lifecycle(
@@ -16501,13 +16545,23 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
         return False
     with _walled_switch_lock:
         if reset in _walled_switch_seen:
-            ok = _walled_switch_seen[reset]
-            _log_lifecycle(
-                "429 on /v1/messages — debounced repeat of wall reset="
-                f"{reset.decode('latin1', 'replace')}, relaying "
-                f"{'a 401' if ok else 'the 429 unchanged'}"
-            )
-            return ok
+            ok, retry_at = _walled_switch_seen[reset]
+            if retry_at is None or time.monotonic() < retry_at:
+                if ok and _walled_credential_is_dead():
+                    _log_lifecycle(
+                        "429 on /v1/messages — debounced repeat of wall "
+                        f"reset={reset.decode('latin1', 'replace')}, but "
+                        "the active credential is struck, relaying the "
+                        "429 unchanged"
+                    )
+                    return False
+                _log_lifecycle(
+                    "429 on /v1/messages — debounced repeat of wall reset="
+                    f"{reset.decode('latin1', 'replace')}, relaying "
+                    f"{'a 401' if ok else 'the 429 unchanged'}"
+                )
+                return ok
+            # The raise's short expiry passed: treat this wall as unseen.
         try:
             switcher = require("switcher")
             result = switcher.switch_off_at_limit_account(
@@ -16518,6 +16572,11 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
                 f"429 on /v1/messages — switch_off_at_limit_account raised "
                 f"{exc.__class__.__name__}, relaying the 429 unchanged"
             )
+            _walled_switch_seen[reset] = (
+                False, time.monotonic() + _WALLED_SWITCH_RAISE_TTL
+            )
+            if len(_walled_switch_seen) > 8:
+                del _walled_switch_seen[next(iter(_walled_switch_seen))]
             return False
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
@@ -16538,7 +16597,7 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
                 f"{result.get('needsLogin') if result else None}, relaying "
                 f"the 429 unchanged"
             )
-        _walled_switch_seen[reset] = ok
+        _walled_switch_seen[reset] = (ok, None)
         if len(_walled_switch_seen) > 8:
             del _walled_switch_seen[next(iter(_walled_switch_seen))]
         return ok
