@@ -5535,9 +5535,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         beat only ever has uuids. Either half absent reads as null."""
         return {"email": email, "uuid": uuid}
 
-    def _set_identity(mismatch: "dict | None") -> None:
+    def _set_identity(mismatch: "dict | bool | None") -> None:
         """The one place a transition logs -- shared with
-        `_freshen_pin_identity` via `note_verdict`."""
+        `_freshen_pin_identity` via `note_verdict`. `False` is an EVALUATED
+        clean verdict; `None` is "never evaluated" -- a reader (`/health`,
+        the RC gate) that cannot tell them apart cannot tell a live clean
+        pin from one that has not minted yet."""
         was = provider.identity_mismatch
         provider.identity_mismatch = mismatch
         if bool(mismatch) == bool(was):
@@ -5599,7 +5602,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 f"the pin ({mail})")
             return False
         if verdict == "ok":
-            _set_identity(None)
+            _set_identity(False)
         return True
 
     def _note_verdict(token: "str | None", verdict: str,
@@ -5619,7 +5622,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         if verdict == "foreign":
             _set_identity({"pinned": _ref(mail), "bearer": bearer_ref})
         elif verdict == "ok":
-            _set_identity(None)
+            _set_identity(False)
 
     def provider() -> str | None:
         _deferred.discard(1)
@@ -5895,12 +5898,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
     provider._lock_acquired_at = None
-    # None: the last verified mint answered as the pin. A dict
-    # ({"pinned": ..., "bearer": ...}) while it does not -- set by
-    # `_identity_ok` above and, at its 12h beat, by `_freshen_pin_identity`
-    # via `note_verdict`. /health and the transition log ONLY -- never a
-    # gate; see `_identity_ok`'s docstring for `_foreign_this_call`, which
-    # is that gate.
+    # None: never evaluated yet (no mint, no beat). False: the last
+    # verified mint answered as the pin. A dict ({"pinned": ...,
+    # "bearer": ...}) while it does not -- False and the dict are both set
+    # by `_identity_ok` above and, at its 12h beat, by
+    # `_freshen_pin_identity` via `note_verdict`; None is the state ONLY
+    # before either has ever run. /health and the transition log ONLY --
+    # never a gate; see `_identity_ok`'s docstring for `_foreign_this_call`,
+    # which is that gate.
     provider.identity_mismatch = None
     provider._tls = threading.local()
     provider.note_verdict = _note_verdict
