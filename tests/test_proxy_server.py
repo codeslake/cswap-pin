@@ -4486,6 +4486,53 @@ class TestHealthEndpoint:
         finally:
             proxy.stop()
 
+    def case_health_names_its_own_pid_not_the_holders(self, certdir):
+        """`pid` is THIS process's own os.getpid(), the one number
+        comparable against proxy.json's `pid` (the daemon's own, self-
+        written at start) -- `holder_pid` above answers a different
+        question and stays constant across every generation one
+        long-lived holder spawns in turn, so it cannot say whether THIS
+        answer came from the generation proxy.json currently calls live."""
+        import json as _json
+        import os as _os
+
+        from cswap_pin.proxy import PinProxy
+
+        def _payload(proxy):
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            try:
+                raw.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                raw.settimeout(5)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                body = resp.split(b"\r\n\r\n", 1)[1]
+                try:
+                    body += raw.recv(4096)
+                except OSError:
+                    pass
+            finally:
+                raw.close()
+            return _json.loads(body.decode() or "{}")
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+        )
+        proxy.start()
+        try:
+            got = _payload(proxy)["pid"]
+        finally:
+            proxy.stop()
+        assert got == _os.getpid(), (
+            f"/health named pid {got!r}, expected this process's own "
+            f"{_os.getpid()}"
+        )
+
     def case_a_hop_that_self_heals_leaves_a_record(self, certdir):
         """A fall-through to a LATER hop, in a tense a later probe can read.
 

@@ -15132,6 +15132,15 @@ class PinProxy:
              "version": _own_version(),
              "can_pin": can_pin, "pin_identity_mismatch": pin_identity_mismatch,
              "egress": egress,
+             # THE RESPONDING PROCESS'S OWN PID -- comparable against
+             # proxy.json's `pid` (`holder_pid` above is NOT this: it is the
+             # supervisor's pid, constant across every generation one
+             # PortHolder spawns in turn). Four generations can share one
+             # accept queue on the same port; this is the one field that
+             # tells a caller whether THIS answer came from the generation
+             # proxy.json currently calls live, or from an older one still
+             # draining on the same socket.
+             "pid": os.getpid(),
              "holder_pid": holder_pid,
              "direct_last": _iso_utc(self._egress_direct_last),
              "refused_last": _iso_utc(self._egress_refused_last),
