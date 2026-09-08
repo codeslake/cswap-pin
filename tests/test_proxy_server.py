@@ -3631,6 +3631,11 @@ class TestChainRediscovery:
         route for the whole length of a stall, where today's deliberate
         design is a single unpinned relay ("ONE REQUEST IS WORTH A RETRY,
         and only one") — this pins that scope."""
+        from cswap_pin.proxy import is_pinned_route
+
+        assert is_pinned_route("/v1/environments/env_1/bridge/reconnect"), (
+            "this route is no longer pinned — the case would pass green "
+            "while testing nothing, the same shape as a non-create route")
         provider = self._blind_provider(stalled=True)
         got, seen = self._post_bridge_create(
             certdir, provider, path="/v1/environments/env_1/bridge/reconnect")
