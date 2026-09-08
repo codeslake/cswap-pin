@@ -15203,7 +15203,7 @@ class PinProxy:
                 # `refresh_lock` -- on a thread-per-connection server with no
                 # cap, and now repeated every respawn once a blind mint 503s
                 # the bridge worker into backing off and retrying.
-                if token is None and getattr(
+                if token is None and should_wait_for_pin(method, rel) and getattr(
                         self._pin_token_provider, "mint_stalled", None
                 ) and self._pin_token_provider.mint_stalled():
                     self._refuse_stalled_mint(conn, method, rel, close=True)

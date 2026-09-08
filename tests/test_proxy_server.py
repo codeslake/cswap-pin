@@ -3480,17 +3480,28 @@ class TestChainRediscovery:
         provider.blind_reason = blind_reason
         provider.can_pin_cached = lambda: False
         provider.mint_stalled = lambda: stalled
+        # THE REST OF THE PRODUCER'S REAL ROW SHAPE, present on every daemon
+        # provider (`make_pin_token_provider`) — `_mint_lock_busy` reads
+        # `refresh_lock` and answers None (not "busy") without it, and
+        # `can_pin_cached` reads `identity_mismatch`. A fixture missing one
+        # of these is how a negative here has already gone non-vacuous by
+        # accident twice this round.
+        provider.refresh_lock = threading.Lock()
+        provider.identity_mismatch = None
+        provider.note_verdict = lambda *a, **k: None
         if noop_after_calls is not None:
             provider.pin_is_noop = lambda: provider.calls >= noop_after_calls
         else:
             provider.pin_is_noop = lambda: noop
         return provider
 
-    def _post_bridge_create(self, certdir, provider):
-        """POST an absolute-form bridge create through `_plain_relay` and
-        return `(status_line, chain.seen)`. The one shape all three relay
-        cases below need — chain, secret, proxy, socket, read the status
-        line — differing only in the provider they hand the daemon."""
+    def _post_bridge_create(self, certdir, provider,
+                             path="/v1/environments/bridge"):
+        """POST an absolute-form request through `_plain_relay` and return
+        `(status_line, chain.seen)`. The one shape the relay cases below
+        need — chain, secret, proxy, socket, read the status line —
+        differing only in the provider they hand the daemon and, for the
+        scope-of-the-guard case, the path."""
         from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
         import base64
 
@@ -3508,9 +3519,9 @@ class TestChainRediscovery:
             got = b""
             try:
                 c.sendall(
-                    b"POST https://api.anthropic.com/v1/environments/bridge"
-                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-                    b"Authorization: Bearer ACTIVE\r\n"
+                    f"POST https://api.anthropic.com{path}"
+                    " HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    "Authorization: Bearer ACTIVE\r\n".encode()
                     + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
                 c.settimeout(10)
                 while b"\r\n\r\n" not in got:
@@ -3607,6 +3618,27 @@ class TestChainRediscovery:
         assert provider.calls <= 2, (
             f"{provider.calls} provider() call(s) — the retry loop ran "
             "instead of the fast pre-check refusing immediately")
+
+    def case_a_stalled_mint_does_not_refuse_a_pinned_non_create_route(
+        self, certdir
+    ):
+        """The pre-check is scoped to `should_wait_for_pin`, not merely to
+        `is_pinned_route` — `/v1/environments/env_1/bridge/reconnect` is
+        pinned (its ownership swap matters) but is NOT a create
+        (`should_wait_for_pin` is False for it), so it never entered the
+        retry loop the pre-check exists to shortcut and buys nothing there.
+        Gating on `is_pinned_route` alone would 503 + close every such
+        route for the whole length of a stall, where today's deliberate
+        design is a single unpinned relay ("ONE REQUEST IS WORTH A RETRY,
+        and only one") — this pins that scope."""
+        provider = self._blind_provider(stalled=True)
+        got, seen = self._post_bridge_create(
+            certdir, provider, path="/v1/environments/env_1/bridge/reconnect")
+        assert got.startswith(b"HTTP/1.1 200"), (
+            f"a stalled mint refused a non-create pinned route: {got[:60]!r}")
+        assert any(b"Bearer ACTIVE" in s for s in seen), (
+            f"the non-create route did not take its usual unpinned relay: "
+            f"{seen!r}")
 
     def case_a_blind_mint_refuses_the_bridge_create_on_the_mitm_path_too(
         self, certdir
