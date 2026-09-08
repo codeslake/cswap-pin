@@ -5655,17 +5655,37 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # something that cannot have happened yet, and the first cut of this
         # cache had a 5s one for exactly that non-reason.
         #
-        # NEVER INVALIDATED BY A VERDICT EITHER: a foreign or unknown token
-        # stays exactly as cached as an ok one -- the store is still read
-        # once per rotation, not once per probe-backoff-window, and every
-        # access (this fast path AND the cold path below) re-asks
-        # `_identity_ok`, which is what actually decides whether to splice.
+        # NOT INVALIDATED BY AN "unknown" VERDICT, OR BY STALENESS ALONE:
+        # an unknown or same-identity-but-stale token stays exactly as
+        # cached -- the store is still read once per rotation, not once per
+        # probe-backoff-window, and every access (this fast path AND the
+        # cold path below) re-asks `_identity_ok`, which is what actually
+        # decides whether to splice.
+        #
+        # A CONFIRMED FOREIGN VERDICT IS DIFFERENT: those cached bytes are
+        # PROVEN wrong, not merely stale, so re-serving them buys nothing --
+        # and a `/login` into this same slot (same `(num, mail)` key) can
+        # land a correctly-identified replacement that this cache would
+        # otherwise hide forever, because `_live_token` alone never asks
+        # whether the disk changed. Evicting bounds the blind window to one
+        # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
+        evict_foreign = False
         if cached is not None:
             provider.blind_reason = ""
             token = _live_token(cached)
             if token:
-                return token if _identity_ok(token, mail) else None
+                if _identity_ok(token, mail):
+                    return token
+                # CONFIRMED FOREIGN: fall through to a re-read under
+                # `refresh_lock` instead of returning here with the entry
+                # popped -- an empty `_cred_cache` reads as `can_pin: False`
+                # to both `_read_alive_port` and the self-heal watchdog,
+                # which recycle a live daemon that a fresh process would
+                # find just as cross-wired. `creds = cached` (not None)
+                # below so a re-read that comes back empty restores this
+                # SAME blob instead of leaving the cache empty.
+                evict_foreign = True
             creds = cached
         else:
             # COLD -- the very first read for this key, which is EVERY key on
@@ -5707,6 +5727,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             # hand back the already-consumed one-time refresh token for a
             # second, doomed refresh.
             fresh = _cred_cache.get(ckey)
+            # THE EVICTION, AS A BYPASS RATHER THAN A REMOVAL: ignore the
+            # entry this call judged foreign so the read below runs, but
+            # never take it OUT -- an empty `_cred_cache` reads as
+            # `can_pin: False`, and a read that RAISES would leave it that
+            # way for good. `fresh is cached` is the same race guard the
+            # branch below uses: a racer's replacement is not ours to discard.
+            if evict_foreign and fresh is cached:
+                fresh = None
             token = _live_token(fresh) if fresh is not None else None
             if token:
                 provider.blind_reason = ""
@@ -5849,11 +5877,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         if pin_is_noop():
             return True
         # A FOREIGN VERDICT NEEDS NO SPECIAL CASE HERE: `_cred_cache` is
-        # never invalidated by a verdict (see `provider`), so a declined
-        # token is still the one this reads -- a daemon that CAN mint
-        # (just declines to splice) correctly answers true, without
-        # consulting the sticky `identity_mismatch` dict (see `_identity_ok`
-        # for why that dict must never gate this).
+        # never REMOVED by a verdict (see `provider`'s bypass), so this
+        # never reads an empty cache -- though a foreign verdict does make
+        # the NEXT call replace the entry, so a declined token is not
+        # necessarily still the one this reads. Either way a daemon that
+        # CAN mint (just declines to splice) correctly answers true,
+        # without consulting the sticky `identity_mismatch` dict (see
+        # `_identity_ok` for why that dict must never gate this).
         target = _current_target()
         if target is None:
             return True
