@@ -4395,19 +4395,20 @@ class TestMakePinTokenProvider:
             release.set()
             t2.join(timeout=5)
 
-    def case_a_confirmed_foreign_verdict_evicts_so_a_repair_is_seen(
+    def case_a_confirmed_foreign_verdict_bypasses_the_cache_so_a_repair_is_seen(
             self, monkeypatch):
         """A `/login` into the same slot writes a NEW identity's credential
         under the same `(num, mail)` key `_cred_cache` is keyed on -- the key
         does not move. Once a token has been CONFIRMED foreign (not merely
         unknown), re-serving it from the fast path forever means the daemon
         stays blind even after the store holds a perfectly good, correctly-
-        identified replacement. The fix: a confirmed-foreign verdict falls
-        through to a re-read under `refresh_lock`, REPLACING the cache entry
-        -- never emptying it, because `can_pin_cached()` must keep answering
-        True or a cross-wired daemon reads `can_pin: False` and gets
-        recycled by `_read_alive_port`/the self-heal watchdog, which a fresh
-        process cannot repair either."""
+        identified replacement. The fix: a confirmed-foreign verdict BYPASSES
+        (never pops) the cache entry and falls through to a re-read under
+        `refresh_lock`, which REPLACES it -- the entry is never taken out,
+        because `can_pin_cached()` must keep answering True or a cross-wired
+        daemon reads `can_pin: False` and gets recycled by
+        `_read_alive_port`/the self-heal watchdog, which a fresh process
+        cannot repair either."""
         import json
 
         from cswap_pin import proxy as pin_proxy
@@ -4432,12 +4433,12 @@ class TestMakePinTokenProvider:
         assert provider() is None, "a confirmed-foreign bearer must not splice"
 
         # One more call, store still unrepaired: the fast path re-confirms
-        # the SAME mismatch and falls through to a re-read under
-        # `refresh_lock` -- this is the eviction itself, and the cache must
-        # come out of it REPLACED, not empty.
+        # the SAME mismatch and bypasses (never pops) the cache entry,
+        # falling through to a re-read under `refresh_lock` -- and the
+        # cache must come out of it REPLACED, never empty.
         assert provider() is None, "still foreign, still declining to splice"
         assert provider.can_pin_cached() is True, (
-            "the eviction left `_cred_cache` empty -- `/health`'s "
+            "the bypass left `_cred_cache` empty -- `/health`'s "
             "`can_pin` reads that as false, and both `_read_alive_port` "
             "and the self-heal watchdog recycle a live daemon on it, even "
             "though a fresh process would read the exact same cross-wired "
@@ -10794,6 +10795,132 @@ class TestPinTokenRefreshIsSerialized:
             "re-spent the winner's already-consumed one-time refresh token"
         )
         assert t1_result == [None] and t2_result == [None]
+
+    def case_a_racing_repair_is_not_discarded_by_the_bypass(
+            self, tmp_path, monkeypatch):
+        """The eviction-as-bypass guard (`fresh is cached`, `provider()`'s
+        fast path) must not fire on a racer's OWN rotation. Same race
+        window as `case_a_queued_reader_reuses_the_winners_rotation`, with
+        ONE addition: `_cred_cache` is first SEEDED with a live, confirmed-
+        foreign blob (distinct from the store's `expired`) so BOTH t1 and
+        t2 enter the critical section with `evict_foreign=True` -- t1 wins
+        the lock, bypasses the seed, refreshes and writes its rotation;
+        t2, queued behind it, must recognise that rotation as `fresh`
+        (object identity says it is not the SAME `cached` blob t2 itself
+        judged foreign) and reuse it, not bypass it a second time and
+        re-spend t1's already-consumed refresh token."""
+        import json
+        import threading
+        import time
+
+        from cswap_pin.proxy import make_pin_token_provider, save_pin
+
+        foreign_seed = json.dumps({"claudeAiOauth": {
+            "accessToken": "seed-foreign", "refreshToken": "rt-seed",
+            "expiresAt": 9999999999000,
+        }})
+        expired = json.dumps({"claudeAiOauth": {
+            "accessToken": "old", "refreshToken": "rt-1", "expiresAt": 1,
+        }})
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "new", "refreshToken": "rt-2",
+            "expiresAt": 9999999999000,
+        }})
+        save_pin(tmp_path, "a@b.c", "org")
+
+        state = {"creds": foreign_seed}
+        counters = {"reads": 0, "refreshes": 0, "persists": 0,
+                    "current_account_number": 0}
+        read_gate = threading.Event()      # t1's real (post-seed) read parks here
+        persist_gate = threading.Event()   # t1's persist parks here
+
+        class FakeSwitcher:
+            backup_dir = tmp_path
+
+            def current_account_number(self):
+                counters["current_account_number"] += 1
+                return "2"  # pinned account is NOT active
+
+            def resolve_account(self, identifier):
+                return "1", "a@b.c", "org"
+
+            def read_account_credentials(self, num, email):
+                counters["reads"] += 1
+                if counters["reads"] == 2:
+                    # Read #1 is the SEEDING read (the cold-cache call
+                    # below); read #2 is t1's real one, and this is where
+                    # it parks so t2 can queue behind it.
+                    read_gate.wait(timeout=5)
+                return state["creds"]
+
+            def persist_backup_credentials(self, num, email, creds):
+                counters["persists"] += 1
+                if counters["persists"] == 1:
+                    persist_gate.wait(timeout=5)
+                state["creds"] = creds
+
+        def fake_refresh(creds):
+            counters["refreshes"] += 1
+            from claude_swap import oauth as _o
+            if "rt-1" in creds and counters["refreshes"] > 1:
+                # The real endpoint rejects a spent one-time refresh token
+                # -- t2 re-spending t1's rt-1 must be caught by the VALUE,
+                # not only by the refresh count.
+                return _o.RefreshOutcome(None, "invalid_grant")
+            return _o.RefreshOutcome(rotated, None)
+
+        import claude_swap.oauth as oauth_mod
+        monkeypatch.setattr(oauth_mod, "try_refresh_oauth_credentials",
+                             fake_refresh)
+        import cswap_pin.proxy as pin_proxy
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"emailAddress": (
+                "someone-else@example.com" if token == "seed-foreign"
+                else "a@b.c")})
+
+        provider = make_pin_token_provider(FakeSwitcher(), "1", "a@b.c")
+
+        # SEED: a cold call reads `foreign_seed` (read #1, ungated) and,
+        # being confirmed foreign, declines to splice -- `_cred_cache` now
+        # holds this live blob, which t1 and t2 will both judge foreign.
+        assert provider() is None
+        state["creds"] = expired  # the store, for the race that follows
+
+        t1_result, t2_result = [], []
+        t1 = threading.Thread(target=lambda: t1_result.append(provider()))
+        t1.start()
+        deadline = time.monotonic() + 5
+        while not provider.refresh_lock.locked() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert provider.refresh_lock.locked(), "the winner never took the lock"
+
+        t2 = threading.Thread(target=lambda: t2_result.append(provider()))
+        t2.start()
+        # The seed call already made one `current_account_number()` read,
+        # so t1's and t2's own pre-lock checks push the counter to 3.
+        deadline = time.monotonic() + 5
+        while (counters["current_account_number"] < 3
+               and time.monotonic() < deadline):
+            time.sleep(0.001)
+        assert counters["current_account_number"] >= 3, (
+            "t2 never queued on the lock before the gate opened -- the "
+            "race window this test exists to force never opened")
+
+        read_gate.set()  # t1's real read returns; it refreshes next
+        t2.join(timeout=5)
+        assert not t2.is_alive(), "the queued reader never returned"
+
+        persist_gate.set()
+        t1.join(timeout=5)
+
+        assert counters["refreshes"] == 1, (
+            f"refreshed {counters['refreshes']}x -- t2's own bypass "
+            "discarded t1's rotation instead of reusing it, re-read the "
+            "not-yet-persisted store, and re-spent the one-time refresh "
+            "token"
+        )
+        assert t1_result == ["new"] and t2_result == ["new"]
 
 
 class TestAmbientProxyPrefersTheLauncherProxy:

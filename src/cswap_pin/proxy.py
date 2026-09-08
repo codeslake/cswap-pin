@@ -5715,14 +5715,6 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         token = None
         rotated = None
         try:
-            # THE EVICTION ITSELF, GUARDED: a racing thread may have
-            # already replaced this slot while we queued on the lock (the
-            # same race `fresh is not cached` below already accounts for),
-            # and popping THAT racer's rotation would throw away a repair
-            # nobody asked us to discard. Only pop the exact object this
-            # call itself judged foreign.
-            if evict_foreign and _cred_cache.get(ckey) is cached:
-                _cred_cache.pop(ckey, None)
             # A RACING THREAD MAY HAVE ALREADY ROTATED THIS SLOT WHILE WE
             # QUEUED ON THIS LOCK. `_cred_cache[ckey]` is written (below, and
             # by any other thread's own pass through this same critical
@@ -5735,6 +5727,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             # hand back the already-consumed one-time refresh token for a
             # second, doomed refresh.
             fresh = _cred_cache.get(ckey)
+            # THE EVICTION, AS A BYPASS RATHER THAN A REMOVAL: ignore the
+            # entry this call judged foreign so the read below runs, but
+            # never take it OUT -- an empty `_cred_cache` reads as
+            # `can_pin: False`, and a read that RAISES would leave it that
+            # way for good. `fresh is cached` is the same race guard the
+            # branch below uses: a racer's replacement is not ours to discard.
+            if evict_foreign and fresh is cached:
+                fresh = None
             token = _live_token(fresh) if fresh is not None else None
             if token:
                 provider.blind_reason = ""
@@ -5877,11 +5877,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         if pin_is_noop():
             return True
         # A FOREIGN VERDICT NEEDS NO SPECIAL CASE HERE: `_cred_cache` is
-        # never invalidated by a verdict (see `provider`), so a declined
-        # token is still the one this reads -- a daemon that CAN mint
-        # (just declines to splice) correctly answers true, without
-        # consulting the sticky `identity_mismatch` dict (see `_identity_ok`
-        # for why that dict must never gate this).
+        # never REMOVED by a verdict (see `provider`'s bypass), so this
+        # never reads an empty cache -- though a foreign verdict does make
+        # the NEXT call replace the entry, so a declined token is not
+        # necessarily still the one this reads. Either way a daemon that
+        # CAN mint (just declines to splice) correctly answers true,
+        # without consulting the sticky `identity_mismatch` dict (see
+        # `_identity_ok` for why that dict must never gate this).
         target = _current_target()
         if target is None:
             return True
