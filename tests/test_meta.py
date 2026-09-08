@@ -48,6 +48,41 @@ def test_a_case_cannot_leave_the_process_marked_draining(request, tmp_path_facto
             pin_proxy._DRAINING_DEPTH.clear()
 
 
+def test_the_daemon_port_is_occupied_for_the_whole_run():
+    """36301 must be unavailable while the suite runs, or a case can draw it.
+
+    `bind(0)` picks from the ephemeral range, which on linux contains 36301 —
+    see `conftest._occupy_the_daemon_port` for the mechanism and the two CI
+    runs it turned red. The fixture holding it is invisible without this
+    check: the flake is ~2 in 173 runs, so a fixture that quietly stopped
+    binding would leave every run green and the red would come back months
+    later attributed to whatever case happened to draw the port.
+
+    IT DOES NOT ASSERT WHO HOLDS IT, deliberately. A developer box runs a live
+    pin on 36301 and that satisfies the contract exactly as the fixture does;
+    what matters is only that no case can be handed the port.
+    """
+    import errno
+    import socket
+
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 36301))
+    except OSError as exc:
+        assert exc.errno == errno.EADDRINUSE, (
+            f"binding 36301 failed with {exc!r} rather than EADDRINUSE, which "
+            "is not evidence that anything is holding the port")
+        return
+    finally:
+        s.close()
+    raise AssertionError(
+        "127.0.0.1:36301 was free during this run, so `bind(0)` in "
+        "`test_proxy.py::_dead_port` can be handed the daemon's own port and "
+        "the wiring classes go red on linux about once in 28k draws. "
+        "`conftest._occupy_the_daemon_port` is supposed to hold it for the "
+        "whole session and is not.")
+
+
 def test_every_case_has_a_driver():
     """A `case_*` method with no `test_all` NEVER RUNS, and nothing says so.
 
