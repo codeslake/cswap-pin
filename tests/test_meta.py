@@ -83,6 +83,65 @@ def test_the_daemon_port_is_occupied_for_the_whole_run():
         "whole session and is not.")
 
 
+def test_the_publish_gate_accepts_a_commit_with_several_green_runs():
+    """N green CI runs on one sha must read as "success", not "success,...".
+
+    Landing pushes the same commit twice — once on the branch, once on main —
+    and CI's `on: push` fires for each, so a release commit routinely has two
+    runs. `map(.conclusion)|join(",")` turned that into "success,success",
+    which matches no branch of publish.yml's `case` but `*)`. Measured on
+    3a90985 (v0.1.254): "REFUSED: CI concluded 'success,success' ... nothing
+    is uploaded" — the tag was created, the wheel never reached PyPI, and the
+    run reported the refusal as though CI had failed. The control is 764a44d
+    (v0.1.253), one run, "success", published.
+
+    This drives the REAL filter, read out of the workflow, rather than a copy:
+    a copy would keep passing after someone edited the workflow, which is the
+    only way this can regress. Both directions are asserted, because a filter
+    that answered "success" unconditionally would satisfy the first half.
+    """
+    import json
+    import pathlib
+    import re
+    import shutil
+    import subprocess
+
+    jq = shutil.which("jq")
+    if jq is None:
+        pytest.skip("jq is not installed; the GitHub runners have it")
+
+    workflow = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / ".github" / "workflows" / "publish.yml"
+    )
+    m = re.search(r"--jq '([^']+)'", workflow.read_text(encoding="utf-8"))
+    assert m, "publish.yml no longer carries a --jq CI-conclusion filter"
+    filt = m.group(1)
+
+    def verdict(runs):
+        out = subprocess.run(
+            [jq, "-r", filt], input=json.dumps(runs),
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+
+    green = {"status": "completed", "conclusion": "success"}
+    red = {"status": "completed", "conclusion": "failure"}
+
+    assert verdict([green]) == "success", "one green run must publish"
+    assert verdict([green, green]) == "success", (
+        "two green runs on one commit read as something other than 'success', "
+        "so publish.yml refuses every release landed by a normal push — the "
+        "v0.1.254 failure. `unique` is what collapses them")
+    # The other direction: the gate must still refuse anything not all-green,
+    # or the first assertion is satisfied by a filter that says yes to
+    # everything.
+    assert verdict([green, red]) != "success", "a red run must still refuse"
+    assert verdict([red]) != "success", "a lone red run must still refuse"
+    assert verdict([]) == "none", "no run at all must still refuse"
+    assert verdict([{"status": "in_progress", "conclusion": None}]) == "pending"
+
+
 def test_every_case_has_a_driver():
     """A `case_*` method with no `test_all` NEVER RUNS, and nothing says so.
 
