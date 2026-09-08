@@ -16876,6 +16876,18 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     untouched rather than debounce every header-less 429 against one shared
     empty key.
 
+    A 401 ASKS THE CLIENT TO RETRY, so it is only ever right when the retry
+    has somewhere to land, and 5h/7d headroom does not say that. On 2026-09-07
+    (~18:1xZ) it did not: account 2 walled, the failover moved to account 4,
+    account 4 was Fable 100%, every rebuilt retry walled again, and the loop
+    exhausted into `authentication_failed` — a reason absent from Claude
+    Code's partial-result set {rate_limit, overloaded, server_error}, so three
+    fable subagents lost their context outright instead of sleeping
+    (req_011Cepk7iQtQCjPtKjVxCxna and two siblings in the same minute). The
+    switch below therefore ranks with every per-model weekly window folded in,
+    which is what makes a full one able to answer "nowhere to land" and keep
+    the wall a wall.
+
     True means "turn the 429 the client will see into a 401" — because either
     this call switched the account off onto a credential the host confirmed
     is LIVE, or an earlier call for this same wall already did. False (no
@@ -16921,12 +16933,40 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
             # The raise's short expiry passed: treat this wall as unseen.
         try:
             switcher = require("switcher")
-            result = switcher.switch_off_at_limit_account(
-                switcher.ClaudeAccountSwitcher()
+            # NOT `switch_off_at_limit_account`, which passes no `models` and
+            # so ranks on 5h/7d alone. `("all",)` is `oauth.relevant_windows`'
+            # sentinel for "fold in EVERY per-model weekly window this account
+            # reports": a candidate sitting at 100% on one of them scores 0
+            # headroom, loses `best > current` against the walled account
+            # `current_at_limit` already pins to 0.0, and the wall is relayed.
+            #
+            # It overrides a user's `autoswitch.model`, deliberately (`switch()`
+            # reads that only when `models is None`), AND THAT IS SAFE ONLY
+            # UNDER A PRECONDITION worth naming rather than assuming. For an
+            # account reporting a 5h or 7d window, `all` folds in a superset of
+            # any setting's windows, so headroom under it is <= headroom under
+            # theirs and this can only relay MORE walls. For an account
+            # reporting ONLY scoped windows — permitted, because
+            # `oauth.py:541-555` writes `five_hour`/`seven_day` conditionally
+            # and the API does send null siblings — the empty basis gives
+            # `account_headroom` None, which `_select_best_switchable` excludes
+            # from `known` as "unknown, never auto-skipped"; `all` gives it a
+            # number instead, so that account can become a switch target where
+            # `no-comparison` would have kept us put. Unobserved on this fleet
+            # (8 store rows, none in that shape) and the fix belongs in
+            # `account_headroom`, which is cswap's, not here.
+            #
+            # The symbol's other job — being the capability probe for an older
+            # claude-swap — survives unchanged: an older `switch()` has no
+            # `models` parameter, so the TypeError lands in the except below
+            # and relays the 429, exactly as a missing symbol did.
+            result = switcher.ClaudeAccountSwitcher().switch(
+                strategy="best", json_output=True,
+                current_at_limit=True, models=("all",),
             )
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
-                f"429 on /v1/messages — switch_off_at_limit_account raised "
+                f"429 on /v1/messages — the at-limit switch raised "
                 f"{exc.__class__.__name__}, relaying the 429 unchanged"
             )
             _walled_switch_seen[reset] = (

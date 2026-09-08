@@ -53,11 +53,15 @@ class _FakeUpstream:
     and replies 200. Uses the same leaf cert the proxy MITMs with, so the
     proxy's own upstream TLS (servername api.anthropic.com) validates it."""
 
-    def __init__(self, certdir: Path, reject_bearer: str | None = None):
+    def __init__(self, certdir: Path, reject_bearer: str | None = None,
+                 reply: bytes | None = None):
         # reject_bearer: answer 403 to exactly this credential, 200 to any
         # other. Models an endpoint the pinned account may not use — the shape
         # that makes a misrouted swap terminal for the client.
+        # reply: the whole response to send instead of the 200, for a case
+        # that needs the origin to answer something the pin then rewrites.
         self.reject_bearer = reject_bearer
+        self.reply = reply
         self.seen_auth: str | None = None
         self.seen_path: str | None = None
         self.seen_body: bytes = b""
@@ -115,10 +119,10 @@ class _FakeUpstream:
                     )
                     tls.close()
                     continue
-                tls.sendall(
+                tls.sendall(self.reply or (
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
                     b"Content-Type: application/json\r\n\r\n{}"
-                )
+                ))
                 tls.close()
             except Exception:
                 pass
@@ -210,7 +214,7 @@ class _RecordingChain:
 
 
 def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: str,
-                           ua: str | None = None):
+                           ua: str | None = None, body: str = "{}"):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
     trusting the proxy's CA. Returns the response status."""
     ctx = ssl.create_default_context(cafile=str(ca_path))
@@ -225,7 +229,7 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
     headers = {"Authorization": f"Bearer {bearer}"}
     if ua is not None:
         headers["User-Agent"] = ua
-    conn.request("POST", path, body="{}", headers=headers)
+    conn.request("POST", path, body=body, headers=headers)
     resp = conn.getresponse()
     resp.read()
     conn.close()
@@ -388,6 +392,125 @@ class TestPinProxyServer:
         finally:
             proxy.stop()
             upstream.stop()
+
+    def _bridge_post(self, certdir, monkeypatch, seed_verdict, expect_swapped,
+                      profile_answer=lambda token: {
+                          "emailAddress": "pin@example.com"}):
+        """Drives a REAL `make_pin_token_provider` through the actual HTTP
+        egress path (`PinProxy` end to end, real upstream TLS) for a pinned
+        `.../bridge` POST. `seed_verdict(pp, provider)` seeds whatever the
+        case is testing before the request fires (or does nothing, for the
+        healthy/positive-control case). `profile_answer` stands in for the
+        mint-time `pin_profile_for` probe and is ALWAYS patched -- a foreign-
+        verdict case that forgot to override it must still never dial
+        api.anthropic.com, it must just get an "ok" verdict from the
+        default. `expect_swapped` picks which invariant this drive proves:
+        `swapped=True` (a healthy verdict DOES splice) or `swapped=False`
+        (a foreign one never does).
+
+        Not the provider in isolation: a provider-level-only test would still
+        pass if a future splice site read the credential store directly
+        instead of calling the provider.
+        """
+        import json as _json
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "pin_profile_for", profile_answer)
+
+        live = _json.dumps({"claudeAiOauth": {
+            "accessToken": "pin-live-token", "expiresAt": 4102444800000,
+            "refreshToken": "rt"}})
+
+        class _Switcher:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def read_account_credentials(self, n, e): return live
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _Switcher()
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+        seed_verdict(pp, provider)
+
+        upstream = _FakeUpstream(certdir)
+        proxy = pp.PinProxy(
+            certdir=certdir,
+            pin_token_provider=provider,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        trace = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(trace))
+        pp._TRACE_CACHE.clear()
+        proxy.start()
+        try:
+            proxy._trace_tick()  # the only thing that opens the handle
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/SID123/bridge", bearer="client-own-token",
+            )
+            assert status == 200
+            want = "Bearer pin-live-token" if expect_swapped else "Bearer client-own-token"
+            assert upstream.seen_auth == want, (
+                f"expected {want!r}, upstream saw {upstream.seen_auth!r}")
+            # ALSO the pinned-ness, or this goes green on a broken pin the
+            # moment `.../bridge` ever drops off the pinned route table --
+            # `swapped=` alone cannot tell "correctly decided" from "never
+            # reached the decision at all".
+            assert f"/bridge pinned=True swapped={expect_swapped}" in trace.read_text()
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_healthy_verdict_still_swaps_the_bridge_post(
+            self, certdir, monkeypatch):
+        """Positive control for the two foreign-verdict cases below. Without
+        this, at least four ways the shared fixture could quietly decay --
+        `load_pin` no longer parsing what `save_pin` writes, so
+        `_current_target()` reads None; `read_account_credentials` moving
+        off the stub's `(n, e)` shape, so `not creds`; `extract_oauth_data`
+        no longer accepting this `claudeAiOauth` blob, so `_live_token`
+        reads None; or the stub's "1"/"2" ever agreeing, so
+        `_pin_is_the_live_login` short-circuits -- would make BOTH
+        foreign-verdict cases pass for a reason that is not the guard,
+        silently. If the fixture decays, THIS case reds and says why."""
+        self._bridge_post(
+            certdir, monkeypatch,
+            seed_verdict=lambda pp, provider: None,
+            expect_swapped=True,
+        )
+
+    def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
+            self, certdir, monkeypatch):
+        """A foreign verdict from the MINT-time probe (`_identity_ok`, via
+        `pin_profile_for`) must never splice -- see `_identity_ok`'s
+        invariant."""
+        self._bridge_post(
+            certdir, monkeypatch,
+            seed_verdict=lambda pp, provider: None,
+            expect_swapped=False,
+            profile_answer=lambda token: {
+                "emailAddress": "someone-else@example.com"},
+        )
+
+    def case_a_foreign_verdict_from_the_identity_beat_leaves_the_bridge_post_unswapped(
+            self, certdir, monkeypatch):
+        """The INCIDENT's own path: the 12h identity beat
+        (`_freshen_pin_identity`) reports a foreign verdict through
+        `provider.note_verdict`, not through a mint-time `pin_profile_for`
+        probe. Both land in the same `_identity_cache` today, but that is an
+        implementation detail one refactor could break -- this case reaches
+        the splice guard the way wmac's incident actually did. `profile_answer`
+        stays the healthy default: if the cache key shape ever moved and the
+        mint fell through to a real probe, this case must still never dial
+        out, and a healthy answer there is also the correct one -- the
+        provider ignores it while its own foreign verdict stands."""
+        self._bridge_post(
+            certdir, monkeypatch,
+            seed_verdict=lambda pp, provider: provider.note_verdict(
+                "pin-live-token", "pin@example.com", "foreign"),
+            expect_swapped=False,
+        )
 
 
 class _StreamingUpstream:
@@ -12561,18 +12684,32 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     @staticmethod
     def _wire(monkeypatch, switched, raises_once=None, needs_login=False,
-              validated=True):
+              validated=True, before=None):
         """Stub claude_swap's switcher so no real account store is touched.
 
         ``validated=None`` omits the key entirely (an older cswap that never
-        probed the landing credential, or a probe that never ran)."""
+        probed the landing credential, or a probe that never ran). ``before``
+        runs at the top of `switch()`, for a case that needs to block or fail
+        inside it.
+
+        The returned list holds the ``models=`` basis of each `switch()` call,
+        so `len(calls)` still counts calls AND a case can assert WHICH windows
+        the ranking was told to weigh. The pin's whole responsibility here is
+        that basis; what the host then decides is the host's."""
         from cswap_pin import proxy as pp
 
         calls = []
         state = {"raised": False}
 
-        def _switch_off(sw):
-            calls.append(sw)
+        # NO `**_`: the fake's signature IS the contract. Swallowing an
+        # unknown kwarg would keep every case green while each real host
+        # raised TypeError into the relay's except and silently stopped
+        # converting any wall at all.
+        def _switch(strategy=None, json_output=False, models=None,
+                    current_at_limit=False):
+            calls.append(models)
+            if before is not None:
+                before()
             if raises_once is not None and not state["raised"]:
                 state["raised"] = True
                 raise raises_once
@@ -12583,8 +12720,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             return result
 
         fake_module = type("M", (), {
-            "ClaudeAccountSwitcher": staticmethod(lambda: None),
-            "switch_off_at_limit_account": staticmethod(_switch_off),
+            "ClaudeAccountSwitcher": staticmethod(
+                lambda: types.SimpleNamespace(switch=_switch)),
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
@@ -12661,20 +12798,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         serialized N real `switch()` calls — each blocking the lock for the
         full config-lock timeout — instead of one. A raise must debounce
         like any other outcome, for its own short expiry."""
-        from cswap_pin import proxy as pp
-
-        calls = []
-
-        def _switch_off(sw):
-            calls.append(sw)
+        def _always_raises():
             raise OSError("locked")
 
-        fake_module = type("M", (), {
-            "ClaudeAccountSwitcher": staticmethod(lambda: None),
-            "switch_off_at_limit_account": staticmethod(_switch_off),
-        })()
-        monkeypatch.setattr(pp, "require", lambda n: fake_module)
-        pp._walled_switch_seen.clear()
+        calls = self._wire(monkeypatch, switched=True, before=_always_raises)
 
         for _ in range(10):
             got = self._relay()
@@ -12837,27 +12964,14 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         seen-and-not-yet-ok and relay the 429 verbatim while the first
         thread's switch is still landing. The lock must stay held across
         `switch()` so every waiter reads the one settled answer."""
-        from cswap_pin import proxy as pp
         entered = threading.Event()
         release = threading.Event()
 
-        def _switch_off(sw):
+        def _block():
             entered.set()
             assert release.wait(timeout=5), "release never set — test bug"
-            return {"switched": True, "needsLogin": False, "validated": True}
 
-        calls = []
-
-        def _counted(sw):
-            calls.append(sw)
-            return _switch_off(sw)
-
-        fake_module = type("M", (), {
-            "ClaudeAccountSwitcher": staticmethod(lambda: None),
-            "switch_off_at_limit_account": staticmethod(_counted),
-        })()
-        monkeypatch.setattr(pp, "require", lambda n: fake_module)
-        pp._walled_switch_seen.clear()
+        calls = self._wire(monkeypatch, switched=True, before=_block)
 
         results = {}
 
@@ -12905,6 +13019,56 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(path="/v1/other")
         assert got.startswith(b"HTTP/1.1 429"), got
         assert not calls, "the switch must only ever be tried for /v1/messages"
+
+    def case_a_wall_with_nowhere_to_land_is_relayed_not_converted(
+        self, monkeypatch, certdir,
+    ):
+        """THE EVENT, 2026-09-07 ~18:1xZ, through the real MITM.
+
+        Account-2 walled, the failover moved to Account-4, Account-4 was Fable
+        100%. The ranking never saw that window — `switch_off_at_limit_account`
+        weighs 5h/7d only — so the switch landed, the pin answered 401, Claude
+        Code rebuilt onto Account-4, walled again, and the retry loop exhausted
+        into `authentication_failed`. That reason is not in Claude Code's
+        partial-result set {rate_limit, overloaded, server_error}, so three
+        fable team leads lost their context outright instead of sleeping
+        (req_011Cepk7iQtQCjPtKjVxCxna and two siblings in the same minute).
+
+        THE ASSERTION THAT DISCRIMINATES IS THE BASIS, not the status: with no
+        candidate the pin relays a 429 either way. `models=("all",)` folds
+        EVERY scoped weekly window the account reports into the comparison
+        (`oauth.relevant_windows`, the `all` sentinel), which is the one thing
+        that makes a full Fable window able to stop the conversion. What the
+        host then decides on that basis is the host's.
+
+        End to end rather than straight into `_relay_response`, because the
+        request and the response are handled in different methods and a wiring
+        that never reaches the relay is invisible from the cases next door."""
+        from cswap_pin.proxy import PinProxy
+
+        calls = self._wire(monkeypatch, switched=False)
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 429 Too Many Requests\r\n" + self.RESET_HEADER
+            + b"\r\n" + self.RETRY_AFTER + b"\r\nContent-Length: 0\r\n"
+            b"Connection: close\r\n\r\n"))
+        proxy = PinProxy(certdir=certdir,
+                         pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages",
+                bearer="disk-token",
+                body=json.dumps({"model": "claude-fable-5-1", "max_tokens": 4}),
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert calls == [("all",)], (
+            "the ranking was not told to weigh the per-model weekly windows, "
+            "so a target full on the model this request needs is invisible to "
+            f"it and the wall becomes a 401 with nowhere to land: {calls}")
+        assert status == 429, status
 
 
 class TestTheEvidenceSurvivesAHandover:

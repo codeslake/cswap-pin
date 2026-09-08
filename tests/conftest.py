@@ -385,6 +385,49 @@ def _shared_ca(monkeypatch, tmp_path_factory):
                 monkeypatch.setattr(mod, "ensure_ca", fast_ensure_ca, raising=False)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _occupy_the_daemon_port():
+    """Hold ``127.0.0.1:36301`` for the whole run so no case can be handed it.
+
+    `bind(0)` draws from the ephemeral range, and on linux that range
+    (32768-60999) CONTAINS the 36301 several classes use as the daemon's port;
+    macOS's (49152-65535) does not. `test_proxy.py::_dead_port` already
+    documents the consequence: a draw that collides makes `_wired_port() ==
+    port` true, the claim check short-circuits to "already wired" and never
+    reaches the repair. Roughly once in 28k draws, ubuntu only — which is
+    exactly the one-job-red split seen twice in CI, run 33290951823
+    (`TestTheDaemonRepairsItsOwnWiring`, `assert [] == [36301]`) and run
+    34171357878 (`TestTheDaemonWatchesItsOwnCode`, `assert 36301 != 36301`).
+
+    Occupying the port deletes the draw. This is also why the box the suite is
+    developed on has never seen it: a live pin already holds 36301 there. The
+    fixture reproduces that condition deliberately.
+
+    ALREADY HELD IS THE SUCCESS CASE. A bind that fails means something else
+    occupies the port, which achieves the identical goal, so the error is
+    swallowed and only a socket we opened is ever closed. No `SO_REUSEADDR` or
+    `SO_REUSEPORT` — exclusive occupation is the entire point.
+
+    `test_meta.py::test_the_daemon_port_is_occupied_for_the_whole_run` is what
+    stops this going quiet: a fixture that silently stops binding looks exactly
+    like one that works, because the flake it prevents is ~2 in 173 runs.
+    """
+    import socket
+
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 36301))
+        s.listen(1)
+    except OSError:
+        s.close()
+        yield
+        return
+    try:
+        yield
+    finally:
+        s.close()
+
+
 @pytest.fixture(scope="session")
 def _session_ca(tmp_path_factory):
     """ONE CA for the whole run, built once and copied by everything that
