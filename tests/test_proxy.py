@@ -4110,7 +4110,11 @@ class TestMakePinTokenProvider:
 
     def case_a_bearer_that_matches_the_pin_is_unchanged(self, monkeypatch):
         """The positive control for the case above: the same profile check,
-        answering as the account we actually asked for, must change nothing."""
+        answering as the account we actually asked for, must splice
+        normally -- and must record that this was EVALUATED (`False`), not
+        leave `identity_mismatch` at its unevaluated `None`; a reader
+        (`/health`, the RC gate) cannot otherwise tell a live clean pin from
+        one that has not minted yet."""
         import json
 
         from cswap_pin import proxy as pin_proxy
@@ -4126,7 +4130,7 @@ class TestMakePinTokenProvider:
         provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
 
         assert provider() == "pin-tok"
-        assert provider.identity_mismatch is None
+        assert provider.identity_mismatch is False
         assert provider.can_pin_cached() is True
 
     def case_the_transition_logs_once_not_on_the_next_mint(self, monkeypatch):
@@ -19945,6 +19949,42 @@ class TestTheSpliceHoldsTheConfigLock:
             "the beat's finding must be keyed so THIS SAME provider's next "
             "mint reads it -- a key derived from the profile's own "
             "(missing) email instead of the provider's mail would miss"
+        )
+
+    def case_the_beats_clean_finding_is_evaluated_not_unevaluated(
+            self, tmp_path, monkeypatch):
+        """The positive control for the case above: a bearer that matches
+        the pin at the 12h beat must record an EVALUATED clean verdict
+        (`False`), not leave `identity_mismatch` at its unevaluated `None`
+        -- the same distinction the mint-time check owes, via the same
+        `note_verdict` -> `_set_identity` path."""
+        import json
+        import time as _time
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        old_ms = int((_time.time() - 13 * 3600) * 1000)
+        pin_proxy.remember_pin_identity(
+            certdir, {**self.PIN, "profileFetchedAt": old_ms})
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "PINTOKEN", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": self.PIN["accountUuid"],
+                           "emailAddress": "pinned@example.com"})
+        sw = _FakeSwitcher(active_num="9", backups={"1": creds})
+        provider = pin_proxy.make_pin_token_provider(
+            sw, "1", "pinned@example.com")
+        me = types.SimpleNamespace(_certdir=certdir, _pin_token_provider=provider)
+
+        assert provider.identity_mismatch is None, "never evaluated yet"
+        assert pin_proxy.PinProxy._freshen_pin_identity(me) is True
+        assert provider.identity_mismatch is False, (
+            "the beat evaluated this bearer and found it clean -- must not "
+            "read the same as never having evaluated it at all"
         )
 
     def case_the_beats_finding_feeds_the_same_verdict_cache(self, monkeypatch):
