@@ -5655,17 +5655,29 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # something that cannot have happened yet, and the first cut of this
         # cache had a 5s one for exactly that non-reason.
         #
-        # NEVER INVALIDATED BY A VERDICT EITHER: a foreign or unknown token
-        # stays exactly as cached as an ok one -- the store is still read
-        # once per rotation, not once per probe-backoff-window, and every
-        # access (this fast path AND the cold path below) re-asks
-        # `_identity_ok`, which is what actually decides whether to splice.
+        # NOT INVALIDATED BY AN "unknown" VERDICT, OR BY STALENESS ALONE:
+        # an unknown or same-identity-but-stale token stays exactly as
+        # cached -- the store is still read once per rotation, not once per
+        # probe-backoff-window, and every access (this fast path AND the
+        # cold path below) re-asks `_identity_ok`, which is what actually
+        # decides whether to splice.
+        #
+        # A CONFIRMED FOREIGN VERDICT IS DIFFERENT: those cached bytes are
+        # PROVEN wrong, not merely stale, so re-serving them buys nothing --
+        # and a `/login` into this same slot (same `(num, mail)` key) can
+        # land a correctly-identified replacement that this cache would
+        # otherwise hide forever, because `_live_token` alone never asks
+        # whether the disk changed. Evicting bounds the blind window to one
+        # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
         if cached is not None:
             provider.blind_reason = ""
             token = _live_token(cached)
             if token:
-                return token if _identity_ok(token, mail) else None
+                if _identity_ok(token, mail):
+                    return token
+                _cred_cache.pop(ckey, None)
+                return None
             creds = cached
         else:
             # COLD -- the very first read for this key, which is EVERY key on

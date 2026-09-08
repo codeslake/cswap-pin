@@ -4395,6 +4395,124 @@ class TestMakePinTokenProvider:
             release.set()
             t2.join(timeout=5)
 
+    def case_a_confirmed_foreign_verdict_evicts_so_a_repair_is_seen(
+            self, monkeypatch):
+        """A `/login` into the same slot writes a NEW identity's credential
+        under the same `(num, mail)` key `_cred_cache` is keyed on -- the key
+        does not move. Once a token has been CONFIRMED foreign (not merely
+        unknown), re-serving it from the fast path forever means the daemon
+        stays blind even after the store holds a perfectly good, correctly-
+        identified replacement. The fix: a confirmed-foreign verdict evicts
+        the cache entry so the very next call re-reads the store instead of
+        re-judging the same stale bytes."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        foreign_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "foreign-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        repaired_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "repaired-tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt-2"}})
+        profiles = {
+            "foreign-tok": {"accountUuid": "foreign-uuid",
+                            "emailAddress": "someone-else@example.com"},
+            "repaired-tok": {"accountUuid": "pin-uuid",
+                             "emailAddress": "pin@example.com"},
+        }
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for", lambda token: profiles[token])
+        sw = _FakeSwitcher(active_num="1", backups={"2": foreign_creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() is None, "a confirmed-foreign bearer must not splice"
+
+        # The re-login: same slot, same email, brand-new bytes -- `ckey` is
+        # unchanged. This is the store write condition 1/2 already land.
+        sw.backups["2"] = repaired_creds
+
+        # One more call still answers `None` -- it is re-confirming the SAME
+        # cached foreign token via the fast path (no re-read yet); this is
+        # where the eviction must happen, so the call AFTER this one is the
+        # one that proves it.
+        assert provider() is None, "still the stale foreign token, one more read"
+
+        assert provider() == "repaired-tok", (
+            "the daemon stayed blind after the store was repaired -- it "
+            "kept re-judging the OLD foreign token from `_cred_cache` "
+            "instead of re-reading the store's new, correctly-identified "
+            "credential"
+        )
+
+    def case_an_unknown_verdict_does_not_evict_the_cache(self, monkeypatch):
+        """Negative control: an INCONCLUSIVE probe (a timeout, an exception)
+        must not evict -- only a CONFIRMED foreign verdict does. Evicting on
+        `unknown` would turn a transient probe failure into a re-read storm
+        on every single request, which is exactly the cost `_cred_cache`
+        exists to avoid."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        reads = []
+
+        class _CountingSwitcher(_FakeSwitcher):
+            def read_account_credentials(self, num, email):
+                reads.append(num)
+                return super().read_account_credentials(num, email)
+
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: (_ for _ in ()).throw(TimeoutError("slow")))
+        sw = _CountingSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "tok", "an unverifiable profile must fail open"
+        assert len(reads) == 1, "the cold call reads the store once"
+        assert provider() == "tok", (
+            "an unknown verdict must still serve from the cache, not evict it"
+        )
+        assert len(reads) == 1, (
+            "an unknown verdict must never trigger a second store read -- "
+            "only a confirmed foreign verdict evicts"
+        )
+
+    def case_a_stale_same_identity_token_still_serves_from_cache(
+            self, monkeypatch):
+        """Negative control: the policy this fix keeps. A token that is
+        STALE BUT CORRECT (same identity, just old bytes on disk) must keep
+        being served from `_cred_cache` without a re-read -- eviction is
+        only for a confirmed MISMATCH, never for staleness alone."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "tok", "expiresAt": 10_000_000_000_000,
+            "refreshToken": "rt"}})
+        reads = []
+
+        class _CountingSwitcher(_FakeSwitcher):
+            def read_account_credentials(self, num, email):
+                reads.append(num)
+                return super().read_account_credentials(num, email)
+
+        monkeypatch.setattr(
+            pin_proxy, "pin_profile_for",
+            lambda token: {"accountUuid": "pin-uuid",
+                           "emailAddress": "pin@example.com"})
+        sw = _CountingSwitcher(active_num="1", backups={"2": creds})
+        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
+        assert provider() == "tok"
+        assert len(reads) == 1
+        assert provider() == "tok", "same-identity stale token stays cached"
+        assert len(reads) == 1, "a same-identity verdict must never evict"
+
 
 class TestRefreshGoesThroughTheInterprocessGate:
     """A refresh token is one-time-use, and this daemon is not the only
