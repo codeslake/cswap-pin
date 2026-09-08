@@ -5670,14 +5670,22 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # whether the disk changed. Evicting bounds the blind window to one
         # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
+        evict_foreign = False
         if cached is not None:
             provider.blind_reason = ""
             token = _live_token(cached)
             if token:
                 if _identity_ok(token, mail):
                     return token
-                _cred_cache.pop(ckey, None)
-                return None
+                # CONFIRMED FOREIGN: fall through to a re-read under
+                # `refresh_lock` instead of returning here with the entry
+                # popped -- an empty `_cred_cache` reads as `can_pin: False`
+                # to both `_read_alive_port` and the self-heal watchdog,
+                # which recycle a live daemon that a fresh process would
+                # find just as cross-wired. `creds = cached` (not None)
+                # below so a re-read that comes back empty restores this
+                # SAME blob instead of leaving the cache empty.
+                evict_foreign = True
             creds = cached
         else:
             # COLD -- the very first read for this key, which is EVERY key on
@@ -5707,6 +5715,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         token = None
         rotated = None
         try:
+            # THE EVICTION ITSELF, GUARDED: a racing thread may have
+            # already replaced this slot while we queued on the lock (the
+            # same race `fresh is not cached` below already accounts for),
+            # and popping THAT racer's rotation would throw away a repair
+            # nobody asked us to discard. Only pop the exact object this
+            # call itself judged foreign.
+            if evict_foreign and _cred_cache.get(ckey) is cached:
+                _cred_cache.pop(ckey, None)
             # A RACING THREAD MAY HAVE ALREADY ROTATED THIS SLOT WHILE WE
             # QUEUED ON THIS LOCK. `_cred_cache[ckey]` is written (below, and
             # by any other thread's own pass through this same critical

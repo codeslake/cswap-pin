@@ -4402,9 +4402,12 @@ class TestMakePinTokenProvider:
         does not move. Once a token has been CONFIRMED foreign (not merely
         unknown), re-serving it from the fast path forever means the daemon
         stays blind even after the store holds a perfectly good, correctly-
-        identified replacement. The fix: a confirmed-foreign verdict evicts
-        the cache entry so the very next call re-reads the store instead of
-        re-judging the same stale bytes."""
+        identified replacement. The fix: a confirmed-foreign verdict falls
+        through to a re-read under `refresh_lock`, REPLACING the cache entry
+        -- never emptying it, because `can_pin_cached()` must keep answering
+        True or a cross-wired daemon reads `can_pin: False` and gets
+        recycled by `_read_alive_port`/the self-heal watchdog, which a fresh
+        process cannot repair either."""
         import json
 
         from cswap_pin import proxy as pin_proxy
@@ -4428,90 +4431,41 @@ class TestMakePinTokenProvider:
 
         assert provider() is None, "a confirmed-foreign bearer must not splice"
 
+        # One more call, store still unrepaired: the fast path re-confirms
+        # the SAME mismatch and falls through to a re-read under
+        # `refresh_lock` -- this is the eviction itself, and the cache must
+        # come out of it REPLACED, not empty.
+        assert provider() is None, "still foreign, still declining to splice"
+        assert provider.can_pin_cached() is True, (
+            "the eviction left `_cred_cache` empty -- `/health`'s "
+            "`can_pin` reads that as false, and both `_read_alive_port` "
+            "and the self-heal watchdog recycle a live daemon on it, even "
+            "though a fresh process would read the exact same cross-wired "
+            "store"
+        )
+
         # The re-login: same slot, same email, brand-new bytes -- `ckey` is
         # unchanged. This is the store write condition 1/2 already land.
         sw.backups["2"] = repaired_creds
 
-        # One more call still answers `None` -- it is re-confirming the SAME
-        # cached foreign token via the fast path (no re-read yet); this is
-        # where the eviction must happen, so the call AFTER this one is the
-        # one that proves it.
-        assert provider() is None, "still the stale foreign token, one more read"
-
+        # The very next call already sees it: a confirmed-foreign verdict
+        # falls through to a re-read on the SAME call that detects it, so
+        # there is no longer a call that re-serves the stale bytes first.
         assert provider() == "repaired-tok", (
             "the daemon stayed blind after the store was repaired -- it "
             "kept re-judging the OLD foreign token from `_cred_cache` "
-            "instead of re-reading the store's new, correctly-identified "
-            "credential"
+            "instead of falling through to a re-read under the lock"
         )
 
-    def case_an_unknown_verdict_does_not_evict_the_cache(self, monkeypatch):
-        """Negative control: an INCONCLUSIVE probe (a timeout, an exception)
-        must not evict -- only a CONFIRMED foreign verdict does. Evicting on
-        `unknown` would turn a transient probe failure into a re-read storm
-        on every single request, which is exactly the cost `_cred_cache`
-        exists to avoid."""
-        import json
-
-        from cswap_pin import proxy as pin_proxy
-
-        creds = json.dumps({"claudeAiOauth": {
-            "accessToken": "tok", "expiresAt": 10_000_000_000_000,
-            "refreshToken": "rt"}})
-        reads = []
-
-        class _CountingSwitcher(_FakeSwitcher):
-            def read_account_credentials(self, num, email):
-                reads.append(num)
-                return super().read_account_credentials(num, email)
-
-        monkeypatch.setattr(
-            pin_proxy, "pin_profile_for",
-            lambda token: (_ for _ in ()).throw(TimeoutError("slow")))
-        sw = _CountingSwitcher(active_num="1", backups={"2": creds})
-        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
-
-        assert provider() == "tok", "an unverifiable profile must fail open"
-        assert len(reads) == 1, "the cold call reads the store once"
-        assert provider() == "tok", (
-            "an unknown verdict must still serve from the cache, not evict it"
-        )
-        assert len(reads) == 1, (
-            "an unknown verdict must never trigger a second store read -- "
-            "only a confirmed foreign verdict evicts"
-        )
-
-    def case_a_stale_same_identity_token_still_serves_from_cache(
-            self, monkeypatch):
-        """Negative control: the policy this fix keeps. A token that is
-        STALE BUT CORRECT (same identity, just old bytes on disk) must keep
-        being served from `_cred_cache` without a re-read -- eviction is
-        only for a confirmed MISMATCH, never for staleness alone."""
-        import json
-
-        from cswap_pin import proxy as pin_proxy
-
-        creds = json.dumps({"claudeAiOauth": {
-            "accessToken": "tok", "expiresAt": 10_000_000_000_000,
-            "refreshToken": "rt"}})
-        reads = []
-
-        class _CountingSwitcher(_FakeSwitcher):
-            def read_account_credentials(self, num, email):
-                reads.append(num)
-                return super().read_account_credentials(num, email)
-
-        monkeypatch.setattr(
-            pin_proxy, "pin_profile_for",
-            lambda token: {"accountUuid": "pin-uuid",
-                           "emailAddress": "pin@example.com"})
-        sw = _CountingSwitcher(active_num="1", backups={"2": creds})
-        provider = pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
-
-        assert provider() == "tok"
-        assert len(reads) == 1
-        assert provider() == "tok", "same-identity stale token stays cached"
-        assert len(reads) == 1, "a same-identity verdict must never evict"
+    # `case_an_unknown_verdict_does_not_evict_the_cache` and
+    # `case_a_stale_same_identity_token_still_serves_from_cache` were cut
+    # here (gate review): both duplicated policy already covered, on the
+    # same code path, by `TestTheCredentialReadIsNotPaidPerRequest`'s
+    # `case_an_unverifiable_identity_still_does_not_reread_the_store` and
+    # `case_repeated_requests_do_not_reread_the_store` (below) -- an
+    # unknown/timeout verdict and a same-identity verdict never set
+    # `evict_foreign`, so this PR's fix does not touch either path and the
+    # existing controls already prove a single store read across repeats.
 
 
 class TestRefreshGoesThroughTheInterprocessGate:
