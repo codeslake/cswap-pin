@@ -50,7 +50,7 @@ jobs:
           set -u
           for i in $(seq 1 60); do
             v=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --commit "$GITHUB_SHA" \
-                  --json status,conclusion --jq 'if length==0 then "none" elif any(.[]; .status!="completed") then "pending" else (map(.conclusion)|join(",")) end')
+                  --json status,conclusion --jq 'if length==0 then "none" elif any(.[]; .status!="completed") then "pending" elif all(.[]; .conclusion=="success") then "success" else (map(.conclusion)|join(",")) end')
             case "$v" in
               success) echo "CI green on $GITHUB_SHA"; exit 0 ;;
               pending) echo "CI still running on $GITHUB_SHA ($i/60) — waiting"; sleep 20 ;;

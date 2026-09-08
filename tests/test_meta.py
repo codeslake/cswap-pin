@@ -592,3 +592,57 @@ def test_a_lock_naming_an_unreadable_pid_is_not_reaped_at_session_start(tmp_path
     finally:
         fake.kill()
         fake.wait()
+
+
+def test_publish_ci_gate_reads_two_successes_as_green():
+    """`publish.yml`'s CI-must-be-green check joins every CI run's own
+    conclusion with a comma before comparing it to the literal `success`, so
+    a commit with TWO CI runs (measured: every commit here has one) produces
+    `success,success` — which matches none of the `case` arms and falls to
+    the `*)` refusal, on CI that is entirely green. 0.1.254 and 0.1.255 both
+    hit this: `REFUSED: CI concluded 'success,success' ... — nothing is
+    uploaded`, and PyPI stayed on 0.1.253 while the tag, the repo and the
+    green suite all said otherwise.
+
+    EXTRACTED FROM THE REAL FILE, not pasted — a copy drifts from what the
+    workflow actually runs and then this tests nothing. Run through the same
+    `jq` binary `gh run list --jq` calls, on constructed run-list fixtures
+    (a real `gh api` call needs a token and a live repo, which this suite
+    must never depend on).
+    """
+    import json
+    import pathlib
+    import re
+    import subprocess
+
+    src = (
+        pathlib.Path(__file__).parent.parent / ".github/workflows/publish.yml"
+    ).read_text(encoding="utf-8")
+    m = re.search(r"--jq '([^']*)'", src)
+    assert m, "the CI-gate jq expression moved or was reworded in publish.yml"
+    expr = m.group(1)
+
+    def apply(fixture):
+        out = subprocess.run(
+            ["jq", "-r", expr], input=json.dumps(fixture),
+            capture_output=True, text=True, timeout=5,
+        )
+        assert out.returncode == 0, out.stderr
+        return out.stdout.strip()
+
+    cases = [
+        ([{"status": "completed", "conclusion": "success"},
+          {"status": "completed", "conclusion": "success"}], "success",
+         "two completed successes must read as green"),
+        ([{"status": "completed", "conclusion": "success"}], "success",
+         "a single success must still read as green"),
+        ([{"status": "completed", "conclusion": "success"},
+          {"status": "completed", "conclusion": "failure"}], "success,failure",
+         "one real failure among the runs must still refuse, and name both"),
+        ([{"status": "in_progress", "conclusion": None}], "pending",
+         "a run still in progress must wait, not refuse or publish"),
+        ([], "none", "no CI run at all must refuse, not publish blind"),
+    ]
+    for fixture, want, why in cases:
+        got = apply(fixture)
+        assert got == want, f"{why}: jq on {fixture!r} -> {got!r}, want {want!r}"
