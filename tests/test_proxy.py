@@ -10505,6 +10505,106 @@ class TestPinTokenRefreshIsSerialized:
         )
         assert results == ["new"] * 8, f"threads got inconsistent tokens: {results}"
 
+    def case_a_queued_reader_reuses_the_winners_rotation(
+            self, tmp_path, monkeypatch):
+        """The fallback persist (no `consume_backup_grant`) runs AFTER
+        `refresh_lock` releases, behind a network identity probe — so a
+        thread that queued on the lock while the winner was still inside its
+        FIRST read (before the winner ever wrote to `_cred_cache`) must not,
+        on waking, re-read the on-disk store: it is not yet persisted, still
+        carries the just-spent one-time refresh token, and refreshing it
+        again is the `invalid_grant` this lock exists to prevent. It must
+        instead see the winner's rotation, which is written to `_cred_cache`
+        before the lock is released."""
+        import json
+        import threading
+        import time
+
+        from cswap_pin.proxy import make_pin_token_provider, save_pin
+
+        expired = json.dumps({"claudeAiOauth": {
+            "accessToken": "old", "refreshToken": "rt-1", "expiresAt": 1,
+        }})
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "new", "refreshToken": "rt-2",
+            "expiresAt": 9999999999000,
+        }})
+        save_pin(tmp_path, "a@b.c", "org")
+
+        state = {"creds": expired}
+        counters = {"reads": 0, "refreshes": 0, "persists": 0}
+        read_gate = threading.Event()      # the winner's FIRST read parks here
+        persist_gate = threading.Event()   # the winner's FIRST persist parks here
+
+        class FakeSwitcher:
+            backup_dir = tmp_path
+
+            def current_account_number(self):
+                return "2"  # pinned account is NOT active
+
+            def resolve_account(self, identifier):
+                return "1", "a@b.c", "org"
+
+            def read_account_credentials(self, num, email):
+                counters["reads"] += 1
+                if counters["reads"] == 1:
+                    # Widens the race window: a second thread's own
+                    # pre-lock `_cred_cache` check must run, and find
+                    # nothing, before the winner's rotation lands there.
+                    read_gate.wait(timeout=5)
+                return state["creds"]
+
+            def persist_backup_credentials(self, num, email, creds):
+                counters["persists"] += 1
+                if counters["persists"] == 1:
+                    persist_gate.wait(timeout=5)
+                state["creds"] = creds
+
+        def fake_refresh(creds):
+            counters["refreshes"] += 1
+            from claude_swap import oauth as _o
+            return _o.RefreshOutcome(rotated, None)
+
+        import claude_swap.oauth as oauth_mod
+        monkeypatch.setattr(oauth_mod, "try_refresh_oauth_credentials",
+                             fake_refresh)
+        import cswap_pin.proxy as pin_proxy
+        monkeypatch.setattr(pin_proxy, "pin_profile_for",
+                             lambda token: {"emailAddress": "a@b.c"})
+
+        provider = make_pin_token_provider(FakeSwitcher(), "1", "a@b.c")
+        t1_result, t2_result = [], []
+        t1 = threading.Thread(target=lambda: t1_result.append(provider()))
+        t1.start()
+        # Wait for the winner to actually hold refresh_lock (it will be
+        # parked in its first read, inside the critical section).
+        deadline = time.monotonic() + 5
+        while not provider.refresh_lock.locked() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert provider.refresh_lock.locked(), "the winner never took the lock"
+
+        t2 = threading.Thread(target=lambda: t2_result.append(provider()))
+        t2.start()
+        # Give the queued reader a moment to run its OWN pre-lock
+        # `_cred_cache` check (a miss, since the winner hasn't written yet)
+        # and block on `refresh_lock.acquire()`, before the winner is let
+        # through.
+        time.sleep(0.1)
+
+        read_gate.set()  # the winner's read returns; it refreshes next
+        t2.join(timeout=5)
+        assert not t2.is_alive(), "the queued reader never returned"
+
+        persist_gate.set()
+        t1.join(timeout=5)
+
+        assert counters["refreshes"] == 1, (
+            f"refreshed {counters['refreshes']}x — the queued reader re-read "
+            "the not-yet-persisted store and spent the one-time refresh "
+            "token a second time"
+        )
+        assert t1_result == ["new"] and t2_result == ["new"]
+
 
 class TestAmbientProxyPrefersTheLauncherProxy:
     """cc-wrapper starts a per-session cache proxy (CCF) and points the

@@ -5695,56 +5695,72 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         token = None
         rotated = None
         try:
-            # Someone may have rotated it while we waited, or this is the
-            # cold-cache case above and this IS the first read — either way
-            # the read happens here, under the lock.
-            creds = switcher.read_account_credentials(num, mail) or creds
-            if not creds:
-                # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
-                # empty read and a read of the WRONG slot are indistinguishable
-                # from the warning alone, and hours went into a machine where
-                # the second was never excluded. The provider is the only
-                # place that knows what it asked for.
-                provider.blind_reason = f"no credential for slot {num} ({mail})"
-                return None
-            provider.blind_reason = ""
-            # REPLACE THE HELD COPY, or the cache keeps handing back the
-            # expired blob and every later request re-enters this lock.
-            _cred_cache[ckey] = creds
-            token = _live_token(creds)
-            if not token:
-                # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error`
-                # already classifies this -- `invalid_grant` means the
-                # lineage is dead and only a person can fix it, `transient`
-                # means try again -- and it was being dropped on the floor.
-                def _consume_recording(c):
-                    out = _consume(c, num, mail)
-                    err = getattr(out, "error", None)
-                    if err:
-                        provider.blind_reason = (
-                            f"refresh {err} for slot {num} ({mail})")
-                    return out
+            # A RACING THREAD MAY HAVE ALREADY ROTATED THIS SLOT WHILE WE
+            # QUEUED ON THIS LOCK. `_cred_cache[ckey]` is written (below, and
+            # by any other thread's own pass through this same critical
+            # section) BEFORE its writer releases the lock -- so a live
+            # entry here, now that we hold the lock, is already the
+            # winner's rotation. Reuse it rather than re-reading the
+            # on-disk store: that store is not guaranteed to reflect the
+            # rotation yet (the persist below runs AFTER the lock releases,
+            # behind a network identity probe), and reading it here would
+            # hand back the already-consumed one-time refresh token for a
+            # second, doomed refresh.
+            fresh = _cred_cache.get(ckey)
+            token = _live_token(fresh) if fresh is not None else None
+            if token:
+                provider.blind_reason = ""
+            else:
+                # Someone may have rotated it while we waited, or this is the
+                # cold-cache case above and this IS the first read — either way
+                # the read happens here, under the lock.
+                creds = switcher.read_account_credentials(num, mail) or creds
+                if not creds:
+                    # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
+                    # empty read and a read of the WRONG slot are indistinguishable
+                    # from the warning alone, and hours went into a machine where
+                    # the second was never excluded. The provider is the only
+                    # place that knows what it asked for.
+                    provider.blind_reason = f"no credential for slot {num} ({mail})"
+                    return None
+                provider.blind_reason = ""
+                # REPLACE THE HELD COPY, or the cache keeps handing back the
+                # expired blob and every later request re-enters this lock.
+                _cred_cache[ckey] = creds
+                token = _live_token(creds)
+                if not token:
+                    # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error`
+                    # already classifies this -- `invalid_grant` means the
+                    # lineage is dead and only a person can fix it, `transient`
+                    # means try again -- and it was being dropped on the floor.
+                    def _consume_recording(c):
+                        out = _consume(c, num, mail)
+                        err = getattr(out, "error", None)
+                        if err:
+                            provider.blind_reason = (
+                                f"refresh {err} for slot {num} ({mail})")
+                        return out
 
-                token, rotated = resolve_pin_token(creds, _consume_recording)
-                if token is None and not getattr(provider, "blind_reason", ""):
-                    # The refresh reported no error and still produced
-                    # nothing. Say that rather than nothing.
-                    provider.blind_reason = (
-                        f"no token after refresh for slot {num} ({mail})")
-                if rotated:
-                    # HELD COPY, SAME AS THE COLD-READ WRITE ABOVE, AND
-                    # UNCONDITIONAL -- the identity verdict (decided AFTER
-                    # this lock releases, below) must not gate whether the
-                    # rotation is kept: `_cred_cache` was left holding the
-                    # pre-refresh (expired) blob after a successful refresh
-                    # otherwise, and `can_pin_cached()` kept reading a
-                    # permanently-expired cache after every rotation.
-                    _cred_cache[ckey] = rotated
-                # The gate persists internally (under the slot lock, CAS on
-                # the refresh-token fingerprint). Persisting again here
-                # would write back OUTSIDE that lock and could clobber a
-                # racing writer's newer lineage — the exact failure the
-                # gate exists to prevent.
+                    token, rotated = resolve_pin_token(creds, _consume_recording)
+                    if token is None and not getattr(provider, "blind_reason", ""):
+                        # The refresh reported no error and still produced
+                        # nothing. Say that rather than nothing.
+                        provider.blind_reason = (
+                            f"no token after refresh for slot {num} ({mail})")
+                    if rotated:
+                        # HELD COPY, SAME AS THE COLD-READ WRITE ABOVE, AND
+                        # UNCONDITIONAL -- the identity verdict (decided AFTER
+                        # this lock releases, below) must not gate whether the
+                        # rotation is kept: `_cred_cache` was left holding the
+                        # pre-refresh (expired) blob after a successful refresh
+                        # otherwise, and `can_pin_cached()` kept reading a
+                        # permanently-expired cache after every rotation.
+                        _cred_cache[ckey] = rotated
+                    # The gate persists internally (under the slot lock, CAS on
+                    # the refresh-token fingerprint). Persisting again here
+                    # would write back OUTSIDE that lock and could clobber a
+                    # racing writer's newer lineage — the exact failure the
+                    # gate exists to prevent.
         finally:
             provider._lock_acquired_at = None
             refresh_lock.release()
