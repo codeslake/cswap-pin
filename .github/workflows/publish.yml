@@ -43,6 +43,18 @@ jobs:
       # was green -- and a release cannot be un-uploaded. Wait for CI to
       # settle (the tag lands seconds after the push that started it), then
       # refuse anything but success. No CI run for the sha is a refusal too.
+      #
+      # `all(...=="success")`, GUARDED ON A NON-ZERO COUNT, NOT `join(",")`. A
+      # commit routinely gets more than one CI run (once on the branch, once
+      # again on main after landing), and `map(.conclusion)|join(",")` turned
+      # two greens into the string "success,success", which matches no case
+      # arm but `*)`. Measured on 3a90985 (v0.1.254): "REFUSED: CI concluded
+      # 'success,success' ... nothing is uploaded" — publish skipped, the tag
+      # left pointing at a release PyPI never received, while 764a44d
+      # (v0.1.253, one CI run) went out clean. `all` alone is not enough: jq's
+      # `all` over an empty array is vacuously true, which would read "no CI
+      # ran at all" as green — so the emptiness is asserted explicitly
+      # (`length>0`) rather than trusted to the elif chain alone.
       - name: CI on this commit must be green
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,7 +62,7 @@ jobs:
           set -u
           for i in $(seq 1 60); do
             v=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --commit "$GITHUB_SHA" \
-                  --json status,conclusion --jq 'if length==0 then "none" elif any(.[]; .status!="completed") then "pending" else (map(.conclusion)|join(",")) end')
+                  --json status,conclusion --jq 'if length==0 then "none" elif any(.[]; .status!="completed") then "pending" elif (length>0 and all(.[]; .conclusion=="success")) then "success" else (map(.conclusion)|join(",")) end')
             case "$v" in
               success) echo "CI green on $GITHUB_SHA"; exit 0 ;;
               pending) echo "CI still running on $GITHUB_SHA ($i/60) — waiting"; sleep 20 ;;
