@@ -508,7 +508,7 @@ class TestPinProxyServer:
         self._bridge_post(
             certdir, monkeypatch,
             seed_verdict=lambda pp, provider: provider.note_verdict(
-                "pin-live-token", "pin@example.com", "foreign"),
+                "pin-live-token", "foreign"),
             expect_swapped=False,
         )
 
