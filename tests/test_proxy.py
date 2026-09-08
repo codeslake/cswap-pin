@@ -10532,7 +10532,8 @@ class TestPinTokenRefreshIsSerialized:
         save_pin(tmp_path, "a@b.c", "org")
 
         state = {"creds": expired}
-        counters = {"reads": 0, "refreshes": 0, "persists": 0}
+        counters = {"reads": 0, "refreshes": 0, "persists": 0,
+                    "current_account_number": 0}
         read_gate = threading.Event()      # the winner's FIRST read parks here
         persist_gate = threading.Event()   # the winner's FIRST persist parks here
 
@@ -10540,6 +10541,7 @@ class TestPinTokenRefreshIsSerialized:
             backup_dir = tmp_path
 
             def current_account_number(self):
+                counters["current_account_number"] += 1
                 return "2"  # pinned account is NOT active
 
             def resolve_account(self, identifier):
@@ -10563,6 +10565,11 @@ class TestPinTokenRefreshIsSerialized:
         def fake_refresh(creds):
             counters["refreshes"] += 1
             from claude_swap import oauth as _o
+            if "rt-1" in creds and counters["refreshes"] > 1:
+                # The real endpoint rejects a spent one-time refresh token.
+                # A queued reader that re-reads and re-spends rt-1 must be
+                # caught by the VALUE, not only by the refresh count.
+                return _o.RefreshOutcome(None, "invalid_grant")
             return _o.RefreshOutcome(rotated, None)
 
         import claude_swap.oauth as oauth_mod
@@ -10585,11 +10592,19 @@ class TestPinTokenRefreshIsSerialized:
 
         t2 = threading.Thread(target=lambda: t2_result.append(provider()))
         t2.start()
-        # Give the queued reader a moment to run its OWN pre-lock
-        # `_cred_cache` check (a miss, since the winner hasn't written yet)
-        # and block on `refresh_lock.acquire()`, before the winner is let
-        # through.
-        time.sleep(0.1)
+        # FORCE the window: wait for t2's OWN pre-lock check (which calls
+        # `current_account_number()` before ever touching `_cred_cache`)
+        # to have run, so it is queued on `refresh_lock.acquire()` -- never
+        # a hoped-for sleep. The winner cannot have written anything yet:
+        # it is still parked in `read_gate.wait()`.
+        deadline = time.monotonic() + 5
+        while (counters["current_account_number"] < 2
+               and time.monotonic() < deadline):
+            time.sleep(0.001)
+        assert counters["current_account_number"] >= 2, (
+            "the queued reader never queued on the lock before the gate "
+            "opened -- the race window this test exists to force never "
+            "opened")
 
         read_gate.set()  # the winner's read returns; it refreshes next
         t2.join(timeout=5)
@@ -10604,6 +10619,109 @@ class TestPinTokenRefreshIsSerialized:
             "token a second time"
         )
         assert t1_result == ["new"] and t2_result == ["new"]
+
+    def case_a_queued_reader_does_not_re_spend_a_liveless_rotation(
+            self, tmp_path, monkeypatch):
+        """Same race as `case_a_queued_reader_reuses_the_winners_rotation`,
+        but the winner's rotation carries NO live token (the refresh
+        response omitted `accessToken`, the real case :5769-5773 declares
+        possible). `_live_token(fresh)` is then None for the queued reader
+        too — it must still recognise `fresh` as the winner's rotation (an
+        object it never saw at its own pre-lock check) and give up, rather
+        than falling through to a re-read of the not-yet-persisted store
+        and a second, doomed refresh with the already-spent token."""
+        import json
+        import threading
+        import time
+
+        from cswap_pin.proxy import make_pin_token_provider, save_pin
+
+        expired = json.dumps({"claudeAiOauth": {
+            "accessToken": "old", "refreshToken": "rt-1", "expiresAt": 1,
+        }})
+        # NO accessToken at all -- `_live_token` returns None for this blob
+        # exactly as it does for `expired`, so the queued reader cannot
+        # tell "rotated but liveless" from "never rotated" by that check
+        # alone; it must use object identity against what it saw pre-lock.
+        liveless_rotation = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "expiresAt": 9999999999000,
+        }})
+        save_pin(tmp_path, "a@b.c", "org")
+
+        state = {"creds": expired}
+        counters = {"reads": 0, "refreshes": 0, "current_account_number": 0}
+        read_gate = threading.Event()
+
+        class FakeSwitcher:
+            backup_dir = tmp_path
+
+            def current_account_number(self):
+                counters["current_account_number"] += 1
+                return "2"
+
+            def resolve_account(self, identifier):
+                return "1", "a@b.c", "org"
+
+            def read_account_credentials(self, num, email):
+                counters["reads"] += 1
+                if counters["reads"] == 1:
+                    read_gate.wait(timeout=5)
+                return state["creds"]
+
+            def persist_backup_credentials(self, num, email, creds):
+                state["creds"] = creds
+
+        def fake_refresh(creds):
+            counters["refreshes"] += 1
+            from claude_swap import oauth as _o
+            return _o.RefreshOutcome(liveless_rotation, None)
+
+        import claude_swap.oauth as oauth_mod
+        monkeypatch.setattr(oauth_mod, "try_refresh_oauth_credentials",
+                             fake_refresh)
+        import cswap_pin.proxy as pin_proxy
+        monkeypatch.setattr(pin_proxy, "pin_profile_for",
+                             lambda token: {"emailAddress": "a@b.c"})
+
+        provider = make_pin_token_provider(FakeSwitcher(), "1", "a@b.c")
+        t1_result, t2_result = [], []
+        t1 = threading.Thread(target=lambda: t1_result.append(provider()))
+        t1.start()
+        deadline = time.monotonic() + 5
+        while not provider.refresh_lock.locked() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert provider.refresh_lock.locked(), "the winner never took the lock"
+
+        t2 = threading.Thread(target=lambda: t2_result.append(provider()))
+        t2.start()
+        # FORCE the window: wait for t2's OWN pre-lock check (which calls
+        # `current_account_number()` before ever touching `_cred_cache`,
+        # `:5637`) to have run, so it is queued on `refresh_lock.acquire()`
+        # -- never a hoped-for sleep. t1 cannot have written anything yet:
+        # it is still parked in `read_gate.wait()`.
+        deadline = time.monotonic() + 5
+        while (counters["current_account_number"] < 2
+               and time.monotonic() < deadline):
+            time.sleep(0.001)
+        assert counters["current_account_number"] >= 2, (
+            "t2 never queued on the lock before the gate opened -- the "
+            "race window this test exists to force never opened")
+
+        read_gate.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert not t1.is_alive() and not t2.is_alive()
+
+        assert counters["reads"] == 1, (
+            f"read the store {counters['reads']}x — the queued reader "
+            "re-read the not-yet-persisted store instead of recognising "
+            "the winner's (liveless) rotation"
+        )
+        assert counters["refreshes"] == 1, (
+            f"refreshed {counters['refreshes']}x — the queued reader "
+            "re-spent the winner's already-consumed one-time refresh token"
+        )
+        assert t1_result == [None] and t2_result == [None]
 
 
 class TestAmbientProxyPrefersTheLauncherProxy:

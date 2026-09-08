@@ -5710,6 +5710,21 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             token = _live_token(fresh) if fresh is not None else None
             if token:
                 provider.blind_reason = ""
+            elif fresh is not None and fresh is not cached:
+                # A RACING THREAD ROTATED THIS SLOT WHILE WE QUEUED, but its
+                # rotation carries no live token (no `accessToken`, or an
+                # `expiresAt` already inside the margin). `fresh` is still
+                # the newest state -- `cached` is what THIS call saw before
+                # ever touching the lock (`None` on a cold read), so
+                # identity, not liveness, is what says someone else already
+                # ran the critical section. The on-disk store still holds
+                # the refresh token that rotation already spent; re-reading
+                # it now would refresh a second time with the same
+                # already-consumed one-time token.
+                creds = fresh
+                provider.blind_reason = (
+                    f"no usable token after a racing refresh for slot "
+                    f"{num} ({mail})")
             else:
                 # Someone may have rotated it while we waited, or this is the
                 # cold-cache case above and this IS the first read — either way
