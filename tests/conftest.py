@@ -41,6 +41,23 @@ def _never_touch_the_real_claude_config(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_profile_never_dials_out(monkeypatch):
+    """No test may reach api.anthropic.com. `make_pin_token_provider`'s
+    mint-time identity check calls `pin_profile_for` on every fresh mint, so
+    any case that mints a real token now makes that call unless it stubs
+    one -- and most do not need to, they are testing something else. Default
+    to the same "could not ask" answer a real network failure produces (the
+    provider's own fail-open, no crash, no wait); a case that DOES want to
+    assert identity behaviour overrides this with its own
+    `monkeypatch.setattr(pin_proxy, "pin_profile_for", ...)`, layered on top
+    and winning for that test.
+    """
+    from cswap_pin import proxy as _p
+
+    monkeypatch.setattr(_p, "pin_profile_for", lambda token: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_daemon_thread_outlives_its_test():
     """A daemon thread that outlives its test runs against the NEXT test.
 
@@ -366,6 +383,49 @@ def _shared_ca(monkeypatch, tmp_path_factory):
         if getattr(mod, "__name__", "").startswith(("test_", "tests.")):
             if getattr(mod, "ensure_ca", None) is real:
                 monkeypatch.setattr(mod, "ensure_ca", fast_ensure_ca, raising=False)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _occupy_the_daemon_port():
+    """Hold ``127.0.0.1:36301`` for the whole run so no case can be handed it.
+
+    `bind(0)` draws from the ephemeral range, and on linux that range
+    (32768-60999) CONTAINS the 36301 several classes use as the daemon's port;
+    macOS's (49152-65535) does not. `test_proxy.py::_dead_port` already
+    documents the consequence: a draw that collides makes `_wired_port() ==
+    port` true, the claim check short-circuits to "already wired" and never
+    reaches the repair. Roughly once in 28k draws, ubuntu only — which is
+    exactly the one-job-red split seen twice in CI, run 33290951823
+    (`TestTheDaemonRepairsItsOwnWiring`, `assert [] == [36301]`) and run
+    34171357878 (`TestTheDaemonWatchesItsOwnCode`, `assert 36301 != 36301`).
+
+    Occupying the port deletes the draw. This is also why the box the suite is
+    developed on has never seen it: a live pin already holds 36301 there. The
+    fixture reproduces that condition deliberately.
+
+    ALREADY HELD IS THE SUCCESS CASE. A bind that fails means something else
+    occupies the port, which achieves the identical goal, so the error is
+    swallowed and only a socket we opened is ever closed. No `SO_REUSEADDR` or
+    `SO_REUSEPORT` — exclusive occupation is the entire point.
+
+    `test_meta.py::test_the_daemon_port_is_occupied_for_the_whole_run` is what
+    stops this going quiet: a fixture that silently stops binding looks exactly
+    like one that works, because the flake it prevents is ~2 in 173 runs.
+    """
+    import socket
+
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 36301))
+        s.listen(1)
+    except OSError:
+        s.close()
+        yield
+        return
+    try:
+        yield
+    finally:
+        s.close()
 
 
 @pytest.fixture(scope="session")

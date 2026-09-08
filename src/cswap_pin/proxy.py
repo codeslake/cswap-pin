@@ -5518,18 +5518,15 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     _deferred: set[int] = set()
 
     # UNKNOWN NEVER VOUCHES AND NEVER FLIPS. A per-(token, mail) verdict --
-    # NOT token alone: the store can answer one string for two different
-    # pinned slots across a re-pin, and a slot's own OK must never vouch for
-    # a different slot's bearer. "ok"/"foreign" are settled and never
-    # re-probed (a store repair or a re-pin mints a new pair); "unknown" --
-    # an exception, a timeout, a non-dict answer, or no comparable field on
-    # either side -- re-probes after one backoff instead of being cached
-    # indefinitely (a single blip must not stand in for expiry) or trusted
-    # immediately (that is the fail-open a foreign store also gets for
-    # free). {(token, mail): (verdict, bearer_ref, next_probe_at)}. Shared
-    # with `_freshen_pin_identity`'s own (uuid-based) finding via
-    # `note_verdict`, so a settled foreign answer there is never re-opened
-    # by a mint's later "unknown" probe.
+    # NOT token alone (a cross-wired store can answer one string for two
+    # different pinned slots) and NOT `_cred_cache` -- a verdict never pops
+    # or skips that cache; the store is still read once per rotation, and
+    # every access (cache hit or miss) re-checks the verdict cache below
+    # instead of trusting a token forever once cached. "ok"/"foreign" are
+    # settled and never re-probed (a store repair or a re-pin mints a new
+    # pair); "unknown" -- an exception, a timeout, a non-dict answer, or no
+    # comparable field on either side -- re-probes after one backoff.
+    # {(token, mail.lower()): (verdict, bearer_ref, next_probe_at)}.
     _identity_cache: dict = {}
 
     def _ref(email=None, uuid=None) -> dict:
@@ -5538,108 +5535,101 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         beat only ever has uuids. Either half absent reads as null."""
         return {"email": email, "uuid": uuid}
 
-    def _record_verdict(key, verdict: str, pinned_ref=None,
-                         bearer_ref=None) -> None:
-        _identity_cache[key] = (
-            verdict, bearer_ref, time.monotonic() + _IDENTITY_PROBE_BACKOFF_S)
-        if verdict == "foreign":
-            _set_identity({"pinned": pinned_ref, "bearer": bearer_ref})
-        elif verdict == "ok":
-            _set_identity(None)
-
-    def _identity_verdict(token: str, mail: str) -> "tuple[str, dict | None]":
-        key = (token, mail)
-        now = time.monotonic()
-        cached = _identity_cache.get(key)
-        if cached and (cached[0] != "unknown" or now < cached[2]):
-            return cached[0], cached[1]
-        verdict, bearer_ref = "unknown", None
-        try:
-            fresh = pin_profile_for(token)
-        except Exception:  # noqa: BLE001 — a flaky probe must not crash a mint
-            fresh = None
-        # COMPARE EMAIL, THE ONLY FIELD THIS SCOPE HAS GROUND TRUTH FOR.
-        # There is no certdir here (see `make_pin_token_provider`'s
-        # docstring), so no pin uuid to fall back to when the profile omits
-        # an email -- that comparison belongs to `_freshen_pin_identity`,
-        # which has one. Without a comparable field on both sides this stays
-        # "unknown", never "foreign".
-        if isinstance(fresh, dict):
-            pin_email = (mail or "").lower()
-            bearer_email = fresh.get("emailAddress")
-            if bearer_email and pin_email:
-                verdict = ("ok" if str(bearer_email).lower() == pin_email
-                           else "foreign")
-                bearer_ref = _ref(str(bearer_email), fresh.get("accountUuid"))
-        _record_verdict(key, verdict, _ref(mail), bearer_ref)
-        return verdict, bearer_ref
-
     def _set_identity(mismatch: "dict | None") -> None:
         """The one place a transition logs -- shared with
-        `_freshen_pin_identity` via `note_verdict`, so its clean/foreign
-        finding cannot desync from this closure's log state (measured:
-        freshen cleared the field directly once, so the next foreign mint
-        here saw no transition and logged nothing)."""
+        `_freshen_pin_identity` via `note_verdict`."""
         was = provider.identity_mismatch
         provider.identity_mismatch = mismatch
         if bool(mismatch) == bool(was):
             return
         if mismatch:
-            pinned, bearer = mismatch["pinned"], mismatch["bearer"]
             who = lambda r: (r or {}).get("email") or (r or {}).get("uuid")
             _log_lifecycle(
-                f"the pin ({who(pinned)}) answers as {who(bearer)} -- "
-                "refusing to splice a foreign bearer, treating this "
-                "exactly like an empty read")
+                f"the pin ({who(mismatch['pinned'])}) answers as "
+                f"{who(mismatch['bearer'])} -- refusing to splice a "
+                "foreign bearer, treating this exactly like an empty read")
         else:
             _log_lifecycle(
                 "the pin answers as itself again -- resuming normal "
                 "pin splicing")
 
-    def _note_verdict(token: "str | None", mail: str, verdict: str,
-                       pinned_ref=None, bearer_ref=None) -> None:
-        """`_freshen_pin_identity`'s own (uuid-based) finding, fed into the
-        SAME verdict cache `_identity_verdict` consults -- a mint's later
-        probe on this same token answering "unknown" (a timeout, a 401)
-        must never read as if nothing were known, while freshen's own
-        confirmed finding stands. A foreign finding also drops `_cred_cache`
-        entirely (unlike a mint's own targeted pop, freshen does not know
-        which (num, mail) pair minted this token) -- or a still-valid,
-        already-cached copy would keep answering the lock-free fast path
-        with no verdict ever consulted again."""
-        if token:
-            _record_verdict((token, mail), verdict, pinned_ref, bearer_ref)
-        elif verdict == "foreign":
-            _set_identity({"pinned": pinned_ref, "bearer": bearer_ref})
-        else:
-            _set_identity(None)
-        if verdict == "foreign":
-            _cred_cache.clear()
-
-    def _identity_ok(token: str, num: str, mail: str) -> "str":
-        """The verdict for `token` -- see `_identity_verdict`. Returns the
-        raw string ("ok"/"foreign"/"unknown") so callers can decide whether
-        THIS credential is safe to keep behind the lock-free fast path
-        (only "ok" is: an "unknown" one must not bypass its own next probe
-        once the backoff passes -- see the two call sites below).
-
-        THE INVARIANT: the pin never splices a bearer whose identity is not
-        the pin's. A foreign verdict is never cached and never spliced -- an
-        empty read of the wrong slot, indistinguishable in effect from an
-        empty read of no slot at all.
+    def _identity_ok(token: str, mail: str) -> bool:
+        """THE INVARIANT: the pin never splices a bearer whose identity is
+        not the pin's. Keyed on (token, mail) -- the token cache's OWN key,
+        so a settled verdict is consulted on every access, cache hit or
+        miss, and never bypassed. A CONFIRMED foreign token also sets
+        `provider._foreign_this_call` and `provider.blind_reason`, read
+        THIS CALL ONLY by `_can_mint`/`can_pin_cached`/`_warn_unpinnable` --
+        never the sticky `identity_mismatch` dict, which is for /health and
+        the transition log alone: a later, UNRELATED failure (the store
+        going unreadable) must read as that failure, not as a stale foreign
+        verdict from a previous call.
         """
-        verdict, bearer_ref = _identity_verdict(token, mail)
+        key = (token, (mail or "").lower())
+        now = time.monotonic()
+        cached = _identity_cache.get(key)
+        if cached and (cached[0] != "unknown" or now < cached[2]):
+            verdict, bearer_ref = cached[0], cached[1]
+        else:
+            verdict, bearer_ref = "unknown", None
+            try:
+                fresh = pin_profile_for(token)
+            except Exception:  # noqa: BLE001 — a flaky probe must not crash a mint
+                fresh = None
+            # COMPARE EMAIL, THE ONLY FIELD THIS SCOPE HAS GROUND TRUTH FOR.
+            # There is no certdir here (see this function's module-level
+            # sibling `make_pin_token_provider`'s docstring), so no pin uuid
+            # to fall back to when the profile omits an email -- that
+            # comparison belongs to `_freshen_pin_identity`, which has one.
+            if isinstance(fresh, dict):
+                pin_email = (mail or "").lower()
+                bearer_email = fresh.get("emailAddress")
+                if bearer_email and pin_email:
+                    verdict = ("ok" if str(bearer_email).lower() == pin_email
+                               else "foreign")
+                    bearer_ref = _ref(str(bearer_email), fresh.get("accountUuid"))
+            _identity_cache[key] = (
+                verdict, bearer_ref, now + _IDENTITY_PROBE_BACKOFF_S)
         if verdict == "foreign":
-            _cred_cache.pop((num, mail), None)
+            _set_identity({"pinned": _ref(mail), "bearer": bearer_ref})
+            provider._tls.foreign = True
             who = (bearer_ref or {}).get("email") or (bearer_ref or {}).get("uuid")
             provider.blind_reason = (
                 f"the pinned slot's credential answers as {who}, not "
                 f"the pin ({mail})")
-        return verdict
+            return False
+        if verdict == "ok":
+            _set_identity(None)
+        return True
+
+    def _note_verdict(token: "str | None", verdict: str,
+                       bearer_ref=None) -> None:
+        """`_freshen_pin_identity`'s own (uuid-based) finding, fed into the
+        SAME verdict cache `_identity_ok` reads. KEYED ON THIS PROVIDER'S
+        OWN mail (`_current_target()`, the same `switcher.resolve_account()
+        [1]`) -- NEVER a caller-supplied one: freshen used to key on the
+        profile's own (optional, differently-cased) email, so its "foreign"
+        landed under a key no mint ever read and a later mint's "unknown"
+        still spliced while /health showed the mismatch."""
+        target = _current_target()
+        mail = target[1] if target else None
+        if token and mail:
+            _identity_cache[(token, mail.lower())] = (
+                verdict, bearer_ref, time.monotonic() + _IDENTITY_PROBE_BACKOFF_S)
+        if verdict == "foreign":
+            _set_identity({"pinned": _ref(mail), "bearer": bearer_ref})
+        elif verdict == "ok":
+            _set_identity(None)
 
     def provider() -> str | None:
         _deferred.discard(1)
         _stalled.flag = False
+        # PER-CALL, always reset here -- read by `_can_mint`,
+        # `can_pin_cached` and the request path's `_warn_unpinnable`
+        # instead of the sticky `identity_mismatch` dict, so a LATER,
+        # unrelated failure (the store going unreadable) is never masked by
+        # a foreign verdict this same provider gave on some earlier call.
+        provider._tls.foreign = False
         target = _current_target()
         if target is None:
             return None
@@ -5652,18 +5642,11 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # ~20ms added to the one channel whose latency is what a live claude.ai
         # view times out on.
         #
-        # KEYED ON THE ACCOUNT, which is what keeps `cswap pin <other>` working
-        # under a live session. The pin is still re-read from disk every
-        # request; only the CREDENTIAL for an account already resolved is held,
-        # so a re-pin is a different key and therefore a miss. The TTL then
-        # bounds the one case the key cannot see: the same account's credential
-        # rotated underneath us by the usage collector or the autoswitcher.
-        # KEYED ON (slot, email), NOT the slot alone. A slot is stable while
-        # the identity in it is not — `cswap move` renumbers, and a stub that
-        # returned one number for two emails proved the point in the suite: the
-        # re-pin case failed because the cache answered for the previous
-        # account. The email is the half that actually identifies who this
-        # credential belongs to.
+        # KEYED ON (slot, email), NOT the slot alone -- a slot is stable
+        # while the identity in it is not (`cswap move` renumbers), and the
+        # email is the half that actually identifies who a credential
+        # belongs to. Re-read from disk every request, so a re-pin is a
+        # different key and therefore a miss, without a restart.
         ckey = (num, mail)
         # EXPIRY IS THE INVALIDATION, NOT TIME. An access token carries its
         # own expiry, and another process rotating the stored credential does
@@ -5672,15 +5655,17 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # something that cannot have happened yet, and the first cut of this
         # cache had a 5s one for exactly that non-reason.
         #
-        # The rotation case is handled where it matters: when the held token
-        # IS expired, the refresh path below takes the lock and re-reads the
-        # store before deciding. That re-read predates this cache.
+        # NEVER INVALIDATED BY A VERDICT EITHER: a foreign or unknown token
+        # stays exactly as cached as an ok one -- the store is still read
+        # once per rotation, not once per probe-backoff-window, and every
+        # access (this fast path AND the cold path below) re-asks
+        # `_identity_ok`, which is what actually decides whether to splice.
         cached = _cred_cache.get(ckey)
         if cached is not None:
             provider.blind_reason = ""
             token = _live_token(cached)
             if token:
-                return token  # common path: no lock, no network
+                return token if _identity_ok(token, mail) else None
             creds = cached
         else:
             # COLD -- the very first read for this key, which is EVERY key on
@@ -5707,82 +5692,112 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 "stuck credential read or refresh, not a broken pin")
             return None
         provider._lock_acquired_at = time.monotonic()
+        token = None
+        rotated = None
         try:
-            # Someone may have rotated it while we waited, or this is the
-            # cold-cache case above and this IS the first read — either way
-            # the read happens here, under the lock.
-            creds = switcher.read_account_credentials(num, mail) or creds
-            if not creds:
-                # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
-                # empty read and a read of the WRONG slot are indistinguishable
-                # from the warning alone, and hours went into a machine where
-                # the second was never excluded. The provider is the only
-                # place that knows what it asked for.
-                provider.blind_reason = f"no credential for slot {num} ({mail})"
-                return None
-            provider.blind_reason = ""
-            # REPLACE THE HELD COPY, or the cache keeps handing back the
-            # expired blob and every later request re-enters this lock.
-            _cred_cache[ckey] = creds
-            token = _live_token(creds)
+            # A RACING THREAD MAY HAVE ALREADY ROTATED THIS SLOT WHILE WE
+            # QUEUED ON THIS LOCK. `_cred_cache[ckey]` is written (below, and
+            # by any other thread's own pass through this same critical
+            # section) BEFORE its writer releases the lock -- so a live
+            # entry here, now that we hold the lock, is already the
+            # winner's rotation. Reuse it rather than re-reading the
+            # on-disk store: that store is not guaranteed to reflect the
+            # rotation yet (the persist below runs AFTER the lock releases,
+            # behind a network identity probe), and reading it here would
+            # hand back the already-consumed one-time refresh token for a
+            # second, doomed refresh.
+            fresh = _cred_cache.get(ckey)
+            token = _live_token(fresh) if fresh is not None else None
             if token:
-                verdict = _identity_ok(token, num, mail)
-                if verdict == "foreign":
-                    return None
-                if verdict == "unknown":
-                    # R7: an unknown verdict must not sit behind the
-                    # lock-free fast path above -- that would skip its own
-                    # next probe forever, once the backoff passes.
-                    _cred_cache.pop(ckey, None)
-                return token
-            # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error` already
-            # classifies this -- `invalid_grant` means the lineage is dead and
-            # only a person can fix it, `transient` means try again -- and it
-            # was being dropped on the floor. The warning then said "could not
-            # be read" for a credential that read perfectly, whose ACCESS token
-            # had merely expired and whose refresh the server had rejected.
-            # Those need opposite responses and looked identical in a log.
-            def _consume_recording(c):
-                out = _consume(c, num, mail)
-                err = getattr(out, "error", None)
-                if err:
-                    provider.blind_reason = (
-                        f"refresh {err} for slot {num} ({mail})")
-                return out
-
-            token, rotated = resolve_pin_token(creds, _consume_recording)
-            if token is None and not getattr(provider, "blind_reason", ""):
-                # The refresh reported no error and still produced nothing.
-                # Say that rather than nothing.
+                provider.blind_reason = ""
+            elif fresh is not None and fresh is not cached:
+                # A RACING THREAD ROTATED THIS SLOT WHILE WE QUEUED, but its
+                # rotation carries no live token (no `accessToken`, or an
+                # `expiresAt` already inside the margin). `fresh` is still
+                # the newest state -- `cached` is what THIS call saw before
+                # ever touching the lock (`None` on a cold read), so
+                # identity, not liveness, is what says someone else already
+                # ran the critical section. The on-disk store still holds
+                # the refresh token that rotation already spent; re-reading
+                # it now would refresh a second time with the same
+                # already-consumed one-time token.
+                creds = fresh
                 provider.blind_reason = (
-                    f"no token after refresh for slot {num} ({mail})")
-            verdict = _identity_ok(token, num, mail) if token else None
-            if verdict == "foreign":
-                # NEITHER CACHED NOR PERSISTED. `_identity_ok` already popped
-                # the pre-refresh blob `_cred_cache` held; a rotated-but-
-                # foreign credential must not replace it or be written back
-                # to the store either -- that would reinforce the exact
-                # corruption this check exists to catch.
-                return None
-            if rotated and verdict != "unknown":
-                # HELD COPY, SAME AS THE COLD-READ WRITE ABOVE. `_cred_cache`
-                # was left holding the pre-refresh (expired) blob after a
-                # successful refresh -- `can_pin_cached()`, and therefore
-                # `/health`'s `can_pin`, kept reading a permanently-expired
-                # cache after every rotation, until the NEXT credential read
-                # happened to run. An "unknown" verdict skips this for the
-                # same reason the cold-read site does (R7).
-                _cred_cache[ckey] = rotated
-            # The gate persists internally (under the slot lock, CAS on the
-            # refresh-token fingerprint). Persisting again here would write
-            # back OUTSIDE that lock and could clobber a racing writer's
-            # newer lineage — the exact failure the gate exists to prevent.
-            if rotated and not hasattr(switcher, "consume_backup_grant"):
-                switcher.persist_backup_credentials(num, mail, rotated)
-            return token
+                    f"no usable token after a racing refresh for slot "
+                    f"{num} ({mail})")
+            else:
+                # Someone may have rotated it while we waited, or this is the
+                # cold-cache case above and this IS the first read — either way
+                # the read happens here, under the lock.
+                creds = switcher.read_account_credentials(num, mail) or creds
+                if not creds:
+                    # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
+                    # empty read and a read of the WRONG slot are indistinguishable
+                    # from the warning alone, and hours went into a machine where
+                    # the second was never excluded. The provider is the only
+                    # place that knows what it asked for.
+                    provider.blind_reason = f"no credential for slot {num} ({mail})"
+                    return None
+                provider.blind_reason = ""
+                # REPLACE THE HELD COPY, or the cache keeps handing back the
+                # expired blob and every later request re-enters this lock.
+                _cred_cache[ckey] = creds
+                token = _live_token(creds)
+                if not token:
+                    # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error`
+                    # already classifies this -- `invalid_grant` means the
+                    # lineage is dead and only a person can fix it, `transient`
+                    # means try again -- and it was being dropped on the floor.
+                    def _consume_recording(c):
+                        out = _consume(c, num, mail)
+                        err = getattr(out, "error", None)
+                        if err:
+                            provider.blind_reason = (
+                                f"refresh {err} for slot {num} ({mail})")
+                        return out
+
+                    token, rotated = resolve_pin_token(creds, _consume_recording)
+                    if token is None and not getattr(provider, "blind_reason", ""):
+                        # The refresh reported no error and still produced
+                        # nothing. Say that rather than nothing.
+                        provider.blind_reason = (
+                            f"no token after refresh for slot {num} ({mail})")
+                    if rotated:
+                        # HELD COPY, SAME AS THE COLD-READ WRITE ABOVE, AND
+                        # UNCONDITIONAL -- the identity verdict (decided AFTER
+                        # this lock releases, below) must not gate whether the
+                        # rotation is kept: `_cred_cache` was left holding the
+                        # pre-refresh (expired) blob after a successful refresh
+                        # otherwise, and `can_pin_cached()` kept reading a
+                        # permanently-expired cache after every rotation.
+                        _cred_cache[ckey] = rotated
+                    # The gate persists internally (under the slot lock, CAS on
+                    # the refresh-token fingerprint). Persisting again here
+                    # would write back OUTSIDE that lock and could clobber a
+                    # racing writer's newer lineage — the exact failure the
+                    # gate exists to prevent.
         finally:
             provider._lock_acquired_at = None
             refresh_lock.release()
+        # THE PROBE RUNS OUTSIDE THE LOCK: it only needs the token string,
+        # and every OTHER pinned thread must not queue behind a network call
+        # this one is making for itself. NO TOKEN AT ALL (a refresh that
+        # succeeded but whose rotated blob carries no `accessToken`) means
+        # there is nothing to probe with, and defaults to "not foreign" --
+        # a missing accessToken is a host quirk, not the store answering as
+        # someone else, and must not gate the persist below.
+        foreign = bool(token) and not _identity_ok(token, mail)
+        # NEVER PERSIST A FOREIGN VERDICT'S ROTATION: this fallback path is
+        # for a switcher that predates `consume_backup_grant` (the gated one
+        # persists internally, above); it must not write a foreign bearer's
+        # rotated bytes back under this slot -- would reinforce the exact
+        # corruption this branch exists to stop. GATED ON THE FOREIGN
+        # VERDICT ALONE, not on `bool(token)`: the one-time refresh token is
+        # spent the moment `rotated` exists, whether or not the blob it
+        # produced happens to carry an `accessToken`, and skipping the write
+        if rotated and not foreign and not hasattr(switcher, "consume_backup_grant"):
+            switcher.persist_backup_credentials(num, mail, rotated)
+        return token if (token and not foreign) else None
 
     def pin_is_noop() -> bool:
         """True when returning no token is the CORRECT answer, not a failure.
@@ -5833,14 +5848,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         """
         if pin_is_noop():
             return True
-        if provider.identity_mismatch is not None:
-            # R8: a foreign bearer is a DECLINED splice, not a failed mint
-            # -- the store answered, this daemon just must not use it.
-            # `can_pin` feeds `_read_alive_port`'s recycle-on-False check
-            # (`ensure_proxy`), and a fresh process reads the same
-            # cross-wired store, so recycling here is a Rule 0 hazard for
-            # no repair. `pin_identity_mismatch` is what carries the state.
-            return True
+        # A FOREIGN VERDICT NEEDS NO SPECIAL CASE HERE: `_cred_cache` is
+        # never invalidated by a verdict (see `provider`), so a declined
+        # token is still the one this reads -- a daemon that CAN mint
+        # (just declines to splice) correctly answers true, without
+        # consulting the sticky `identity_mismatch` dict (see `_identity_ok`
+        # for why that dict must never gate this).
         target = _current_target()
         if target is None:
             return True
@@ -5853,10 +5866,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.can_pin_cached = can_pin_cached
     provider._lock_acquired_at = None
     # None: the last verified mint answered as the pin. A dict
-    # ({"pinned": ..., "bearer": ...}) while it does not -- set through
-    # `note_verdict` by `_identity_ok` above (via `_record_verdict`) and, at
-    # its 12h beat, by `_freshen_pin_identity`.
+    # ({"pinned": ..., "bearer": ...}) while it does not -- set by
+    # `_identity_ok` above and, at its 12h beat, by `_freshen_pin_identity`
+    # via `note_verdict`. /health and the transition log ONLY -- never a
+    # gate; see `_identity_ok`'s docstring for `_foreign_this_call`, which
+    # is that gate.
     provider.identity_mismatch = None
+    provider._tls = threading.local()
     provider.note_verdict = _note_verdict
     return provider
 
@@ -5903,13 +5919,13 @@ def _can_mint(provider) -> "bool | None":
         token = provider()
         if token:
             return True
-        # R8: A FOREIGN VERDICT IS A DECLINED SPLICE, NOT A FAILED MINT. The
+        # A FOREIGN VERDICT IS A DECLINED SPLICE, NOT A FAILED MINT. The
         # store answered; this daemon just must not use what it said. The
         # self-heal watchdog reads `is False` as "recycle me" -- and a
         # recycle cannot repair a cross-wired credential store, since a
-        # fresh process reads the very same one. Not blind, no marker, no
-        # recycle; `identity_mismatch` is what carries the state.
-        if getattr(provider, "identity_mismatch", None) is not None:
+        # fresh process reads the very same one. THIS CALL'S OWN flag, not
+        # the sticky `identity_mismatch` -- see `_identity_ok`.
+        if getattr(getattr(provider, "_tls", None), "foreign", False):
             return True
         return _pin_is_noop(provider)
     except Exception:  # noqa: BLE001 — a health question is never fatal
@@ -13741,6 +13757,15 @@ class PinProxy:
         # the pin's, and the uuid check below is what keeps a foreign answer
         # out. Same fallback `sweep_policy_once` makes.
         provider_token = self._pin_token_provider()
+        # ONLY A provider()-SOURCED TOKEN FEEDS THE MINT-TIME STATE below,
+        # via `note_verdict`: the `_active_oauth_token()` fallback answers
+        # for the pin==active no-op case, and judging THAT bearer would
+        # read a merely deferred or stalled provider (also None) as a
+        # confirmed foreign identity, overriding /health's deliberate
+        # can_pin=True for that case. Hoisted once: a bare test double
+        # carries no `note_verdict` at all.
+        note_verdict = provider_token and getattr(
+            self._pin_token_provider, "note_verdict", None)
         token = provider_token or _active_oauth_token()
         fresh = pin_profile_for(token) if token else None
         if not fresh or fresh.get("accountUuid") != ident.get("accountUuid"):
@@ -13758,27 +13783,14 @@ class PinProxy:
                     f"the pin's profile stamp is {age_s / 3600:.0f}h old and "
                     f"could not be refreshed: {why} — Claude Code re-fetches "
                     "it as the active account on the next session start")
-            # ONLY A provider()-SOURCED TOKEN FEEDS THE MINT-TIME STATE. The
-            # `_active_oauth_token()` fallback answers for the pin==active
-            # no-op case; judging THAT bearer would read a merely deferred or
-            # stalled provider (also None) as a confirmed foreign identity,
-            # overriding /health's deliberate can_pin=True for that case.
-            if fresh and provider_token:
-                note_verdict = getattr(
-                    self._pin_token_provider, "note_verdict", None)
-                if note_verdict:
-                    note_verdict(
-                        provider_token, ident.get("emailAddress"), "foreign",
-                        {"email": ident.get("emailAddress"),
-                         "uuid": ident.get("accountUuid")},
-                        {"email": fresh.get("emailAddress"),
-                         "uuid": fresh.get("accountUuid")})
+            if fresh and note_verdict:
+                note_verdict(
+                    provider_token, "foreign",
+                    {"email": fresh.get("emailAddress"),
+                     "uuid": fresh.get("accountUuid")})
             return False
-        if provider_token:
-            note_verdict = getattr(
-                self._pin_token_provider, "note_verdict", None)
-            if note_verdict:
-                note_verdict(provider_token, ident.get("emailAddress"), "ok")
+        if note_verdict:
+            note_verdict(provider_token, "ok")
         remember_pin_identity(certdir, {**ident, **fresh})
         _log_lifecycle("refreshed the pin's profile from the server, so the "
                        "live config stays inside Claude Code's fetch window")
@@ -14909,13 +14921,25 @@ class PinProxy:
         """
         if getattr(self, "_warned_unpinnable", False):
             return
+        # A FOREIGN VERDICT NEVER REACHES THE LATCH, checked HERE rather than
+        # only at the call site -- a second caller added later that skips a
+        # guard it never knew to duplicate would otherwise consume this
+        # once-per-daemon budget on a declined splice, silencing the warning
+        # (and the record) for a LATER, genuinely unreadable store on the
+        # same daemon (I2). The advice below — "re-run `cswap pin` from a
+        # normal terminal" — is also wrong for this case, so nothing here
+        # fires for it: not the latch, not `mark_daemon_unpinnable`, not the
+        # stderr line.
+        if getattr(getattr(getattr(self, "_pin_token_provider", None),
+                            "_tls", None), "foreign", False):
+            return
         self._warned_unpinnable = True
-        # RECORD IT, do not only say it. The advice this prints — "re-run
-        # `cswap pin` from a normal terminal" — cannot work on its own:
-        # ensure_proxy reuses any daemon whose fingerprint matches, so the re-
-        # run finds this same blind daemon and returns it. Written to the state
-        # file so the NEXT ensure_proxy can see what only this process could
-        # learn, and recycle instead of reusing.
+        # RECORD IT, do not only say it. Written to the state file so the
+        # NEXT ensure_proxy can see what only this process could learn, and
+        # recycle instead of reusing (`ensure_proxy` reuses any daemon whose
+        # fingerprint matches). `_read_alive_port` refuses ANY daemon
+        # carrying this mark outright (`st.get("unpinnable")`), independent
+        # of `can_pin`.
         try:
             mark_daemon_unpinnable(self._certdir)
         except Exception:  # noqa: BLE001 — advisory; never break a request
@@ -15019,14 +15043,11 @@ class PinProxy:
         # populated on a healthy daemon.
         mint_stalled_s = _mint_lock_busy(self._pin_token_provider)
         # SET BY `_identity_ok` (at mint) and `_freshen_pin_identity` (at its
-        # 12h beat) -- see `make_pin_token_provider`. ADDITIVE, never ANDed
-        # into `can_pin` below (R8): a foreign bearer is a daemon that CAN
-        # mint and has chosen not to splice, so it is not what `can_pin`
-        # answers -- `_read_alive_port`'s `_serving_can_pin(...) is False`
-        # check recycles on a false `can_pin`, and a fresh daemon cannot
-        # repair a cross-wired credential store. This field alone carries
-        # the foreign state; `can_pin_cached()` already reads it too (so a
-        # mint that popped its own cache on "foreign" still reports true).
+        # 12h beat). ADDITIVE, never ANDed into `can_pin` below: a foreign
+        # bearer is a daemon that CAN mint and has chosen not to splice, and
+        # `_read_alive_port` recycles on a false `can_pin` -- a fresh daemon
+        # cannot repair a cross-wired credential store. This field alone
+        # carries the foreign state.
         pin_identity_mismatch = getattr(
             self._pin_token_provider, "identity_mismatch", None)
         can_pin = (True if mint_stalled_s is not None
@@ -15567,14 +15588,7 @@ class PinProxy:
                 # the active one there is nothing to swap, and warning then
                 # trains the reader to disbelieve the warning (see
                 # ``pin_is_noop``).
-                # R8: a foreign bearer already logged its own transition
-                # (`_set_identity`) and must never reach
-                # `mark_daemon_unpinnable` -- that mark makes
-                # `_read_alive_port` recycle a daemon a fresh process
-                # cannot fix any better, on the incident state itself.
-                if (not _pin_is_noop(self._pin_token_provider)
-                        and getattr(self._pin_token_provider,
-                                    "identity_mismatch", None) is None):
+                if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
         # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
         # inside `_forward`'s status hook, and it takes no arguments from
@@ -16951,6 +16965,18 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     untouched rather than debounce every header-less 429 against one shared
     empty key.
 
+    A 401 ASKS THE CLIENT TO RETRY, so it is only ever right when the retry
+    has somewhere to land, and 5h/7d headroom does not say that. On 2026-09-07
+    (~18:1xZ) it did not: account 2 walled, the failover moved to account 4,
+    account 4 was Fable 100%, every rebuilt retry walled again, and the loop
+    exhausted into `authentication_failed` — a reason absent from Claude
+    Code's partial-result set {rate_limit, overloaded, server_error}, so three
+    fable subagents lost their context outright instead of sleeping
+    (req_011Cepk7iQtQCjPtKjVxCxna and two siblings in the same minute). The
+    switch below therefore ranks with every per-model weekly window folded in,
+    which is what makes a full one able to answer "nowhere to land" and keep
+    the wall a wall.
+
     True means "turn the 429 the client will see into a 401" — because either
     this call switched the account off onto a credential the host confirmed
     is LIVE, or an earlier call for this same wall already did. False (no
@@ -16996,12 +17022,40 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
             # The raise's short expiry passed: treat this wall as unseen.
         try:
             switcher = require("switcher")
-            result = switcher.switch_off_at_limit_account(
-                switcher.ClaudeAccountSwitcher()
+            # NOT `switch_off_at_limit_account`, which passes no `models` and
+            # so ranks on 5h/7d alone. `("all",)` is `oauth.relevant_windows`'
+            # sentinel for "fold in EVERY per-model weekly window this account
+            # reports": a candidate sitting at 100% on one of them scores 0
+            # headroom, loses `best > current` against the walled account
+            # `current_at_limit` already pins to 0.0, and the wall is relayed.
+            #
+            # It overrides a user's `autoswitch.model`, deliberately (`switch()`
+            # reads that only when `models is None`), AND THAT IS SAFE ONLY
+            # UNDER A PRECONDITION worth naming rather than assuming. For an
+            # account reporting a 5h or 7d window, `all` folds in a superset of
+            # any setting's windows, so headroom under it is <= headroom under
+            # theirs and this can only relay MORE walls. For an account
+            # reporting ONLY scoped windows — permitted, because
+            # `oauth.py:541-555` writes `five_hour`/`seven_day` conditionally
+            # and the API does send null siblings — the empty basis gives
+            # `account_headroom` None, which `_select_best_switchable` excludes
+            # from `known` as "unknown, never auto-skipped"; `all` gives it a
+            # number instead, so that account can become a switch target where
+            # `no-comparison` would have kept us put. Unobserved on this fleet
+            # (8 store rows, none in that shape) and the fix belongs in
+            # `account_headroom`, which is cswap's, not here.
+            #
+            # The symbol's other job — being the capability probe for an older
+            # claude-swap — survives unchanged: an older `switch()` has no
+            # `models` parameter, so the TypeError lands in the except below
+            # and relays the 429, exactly as a missing symbol did.
+            result = switcher.ClaudeAccountSwitcher().switch(
+                strategy="best", json_output=True,
+                current_at_limit=True, models=("all",),
             )
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
-                f"429 on /v1/messages — switch_off_at_limit_account raised "
+                f"429 on /v1/messages — the at-limit switch raised "
                 f"{exc.__class__.__name__}, relaying the 429 unchanged"
             )
             _walled_switch_seen[reset] = (
