@@ -15872,6 +15872,11 @@ class PinProxy:
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
                 certdir=getattr(self, "_certdir", None),
+                # WHAT ACTUALLY WENT UPSTREAM, not what arrived. A wall 429 is
+                # only convertible when the bearer that earned it is still the
+                # live account, and `headers` here is the request as sent.
+                auth=next((v for k, v in headers
+                           if k.lower() == "authorization"), ""),
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
                 # client has received nothing and the SDK retries; after it,
                 # part of an answer is already delivered.
@@ -16986,9 +16991,10 @@ _walled_switch_lock = threading.Lock()
 # OLDEST entry is dropped, so a straggler request from a wall we already
 # left (A -> switched to B -> B also walled -> switched to C) can re-run the
 # switch once, the pre-existing behaviour. `retry_at` is None for a settled
-# switch (never re-tried) and a monotonic deadline for a raise (retried
-# after `_WALLED_SWITCH_RAISE_TTL`, so a raise still debounces a storm
-# instead of recording nothing).
+# CONVERSION (never re-tried: the account really is switched off) and a
+# monotonic deadline for every negative — a raise, and equally "nowhere to
+# land YET" — so a wall still debounces a storm instead of being silenced
+# for its whole window by one transient answer.
 _walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
 
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
@@ -16998,7 +17004,58 @@ _walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
 _WALLED_SWITCH_RAISE_TTL = 30.0
 
 
-def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
+def _remember_walled_switch(reset: bytes, ok: bool) -> None:
+    """Record this wall's verdict. Call under `_walled_switch_lock`.
+
+    ONE WRITER, because the asymmetry is the whole point and it was wrong in
+    two of the three places that wrote it. A conversion is permanent: the
+    account is off, and re-running `switch()` for a later repeat of the same
+    wall would churn accounts and let `current_at_limit=True` pin the healthy
+    account it just landed on to 0.0. Every negative EXPIRES: a raise and a
+    `switched=False` both mean "not now", not "not ever", and `retry_at=None`
+    on a `switched=False` is what relayed 28 raw 429s across 101 seconds on
+    2026-09-09 while a healthy account sat live and unreachable.
+    """
+    _walled_switch_seen[reset] = (
+        (True, None) if ok
+        else (False, time.monotonic() + _WALLED_SWITCH_RAISE_TTL)
+    )
+    if len(_walled_switch_seen) > 8:
+        del _walled_switch_seen[next(iter(_walled_switch_seen))]
+
+
+def _live_account_headroom() -> float | None:
+    """Headroom, in percent, of the account cswap has active RIGHT NOW.
+
+    ``None`` means UNKNOWN and every caller must fail CLOSED on it, because
+    the two answers are indistinguishable from the outside: `decision_value`
+    returns ``None`` for "no reading recent enough to act on" — a property of
+    the CACHE, not of the account — and an empty reading read as "no limit
+    anywhere" hands out a 401 onto an account nobody has measured. A sentinel
+    string (a rate-limited row) is not a dict and is not a number either.
+
+    ``fetch=None``, as `switch()` itself reads it: ``fetch=set()`` forbids
+    every fetch, and a wall is precisely when nobody has polled inside
+    ``STALE_OK_S``, so a cache-only read would be unavailable at the one
+    moment this matters. ``("all",)`` folds in every per-model weekly window
+    the account reports, for the same reason the switch below ranks on it: an
+    account at 100% on one of them cannot serve the request that walled.
+    """
+    try:
+        snap = require("switcher").ClaudeAccountSwitcher().accounts_snapshot(
+            fetch=None)
+        entry = next((a.usage for a in snap.accounts if a.is_active), None)
+        usage = entry.decision_value(("all",)) if entry is not None else None
+        if not isinstance(usage, dict):
+            return None
+        return oauth.account_headroom(usage, ("all",))
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return None
+
+
+def _switch_off_walled_account(
+    reset: bytes, retry_after: bytes, auth: str = "",
+) -> bool:
     """Switch cswap off the account that just 429'd, at most once per wall.
 
     ``reset`` is the wall's own ``anthropic-ratelimit-unified-reset`` value —
@@ -17021,11 +17078,14 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     which is what makes a full one able to answer "nowhere to land" and keep
     the wall a wall.
 
-    True means "turn the 429 the client will see into a 401" — because either
-    this call switched the account off onto a credential the host confirmed
-    is LIVE, or an earlier call for this same wall already did. False (no
-    headroom anywhere, `switch()` raised, `switch()` landed a credential it
-    never validated, or a repeat of a wall that never earned a 401) means
+    True means "turn the 429 the client will see into a 401" — because this
+    call switched the account off onto a credential the host confirmed is
+    LIVE, or an earlier call for this same wall already did, or the host had
+    ALREADY moved and the client's frozen bearer is the only thing still on
+    the walled account (`_live_account_headroom`: a 401 alone fixes that, and
+    no switch can). False (no headroom anywhere, `switch()` raised, `switch()`
+    landed a credential it never validated, or a repeat of a wall that never
+    earned a 401 and whose expiry has not passed) means
     relay the 429 untouched — a relayed wall 429 costs a sleep the client
     can abandon; a 401 onto a credential nobody confirmed is alive is worse
     than the wall itself, because CC rebuilds onto it.
@@ -17034,16 +17094,19 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
     held ACROSS `switch()`: the wall claims its slot and every waiter blocks
     on the one call actually doing the work, rather than reading a
     seen-but-not-yet-decided slot and relaying the wall 429 while the first
-    caller's switch is still landing. Concurrent 429s on one wall (measured:
+    caller's switch is still landing. The bearer test runs inside the same
+    lock and BEFORE `switch()`, so a wall the host has already left costs no
+    cross-process lock at all. Concurrent 429s on one wall (measured:
     ten in a cycle, each its own MITM thread) and a retry that reused the
     same stale bearer all block here and then read the single settled
     answer, instead of each taking three cross-process locks and a usage
-    fetch, or re-walling the account `switch()` just moved onto. A raise
-    records `False` for `_WALLED_SWITCH_RAISE_TTL` — not nothing, and not
-    forever — so a transient failure (this daemon's own
-    `claude_config_lock` held elsewhere, or an older claude-swap with no
-    such symbol) still debounces a storm, and a fresh attempt is due well
-    inside the wall rather than never.
+    fetch, or re-walling the account `switch()` just moved onto. EVERY
+    NEGATIVE records `False` for `_WALLED_SWITCH_RAISE_TTL` — not nothing,
+    and not forever (`_remember_walled_switch`) — so a transient failure
+    (this daemon's own `claude_config_lock` held elsewhere, an older
+    claude-swap with no such symbol, or simply nowhere to land YET) still
+    debounces a storm, and a fresh attempt is due well inside the wall
+    rather than never.
     """
     if not reset:
         _log_lifecycle(
@@ -17063,7 +17126,41 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
                     f"{'a 401' if ok else 'the 429 unchanged'}"
                 )
                 return ok
-            # The raise's short expiry passed: treat this wall as unseen.
+            # The negative's short expiry passed: treat this wall as unseen.
+        # NO SWITCH IS NEEDED WHEN THE HOST HAS ALREADY MOVED. `switch()`
+        # answers "did I just switch?"; what decides whether a 401 helps is
+        # "is the client's bearer still the live account?". The pin forwards
+        # `Authorization` verbatim on `/v1/messages` (never a pinned route,
+        # so billing follows the swapped inference account), so this bearer
+        # IS the account Claude Code believes it is on — and a 429 never
+        # rebuilds its client, so a bearer frozen on an account somebody else
+        # switched away from re-walls on every retry, forever, while
+        # `current_at_limit=True` pins the healthy account now live to 0.0 and
+        # `switch()` reports `switched=False` for as long as the wall lasts.
+        # Measured 2026-09-09: account 8 went live 97s after the last 429 and
+        # the session stayed walled for its whole window.
+        token = auth.strip()
+        if token[:7].lower() == "bearer ":
+            token = token[7:].strip()
+        live = _active_oauth_token()
+        if token and live and token != live:
+            # AND ONLY WHEN THE RETRY CAN LAND. A stale bearer says the
+            # client would rebuild; it says nothing about whether what it
+            # rebuilds onto can serve, and a 401 with nowhere to land
+            # exhausts into `authentication_failed` — absent from Claude
+            # Code's partial-result set, so a subagent loses its context
+            # outright instead of sleeping (2026-09-07, three leads). An
+            # unknown reading is not headroom: fail closed to the switch.
+            headroom = _live_account_headroom()
+            if headroom is not None and headroom > 0:
+                _log_lifecycle(
+                    "429 on /v1/messages — the client's bearer is no longer "
+                    "the live account, which has "
+                    f"{headroom:.0f}% headroom; relaying a 401 so the client "
+                    "rebuilds onto it, without switching"
+                )
+                _remember_walled_switch(reset, True)
+                return True
         try:
             switcher = require("switcher")
             # NOT `switch_off_at_limit_account`, which passes no `models` and
@@ -17102,11 +17199,7 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
                 f"429 on /v1/messages — the at-limit switch raised "
                 f"{exc.__class__.__name__}, relaying the 429 unchanged"
             )
-            _walled_switch_seen[reset] = (
-                False, time.monotonic() + _WALLED_SWITCH_RAISE_TTL
-            )
-            if len(_walled_switch_seen) > 8:
-                del _walled_switch_seen[next(iter(_walled_switch_seen))]
+            _remember_walled_switch(reset, False)
             return False
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
@@ -17130,9 +17223,7 @@ def _switch_off_walled_account(reset: bytes, retry_after: bytes) -> bool:
                 f"{result.get('needsLogin') if result else None}, relaying "
                 f"the 429 unchanged"
             )
-        _walled_switch_seen[reset] = (ok, None)
-        if len(_walled_switch_seen) > 8:
-            del _walled_switch_seen[next(iter(_walled_switch_seen))]
+        _remember_walled_switch(reset, ok)
         return ok
 
 
@@ -17146,6 +17237,7 @@ def _relay_response(
     on_status=None,
     path: str | None = None,
     certdir=None,
+    auth: str = "",
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -17226,7 +17318,7 @@ def _relay_response(
              if l.lower().startswith(b"retry-after:")),
             b"",
         )
-        _walled_401 = _switch_off_walled_account(reset, retry_after)
+        _walled_401 = _switch_off_walled_account(reset, retry_after, auth)
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
@@ -17349,13 +17441,13 @@ def _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
                 on_headers=None, on_status=on_status, path=path,
-                certdir=certdir,
+                certdir=certdir, auth=auth,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
             on_headers=None, on_status=on_status, path=path,
-            certdir=certdir,
+            certdir=certdir, auth=auth,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
