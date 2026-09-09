@@ -19755,7 +19755,7 @@ class TestTheSpliceHoldsTheConfigLock:
     # carries it into the live config.
 
     def case_the_profile_mapping_is_the_one_claude_code_writes(self):
-        """Same keys as CC's own writer (2.1.261 `XQe`), absent-vs-null
+        """Same keys as CC's own writer (2.1.267 `srt`), absent-vs-null
         included: its gate tests four of them for `!== undefined`, so a null
         where CC omits the key re-opens the fetch this exists to close."""
         from cswap_pin import proxy as pin_proxy
