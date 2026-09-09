@@ -13043,8 +13043,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         live slot's decision-grade usage value — ``None`` for "no reading",
         a sentinel string, or a window dict. ``snap`` collects each
         ``usage_entries_by_account`` ``fetch=`` argument. ``live_num`` is what
-        `current_account_number()` answers; ``None`` is an UNMANAGED live
-        login, which cswap refuses to evaluate the usage of.
+        `current_account_number()` answers, or a CALLABLE when a case needs it
+        to change between relays; ``None`` is an UNMANAGED live login, which
+        cswap refuses to evaluate the usage of.
 
         The returned list holds the ``models=`` basis of each `switch()` call,
         so `len(calls)` still counts calls AND a case can assert WHICH windows
@@ -13103,7 +13104,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 lambda: types.SimpleNamespace(
                     switch=_switch,
                     _read_credentials=_read_credentials,
-                    current_account_number=lambda: live_num,
+                    current_account_number=(
+                        live_num if callable(live_num) else lambda: live_num),
                     usage_entries_by_account=_usage_entries_by_account)),
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
@@ -13544,6 +13546,95 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         got = self._relay(auth="Basic dXNlcjpwYXNz")
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
         assert len(calls) == 1, len(calls)
+
+    def case_the_bearer_paths_own_negative_expires(self, monkeypatch):
+        """m1: NOTHING ASSERTED THAT THIS PATH'S ENTRY EXPIRES. Writing
+        `(False, None)` instead of going through `_remember_walled_switch`
+        left all 38 cases green, so "at most once per TTL" was enforced by
+        nobody. The case next door pins the debounce INSIDE the TTL; this one
+        pins that the TTL ends. A straggler still holding the old bearer must
+        get another chance to be told to rebuild."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        for n in (1, 2):
+            got = self._relay(auth="Bearer stale-account-token")
+            assert got.startswith(b"HTTP/1.1 401"), (
+                f"relay {n}: the bearer path's negative must expire like "
+                f"every other one: {got[:40]!r}")
+        assert not calls, calls
+
+    def case_a_hairline_headroom_converts_and_the_rebuild_closes_it(
+        self, monkeypatch,
+    ):
+        """I1: THE (0, 1) BAND WAS UNASSERTED. `account_headroom` is
+        `100 - max(pct)`, so a live account at 99.9% scores 0.1 and this
+        branch answers 401; the full-account case pins exactly 100.0, which
+        says nothing about the band below it.
+
+        It converts, and that is deliberate: 0.1% is not "at limit", the
+        retry lands, and what bounds the danger is not the size of the number
+        but the REBUILD. Once the client is on the live account its bearer
+        equals the live token, so this path cannot fire again -- a second 401
+        needs a bearer that is still stale. That is the mechanism, asserted
+        rather than argued."""
+        calls = self._wire(
+            monkeypatch, switched=False, live_token=self.LIVE,
+            usage={"five_hour": {"pct": 99.9}, "seven_day": {"pct": 20.0}})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert not calls, calls
+        # The client rebuilt: its bearer IS the live account now.
+        after = self._relay(reset=self.RESET_HEADER_2,
+                            auth="Bearer " + self.LIVE)
+        assert after.startswith(b"HTTP/1.1 429"), (
+            "once the client is on the live account this path is closed, so "
+            f"no 401 can repeat and the retry loop cannot exhaust: {after[:40]!r}")
+
+    def case_a_hairline_headroom_is_logged_as_itself(self, monkeypatch):
+        """I1: `{headroom:.0f}` printed "0% headroom; relaying a 401" for the
+        very band the branch was taken on, so the only post-hoc evidence
+        contradicted the decision it recorded. This round's own event took two
+        analyzers to read out of daemon.log; a line that lies costs a third."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                   usage={"five_hour": {"pct": 99.9}, "seven_day": {"pct": 20.0}})
+        self._relay(auth="Bearer stale-account-token")
+        line = next(m for m in logged if "no longer the live account" in m)
+        assert "0.1% headroom" in line, (
+            f"the headroom that decided the branch must be readable: {line!r}")
+        assert "0% headroom" not in line, line
+
+    def case_two_accounts_sharing_a_reset_epoch_decide_separately(
+        self, monkeypatch,
+    ):
+        """I2: A UNIFIED-RESET EPOCH IS A CLOCK BOUNDARY, NOT AN IDENTITY.
+        This round's own wall was `1788925200` = 03:40:00Z exactly, so two
+        accounts hitting their window at the same boundary carry the SAME
+        reset. Keyed on the epoch alone, the first client's settled TRUE
+        answers 401 for the second account's wall with no bearer test and no
+        headroom test -- an account that never earned it.
+
+        The exposure is this branch's own doing: a settled negative used to
+        close the key forever, and now expires every TTL, so `switch()` gets
+        an attempt per TTL across the whole window to mint that permanent
+        TRUE. The key is `(reset, slot)`; the slot does not rotate per retry,
+        so a same-account token rotation still debounces."""
+        slots = iter(["1", "2"])   # one slot read per relay
+        calls = self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                           usage=self.HEADROOM,
+                           live_num=lambda: next(slots, "2"))
+        first = self._relay(auth="Bearer " + self.LIVE)
+        assert first.startswith(b"HTTP/1.1 401"), first[:40]
+        # Slot 2's own wall, same epoch, and it has never been switched off.
+        second = self._relay(auth="Bearer " + self.LIVE)
+        assert second.startswith(b"HTTP/1.1 401"), second[:40]
+        assert len(calls) == 2, (
+            "the second account's wall must be decided on its own evidence, "
+            f"not inherited from a conversion the first account earned: {calls}")
 
     def case_the_bearer_conversion_is_logged(self, monkeypatch):
         """`_TRACE` is off on a serving daemon, so daemon.log is the only

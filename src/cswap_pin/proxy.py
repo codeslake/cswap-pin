@@ -16993,7 +16993,8 @@ _walled_switch_lock = threading.Lock()
 # switch once, the pre-existing behaviour. `retry_at` is None for a settled
 # CONVERSION and a monotonic deadline for every negative; see
 # `_remember_walled_switch` for why the asymmetry runs that way.
-_walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
+_walled_switch_seen: dict[tuple[bytes, str | None],
+                          tuple[bool, float | None]] = {}
 
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
 # enough that a storm on one wall does not re-attempt for every repeat,
@@ -17002,7 +17003,7 @@ _walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
 _WALLED_SWITCH_RAISE_TTL = 30.0
 
 
-def _remember_walled_switch(reset: bytes, ok: bool) -> None:
+def _remember_walled_switch(key: tuple[bytes, str | None], ok: bool) -> None:
     """Record this wall's verdict. Call under `_walled_switch_lock`.
 
     ONE WRITER, because the asymmetry is the whole point and it was wrong in
@@ -17013,7 +17014,7 @@ def _remember_walled_switch(reset: bytes, ok: bool) -> None:
     is what relayed 28 raw 429s across 101 seconds on 2026-09-09 while a
     healthy account sat live and unreachable.
     """
-    _walled_switch_seen[reset] = (
+    _walled_switch_seen[key] = (
         (True, None) if ok
         else (False, time.monotonic() + _WALLED_SWITCH_RAISE_TTL)
     )
@@ -17021,8 +17022,22 @@ def _remember_walled_switch(reset: bytes, ok: bool) -> None:
         del _walled_switch_seen[next(iter(_walled_switch_seen))]
 
 
-def _live_account_headroom() -> float | None:
-    """Headroom, in percent, of the account cswap has active RIGHT NOW.
+def _live_account_slot() -> str | None:
+    """The slot cswap has live, or ``None`` when there is none or it is
+    unmanaged — deliberately, with no fallback to the recorded slot, so
+    nobody evaluates another account's usage. Read ONCE per 429: it keys the
+    memo and it names the row the headroom comes from, and those two must be
+    the same account or the memo answers for one and the evidence for
+    another."""
+    try:
+        return require("switcher").ClaudeAccountSwitcher(
+        ).current_account_number()
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return None
+
+
+def _live_account_headroom(num: str) -> float | None:
+    """Headroom, in percent, of slot ``num``, which is the live one.
 
     ``None`` means UNKNOWN and every caller must fail CLOSED on it, because
     the two answers are indistinguishable from the outside: `decision_value`
@@ -17050,12 +17065,6 @@ def _live_account_headroom() -> float | None:
     """
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
-        # None for a live login cswap does not own -- deliberately, with no
-        # fallback to the recorded slot, so nobody evaluates another account's
-        # usage. No live account is no evidence.
-        num = sw.current_account_number()
-        if num is None:
-            return None
         usage = sw.usage_entries_by_account(
             fetch={num})[num].decision_value(("all",))
         # `relevant_windows` answers [] for anything that is not a window dict,
@@ -17110,8 +17119,9 @@ def _switch_off_walled_account(
     on the one call actually doing the work, rather than reading a
     seen-but-not-yet-decided slot and relaying the wall 429 while the first
     caller's switch is still landing. The bearer test runs inside the same
-    lock and BEFORE `switch()`, so a wall the host has already left costs no
-    cross-process lock at all. Concurrent 429s on one wall (measured:
+    lock and BEFORE `switch()`, so a wall the host has already left never
+    takes cswap's three cross-process locks — it still holds this one across
+    a usage fetch. Concurrent 429s on one wall (measured:
     ten in a cycle, each its own MITM thread) and a retry that reused the
     same stale bearer all block here and then read the single settled
     answer, instead of each taking three cross-process locks and a usage
@@ -17129,8 +17139,19 @@ def _switch_off_walled_account(
         )
         return False
     with _walled_switch_lock:
-        if reset in _walled_switch_seen:
-            ok, retry_at = _walled_switch_seen[reset]
+        # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
+        # BOUNDARY and not an identity -- 1788925200, this seam's own event,
+        # is 03:40:00Z exactly -- so two accounts reaching their window on the
+        # same boundary carry the same `reset`. On the epoch alone one
+        # client's settled TRUE answers 401 for the other account's wall with
+        # no bearer test and no headroom test. NOT `(reset, token)`: a
+        # rotation mints a new access token per retry, so every retry would be
+        # a fresh key and the 401 -> 429 -> 401 loop below reopens; a slot
+        # number does not rotate.
+        slot = _live_account_slot()
+        key = (reset, slot)
+        if key in _walled_switch_seen:
+            ok, retry_at = _walled_switch_seen[key]
             if retry_at is None or time.monotonic() < retry_at:
                 _log_lifecycle(
                     "429 on /v1/messages — debounced repeat of wall reset="
@@ -17157,19 +17178,23 @@ def _switch_off_walled_account(
         token = auth.strip()
         token = token[7:].strip() if token[:7].lower() == "bearer " else ""
         live = _active_oauth_token()
-        if token and live and token != live:
+        if token and live and token != live and slot is not None:
             # AND ONLY WHEN THE RETRY CAN LAND. A stale bearer says the
             # client would rebuild; it says nothing about whether what it
             # rebuilds onto can serve, and a 401 with nowhere to land
             # exhausts into `authentication_failed` — absent from Claude
             # Code's partial-result set, so a subagent loses its context
             # outright instead of sleeping (2026-09-07, three leads).
-            headroom = _live_account_headroom()
+            headroom = _live_account_headroom(slot)
             if headroom is not None and headroom > 0:
+                # `:.3g`, NOT `:.0f`. The band this branch is least obvious in
+                # is the one just above zero, and `:.0f` printed "0% headroom;
+                # relaying a 401" there -- the only post-hoc evidence
+                # contradicting the decision it was recording.
                 _log_lifecycle(
                     "429 on /v1/messages — the client's bearer is no longer "
                     "the live account, which has "
-                    f"{headroom:.0f}% headroom; relaying a 401 so the client "
+                    f"{headroom:.3g}% headroom; relaying a 401 so the client "
                     "rebuilds onto it, without switching"
                 )
                 # RECORD A NEGATIVE, RETURN TRUE: this request gets its 401
@@ -17183,7 +17208,7 @@ def _switch_off_walled_account(
                 # token ROTATION reaches it (bearer != live, account unchanged
                 # and still walled), giving 401 -> 429 -> 401 with no sleep
                 # until the retry loop exhausts into `authentication_failed`.
-                _remember_walled_switch(reset, False)
+                _remember_walled_switch(key, False)
                 return True
         try:
             switcher = require("switcher")
@@ -17223,7 +17248,7 @@ def _switch_off_walled_account(
                 f"429 on /v1/messages — the at-limit switch raised "
                 f"{exc.__class__.__name__}, relaying the 429 unchanged"
             )
-            _remember_walled_switch(reset, False)
+            _remember_walled_switch(key, False)
             return False
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
@@ -17247,7 +17272,7 @@ def _switch_off_walled_account(
                 f"{result.get('needsLogin') if result else None}, relaying "
                 f"the 429 unchanged"
             )
-        _remember_walled_switch(reset, ok)
+        _remember_walled_switch(key, ok)
         return ok
 
 
