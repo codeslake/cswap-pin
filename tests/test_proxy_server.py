@@ -13418,9 +13418,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                    usage=self.HEADROOM, snap=snap)
         self._relay(auth="Bearer stale-account-token")
         assert snap == [{"1"}], (
-            "the read must name the live slot: `fetch=None` sweeps EVERY "
-            "managed account over the network inside the wall's lock, to "
-            f"answer a question about exactly one of them: {snap}")
+            "the read must name the live slot: `fetch=None` reserves with "
+            "`respect_plans=True`, so a row that is stale but not yet "
+            "poll-due is NOT refetched and the reading can describe the "
+            "account as it was before it walled — and it sweeps every managed "
+            f"account over the network to do it: {snap}")
 
     def case_a_request_with_no_bearer_never_converts(self, monkeypatch):
         """NOTHING KILLED THE `token and` GUARD. Every case that predates the

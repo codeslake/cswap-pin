@@ -17031,15 +17031,22 @@ def _live_account_headroom() -> float | None:
     anywhere" hands out a 401 onto an account nobody has measured. A sentinel
     string (a rate-limited row) is not a dict and is not a number either.
 
-    ONE SLOT, NAMED: one fetch for the live account, not a sweep of the whole
-    roster over the network inside `_walled_switch_lock`. (`fetch=set()` is the
-    other extreme and forbids every fetch, which is worthless at a wall.)
+    ONE SLOT, NAMED, and that is a CORRECTNESS argument before it is a cost
+    one. `fetch=None` reserves with `respect_plans=True` — the entry must be
+    stale AND poll-due — so a row that is stale but not yet due is not
+    refetched and the reading handed back can describe the account as it was
+    BEFORE it walled, which is the reading that forges a 401 with nowhere to
+    land. An explicit set reserves with `respect_plans=False`, poll-due OR
+    stale, which is how a fetch beats the serve TTL. It is also one fetch
+    rather than a sweep of the whole roster over the network inside
+    `_walled_switch_lock`. (`fetch=set()` is the other extreme and forbids
+    every fetch, worthless at a wall.)
 
-    ``("all",)`` matches how the switch below ranks, which is why BOTH base
-    windows are required rather than assumed: `relevant_windows` appends each
-    only when the account reports it, so a reading missing one, or a
-    scoped-only account, still yields a number — a headroom for a question
-    nobody asked.
+    ``("all",)`` matches how the switch below ranks, and is what lets a
+    scoped-only account produce a number at all — so BOTH base windows are
+    required rather than assumed: `relevant_windows` appends each only when
+    the account reports it, so a reading missing one still yields a headroom
+    for a question nobody asked.
     """
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
@@ -17144,8 +17151,9 @@ def _switch_off_walled_account(
         # `switch()` reports `switched=False` for as long as the wall lasts.
         # Measured 2026-09-09: account 8 went live 97s after the last 429 and
         # the session stayed walled for its whole window.
-        # ONLY A BEARER SCHEME: any other payload can never equal the live
-        # token, so keeping it would convert unconditionally.
+        # ONLY A BEARER SCHEME: keeping a non-bearer payload as the token
+        # would convert unconditionally, since it can never equal the live
+        # token.
         token = auth.strip()
         token = token[7:].strip() if token[:7].lower() == "bearer " else ""
         live = _active_oauth_token()
@@ -17171,9 +17179,10 @@ def _switch_off_walled_account(
                 # repeat carrying the same reset is proof the conversion did
                 # not land: the epoch is per (account, window), so a client
                 # that really rebuilt onto another account cannot re-earn it.
-                # Recorded as a settled TRUE this was permanent, and a
-                # same-account token ROTATION reaches it (bearer != live,
-                # account unchanged and still walled).
+                # Recorded as a settled TRUE it was permanent: a same-account
+                # token ROTATION reaches it (bearer != live, account unchanged
+                # and still walled), giving 401 -> 429 -> 401 with no sleep
+                # until the retry loop exhausts into `authentication_failed`.
                 _remember_walled_switch(reset, False)
                 return True
         try:
