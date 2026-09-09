@@ -15872,9 +15872,9 @@ class PinProxy:
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
                 certdir=getattr(self, "_certdir", None),
-                # WHAT ACTUALLY WENT UPSTREAM, not what arrived. A wall 429 is
-                # only convertible when the bearer that earned it is still the
-                # live account, and `headers` here is the request as sent.
+                # WHAT ACTUALLY WENT UPSTREAM, not what arrived: `headers` is
+                # rebound to the swapped list above when the route is pinned,
+                # and `original_headers` keeps the arrival copy.
                 auth=next((v for k, v in headers
                            if k.lower() == "authorization"), ""),
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
@@ -16991,10 +16991,8 @@ _walled_switch_lock = threading.Lock()
 # OLDEST entry is dropped, so a straggler request from a wall we already
 # left (A -> switched to B -> B also walled -> switched to C) can re-run the
 # switch once, the pre-existing behaviour. `retry_at` is None for a settled
-# CONVERSION (never re-tried: the account really is switched off) and a
-# monotonic deadline for every negative — a raise, and equally "nowhere to
-# land YET" — so a wall still debounces a storm instead of being silenced
-# for its whole window by one transient answer.
+# CONVERSION and a monotonic deadline for every negative; see
+# `_remember_walled_switch` for why the asymmetry runs that way.
 _walled_switch_seen: dict[bytes, tuple[bool, float | None]] = {}
 
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
@@ -17008,13 +17006,12 @@ def _remember_walled_switch(reset: bytes, ok: bool) -> None:
     """Record this wall's verdict. Call under `_walled_switch_lock`.
 
     ONE WRITER, because the asymmetry is the whole point and it was wrong in
-    two of the three places that wrote it. A conversion is permanent: the
-    account is off, and re-running `switch()` for a later repeat of the same
-    wall would churn accounts and let `current_at_limit=True` pin the healthy
-    account it just landed on to 0.0. Every negative EXPIRES: a raise and a
-    `switched=False` both mean "not now", not "not ever", and `retry_at=None`
-    on a `switched=False` is what relayed 28 raw 429s across 101 seconds on
-    2026-09-09 while a healthy account sat live and unreachable.
+    two of the three places that wrote it. A validated conversion is
+    permanent: the account really is off, so a later repeat has nothing to
+    re-decide. Every negative EXPIRES — a raise and a `switched=False` both
+    mean "not now", not "not ever", and `retry_at=None` on a `switched=False`
+    is what relayed 28 raw 429s across 101 seconds on 2026-09-09 while a
+    healthy account sat live and unreachable.
     """
     _walled_switch_seen[reset] = (
         (True, None) if ok
@@ -17034,21 +17031,37 @@ def _live_account_headroom() -> float | None:
     anywhere" hands out a 401 onto an account nobody has measured. A sentinel
     string (a rate-limited row) is not a dict and is not a number either.
 
-    ``fetch=None``, as `switch()` itself reads it: ``fetch=set()`` forbids
-    every fetch, and a wall is precisely when nobody has polled inside
-    ``STALE_OK_S``, so a cache-only read would be unavailable at the one
-    moment this matters. ``("all",)`` folds in every per-model weekly window
-    the account reports, for the same reason the switch below ranks on it: an
-    account at 100% on one of them cannot serve the request that walled.
+    ONE SLOT, NAMED. `fetch=None` makes every managed account a candidate and
+    still only "respects the persisted poll plans", so it sweeps the whole
+    roster over the network inside `_walled_switch_lock` and can STILL hand
+    back a plan-blocked reading; an explicit set is one fetch that may beat
+    the serve TTL. `fetch=set()` is the other extreme and forbids every fetch,
+    which is worthless at a wall — nobody has polled inside ``STALE_OK_S``,
+    which is exactly when a wall happens.
+
+    ``("all",)`` matches how the switch below ranks. It is also why the 5h and
+    7d windows are required rather than assumed: `relevant_windows` appends
+    each only when the account reports it, so a reading missing one scores
+    ``100 - max`` over what is left and a scoped-only account produces a
+    number with no base window measured at all. Either is a headroom for a
+    question nobody asked; both read as UNKNOWN here.
     """
     try:
-        snap = require("switcher").ClaudeAccountSwitcher().accounts_snapshot(
-            fetch=None)
-        entry = next((a.usage for a in snap.accounts if a.is_active), None)
-        usage = entry.decision_value(("all",)) if entry is not None else None
+        sw = require("switcher").ClaudeAccountSwitcher()
+        # None for a live login cswap does not own -- deliberately, with no
+        # fallback to the recorded slot, so nobody evaluates another account's
+        # usage. No live account is no evidence.
+        num = sw.current_account_number()
+        if num is None:
+            return None
+        usage = sw.usage_entries_by_account(
+            fetch={num})[num].decision_value(("all",))
         if not isinstance(usage, dict):
             return None
-        return oauth.account_headroom(usage, ("all",))
+        windows = oauth.relevant_windows(usage, ("all",))
+        if not {"5h", "7d"} <= {label for label, _, _ in windows}:
+            return None
+        return 100.0 - max(pct for _, pct, _ in windows)
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None
 
@@ -17100,13 +17113,10 @@ def _switch_off_walled_account(
     ten in a cycle, each its own MITM thread) and a retry that reused the
     same stale bearer all block here and then read the single settled
     answer, instead of each taking three cross-process locks and a usage
-    fetch, or re-walling the account `switch()` just moved onto. EVERY
-    NEGATIVE records `False` for `_WALLED_SWITCH_RAISE_TTL` — not nothing,
-    and not forever (`_remember_walled_switch`) — so a transient failure
-    (this daemon's own `claude_config_lock` held elsewhere, an older
-    claude-swap with no such symbol, or simply nowhere to land YET) still
-    debounces a storm, and a fresh attempt is due well inside the wall
-    rather than never.
+    fetch, or re-walling the account `switch()` just moved onto. Every
+    negative expires (`_remember_walled_switch`), so a transient failure
+    still debounces a storm without silencing the wall for its whole
+    window.
     """
     if not reset:
         _log_lifecycle(
@@ -17139,9 +17149,12 @@ def _switch_off_walled_account(
         # `switch()` reports `switched=False` for as long as the wall lasts.
         # Measured 2026-09-09: account 8 went live 97s after the last 429 and
         # the session stayed walled for its whole window.
+        # ONLY A BEARER SCHEME. Stripping the prefix when present and keeping
+        # the value otherwise makes every OTHER scheme's whole payload a
+        # "token" that can never equal the live one, so a `Basic` credential
+        # -- or a bare token -- would convert unconditionally.
         token = auth.strip()
-        if token[:7].lower() == "bearer ":
-            token = token[7:].strip()
+        token = token[7:].strip() if token[:7].lower() == "bearer " else ""
         live = _active_oauth_token()
         if token and live and token != live:
             # AND ONLY WHEN THE RETRY CAN LAND. A stale bearer says the
@@ -17149,8 +17162,7 @@ def _switch_off_walled_account(
             # rebuilds onto can serve, and a 401 with nowhere to land
             # exhausts into `authentication_failed` — absent from Claude
             # Code's partial-result set, so a subagent loses its context
-            # outright instead of sleeping (2026-09-07, three leads). An
-            # unknown reading is not headroom: fail closed to the switch.
+            # outright instead of sleeping (2026-09-07, three leads).
             headroom = _live_account_headroom()
             if headroom is not None and headroom > 0:
                 _log_lifecycle(
@@ -17159,7 +17171,19 @@ def _switch_off_walled_account(
                     f"{headroom:.0f}% headroom; relaying a 401 so the client "
                     "rebuilds onto it, without switching"
                 )
-                _remember_walled_switch(reset, True)
+                # RECORD A NEGATIVE, RETURN TRUE: this request gets its 401,
+                # and the NEXT 429 on this wall does not. A repeat carrying
+                # the same reset is proof the conversion did not land -- the
+                # epoch is per (account, window), so a client that really
+                # rebuilt onto another account cannot re-earn it. Recorded as
+                # a settled TRUE instead, the memo re-answered 401 to that
+                # proof forever without re-reading either the bearer or the
+                # headroom, and a same-account token ROTATION reaches it
+                # (bearer != live, account unchanged and still walled): 401 ->
+                # 429 -> 401 with no sleep, until the retry loop exhausts into
+                # `authentication_failed`. One 401 asks the client to rebuild;
+                # a second only spends its retries faster.
+                _remember_walled_switch(reset, False)
                 return True
         try:
             switcher = require("switcher")
