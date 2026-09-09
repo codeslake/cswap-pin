@@ -13591,6 +13591,13 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert after.startswith(b"HTTP/1.1 429"), (
             "once the client is on the live account this path is closed, so "
             f"no 401 can repeat and the retry loop cannot exhaust: {after[:40]!r}")
+        # AND IT REACHED THE SWITCH. `switched=False` makes 429 the answer from
+        # the switch path too, so the status alone also passes if the function
+        # returned False at the top (a RESET_HEADER_2 that stopped parsing).
+        # This pins that the BEARER branch is what was skipped.
+        assert len(calls) == 1, (
+            f"the second wall never reached switch(), so the 429 above does "
+            f"not show the bearer branch was closed: {calls}")
 
     def case_a_hairline_headroom_is_logged_as_itself(self, monkeypatch):
         """I1: `{headroom:.0f}` printed "0% headroom; relaying a 401" for the
@@ -13662,10 +13669,25 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     @classmethod
     def _model_rows(cls):
+        """Rows of the committed expansion, checked against the model itself.
+
+        A PARAMETER ADDED WITHOUT RE-RUNNING `pict` leaves the sweep passing on
+        the stale set while it reports full model coverage -- the model's own
+        "an unrun gate reads like a passed one", one level up. The header row
+        is the cheap witness: it is exactly the model's parameter names, in
+        order."""
         from pathlib import Path
-        tsv = (Path(__file__).parent / "models"
-               / "at_limit_conversion.tsv").read_text().splitlines()
+        models = Path(__file__).parent / "models"
+        tsv = (models / "at_limit_conversion.tsv").read_text().splitlines()
         head = tsv[0].split("\t")
+        declared = [
+            ln.split(":", 1)[0].strip()
+            for ln in (models / "at_limit_conversion.pict").read_text().splitlines()
+            if ln and not ln.lstrip().startswith(("#", "IF")) and ":" in ln
+        ]
+        assert declared == head, (
+            "at_limit_conversion.tsv is not the expansion of the current "
+            f"model -- re-run `pict`. model={declared} tsv={head}")
         return [dict(zip(head, line.split("\t"))) for line in tsv[1:] if line]
 
     @staticmethod

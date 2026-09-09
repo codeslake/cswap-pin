@@ -41,10 +41,25 @@ Headroom: Ample, Hairline, Exhausted, OverLimit, NoReading, Sentinel, MissingBas
 # What claude-swap's switch() does, when it is reached at all.
 Switch: LandedValidated, LandedUnvalidated, NoCandidate, NeedsLogin, Raised
 
+# THREE-WAY, FOR THESE THREE ONLY. The identity test is a three-condition
+# guard (`token and live and slot is not None`), and pairwise leaves its
+# conditions co-varying: the sole Present row carrying a stale bearer with an
+# unmanaged slot ALSO carried an unreadable token, so whichever guard fires
+# first masked the other and deleting `slot is not None` left the sweep green.
+# Order 3 over exactly this triple forces the isolating rows to exist.
+{ Authorization, LiveToken, LiveSlot } @ 3
+
 # --- constraints: combinations the code cannot present ---
 
-# An absent reset returns before the memo is read or written.
-IF [ResetHeader] = "Absent" THEN [MemoEntry] = "Unseen";
+# An absent reset returns at the top, before the memo and before every read
+# below it, so those parameters are MASKED. Pin all of them: left free, the
+# expansion spends 16 of 64 rows on one assertion AND parks real pairs there --
+# (BearerStale, Unmanaged) and (BearerStale, Unreadable) landed only on an
+# Absent row, so the sweep never reached the `slot is not None` and `live`
+# guards those pairs exist to exercise. A pair covered only in a masked row is
+# the HOLE this file's header is about.
+IF [ResetHeader] = "Absent" THEN [MemoEntry] = "Unseen" AND [Authorization] = "BearerStale"
+   AND [LiveToken] = "Readable" AND [LiveSlot] = "Managed" AND [Switch] = "NoCandidate";
 
 # A live memo entry returns before the bearer test and before switch().
 IF [MemoEntry] IN {"SettledConversion", "LiveNegative"} THEN [Switch] = "NoCandidate";

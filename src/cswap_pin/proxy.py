@@ -17138,16 +17138,26 @@ def _switch_off_walled_account(
                if retry_after else "")
         )
         return False
-    # BEFORE THE LOCK, DELIBERATELY. `current_account_number()` resolves
-    # through `_live_login_identity`, whose own docstring says
+    # BEFORE THE LOCK, AND THE TWO ARE READ TOGETHER. `current_account_number()`
+    # resolves through `_live_login_identity`, whose own docstring says
     # "`ask_server=False` for a caller inside the locks" -- and it takes the
-    # DEFAULT `ask_server=True`. Read under `_walled_switch_lock` that puts a
-    # server round trip inside the one lock every waiter in a storm blocks on,
-    # paid in series by each of ten concurrent 429s and by each of the 28
-    # debounced repeats the 2026-09-09 event produced. The key needs the slot;
-    # nothing needs it read under the lock, and a switch landing between this
-    # read and the lock is the same tolerance the bearer read already has.
+    # DEFAULT `ask_server=True`. That oracle is conditional, not the ordinary
+    # path (it needs a spliced config AND `_live_credential_is` returning
+    # False), but under the lock even the local resolution is paid in series by
+    # every waiter in a storm: ten concurrent 429s on one wall is measured, and
+    # the 2026-09-09 event produced 28 debounced repeats.
+    #
+    # THEY MUST COME FROM ONE POINT IN TIME. The slot keys the memo and names
+    # the row the headroom is read from; the token says whether the client is
+    # still on that account. Split across the lock -- which is held across a
+    # usage fetch and `switch()` -- cswap can move the live account while this
+    # thread waits, and the headroom would then be measured for the PREVIOUS
+    # account while the 401 sends the client to rebuild onto one nobody read.
+    # That is the exhaustion `headroom > 0` exists to prevent, so the pair is
+    # read adjacently here and the debounce pays one extra store read rather
+    # than deciding on two different accounts.
     slot = _live_account_slot()
+    live = _active_oauth_token()
     with _walled_switch_lock:
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
@@ -17186,7 +17196,6 @@ def _switch_off_walled_account(
         # token.
         token = auth.strip()
         token = token[7:].strip() if token[:7].lower() == "bearer " else ""
-        live = _active_oauth_token()
         if token and live and token != live and slot is not None:
             # AND ONLY WHEN THE RETRY CAN LAND. A stale bearer says the
             # client would rebuild; it says nothing about whether what it
