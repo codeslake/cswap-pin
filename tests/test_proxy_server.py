@@ -13078,19 +13078,16 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 raise OSError("credential store unreadable")
             return json.dumps({"claudeAiOauth": {"accessToken": live_token}})
 
-        def _usage_entries_by_account(fetch=None, scheduled=False):
+        def _usage_entries_by_account(fetch=None):
             if snap is not None:
                 snap.append(fetch)
-            # THE NON-LIVE ROW IS FIRST, and it has full headroom. A read that
-            # takes whatever row it finds instead of the live slot answers
-            # "there is headroom" on a fleet where only the walled account is
-            # live -- the reading that forges a 401 with nowhere to land.
+            # Decoy rows with full headroom: a read that takes any row but
+            # the live slot answers "there is headroom" on a fleet where only
+            # the walled account is live.
             return {
-                # A ROW UNDER THE UNMANAGED SLOT, with full headroom. Without
-                # it `[None]` raises KeyError into the helper's `except` and
-                # the unmanaged-login case passes no matter what the code
-                # does -- an incidentally-correct safety property, which is
-                # the shape this file exists to refuse.
+                # Without a row here `[None]` raises KeyError into the
+                # helper's own `except` and the unmanaged-login case passes
+                # whatever the code does.
                 None: types.SimpleNamespace(
                     decision_value=lambda models=(): {
                         "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
@@ -13422,9 +13419,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._relay(auth="Bearer stale-account-token")
         assert snap == [{"1"}], (
             "the read must name the live slot: `fetch=None` sweeps EVERY "
-            "managed account over the network inside the wall's lock and "
-            "still only respects the persisted poll plans, while an explicit "
-            f"set is one fetch that may beat the serve TTL: {snap}")
+            "managed account over the network inside the wall's lock, to "
+            f"answer a question about exactly one of them: {snap}")
 
     def case_a_request_with_no_bearer_never_converts(self, monkeypatch):
         """NOTHING KILLED THE `token and` GUARD. Every case that predates the
@@ -13472,8 +13468,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         unchanged and still walled), giving 401 -> 429 -> 401 with no sleep
         until the retry loop exhausts into `authentication_failed`.
 
-        So the wall gets ONE 401 out of this path. Everything after it relays,
-        which is a sleep the client survives."""
+        So the wall converts at most once per `_WALLED_SWITCH_RAISE_TTL` out
+        of this path; every 429 in between relays, which is a sleep the client
+        survives. Not once and never again -- the entry expires like any other
+        negative, so a straggler still on the old bearer is not starved."""
         calls = self._wire(monkeypatch, switched=False,
                            live_token=self.LIVE, usage=self.HEADROOM)
         first = self._relay(auth="Bearer stale-account-token")
