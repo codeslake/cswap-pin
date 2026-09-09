@@ -13735,6 +13735,31 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             f"{len(failures)} of {len(rows)} model rows disagree with the "
             "implementation:\n" + "\n".join(failures[:6]))
 
+    def case_the_live_slot_is_read_outside_the_wall_lock(self, monkeypatch):
+        """`_live_login_identity`'s own docstring: "`ask_server=False` for a
+        caller inside the locks". `current_account_number()` takes the DEFAULT
+        `ask_server=True`, so reading it under `_walled_switch_lock` puts a
+        server round trip inside the one lock every waiter in a wall storm
+        blocks on -- ten concurrent 429s on one wall is measured, and the
+        debounced repeats (28 in the 2026-09-09 event) would each pay it in
+        series. The key needs the slot; nothing needs it read under the lock."""
+        from cswap_pin import proxy as pp
+        under_lock = []
+
+        def _slot():
+            free = pp._walled_switch_lock.acquire(blocking=False)
+            if free:
+                pp._walled_switch_lock.release()
+            under_lock.append(not free)
+            return "1"
+
+        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                   usage=self.HEADROOM, live_num=_slot)
+        self._relay(auth="Bearer stale-account-token")
+        assert under_lock and not any(under_lock), (
+            "the live slot was resolved while `_walled_switch_lock` was held: "
+            f"{under_lock}")
+
     def case_the_bearer_conversion_is_logged(self, monkeypatch):
         """`_TRACE` is off on a serving daemon, so daemon.log is the only
         record — and every count in the 2026-09-09 analysis came from

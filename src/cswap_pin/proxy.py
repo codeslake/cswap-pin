@@ -17138,6 +17138,16 @@ def _switch_off_walled_account(
                if retry_after else "")
         )
         return False
+    # BEFORE THE LOCK, DELIBERATELY. `current_account_number()` resolves
+    # through `_live_login_identity`, whose own docstring says
+    # "`ask_server=False` for a caller inside the locks" -- and it takes the
+    # DEFAULT `ask_server=True`. Read under `_walled_switch_lock` that puts a
+    # server round trip inside the one lock every waiter in a storm blocks on,
+    # paid in series by each of ten concurrent 429s and by each of the 28
+    # debounced repeats the 2026-09-09 event produced. The key needs the slot;
+    # nothing needs it read under the lock, and a switch landing between this
+    # read and the lock is the same tolerance the bearer read already has.
+    slot = _live_account_slot()
     with _walled_switch_lock:
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
@@ -17148,7 +17158,6 @@ def _switch_off_walled_account(
         # rotation mints a new access token per retry, so every retry would be
         # a fresh key and the 401 -> 429 -> 401 loop below reopens; a slot
         # number does not rotate.
-        slot = _live_account_slot()
         key = (reset, slot)
         if key in _walled_switch_seen:
             ok, retry_at = _walled_switch_seen[key]
