@@ -13768,7 +13768,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             # edge/gateway 429 (ResetHeader=Absent) is outside this decision
             # and must pass every header through unchanged.
             if row["ResetHeader"] == "Present":
-                if self.RESET_HEADER in got or self.RETRY_AFTER in got:
+                if (self.RESET_HEADER in got or self.RETRY_AFTER in got
+                        or self.UNIFIED_STATUS in got):
                     failures.append(
                         f"row {i + 1} {row} -> rate-limit headers survived "
                         f"(401={saw_401})")
@@ -13818,7 +13819,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._relay(auth="Bearer stale-account-token")
         assert sum("no longer the live account" in m for m in logged) == 1, logged
 
-    def case_a_switch_without_a_validated_landing_relays_the_429_unchanged(
+    def case_a_switch_without_a_validated_landing_relays_the_429_with_headers_stripped(
         self, monkeypatch,
     ):
         """`switch()` landed a credential but never probed it live (an older
@@ -13835,14 +13836,14 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.RETRY_AFTER not in got, got[:80]
         assert sum(
             "did not validate the landing credential (validated absent), "
-            "relaying the 429 unchanged" in m for m in logged
+            "relaying the 429 with headers stripped" in m for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
         assert self.RESET_HEADER not in second, second[:80]
         assert len(calls) == 1, len(calls)
 
-    def case_a_switch_with_validated_false_relays_the_429_unchanged(
+    def case_a_switch_with_validated_false_relays_the_429_with_headers_stripped(
         self, monkeypatch,
     ):
         """Same as the missing-key case, spelled the other way: `switch()`
@@ -13857,7 +13858,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.RETRY_AFTER not in got, got[:80]
         assert sum(
             "did not validate the landing credential (validated False), "
-            "relaying the 429 unchanged" in m for m in logged
+            "relaying the 429 with headers stripped" in m for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]

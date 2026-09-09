@@ -17176,7 +17176,7 @@ def _switch_off_walled_account(
                 _log_lifecycle(
                     "429 on /v1/messages — debounced repeat of wall reset="
                     f"{reset.decode('latin1', 'replace')}, relaying "
-                    f"{'a 401' if ok else 'the 429 unchanged'}"
+                    f"{'a 401' if ok else 'the 429 with headers stripped'}"
                 )
                 return ok
             # The negative's short expiry passed: treat this wall as unseen.
@@ -17265,7 +17265,8 @@ def _switch_off_walled_account(
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
                 f"429 on /v1/messages — the at-limit switch raised "
-                f"{exc.__class__.__name__}, relaying the 429 unchanged"
+                f"{exc.__class__.__name__}, relaying the 429 with headers "
+                f"stripped"
             )
             _remember_walled_switch(key, False)
             return False
@@ -17279,7 +17280,7 @@ def _switch_off_walled_account(
                 "429 on /v1/messages — switch landed but the host did not "
                 "validate the landing credential "
                 f"(validated {'absent' if validated is None else validated}), "
-                "relaying the 429 unchanged"
+                "relaying the 429 with headers stripped"
             )
         else:
             _log_lifecycle(
@@ -17289,7 +17290,7 @@ def _switch_off_walled_account(
                 f"429 on /v1/messages — switch() reported switched="
                 f"{result.get('switched') if result else None} needsLogin="
                 f"{result.get('needsLogin') if result else None}, relaying "
-                f"the 429 unchanged"
+                f"the 429 with headers stripped"
             )
         _remember_walled_switch(key, ok)
         return ok
@@ -17401,6 +17402,13 @@ def _relay_response(
             )
             _TRACE.flush()
         status_line = b"HTTP/1.1 401 Unauthorized"
+    elif _wall_relay and _TRACE is not None:
+        _TRACE.write(
+            f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
+            " (wall could not be converted — rate-limit headers stripped so"
+            " the client backs off instead of sleeping the wall's window)\n"
+        )
+        _TRACE.flush()
     if (status_line.startswith(b"HTTP/1.1 404")
             and _STREAM_ROUTE.search(path or "")
             and (_stream_404_is_spurious(path, certdir)
