@@ -17110,9 +17110,10 @@ def _switch_off_walled_account(
     no switch can). False (no headroom anywhere, `switch()` raised, `switch()`
     landed a credential it never validated, or a repeat of a wall that never
     earned a 401 and whose expiry has not passed) means
-    relay the 429 untouched — a relayed wall 429 costs a sleep the client
-    can abandon; a 401 onto a credential nobody confirmed is alive is worse
-    than the wall itself, because CC rebuilds onto it.
+    relay the 429 with its rate-limit headers stripped, so the client backs
+    off and retries instead of sleeping the wall's own reset window; a 401
+    onto a credential nobody confirmed is alive is worse than the wall
+    itself, because CC rebuilds onto it.
 
     Storm control and per-wall debounce are the SAME guard, and the lock is
     held ACROSS `switch()`: the wall claims its slot and every waiter blocks
@@ -17373,6 +17374,10 @@ def _relay_response(
     # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
     # above cannot see it; 401 is a rebuild trigger, 429 is not.
     _walled_401 = False
+    # True for a wall 429 the pin could not convert: the client still sees a
+    # 429, but its rate-limit headers are stripped below so it backs off
+    # instead of sleeping the wall's own reset window.
+    _wall_relay = False
     if (status_line.startswith(b"HTTP/1.1 429")
             and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"):
         reset = next(
@@ -17386,6 +17391,7 @@ def _relay_response(
             b"",
         )
         _walled_401 = _switch_off_walled_account(reset, retry_after, auth)
+        _wall_relay = bool(reset) and not _walled_401
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
@@ -17442,17 +17448,21 @@ def _relay_response(
             chunked = True
         elif kl == b"connection" and b"close" in vl:
             keep = False
-        if _walled_401 and (
-            kl in (b"retry-after", b"x-should-retry")
-            or kl.startswith(b"anthropic-ratelimit-")
-        ):
+        if (
+            (_walled_401 or _wall_relay)
+            and (kl == b"retry-after" or kl.startswith(b"anthropic-ratelimit-"))
+        ) or (_walled_401 and kl == b"x-should-retry"):
             # `retry-after` > 60s on a 401 throws
             # `api_request_retry_after_too_long`; every rate-limit header
             # (unified-status/-remaining/-limit and the requests/tokens-*
-            # family) is meaningless, or misleading, on a 401.
+            # family) is meaningless on a 401 and, relayed on a wall the pin
+            # could not convert, renders a false "resets in ~Ns" into the
+            # client's own transcript — stripped on both paths for that.
             # `x-should-retry: true` would have the SDK retry internally on
             # the same client without ever rebuilding it — no credential
-            # re-read, the whole point of the 401 defeated silently.
+            # re-read, the whole point of the 401 defeated silently. Left on
+            # a relay: there is no rebuild to defeat, and a 429 retries by
+            # default with or without this header.
             continue
         if kl in _HOP_BY_HOP_BYTES:
             continue

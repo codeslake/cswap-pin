@@ -13155,12 +13155,20 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.UNIFIED_STATUS not in got, got[:80]
         assert self.SHOULD_RETRY not in got, got[:80]
 
-    def case_no_headroom_anywhere_relays_the_429_untouched(self, monkeypatch):
+    def case_no_headroom_anywhere_relays_the_429_with_rate_limit_headers_stripped(
+        self, monkeypatch,
+    ):
+        """A relayed wall the pin could not convert must not carry a reset
+        the client would sleep the whole window for — nor a header it would
+        render as a false 'resets in ~Ns' into its own transcript.
+        `x-should-retry` is left alone: a 429 retries by default, so there
+        is no rebuild for it to defeat, unlike on a 401."""
         calls = self._wire(monkeypatch, switched=False)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER in got, got[:80]
-        assert self.UNIFIED_STATUS in got, got[:80]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert self.UNIFIED_STATUS not in got, got[:80]
+        assert self.RETRY_AFTER not in got, got[:80]
         assert self.SHOULD_RETRY in got, got[:80]
         assert len(calls) == 1, len(calls)
 
@@ -13288,13 +13296,14 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         it also has to stop a storm of retries on a wall with no headroom
         anywhere. A debounce hit must only forge a 401 for a wall this
         daemon actually switched off; one that never succeeded must keep
-        relaying the 429 untouched on every repeat, not just the first."""
+        relaying the 429, headers stripped, on every repeat, not just the
+        first."""
         calls = self._wire(monkeypatch, switched=False)
         first = self._relay()
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
-        assert self.RESET_HEADER in second, second[:80]
+        assert self.RESET_HEADER not in second, second[:80]
         assert len(calls) == 1, len(calls)
 
     def case_a_settled_negative_expires_so_the_next_429_re_attempts(
@@ -13753,6 +13762,20 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 failures.append(
                     f"row {i + 1} {row} -> 401={saw_401} calls={len(calls)}, "
                     f"model says 401={want_401} calls={want_calls}")
+                continue
+            # Every wall this decision reaches (ResetHeader=Present, 401 or
+            # relayed) must lose its rate-limit family either way; an
+            # edge/gateway 429 (ResetHeader=Absent) is outside this decision
+            # and must pass every header through unchanged.
+            if row["ResetHeader"] == "Present":
+                if self.RESET_HEADER in got or self.RETRY_AFTER in got:
+                    failures.append(
+                        f"row {i + 1} {row} -> rate-limit headers survived "
+                        f"(401={saw_401})")
+            elif self.RETRY_AFTER not in got:
+                failures.append(
+                    f"row {i + 1} {row} -> an edge/gateway 429 lost a header "
+                    "this decision never touches")
         assert not failures, (
             f"{len(failures)} of {len(rows)} model rows disagree with the "
             "implementation:\n" + "\n".join(failures[:6]))
@@ -13808,15 +13831,15 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         calls = self._wire(monkeypatch, switched=True, validated=None)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER in got, got[:80]
-        assert self.RETRY_AFTER in got, got[:80]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert self.RETRY_AFTER not in got, got[:80]
         assert sum(
             "did not validate the landing credential (validated absent), "
             "relaying the 429 unchanged" in m for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
-        assert self.RESET_HEADER in second, second[:80]
+        assert self.RESET_HEADER not in second, second[:80]
         assert len(calls) == 1, len(calls)
 
     def case_a_switch_with_validated_false_relays_the_429_unchanged(
@@ -13830,8 +13853,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         calls = self._wire(monkeypatch, switched=True, validated=False)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER in got, got[:80]
-        assert self.RETRY_AFTER in got, got[:80]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert self.RETRY_AFTER not in got, got[:80]
         assert sum(
             "did not validate the landing credential (validated False), "
             "relaying the 429 unchanged" in m for m in logged
