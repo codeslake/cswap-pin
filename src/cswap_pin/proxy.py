@@ -17460,9 +17460,10 @@ def _relay_response(
             kl in (b"retry-after", b"x-should-retry")
             or kl.startswith(b"anthropic-ratelimit-")
         ):
-            # `retry-after` > 60s throws `api_request_retry_after_too_long`;
-            # the rate-limit family renders a false "resets in ~Ns" into the
-            # client's own transcript. Both are stripped on either path.
+            # `retry-after` > 60s throws on a 401; the rate-limit family
+            # renders a false "resets in ~Ns" on a relay; `x-should-retry:
+            # false` would stop the retry the relay depends on. Stripped
+            # either way.
             continue
         if kl in _HOP_BY_HOP_BYTES:
             continue
