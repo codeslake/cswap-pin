@@ -13636,6 +13636,105 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             "the second account's wall must be decided on its own evidence, "
             f"not inherited from a conversion the first account earned: {calls}")
 
+    # --- the model sweep -------------------------------------------------
+    # tests/models/at_limit_conversion.pict enumerates the decision's inputs;
+    # `pict` expands it to the pairwise set beside it. The cases above each
+    # carry a NAMED rationale for one combination; this one walks every row of
+    # the model so a combination nobody imagined cannot go missing quietly.
+
+    HEADROOM_USAGE = {
+        "Ample": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}},
+        "Hairline": {"five_hour": {"pct": 99.9}, "seven_day": {"pct": 20.0}},
+        "Exhausted": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}},
+        "OverLimit": {"five_hour": {"pct": 120.0}, "seven_day": {"pct": 20.0}},
+        "NoReading": None,
+        "Sentinel": "rate_limited",
+        "MissingBaseWindow": {"five_hour": {"pct": 10.0}},
+        "ScopedOnly": {"scoped": [{"name": "Fable", "pct": 10.0}]},
+    }
+    SWITCH_WIRING = {
+        "LandedValidated": dict(switched=True, validated=True),
+        "LandedUnvalidated": dict(switched=True, validated=None),
+        "NoCandidate": dict(switched=False),
+        "NeedsLogin": dict(switched=True, needs_login=True),
+        "Raised": dict(switched=True),
+    }
+
+    @classmethod
+    def _model_rows(cls):
+        from pathlib import Path
+        tsv = (Path(__file__).parent / "models"
+               / "at_limit_conversion.tsv").read_text().splitlines()
+        head = tsv[0].split("\t")
+        return [dict(zip(head, line.split("\t"))) for line in tsv[1:] if line]
+
+    @staticmethod
+    def _model_expects(row):
+        """The SPEC, read off the model -- never a second copy of the code.
+
+        A wall 429 becomes a 401 when, and only when, one of two things is
+        true: an earlier call for this same (wall, account) already converted
+        it, or the client's bearer is no longer the live account AND that
+        account has measured headroom to serve the retry. Everything else
+        relays, including every reading that is merely UNKNOWN.
+        """
+        if row["ResetHeader"] == "Absent":
+            return False, 0
+        if row["MemoEntry"] == "SettledConversion":
+            return True, 0
+        if row["MemoEntry"] == "LiveNegative":
+            return False, 0
+        stale_bearer = (row["Authorization"] == "BearerStale"
+                        and row["LiveToken"] == "Readable"
+                        and row["LiveSlot"] == "Managed")
+        if stale_bearer and row["Headroom"] in ("Ample", "Hairline"):
+            return True, 0
+        return row["Switch"] == "LandedValidated", 1
+
+    def case_every_row_of_the_pict_model(self, monkeypatch):
+        """One row per pairwise combination, expected outcome derived from the
+        model's rules rather than from the implementation."""
+        from cswap_pin import proxy as pp
+
+        rows = self._model_rows()
+        assert len(rows) > 40, f"the expanded model looks truncated: {len(rows)}"
+        failures = []
+        for i, row in enumerate(rows):
+            def _raise():
+                raise OSError("locked")
+
+            slot = "1" if row["LiveSlot"] == "Managed" else None
+            calls = self._wire(
+                monkeypatch,
+                live_token=self.LIVE if row["LiveToken"] == "Readable" else None,
+                usage=self.HEADROOM_USAGE[row["Headroom"]],
+                live_num=slot,
+                before=_raise if row["Switch"] == "Raised" else None,
+                **self.SWITCH_WIRING[row["Switch"]])
+            key = (b"9999999999", slot)
+            if row["MemoEntry"] == "SettledConversion":
+                pp._walled_switch_seen[key] = (True, None)
+            elif row["MemoEntry"] == "LiveNegative":
+                pp._walled_switch_seen[key] = (False, time.monotonic() + 1e6)
+            elif row["MemoEntry"] == "ExpiredNegative":
+                pp._walled_switch_seen[key] = (False, time.monotonic() - 1.0)
+            auth = {"BearerStale": "Bearer stale-account-token",
+                    "BearerIsLive": "Bearer " + self.LIVE,
+                    "NonBearerScheme": "Basic dXNlcjpwYXNz",
+                    "NoHeader": ""}[row["Authorization"]]
+            got = self._relay(
+                reset=False if row["ResetHeader"] == "Absent" else None,
+                auth=auth)
+            want_401, want_calls = self._model_expects(row)
+            saw_401 = got.startswith(b"HTTP/1.1 401")
+            if saw_401 != want_401 or len(calls) != want_calls:
+                failures.append(
+                    f"row {i + 1} {row} -> 401={saw_401} calls={len(calls)}, "
+                    f"model says 401={want_401} calls={want_calls}")
+        assert not failures, (
+            f"{len(failures)} of {len(rows)} model rows disagree with the "
+            "implementation:\n" + "\n".join(failures[:6]))
+
     def case_the_bearer_conversion_is_logged(self, monkeypatch):
         """`_TRACE` is off on a serving daemon, so daemon.log is the only
         record — and every count in the 2026-09-09 analysis came from
