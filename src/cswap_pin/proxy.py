@@ -11489,7 +11489,7 @@ def policy_limits_for(token: "str | None") -> "dict | None":
 
 
 #: Claude Code re-fetches its profile once `oauthAccount.profileFetchedAt` is a
-#: day old (2.1.261 `Spe`: 86400000 ms) and writes the answer into the field
+#: day old (2.1.267 `Mme`: 86400000 ms) and writes the answer into the field
 #: WHOLE, account uuid included. That fetch travels as the ACTIVE account, so
 #: on a pinned machine it is the write that moves the field off the pin. A
 #: spliced identity younger than this never opens that gate.
@@ -11508,7 +11508,7 @@ def profile_identity_from(doc, now_ms=None) -> "dict | None":
     """`oauthAccount` as Claude Code writes it from `/api/oauth/profile`.
 
     The same keys and the same absent-vs-null rules as CC's own writer
-    (2.1.261 `XQe`), because its profile gate tests these names: a field
+    (2.1.267 `srt`), because its profile gate tests these names: a field
     spelled differently here is a field CC finds missing, and a missing one
     re-opens the fetch this exists to keep closed.
     """
