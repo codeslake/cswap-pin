@@ -2,7 +2,8 @@
 #
 # THE DECISION, not the code path. Every parameter below is an input the
 # function reads; the outcome is exactly one of {relay the 429, answer 401}
-# plus whether claude-swap's switch() was called at all.
+# plus whether claude-swap's switch() was called at all. A relayed 429 is no
+# longer byte-identical: its rate-limit headers are stripped before it leaves.
 #
 # Why a model and not a list of cases: an unrun gate reads like a passed one,
 # and a hand-written suite has that property one level down. A required pair

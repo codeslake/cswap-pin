@@ -17456,21 +17456,13 @@ def _relay_response(
             chunked = True
         elif kl == b"connection" and b"close" in vl:
             keep = False
-        if (
-            (_walled_401 or _wall_relay)
-            and (kl == b"retry-after" or kl.startswith(b"anthropic-ratelimit-"))
-        ) or (_walled_401 and kl == b"x-should-retry"):
-            # `retry-after` > 60s on a 401 throws
-            # `api_request_retry_after_too_long`; every rate-limit header
-            # (unified-status/-remaining/-limit and the requests/tokens-*
-            # family) is meaningless on a 401 and, relayed on a wall the pin
-            # could not convert, renders a false "resets in ~Ns" into the
-            # client's own transcript — stripped on both paths for that.
-            # `x-should-retry: true` would have the SDK retry internally on
-            # the same client without ever rebuilding it — no credential
-            # re-read, the whole point of the 401 defeated silently. Left on
-            # a relay: there is no rebuild to defeat, and a 429 retries by
-            # default with or without this header.
+        if (_walled_401 or _wall_relay) and (
+            kl in (b"retry-after", b"x-should-retry")
+            or kl.startswith(b"anthropic-ratelimit-")
+        ):
+            # `retry-after` > 60s throws `api_request_retry_after_too_long`;
+            # the rate-limit family renders a false "resets in ~Ns" into the
+            # client's own transcript. Both are stripped on either path.
             continue
         if kl in _HOP_BY_HOP_BYTES:
             continue

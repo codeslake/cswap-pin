@@ -13161,15 +13161,17 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         """A relayed wall the pin could not convert must not carry a reset
         the client would sleep the whole window for — nor a header it would
         render as a false 'resets in ~Ns' into its own transcript.
-        `x-should-retry` is left alone: a 429 retries by default, so there
-        is no rebuild for it to defeat, unlike on a 401."""
+        `x-should-retry` is stripped too: a bare `false` would stop the
+        retry this fix depends on, and absent or `true` both fall back to
+        the client's own default retry on a 429, so stripping costs
+        nothing and removes the one case that would regress."""
         calls = self._wire(monkeypatch, switched=False)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
         assert self.RESET_HEADER not in got, got[:80]
         assert self.UNIFIED_STATUS not in got, got[:80]
         assert self.RETRY_AFTER not in got, got[:80]
-        assert self.SHOULD_RETRY in got, got[:80]
+        assert self.SHOULD_RETRY not in got, got[:80]
         assert len(calls) == 1, len(calls)
 
     def case_a_raising_switch_releases_the_slot_for_a_retry(self, monkeypatch):
@@ -13769,11 +13771,12 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             # and must pass every header through unchanged.
             if row["ResetHeader"] == "Present":
                 if (self.RESET_HEADER in got or self.RETRY_AFTER in got
-                        or self.UNIFIED_STATUS in got):
+                        or self.UNIFIED_STATUS in got
+                        or self.SHOULD_RETRY in got):
                     failures.append(
                         f"row {i + 1} {row} -> rate-limit headers survived "
                         f"(401={saw_401})")
-            elif self.RETRY_AFTER not in got:
+            elif self.RETRY_AFTER not in got or self.SHOULD_RETRY not in got:
                 failures.append(
                     f"row {i + 1} {row} -> an edge/gateway 429 lost a header "
                     "this decision never touches")
