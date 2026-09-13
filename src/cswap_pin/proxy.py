@@ -5020,12 +5020,18 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # surfaces there instead
     # NO CREDENTIAL IS MINTED HERE ANYMORE. A `proxy.secret` an older install
     # left in this cert dir (or one this package minted before this change)
-    # is inert to THIS package: nothing in cswap-pin reads it anymore. Other
-    # tools outside this package (e.g. cswap's own health check and its
-    # cleanup sweep) still stat the file to decide "pin present" and should
-    # move to the bare URL; that migration is theirs, not this file's. Not
-    # cleaned up on purpose — deleting another version's file on upgrade is a
-    # worse failure than leaving one this package no longer consults.
+    # is inert to THIS package: nothing in cswap-pin reads it or sends it
+    # anymore. KNOWN ROLLOUT RISK, NOT THIS FILE'S TO FIX: at least two tools
+    # outside this package still read the file and send it as a proxy
+    # credential — cswap's own health check builds a `Proxy-Authorization`
+    # header from it and reports the chain broken at the `dial` stage if it
+    # cannot read the file, and its cleanup sweep reads it to decide a pin is
+    # present at all. A FRESH install after this change never creates the
+    # file, so those two callers will misread a live pin as absent until they
+    # move to the bare URL themselves; that migration belongs to them, not to
+    # this comment. Not cleaned up on purpose here either — deleting another
+    # version's leftover file on upgrade is a worse failure than leaving one
+    # this package no longer consults.
     # AND THE CONFIG MUST NAME THE PIN, which is the half that was missing.
     # Best-effort by design: the record is written and the proxy is serving by
     # the time we get here, so a config that cannot be written is a worse pin,
@@ -14426,10 +14432,10 @@ class PinProxy:
                 # wiring hands out a credential anymore (wire_env/
                 # wire_global_config hand out a bare URL now — an inert
                 # `proxy.secret` an older install left behind may still sit
-                # on disk, and a tool outside this package may still stat it,
-                # but this listener reads neither the file nor these
-                # headers), and the gate that read these headers was retired
-                # below regardless.
+                # on disk, and a tool outside this package may still read it
+                # and send it as a credential, but this listener reads
+                # neither the file nor these headers), and the gate that read
+                # these headers was retired below regardless.
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
