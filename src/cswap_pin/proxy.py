@@ -11015,7 +11015,8 @@ def wire_env(
     down at once); pin-env emits the `exec {fd}<>fifo` for the shell instead.
     """
     out = dict(env)
-    # No credential in the URL — see `wire_global_config`'s call for why.
+    # No credential in the URL — see `_wire_global_config_locked`'s note
+    # for why.
     proxy = f"http://127.0.0.1:{port}"
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
