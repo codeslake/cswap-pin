@@ -1,0 +1,73 @@
+# _switch_off_walled_account: does a wall 429 on /v1/messages become a 401?
+#
+# THE DECISION, not the code path. Every parameter below is an input the
+# function reads; the outcome is exactly one of {relay the 429, answer 401}
+# plus whether claude-swap's switch() was called at all. A relayed WALL 429
+# (ResetHeader=Present) is no longer byte-identical: its rate-limit headers
+# are stripped before it leaves. An Absent-reset relay is untouched.
+#
+# Why a model and not a list of cases: an unrun gate reads like a passed one,
+# and a hand-written suite has that property one level down. A required pair
+# with no case is a HOLE; a case outside the model is REDUNDANT. Measured in
+# this seam: replacing the bearer path's expiry call with `(False, None)` left
+# all 38 hand-written cases green while starving a straggler the docstring
+# promises to serve -- a combination nobody had imagined, leaving no trace of
+# its absence.
+#
+# Expand:  pict tests/models/at_limit_conversion.pict
+# Syntax:  https://github.com/microsoft/pict
+
+# The wall's own anthropic-ratelimit-unified-reset. Empty means this is not an
+# account-level unified wall (edge/gateway, or org/key-scoped).
+ResetHeader: Present, Absent
+
+# _walled_switch_seen[(reset, slot)] when this 429 arrives. The key is the pair
+# because a reset epoch is a CLOCK BOUNDARY two accounts can share.
+MemoEntry: Unseen, SettledConversion, LiveNegative, ExpiredNegative
+
+# The Authorization value the pin forwarded upstream. /v1/messages is never a
+# pinned route, so this is the client's own bearer.
+Authorization: BearerStale, BearerIsLive, NonBearerScheme, NoHeader
+
+# _active_oauth_token(): the live account's access token, or None.
+LiveToken: Readable, Unreadable
+
+# current_account_number(): the live slot, or None for an unmanaged login.
+LiveSlot: Managed, Unmanaged
+
+# _live_account_headroom(slot). Ample/Hairline are (0,100]; Exhausted is
+# exactly 0.0 and OverLimit is negative. The last four are UNKNOWN and must be
+# indistinguishable from one another at the call site.
+Headroom: Ample, Hairline, Exhausted, OverLimit, NoReading, Sentinel, MissingBaseWindow, ScopedOnly
+
+# What claude-swap's switch() does, when it is reached at all.
+Switch: LandedValidated, LandedUnvalidated, NoCandidate, NeedsLogin, Raised
+
+# THREE-WAY, FOR THESE THREE ONLY. The identity test is a three-condition
+# guard (`token and live and slot is not None`), and pairwise leaves its
+# conditions co-varying: the sole Present row carrying a stale bearer with an
+# unmanaged slot ALSO carried an unreadable token, so whichever guard fires
+# first masked the other and deleting `slot is not None` left the sweep green.
+# Order 3 over exactly this triple forces the isolating rows to exist.
+{ Authorization, LiveToken, LiveSlot } @ 3
+
+# --- constraints: combinations the code cannot present ---
+
+# An absent reset returns at the top, before the memo and before every read
+# below it, so those parameters are MASKED. Pin all of them: left free, the
+# expansion spends 16 of 64 rows on one assertion AND parks real pairs there --
+# (BearerStale, Unmanaged) and (BearerStale, Unreadable) landed only on an
+# Absent row, so the sweep never reached the `slot is not None` and `live`
+# guards those pairs exist to exercise. A pair covered only in a masked row is
+# the HOLE this file's header is about.
+IF [ResetHeader] = "Absent" THEN [MemoEntry] = "Unseen" AND [Authorization] = "BearerStale"
+   AND [LiveToken] = "Readable" AND [LiveSlot] = "Managed" AND [Switch] = "NoCandidate";
+
+# A live memo entry returns before the bearer test and before switch().
+IF [MemoEntry] IN {"SettledConversion", "LiveNegative"} THEN [Switch] = "NoCandidate";
+
+# Headroom is only READ once the identity test passes: a stale bearer, a
+# readable live token, and a managed live slot. Pinned otherwise so the model
+# does not enumerate a reading nobody takes.
+IF NOT ([Authorization] = "BearerStale" AND [LiveToken] = "Readable" AND [LiveSlot] = "Managed")
+   THEN [Headroom] = "Ample";
