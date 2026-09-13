@@ -4904,6 +4904,26 @@ class TestWireEnv:
         text = (tmp_path / "ca-bundle.pem").read_text()
         assert "PIN-CA" in text and "CCF-CA" in text
 
+    def case_no_userinfo_even_with_a_stale_secret_file_in_certdir(self, tmp_path):
+        """The credential must not reach HTTPS_PROXY, whether or not an older
+        install's ``proxy.secret`` still sits in the cert dir. Parsed with
+        ``urlsplit`` rather than compared to a literal URL, which would itself
+        carry the fixture's token."""
+        import secrets
+        from urllib.parse import urlsplit
+
+        from cswap_pin.proxy import wire_env
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        (tmp_path / "proxy.secret").write_text(secrets.token_urlsafe(32))
+        env = wire_env({}, 9955, ca)
+        for key in ("HTTPS_PROXY", "https_proxy"):
+            parsed = urlsplit(env[key])
+            assert parsed.username is None and parsed.password is None, (
+                f"{key} carries a credential from a proxy.secret file that "
+                "nothing should read anymore"
+            )
 
     def case_ssl_cert_file_only_when_it_provably_subsumes_the_store(
         self, tmp_path, monkeypatch
@@ -5446,6 +5466,32 @@ class TestWireGlobalConfig:
         assert env["NODE_EXTRA_CA_CERTS"] == "/tmp/ca.pem"
         # unrelated config must survive
         assert json.loads(path.read_text())["projects"] == {}
+
+    def case_no_userinfo_even_with_a_stale_secret_file_in_certdir(
+        self, tmp_path, monkeypatch
+    ):
+        """Same property as `wire_env`'s case of the same name, for the
+        `.claude.json` path: a `proxy.secret` left by an older install must
+        not surface in the URL this writes."""
+        import secrets
+        from pathlib import Path
+        from urllib.parse import urlsplit
+
+        from cswap_pin.proxy import wire_global_config
+
+        certdir = Path(tmp_path) / "pin-proxy"
+        certdir.mkdir()
+        (certdir / "proxy.secret").write_text(secrets.token_urlsafe(32))
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
+
+        assert wire_global_config(9955, certdir / "ca.pem") is True
+        env = json.loads(path.read_text())["env"]
+        for key in ("HTTPS_PROXY", "https_proxy"):
+            parsed = urlsplit(env[key])
+            assert parsed.username is None and parsed.password is None, (
+                f"{key} carries a credential from a proxy.secret file that "
+                "nothing should read anymore"
+            )
 
     def case_all_proxy_names_the_same_hop(self, tmp_path, monkeypatch):
         """A launcher that sets ALL_PROXY leaves it naming the proxy we chain
@@ -13005,26 +13051,6 @@ class TestTheGateDisarmsWhenThePinIsCleared:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def case_clear_removes_the_secret(self, tmp_path, monkeypatch):
-        from cswap_pin import proxy as pin_proxy
-
-        certdir = tmp_path / "pin-proxy"
-        certdir.mkdir(parents=True)
-        pin_proxy.ensure_proxy_secret(certdir)
-        assert pin_proxy.read_proxy_secret(certdir) is not None
-
-        class _Sw:
-            backup_dir = tmp_path
-
-        monkeypatch.setattr(pin_proxy, "save_pin", lambda *a, **k: None)
-        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
-        pin_proxy.apply_pin(_Sw(), None, None)
-
-        assert pin_proxy.read_proxy_secret(certdir) is None, (
-            "the pin is off but the gate is still armed — the next pin will "
-            "407 every session started in between"
-        )
-
     def case_clearing_without_a_secret_is_not_an_error(self, tmp_path, monkeypatch):
         from cswap_pin import proxy as pin_proxy
 
@@ -13080,31 +13106,6 @@ class TestArmingReportsWhoItCutsOff:
                 c.close()
         finally:
             srv.close()
-
-    def case_a_repin_reports_nothing_because_it_arms_nothing(
-        self, tmp_path, monkeypatch
-    ):
-        """Only the FIRST pin mints the secret; re-pinning reuses it and cuts
-        off nobody. Reporting a cutoff there would cry wolf."""
-        from cswap_pin import proxy as pin_proxy
-
-        certdir = tmp_path / "pin-proxy"
-        certdir.mkdir(parents=True)
-        pin_proxy.ensure_proxy_secret(certdir)
-
-        class _Sw:
-            backup_dir = tmp_path
-
-        monkeypatch.setattr(pin_proxy, "save_pin", lambda *a, **k: None)
-        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
-        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: None)
-        monkeypatch.setattr(
-            pin_proxy,
-            "clients_that_arming_would_cut_off",
-            lambda p: (_ for _ in ()).throw(AssertionError("counted on a re-pin")),
-        )
-        pin_proxy.apply_pin(_Sw(), "a@b.c", None)
-        assert pin_proxy.last_arm_cutoff() is None
 
 
 class TestClearingThePinDoesNotStrandLiveSessions:
@@ -17392,65 +17393,6 @@ class TestLoadCertDoesNotRaceItself:
         )
 
 
-class TestARefusedUnlinkDoesNotReportDisarmed:
-    """`apply_pin(email=None)` unlinks the proxy secret to disarm the gate,
-    then returns `False` unconditionally — the SAME `False` whether the
-    secret is now gone or the unlink was REFUSED (permission denied, a
-    read-only mount) and it is still sitting there, armed. A caller reading
-    `False` has no way to tell "disarmed" from "still armed, and I could not
-    tell you" — the shape every task in this release is about.
-
-    Absent (`FileNotFoundError`) and refused (any other `OSError`) are not
-    the same outcome and must not share a silent `pass`.
-    """
-
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
-
-    def case_a_refused_unlink_does_not_look_like_a_successful_disarm(
-        self, tmp_path, monkeypatch
-    ):
-        from cswap_pin import proxy as pin_proxy
-
-        certdir = tmp_path / "pin-proxy"
-        certdir.mkdir(parents=True)
-        pin_proxy.ensure_proxy_secret(certdir)
-        assert pin_proxy.read_proxy_secret(certdir) is not None
-
-        class _Sw:
-            backup_dir = tmp_path
-
-        monkeypatch.setattr(pin_proxy, "save_pin", lambda *a, **k: None)
-        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: True)
-
-        real_unlink = Path.unlink
-
-        def refusing_unlink(self, *a, **k):
-            if self.name == pin_proxy._SECRET_FILE:
-                raise PermissionError(13, "Permission denied")
-            return real_unlink(self, *a, **k)
-
-        monkeypatch.setattr(Path, "unlink", refusing_unlink)
-
-        raised = False
-        try:
-            pin_proxy.apply_pin(_Sw(), None, None)
-        except OSError:
-            raised = True
-
-        assert raised, (
-            "apply_pin swallowed a REFUSED unlink and returned normally — "
-            "the secret is still armed and nothing told the caller"
-        )
-        assert pin_proxy.read_proxy_secret(certdir) is not None, (
-            "fixture broken: the secret should still be there since the "
-            "unlink was refused"
-        )
-        # The absent-secret CONTROL is already covered by
-        # TestTheGateDisarmsWhenThePinIsCleared.test_clearing_without_a_secret_is_not_an_error.
-
-
 class TestAReleaseFailureDoesNotLookLikeSuccess:
     """`_release_daemon_state` returns `False` both when it dropped
     ``proxy.json`` (its own state, now gone) AND when the unlink was
@@ -18255,7 +18197,6 @@ class TestEverySmallCaseHolder:
                 TestLoadCertSurvivesAnAmbientErrorFilter(),
                 TestCarriesUsesTheSameGuardAsEverySite(),
                 TestLoadCertDoesNotRaceItself(),
-                TestARefusedUnlinkDoesNotReportDisarmed(),
                 TestAReleaseFailureDoesNotLookLikeSuccess(),
                 TestASalvageWriteFailureNeverCostsOurOwnCA(),
                 ],
@@ -21732,149 +21673,6 @@ class TestATransportOutageIsNotASessionEnding:
         pp = self._reset()
         pp._note_hop_trouble(b"HTTP/1.1 404 Not Found")
         assert pp._hop_recently_failed() is False
-
-
-class TestRotatingTheSecretDoesNotCutLiveSessions:
-    """A credential rotation must not 407 the sessions already holding the old one.
-
-    The wiring reaches a session through `~/.claude.json`, which Claude Code
-    reads ONCE at exec. So a rotated secret is unreachable to every live
-    process, and rejecting the old one cuts each of them until it restarts --
-    the 407 storm this codebase already carries measured history of.
-
-    Idempotence avoided the problem by never rotating. That is the right
-    default and the wrong ceiling: it means a leaked credential can only be
-    replaced by cutting the fleet.
-
-    So the retired secret keeps working for a grace window, which is the only
-    thing that makes rotation and no-interruption compatible.
-    """
-
-    @staticmethod
-    def _hdr(secret):
-        import base64
-        v = base64.b64encode(f"cswap:{secret}".encode()).decode()
-        return [("Proxy-Authorization", f"Basic {v}")]
-
-    def test_the_current_secret_is_accepted(self):
-        import cswap_pin.proxy as pp
-        assert pp._proxy_authorized(self._hdr("new"), "new") is True
-
-    def test_a_wrong_secret_is_still_refused(self):
-        """THE CONTROL. Without it a grace window could accept anything."""
-        import cswap_pin.proxy as pp
-        pp._retire_secret(None)
-        assert pp._proxy_authorized(self._hdr("junk"), "new") is False
-
-    def test_the_retired_secret_is_accepted_inside_the_window(self):
-        import cswap_pin.proxy as pp
-        pp._retire_secret("old")
-        try:
-            assert pp._proxy_authorized(self._hdr("old"), "new") is True
-        finally:
-            pp._retire_secret(None)
-
-    def test_the_retired_secret_stops_working_after_the_window(self):
-        import time
-        import cswap_pin.proxy as pp
-        pp._retire_secret("old")
-        pp._retired_at = time.time() - (pp._RETIRED_SECRET_SECONDS + 60)
-        try:
-            assert pp._proxy_authorized(self._hdr("old"), "new") is False
-        finally:
-            pp._retire_secret(None)
-
-
-class TestTheRotationItself:
-    """`rotate_proxy_secret` must mint a new one AND spare the old."""
-
-    def test_it_mints_a_different_secret(self, tmp_path):
-        import cswap_pin.proxy as pp
-        pp._retire_secret(None)
-        first = pp.ensure_proxy_secret(tmp_path)
-        second = pp.rotate_proxy_secret(tmp_path)
-        try:
-            assert second and second != first
-            assert pp.read_proxy_secret(tmp_path) == second
-        finally:
-            pp._retire_secret(None)
-
-    def test_the_old_one_still_authorises_afterwards(self, tmp_path):
-        """The whole point: a live session holding the old value keeps working."""
-        import base64
-        import cswap_pin.proxy as pp
-        pp._retire_secret(None)
-        first = pp.ensure_proxy_secret(tmp_path)
-        second = pp.rotate_proxy_secret(tmp_path)
-        hdr = [("Proxy-Authorization",
-                "Basic " + base64.b64encode(f"cswap:{first}".encode()).decode())]
-        try:
-            assert pp._proxy_authorized(hdr, second) is True
-        finally:
-            pp._retire_secret(None)
-
-    def test_rotating_with_nothing_stored_is_not_an_error(self, tmp_path):
-        """THE CONTROL: a first rotation has no predecessor to spare, and must
-        not retire an empty string into the accepted set."""
-        import base64
-        import cswap_pin.proxy as pp
-        pp._retire_secret(None)
-        made = pp.rotate_proxy_secret(tmp_path)
-        hdr = [("Proxy-Authorization",
-                "Basic " + base64.b64encode(b"cswap:").decode())]
-        try:
-            assert made
-            assert pp._proxy_authorized(hdr, made) is False
-        finally:
-            pp._retire_secret(None)
-
-
-class TestTheRetirementMustCrossProcesses:
-    """The daemon is not the process that rotates, so memory cannot carry this.
-
-    `_current_secret()` re-reads the secret FILE per request, so a rotation is
-    visible to the daemon at once. The retirement was a module global in
-    whichever process called `rotate_proxy_secret` -- a CLI, a script, never
-    the daemon -- so the daemon enforced the new secret while every live
-    session still presented the old one. The grace window existed only in a
-    process that had already exited.
-
-    It has to live beside the secret, like `worker-alive.json` does for the
-    other fact two processes must share.
-    """
-
-    def test_a_rotation_is_visible_to_a_different_process(self, tmp_path):
-        import base64
-        import cswap_pin.proxy as pp
-        old = pp.ensure_proxy_secret(tmp_path)
-        new = pp.rotate_proxy_secret(tmp_path)
-        # simulate the daemon: a process that never called rotate
-        pp._retire_secret(None)
-        hdr = [("Proxy-Authorization",
-                "Basic " + base64.b64encode(f"cswap:{old}".encode()).decode())]
-        try:
-            assert pp._proxy_authorized(hdr, new, certdir=tmp_path) is True, (
-                "the daemon rejected a live session's credential seconds after "
-                "a rotation it did not perform — the grace window never "
-                "reached it")
-        finally:
-            pp._retire_secret(None)
-
-    def test_an_expired_retirement_on_disk_is_not_honoured(self, tmp_path):
-        """THE CONTROL. A persisted window that never expires is worse than
-        none: a leaked value would be honoured forever."""
-        import base64, json
-        import cswap_pin.proxy as pp
-        old = pp.ensure_proxy_secret(tmp_path)
-        new = pp.rotate_proxy_secret(tmp_path)
-        pp._retire_secret(None)
-        p = pp._retired_path(tmp_path)
-        d = json.loads(p.read_text())
-        d["at"] = d["at"] - (pp._RETIRED_SECRET_SECONDS + 60)
-        p.write_text(json.dumps(d))
-        hdr = [("Proxy-Authorization",
-                "Basic " + base64.b64encode(f"cswap:{old}".encode()).decode())]
-        assert pp._proxy_authorized(hdr, new, certdir=tmp_path) is False
 
 
 class TestTheLogLineNamesTheHostCheckoutToo:

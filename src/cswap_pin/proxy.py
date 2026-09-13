@@ -2190,10 +2190,10 @@ def _wire_global_config_locked(
     if port is None or ca_path is None:
         pass  # `ledger` above already records "not wired"
     else:
-        # The CA lives in the cert dir, so its parent IS the cert dir — which
-        # is where the proxy credential lives too. Deriving it here keeps the
-        # public signature unchanged for every caller.
-        proxy = _proxy_url(port, Path(ca_path).parent)
+        # No credential in the URL: nothing downstream checks one, so
+        # putting it here only bought Claude Code's /status panel a bearer to
+        # print. See `_plain_relay` for where the gate this satisfied lived.
+        proxy = f"http://127.0.0.1:{port}"
         node_ca = _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
         # PYTHON DOES NOT READ NODE_EXTRA_CA_CERTS, and cswap's usage poll is
         # plain urllib -- so it obeys the proxy vars above while trusting
@@ -2389,27 +2389,6 @@ def _recorded_upstream(certdir: Path | None) -> str | None:
     # feeds back INTO the hint, so reconstructing it here launders the
     # credential out on the other side of the same round trip.
     return _read_upstream(certdir, "proxy") or None
-
-
-def _proxy_url(port: int, certdir: Path | None) -> str:
-    """The proxy URL to hand a client, carrying the credential when there is one.
-
-    Userinfo in the URL is how every client we wire (Node, curl, python) is
-    told to send ``Proxy-Authorization`` — measured: the real Claude Code
-    client sends ``Proxy-Authorization: Basic`` on CONNECT when HTTPS_PROXY
-    carries user:pass, and sends nothing when it does not. That measurement is
-    the whole reason this can be enforced without cutting every session off.
-
-    No secret (a cert dir we could not write) yields the bare URL, so the pin
-    keeps working unauthenticated rather than becoming unusable.
-    """
-    if certdir is not None:
-        secret = read_proxy_secret(certdir)
-        if secret:
-            from urllib.parse import quote
-
-            return f"http://cswap:{quote(secret, safe='')}@127.0.0.1:{port}"
-    return f"http://127.0.0.1:{port}"
 
 
 def _port_is_serving(host: str, port: int) -> bool:
@@ -5020,22 +4999,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # cswap can resolve an account in its own backup store. None therefore
         # means "could not look one up", and the splice leaves the field alone
         # rather than erasing it — cswap's own switch rewrites it on the next
-        # rotation, and a blank owner is worse than a stale one. DISARM. The
-        # gate is only meaningful while a pin exists, and leaving the secret
-        # behind means "I turned the pin off" and "the proxy still demands a
-        # credential" are both true at once — a state no user has a model for.
-        # Worse, the next `cswap pin` re-arms it against sessions wired in
-        # between, which is exactly the 407 storm this is fixed for.
-        #
-        # ABSENT AND REFUSED ARE NOT THE SAME OSError. FileNotFoundError means
-        # there was never anything armed — fine, `False` is correct. Any other
-        # OSError (permission denied, a read-only mount) means the secret is
-        # STILL THERE and this function is about to return the exact `False` a
-        # successful disarm would, which every caller reads as "nothing is
-        # armed". RE-RAISE rather than log: logging still returns the false
-        # `False`, and the caller's next decision — including the next `cswap
-        # pin` re-arming against sessions wired in the meantime — is made on
-        # that return value, not on a log line nobody is required to read.
+        # rotation, and a blank owner is worse than a stale one.
         try:
             splice_config_identity(identity)
         except Exception:  # noqa: BLE001 — the clear must work regardless
@@ -5043,10 +5007,6 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                            "config — bridges keep its owner until the next "
                            "switch")
         remember_pin_identity(switcher.backup_dir / "pin-proxy", None)
-        try:
-            proxy_secret_path(switcher.backup_dir / "pin-proxy").unlink()
-        except FileNotFoundError:
-            pass  # never armed, or already disarmed: nothing to do
         return False
     # Mint the proxy credential HERE, not in the daemon. This is the one path
     # that also rewrites the wiring, so the gate and the URL that satisfies it
@@ -5056,21 +5016,15 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # resulting failures. An existing secret is reused, so re-pinning does not
     # invalidate anything.
     certdir = switcher.backup_dir / "pin-proxy"
-    # Arming is a ONE-WAY DOOR for every session already running, so count
-    # them BEFORE minting — afterwards the connections are already being
-    # refused and the number is gone. Only when the secret does not exist
-    # yet: re-pinning reuses it and cuts off nobody.
-    global _last_arm_cutoff
-    _last_arm_cutoff = None
-    if read_proxy_secret(certdir) is None:
-        port = _read_alive_port(certdir)
-        if port is not None:
-            _last_arm_cutoff = clients_that_arming_would_cut_off(port)
     try:
         certdir.mkdir(parents=True, exist_ok=True)
-        ensure_proxy_secret(certdir)
     except OSError:
-        pass  # unwritable cert dir: serve unauthenticated rather than not at all
+        pass  # unwritable cert dir: the identity/config writes below no-op too
+    # NO CREDENTIAL IS MINTED HERE ANYMORE. A `proxy.secret` an older install
+    # left in this cert dir (or one this package minted before this change)
+    # is now inert: nothing reads it. Not cleaned up on purpose — deleting
+    # another version's file on upgrade is a worse failure than leaving one
+    # nothing consults.
     # AND THE CONFIG MUST NAME THE PIN, which is the half that was missing.
     # Best-effort by design: the record is written and the proxy is serving by
     # the time we get here, so a config that cannot be written is a worse pin,
@@ -5292,24 +5246,6 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
                        f"{str(was)[:12]} -> "
                        f"{str(identity.get('accountUuid'))[:12]}")
     return True
-
-
-# Set by the last apply_pin: how many live clients that call's arming cut off,
-# or None when it armed nothing (or could not measure). A module global rather
-# than a return value because apply_pin's bool is load-bearing for two callers
-# and the TUI menu; this is advisory, and a caller that ignores it is correct.
-_last_arm_cutoff: int | None = None
-
-
-def last_arm_cutoff() -> int | None:
-    """Live clients cut off by the most recent :func:`apply_pin`, if any.
-
-    None means nothing was armed — the usual case, since the secret is minted
-    once and reused. A number means those sessions will 407 on their next
-    request and only a relaunch fixes them, which is the thing an operator has
-    to be told at the moment they can still act on it.
-    """
-    return _last_arm_cutoff
 
 
 # HOW LONG A PINNED REQUEST WAITS ON `refresh_lock` BEFORE GIVING UP. The
@@ -7814,28 +7750,6 @@ def watch_refcount(
             pass
 
 
-_SECRET_FILE = "proxy.secret"
-
-
-def proxy_secret_path(certdir: Path) -> Path:
-    """Where the daemon's proxy credential lives (0600, in the cert dir)."""
-    return Path(certdir) / _SECRET_FILE
-
-
-def read_proxy_secret(certdir: Path) -> str | None:
-    """The daemon's proxy credential, or None when it has none.
-
-    None means "this daemon predates the credential" and every caller must
-    treat it as no-auth-required. A pin that starts rejecting traffic after an
-    upgrade is a worse failure than the one the credential prevents.
-    """
-    try:
-        val = proxy_secret_path(certdir).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return val or None
-
-
 def clients_that_arming_would_cut_off(port: int) -> int | None:
     """How many live processes are talking to the proxy right now.
 
@@ -7881,212 +7795,6 @@ def clients_that_arming_would_cut_off(port: int) -> int | None:
         if link.startswith("socket:[") and link[8:-1] in inodes:
             pids.add(fd.split("/")[2])
     return len(pids)
-
-
-def ensure_proxy_secret(certdir: Path) -> str:
-    """Mint (once) the credential a client must present to use this proxy.
-
-    THE PROBLEM: the daemon listens on unauthenticated loopback and swaps the
-    Authorization header of any request matching a pinned route. Loopback
-    carries no identity — the kernel does not check uid on a TCP connect — so
-    any process that can reach the port can CONNECT to api.anthropic.com with
-    a junk bearer and receive one minted from the pinned account's real
-    credential. cswap's own store is 0700/0600 precisely so that credential
-    cannot be read; the proxy hands out its effect to anyone who asks.
-
-    Loopback is not the boundary people assume. On a single-user laptop the
-    exposure is other processes running AS that user, which is a smaller
-    step-up than it sounds (a sandboxed tool, a compromised npm postinstall,
-    any code the user runs but does not trust with their Claude account). On a
-    shared or multi-account host it is other logins outright. Neither is
-    covered by file permissions, because the port is not a file.
-
-    So: a per-daemon secret, written 0600 next to the CA key that already
-    lives at 0600, and handed to clients through the same wiring that already
-    tells them the port. A client that can read the secret is a client that
-    could read the cert dir anyway — the credential adds nothing for an
-    attacker who already has that, and everything against one who does not.
-
-    Idempotent: an existing secret is reused, so a respawn does not invalidate
-    the wiring live sessions are already using.
-    """
-    import secrets
-
-    path = proxy_secret_path(certdir)
-    existing = read_proxy_secret(certdir)
-    if existing:
-        return existing
-    token = secrets.token_urlsafe(32)
-    tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    try:
-        # 0600 from creation, never briefly world-readable: the umask decides
-        # the mode of a plain write, and a 022 umask would publish this at
-        # 0644 in the window before any chmod.
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, token.encode("ascii"))
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-    except OSError:
-        # Cannot persist it — fail OPEN rather than block the pin. An
-        # unauthenticated proxy is the status quo; a proxy nobody can use is a
-        # regression.
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return ""
-    return token
-
-
-#: A retired secret keeps working for this long after a rotation.
-#:
-#: The wiring reaches a session through `~/.claude.json`, which the client
-#: reads ONCE at exec. A rotated secret is therefore unreachable to every LIVE
-#: process, and refusing the old one 407s each of them until it restarts.
-#: Without a window, rotating a leaked credential and cutting the fleet are the
-#: same operation.
-#:
-#: Long enough that an operator can rewire and let sessions turn over; short
-#: enough that a leaked value is not honoured indefinitely.
-_RETIRED_SECRET_SECONDS = 3600.0
-_RETIRED_FILE = "proxy.retired"
-_retired_secret: "str | None" = None
-_retired_at = 0.0
-
-
-def _retired_path(certdir) -> Path:
-    return Path(certdir) / _RETIRED_FILE
-
-
-def _retire_secret(old: "str | None", certdir=None) -> None:
-    """Keep accepting `old` for the grace window. None clears it at once.
-
-    ON DISK WHEN A CERTDIR IS GIVEN, because the process that ROTATES is never
-    the daemon that AUTHORISES. `_current_secret()` re-reads the secret file
-    per request, so a rotation reaches the daemon at once -- and a retirement
-    held in the rotating process's memory reaches it never. The daemon then
-    demands the new value while every live session still presents the old one,
-    which is the outage the window exists to prevent.
-    """
-    global _retired_secret, _retired_at
-    _retired_secret = old or None
-    _retired_at = time.time() if old else 0.0
-    if certdir is None:
-        return
-    path = _retired_path(certdir)
-    try:
-        if not old:
-            path.unlink(missing_ok=True)
-            return
-        fd = os.open(str(path) + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, json.dumps({"secret": old, "at": _retired_at}).encode())
-        finally:
-            os.close(fd)
-        os.replace(str(path) + ".tmp", path)
-    except OSError:
-        pass          # a window we cannot persist is a window we do not get
-
-
-def _retired_still_valid(certdir=None) -> "str | None":
-    """The retired secret if it is still inside the window, else None."""
-    now = time.time()
-    if _retired_secret and now - _retired_at <= _RETIRED_SECRET_SECONDS:
-        return _retired_secret
-    if certdir is None:
-        return None
-    try:
-        d = json.loads(_retired_path(certdir).read_text())
-    except (OSError, ValueError):
-        return None
-    sec, at = d.get("secret"), d.get("at")
-    if not isinstance(sec, str) or not sec or not isinstance(at, (int, float)):
-        return None
-    # Bounded BOTH ways: a future stamp is clock skew, not a licence to honour
-    # a retired value forever.
-    return sec if -_RETIRED_SECRET_SECONDS <= (now - at) <= _RETIRED_SECRET_SECONDS else None
-
-
-def rotate_proxy_secret(certdir: Path) -> str:
-    """Mint a replacement credential, sparing the old one for the grace window.
-
-    `ensure_proxy_secret` is idempotent on purpose -- a respawn must not
-    invalidate wiring live sessions already hold. That makes it the wrong tool
-    when the value itself has to change, which is why this exists separately
-    rather than as a flag on it.
-
-    The retirement is what keeps this from being an outage: the caller rewrites
-    the wiring, new processes take the new value, and the ones already running
-    keep working on the old one until they turn over.
-    """
-    import secrets
-
-    old = read_proxy_secret(certdir)
-    path = proxy_secret_path(certdir)
-    token = secrets.token_urlsafe(32)
-    tmp = path.with_suffix(f".{os.getpid()}.rot")
-    try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, token.encode("ascii"))
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return old or ""
-    # AFTER the write, and only for a REAL predecessor. Retiring "" would put
-    # an empty password into the accepted set, which authorises everyone.
-    _retire_secret(old or None, certdir)
-    return token
-
-
-def _proxy_authorized(headers: list[tuple[str, str]], secret: str | None,
-                      certdir=None) -> bool:
-    """Whether a CONNECT may use this proxy.
-
-    No secret configured => authorized, so a daemon from before this change
-    (or one that could not write its secret) keeps serving. Comparison is
-    constant-time; the value is a bearer for the pinned account in all but
-    name.
-    """
-    import hmac
-
-    if not secret:
-        return True
-    accepted = [secret]
-    retired = _retired_still_valid(certdir)
-    if retired:
-        accepted.append(retired)
-    for key, value in headers:
-        if key.lower() != "proxy-authorization":
-            continue
-        scheme, _, param = value.partition(" ")
-        if scheme.lower() != "basic":
-            continue
-        try:
-            decoded = base64.b64decode(param.strip(), validate=True).decode(
-                "utf-8", "replace"
-            )
-        except Exception:
-            continue
-        # user:pass — the secret is the password; the user part is cosmetic.
-        _, _, presented = decoded.partition(":")
-        # EVERY candidate is compared, never short-circuited: returning early
-        # on the first match would make the reply time depend on WHICH secret
-        # matched, which is the leak constant-time comparison exists to avoid.
-        ok = False
-        for candidate in accepted:
-            if hmac.compare_digest(presented, candidate):
-                ok = True
-        if ok:
-            return True
-    return False
 
 
 _PORT_HINT_FILE = "port.hint"
@@ -11315,9 +11023,8 @@ def wire_env(
     down at once); pin-env emits the `exec {fd}<>fifo` for the shell instead.
     """
     out = dict(env)
-    # Same derivation as the global config path: the CA's directory is the
-    # cert dir, which holds the proxy credential.
-    proxy = _proxy_url(port, Path(ca_path).parent)
+    # No credential in the URL — see `wire_global_config`'s call for why.
+    proxy = f"http://127.0.0.1:{port}"
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
     # Rewrite an ALL_PROXY the caller already had; never create one. Creating
@@ -11596,8 +11303,6 @@ class PinProxy:
         # The last hop fault reported, so a steadily-down hop costs one line
         # instead of one per connection — see _note_hop_unusable.
         self._hop_fault: "tuple[tuple[str, int], str] | None" = None
-        # The credential a client must present on CONNECT is re-read per
-        # connection, not cached here — ``_current_secret``.
         self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
         self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._server_ctx.load_cert_chain(
@@ -14686,16 +14391,14 @@ class PinProxy:
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
-                # Keep the CONNECT headers rather than draining them: the
-                # proxy credential arrives here and nowhere else.
-                connect_headers: list[tuple[str, str]] = []
+                # Drain the CONNECT headers. Nothing here reads them: the
+                # credential this once looked for no longer exists anywhere
+                # (wire_env/wire_global_config hand out a bare URL now), and
+                # the gate that read them was retired below regardless.
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
                         break
-                    if ":" in h:
-                        k, v = h.split(":", 1)
-                        connect_headers.append((k.strip(), v.strip()))
                 # A PIN THAT IS SET IS A PIN THAT APPLIES. The gate this
                 # replaces demanded a credential carried in HTTPS_PROXY, which
                 # is fixed at exec. Neither is what the feature is for. `cswap
@@ -14759,26 +14462,6 @@ class PinProxy:
             except OSError:
                 pass
 
-    def _current_secret(self) -> str | None:
-        """The credential to require RIGHT NOW, or None to require none.
-
-        Re-read per connection, like ``_current_chain`` does for the egress
-        proxy, so a secret written under a running daemon takes effect without
-        a respawn. Caching it at construction meant the gate armed on the next
-        RESPAWN instead — a fingerprint recycle, a deploy, an idle teardown —
-        with nothing a human would connect to the resulting 407s.
-
-        Arming DOES cut off sessions wired before the credential existed —
-        their ``HTTPS_PROXY`` is fixed at exec time and cannot be updated in
-        place (measured: 67 such sessions on linux). That is unavoidable, not
-        a bug to design around: nothing in a request distinguishes one of them
-        from an attacker, so any rule that keeps serving them keeps the hole
-        open. What matters is that it happens WHEN AN OPERATOR ASKS, in one
-        step they can pair with a relaunch, instead of silently on some later
-        respawn. Hence: minted by ``apply_pin``, enforced from that instant.
-        """
-        return read_proxy_secret(self._certdir) or None
-
     def _wait_for_pin_token(self, method: str, path: str, token):
         """`token`, retried briefly where a miss costs something PERMANENT.
 
@@ -14832,27 +14515,6 @@ class PinProxy:
         )
         return None
 
-    def _refuse_unauthorized(self, conn: socket.socket) -> None:
-        """407 a CONNECT that did not present the proxy credential.
-
-        407 rather than a silent close so a misconfigured client says what is
-        wrong instead of retrying forever against a proxy that looks dead —
-        that failure mode cost a day when a dead port produced
-        "ConnectionRefused, attempt 14/300" and nothing named the cause.
-        """
-        try:
-            conn.sendall(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-                b'Proxy-Authenticate: Basic realm="cswap-pin"\r\n'
-                b"Content-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-        except OSError:
-            pass
-        try:
-            conn.close()
-        except OSError:
-            pass
-
     def _refuse_stalled_mint(self, tls, method: str, path: str,
                               reason: str | None = None,
                               close: bool = False) -> bool:
@@ -14869,8 +14531,8 @@ class PinProxy:
         to close themselves (`_handle_client` has no keep-alive loop of its
         own here), so advertising keep-alive there just races the caller's
         own FIN with whatever reused the socket believing it. ``close=True``
-        is for those callers, matching the ``Connection: close`` its
-        neighbour ``_refuse_unauthorized`` already sends on the same path.
+        is for those callers, matching the ``Connection: close`` this used
+        to share with the now-retired credential gate's own 407.
 
         Rate-limited like ``_note_mint_busy`` and ``_note_busy_slot`` — a
         session retrying a pinned route against a stuck store would
@@ -15148,33 +14810,17 @@ class PinProxy:
             if ":" in h:
                 k, v = h.split(":", 1)
                 parsed.append((k.strip(), v.strip()))
-                # Never forward OUR proxy credential onward. This path relays
-                # the client's headers verbatim to the chain (a cache proxy, a corporate
-                # proxy), which would hand them a working credential for the
-                # pinned account's proxy. It is hop-by-hop by definition
-                # (RFC 9110): it authenticates to THIS proxy and stops here.
+                # Never forward a Proxy-Authorization onward. We no longer
+                # require one ourselves (see the module note on the retired
+                # gate), but this path relays the client's headers verbatim
+                # to the chain (a cache proxy, a corporate proxy), and a
+                # client-supplied one is not ours to hand that chain. It is
+                # hop-by-hop by definition (RFC 9110): it authenticates to
+                # THIS proxy and stops here — this strip is that correctness,
+                # unrelated to the gate that used to sit below it.
                 if k.strip().lower() == "proxy-authorization":
                     continue
             headers.append(h)
-        # STILL A HARD GATE here, unlike CONNECT. This path is plain-HTTP
-        # forwarding to an arbitrary host: there is no bearer to withhold, so
-        # "serve it unpinned" is not a weaker option — it just makes us an open
-        # forward proxy. The CONNECT path could soften because refusing there
-        # bought nothing the swap decision does not already buy.
-        #
-        # Claude Code DOES reach here: its Remote Control bridge client speaks
-        # absolute form, so `claude remote-control` registers its environment
-        # on this path. The refusal cannot cut those off — they carry our
-        # credential — and the swap below exists because they arrive here.
-        #
-        # AND IT COMES BEFORE THE BODY. `_read_body` loops until the client's
-        # own Content-Length is satisfied, so reading first lets an
-        # unauthenticated caller hold a thread and an unbounded buffer by
-        # announcing a body and sending none.
-        if not _proxy_authorized(parsed, self._current_secret(),
-                                 certdir=self._certdir):
-            self._refuse_unauthorized(conn)
-            return
         # THE BODY IS OURS TO CARRY, not `_pump`'s: anything that reads the
         # RESPONSE first deadlocks otherwise — the origin waits for
         # Content-Length bytes nobody sent while we wait for a status line.
