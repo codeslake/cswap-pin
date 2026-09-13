@@ -2275,10 +2275,9 @@ def _wire_global_config_locked(
         # mode, and the rename makes it permanent.
         tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
         # 0600 from creation, and never wider than what we are replacing.
-        # ``.claude.json`` carries primaryApiKey, inline MCP credentials and
-        # (once the gate is armed) the proxy URL's own credential. A plain
-        # write takes its mode from the umask, so a normal 022 would publish
-        # all of that at 0644 — and because this is a rename, the mode
+        # ``.claude.json`` carries primaryApiKey and inline MCP credentials.
+        # A plain write takes its mode from the umask, so a normal 022 would
+        # publish all of that at 0644 — and because this is a rename, the mode
         # SURVIVES: wiring the pin permanently downgrades a 0600 config.
         mode = _mode_of(path, default=0o600)
         try:
@@ -5008,13 +5007,6 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                            "switch")
         remember_pin_identity(switcher.backup_dir / "pin-proxy", None)
         return False
-    # Mint the proxy credential HERE, not in the daemon. This is the one path
-    # that also rewrites the wiring, so the gate and the URL that satisfies it
-    # arrive together, at a moment an operator chose. A daemon respawn must
-    # never arm it by itself: that would fire on a fingerprint recycle, a
-    # deploy or an idle teardown, with nothing a human could connect to the
-    # resulting failures. An existing secret is reused, so re-pinning does not
-    # invalidate anything.
     certdir = switcher.backup_dir / "pin-proxy"
     try:
         certdir.mkdir(parents=True, exist_ok=True)
@@ -7577,11 +7569,11 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
     so they could not be told; they got ConnectionRefused and retried forever
     (measured: 312 processes, `attempt 6/300`, plus "Auto-update failed").
 
-    That is the same root as the 407 — env cannot be updated in a running
-    process — pointing the other way: arming broke them, and disarming broke
-    them too. A daemon someone is actually connected to is not idle, whatever
-    the config says, so serving that traffic until it drains is what makes
-    turning the pin off as harmless as turning it on.
+    That is the same root as the retired gate's 407 — env cannot be updated in
+    a running process — pointing the other way: arming it broke them, and
+    disarming breaks them too. A daemon someone is actually connected to is
+    not idle, whatever the config says, so serving that traffic until it
+    drains is what makes turning the pin off as harmless as turning it on.
 
     ``live_clients`` is that question asked of the daemon itself (its own
     connection count). It must be, because the socket-scan answer is
@@ -9072,10 +9064,11 @@ def _port_returns_bytes(port: int, timeout: float | None = None) -> bool:
     The two questions are one word apart in English and opposite in effect, so
     they get names that cannot be mistaken for each other.
 
-    ANY BYTE COUNTS AND THE STATUS IS IGNORED. A live daemon answers 407 to an
-    unauthenticated request and a carrying peer relay answers 503 on purpose;
-    both mean "somebody is behind this socket", which is the only question
-    here. Parsing would make those two disagree and would need a credential.
+    ANY BYTE COUNTS AND THE STATUS IS IGNORED. A live daemon answers `/health`
+    with a real HTTP response, whatever its status, and a carrying peer relay
+    answers 503 on purpose; both mean "somebody is behind this socket", which
+    is the only question here. Parsing would make those two disagree over a
+    status neither side promises to keep stable.
 
     REFUSED AND ACCEPTED-THEN-SILENT BOTH READ FALSE, but only the second is
     subtle: this process is holding the LISTENING descriptor, so a connect to
@@ -10801,13 +10794,6 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
 
     certdir = Path(certdir)
     switcher = ClaudeAccountSwitcher()
-    # NOT minted here. A daemon respawn (a fingerprint recycle, a deploy) must
-    # not be able to turn the gate on: a live session's HTTPS_PROXY is fixed at
-    # exec time, so a session wired before the credential existed carries a URL
-    # without one and would start getting 407 on its next request — the upgrade
-    # cutting off the very sessions it protects. ``apply_pin`` mints it
-    # instead, so the gate arms exactly when the wiring is rewritten to carry
-    # it. PinProxy only ever READS the value.
     proxy = PinProxy(
         certdir=certdir,
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
