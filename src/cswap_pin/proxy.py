@@ -14383,10 +14383,12 @@ class PinProxy:
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
-                # Drain the CONNECT headers. Nothing here reads them: the
-                # credential this once looked for no longer exists anywhere
-                # (wire_env/wire_global_config hand out a bare URL now), and
-                # the gate that read them was retired below regardless.
+                # Drain the CONNECT headers. Nothing here reads them: no
+                # wiring hands out a credential anymore (wire_env/
+                # wire_global_config hand out a bare URL now — an inert
+                # `proxy.secret` an older install left behind may still sit
+                # on disk, but nothing reads it either), and the gate that
+                # read these headers was retired below regardless.
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
