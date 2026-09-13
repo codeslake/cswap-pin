@@ -5023,13 +5023,15 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # is inert to THIS package: nothing in cswap-pin reads it or sends it
     # anymore. KNOWN ROLLOUT RISK, NOT THIS FILE'S TO FIX: at least two tools
     # outside this package still read the file and send it as a proxy
-    # credential — cswap's own health check builds a `Proxy-Authorization`
-    # header from it and reports the chain broken at the `dial` stage if it
-    # cannot read the file, and its cleanup sweep reads it to decide a pin is
-    # present at all. A FRESH install after this change never creates the
-    # file, so those two callers will misread a live pin as absent until they
-    # move to the bare URL themselves; that migration belongs to them, not to
-    # this comment. Not cleaned up on purpose here either — deleting another
+    # credential — cswap's own health check (a separate project) builds a
+    # `Proxy-Authorization` header from it and reports the chain broken at
+    # the `dial` stage if it cannot read the file, and dotfiles' cleanup-rc
+    # sweep reads it to decide a pin is present at all. Any cert dir that
+    # does not already hold the file — a fresh install, or a host that pinned
+    # or cleared under a version at or after this one — never gets one, so
+    # those two callers will misread a live pin as absent until they move to
+    # the bare URL themselves; that migration belongs to them, not to this
+    # comment. Not cleaned up on purpose here either — deleting another
     # version's leftover file on upgrade is a worse failure than leaving one
     # this package no longer consults.
     # AND THE CONFIG MUST NAME THE PIN, which is the half that was missing.
