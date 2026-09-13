@@ -2192,7 +2192,8 @@ def _wire_global_config_locked(
     else:
         # No credential in the URL: nothing downstream checks one, so
         # putting it here only bought Claude Code's /status panel a bearer to
-        # print. See `_plain_relay` for where the gate this satisfied lived.
+        # print. See `_handle_client`'s "WHAT THE CREDENTIAL BOUGHT" note for
+        # why the check this satisfied was retired.
         proxy = f"http://127.0.0.1:{port}"
         node_ca = _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
         # PYTHON DOES NOT READ NODE_EXTRA_CA_CERTS, and cswap's usage poll is
@@ -14400,21 +14401,20 @@ class PinProxy:
                 # WHAT THE CREDENTIAL BOUGHT, precisely: the proxy listens on
                 # loopback and the kernel does not check uid on a TCP connect,
                 # so any process that can reach the port could obtain a bearer
-                # for the pinned account. But the secret lives at 0600 in the
-                # cert dir, so every process running AS THIS USER can read it —
-                # the sandboxed tool, the npm postinstall — which is the threat
-                # the docstring named. It only ever excluded a DIFFERENT login
-                # on a shared host. These are single-user machines; there is no
-                # such login to exclude, and the cost was the feature not
-                # working.
+                # for the pinned account. But the secret lived at 0600 in the
+                # cert dir, so every process running AS THIS USER could read
+                # it — the sandboxed tool, the npm postinstall. It only ever
+                # excluded a DIFFERENT login on a shared host. These are
+                # single-user machines; there is no such login to exclude,
+                # and the cost was the feature not working.
                 #
-                # THE BLIND TUNNEL IS NOT GATED EITHER, and keeping it gated
-                # was my error. "Do not be an open forward proxy" assumes the
-                # port is reachable; this one binds 127.0.0.1 only, so the
-                # population it could refuse is the same-user processes that
-                # can read the 0600 secret anyway. What it actually cost: every
-                # host that is NOT api.anthropic.com takes this path — git,
-                # pip, npm, the auto-updater.
+                # THE BLIND TUNNEL IS NOT GATED EITHER. "Do not be an open
+                # forward proxy" assumes the port is reachable; this one
+                # binds 127.0.0.1 only, so the population it could refuse was
+                # the same-user processes that could read the 0600 secret
+                # anyway. What it actually cost: every host that is NOT
+                # api.anthropic.com takes this path — git, pip, npm, the
+                # auto-updater.
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
                     return self._blind_tunnel(target, conn)
