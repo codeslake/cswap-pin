@@ -7571,8 +7571,8 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
 
     That is the same root as the retired gate's 407 — env cannot be updated in
     a running process — pointing the other way: arming it broke them, and
-    disarming breaks them too. A daemon someone is actually connected to is
-    not idle, whatever the config says, so serving that traffic until it
+    disarming the pin breaks them too. A daemon someone is actually connected
+    to is not idle, whatever the config says, so serving that traffic until it
     drains is what makes turning the pin off as harmless as turning it on.
 
     ``live_clients`` is that question asked of the daemon itself (its own
