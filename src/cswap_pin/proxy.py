@@ -5011,7 +5011,10 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     try:
         certdir.mkdir(parents=True, exist_ok=True)
     except OSError:
-        pass  # unwritable cert dir: the identity/config writes below no-op too
+        pass  # unwritable cert dir: only remember_pin_identity's own memo
+        # file no-ops on that below (it swallows the write itself and still
+        # returns the identity) — splice_config_identity and ensure_proxy do
+        # not touch certdir and still run
     # NO CREDENTIAL IS MINTED HERE ANYMORE. A `proxy.secret` an older install
     # left in this cert dir (or one this package minted before this change)
     # is now inert: nothing reads it. Not cleaned up on purpose — deleting
@@ -7745,11 +7748,10 @@ def watch_refcount(
 def clients_that_arming_would_cut_off(port: int) -> int | None:
     """How many live processes are talking to the proxy right now.
 
-    Arming the gate rejects every client whose ``HTTPS_PROXY`` carries no
-    credential, and that variable is fixed at exec — a running session cannot
-    be updated in place. So the honest question before minting a secret is
-    "who is using this port", and the answer has to reach the operator, or the
-    docstring's "pair it with a relaunch" is advice nobody can act on.
+    ``_is_claimed`` calls this when the daemon itself cannot answer, to decide
+    whether a proxy still has connected clients before treating it as idle and
+    tearing it down. A running session's ``HTTPS_PROXY`` is fixed at exec, so
+    the honest question before that teardown is "who is using this port".
 
     COUNTS SOCKETS, NOT ENVIRONMENTS. A previous version of this counted
     processes whose ``/proc/<pid>/environ`` named the port, and that number was
