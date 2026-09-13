@@ -5020,9 +5020,12 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # surfaces there instead
     # NO CREDENTIAL IS MINTED HERE ANYMORE. A `proxy.secret` an older install
     # left in this cert dir (or one this package minted before this change)
-    # is now inert: nothing reads it. Not cleaned up on purpose — deleting
-    # another version's file on upgrade is a worse failure than leaving one
-    # nothing consults.
+    # is inert to THIS package: nothing in cswap-pin reads it anymore. Other
+    # tools outside this package (e.g. cswap's own health check and its
+    # cleanup sweep) still stat the file to decide "pin present" and should
+    # move to the bare URL; that migration is theirs, not this file's. Not
+    # cleaned up on purpose — deleting another version's file on upgrade is a
+    # worse failure than leaving one this package no longer consults.
     # AND THE CONFIG MUST NAME THE PIN, which is the half that was missing.
     # Best-effort by design: the record is written and the proxy is serving by
     # the time we get here, so a config that cannot be written is a worse pin,
@@ -14423,8 +14426,10 @@ class PinProxy:
                 # wiring hands out a credential anymore (wire_env/
                 # wire_global_config hand out a bare URL now — an inert
                 # `proxy.secret` an older install left behind may still sit
-                # on disk, but nothing reads it either), and the gate that
-                # read these headers was retired below regardless.
+                # on disk, and a tool outside this package may still stat it,
+                # but this listener reads neither the file nor these
+                # headers), and the gate that read these headers was retired
+                # below regardless.
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
