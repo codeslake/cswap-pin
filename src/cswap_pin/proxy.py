@@ -14376,9 +14376,9 @@ class PinProxy:
                     # like a healthy tunnel. Logged, not refused — these
                     # connections already fail, and a 400 is a different
                     # failure than the one the client gets today.
-                    # THE SHAPE, NOT THE LINE: this runs before any credential
-                    # check and the rest of a CONNECT line is whatever the
-                    # client wrote, userinfo included.
+                    # THE SHAPE, NOT THE LINE: the rest of a CONNECT line is
+                    # whatever the client wrote, userinfo included, and
+                    # nothing here parses it.
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
@@ -14802,13 +14802,12 @@ class PinProxy:
                 k, v = h.split(":", 1)
                 parsed.append((k.strip(), v.strip()))
                 # Never forward a Proxy-Authorization onward. We no longer
-                # require one ourselves (see the module note on the retired
-                # gate), but this path relays the client's headers verbatim
-                # to the chain (a cache proxy, a corporate proxy), and a
-                # client-supplied one is not ours to hand that chain. It is
-                # hop-by-hop by definition (RFC 9110): it authenticates to
-                # THIS proxy and stops here — this strip is that correctness,
-                # unrelated to the gate that used to sit below it.
+                # require one ourselves (see the CONNECT handler's "WHAT THE
+                # CREDENTIAL BOUGHT" note, above), but this path relays the
+                # client's headers verbatim to the chain (a cache proxy, a
+                # corporate proxy), and a client-supplied one is not ours to
+                # hand that chain. It is hop-by-hop by definition (RFC 9110):
+                # it authenticates to THIS proxy and stops here.
                 if k.strip().lower() == "proxy-authorization":
                     continue
             headers.append(h)
