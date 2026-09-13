@@ -7762,9 +7762,8 @@ def clients_that_arming_would_cut_off(port: int) -> int | None:
     a different set entirely: 214 by environ against 7 actually connected, with
     an overlap of ZERO. ``environ`` is an exec-time snapshot and Claude Code
     applies ``.claude.json``'s env block at boot, so it keeps naming whatever
-    the launcher had. An operator reading "214 sessions will break" never
-    tears a proxy down; a wrong number in the one channel meant to inform a
-    decision is worse than no number.
+    the launcher had. A wrong count here would keep a proxy alive forever, or
+    tear one down mid-conversation.
 
     Returns None where it cannot be measured rather than 0 — a silent zero
     reads as "nobody is affected", which is the same lie in the other
