@@ -6184,59 +6184,6 @@ class TestDaemonState:
         assert read_daemon_state(tmp_path)["plain_relay_ungated"] is True
 
 
-class TestLeftoverSecretSweep:
-    """A `proxy.secret` left by a gated (pre-0.1.264) install is dead weight
-    once nothing can read it back into a client-facing URL — but that is only
-    true once `proxy.json` itself says so: see `_PLAIN_RELAY_UNGATED_KEY` and
-    `_sweep_leftover_secret`."""
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
-
-    def case_survives_while_proxy_json_lacks_the_key(self, tmp_path):
-        from cswap_pin.proxy import (
-            _sweep_leftover_secret, proxy_secret_path, write_daemon_state,
-        )
-
-        proxy_secret_path(tmp_path).write_text("s")
-        write_daemon_state(tmp_path, port=1, pid=1, fingerprint="fp")
-        _sweep_leftover_secret(tmp_path)
-        assert proxy_secret_path(tmp_path).exists(), (
-            "a sweep with no capability key on record must not delete the "
-            "secret — a gated holder may still be the one serving"
-        )
-
-    def case_survives_when_proxy_json_is_missing(self, tmp_path):
-        from cswap_pin.proxy import _sweep_leftover_secret, proxy_secret_path
-
-        proxy_secret_path(tmp_path).write_text("s")
-        _sweep_leftover_secret(tmp_path)
-        assert proxy_secret_path(tmp_path).exists(), (
-            "no proxy.json at all is unknown, not confirmation of a takeover"
-        )
-
-    def case_removed_once_the_key_is_recorded(self, tmp_path):
-        from cswap_pin.proxy import (
-            _sweep_leftover_secret, proxy_secret_path, write_daemon_state,
-        )
-
-        proxy_secret_path(tmp_path).write_text("s")
-        write_daemon_state(tmp_path, port=1, pid=1, fingerprint="fp",
-                            ungated=True)
-        _sweep_leftover_secret(tmp_path)
-        assert not proxy_secret_path(tmp_path).exists(), (
-            "a daemon that recorded it took over serving ungated must sweep "
-            "the leftover secret"
-        )
-
-    def case_no_secret_is_a_no_op(self, tmp_path):
-        from cswap_pin.proxy import _sweep_leftover_secret, write_daemon_state
-
-        write_daemon_state(tmp_path, port=1, pid=1, fingerprint="fp",
-                            ungated=True)
-        _sweep_leftover_secret(tmp_path)  # must not raise
-
-
 class TestEnsureProxyLifecycle:
     """ensure_proxy under the CCF-style lifecycle: reuse a fresh live daemon,
     recycle a stale-fingerprint one, and never double-spawn under a race."""
@@ -13121,13 +13068,18 @@ class TestTheDaemonWatchesItsOwnCode:
         finally:
             self._stop_live()
 
-    def case_a_real_daemon_start_records_ungated_and_sweeps_a_leftover_secret(
+    def case_a_real_daemon_start_records_ungated_and_leaves_a_leftover_secret(
         self, tmp_path, monkeypatch
     ):
         """`daemon_main`, RUN rather than read: it records the capability key
-        the instant it takes over serving, and that record is what makes it
-        safe to delete a `proxy.secret` an older install left behind. See
-        `_PLAIN_RELAY_UNGATED_KEY` and `_sweep_leftover_secret`."""
+        the instant it takes over serving, so a client-facing URL builder can
+        hand out the bare form. See `_PLAIN_RELAY_UNGATED_KEY`.
+
+        A `proxy.secret` an older install left behind is NOT deleted:
+        cswap's own health check and dotfiles' cleanup-rc sweep still read it
+        outside this package, and either one misreads a live pin as absent
+        the moment the file is gone.
+        """
         import secrets
 
         import claude_swap.paths as paths
@@ -13141,70 +13093,10 @@ class TestTheDaemonWatchesItsOwnCode:
         try:
             st = pin_proxy.read_daemon_state(certdir)
             assert st.get("plain_relay_ungated") is True, st
-            assert not (certdir / "proxy.secret").exists(), (
-                "a leftover secret must be swept once this daemon recorded "
-                "that it took over serving ungated"
+            assert (certdir / "proxy.secret").exists(), (
+                "a leftover secret must survive an ungated daemon start — "
+                "readers outside this package still depend on it"
             )
-        finally:
-            self._stop_live()
-
-    def case_a_real_daemon_start_rewires_a_config_still_naming_the_userinfo_form(
-        self, tmp_path, monkeypatch
-    ):
-        """A CONFIG WRITTEN JUST BEFORE THE RECYCLE MUST NOT OUTLIVE IT.
-
-        `heal` calls `rewire_if_version_changed` BEFORE it recycles a stale,
-        still-gated daemon. Read at that instant, `proxy.json` still names
-        the OLD, gated holder, so `_client_proxy_url` takes the userinfo
-        branch and stamps the result `writtenBy=<the version already on
-        disk>` -- the version THIS daemon also reports once it takes over.
-        `rewire_if_version_changed`'s whole cost model is "skip when
-        `writtenBy` already matches", so once the new daemon goes ungated and
-        sweeps `proxy.secret`, nothing ever revisits that write: every
-        hand-launched session and `/status` reads a `HTTPS_PROXY` naming a
-        credential that no longer exists, until a full launch or a port
-        change.
-
-        So the daemon that just went ungated must correct that specific
-        shape itself, in the same beat it retires the secret behind it.
-        """
-        import claude_swap.paths as paths
-        from cswap_pin import proxy as pin_proxy
-
-        free = socket.socket()
-        free.bind(("127.0.0.1", 0))
-        port = free.getsockname()[1]
-        free.close()
-
-        stale_secret = "STALE-DEAD-SECRET"
-        userinfo_url = f"http://cswap:{stale_secret}@127.0.0.1:{port}"
-        seeded = json.dumps({
-            "env": {
-                "HTTPS_PROXY": userinfo_url,
-                "https_proxy": userinfo_url,
-                "ALL_PROXY": userinfo_url,
-                "CSWAP_PIN_PORT": str(port),
-            },
-            "_cswapPinWiredKeys": [
-                "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "CSWAP_PIN_PORT"],
-            "_cswapPinWiredKeysSaved": {},
-            "writtenBy": pin_proxy._own_version(),
-        })
-
-        certdir, cfg, _ = self._live_daemon(
-            tmp_path, monkeypatch, paths, cfg_text=seeded)
-        try:
-            st = pin_proxy.read_daemon_state(certdir)
-            assert st["port"] == port, (
-                "premise: the daemon must reclaim the exact port the stale "
-                "config names, or this never exercises the shape it "
-                "corrects", st)
-            assert st.get("plain_relay_ungated") is True, st
-            wired = json.loads(cfg.read_text())["env"]["HTTPS_PROXY"]
-            assert wired == f"http://127.0.0.1:{port}", (
-                "a real ungate must rewrite a config still naming the "
-                "userinfo form for its own port, not leave a dead "
-                "credential wired", wired)
         finally:
             self._stop_live()
 
