@@ -2190,11 +2190,10 @@ def _wire_global_config_locked(
     if port is None or ca_path is None:
         pass  # `ledger` above already records "not wired"
     else:
-        # No credential in the URL: nothing downstream checks one, so
-        # putting it here only bought Claude Code's /status panel a bearer to
-        # print. See `_handle_client`'s "WHAT THE CREDENTIAL BOUGHT" note for
-        # why the check this satisfied was retired.
-        proxy = f"http://127.0.0.1:{port}"
+        # Bare only once `proxy.json` says the serving daemon retired the
+        # gate — else the old userinfo form, rebuilt from the gated holder's
+        # own secret. See `_client_proxy_url`.
+        proxy = _client_proxy_url(port, Path(ca_path).parent)
         node_ca = _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
         # PYTHON DOES NOT READ NODE_EXTRA_CA_CERTS, and cswap's usage poll is
         # plain urllib -- so it obeys the proxy vars above while trusting
@@ -5020,9 +5019,11 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # surfaces there instead
     # NO CREDENTIAL IS MINTED HERE ANYMORE. A `proxy.secret` an older install
     # left in this cert dir (or one this package minted before this change)
-    # is inert to THIS package: nothing in cswap-pin reads it or sends it
-    # anymore. KNOWN ROLLOUT RISK, NOT THIS FILE'S TO FIX: at least two tools
-    # outside this package still read the file and send it as a proxy
+    # is still read by THIS package, but only until the serving daemon
+    # records that it retired the capability gate — see
+    # `_PLAIN_RELAY_UNGATED_KEY`, `read_proxy_secret` and `_client_proxy_url`.
+    # KNOWN ROLLOUT RISK, NOT THIS FILE'S TO FIX: at least two tools outside
+    # this package also read the file directly and send it as a proxy
     # credential — cswap's own health check (a separate project) builds a
     # `Proxy-Authorization` header from it and reports the chain broken at
     # the `dial` stage if it cannot read the file, and dotfiles' cleanup-rc
@@ -5031,9 +5032,9 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # or cleared under a version at or after this one — never gets one, so
     # those two callers will misread a live pin as absent until they move to
     # the bare URL themselves; that migration belongs to them, not to this
-    # comment. Not cleaned up on purpose here either — deleting another
-    # version's leftover file on upgrade is a worse failure than leaving one
-    # this package no longer consults.
+    # comment. NEVER DELETED, on purpose — those same two callers keep
+    # depending on it long after this package stops needing it (see the note
+    # beside `daemon_main`'s `write_daemon_state(..., ungated=True)` call).
     # AND THE CONFIG MUST NAME THE PIN, which is the half that was missing.
     # Best-effort by design: the record is written and the proxy is serving by
     # the time we get here, so a config that cannot be written is a worse pin,
@@ -6571,6 +6572,17 @@ _DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 
 _STATE_FILE = "proxy.json"
 # Writing this file reaches a daemon that is already serving.
+# ONLY THIS DAEMON'S OWN RECORD MAY CARRY IT, and only once `daemon_main` has
+# called `proxy.start()` successfully: the key says "the daemon this record
+# names has taken over serving, and its plain relay (`_plain_relay`) checks no
+# credential" — never written by a standby, a starting process, or the
+# handover-marking write in `_spawn_daemon` (that one renames the DEPARTING
+# predecessor's own record and carries its existing value through unchanged,
+# rather than inventing one for a daemon it is not). Absence — the key
+# missing, or `proxy.json` missing/unreadable/unparseable — reads as unknown,
+# and every reader here treats unknown the same as False: see
+# `_client_proxy_url` for what that buys.
+_PLAIN_RELAY_UNGATED_KEY = "plain_relay_ungated"
 _TRACE_SWITCH_FILE = "trace-to"
 # Re-read at most this often: the check sits on the request path, and a stat
 # per request buys nothing when the answer changes once a day at most.
@@ -7841,6 +7853,36 @@ def clients_that_arming_would_cut_off(port: int) -> int | None:
     return len(pids)
 
 
+_SECRET_FILE = "proxy.secret"
+
+
+def proxy_secret_path(certdir: Path) -> Path:
+    """Where an older install's proxy credential lives, if one exists.
+
+    READ-ONLY on purpose. Nothing in this package mints, rotates or checks
+    this value anymore — the CONNECT/plain-relay gate it armed is retired for
+    good — but the client-facing URL builder (`_client_proxy_url`) still needs
+    to REBUILD the old userinfo shape during the handover window where
+    `proxy.json` has not yet recorded the capability key: see
+    `_PLAIN_RELAY_UNGATED_KEY`.
+    """
+    return Path(certdir) / _SECRET_FILE
+
+
+def read_proxy_secret(certdir: Path) -> str | None:
+    """The value at `proxy_secret_path`, or None when there is none to read.
+
+    None covers "never minted" and "unreadable" alike: either way there is no
+    credential to embed, so the caller falls back to the bare URL, same as
+    when a secret never existed at all.
+    """
+    try:
+        val = proxy_secret_path(certdir).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return val or None
+
+
 _PORT_HINT_FILE = "port.hint"
 
 
@@ -7865,7 +7907,8 @@ def read_port_hint(certdir: Path) -> int | None:
 
 
 def write_daemon_state(
-    certdir: Path, port: int, pid: int, fingerprint: str, handover: bool = False
+    certdir: Path, port: int, pid: int, fingerprint: str, handover: bool = False,
+    ungated: bool = False,
 ) -> None:
     """Record the live daemon's identity atomically (temp-then-rename).
 
@@ -7875,12 +7918,18 @@ def write_daemon_state(
     teardown and the SIGTERM handler — because all three already read this
     file and none of them can see the others' locals. The mark says: nothing
     is serving on this record, and whoever is departing must not unwire.
+
+    ``ungated`` sets ``_PLAIN_RELAY_UNGATED_KEY`` in the record. Pass it only
+    from a caller that has itself taken over serving on ``port`` — see that
+    constant's own comment for why.
     """
     import json
 
     rec = {"port": port, "pid": pid, "fingerprint": fingerprint}
     if handover:
         rec["handover"] = True
+    if ungated:
+        rec[_PLAIN_RELAY_UNGATED_KEY] = True
     tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(rec))
     os.replace(tmp, Path(certdir) / _STATE_FILE)
@@ -8012,6 +8061,50 @@ def read_daemon_state(certdir: Path) -> dict | None:
     if not isinstance(data, dict) or "port" not in data or "pid" not in data:
         return None
     return data
+
+
+def _serving_daemon_ungated(certdir: Path | None) -> bool:
+    """Whether ``proxy.json`` says the daemon serving ``certdir`` has retired
+    its plain-relay credential gate — see ``_PLAIN_RELAY_UNGATED_KEY``.
+
+    False on every unknown: no cert dir, no file, an unreadable or malformed
+    one, or a record that simply does not carry the key. ``read_daemon_state``
+    already collapses "absent" and "corrupt" to None; this collapses that
+    together with "key missing" and "key false" into the one safe default.
+    """
+    if certdir is None:
+        return False
+    state = read_daemon_state(certdir)
+    return bool(isinstance(state, dict) and state.get(_PLAIN_RELAY_UNGATED_KEY))
+
+
+def _client_proxy_url(port: int, certdir: Path | None) -> str:
+    """The proxy URL to hand a client: the shape depends on who is serving.
+
+    BARE when ``proxy.json`` says the serving daemon has retired the
+    credential gate (``_serving_daemon_ungated``) — the common case on this
+    release. Otherwise the OLD userinfo form, built from whatever the gated
+    holder left at ``read_proxy_secret`` — the shape a 0.1.262-era daemon
+    still demands on CONNECT, and the only one Remote Control's bridge client
+    was ever refused without.
+
+    FAILS CLOSED. ``proxy.json`` missing, unreadable, malformed, or simply
+    silent about the capability all read as "unknown, assume gated" here —
+    the same default `_serving_daemon_ungated` uses — because handing out the
+    bare form while an old, still-gated daemon might be the one actually
+    serving is the lost-bridge window this function exists to close. When
+    even the old form has nothing to embed (no secret was ever minted for
+    this cert dir), the bare URL is correct anyway: no credential ever
+    existed to demand, so nothing is lost by leaving it out.
+    """
+    if certdir is not None and _serving_daemon_ungated(certdir):
+        return f"http://127.0.0.1:{port}"
+    secret = read_proxy_secret(certdir) if certdir is not None else None
+    if secret:
+        from urllib.parse import quote
+
+        return f"http://cswap:{quote(secret, safe='')}@127.0.0.1:{port}"
+    return f"http://127.0.0.1:{port}"
 
 
 def _tree_digest_input(root: Path) -> bytes:
@@ -9388,6 +9481,12 @@ def _spawn_daemon(
             write_daemon_state(
                 certdir, prev.get("port") or 0, prev["pid"],
                 prev.get("fingerprint") or "", handover=True,
+                # CARRIED THROUGH, NEVER INVENTED: this rewrites the
+                # DEPARTING predecessor's own record, so its capability is
+                # whatever it already was — this call cannot know the
+                # successor's, and must not claim one for a daemon that is
+                # not this one.
+                ungated=bool(prev.get(_PLAIN_RELAY_UNGATED_KEY)),
             )
         except OSError:
             pass
@@ -10862,8 +10961,20 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     #
     # Same function, opposite requirement, one line apart in intent — the
     # watchdog's disk side must be fresh, an identity must not move.
+    #
+    # ``ungated=True``: this line runs only after ``proxy.start()`` returned,
+    # so THIS daemon is now the one serving ``port``, and every daemon on this
+    # release retired the CONNECT/plain-relay credential gate for good. That
+    # is what makes it safe for a client-facing URL builder to hand out the
+    # bare form once it reads this record — see `_PLAIN_RELAY_UNGATED_KEY`
+    # and `_client_proxy_url`. A `proxy.secret` an older install left behind
+    # is NOT deleted here: cswap's own health check and dotfiles' cleanup-rc
+    # sweep both still read it outside this package (see the note above
+    # `remember_pin_identity`'s cert-dir mkdir), so removing it breaks a
+    # working reader in exchange for tidying a file this package no longer
+    # consults.
     write_daemon_state(
-        certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT
+        certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT, ungated=True
     )
     # A start line means the log is never empty for a daemon that ran, so
     # "no teardown line" becomes evidence of a CRASH rather than of nothing.
@@ -11061,9 +11172,9 @@ def wire_env(
     down at once); pin-env emits the `exec {fd}<>fifo` for the shell instead.
     """
     out = dict(env)
-    # No credential in the URL — see `_wire_global_config_locked`'s note
-    # for why.
-    proxy = f"http://127.0.0.1:{port}"
+    # Bare only once `proxy.json` says the serving daemon retired the gate —
+    # see `_client_proxy_url`.
+    proxy = _client_proxy_url(port, Path(ca_path).parent)
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
     # Rewrite an ALL_PROXY the caller already had; never create one. Creating
@@ -11335,6 +11446,13 @@ class PinProxy:
         # returns, so without this a refused outage that healed before the
         # next probe would leave no trace at all. See `direct_last`.
         self._egress_refused_last: "float | None" = None
+        # MONOTONIC and stamped on EVERY refusal, not just the transition
+        # into one — see `_note_egress_refused`. `_report_deaf_bridges`
+        # reads this to tell a stamped post from one that actually reached
+        # claude.ai: a post is recorded when the request LINE arrives,
+        # before this pin dials upstream, so during a refusal window the
+        # pin answers 503 and the post it stamped may never have landed.
+        self._egress_refused_last_monotonic: "float | None" = None
         # DEGRADED, not abandoned — see `hop_degraded_last`. Separate from the
         # one above because falling to a LATER hop is still egress through a
         # configured proxy, so `direct` stays False and that stamp never runs.
@@ -12594,15 +12712,30 @@ class PinProxy:
             # counts of the same set taken seconds apart.
             posted = self._posting_now()
             draining_now = this_process_is_draining()
+            # A POST STAMPED WHILE EGRESS WAS REFUSED MAY NEVER HAVE
+            # REACHED claude.ai: the stamp lands when the request line
+            # arrives, before this pin dials upstream, and a refusal
+            # answers 503 without posting or stream-GETting anywhere. So a
+            # deaf verdict taken inside that window is unproven, same as
+            # one taken while a predecessor drains.
+            refused_last = getattr(self, "_egress_refused_last_monotonic",
+                                    None)
+            blind_refused = (refused_last is not None
+                              and time.monotonic() - refused_last
+                              <= _DEAF_WINDOW_S)
             prev = getattr(self, "_last_deaf", None)
-            # A BLIND EMITTED BECAUSE *THIS* PROCESS WAS DRAINING must not
-            # latch forever once the drain aborts and this process keeps
-            # serving: `now == prev` alone would otherwise dedupe away the
-            # MARK for an unchanged deaf set for the rest of this process's
-            # life, silencing every consumer of it. Only that one direction
-            # forces a re-emit; an ordinary unchanged set still dedupes.
-            stale_blind = (getattr(self, "_last_deaf_blind_draining", False)
-                           and not draining_now)
+            # A BLIND EMITTED BECAUSE *THIS* PROCESS WAS DRAINING, OR
+            # BECAUSE EGRESS WAS RECENTLY REFUSED, must not latch forever
+            # once that condition clears and the deaf set stays the same:
+            # `now == prev` alone would otherwise dedupe away the MARK for
+            # the rest of this process's life, silencing every consumer of
+            # it. Only that one direction forces a re-emit; an ordinary
+            # unchanged set still dedupes.
+            stale_blind = (
+                (getattr(self, "_last_deaf_blind_draining", False)
+                 and not draining_now)
+                or (getattr(self, "_last_deaf_blind_refused", False)
+                    and not blind_refused))
             if now == prev and not stale_blind:
                 return
             # SAME GUARD AS THE CHEAP BRANCH, for the same reason: a mute
@@ -12615,6 +12748,7 @@ class PinProxy:
                 return
             self._last_deaf = now
             self._last_deaf_blind_draining = False
+            self._last_deaf_blind_refused = False
             if mute:
                 _log_lifecycle(
                     f"{DEAF_REPORT_BLIND} — {len(mute)} draining predecessor(s) "
@@ -12633,6 +12767,15 @@ class PinProxy:
                     "own held-bridge view is partial by construction and a "
                     "bridge that looks streamless here may already be held "
                     "by the successor: "
+                    + " ".join(self._with_deaf_age(b) for b in now)
+                )
+            elif now and blind_refused:
+                self._last_deaf_blind_refused = True
+                age = int(time.monotonic() - refused_last)
+                _log_lifecycle(
+                    f"{DEAF_REPORT_BLIND} — egress was refused {age}s ago, "
+                    "so a post inside that window may never have reached "
+                    "the server: "
                     + " ".join(self._with_deaf_age(b) for b in now)
                 )
             elif now:
@@ -14430,14 +14573,12 @@ class PinProxy:
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
-                # Drain the CONNECT headers. Nothing here reads them: no
-                # wiring hands out a credential anymore (wire_env/
-                # wire_global_config hand out a bare URL now — an inert
-                # `proxy.secret` an older install left behind may still sit
-                # on disk, and a tool outside this package may still read it
-                # and send it as a credential, but this listener reads
-                # neither the file nor these headers), and the gate that read
-                # these headers was retired below regardless.
+                # Drain the CONNECT headers. Nothing here reads them: even
+                # while a still-gated `proxy.json` makes `wire_env`/
+                # `wire_global_config` hand out the userinfo form (see
+                # `_client_proxy_url`), this listener reads neither the
+                # `proxy.secret` file nor these headers, and the gate that
+                # once read them was retired below regardless.
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
@@ -14973,11 +15114,14 @@ class PinProxy:
             for chain in candidates:
                 try:
                     sock = _dial_chain(chain, extra_ca=self._chain_ca())
-                except (OSError, ssl.SSLError):
+                except (OSError, ssl.SSLError) as exc:
+                    self._note_hop_unusable(chain.address, f"dial failed: {exc!r}")
                     continue
                 # A plain proxy takes the absolute-form line as-is. Our own
                 # credential for the chain rides here, not the client's.
                 self._egress_refused = False
+                if self._hop_fault and self._hop_fault[0] == chain.address:
+                    self._hop_fault = None
                 return sock, (
                     f"{method} {url} HTTP/1.1\r\n"
                     + "\r\n".join(hdrs)
@@ -15810,6 +15954,10 @@ class PinProxy:
         again, so a flapping chain costs one line per outage, not per
         connection.
         """
+        # STAMPED BEFORE THE ONCE-PER-OUTAGE RETURN, on every call, not
+        # only the first: `_report_deaf_bridges` needs how recently egress
+        # was refused, which keeps moving for the width of the outage.
+        self._egress_refused_last_monotonic = time.monotonic()
         if self._egress_refused:
             return
         self._egress_refused = True
@@ -15830,7 +15978,12 @@ class PinProxy:
         holding that port exists to prevent; the other it cannot touch.
 
         Deduplicated on the transition like :meth:`_note_egress`, so a hop
-        that is steadily down costs one line rather than one per connection.
+        that is steadily down costs one line rather than one per connection —
+        once per (hop, reason), AND AGAIN after a recovery: the FAULTED hop
+        carrying again resets `_hop_fault`, so the same fault recurring after
+        that is a new transition, not a repeat. Scoped to that hop: another
+        hop carrying does not clear it, or a persistently dead hop behind a
+        healthy one would re-log on every connection.
         """
         state = (hop, why)
         if state == self._hop_fault:
@@ -15873,6 +16026,8 @@ class PinProxy:
         state = None if direct else hop
         if not direct:
             self._egress_refused = False
+            if self._hop_fault and self._hop_fault[0] == hop:
+                self._hop_fault = None
         if direct == self._egress_direct and state == self._egress_hop:
             return
         self._egress_direct, self._egress_hop = direct, state
@@ -16079,6 +16234,10 @@ class PinProxy:
         for chain in candidates:
             try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
+            except OSError as exc:
+                self._note_hop_unusable(chain.address, f"dial failed: {exc!r}")
+                continue
+            try:
                 up.sendall(
                     f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
                     f"{chain.connect_headers()}\r\n".encode("latin1")
@@ -16088,17 +16247,24 @@ class PinProxy:
                     h = _read_line(up)
                     if h in ("", None):
                         break
-                if not _connect_ok(status):
-                    # Refused BY this hop (not a transport failure). Try the
-                    # hop behind it; a direct dial is what happens only when
-                    # none of them will carry it.
-                    self._tunnel_trace(
-                        f"chain refused {target} "
-                        f"({(status or '').strip()}) — next hop")
-                    up.close()
-                    up = None
-                    continue
             except OSError:
+                status = None
+            if not _connect_ok(status):
+                # Refused BY this hop (not a transport failure, or none came
+                # back at all). Try the hop behind it; a direct dial is what
+                # happens only when none of them will carry it.
+                self._note_hop_unusable(
+                    chain.address,
+                    "accepted but did not tunnel: "
+                    + (f"CONNECT -> {status!r}" if status else "no reply"),
+                )
+                self._tunnel_trace(
+                    f"chain refused {target} "
+                    f"({(status or '').strip()}) — next hop")
+                try:
+                    up.close()
+                except OSError:
+                    pass
                 up = None
                 continue
             break
@@ -16109,6 +16275,8 @@ class PinProxy:
             # Trusting the status alone made Remote Control silently deaf —
             # everything Claude Code SENDS still went through the MITM path at
             # 200 while the receive channel was a dead socket.
+            self._note_hop_unusable(
+                chain.address, "answered 200 but the tunnel was already EOF")
             self._tunnel_trace(
                 f"chain answered 200 but the tunnel to {target} was already "
                 f"EOF — dialling direct")
@@ -16121,6 +16289,8 @@ class PinProxy:
             # `/health.refused_last`) never resets. Same condition
             # `_note_egress` uses (direct=False).
             self._egress_refused = False
+            if self._hop_fault and self._hop_fault[0] == chain.address:
+                self._hop_fault = None
             up = carrying  # the peeked byte, pushed back in front of the stream
         if up is None:
             # Every hop failed (down, or refused this host outright). A host

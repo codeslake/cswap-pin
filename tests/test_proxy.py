@@ -4981,11 +4981,66 @@ class TestWireEnv:
         text = (tmp_path / "ca-bundle.pem").read_text()
         assert "PIN-CA" in text and "CCF-CA" in text
 
-    def case_no_userinfo_even_with_a_stale_secret_file_in_certdir(self, tmp_path):
-        """The credential must not reach HTTPS_PROXY, whether or not an older
-        install's ``proxy.secret`` still sits in the cert dir. Parsed with
-        ``urlsplit`` rather than compared to a literal URL, which would itself
-        carry the fixture's token."""
+    def case_userinfo_form_when_proxy_json_lacks_the_capability_key(
+        self, tmp_path
+    ):
+        """A gated (pre-0.1.264) holder may still be the one actually
+        serving, so a `proxy.json` that does not say the gate is retired
+        keeps the OLD userinfo shape, built from that holder's own secret.
+        Parsed with ``urlsplit`` rather than compared to a literal URL, which
+        would itself carry the fixture's token."""
+        import secrets
+        from urllib.parse import urlsplit
+
+        from cswap_pin.proxy import wire_env, write_daemon_state
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        secret = secrets.token_urlsafe(32)
+        (tmp_path / "proxy.secret").write_text(secret)
+        write_daemon_state(tmp_path, port=9955, pid=1, fingerprint="fp")
+        env = wire_env({}, 9955, ca)
+        for key in ("HTTPS_PROXY", "https_proxy"):
+            parsed = urlsplit(env[key])
+            assert parsed.username == "cswap" and parsed.password == secret, (
+                f"{key} must carry the gated holder's own credential while "
+                f"proxy.json does not say the gate is retired: {env[key]!r}"
+            )
+
+    def case_bare_form_when_proxy_json_carries_the_capability_key(
+        self, tmp_path
+    ):
+        """Once the serving daemon has recorded that it retired the gate, the
+        URL drops the credential even though a stale secret file is still
+        sitting in the cert dir."""
+        import secrets
+        from urllib.parse import urlsplit
+
+        from cswap_pin.proxy import wire_env, write_daemon_state
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        (tmp_path / "proxy.secret").write_text(secrets.token_urlsafe(32))
+        write_daemon_state(
+            tmp_path, port=9955, pid=1, fingerprint="fp", ungated=True
+        )
+        env = wire_env({}, 9955, ca)
+        for key in ("HTTPS_PROXY", "https_proxy"):
+            parsed = urlsplit(env[key])
+            assert parsed.username is None and parsed.password is None, (
+                f"{key} still carries a credential once proxy.json says the "
+                f"gate is retired: {env[key]!r}"
+            )
+
+    def case_userinfo_form_when_proxy_json_is_missing_or_unparseable(
+        self, tmp_path
+    ):
+        """Every unknown about ``proxy.json`` keeps the old shape: a record
+        this launch could not read says nothing about which daemon (gated or
+        not) is actually serving, and the only safe default is the one that
+        never loses a bridge. An unreadable file (permission denied) hits the
+        same ``except OSError`` as missing, so the two are not tested
+        separately."""
         import secrets
         from urllib.parse import urlsplit
 
@@ -4993,14 +5048,70 @@ class TestWireEnv:
 
         ca = tmp_path / "ca.pem"
         ca.write_text("PIN-CA\n")
-        (tmp_path / "proxy.secret").write_text(secrets.token_urlsafe(32))
+        secret = secrets.token_urlsafe(32)
+        (tmp_path / "proxy.secret").write_text(secret)
+
+        # proxy.json does not exist at all
         env = wire_env({}, 9955, ca)
-        for key in ("HTTPS_PROXY", "https_proxy"):
-            parsed = urlsplit(env[key])
-            assert parsed.username is None and parsed.password is None, (
-                f"{key} carries a credential from a proxy.secret file that "
-                "nothing should read anymore"
-            )
+        parsed = urlsplit(env["HTTPS_PROXY"])
+        assert parsed.username == "cswap" and parsed.password == secret, (
+            env["HTTPS_PROXY"]
+        )
+
+        # proxy.json exists but is not valid JSON
+        (tmp_path / "proxy.json").write_text("{not json")
+        env = wire_env({}, 9955, ca)
+        parsed = urlsplit(env["HTTPS_PROXY"])
+        assert parsed.username == "cswap" and parsed.password == secret, (
+            env["HTTPS_PROXY"]
+        )
+
+    def case_bare_form_when_old_shape_needed_but_no_secret_exists(
+        self, tmp_path
+    ):
+        """No ``proxy.secret`` was ever minted for this cert dir (a fresh
+        install under this version, or one that pinned after the mint was
+        removed). Falling back to userinfo here would embed nothing to
+        authenticate with; the bare form is the shape that cannot lose a
+        bridge."""
+        from urllib.parse import urlsplit
+
+        from cswap_pin.proxy import wire_env, write_daemon_state
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        write_daemon_state(tmp_path, port=9955, pid=1, fingerprint="fp")
+        env = wire_env({}, 9955, ca)
+        parsed = urlsplit(env["HTTPS_PROXY"])
+        assert parsed.username is None and parsed.password is None, (
+            env["HTTPS_PROXY"]
+        )
+
+    def case_handover_sequence_flips_userinfo_to_bare_exactly_then(
+        self, tmp_path
+    ):
+        """The unit-level version of the deploy-window story: an old-shape
+        `proxy.json` (no key) is replaced by a new one (key), and wire_env's
+        output changes from userinfo to bare EXACTLY then — never before."""
+        import secrets
+        from urllib.parse import urlsplit
+
+        from cswap_pin.proxy import wire_env, write_daemon_state
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("PIN-CA\n")
+        secret = secrets.token_urlsafe(32)
+        (tmp_path / "proxy.secret").write_text(secret)
+
+        write_daemon_state(tmp_path, port=9955, pid=1, fingerprint="old")
+        before = urlsplit(wire_env({}, 9955, ca)["HTTPS_PROXY"])
+        assert before.username == "cswap" and before.password == secret
+
+        write_daemon_state(
+            tmp_path, port=9955, pid=2, fingerprint="new", ungated=True
+        )
+        after = urlsplit(wire_env({}, 9955, ca)["HTTPS_PROXY"])
+        assert after.username is None and after.password is None
 
     def case_ssl_cert_file_only_when_it_provably_subsumes_the_store(
         self, tmp_path, monkeypatch
@@ -5544,21 +5655,52 @@ class TestWireGlobalConfig:
         # unrelated config must survive
         assert json.loads(path.read_text())["projects"] == {}
 
-    def case_no_userinfo_even_with_a_stale_secret_file_in_certdir(
+    def case_userinfo_form_when_proxy_json_lacks_the_capability_key(
         self, tmp_path, monkeypatch
     ):
         """Same property as `wire_env`'s case of the same name, for the
-        `.claude.json` path: a `proxy.secret` left by an older install must
-        not surface in the URL this writes."""
+        `.claude.json` path: a `proxy.secret` left by a gated holder still
+        surfaces in the URL this writes while `proxy.json` does not say that
+        holder's gate is retired."""
         import secrets
         from pathlib import Path
         from urllib.parse import urlsplit
 
-        from cswap_pin.proxy import wire_global_config
+        from cswap_pin.proxy import wire_global_config, write_daemon_state
+
+        certdir = Path(tmp_path) / "pin-proxy"
+        certdir.mkdir()
+        secret = secrets.token_urlsafe(32)
+        (certdir / "proxy.secret").write_text(secret)
+        write_daemon_state(certdir, port=9955, pid=1, fingerprint="fp")
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
+
+        assert wire_global_config(9955, certdir / "ca.pem") is True
+        env = json.loads(path.read_text())["env"]
+        for key in ("HTTPS_PROXY", "https_proxy"):
+            parsed = urlsplit(env[key])
+            assert parsed.username == "cswap" and parsed.password == secret, (
+                f"{key} must carry the gated holder's own credential while "
+                f"proxy.json does not say the gate is retired: {env[key]!r}"
+            )
+
+    def case_bare_form_when_proxy_json_carries_the_capability_key(
+        self, tmp_path, monkeypatch
+    ):
+        """Once the serving daemon recorded that it retired the gate, the
+        `.claude.json` write drops the credential too."""
+        import secrets
+        from pathlib import Path
+        from urllib.parse import urlsplit
+
+        from cswap_pin.proxy import wire_global_config, write_daemon_state
 
         certdir = Path(tmp_path) / "pin-proxy"
         certdir.mkdir()
         (certdir / "proxy.secret").write_text(secrets.token_urlsafe(32))
+        write_daemon_state(
+            certdir, port=9955, pid=1, fingerprint="fp", ungated=True
+        )
         path = self._config(tmp_path, monkeypatch, {"projects": {}})
 
         assert wire_global_config(9955, certdir / "ca.pem") is True
@@ -5566,8 +5708,8 @@ class TestWireGlobalConfig:
         for key in ("HTTPS_PROXY", "https_proxy"):
             parsed = urlsplit(env[key])
             assert parsed.username is None and parsed.password is None, (
-                f"{key} carries a credential from a proxy.secret file that "
-                "nothing should read anymore"
+                f"{key} still carries a credential once proxy.json says the "
+                f"gate is retired: {env[key]!r}"
             )
 
     def case_all_proxy_names_the_same_hop(self, tmp_path, monkeypatch):
@@ -6027,6 +6169,20 @@ class TestDaemonState:
             "2", "b@co.com"
         )
         assert daemon_fingerprint() == daemon_fingerprint("1", "a@co.com")
+
+    def case_ungated_key_recorded_only_when_true(self, tmp_path):
+        """``ungated=False`` (the default) omits the key entirely, matching
+        every existing caller's record shape; only ``ungated=True`` adds
+        it — mirroring how ``handover`` already behaves."""
+        from cswap_pin.proxy import read_daemon_state, write_daemon_state
+
+        write_daemon_state(tmp_path, port=1, pid=2, fingerprint="fp")
+        assert "plain_relay_ungated" not in read_daemon_state(tmp_path)
+
+        write_daemon_state(tmp_path, port=1, pid=2, fingerprint="fp",
+                            ungated=True)
+        assert read_daemon_state(tmp_path)["plain_relay_ungated"] is True
+
 
 class TestEnsureProxyLifecycle:
     """ensure_proxy under the CCF-style lifecycle: reuse a fresh live daemon,
@@ -12909,6 +13065,38 @@ class TestTheDaemonWatchesItsOwnCode:
                 "a serving daemon left the config naming no port at all, so "
                 "every hand-launched session afterwards runs unpinned",
                 cfg.read_text())
+        finally:
+            self._stop_live()
+
+    def case_a_real_daemon_start_records_ungated_and_leaves_a_leftover_secret(
+        self, tmp_path, monkeypatch
+    ):
+        """`daemon_main`, RUN rather than read: it records the capability key
+        the instant it takes over serving, so a client-facing URL builder can
+        hand out the bare form. See `_PLAIN_RELAY_UNGATED_KEY`.
+
+        A `proxy.secret` an older install left behind is NOT deleted:
+        cswap's own health check and dotfiles' cleanup-rc sweep still read it
+        outside this package, and either one misreads a live pin as absent
+        the moment the file is gone.
+        """
+        import secrets
+
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        precreated = tmp_path / "pin-proxy"
+        precreated.mkdir()
+        (precreated / "proxy.secret").write_text(secrets.token_urlsafe(32))
+
+        certdir, cfg, _ = self._live_daemon(tmp_path, monkeypatch, paths)
+        try:
+            st = pin_proxy.read_daemon_state(certdir)
+            assert st.get("plain_relay_ungated") is True, st
+            assert (certdir / "proxy.secret").exists(), (
+                "a leftover secret must survive an ungated daemon start — "
+                "readers outside this package still depend on it"
+            )
         finally:
             self._stop_live()
 

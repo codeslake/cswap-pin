@@ -3002,6 +3002,401 @@ class TestChainRediscovery:
         finally:
             rude.close()
 
+    def case_the_absolute_form_dial_logs_the_hop_reason_before_REFUSED(
+        self, certdir, monkeypatch
+    ):
+        """`_plain_relay`'s own `dial()` walks the chain exactly like
+        `_walk_chain_once`, but its `except (OSError, ssl.SSLError): continue`
+        never called `_note_hop_unusable` — so the `egress REFUSED` line this
+        path also emits landed with no hop reason above it to explain why.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        dead = self._dead_port()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", dead),
+            rediscover_chain=True,
+        )
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"GET http://example.com/x HTTP/1.1\r\n"
+                    b"Host: example.com\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{dead} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert "dial failed" in lines[unusable[0]], lines[unusable[0]]
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_the_blind_tunnel_dial_failure_logs_before_REFUSED(
+        self, certdir, monkeypatch
+    ):
+        """`_blind_tunnel` is the OTHER walk that can emit `egress REFUSED`
+        (Remote Control's own path). A dead hop's dial failure must reach
+        `_note_hop_unusable`, not just the trace FILE (`_tunnel_trace`), so
+        the REFUSED line it also emits carries a hop reason in the daemon
+        log above it."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        dead = self._dead_port()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{dead} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert "dial failed" in lines[unusable[0]], lines[unusable[0]]
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_the_blind_tunnel_CONNECT_refusal_names_the_reason(
+        self, certdir, monkeypatch
+    ):
+        """A second `_blind_tunnel` fall-through, distinct from a dead dial:
+        a hop that ACCEPTS the CONNECT and answers non-200 — a cache proxy
+        mid-restart. The reason logged must say so, not read as a dead
+        port."""
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        wrong_lines = [
+            l for l in buf.getvalue().splitlines()
+            if f"{refusing_port} unusable" in l
+        ]
+        assert wrong_lines, (
+            f"a hop that answered and refused to tunnel was skipped "
+            f"silently: {buf.getvalue()!r}")
+        assert "dial failed" not in wrong_lines[0], (
+            "a hop that ANSWERED was reported as a dead port")
+        assert "accepted but did not tunnel" in wrong_lines[0], wrong_lines
+        assert "CONNECT ->" in wrong_lines[0], wrong_lines
+
+    def case_the_blind_tunnel_EOF_after_200_logs_the_reason(
+        self, certdir, monkeypatch
+    ):
+        """A FOURTH fall-through in the same function: a hop that ACCEPTS the
+        CONNECT, answers 200, and then closes before carrying anything — a
+        filtering proxy that answers optimistically and dials afterwards,
+        closing when that dial fails (`_tunnel_is_open` catches exactly
+        this). That path also fell through to `egress REFUSED` with no hop
+        reason above it.
+        """
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        srv_port = srv.getsockname()[1]
+
+        def _serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    seen = b""
+                    while b"\r\n\r\n" not in seen:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        seen += d
+                    c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                except OSError:
+                    pass
+                finally:
+                    c.close()  # accepted, answered 200, and EOF right after
+
+        threading.Thread(target=_serve, daemon=True).start()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{srv_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            srv.close()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{srv_port} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert "EOF" in lines[unusable[0]], lines[unusable[0]]
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_a_hop_that_recovers_then_faults_again_logs_a_second_line(
+        self, certdir
+    ):
+        """`_hop_fault`'s dedup is on the (hop, reason) TRANSITION, and must
+        be reset by that hop's own recovery — so a hop that goes down, comes
+        back and carries a request, then goes down again with the SAME
+        reason logs a second time, not silence. On a real daemon.log that
+        read 12 REFUSED lines behind 3 `unusable` lines, and the incident
+        could not be attributed to a specific outage window.
+
+        THE SAME HOP, not a different one behind it: reset the dedup for
+        every carrying hop and a chain with a persistently dead FIRST hop and
+        a healthy SECOND one floods a line per connection again — the exact
+        shape the dedup exists to prevent. So this pins the port itself going
+        down, up, then down again, not two different candidates.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens here yet — the hop starts DOWN
+
+        relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+        relay._chain_candidates = lambda: [
+            pin_proxy._as_chain(("127.0.0.1", port))
+        ]
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            except OSError:
+                pass
+        first = [
+            l for l in buf.getvalue().splitlines() if f"{port} unusable" in l
+        ]
+        assert first, f"the first fault was not logged: {buf.getvalue()!r}"
+
+        # THE SAME PORT RECOVERS: a listener bound to the identical address.
+        good = socket.socket()
+        good.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        good.bind(("127.0.0.1", port))
+        good.listen(4)
+
+        def _answer():
+            while True:
+                try:
+                    conn, _ = good.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+        threading.Thread(target=_answer, daemon=True).start()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            # premise: the hop carried, which is what should reset the dedup
+        finally:
+            good.close()
+
+        # CONFIRM THE PORT IS ACTUALLY DOWN before the next walk — closing a
+        # listening socket and a fresh connect racing it is not instantaneous
+        # everywhere, and `_connect_upstream` itself retries for 2.5s, which
+        # would silently ride out a slow teardown and mask the very thing
+        # this phase means to pin.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            except OSError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"port {port} never closed after good.close()")
+
+        # THE SAME PORT GOES DOWN AGAIN, the identical reason.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            except OSError:
+                pass
+        second = [
+            l for l in buf.getvalue().splitlines() if f"{port} unusable" in l
+        ]
+        assert second, (
+            "the SAME fault recurring after the SAME hop recovered was "
+            f"suppressed — _hop_fault's dedup is never reset by that hop's "
+            f"own recovery: {buf.getvalue()!r}")
+
+    def case_a_persistently_dead_first_hop_does_not_flood_once_the_second_carries(
+        self, certdir
+    ):
+        """A reset that clears `_hop_fault` on ANY hop carrying — not just the
+        one that faulted — reintroduces the flood the dedup exists to
+        prevent: a chain [A dead, B up] would re-log A's fault on every
+        connection, because B's carry re-arms the dedup before the next
+        walk. The reset must be scoped to the hop that just recovered.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        good = socket.socket()
+        good.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        good.bind(("127.0.0.1", 0))
+        good.listen(4)
+        good_port = good.getsockname()[1]
+
+        def _answer():
+            while True:
+                try:
+                    conn, _ = good.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+        threading.Thread(target=_answer, daemon=True).start()
+        try:
+            relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", dead_port)),
+                pin_proxy._as_chain(("127.0.0.1", good_port)),
+            ]
+
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            first = [
+                l for l in buf.getvalue().splitlines()
+                if f"{dead_port} unusable" in l
+            ]
+            assert first, f"the first fault was not logged: {buf.getvalue()!r}"
+
+            # SAME unchanged chain, again: A is still dead, B still carries.
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            second = [
+                l for l in buf.getvalue().splitlines()
+                if f"{dead_port} unusable" in l
+            ]
+            assert not second, (
+                "A's fault was re-logged after B merely carried again — B "
+                f"recovering does not mean A did: {buf.getvalue()!r}")
+        finally:
+            good.close()
+
     def case_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
         self, certdir, tmp_path, monkeypatch
     ):
@@ -8748,6 +9143,106 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
             pp._pin_daemon_pids = real_pids
+
+    def case_a_deaf_verdict_inside_a_refusal_window_is_blind_not_a_mark(
+            self, monkeypatch):
+        """A bridge's post is stamped the moment the request LINE arrives,
+        before the pin dials upstream. During an egress refusal the pin
+        answers 503 without ever posting to claude.ai, so a post stamped
+        inside that window may never have reached the server at all -- a
+        DEAF verdict taken from it is unproven and must read BLIND, not
+        the ordinary MARK.
+
+        Measured on an egress outage: `_report_deaf_bridges` fired MARK
+        four times across a 76-minute refusal on the same pin process and
+        cleared the moment the chain returned, with no restart in between
+        -- the bridges were never deaf, their posts just never landed.
+
+        Once the refusal window passes and the deaf set is unchanged, the
+        MARK must return -- the BLIND must not dedupe-silence it forever,
+        same shape as the draining-BLIND case above.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._egress_refused = False
+            srv._egress_refused_last = None
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1000.0)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_MAYBE/worker/messages")
+            srv._connected_bridges = {"cse_MAYBE"}
+            srv._note_egress_refused()
+
+            # (a) INSIDE THE WINDOW: BLIND, not MARK.
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1010.0)
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_BLIND in lines[-1], (
+                "a deaf verdict inside a refusal window was not BLIND: "
+                + repr(lines))
+            assert pp.DEAF_REPORT_MARK not in lines[-1], lines[-1]
+            assert "cse_MAYBE" in lines[-1], lines[-1]
+
+            # (b) PAST THE WINDOW, the bridge still posting (egress healthy
+            # again) and still no stream: the MARK must return, not stay
+            # dedupe-silenced by the BLIND above.
+            past_window = 1010.0 + pp._DEAF_WINDOW_S + 1.0
+            monkeypatch.setattr(pp.time, "monotonic", lambda: past_window)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_MAYBE/worker/messages")
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) > before, (
+                "the refusal-BLIND latched permanently -- no MARK ever "
+                "followed for a bridge that is genuinely still deaf")
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+
+            # THE ORDINARY DEDUPE STILL APPLIES once the MARK itself stands.
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) == before, (
+                "an unchanged MARK was re-logged; the refusal-window fix "
+                "must not defeat the dedupe generally")
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_CONTROL_no_refusal_ever_marks_exactly_as_before(self):
+        """No refusal recorded at all: the same deaf set must MARK exactly
+        as before this change -- the control that proves the refusal check
+        does not swallow every verdict."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_PLAIN/worker/messages")
+            srv._connected_bridges = {"cse_PLAIN"}
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], (
+                "with no refusal ever recorded, an ordinary deaf bridge "
+                f"must still MARK: {lines!r}")
+        finally:
+            pp._log_lifecycle = real_log
 
     def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
         """Nothing recorded whether a claude.ai attachment ever downloaded.
