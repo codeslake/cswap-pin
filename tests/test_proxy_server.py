@@ -3002,6 +3002,240 @@ class TestChainRediscovery:
         finally:
             rude.close()
 
+    def case_the_absolute_form_dial_logs_the_hop_reason_before_REFUSED(
+        self, certdir, monkeypatch
+    ):
+        """`_plain_relay`'s own `dial()` walks the chain exactly like
+        `_walk_chain_once`, but its `except (OSError, ssl.SSLError): continue`
+        never called `_note_hop_unusable` — so the `egress REFUSED` line this
+        path also emits landed with no hop reason above it to explain why.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        dead = self._dead_port()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", dead),
+            rediscover_chain=True,
+        )
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"GET http://example.com/x HTTP/1.1\r\n"
+                    b"Host: example.com\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{dead} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert "dial failed" in lines[unusable[0]], lines[unusable[0]]
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_the_blind_tunnel_dial_failure_logs_before_REFUSED(
+        self, certdir, monkeypatch
+    ):
+        """`_blind_tunnel` falls through a dead hop writing only to the trace
+        FILE (`_tunnel_trace`), never to `_note_hop_unusable` — so the
+        `egress REFUSED` line it also emits (Remote Control's own path) had
+        no hop reason in the daemon log."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        dead = self._dead_port()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{dead} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert "dial failed" in lines[unusable[0]], lines[unusable[0]]
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_the_blind_tunnel_CONNECT_refusal_names_the_reason(
+        self, certdir, monkeypatch
+    ):
+        """The other `_blind_tunnel` fall-through: a hop that ACCEPTS the
+        CONNECT and answers non-200 — a cache proxy mid-restart. Today that
+        is a bare `up.close(); up = None; continue`, same as a dead port."""
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        wrong_lines = [
+            l for l in buf.getvalue().splitlines()
+            if f"{refusing_port} unusable" in l
+        ]
+        assert wrong_lines, (
+            f"a hop that answered and refused to tunnel was skipped "
+            f"silently: {buf.getvalue()!r}")
+        assert "dial failed" not in wrong_lines[0], (
+            "a hop that ANSWERED was reported as a dead port")
+        assert "accepted but did not tunnel" in wrong_lines[0], wrong_lines
+        assert "CONNECT ->" in wrong_lines[0], wrong_lines
+
+    def case_a_hop_that_recovers_then_faults_again_logs_a_second_line(
+        self, certdir
+    ):
+        """`_hop_fault`'s dedup is on the (hop, reason) TRANSITION and is
+        never reset by a recovery — so a hop that goes down, comes back and
+        carries a request, then goes down again with the SAME reason is
+        silent the second time. On a real daemon.log that read 12 REFUSED
+        lines behind 3 `unusable` lines, and the incident could not be
+        attributed to a specific outage window."""
+        from cswap_pin import proxy as pin_proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        good = socket.socket()
+        good.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        good.bind(("127.0.0.1", 0))
+        good.listen(4)
+        good_port = good.getsockname()[1]
+
+        def _answer():
+            while True:
+                try:
+                    conn, _ = good.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+        threading.Thread(target=_answer, daemon=True).start()
+        try:
+            relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", dead_port))
+            ]
+
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                try:
+                    sock, _ = relay._connect_upstream()
+                    sock.close()
+                except OSError:
+                    pass
+            first = [
+                l for l in buf.getvalue().splitlines()
+                if f"{dead_port} unusable" in l
+            ]
+            assert first, f"the first fault was not logged: {buf.getvalue()!r}"
+
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", good_port))
+            ]
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            # premise: the hop carried, which is what should reset the dedup
+
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", dead_port))
+            ]
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                try:
+                    sock, _ = relay._connect_upstream()
+                    sock.close()
+                except OSError:
+                    pass
+            second = [
+                l for l in buf.getvalue().splitlines()
+                if f"{dead_port} unusable" in l
+            ]
+            assert second, (
+                "the SAME fault recurring after a recovery was suppressed — "
+                f"_hop_fault's dedup is never reset by a recovery: "
+                f"{buf.getvalue()!r}")
+        finally:
+            good.close()
+
     def case_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
         self, certdir, tmp_path, monkeypatch
     ):

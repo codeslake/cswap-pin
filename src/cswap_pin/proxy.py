@@ -15139,11 +15139,13 @@ class PinProxy:
             for chain in candidates:
                 try:
                     sock = _dial_chain(chain, extra_ca=self._chain_ca())
-                except (OSError, ssl.SSLError):
+                except (OSError, ssl.SSLError) as exc:
+                    self._note_hop_unusable(chain.address, f"dial failed: {exc!r}")
                     continue
                 # A plain proxy takes the absolute-form line as-is. Our own
                 # credential for the chain rides here, not the client's.
                 self._egress_refused = False
+                self._hop_fault = None
                 return sock, (
                     f"{method} {url} HTTP/1.1\r\n"
                     + "\r\n".join(hdrs)
@@ -16000,7 +16002,10 @@ class PinProxy:
         holding that port exists to prevent; the other it cannot touch.
 
         Deduplicated on the transition like :meth:`_note_egress`, so a hop
-        that is steadily down costs one line rather than one per connection.
+        that is steadily down costs one line rather than one per connection —
+        once per (hop, reason), AND AGAIN after a recovery: whoever carries a
+        request resets `_hop_fault`, so the same fault recurring after that is
+        a new transition, not a repeat.
         """
         state = (hop, why)
         if state == self._hop_fault:
@@ -16043,6 +16048,7 @@ class PinProxy:
         state = None if direct else hop
         if not direct:
             self._egress_refused = False
+            self._hop_fault = None
         if direct == self._egress_direct and state == self._egress_hop:
             return
         self._egress_direct, self._egress_hop = direct, state
@@ -16249,6 +16255,11 @@ class PinProxy:
         for chain in candidates:
             try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
+            except OSError as exc:
+                self._note_hop_unusable(chain.address, f"dial failed: {exc!r}")
+                up = None
+                continue
+            try:
                 up.sendall(
                     f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
                     f"{chain.connect_headers()}\r\n".encode("latin1")
@@ -16258,17 +16269,24 @@ class PinProxy:
                     h = _read_line(up)
                     if h in ("", None):
                         break
-                if not _connect_ok(status):
-                    # Refused BY this hop (not a transport failure). Try the
-                    # hop behind it; a direct dial is what happens only when
-                    # none of them will carry it.
-                    self._tunnel_trace(
-                        f"chain refused {target} "
-                        f"({(status or '').strip()}) — next hop")
-                    up.close()
-                    up = None
-                    continue
             except OSError:
+                status = None
+            if not _connect_ok(status):
+                # Refused BY this hop (not a transport failure, or none came
+                # back at all). Try the hop behind it; a direct dial is what
+                # happens only when none of them will carry it.
+                self._note_hop_unusable(
+                    chain.address,
+                    "accepted but did not tunnel: "
+                    + (f"CONNECT -> {status!r}" if status else "no reply"),
+                )
+                self._tunnel_trace(
+                    f"chain refused {target} "
+                    f"({(status or '').strip()}) — next hop")
+                try:
+                    up.close()
+                except OSError:
+                    pass
                 up = None
                 continue
             break
@@ -16291,6 +16309,7 @@ class PinProxy:
             # `/health.refused_last`) never resets. Same condition
             # `_note_egress` uses (direct=False).
             self._egress_refused = False
+            self._hop_fault = None
             up = carrying  # the peeked byte, pushed back in front of the stream
         if up is None:
             # Every hop failed (down, or refused this host outright). A host
