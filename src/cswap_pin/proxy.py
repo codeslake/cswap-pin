@@ -15145,7 +15145,8 @@ class PinProxy:
                 # A plain proxy takes the absolute-form line as-is. Our own
                 # credential for the chain rides here, not the client's.
                 self._egress_refused = False
-                self._hop_fault = None
+                if self._hop_fault and self._hop_fault[0] == chain.address:
+                    self._hop_fault = None
                 return sock, (
                     f"{method} {url} HTTP/1.1\r\n"
                     + "\r\n".join(hdrs)
@@ -16048,7 +16049,8 @@ class PinProxy:
         state = None if direct else hop
         if not direct:
             self._egress_refused = False
-            self._hop_fault = None
+            if self._hop_fault and self._hop_fault[0] == hop:
+                self._hop_fault = None
         if direct == self._egress_direct and state == self._egress_hop:
             return
         self._egress_direct, self._egress_hop = direct, state
@@ -16309,7 +16311,8 @@ class PinProxy:
             # `/health.refused_last`) never resets. Same condition
             # `_note_egress` uses (direct=False).
             self._egress_refused = False
-            self._hop_fault = None
+            if self._hop_fault and self._hop_fault[0] == chain.address:
+                self._hop_fault = None
             up = carrying  # the peeked byte, pushed back in front of the stream
         if up is None:
             # Every hop failed (down, or refused this host outright). A host

@@ -3160,7 +3160,106 @@ class TestChainRediscovery:
         carries a request, then goes down again with the SAME reason is
         silent the second time. On a real daemon.log that read 12 REFUSED
         lines behind 3 `unusable` lines, and the incident could not be
-        attributed to a specific outage window."""
+        attributed to a specific outage window.
+
+        THE SAME HOP, not a different one behind it: reset the dedup for
+        every carrying hop and a chain with a persistently dead FIRST hop and
+        a healthy SECOND one floods a line per connection again — the exact
+        shape the dedup exists to prevent. So this pins the port itself going
+        down, up, then down again, not two different candidates.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens here yet — the hop starts DOWN
+
+        relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+        relay._chain_candidates = lambda: [
+            pin_proxy._as_chain(("127.0.0.1", port))
+        ]
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            except OSError:
+                pass
+        first = [
+            l for l in buf.getvalue().splitlines() if f"{port} unusable" in l
+        ]
+        assert first, f"the first fault was not logged: {buf.getvalue()!r}"
+
+        # THE SAME PORT RECOVERS: a listener bound to the identical address.
+        good = socket.socket()
+        good.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        good.bind(("127.0.0.1", port))
+        good.listen(4)
+
+        def _answer():
+            while True:
+                try:
+                    conn, _ = good.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+        threading.Thread(target=_answer, daemon=True).start()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            # premise: the hop carried, which is what should reset the dedup
+        finally:
+            good.close()
+
+        # CONFIRM THE PORT IS ACTUALLY DOWN before the next walk — closing a
+        # listening socket and a fresh connect racing it is not instantaneous
+        # everywhere, and `_connect_upstream` itself retries for 2.5s, which
+        # would silently ride out a slow teardown and mask the very thing
+        # this phase means to pin.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            except OSError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"port {port} never closed after good.close()")
+
+        # THE SAME PORT GOES DOWN AGAIN, the identical reason.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            except OSError:
+                pass
+        second = [
+            l for l in buf.getvalue().splitlines() if f"{port} unusable" in l
+        ]
+        assert second, (
+            "the SAME fault recurring after the SAME hop recovered was "
+            f"suppressed — _hop_fault's dedup is never reset by that hop's "
+            f"own recovery: {buf.getvalue()!r}")
+
+    def case_a_persistently_dead_first_hop_does_not_flood_once_the_second_carries(
+        self, certdir
+    ):
+        """A reset that clears `_hop_fault` on ANY hop carrying — not just the
+        one that faulted — reintroduces the flood the dedup exists to
+        prevent: a chain [A dead, B up] would re-log A's fault on every
+        connection, because B's carry re-arms the dedup before the next
+        walk. The reset must be scoped to the hop that just recovered.
+        """
         from cswap_pin import proxy as pin_proxy
 
         dead = socket.socket()
@@ -3190,49 +3289,32 @@ class TestChainRediscovery:
         try:
             relay = pin_proxy.PinProxy(certdir, lambda: "tok")
             relay._chain_candidates = lambda: [
-                pin_proxy._as_chain(("127.0.0.1", dead_port))
+                pin_proxy._as_chain(("127.0.0.1", dead_port)),
+                pin_proxy._as_chain(("127.0.0.1", good_port)),
             ]
 
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
-                try:
-                    sock, _ = relay._connect_upstream()
-                    sock.close()
-                except OSError:
-                    pass
+                sock, _ = relay._connect_upstream()
+                sock.close()
             first = [
                 l for l in buf.getvalue().splitlines()
                 if f"{dead_port} unusable" in l
             ]
             assert first, f"the first fault was not logged: {buf.getvalue()!r}"
 
-            relay._chain_candidates = lambda: [
-                pin_proxy._as_chain(("127.0.0.1", good_port))
-            ]
+            # SAME unchanged chain, again: A is still dead, B still carries.
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
                 sock, _ = relay._connect_upstream()
                 sock.close()
-            # premise: the hop carried, which is what should reset the dedup
-
-            relay._chain_candidates = lambda: [
-                pin_proxy._as_chain(("127.0.0.1", dead_port))
-            ]
-            buf = io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                try:
-                    sock, _ = relay._connect_upstream()
-                    sock.close()
-                except OSError:
-                    pass
             second = [
                 l for l in buf.getvalue().splitlines()
                 if f"{dead_port} unusable" in l
             ]
-            assert second, (
-                "the SAME fault recurring after a recovery was suppressed — "
-                f"_hop_fault's dedup is never reset by a recovery: "
-                f"{buf.getvalue()!r}")
+            assert not second, (
+                "A's fault was re-logged after B merely carried again — B "
+                f"recovering does not mean A did: {buf.getvalue()!r}")
         finally:
             good.close()
 
