@@ -16259,7 +16259,6 @@ class PinProxy:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
             except OSError as exc:
                 self._note_hop_unusable(chain.address, f"dial failed: {exc!r}")
-                up = None
                 continue
             try:
                 up.sendall(
@@ -16299,6 +16298,8 @@ class PinProxy:
             # Trusting the status alone made Remote Control silently deaf —
             # everything Claude Code SENDS still went through the MITM path at
             # 200 while the receive channel was a dead socket.
+            self._note_hop_unusable(
+                chain.address, "answered 200 but the tunnel was already EOF")
             self._tunnel_trace(
                 f"chain answered 200 but the tunnel to {target} was already "
                 f"EOF — dialling direct")

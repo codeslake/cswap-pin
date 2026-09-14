@@ -3057,10 +3057,11 @@ class TestChainRediscovery:
     def case_the_blind_tunnel_dial_failure_logs_before_REFUSED(
         self, certdir, monkeypatch
     ):
-        """`_blind_tunnel` falls through a dead hop writing only to the trace
-        FILE (`_tunnel_trace`), never to `_note_hop_unusable` — so the
-        `egress REFUSED` line it also emits (Remote Control's own path) had
-        no hop reason in the daemon log."""
+        """`_blind_tunnel` is the OTHER walk that can emit `egress REFUSED`
+        (Remote Control's own path). A dead hop's dial failure must reach
+        `_note_hop_unusable`, not just the trace FILE (`_tunnel_trace`), so
+        the REFUSED line it also emits carries a hop reason in the daemon
+        log above it."""
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         dead = self._dead_port()
@@ -3105,9 +3106,10 @@ class TestChainRediscovery:
     def case_the_blind_tunnel_CONNECT_refusal_names_the_reason(
         self, certdir, monkeypatch
     ):
-        """The other `_blind_tunnel` fall-through: a hop that ACCEPTS the
-        CONNECT and answers non-200 — a cache proxy mid-restart. Today that
-        is a bare `up.close(); up = None; continue`, same as a dead port."""
+        """A second `_blind_tunnel` fall-through, distinct from a dead dial:
+        a hop that ACCEPTS the CONNECT and answers non-200 — a cache proxy
+        mid-restart. The reason logged must say so, not read as a dead
+        port."""
         refusing, refusing_port, seen = self._refusing_chain()
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
@@ -3152,15 +3154,92 @@ class TestChainRediscovery:
         assert "accepted but did not tunnel" in wrong_lines[0], wrong_lines
         assert "CONNECT ->" in wrong_lines[0], wrong_lines
 
+    def case_the_blind_tunnel_EOF_after_200_logs_the_reason(
+        self, certdir, monkeypatch
+    ):
+        """A FOURTH fall-through in the same function: a hop that ACCEPTS the
+        CONNECT, answers 200, and then closes before carrying anything — a
+        filtering proxy that answers optimistically and dials afterwards,
+        closing when that dial fails (`_tunnel_is_open` catches exactly
+        this). That path also fell through to `egress REFUSED` with no hop
+        reason above it.
+        """
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        srv_port = srv.getsockname()[1]
+
+        def _serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    seen = b""
+                    while b"\r\n\r\n" not in seen:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        seen += d
+                    c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                except OSError:
+                    pass
+                finally:
+                    c.close()  # accepted, answered 200, and EOF right after
+
+        threading.Thread(target=_serve, daemon=True).start()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{srv_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            srv.close()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{srv_port} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert "EOF" in lines[unusable[0]], lines[unusable[0]]
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
     def case_a_hop_that_recovers_then_faults_again_logs_a_second_line(
         self, certdir
     ):
-        """`_hop_fault`'s dedup is on the (hop, reason) TRANSITION and is
-        never reset by a recovery — so a hop that goes down, comes back and
-        carries a request, then goes down again with the SAME reason is
-        silent the second time. On a real daemon.log that read 12 REFUSED
-        lines behind 3 `unusable` lines, and the incident could not be
-        attributed to a specific outage window.
+        """`_hop_fault`'s dedup is on the (hop, reason) TRANSITION, and must
+        be reset by that hop's own recovery — so a hop that goes down, comes
+        back and carries a request, then goes down again with the SAME
+        reason logs a second time, not silence. On a real daemon.log that
+        read 12 REFUSED lines behind 3 `unusable` lines, and the incident
+        could not be attributed to a specific outage window.
 
         THE SAME HOP, not a different one behind it: reset the dedup for
         every carrying hop and a chain with a persistently dead FIRST hop and
