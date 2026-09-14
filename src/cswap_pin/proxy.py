@@ -2190,11 +2190,10 @@ def _wire_global_config_locked(
     if port is None or ca_path is None:
         pass  # `ledger` above already records "not wired"
     else:
-        # No credential in the URL: nothing downstream checks one, so
-        # putting it here only bought Claude Code's /status panel a bearer to
-        # print. See `_handle_client`'s "WHAT THE CREDENTIAL BOUGHT" note for
-        # why the check this satisfied was retired.
-        proxy = f"http://127.0.0.1:{port}"
+        # Bare only once `proxy.json` says the serving daemon retired the
+        # gate — else the old userinfo form, rebuilt from the gated holder's
+        # own secret. See `_client_proxy_url`.
+        proxy = _client_proxy_url(port, Path(ca_path).parent)
         node_ca = _merged_ca(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
         # PYTHON DOES NOT READ NODE_EXTRA_CA_CERTS, and cswap's usage poll is
         # plain urllib -- so it obeys the proxy vars above while trusting
@@ -6571,6 +6570,17 @@ _DAEMON_MODULE_NAMES = (_DAEMON_MODULE, "claude_swap.pin_proxy")
 
 _STATE_FILE = "proxy.json"
 # Writing this file reaches a daemon that is already serving.
+# ONLY THIS DAEMON'S OWN RECORD MAY CARRY IT, and only once `daemon_main` has
+# called `proxy.start()` successfully: the key says "the daemon this record
+# names has taken over serving, and its plain relay (`_plain_relay`) checks no
+# credential" — never written by a standby, a starting process, or the
+# handover-marking write in `_spawn_daemon` (that one renames the DEPARTING
+# predecessor's own record and carries its existing value through unchanged,
+# rather than inventing one for a daemon it is not). Absence — the key
+# missing, or `proxy.json` missing/unreadable/unparseable — reads as unknown,
+# and every reader here treats unknown the same as False: see
+# `_client_proxy_url` for what that buys.
+_PLAIN_RELAY_UNGATED_KEY = "plain_relay_ungated"
 _TRACE_SWITCH_FILE = "trace-to"
 # Re-read at most this often: the check sits on the request path, and a stat
 # per request buys nothing when the answer changes once a day at most.
@@ -7841,6 +7851,36 @@ def clients_that_arming_would_cut_off(port: int) -> int | None:
     return len(pids)
 
 
+_SECRET_FILE = "proxy.secret"
+
+
+def proxy_secret_path(certdir: Path) -> Path:
+    """Where an older install's proxy credential lives, if one exists.
+
+    READ-ONLY on purpose. Nothing in this package mints, rotates or checks
+    this value anymore — the CONNECT/plain-relay gate it armed is retired for
+    good — but the client-facing URL builder (`_client_proxy_url`) still needs
+    to REBUILD the old userinfo shape during the handover window where
+    `proxy.json` has not yet recorded the capability key: see
+    `_PLAIN_RELAY_UNGATED_KEY`.
+    """
+    return Path(certdir) / _SECRET_FILE
+
+
+def read_proxy_secret(certdir: Path) -> str | None:
+    """The value at `proxy_secret_path`, or None when there is none to read.
+
+    None covers "never minted" and "unreadable" alike: either way there is no
+    credential to embed, so the caller falls back to the bare URL, same as
+    when a secret never existed at all.
+    """
+    try:
+        val = proxy_secret_path(certdir).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return val or None
+
+
 _PORT_HINT_FILE = "port.hint"
 
 
@@ -7865,7 +7905,8 @@ def read_port_hint(certdir: Path) -> int | None:
 
 
 def write_daemon_state(
-    certdir: Path, port: int, pid: int, fingerprint: str, handover: bool = False
+    certdir: Path, port: int, pid: int, fingerprint: str, handover: bool = False,
+    ungated: bool = False,
 ) -> None:
     """Record the live daemon's identity atomically (temp-then-rename).
 
@@ -7875,12 +7916,18 @@ def write_daemon_state(
     teardown and the SIGTERM handler — because all three already read this
     file and none of them can see the others' locals. The mark says: nothing
     is serving on this record, and whoever is departing must not unwire.
+
+    ``ungated`` sets ``_PLAIN_RELAY_UNGATED_KEY`` in the record. Pass it only
+    from a caller that has itself taken over serving on ``port`` — see that
+    constant's own comment for why.
     """
     import json
 
     rec = {"port": port, "pid": pid, "fingerprint": fingerprint}
     if handover:
         rec["handover"] = True
+    if ungated:
+        rec[_PLAIN_RELAY_UNGATED_KEY] = True
     tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(rec))
     os.replace(tmp, Path(certdir) / _STATE_FILE)
@@ -8012,6 +8059,74 @@ def read_daemon_state(certdir: Path) -> dict | None:
     if not isinstance(data, dict) or "port" not in data or "pid" not in data:
         return None
     return data
+
+
+def _serving_daemon_ungated(certdir: Path | None) -> bool:
+    """Whether ``proxy.json`` says the daemon serving ``certdir`` has retired
+    its plain-relay credential gate — see ``_PLAIN_RELAY_UNGATED_KEY``.
+
+    False on every unknown: no cert dir, no file, an unreadable or malformed
+    one, or a record that simply does not carry the key. ``read_daemon_state``
+    already collapses "absent" and "corrupt" to None; this collapses that
+    together with "key missing" and "key false" into the one safe default.
+    """
+    if certdir is None:
+        return False
+    state = read_daemon_state(certdir)
+    return bool(isinstance(state, dict) and state.get(_PLAIN_RELAY_UNGATED_KEY))
+
+
+def _client_proxy_url(port: int, certdir: Path | None) -> str:
+    """The proxy URL to hand a client: the shape depends on who is serving.
+
+    BARE when ``proxy.json`` says the serving daemon has retired the
+    credential gate (``_serving_daemon_ungated``) — the common case on this
+    release. Otherwise the OLD userinfo form, built from whatever the gated
+    holder left at ``read_proxy_secret`` — the shape a 0.1.262-era daemon
+    still demands on CONNECT, and the only one Remote Control's bridge client
+    was ever refused without.
+
+    FAILS CLOSED. ``proxy.json`` missing, unreadable, malformed, or simply
+    silent about the capability all read as "unknown, assume gated" here —
+    the same default `_serving_daemon_ungated` uses — because handing out the
+    bare form while an old, still-gated daemon might be the one actually
+    serving is the lost-bridge window this function exists to close. When
+    even the old form has nothing to embed (no secret was ever minted for
+    this cert dir), the bare URL is correct anyway: no credential ever
+    existed to demand, so nothing is lost by leaving it out.
+    """
+    if certdir is not None and _serving_daemon_ungated(certdir):
+        return f"http://127.0.0.1:{port}"
+    secret = read_proxy_secret(certdir) if certdir is not None else None
+    if secret:
+        from urllib.parse import quote
+
+        return f"http://cswap:{quote(secret, safe='')}@127.0.0.1:{port}"
+    return f"http://127.0.0.1:{port}"
+
+
+def _sweep_leftover_secret(certdir: Path) -> None:
+    """Delete a leftover ``proxy.secret`` once it is confirmed dead.
+
+    Confirmed, not assumed: this re-reads ``proxy.json`` itself rather than
+    trusting the caller, and proceeds only when it says THIS cert dir's daemon
+    has taken over serving and retired the gate (`_serving_daemon_ungated`).
+    That is what makes the delete safe — no gated (pre-0.1.264) holder can be
+    serving this cert dir once that is true, so `_client_proxy_url` will never
+    take the userinfo branch for a NEW read of this record again, and the
+    value has no reader left in this package.
+
+    Call only from `daemon_main`, after the ``ungated=True`` state write —
+    never from a standby, a starting process, or the handover-marking write in
+    `_spawn_daemon`. Best-effort: a file we cannot remove is left for the next
+    daemon's sweep, same as everything else in this module.
+    """
+    if not _serving_daemon_ungated(certdir):
+        return
+    try:
+        proxy_secret_path(certdir).unlink()
+    except OSError:
+        pass
 
 
 def _tree_digest_input(root: Path) -> bytes:
@@ -9388,6 +9503,12 @@ def _spawn_daemon(
             write_daemon_state(
                 certdir, prev.get("port") or 0, prev["pid"],
                 prev.get("fingerprint") or "", handover=True,
+                # CARRIED THROUGH, NEVER INVENTED: this rewrites the
+                # DEPARTING predecessor's own record, so its capability is
+                # whatever it already was — this call cannot know the
+                # successor's, and must not claim one for a daemon that is
+                # not this one.
+                ungated=bool(prev.get(_PLAIN_RELAY_UNGATED_KEY)),
             )
         except OSError:
             pass
@@ -10862,9 +10983,22 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     #
     # Same function, opposite requirement, one line apart in intent — the
     # watchdog's disk side must be fresh, an identity must not move.
+    #
+    # ``ungated=True``: this line runs only after ``proxy.start()`` returned,
+    # so THIS daemon is now the one serving ``port``, and every daemon on this
+    # release retired the CONNECT/plain-relay credential gate for good. That
+    # is what makes it safe for a client-facing URL builder to hand out the
+    # bare form once it reads this record, and what makes it safe for the
+    # leftover-secret sweep below to run at all — see
+    # `_PLAIN_RELAY_UNGATED_KEY` and `_sweep_leftover_secret`.
     write_daemon_state(
-        certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT
+        certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT, ungated=True
     )
+    # SAFE ONLY NOW: the record above just said no gated holder can be
+    # serving this cert dir anymore, so nothing that reads `proxy.json` fresh
+    # from here on will ever need this file again. A standby or a
+    # starting process must never call this — see the guard inside.
+    _sweep_leftover_secret(certdir)
     # A start line means the log is never empty for a daemon that ran, so
     # "no teardown line" becomes evidence of a CRASH rather than of nothing.
     _log_lifecycle(f"serving on port {proxy.port} for account {account_num}")
@@ -11061,9 +11195,9 @@ def wire_env(
     down at once); pin-env emits the `exec {fd}<>fifo` for the shell instead.
     """
     out = dict(env)
-    # No credential in the URL — see `_wire_global_config_locked`'s note
-    # for why.
-    proxy = f"http://127.0.0.1:{port}"
+    # Bare only once `proxy.json` says the serving daemon retired the gate —
+    # see `_client_proxy_url`.
+    proxy = _client_proxy_url(port, Path(ca_path).parent)
     out["HTTPS_PROXY"] = proxy
     out["https_proxy"] = proxy
     # Rewrite an ALL_PROXY the caller already had; never create one. Creating
