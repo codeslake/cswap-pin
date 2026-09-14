@@ -13148,6 +13148,66 @@ class TestTheDaemonWatchesItsOwnCode:
         finally:
             self._stop_live()
 
+    def case_a_real_daemon_start_rewires_a_config_still_naming_the_userinfo_form(
+        self, tmp_path, monkeypatch
+    ):
+        """A CONFIG WRITTEN JUST BEFORE THE RECYCLE MUST NOT OUTLIVE IT.
+
+        `heal` calls `rewire_if_version_changed` BEFORE it recycles a stale,
+        still-gated daemon. Read at that instant, `proxy.json` still names
+        the OLD, gated holder, so `_client_proxy_url` takes the userinfo
+        branch and stamps the result `writtenBy=<the version already on
+        disk>` -- the version THIS daemon also reports once it takes over.
+        `rewire_if_version_changed`'s whole cost model is "skip when
+        `writtenBy` already matches", so once the new daemon goes ungated and
+        sweeps `proxy.secret`, nothing ever revisits that write: every
+        hand-launched session and `/status` reads a `HTTPS_PROXY` naming a
+        credential that no longer exists, until a full launch or a port
+        change.
+
+        So the daemon that just went ungated must correct that specific
+        shape itself, in the same beat it retires the secret behind it.
+        """
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+        free.close()
+
+        stale_secret = "STALE-DEAD-SECRET"
+        userinfo_url = f"http://cswap:{stale_secret}@127.0.0.1:{port}"
+        seeded = json.dumps({
+            "env": {
+                "HTTPS_PROXY": userinfo_url,
+                "https_proxy": userinfo_url,
+                "ALL_PROXY": userinfo_url,
+                "CSWAP_PIN_PORT": str(port),
+            },
+            "_cswapPinWiredKeys": [
+                "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "CSWAP_PIN_PORT"],
+            "_cswapPinWiredKeysSaved": {},
+            "writtenBy": pin_proxy._own_version(),
+        })
+
+        certdir, cfg, _ = self._live_daemon(
+            tmp_path, monkeypatch, paths, cfg_text=seeded)
+        try:
+            st = pin_proxy.read_daemon_state(certdir)
+            assert st["port"] == port, (
+                "premise: the daemon must reclaim the exact port the stale "
+                "config names, or this never exercises the shape it "
+                "corrects", st)
+            assert st.get("plain_relay_ungated") is True, st
+            wired = json.loads(cfg.read_text())["env"]["HTTPS_PROXY"]
+            assert wired == f"http://127.0.0.1:{port}", (
+                "a real ungate must rewrite a config still naming the "
+                "userinfo form for its own port, not leave a dead "
+                "credential wired", wired)
+        finally:
+            self._stop_live()
+
     def case_a_real_daemon_start_REWIRES_a_config_naming_ANOTHER_port(
         self, tmp_path, monkeypatch
     ):

@@ -8105,6 +8105,47 @@ def _client_proxy_url(port: int, certdir: Path | None) -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def _rewire_stale_userinfo_form(certdir: Path, port: int) -> None:
+    """Correct a ``.claude.json`` still naming the userinfo form for our own
+    port, the instant we go ungated.
+
+    THE GAP THIS CLOSES. ``heal`` calls ``rewire_if_version_changed`` BEFORE
+    it recycles a stale, still-gated daemon. Read at that instant,
+    ``proxy.json`` still names the OLD holder, so ``_client_proxy_url`` takes
+    the userinfo branch and stamps the result ``writtenBy=<the version
+    already on disk>`` — the same version THIS daemon reports once it takes
+    over. ``rewire_if_version_changed``'s whole cost model is "skip once
+    ``writtenBy`` already matches", so once we go ungated and
+    ``_sweep_leftover_secret`` retires the credential that URL names,
+    nothing else ever revisits that write: every hand-launched session and
+    ``/status`` keeps reading a dead credential until a full launch or a
+    port change.
+
+    So this runs unconditionally on every ungate, not gated on version: it
+    reads the config fresh, and rewires only when it still carries EXACTLY
+    our own userinfo form for THIS port — never a user's own proxy, and
+    never a wiring that already moved on.
+
+    Best-effort and never raises: called from ``daemon_main``.
+    """
+    try:
+        get_global_config_path = require("paths").get_global_config_path
+        cfg = get_global_config_path()
+        raw = json.loads(cfg.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        if not _read_ledger(cfg, raw).get(_WIRE_MARK):
+            return  # not wired by us
+        env = raw.get("env")
+        current = (env or {}).get("HTTPS_PROXY") if isinstance(env, dict) else None
+        if (isinstance(current, str)
+                and current.startswith("http://cswap:")
+                and current.endswith(f"@127.0.0.1:{port}")):
+            wire_global_config(port, certdir / "ca.pem")
+    except Exception:  # noqa: BLE001 — a daemon must not die on this
+        pass
+
+
 def _sweep_leftover_secret(certdir: Path) -> None:
     """Delete a leftover ``proxy.secret`` once it is confirmed dead.
 
@@ -10994,6 +11035,12 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     write_daemon_state(
         certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT, ungated=True
     )
+    # A CONFIG A PREDECESSOR'S `rewire_if_version_changed` WROTE BEFORE WE
+    # TOOK OVER may still carry that predecessor's userinfo form, stamped
+    # with a version its own `writtenBy` check will never revisit — see
+    # `_rewire_stale_userinfo_form`. Fix it before the secret it names is
+    # gone for good.
+    _rewire_stale_userinfo_form(certdir, proxy.port)
     # SAFE ONLY NOW: the record above just said no gated holder can be
     # serving this cert dir anymore, so nothing that reads `proxy.json` fresh
     # from here on will ever need this file again. A standby or a
