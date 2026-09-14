@@ -8749,6 +8749,106 @@ class TestDrainReportsWhatItCut:
             pp._log_lifecycle = real_log
             pp._pin_daemon_pids = real_pids
 
+    def case_a_deaf_verdict_inside_a_refusal_window_is_blind_not_a_mark(
+            self, monkeypatch):
+        """A bridge's post is stamped the moment the request LINE arrives,
+        before the pin dials upstream. During an egress refusal the pin
+        answers 503 without ever posting to claude.ai, so a post stamped
+        inside that window may never have reached the server at all -- a
+        DEAF verdict taken from it is unproven and must read BLIND, not
+        the ordinary MARK.
+
+        Measured on an egress outage: `_report_deaf_bridges` fired MARK
+        four times across a 76-minute refusal on the same pin process and
+        cleared the moment the chain returned, with no restart in between
+        -- the bridges were never deaf, their posts just never landed.
+
+        Once the refusal window passes and the deaf set is unchanged, the
+        MARK must return -- the BLIND must not dedupe-silence it forever,
+        same shape as the draining-BLIND case above.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._egress_refused = False
+            srv._egress_refused_last = None
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1000.0)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_MAYBE/worker/messages")
+            srv._connected_bridges = {"cse_MAYBE"}
+            srv._note_egress_refused()
+
+            # (a) INSIDE THE WINDOW: BLIND, not MARK.
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1010.0)
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_BLIND in lines[-1], (
+                "a deaf verdict inside a refusal window was not BLIND: "
+                + repr(lines))
+            assert pp.DEAF_REPORT_MARK not in lines[-1], lines[-1]
+            assert "cse_MAYBE" in lines[-1], lines[-1]
+
+            # (b) PAST THE WINDOW, the bridge still posting (egress healthy
+            # again) and still no stream: the MARK must return, not stay
+            # dedupe-silenced by the BLIND above.
+            past_window = 1010.0 + pp._DEAF_WINDOW_S + 1.0
+            monkeypatch.setattr(pp.time, "monotonic", lambda: past_window)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_MAYBE/worker/messages")
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) > before, (
+                "the refusal-BLIND latched permanently -- no MARK ever "
+                "followed for a bridge that is genuinely still deaf")
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+
+            # THE ORDINARY DEDUPE STILL APPLIES once the MARK itself stands.
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) == before, (
+                "an unchanged MARK was re-logged; the refusal-window fix "
+                "must not defeat the dedupe generally")
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_CONTROL_no_refusal_ever_marks_exactly_as_before(self):
+        """No refusal recorded at all: the same deaf set must MARK exactly
+        as before this change -- the control that proves the refusal check
+        does not swallow every verdict."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_PLAIN/worker/messages")
+            srv._connected_bridges = {"cse_PLAIN"}
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], (
+                "with no refusal ever recorded, an ordinary deaf bridge "
+                f"must still MARK: {lines!r}")
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
         """Nothing recorded whether a claude.ai attachment ever downloaded.
 

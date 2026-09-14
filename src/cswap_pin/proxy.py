@@ -11469,6 +11469,13 @@ class PinProxy:
         # returns, so without this a refused outage that healed before the
         # next probe would leave no trace at all. See `direct_last`.
         self._egress_refused_last: "float | None" = None
+        # MONOTONIC and stamped on EVERY refusal, not just the transition
+        # into one — see `_note_egress_refused`. `_report_deaf_bridges`
+        # reads this to tell a stamped post from one that actually reached
+        # claude.ai: a post is recorded when the request LINE arrives,
+        # before this pin dials upstream, so during a refusal window the
+        # pin answers 503 and the post it stamped may never have landed.
+        self._egress_refused_last_monotonic: "float | None" = None
         # DEGRADED, not abandoned — see `hop_degraded_last`. Separate from the
         # one above because falling to a LATER hop is still egress through a
         # configured proxy, so `direct` stays False and that stamp never runs.
@@ -12728,15 +12735,30 @@ class PinProxy:
             # counts of the same set taken seconds apart.
             posted = self._posting_now()
             draining_now = this_process_is_draining()
+            # A POST STAMPED WHILE EGRESS WAS REFUSED MAY NEVER HAVE
+            # REACHED claude.ai: the stamp lands when the request line
+            # arrives, before this pin dials upstream, and a refusal
+            # answers 503 without posting or stream-GETting anywhere. So a
+            # deaf verdict taken inside that window is unproven, same as
+            # one taken while a predecessor drains.
+            refused_last = getattr(self, "_egress_refused_last_monotonic",
+                                    None)
+            blind_refused = (refused_last is not None
+                              and time.monotonic() - refused_last
+                              <= _DEAF_WINDOW_S)
             prev = getattr(self, "_last_deaf", None)
-            # A BLIND EMITTED BECAUSE *THIS* PROCESS WAS DRAINING must not
-            # latch forever once the drain aborts and this process keeps
-            # serving: `now == prev` alone would otherwise dedupe away the
-            # MARK for an unchanged deaf set for the rest of this process's
-            # life, silencing every consumer of it. Only that one direction
-            # forces a re-emit; an ordinary unchanged set still dedupes.
-            stale_blind = (getattr(self, "_last_deaf_blind_draining", False)
-                           and not draining_now)
+            # A BLIND EMITTED BECAUSE *THIS* PROCESS WAS DRAINING, OR
+            # BECAUSE EGRESS WAS RECENTLY REFUSED, must not latch forever
+            # once that condition clears and the deaf set stays the same:
+            # `now == prev` alone would otherwise dedupe away the MARK for
+            # the rest of this process's life, silencing every consumer of
+            # it. Only that one direction forces a re-emit; an ordinary
+            # unchanged set still dedupes.
+            stale_blind = (
+                (getattr(self, "_last_deaf_blind_draining", False)
+                 and not draining_now)
+                or (getattr(self, "_last_deaf_blind_refused", False)
+                    and not blind_refused))
             if now == prev and not stale_blind:
                 return
             # SAME GUARD AS THE CHEAP BRANCH, for the same reason: a mute
@@ -12749,6 +12771,7 @@ class PinProxy:
                 return
             self._last_deaf = now
             self._last_deaf_blind_draining = False
+            self._last_deaf_blind_refused = False
             if mute:
                 _log_lifecycle(
                     f"{DEAF_REPORT_BLIND} — {len(mute)} draining predecessor(s) "
@@ -12767,6 +12790,15 @@ class PinProxy:
                     "own held-bridge view is partial by construction and a "
                     "bridge that looks streamless here may already be held "
                     "by the successor: "
+                    + " ".join(self._with_deaf_age(b) for b in now)
+                )
+            elif now and blind_refused:
+                self._last_deaf_blind_refused = True
+                age = int(time.monotonic() - refused_last)
+                _log_lifecycle(
+                    f"{DEAF_REPORT_BLIND} — egress was refused {age}s ago, "
+                    "so a post inside that window may never have reached "
+                    "the server: "
                     + " ".join(self._with_deaf_age(b) for b in now)
                 )
             elif now:
@@ -15944,6 +15976,10 @@ class PinProxy:
         again, so a flapping chain costs one line per outage, not per
         connection.
         """
+        # STAMPED BEFORE THE ONCE-PER-OUTAGE RETURN, on every call, not
+        # only the first: `_report_deaf_bridges` needs how recently egress
+        # was refused, which keeps moving for the width of the outage.
+        self._egress_refused_last_monotonic = time.monotonic()
         if self._egress_refused:
             return
         self._egress_refused = True
