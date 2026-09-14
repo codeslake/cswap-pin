@@ -5019,9 +5019,11 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # surfaces there instead
     # NO CREDENTIAL IS MINTED HERE ANYMORE. A `proxy.secret` an older install
     # left in this cert dir (or one this package minted before this change)
-    # is inert to THIS package: nothing in cswap-pin reads it or sends it
-    # anymore. KNOWN ROLLOUT RISK, NOT THIS FILE'S TO FIX: at least two tools
-    # outside this package still read the file and send it as a proxy
+    # is still read by THIS package, but only until the serving daemon
+    # records that it retired the capability gate — see
+    # `_PLAIN_RELAY_UNGATED_KEY`, `read_proxy_secret` and `_client_proxy_url`.
+    # KNOWN ROLLOUT RISK, NOT THIS FILE'S TO FIX: at least two tools outside
+    # this package also read the file directly and send it as a proxy
     # credential — cswap's own health check (a separate project) builds a
     # `Proxy-Authorization` header from it and reports the chain broken at
     # the `dial` stage if it cannot read the file, and dotfiles' cleanup-rc
@@ -5030,9 +5032,9 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # or cleared under a version at or after this one — never gets one, so
     # those two callers will misread a live pin as absent until they move to
     # the bare URL themselves; that migration belongs to them, not to this
-    # comment. Not cleaned up on purpose here either — deleting another
-    # version's leftover file on upgrade is a worse failure than leaving one
-    # this package no longer consults.
+    # comment. NEVER DELETED, on purpose — those same two callers keep
+    # depending on it long after this package stops needing it (see the note
+    # beside `daemon_main`'s `write_daemon_state(..., ungated=True)` call).
     # AND THE CONFIG MUST NAME THE PIN, which is the half that was missing.
     # Best-effort by design: the record is written and the proxy is serving by
     # the time we get here, so a config that cannot be written is a worse pin,
@@ -14571,14 +14573,12 @@ class PinProxy:
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
-                # Drain the CONNECT headers. Nothing here reads them: no
-                # wiring hands out a credential anymore (wire_env/
-                # wire_global_config hand out a bare URL now — an inert
-                # `proxy.secret` an older install left behind may still sit
-                # on disk, and a tool outside this package may still read it
-                # and send it as a credential, but this listener reads
-                # neither the file nor these headers), and the gate that read
-                # these headers was retired below regardless.
+                # Drain the CONNECT headers. Nothing here reads them: even
+                # while a still-gated `proxy.json` makes `wire_env`/
+                # `wire_global_config` hand out the userinfo form (see
+                # `_client_proxy_url`), this listener reads neither the
+                # `proxy.secret` file nor these headers, and the gate that
+                # once read them was retired below regardless.
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
