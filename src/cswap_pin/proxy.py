@@ -16004,9 +16004,11 @@ class PinProxy:
 
         Deduplicated on the transition like :meth:`_note_egress`, so a hop
         that is steadily down costs one line rather than one per connection —
-        once per (hop, reason), AND AGAIN after a recovery: whoever carries a
-        request resets `_hop_fault`, so the same fault recurring after that is
-        a new transition, not a repeat.
+        once per (hop, reason), AND AGAIN after a recovery: the FAULTED hop
+        carrying again resets `_hop_fault`, so the same fault recurring after
+        that is a new transition, not a repeat. Scoped to that hop: another
+        hop carrying does not clear it, or a persistently dead hop behind a
+        healthy one would re-log on every connection.
         """
         state = (hop, why)
         if state == self._hop_fault:
