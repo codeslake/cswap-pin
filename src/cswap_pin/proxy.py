@@ -14561,18 +14561,30 @@ class PinProxy:
             if parts[0] == "CONNECT":
                 target = parts[1] if len(parts) > 1 else ""  # host:port
                 if not target.strip():
-                    # An empty authority makes `_blind_tunnel` dial host "":
-                    # every hop refuses it and the request ends on a direct
-                    # dial that never sees a bearer, while looking exactly
-                    # like a healthy tunnel. Logged, not refused — these
-                    # connections already fail, and a 400 is a different
-                    # failure than the one the client gets today.
+                    # Measured on lmd42-docker, 2026-09-15: some client on the
+                    # host sent a bare `CONNECT  HTTP/1.1` (empty authority).
+                    # Handing that "" target to `_blind_tunnel` dialled EVERY
+                    # hop with `CONNECT  HTTP/1.1`; each refused in its own
+                    # dialect, writing two FALSE `hop unusable` lines and a
+                    # FALSE `egress REFUSED`, which flips `_egress_refused`
+                    # and makes `_report_deaf_bridges` read the whole pin as
+                    # BLIND — one garbage request marking the pin's entire
+                    # egress refused. Answer 400 here, before any hop is asked.
                     # THE SHAPE, NOT THE LINE: the rest of a CONNECT line is
                     # whatever the client wrote, userinfo included, and
                     # nothing here parses it.
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
+                    try:
+                        conn.sendall(
+                            b"HTTP/1.1 400 Bad Request\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    except OSError:
+                        pass
+                    conn.close()
+                    return
                 # Drain the CONNECT headers. Nothing here reads them: even
                 # while a still-gated `proxy.json` makes `wire_env`/
                 # `wire_global_config` hand out the userinfo form (see
@@ -15924,7 +15936,8 @@ class PinProxy:
             if not _connect_ok(status):
                 self._note_hop_unusable(
                     chain.address,
-                    "accepted but did not tunnel: "
+                    f"accepted but did not tunnel "
+                    f"{self._upstream[0]}:{self._upstream[1]}: "
                     + (f"CONNECT -> {status!r}" if status else "no reply"),
                 )
                 try:
@@ -15984,6 +15997,10 @@ class PinProxy:
         that is a new transition, not a repeat. Scoped to that hop: another
         hop carrying does not clear it, or a persistently dead hop behind a
         healthy one would re-log on every connection.
+
+        `why` names the CONNECT target where there is one (a client's blind
+        tunnel, or the MITM's own dial to the upstream host); a "dial failed"
+        reason names none, since a dead port has no target to blame.
         """
         state = (hop, why)
         if state == self._hop_fault:
@@ -16255,7 +16272,7 @@ class PinProxy:
                 # happens only when none of them will carry it.
                 self._note_hop_unusable(
                     chain.address,
-                    "accepted but did not tunnel: "
+                    f"accepted but did not tunnel {target}: "
                     + (f"CONNECT -> {status!r}" if status else "no reply"),
                 )
                 self._tunnel_trace(
@@ -16276,7 +16293,8 @@ class PinProxy:
             # everything Claude Code SENDS still went through the MITM path at
             # 200 while the receive channel was a dead socket.
             self._note_hop_unusable(
-                chain.address, "answered 200 but the tunnel was already EOF")
+                chain.address,
+                f"answered 200 but the tunnel to {target} was already EOF")
             self._tunnel_trace(
                 f"chain answered 200 but the tunnel to {target} was already "
                 f"EOF — dialling direct")
