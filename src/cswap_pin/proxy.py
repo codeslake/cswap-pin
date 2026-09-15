@@ -14569,10 +14569,9 @@ class PinProxy:
                 # does, so a portless `CONNECT host HTTP/1.1` (host="" on that
                 # split too) is caught here rather than raising `int("host")`
                 # inside `_blind_tunnel` later.
-                unreadable = (
-                    not target.strip()
-                    or not target.rpartition(":")[0].strip()
-                )
+                # A fully-empty target is caught by this too: "".rpartition(":")
+                # is ("", "", ""), so the host half is empty either way.
+                unreadable = not target.rpartition(":")[0].strip()
                 if unreadable:
                     # Measured 2026-09-15: some client sent a bare
                     # `CONNECT  HTTP/1.1` (empty authority). Handing that ""
