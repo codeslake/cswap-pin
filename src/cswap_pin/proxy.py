@@ -14565,9 +14565,13 @@ class PinProxy:
                 # `_blind_tunnel`/`_dial_chain` with the same host="" that the
                 # fully-empty shape does — the check has to name what
                 # `_blind_tunnel` actually dials, not merely "some token was
-                # there".
+                # there". `rpartition`, the same split `_blind_tunnel` itself
+                # does, so a portless `CONNECT host HTTP/1.1` (host="" on that
+                # split too) is caught here rather than raising `int("host")`
+                # inside `_blind_tunnel` later.
                 unreadable = (
-                    not target.strip() or not target.rsplit(":", 1)[0].strip()
+                    not target.strip()
+                    or not target.rpartition(":")[0].strip()
                 )
                 if unreadable:
                     # Measured 2026-09-15: some client sent a bare
@@ -16133,8 +16137,8 @@ class PinProxy:
         if not nxt or nxt == _read_upstream(self._certdir, "next"):
             return
         # A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP. A looped proxy neither
-        # answers nor exits — it appears here as "accepted but did not tunnel:
-        # no reply".
+        # answers nor exits — it appears here as "accepted but did not tunnel
+        # <target>: no reply".
         if self._is_me(nxt):
             _log_lifecycle(
                 f"{recorded} names this daemon as its upstream — refusing to "

@@ -2999,6 +2999,7 @@ class TestChainRediscovery:
                 "a hop that ANSWERED was reported as a dead port — the two "
                 "faults are indistinguishable again")
             assert "502" in wrong_lines[0], wrong_lines
+            assert "api.anthropic.com:443" in wrong_lines[0], wrong_lines
         finally:
             rude.close()
 
@@ -3318,6 +3319,8 @@ class TestChainRediscovery:
         refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
         assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
         assert "EOF" in lines[unusable[0]], lines[unusable[0]]
+        assert "rc-ingress.example.com:443" in lines[unusable[0]], (
+            lines[unusable[0]])
         assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
         assert unusable[0] < refused[0], (
             "the hop reason must precede the REFUSED it explains: "
