@@ -3197,7 +3197,7 @@ class TestChainRediscovery:
         finally:
             proxy.stop()
             refusing.close()
-        assert resp.splitlines()[0] == b"HTTP/1.1 400 Bad Request", resp
+        assert resp.startswith(b"HTTP/1.1 400 Bad Request"), resp
         lines = buf.getvalue().splitlines()
         assert not [l for l in lines if "unusable" in l], (
             f"an empty-authority CONNECT judged a hop: {buf.getvalue()!r}")
@@ -3244,7 +3244,7 @@ class TestChainRediscovery:
         finally:
             proxy.stop()
             refusing.close()
-        assert resp.splitlines()[0] == b"HTTP/1.1 400 Bad Request", resp
+        assert resp.startswith(b"HTTP/1.1 400 Bad Request"), resp
         assert seen == [], "a hop was dialled for an empty-host CONNECT"
 
     def case_the_blind_tunnel_EOF_after_200_logs_the_reason(

@@ -14566,9 +14566,14 @@ class PinProxy:
                 # fully-empty shape does — the check has to name what
                 # `_blind_tunnel` actually dials, not merely "some token was
                 # there". `rpartition`, the same split `_blind_tunnel` itself
-                # does, so a portless `CONNECT host HTTP/1.1` (host="" on that
-                # split too) is caught here rather than raising `int("host")`
-                # inside `_blind_tunnel` later.
+                # does, so a portless `CONNECT host HTTP/1.1` is caught here
+                # too — on the blind path that avoids `int("host")` raising
+                # inside `_blind_tunnel` later; on the MITM path (a portless
+                # `CONNECT api.anthropic.com HTTP/1.1`) it is a behaviour
+                # change, trading a request the routing split below used to
+                # accept for a 400 — authority-form CONNECT requires
+                # host:port (RFC 7230 §5.3.3), so the old accept was the
+                # non-conformant side.
                 # A fully-empty target is caught by this too: "".rpartition(":")
                 # is ("", "", ""), so the host half is empty either way.
                 unreadable = not target.rpartition(":")[0].strip()
