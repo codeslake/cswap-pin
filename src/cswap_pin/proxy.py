@@ -14560,14 +14560,23 @@ class PinProxy:
             parts = line.split(" ")
             if parts[0] == "CONNECT":
                 target = parts[1] if len(parts) > 1 else ""  # host:port
-                if not target.strip():
-                    # Measured on lmd42-docker, 2026-09-15: some client on the
-                    # host sent a bare `CONNECT  HTTP/1.1` (empty authority).
-                    # Handing that "" target to `_blind_tunnel` dialled EVERY
-                    # hop with `CONNECT  HTTP/1.1`; each refused in its own
-                    # dialect, writing two FALSE `hop unusable` lines and a
-                    # FALSE `egress REFUSED`, which flips `_egress_refused`
-                    # and makes `_report_deaf_bridges` read the whole pin as
+                # THE HOST, NOT JUST THE TARGET: `CONNECT :443 HTTP/1.1` has a
+                # non-empty target but an empty host once split, and reaches
+                # `_blind_tunnel`/`_dial_chain` with the same host="" that the
+                # fully-empty shape does — the check has to name what
+                # `_blind_tunnel` actually dials, not merely "some token was
+                # there".
+                unreadable = (
+                    not target.strip() or not target.rsplit(":", 1)[0].strip()
+                )
+                if unreadable:
+                    # Measured 2026-09-15: some client sent a bare
+                    # `CONNECT  HTTP/1.1` (empty authority). Handing that ""
+                    # target to `_blind_tunnel` dialled EVERY hop with
+                    # `CONNECT  HTTP/1.1`; each refused in its own dialect,
+                    # writing two FALSE `hop unusable` lines and a FALSE
+                    # `egress REFUSED`, which flips `_egress_refused` and
+                    # makes `_report_deaf_bridges` read the whole pin as
                     # BLIND — one garbage request marking the pin's entire
                     # egress refused. Answer 400 here, before any hop is asked.
                     # THE SHAPE, NOT THE LINE: the rest of a CONNECT line is
@@ -14576,6 +14585,20 @@ class PinProxy:
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
+                # Drain the CONNECT headers regardless — even an unreadable
+                # target came with them, and closing on top of unread bytes
+                # sends RST instead of a clean FIN, which can drop the 400
+                # this is about to send along with it. Nothing here reads
+                # them: even while a still-gated `proxy.json` makes
+                # `wire_env`/`wire_global_config` hand out the userinfo form
+                # (see `_client_proxy_url`), this listener reads neither the
+                # `proxy.secret` file nor these headers, and the gate that
+                # once read them was retired below regardless.
+                while True:
+                    h = _read_line(conn)
+                    if h in ("", None):
+                        break
+                if unreadable:
                     try:
                         conn.sendall(
                             b"HTTP/1.1 400 Bad Request\r\n"
@@ -14585,16 +14608,6 @@ class PinProxy:
                         pass
                     conn.close()
                     return
-                # Drain the CONNECT headers. Nothing here reads them: even
-                # while a still-gated `proxy.json` makes `wire_env`/
-                # `wire_global_config` hand out the userinfo form (see
-                # `_client_proxy_url`), this listener reads neither the
-                # `proxy.secret` file nor these headers, and the gate that
-                # once read them was retired below regardless.
-                while True:
-                    h = _read_line(conn)
-                    if h in ("", None):
-                        break
                 # A PIN THAT IS SET IS A PIN THAT APPLIES. The gate this
                 # replaces demanded a credential carried in HTTPS_PROXY, which
                 # is fixed at exec. Neither is what the feature is for. `cswap
@@ -16000,7 +16013,11 @@ class PinProxy:
 
         `why` names the CONNECT target where there is one (a client's blind
         tunnel, or the MITM's own dial to the upstream host); a "dial failed"
-        reason names none, since a dead port has no target to blame.
+        reason names none, since a dead port has no target to blame. The
+        target lives INSIDE `why`, not in a separate dedup key, on purpose: a
+        hop that tunnels datadog fine and then refuses github is two
+        different facts, and letting the second log too is the point, not a
+        flood to fix.
         """
         state = (hop, why)
         if state == self._hop_fault:

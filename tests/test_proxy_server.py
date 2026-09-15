@@ -3206,6 +3206,46 @@ class TestChainRediscovery:
         assert proxy._egress_refused is False
         assert seen == [], "a hop was dialled for an empty-authority CONNECT"
 
+    def case_an_empty_host_with_a_port_is_refused_the_same_way(
+        self, certdir, monkeypatch
+    ):
+        """`CONNECT :443 HTTP/1.1` has a non-empty TARGET (`:443`) but an
+        EMPTY HOST once split on `:` — the same host `_blind_tunnel` would
+        dial as the fully-empty shape. A check on `target` alone lets this
+        one through; the check has to read the host `_blind_tunnel` actually
+        uses."""
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(b"CONNECT :443 HTTP/1.1\r\nHost: :443\r\n\r\n")
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        assert resp.splitlines()[0] == b"HTTP/1.1 400 Bad Request", resp
+        assert seen == [], "a hop was dialled for an empty-host CONNECT"
+
     def case_the_blind_tunnel_EOF_after_200_logs_the_reason(
         self, certdir, monkeypatch
     ):
