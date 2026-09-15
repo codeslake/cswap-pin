@@ -14560,29 +14560,62 @@ class PinProxy:
             parts = line.split(" ")
             if parts[0] == "CONNECT":
                 target = parts[1] if len(parts) > 1 else ""  # host:port
-                if not target.strip():
-                    # An empty authority makes `_blind_tunnel` dial host "":
-                    # every hop refuses it and the request ends on a direct
-                    # dial that never sees a bearer, while looking exactly
-                    # like a healthy tunnel. Logged, not refused — these
-                    # connections already fail, and a 400 is a different
-                    # failure than the one the client gets today.
+                # THE HOST, NOT JUST THE TARGET: `CONNECT :443 HTTP/1.1` has a
+                # non-empty target but an empty host once split, and reaches
+                # `_blind_tunnel`/`_dial_chain` with the same host="" that the
+                # fully-empty shape does — the check has to name what
+                # `_blind_tunnel` actually dials, not merely "some token was
+                # there". `rpartition`, the same split `_blind_tunnel` itself
+                # does, so a portless `CONNECT host HTTP/1.1` is caught here
+                # too — on the blind path that avoids `int("host")` raising
+                # inside `_blind_tunnel` later; on the MITM path (a portless
+                # `CONNECT api.anthropic.com HTTP/1.1`) it is a behaviour
+                # change, trading a request the routing split below used to
+                # accept for a 400 — authority-form CONNECT requires
+                # host:port (RFC 7230 §5.3.3), so the old accept was the
+                # non-conformant side.
+                # A fully-empty target is caught by this too: "".rpartition(":")
+                # is ("", "", ""), so the host half is empty either way.
+                unreadable = not target.rpartition(":")[0].strip()
+                if unreadable:
+                    # Measured 2026-09-15: some client sent a bare
+                    # `CONNECT  HTTP/1.1` (empty authority). Handing that ""
+                    # target to `_blind_tunnel` dialled EVERY hop with
+                    # `CONNECT  HTTP/1.1`; each refused in its own dialect,
+                    # writing two FALSE `hop unusable` lines and a FALSE
+                    # `egress REFUSED`, which flips `_egress_refused` and
+                    # makes `_report_deaf_bridges` read the whole pin as
+                    # BLIND — one garbage request marking the pin's entire
+                    # egress refused. Answer 400 here, before any hop is asked.
                     # THE SHAPE, NOT THE LINE: the rest of a CONNECT line is
                     # whatever the client wrote, userinfo included, and
                     # nothing here parses it.
                     self._tunnel_trace(
                         "CONNECT with an unreadable authority: "
                         f"{len(parts)} token(s), {len(line)} bytes")
-                # Drain the CONNECT headers. Nothing here reads them: even
-                # while a still-gated `proxy.json` makes `wire_env`/
-                # `wire_global_config` hand out the userinfo form (see
-                # `_client_proxy_url`), this listener reads neither the
+                # Drain the CONNECT headers regardless — even an unreadable
+                # target came with them, and closing on top of unread bytes
+                # sends RST instead of a clean FIN, which can drop the 400
+                # this is about to send along with it. Nothing here reads
+                # them: even while a still-gated `proxy.json` makes
+                # `wire_env`/`wire_global_config` hand out the userinfo form
+                # (see `_client_proxy_url`), this listener reads neither the
                 # `proxy.secret` file nor these headers, and the gate that
                 # once read them was retired below regardless.
                 while True:
                     h = _read_line(conn)
                     if h in ("", None):
                         break
+                if unreadable:
+                    try:
+                        conn.sendall(
+                            b"HTTP/1.1 400 Bad Request\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    except OSError:
+                        pass
+                    conn.close()
+                    return
                 # A PIN THAT IS SET IS A PIN THAT APPLIES. The gate this
                 # replaces demanded a credential carried in HTTPS_PROXY, which
                 # is fixed at exec. Neither is what the feature is for. `cswap
@@ -15924,7 +15957,8 @@ class PinProxy:
             if not _connect_ok(status):
                 self._note_hop_unusable(
                     chain.address,
-                    "accepted but did not tunnel: "
+                    f"accepted but did not tunnel "
+                    f"{self._upstream[0]}:{self._upstream[1]}: "
                     + (f"CONNECT -> {status!r}" if status else "no reply"),
                 )
                 try:
@@ -15984,6 +16018,14 @@ class PinProxy:
         that is a new transition, not a repeat. Scoped to that hop: another
         hop carrying does not clear it, or a persistently dead hop behind a
         healthy one would re-log on every connection.
+
+        `why` names the CONNECT target where there is one (a client's blind
+        tunnel, or the MITM's own dial to the upstream host); a "dial failed"
+        reason names none, since a dead port has no target to blame. The
+        target lives INSIDE `why`, not in a separate dedup key, on purpose: a
+        hop that tunnels datadog fine and then refuses github is two
+        different facts, and letting the second log too is the point, not a
+        flood to fix.
         """
         state = (hop, why)
         if state == self._hop_fault:
@@ -16099,8 +16141,8 @@ class PinProxy:
         if not nxt or nxt == _read_upstream(self._certdir, "next"):
             return
         # A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP. A looped proxy neither
-        # answers nor exits — it appears here as "accepted but did not tunnel:
-        # no reply".
+        # answers nor exits — it appears here as "accepted but did not tunnel
+        # <target>: no reply".
         if self._is_me(nxt):
             _log_lifecycle(
                 f"{recorded} names this daemon as its upstream — refusing to "
@@ -16255,7 +16297,7 @@ class PinProxy:
                 # happens only when none of them will carry it.
                 self._note_hop_unusable(
                     chain.address,
-                    "accepted but did not tunnel: "
+                    f"accepted but did not tunnel {target}: "
                     + (f"CONNECT -> {status!r}" if status else "no reply"),
                 )
                 self._tunnel_trace(
@@ -16276,7 +16318,8 @@ class PinProxy:
             # everything Claude Code SENDS still went through the MITM path at
             # 200 while the receive channel was a dead socket.
             self._note_hop_unusable(
-                chain.address, "answered 200 but the tunnel was already EOF")
+                chain.address,
+                f"answered 200 but the tunnel to {target} was already EOF")
             self._tunnel_trace(
                 f"chain answered 200 but the tunnel to {target} was already "
                 f"EOF — dialling direct")

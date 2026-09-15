@@ -2999,6 +2999,7 @@ class TestChainRediscovery:
                 "a hop that ANSWERED was reported as a dead port — the two "
                 "faults are indistinguishable again")
             assert "502" in wrong_lines[0], wrong_lines
+            assert "api.anthropic.com:443" in wrong_lines[0], wrong_lines
         finally:
             rude.close()
 
@@ -3153,6 +3154,98 @@ class TestChainRediscovery:
             "a hop that ANSWERED was reported as a dead port")
         assert "accepted but did not tunnel" in wrong_lines[0], wrong_lines
         assert "CONNECT ->" in wrong_lines[0], wrong_lines
+        assert "rc-ingress.example.com:443" in wrong_lines[0], wrong_lines
+
+    def case_an_empty_authority_CONNECT_is_refused_400_and_judges_no_hop(
+        self, certdir, monkeypatch
+    ):
+        """Measured on lmd42-docker, 2026-09-15: some client on the host sent
+        a 17-byte `CONNECT  HTTP/1.1` (empty authority — 3 tokens: `CONNECT`,
+        ``, `HTTP/1.1`). `_handle_client` used to trace-log it and still hand
+        the empty target to `_blind_tunnel`, which dialled every hop with
+        `CONNECT  HTTP/1.1`; each hop refused in its own dialect, writing two
+        FALSE `hop unusable` lines and one FALSE `egress REFUSED`, and the
+        client got a 503 — one garbage request marking the whole pin's
+        egress refused. It must now be answered 400 before any hop is asked.
+        """
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(b"CONNECT  HTTP/1.1\r\n\r\n")
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        assert resp.startswith(b"HTTP/1.1 400 Bad Request"), resp
+        lines = buf.getvalue().splitlines()
+        assert not [l for l in lines if "unusable" in l], (
+            f"an empty-authority CONNECT judged a hop: {buf.getvalue()!r}")
+        assert not [l for l in lines if "egress REFUSED" in l], (
+            f"an empty-authority CONNECT marked egress refused: "
+            f"{buf.getvalue()!r}")
+        assert proxy._egress_refused is False
+        assert seen == [], "a hop was dialled for an empty-authority CONNECT"
+
+    def case_an_empty_host_with_a_port_is_refused_the_same_way(
+        self, certdir, monkeypatch
+    ):
+        """`CONNECT :443 HTTP/1.1` has a non-empty TARGET (`:443`) but an
+        EMPTY HOST once split on `:` — the same host `_blind_tunnel` would
+        dial as the fully-empty shape. A check on `target` alone lets this
+        one through; the check has to read the host `_blind_tunnel` actually
+        uses."""
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(b"CONNECT :443 HTTP/1.1\r\nHost: :443\r\n\r\n")
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        assert resp.startswith(b"HTTP/1.1 400 Bad Request"), resp
+        assert seen == [], "a hop was dialled for an empty-host CONNECT"
 
     def case_the_blind_tunnel_EOF_after_200_logs_the_reason(
         self, certdir, monkeypatch
@@ -3226,6 +3319,8 @@ class TestChainRediscovery:
         refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
         assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
         assert "EOF" in lines[unusable[0]], lines[unusable[0]]
+        assert "rc-ingress.example.com:443" in lines[unusable[0]], (
+            lines[unusable[0]])
         assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
         assert unusable[0] < refused[0], (
             "the hop reason must precede the REFUSED it explains: "
