@@ -4558,7 +4558,9 @@ class TestChainRediscovery:
         hops = pp._chain_hops(certdir)
         assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
 
-    def case_a_hop_that_answers_4xx_is_not_asked_again(self, certdir):
+    def case_a_hop_that_answers_4xx_is_asked_once_and_leaves_no_disk_record(
+        self, certdir
+    ):
         """MEASURED (sandbox privoxy 4.2.0, the owner's own config): no
         request form `_probe_next_hop` could send is both quiet on privoxy's
         own log and answered by the local cache proxy, which matches
@@ -4567,8 +4569,18 @@ class TestChainRediscovery:
         intercepted requests" error, logged as THAT proxy's error, not ours
         to keep causing. A hop that answers with a real HTTP response
         carrying a 4xx status is exactly this shape — something is there,
-        but it is not a /health server — so once known it must not be
-        probed again."""
+        but it is not a /health server — so once known it must not be probed
+        again.
+
+        THE MEMO IS PROCESS-LOCAL, NOT ON DISK. The owner withdrew the
+        earlier disk-persisted record for the shape of bug it was: it never
+        expired, so one 400 poisoned an address for good, including after a
+        real /health server took that port. `_ASKED_NOHEALTH` (see
+        `_probe_next_hop`) carries the same "don't ask again" behaviour for
+        exactly as long as this process runs, and `write_upstream_hint`'s
+        own record carries nothing about it forward."""
+        import json
+
         import cswap_pin.proxy as pp
 
         srv = socket.socket()
@@ -4603,27 +4615,35 @@ class TestChainRediscovery:
                     c.close()
 
         threading.Thread(target=serve, daemon=True).start()
+        address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
-            url = f"http://127.0.0.1:{srv.getsockname()[1]}"
-            nxt = pp._probe_next_hop(url, certdir=certdir)
+            url = f"http://{address}"
+            nxt = pp._probe_next_hop(url)
             assert nxt is None
             assert handled == [1], handled
 
-            # A second probe, same certdir: the gate must return None
-            # without opening a socket at all.
-            nxt2 = pp._probe_next_hop(url, certdir=certdir)
+            # A second probe of the same address: the process-local memo
+            # must return None without opening a socket at all.
+            nxt2 = pp._probe_next_hop(url)
             assert nxt2 is None
             assert handled == [1], (
-                "a hop already known to answer non-200 was asked again")
+                "a hop already known to answer 4xx was asked again")
+
+            # And nothing about it reached disk — a launch's own re-stamp
+            # carries no record of which hops answered 4xx.
+            pp.write_upstream_hint(certdir, url)
+            raw = json.loads((certdir / pp._UPSTREAM_FILE).read_text())
+            assert "nohealth" not in raw, raw
         finally:
+            pp._ASKED_NOHEALTH.discard(address)
             srv.close()
 
-    def case_a_hop_that_answers_5xx_is_still_reprobed(self, certdir):
-        """`nohealth` HAS NO EXPIRY, so it is scoped to 4xx (privoxy's own
-        answer, and the measured shape of "this isn't a /health server").
-        A 5xx is a genuine /health server having a bad moment — restarting,
-        its own upstream down — and must still be asked once it recovers,
-        not poisoned for good on one bad tick."""
+    def case_a_hop_that_answers_5xx_is_still_reprobed(self):
+        """The process-local memo (see `_probe_next_hop`) is scoped to 4xx
+        (privoxy's own answer, and the measured shape of "this isn't a
+        /health server"). A 5xx is a genuine /health server having a bad
+        moment — restarting, its own upstream down — and must still be
+        asked once it recovers, not poisoned for good on one bad tick."""
         import cswap_pin.proxy as pp
 
         srv = socket.socket()
@@ -4658,37 +4678,36 @@ class TestChainRediscovery:
                     c.close()
 
         threading.Thread(target=serve, daemon=True).start()
+        address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
-            url = f"http://127.0.0.1:{srv.getsockname()[1]}"
-            nxt = pp._probe_next_hop(url, certdir=certdir)
+            url = f"http://{address}"
+            nxt = pp._probe_next_hop(url)
             assert nxt is None
             assert handled == [1], handled
-            assert pp._read_upstream(certdir, "nohealth") is None, (
-                "a 5xx was recorded as nohealth, poisoning a hop that is "
-                "merely having a bad moment")
+            assert address not in pp._ASKED_NOHEALTH, (
+                "a 5xx was memoized as 4xx, poisoning a hop that is merely "
+                "having a bad moment")
 
-            # a second probe, same certdir: still asked, unlike the 4xx case.
-            nxt2 = pp._probe_next_hop(url, certdir=certdir)
+            # a second probe, same address: still asked, unlike the 4xx case.
+            nxt2 = pp._probe_next_hop(url)
             assert nxt2 is None
             assert handled == [1, 1], (
                 "a 5xx hop was not reprobed on the second call")
         finally:
             srv.close()
 
-    def case_a_dead_hop_records_nothing_and_is_reprobed_once_it_answers(
-        self, certdir
-    ):
+    def case_a_dead_hop_records_nothing_and_is_reprobed_once_it_answers(self):
         """A CCF that is merely DOWN must still be asked when it comes back —
         only a hop that positively answered something other than 200 is
         remembered. Same address, dead first, then serving: nothing about the
-        earlier failure should have been written against it."""
+        earlier failure should have excluded it from being asked again."""
         import cswap_pin.proxy as pp
 
         dead = self._dead_port()
-        nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}", certdir=certdir)
+        nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}")
         assert nxt is None
-        assert pp._read_upstream(certdir, "nohealth") is None, (
-            "a hop that never answered was recorded as nohealth")
+        assert f"127.0.0.1:{dead}" not in pp._ASKED_NOHEALTH, (
+            "a hop that never answered was memoized as 4xx")
 
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -4723,116 +4742,24 @@ class TestChainRediscovery:
 
         threading.Thread(target=serve, daemon=True).start()
         try:
-            nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}", certdir=certdir)
+            nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}")
             assert nxt == "http://127.0.0.1:8118", (
-                "the earlier failure to answer at all must not have been "
-                "recorded against this address")
+                "the earlier failure to answer at all must not have "
+                "excluded this address")
         finally:
             srv.close()
 
-    def case_write_upstream_hint_preserves_nohealth_across_a_re_stamp(
-        self, certdir
-    ):
-        """`write_upstream_hint` rewrites the whole record for its OWN
-        reasons (a new proxy/ca/next observed at launch) and has no opinion
-        on which hops answered /health — a re-stamp must carry that key
-        through unchanged, not drop it back to absent."""
-        import cswap_pin.proxy as pp
-
-        pp._mark_nohealth(certdir, "127.0.0.1:9999")
-        assert pp._read_upstream(certdir, "nohealth") == "127.0.0.1:9999"
-
-        pp.write_upstream_hint(certdir, "http://127.0.0.1:9901")
-        assert pp._read_upstream(certdir, "nohealth") == "127.0.0.1:9999", (
-            "a re-stamp for the proxy/ca/next fields erased the nohealth "
-            "record")
-
-    def case_a_hop_that_is_the_launchs_own_proxy_is_never_asked(self, certdir):
-        """A forward proxy answers a path-only request line with an error BY
-        DEFINITION, and writes that error into its own log — somebody else's
-        log, when that proxy is a machine's shared egress. Asking is only
-        useful when something wired this launch OVER the hop; when the hop
-        IS the launch's own proxy, nothing was wired over it, so the probe
-        can only cause the error, never learn anything from it.
-
-        The discriminator is connections accepted, not the return value: the
-        old code also returns None for a hop that never answers, so a bare
-        `is None` on the result would pass unchanged."""
-        import cswap_pin.proxy as pp
-
-        def health_server(next_hop):
-            srv = socket.socket()
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(("127.0.0.1", 0))
-            srv.listen(4)
-            accepted = []
-
-            def serve():
-                while True:
-                    try:
-                        c, _ = srv.accept()
-                    except OSError:
-                        return
-                    accepted.append(1)
-                    try:
-                        buf = b""
-                        while b"\r\n\r\n" not in buf:
-                            d = c.recv(4096)
-                            if not d:
-                                break
-                            buf += d
-                        body = json.dumps(
-                            {"status": "ok", "https_proxy": next_hop}
-                        ).encode()
-                        c.sendall(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                            b"Content-Length: " + str(len(body)).encode()
-                            + b"\r\n\r\n" + body
-                        )
-                    except OSError:
-                        pass
-                    finally:
-                        c.close()
-
-            threading.Thread(target=serve, daemon=True).start()
-            return srv, accepted
-
-        ambient_srv, ambient_accepted = health_server("http://127.0.0.1:1")
-        other_srv, other_accepted = health_server("http://127.0.0.1:2")
-        try:
-            ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
-            other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
-
-            # The hop asked IS the launch's own ambient proxy: nothing wired
-            # this launch over it, so it is never even connected to.
-            nxt = pp._probe_next_hop(ambient_url, own_proxy=ambient_url)
-            time.sleep(0.2)
-            assert nxt is None
-            assert ambient_accepted == [], (
-                "the launch's own proxy was asked for /health anyway"
-            )
-
-            # Positive control: a hop that is NOT the ambient proxy is still
-            # asked, exactly once, and its answer still comes back. No sleep
-            # needed here: `_probe_next_hop` only returns after the response
-            # has already been read, so the accept is already recorded.
-            nxt = pp._probe_next_hop(other_url, own_proxy=ambient_url)
-            assert nxt == "http://127.0.0.1:2"
-            assert other_accepted == [1], other_accepted
-        finally:
-            ambient_srv.close()
-            other_srv.close()
-
-    def case_ensure_proxy_never_probes_the_shells_own_exported_proxy(
+    def case_ensure_proxy_still_probes_the_shells_own_exported_proxy(
         self, tmp_path, monkeypatch
     ):
-        """The call site, not the comparison in isolation. When this
-        launch's own shell exports HTTPS_PROXY directly at a hop — an
-        ordinary shell, or an ssh shell, whose only proxy is the
-        machine-wide egress the launcher itself chains to — `ensure_proxy`
-        resolves that hop as `ambient` unchanged (nothing recorded yet to
-        prefer instead), so it must never connect to it for `/health`
-        either."""
+        """THE LAUNCHER-WITH-CACHE-PROXY CONFIGURATION (`learn_next_hop`'s
+        own docstring, the measured 9901 -> 8118 case): a shell whose only
+        visible proxy IS the hop `ensure_proxy` needs to walk further from.
+        An earlier `own_proxy` guard suppressed exactly this probe — a
+        no-op on the normal `cswap pin` path (a plain shell exports neither
+        HTTPS_PROXY nor https_proxy at all) that refused the one
+        configuration where the probe mattered. Removed: a hop is asked on
+        its own merits, whatever the shell happens to export."""
         import cswap_pin.proxy as pp
 
         srv = socket.socket()
@@ -4848,7 +4775,25 @@ class TestChainRediscovery:
                 except OSError:
                     return
                 accepted.append(1)
-                c.close()
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://127.0.0.1:8118"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
 
         threading.Thread(target=serve, daemon=True).start()
         try:
@@ -4869,12 +4814,14 @@ class TestChainRediscovery:
                     return "1", email, None
 
             got = pp.ensure_proxy(_SW())
-            time.sleep(0.2)
             assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
-            assert accepted == [], (
-                "ensure_proxy asked its own shell's exported proxy for "
-                "/health"
+            assert accepted == [1], (
+                "ensure_proxy never asked the shell's own exported proxy "
+                "for /health, so the outer hop a launcher-installed cache "
+                "proxy chains through can never be learned"
             )
+            certdir = tmp_path / "pin-proxy"
+            assert pp._chain_hops(certdir)[-1].address == ("127.0.0.1", 8118)
         finally:
             srv.close()
 

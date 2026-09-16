@@ -129,60 +129,18 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     return parse_upstream_proxy(_read_upstream(certdir, "proxy"))
 
 
-def _mark_nohealth(certdir: Path, address: str) -> None:
-    """Record that ``address`` answered but is not a /health server.
-
-    MEASURED (sandbox privoxy 4.2.0, the owner's own config): no request form
-    is both quiet on privoxy's own log and answered by the local cache proxy
-    (which matches origin-form ``GET /health`` only) — origin-form,
-    absolute-form and ``OPTIONS *`` each trip privoxy's "isn't configured to
-    accept intercepted requests" error. A hop that answers with a 4xx status
-    is exactly that: something is there, but it is not a /health server, and
-    asking again on every launch (`ensure_proxy`) and every daemon
-    code-watch tick (`learn_next_hop`) repeats the same error for nothing.
-    Scoped to 4xx (see the caller) so a genuine /health server's bad moment
-    is not recorded here as permanent.
-
-    A merge-write, not ``write_upstream_hint``: that function rewrites
-    ``proxy``/``ca``/``next`` for a launch's own reasons and has no opinion on
-    this key, so it is written here directly, tmp+replace, preserving whatever
-    else is on disk.
-    """
-    # ponytail: the record never expires and nothing clears it but a manual
-    # edit of upstream.json, so an address that answers 4xx once stays
-    # unaskable even after whatever held that port is fixed or replaced.
-    # Narrowing to 4xx (see the caller) already excludes a /health server's
-    # own transient 5xx; a full fix (a TTL, or re-probing after N sweeps)
-    # is not something the task asked for and is not built here.
-    path = Path(certdir) / _UPSTREAM_FILE
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, ValueError):
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    raw["nohealth"] = address
-    # PID-SUFFIXED, matching this file's own convention elsewhere (e.g.
-    # `write_upstream_hint`'s neighbouring `.tmp`, unguarded, is a
-    # pre-existing gap this call is not the one to fix) — `_mark_nohealth`
-    # is a NEW writer of THIS file, reachable from `learn_next_hop`'s daemon
-    # timer at the same time a fresh `ensure_proxy` launch calls
-    # `write_upstream_hint`; two processes racing the same un-suffixed tmp
-    # name can have one's `replace` publish the other's half-written
-    # content, corrupting the whole record (proxy/ca/next all read back
-    # None — a direct dial into the corporate inspector).
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(json.dumps(raw))
-        tmp.replace(path)
-    except OSError:
-        pass
+# Addresses that answered /health with a 4xx at least once THIS PROCESS —
+# "this is not what I accept", not "I am struggling right now" (see the
+# caller). PROCESS-LOCAL, not a disk record: the owner withdrew the earlier
+# `nohealth` key in upstream.json for the same shape of bug this file's other
+# state avoids — a remembered failure outliving the process that observed it,
+# with no way to learn that the address now answers (a real /health server
+# taking a port privoxy used to hold). A set scoped to this process's
+# lifetime expires exactly when the process that made the observation does.
+_ASKED_NOHEALTH: set[str] = set()
 
 
-def _probe_next_hop(
-    value: str | None, timeout: float = 1.0, *,
-    own_proxy: str | None = None, certdir: Path | None = None,
-) -> str | None:
+def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
     """The proxy the recorded hop is ITSELF chaining to, asked of that hop.
 
     A local cache proxy reports its own upstream on ``/health`` while it is
@@ -196,39 +154,26 @@ def _probe_next_hop(
     remote corporate proxy for a /health it does not serve would spend the
     timeout on every launch.
 
-    ``own_proxy`` is the proxy this launch's own environment already named,
-    unrelated to any probing. A forward proxy answers a path-only request
-    line (what ``/health`` is, on the wire) with an error by definition — it
-    is not the origin-form request it was told to relay — and that error
-    lands in a log that is not ours to write into. Asking is only useful when
-    something wired this launch over the hop, so a hop that turns out to BE
-    the launch's own proxy is never asked at all: nothing was wired over it,
-    so there is no inner/outer distinction to learn, only the error to cause.
-
-    ``certdir``, when given, gates against ``upstream.json``'s ``"nohealth"``
-    record: a hop already known to answer a 4xx (this isn't a /health server
-    at all) is not asked again — no socket, no error, no repeat log line.
-    Scoped to 4xx, not every non-200: `nohealth` has no expiry, and a genuine
-    /health server having a bad moment (5xx, a redirect) is still worth
-    asking once it recovers, unlike privoxy's fixed "not configured to
-    accept intercepted requests" 400. A hop that answers 200 clears nothing
-    here (this function does not write a 200 result); a hop that never
-    answers at all (a dead port, a timeout, an unreadable body) is not
-    recorded either, because a cache proxy that is merely down must still be
-    asked once it comes back.
+    Gated against ``_ASKED_NOHEALTH``: an address already known, this
+    process, to answer a 4xx (this isn't a /health server at all) is not
+    asked again — no socket, no error, no repeat log line. Scoped to 4xx, not
+    every non-200: a genuine /health server having a bad moment (5xx, a
+    redirect) is still worth asking once it recovers, unlike privoxy's fixed
+    "not configured to accept intercepted requests" 400. A hop that answers
+    200 clears nothing here (this function does not write a 200 result); a
+    hop that never answers at all (a dead port, a timeout, an unreadable
+    body) is not recorded either, because a cache proxy that is merely down
+    must still be asked once it comes back.
     """
     import http.client
 
     hop = parse_upstream_proxy(value)
     if hop is None:
         return None
-    own = parse_upstream_proxy(own_proxy)
-    if own is not None and own.address == hop.address:
-        return None
     if hop.host not in _LOOPBACK or hop.tls:
         return None
     address = f"{hop.host}:{hop.port}"
-    if certdir is not None and _read_upstream(certdir, "nohealth") == address:
+    if address in _ASKED_NOHEALTH:
         return None
     try:
         conn = http.client.HTTPConnection(hop.host, hop.port, timeout=timeout)
@@ -242,10 +187,9 @@ def _probe_next_hop(
                 # genuine /health server under load can answer 5xx or
                 # redirect, and that is a hop worth asking again once it
                 # recovers, not a hop that permanently isn't a /health
-                # server. `nohealth` has no expiry, so widening this to
-                # every non-200 would poison a hop for good on one bad tick.
-                if certdir is not None and 400 <= resp.status < 500:
-                    _mark_nohealth(certdir, address)
+                # server.
+                if 400 <= resp.status < 500:
+                    _ASKED_NOHEALTH.add(address)
                 return None
             body = json.loads(resp.read())
         finally:
@@ -323,15 +267,9 @@ def write_upstream_hint(
         # so an authenticated or TLS corporate proxy survived exactly until the
         # next re-pin, then every pinned request 407'd.
         keep_proxy = _read_upstream(certdir, "proxy") or ""
-    # This function has no opinion on which hops answered /health — that is
-    # `_probe_next_hop`/`_mark_nohealth`'s record — so a re-stamp for
-    # proxy/ca/next reasons must carry it through unchanged rather than
-    # dropping it back to "".
-    keep_nohealth = _read_upstream(certdir, "nohealth") or ""
     try:
         tmp.write_text(json.dumps({
             "proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next,
-            "nohealth": keep_nohealth,
         }))
         tmp.replace(path)
     except OSError:
@@ -6160,11 +6098,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         certdir,
         ambient,
         os.environ.get("NODE_EXTRA_CA_CERTS"),
-        next_hop=_probe_next_hop(
-            ambient or _read_upstream(certdir, "proxy"),
-            own_proxy=_shell_proxy(),
-            certdir=certdir,
-        )
+        next_hop=_probe_next_hop(ambient or _read_upstream(certdir, "proxy"))
         or observed_next,
     )
     fp = daemon_fingerprint(account_num, email)
@@ -12566,7 +12500,7 @@ class PinProxy:
                              "confirmed_at": int(time.time() * 1000),
                              "hipaa_seen": seen[-8:]}
                 try:
-                    # PID-SUFFIXED, matching `_mark_nohealth`'s convention:
+                    # PID-SUFFIXED, matching `write_daemon_state`'s convention:
                     # CC mints this same sidecar, and a draining daemon plus
                     # its successor both call this sweep against one config
                     # home, so an un-suffixed tmp name lets one writer's
@@ -16595,8 +16529,7 @@ class PinProxy:
         recorded = _read_upstream(self._certdir, "proxy")
         if not recorded:
             return
-        nxt = _probe_next_hop(
-            recorded, own_proxy=_shell_proxy(), certdir=self._certdir)
+        nxt = _probe_next_hop(recorded)
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down
         # would erase a next hop learned while it was up, at the moment it
