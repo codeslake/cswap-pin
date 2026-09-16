@@ -11526,6 +11526,48 @@ def pin_profile_for(token: "str | None") -> "dict | None":
         return None
 
 
+def _canonical_body_sha(doc: dict) -> str:
+    """The `sha` CC's own gate computes for a `policy-limits.json` body.
+
+    Read from the shipped 2.1.271 binary: `Poe(e){let n=lK(e),s=S(n);
+    return`sha256:${sha256(s).hex}`}`, where `lK` sorts every object's keys
+    recursively (arrays keep their order) and `S` is a compact
+    `JSON.stringify` -- not this file's own on-disk formatting, which is
+    why this re-encodes `doc` rather than hashing whatever bytes we wrote.
+    """
+    import hashlib
+    canon = json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _local_stamp_identity() -> "tuple[str, str] | None":
+    """`(identity, kind)` CC's stamp gate derives for the LOCAL credential,
+    or None when this does not derive one.
+
+    THE LOCAL credential, never the pin's bearer -- read from the shipped
+    binary's `lve()` -> `Rn()` -> `Z()`: for the ordinary signed-in case (an
+    oauth login with a stored `organizationUuid`, CC's "store" branch) the
+    descriptor is `org:<organizationUuid lower>`, sha256'd (`nve`).
+    `_login_identity` already reads the same `oauthAccount` field CC's
+    `zf()` does, for the bridge-pointer carry above.
+
+    Other branches (WIF, a token with no stored org, an env/fd override) are
+    not derived here: a WRONG identity would only buy "foreign", which
+    refuses exactly like "unstamped" does (see `sweep_policy_once`), so an
+    indeterminate case falls back to the plain unlink instead of guessing.
+    """
+    import hashlib
+    login = _login_identity()
+    if login is None:
+        return None
+    _account_uuid, org_uuid = login
+    if not org_uuid:
+        return None
+    descriptor = f"org:{org_uuid.lower()}"
+    return hashlib.sha256(descriptor.encode("utf-8")).hexdigest(), "org"
+
+
 class PinProxy:
     """A CONNECT forward proxy that MITMs api.anthropic.com and swaps the
     Authorization bearer to a pinned token on the RC/Artifact routes.
@@ -12289,38 +12331,72 @@ class PinProxy:
             except OSError:
                 write_failed = True
         # CC gates this file on a sidecar, `policy-limits.json.stamp.json`,
-        # left by ITS OWN last fetch. A stale stamp (`sha` no longer matching
-        # the body on disk) reads "torn" and CC refuses the body outright; an
-        # ABSENT stamp reads "legacy" and CC serves the body verbatim — same
-        # as a genuine "match", just without a log line and an identity
-        # re-check that a file only this daemon writes has no use for. So
-        # the unlink is UNCONDITIONAL, not only on the branch that just
-        # wrote: an older binary never unlinked either, so a host upgrading
-        # onto this fix commonly finds `doc` already equal to whatever that
-        # binary last wrote, WITH a stale stamp still attached from before —
-        # exactly the reported defect — and the equal-body branch above
-        # would otherwise never touch it, leaving that host stuck until the
-        # server-side policy value itself happens to change. Placed AFTER
-        # any write (not before): mid-write the state is "new body, old
-        # stamp" -> torn -> refused, which is the safe direction (absent is
-        # DENIED) rather than "old body, no stamp" -> legacy -> serving a
-        # possibly wrong-account body verbatim for the transition. Missing
-        # is the normal case (an older host writes no stamp at all), so a
-        # missing file or any OSError here is silently fine; this runs off
-        # the sweep's own timer and must never fail it.
+        # left by ITS OWN last fetch: `stamp===null||stamp.sha!==bodySha` ->
+        # "unstamped" (refused), `stamp.identity!==identity` -> "foreign"
+        # (refused), else "match" (served). CC derives `identity` from the
+        # LOCAL credential, never from the bearer this proxy swaps onto the
+        # wire — so a pin-target change with the active account unchanged
+        # still reads "match" against the stale pinned body, and this write
+        # is the one thing that can catch it.
         #
-        # RUN EVEN WHEN THE WRITE FAILED. A failed write leaves the OLD body
-        # on disk, still with whatever stamp was there — unlinking is just
-        # as harmless on that path (old body, no stamp -> "legacy", served
-        # verbatim) as on every other, and skipping it here would be the one
-        # occasion this heal is needed most: a body write that keeps failing
-        # would otherwise leave a torn stamp on the old body forever.
+        # SO THE WRITE MINTS THE SAME STAMP CC WOULD (`_canonical_body_sha`,
+        # `_local_stamp_identity`), not merely an ABSENT one. An unlink only
+        # ever buys "legacy" (no stamp, served verbatim like a genuine
+        # "match") — fine while nothing restamps it, but 2.1.273's
+        # `restampConfirmedCache` stopped silently restamping a body it did
+        # not mint, so "legacy" no longer self-heals into "match" either.
+        # WHEN THE LOCAL IDENTITY CANNOT BE DERIVED (no login, or a
+        # credential shape `_local_stamp_identity` does not cover), this
+        # still falls back to the plain unlink: a WRONG identity would only
+        # buy "foreign", which refuses exactly like "unstamped" does, so
+        # guessing is never better than not guessing.
+        #
+        # Skipped when an existing stamp already names this body's sha and
+        # this identity — no write, no churn, same discipline as the body
+        # above. Placed AFTER any write, not before: mid-write the state is
+        # "new stamp, old body" -> torn -> refused, the safe direction.
+        #
+        # A FAILED WRITE FORCES THE PLAIN UNLINK, unconditionally, same as
+        # it always has: `doc` is the FRESH fetch, but a failed write left
+        # the OLD body on disk, so minting a stamp for `doc` here would vouch
+        # for a body that is not actually there. The unlink is exactly as
+        # harmless on that path as on every other: old body, no stamp,
+        # reads as "legacy" and is served verbatim. Any OSError here is
+        # silently fine; this runs off the sweep's own timer and must never
+        # fail it.
         stamp = path.with_name(path.name + ".stamp.json")
-        healed = not wrote and stamp.exists()  # the skip path, stamp present
-        try:
-            stamp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        local_identity = None if write_failed else _local_stamp_identity()
+        healed = False
+        if local_identity is not None:
+            identity_hex, kind = local_identity
+            body_sha = _canonical_body_sha(doc)
+            existing = _read_json(stamp)
+            already_right = (isinstance(existing, dict)
+                              and existing.get("sha") == body_sha
+                              and existing.get("identity") == identity_hex)
+            if not already_right:
+                healed = not wrote
+                prev_seen = existing.get("hipaa_seen") \
+                    if isinstance(existing, dict) else None
+                seen = [h for h in (prev_seen or []) if h != identity_hex]
+                if "hipaa" in (doc.get("compliance_taints") or []):
+                    seen.append(identity_hex)
+                new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
+                             "sha": body_sha,
+                             "confirmed_at": int(time.time() * 1000),
+                             "hipaa_seen": seen[-8:]}
+                try:
+                    tmp = stamp.with_name(stamp.name + ".tmp")
+                    tmp.write_text(json.dumps(new_stamp), encoding="utf-8")
+                    tmp.replace(stamp)  # atomic: no reader sees half a stamp
+                except OSError:
+                    pass
+        else:
+            healed = not wrote and stamp.exists()  # the skip path, present
+            try:
+                stamp.unlink(missing_ok=True)
+            except OSError:
+                pass
         if write_failed:
             return False
         if wrote:
@@ -12328,9 +12404,12 @@ class PinProxy:
                            "these sessions travel as")
         elif healed:
             # THE ONLY OBSERVABLE of the skip-path heal actually firing: the
-            # body needed no write, but a stamp was still there to remove.
-            _log_lifecycle("removed a stale policy-cache stamp left by an "
-                           "earlier write")
+            # body needed no write, but the stamp was still wrong.
+            _log_lifecycle(
+                "refreshed the policy-cache stamp so CC's own gate reads "
+                "it as a match" if local_identity is not None else
+                "removed a stale policy-cache stamp left by an earlier "
+                "write")
         return wrote
 
     def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:

@@ -7,6 +7,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import threading
@@ -1646,6 +1647,177 @@ class TestLiveRemoteControlSessions:
         assert not stamp.exists(), (
             "a stale stamp survived a failed write, so a body write that "
             "keeps failing leaves the OLD body permanently torn"
+        )
+
+    def case_a_known_local_identity_gets_a_stamp_ccs_own_gate_reads_as_match(
+        self, tmp_path, monkeypatch
+    ):
+        """THE PIN OWES A STAMP-AWARE WRITE, NOT JUST AN UNLINK (T0681).
+
+        2.1.271 gates the body on `policy-limits.json.stamp.json`:
+        `stamp===null||stamp.sha!==bodySha` -> "unstamped" (refused);
+        `stamp.identity!==identity` -> "foreign" (refused); else "match"
+        (served). `identity` comes from the LOCAL credential
+        (`lve()`/`zf()`'s `oauthAccount.organizationUuid`), never from the
+        pin's bearer -- so a pin-target change with the active account
+        unchanged still reads "match" against the stale pinned body, and
+        the plain unlink (this file's stopgap since T0656) only ever buys
+        "legacy". Since 2.1.273's `restampConfirmedCache` stopped silently
+        restamping a body it did not mint, "legacy" does not self-heal into
+        "match" either -- the write has to mint the SAME stamp CC's own
+        `bzn`/`Poe`/`lK` would.
+
+        MEASURED (reading of the shipped 2.1.271 binary, not guessed):
+        `Poe(e){let n=lK(e),s=S(n);return`sha256:${sha256(s).hex}`}` where
+        `lK` sorts every object's keys recursively (arrays keep their
+        order) and `S` is a compact `JSON.stringify` -- and
+        `nve(e){return sha256(e.descriptor).hex}` with `Z(orgUuid)` ->
+        `descriptor:"org:"+orgUuid.toLowerCase()` for the ordinary
+        oauth-store case `lve()`/`Rn()` resolve to.
+
+        This test reimplements CC's own three-way verdict (`fe`)
+        independently of whatever the production code computes internally,
+        against the stamp this write actually left on disk, and asserts it
+        reads "match" -- not merely that the production code is
+        self-consistent with itself.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+               "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("acct-1", "Org-UUID-ABC"))
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        assert stamp_path.exists(), (
+            "the fix must WRITE a matching stamp, not unlink it away")
+        stamp = json.loads(stamp_path.read_text())
+
+        canon = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+        body_sha = "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
+        identity = hashlib.sha256(b"org:org-uuid-abc").hexdigest()
+
+        def fe(stamp, identity, body_sha):
+            """CC's own verdict function, reimplemented from the binary."""
+            if stamp is None or stamp.get("sha") != body_sha:
+                return "unstamped"
+            if stamp.get("identity") != identity:
+                return "foreign"
+            return "match"
+
+        verdict = fe(stamp, identity, body_sha)
+        assert verdict == "match", (
+            f"CC's own gate reads this stamp as {verdict!r}, not a match "
+            "-- exactly the refusal T0681 is about"
+        )
+
+    def case_a_matching_stamp_is_left_alone(self, tmp_path, monkeypatch):
+        """NO WRITE, NO CHURN -- same discipline as the body write above."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+        (cfg / "policy-limits.json").write_text(json.dumps(doc))
+
+        canon = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+        body_sha = "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
+        identity = hashlib.sha256(b"org:org-uuid-abc").hexdigest()
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        stamp_path.write_text(json.dumps({
+            "v": 1, "identity": identity, "kind": "org", "sha": body_sha,
+            "confirmed_at": 1, "hipaa_seen": [],
+        }))
+        before = stamp_path.stat().st_mtime_ns
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("acct-1", "Org-UUID-ABC"))
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False
+        assert stamp_path.stat().st_mtime_ns == before, (
+            "a stamp that already named this body's sha and this identity "
+            "was rewritten anyway"
+        )
+
+    def case_no_local_identity_still_falls_back_to_the_unlink(
+        self, tmp_path, monkeypatch
+    ):
+        """THE BOUNDARY THIS FIX DRAWS. No local login (or none
+        `_login_identity` derives an organization from) mints no stamp -- a
+        WRONG identity would only buy "foreign", which refuses exactly like
+        "unstamped" does, so this keeps the T0656 unlink as the honest
+        fallback rather than guess."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+        monkeypatch.setattr(pin_proxy, "_login_identity", lambda: None)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not stamp.exists()
+
+    def case_a_failed_write_with_a_known_identity_still_only_unlinks(
+        self, tmp_path, monkeypatch
+    ):
+        """A KNOWN IDENTITY MUST NOT MINT A STAMP FOR A BODY NOT ON DISK.
+
+        `doc` is the fresh fetch, but a failed write leaves the OLD body on
+        disk -- minting a stamp for `doc` here would vouch for a body that
+        was never actually written, which is worse than the plain unlink
+        this path always took: an absent stamp reads "legacy" and serves
+        the OLD body verbatim; a stamp naming the wrong sha reads "torn"
+        and refuses the OLD body outright."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        different = {"restrictions": {"allow_remote_control": {"allowed": False}}}
+        (cfg / "policy-limits.json").write_text(json.dumps(different))
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+
+        doc = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+        monkeypatch.setattr(pin_proxy, "_login_identity",
+                            lambda: ("acct-1", "Org-UUID-ABC"))
+
+        real_write_text = Path.write_text
+
+        def failing_write_text(self, *a, **kw):
+            if self.name.endswith(".json.tmp"):
+                raise OSError("simulated")
+            return real_write_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False
+        assert not stamp.exists(), (
+            "a known identity minted a stamp for a body the failed write "
+            "never actually put on disk"
         )
 
     def case_a_live_sessions_archived_bridge_is_revived(self, monkeypatch):
