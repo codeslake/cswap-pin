@@ -4558,7 +4558,7 @@ class TestChainRediscovery:
         hops = pp._chain_hops(certdir)
         assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
 
-    def case_a_hop_that_answers_non_200_is_not_asked_again(self, certdir):
+    def case_a_hop_that_answers_4xx_is_not_asked_again(self, certdir):
         """MEASURED (sandbox privoxy 4.2.0, the owner's own config): no
         request form `_probe_next_hop` could send is both quiet on privoxy's
         own log and answered by the local cache proxy, which matches

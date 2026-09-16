@@ -148,6 +148,12 @@ def _mark_nohealth(certdir: Path, address: str) -> None:
     this key, so it is written here directly, tmp+replace, preserving whatever
     else is on disk.
     """
+    # ponytail: the record never expires and nothing clears it but a manual
+    # edit of upstream.json, so an address that answers 4xx once stays
+    # unaskable even after whatever held that port is fixed or replaced.
+    # Narrowing to 4xx (see the caller) already excludes a /health server's
+    # own transient 5xx; a full fix (a TTL, or re-probing after N sweeps)
+    # is not something the task asked for and is not built here.
     path = Path(certdir) / _UPSTREAM_FILE
     try:
         raw = json.loads(path.read_text())
@@ -156,7 +162,16 @@ def _mark_nohealth(certdir: Path, address: str) -> None:
     if not isinstance(raw, dict):
         raw = {}
     raw["nohealth"] = address
-    tmp = path.with_suffix(".tmp")
+    # PID-SUFFIXED, matching this file's own convention elsewhere (e.g.
+    # `write_upstream_hint`'s neighbouring `.tmp`, unguarded, is a
+    # pre-existing gap this call is not the one to fix) — `_mark_nohealth`
+    # is a NEW writer of THIS file, reachable from `learn_next_hop`'s daemon
+    # timer at the same time a fresh `ensure_proxy` launch calls
+    # `write_upstream_hint`; two processes racing the same un-suffixed tmp
+    # name can have one's `replace` publish the other's half-written
+    # content, corrupting the whole record (proxy/ca/next all read back
+    # None — a direct dial into the corporate inspector).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         tmp.write_text(json.dumps(raw))
         tmp.replace(path)
@@ -12292,13 +12307,20 @@ class PinProxy:
         # is the normal case (an older host writes no stamp at all), so a
         # missing file or any OSError here is silently fine; this runs off
         # the sweep's own timer and must never fail it.
+        stamp = path.with_name(path.name + ".stamp.json")
+        healed = not wrote and stamp.exists()  # the skip path, stamp present
         try:
-            path.with_name(path.name + ".stamp.json").unlink(missing_ok=True)
+            stamp.unlink(missing_ok=True)
         except OSError:
             pass
         if wrote:
             _log_lifecycle("refreshed the org-policy cache for the account "
                            "these sessions travel as")
+        elif healed:
+            # THE ONLY OBSERVABLE of the skip-path heal actually firing: the
+            # body needed no write, but a stamp was still there to remove.
+            _log_lifecycle("removed a stale policy-cache stamp left by an "
+                           "earlier write")
         return wrote
 
     def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:

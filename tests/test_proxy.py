@@ -1528,7 +1528,9 @@ class TestLiveRemoteControlSessions:
         cfg = tmp_path / "config"
         cfg.mkdir()
         doc = {"restrictions": {}, "compliance_taints": []}
-        (cfg / "policy-limits.json").write_text(json.dumps(doc))
+        body_path = cfg / "policy-limits.json"
+        body_path.write_text(json.dumps(doc))
+        before = body_path.stat().st_mtime_ns
         stamp = cfg / "policy-limits.json.stamp.json"
         stamp.write_text(json.dumps({"sha": "stale"}))
 
@@ -1539,8 +1541,11 @@ class TestLiveRemoteControlSessions:
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is False, (
             "the skip-when-equal path must still report no write happened")
-        assert json.loads((cfg / "policy-limits.json").read_text()) == doc, (
-            "the skip path must not have rewritten the body")
+        # The real discriminator for "no write happened": the file's own
+        # mtime, not its content, since the body written would be identical
+        # to what was already there either way.
+        assert body_path.stat().st_mtime_ns == before, (
+            "the skip path rewrote a body that already matched")
         assert not stamp.exists(), (
             "a stale stamp survived the skip path, stranding an upgraded "
             "host stuck at torn until the server-side policy changes")
