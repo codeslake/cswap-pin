@@ -1505,12 +1505,23 @@ class TestLiveRemoteControlSessions:
             "the stale stamp survived the write, so CC reads the fresh body "
             "as torn and refuses it")
 
-    def case_a_skipped_write_leaves_the_stamp_alone(self, tmp_path, monkeypatch):
-        """THE SKIP-WHEN-EQUAL PATH NEVER WRITES, SO IT MUST NEVER UNLINK.
+    def case_a_skipped_write_still_removes_a_stale_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SKIP-WHEN-EQUAL PATH MUST STILL UNLINK, UNCONDITIONALLY.
 
-        When the body on disk already matches, a stamp there is CC's OWN — it
-        vouches for exactly that body, reading "match". Removing it would
-        downgrade a body CC already trusts to "legacy" for nothing.
+        An older binary never unlinked either, so a host upgrading onto this
+        fix commonly finds `doc` already equal to whatever that binary last
+        wrote — the equal-body branch fires on the VERY FIRST sweep tick
+        after the upgrade — while a stale stamp from before this fix shipped
+        is still attached. That is exactly the reported defect ("a document
+        left by a restricted org denied Remote Control ... for the better
+        part of a day"), and nothing about content already matching proves
+        the on-disk stamp is CC's own rather than a leftover: only the
+        unlink, run every time, heals it without waiting for the policy
+        value itself to change. Per CC's own gate, this costs nothing even
+        when the stamp WAS genuine: an absent stamp reads "legacy" and
+        serves the body verbatim, exactly like "match" does.
         """
         from cswap_pin import proxy as pin_proxy
 
@@ -1519,17 +1530,20 @@ class TestLiveRemoteControlSessions:
         doc = {"restrictions": {}, "compliance_taints": []}
         (cfg / "policy-limits.json").write_text(json.dumps(doc))
         stamp = cfg / "policy-limits.json.stamp.json"
-        stamp.write_text(json.dumps({"sha": "current"}))
+        stamp.write_text(json.dumps({"sha": "stale"}))
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
         monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
-        assert daemon.sweep_policy_once() is False
-        assert stamp.exists() and json.loads(stamp.read_text()) == {
-            "sha": "current"
-        }, "the skip-when-equal path touched a stamp it never wrote to"
+        assert daemon.sweep_policy_once() is False, (
+            "the skip-when-equal path must still report no write happened")
+        assert json.loads((cfg / "policy-limits.json").read_text()) == doc, (
+            "the skip path must not have rewritten the body")
+        assert not stamp.exists(), (
+            "a stale stamp survived the skip path, stranding an upgraded "
+            "host stuck at torn until the server-side policy changes")
 
     def case_no_stamp_on_disk_is_the_normal_case(self, tmp_path, monkeypatch):
         """OLDER HOSTS WRITE NO STAMP AT ALL. The unlink must be a quiet no-op
@@ -1566,9 +1580,11 @@ class TestLiveRemoteControlSessions:
         monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
 
         real_unlink = Path.unlink
+        called = []
 
         def raising_unlink(self, *a, **kw):
             if self.name.endswith(".stamp.json"):
+                called.append(1)
                 raise OSError("simulated")
             return real_unlink(self, *a, **kw)
 
@@ -1578,6 +1594,9 @@ class TestLiveRemoteControlSessions:
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is True
         assert json.loads((cfg / "policy-limits.json").read_text()) == doc
+        assert called, (
+            "the raising unlink was never reached, so this proved nothing "
+            "about the OSError being swallowed")
 
     def case_a_live_sessions_archived_bridge_is_revived(self, monkeypatch):
         """AN ARCHIVED BRIDGE UNDER A LIVE SESSION IS A BROKEN RECONNECT.

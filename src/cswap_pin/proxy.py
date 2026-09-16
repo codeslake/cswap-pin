@@ -133,13 +133,15 @@ def _mark_nohealth(certdir: Path, address: str) -> None:
     """Record that ``address`` answered but is not a /health server.
 
     MEASURED (sandbox privoxy 4.2.0, the owner's own config): no request form
-    is both quiet on privoxy's own log and answered by CCF (which matches
-    origin-form ``GET /health`` only) — origin-form, absolute-form and
-    ``OPTIONS *`` each trip privoxy's "isn't configured to accept intercepted
-    requests" error. A hop that answers with a non-200 status is exactly that:
-    something is there, but it is not a /health server, and asking again on
-    every launch (`ensure_proxy`) and every daemon code-watch tick
-    (`learn_next_hop`) repeats the same error for nothing.
+    is both quiet on privoxy's own log and answered by the local cache proxy
+    (which matches origin-form ``GET /health`` only) — origin-form,
+    absolute-form and ``OPTIONS *`` each trip privoxy's "isn't configured to
+    accept intercepted requests" error. A hop that answers with a 4xx status
+    is exactly that: something is there, but it is not a /health server, and
+    asking again on every launch (`ensure_proxy`) and every daemon
+    code-watch tick (`learn_next_hop`) repeats the same error for nothing.
+    Scoped to 4xx (see the caller) so a genuine /health server's bad moment
+    is not recorded here as permanent.
 
     A merge-write, not ``write_upstream_hint``: that function rewrites
     ``proxy``/``ca``/``next`` for a launch's own reasons and has no opinion on
@@ -189,12 +191,16 @@ def _probe_next_hop(
     so there is no inner/outer distinction to learn, only the error to cause.
 
     ``certdir``, when given, gates against ``upstream.json``'s ``"nohealth"``
-    record: a hop already known to answer something other than a /health
-    server is not asked again — no socket, no error, no repeat log line. A
-    hop that answers 200 clears nothing here (this function does not write a
-    200 result); a hop that never answers at all (a dead port, a timeout, an
-    unreadable body) is not recorded either, because a CCF that is merely
-    down must still be asked once it comes back.
+    record: a hop already known to answer a 4xx (this isn't a /health server
+    at all) is not asked again — no socket, no error, no repeat log line.
+    Scoped to 4xx, not every non-200: `nohealth` has no expiry, and a genuine
+    /health server having a bad moment (5xx, a redirect) is still worth
+    asking once it recovers, unlike privoxy's fixed "not configured to
+    accept intercepted requests" 400. A hop that answers 200 clears nothing
+    here (this function does not write a 200 result); a hop that never
+    answers at all (a dead port, a timeout, an unreadable body) is not
+    recorded either, because a cache proxy that is merely down must still be
+    asked once it comes back.
     """
     import http.client
 
@@ -215,7 +221,15 @@ def _probe_next_hop(
             conn.request("GET", "/health")
             resp = conn.getresponse()
             if resp.status != 200:
-                if certdir is not None:
+                # MEASURED: privoxy answers every form with 400, a client
+                # error — "this isn't what I accept", not "I am struggling
+                # right now". Recording is scoped to 4xx for that reason: a
+                # genuine /health server under load can answer 5xx or
+                # redirect, and that is a hop worth asking again once it
+                # recovers, not a hop that permanently isn't a /health
+                # server. `nohealth` has no expiry, so widening this to
+                # every non-200 would poison a hop for good on one bad tick.
+                if certdir is not None and 400 <= resp.status < 500:
                     _mark_nohealth(certdir, address)
                 return None
             body = json.loads(resp.read())
@@ -12244,35 +12258,48 @@ class PinProxy:
         if not isinstance(doc, dict):
             return False
         path = _config_home_for_policy() / "policy-limits.json"
+        wrote = True
         try:
             if path.exists() and json.loads(
                     path.read_text(encoding="utf-8")) == doc:
-                return False       # already right; no write, no churn
+                wrote = False      # already right; no write, no churn
         except Exception:  # noqa: BLE001 — unreadable counts as "replace it"
             pass
-        try:
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(doc), encoding="utf-8")
-            tmp.replace(path)      # atomic: no reader sees half a document
-        except OSError:
-            return False
+        if wrote:
+            try:
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(doc), encoding="utf-8")
+                tmp.replace(path)  # atomic: no reader sees half a document
+            except OSError:
+                return False
         # CC gates this file on a sidecar, `policy-limits.json.stamp.json`,
         # left by ITS OWN last fetch. A stale stamp (`sha` no longer matching
-        # what we just wrote) reads "torn" and CC refuses the body outright;
-        # an ABSENT stamp reads "legacy" and CC serves the body verbatim, no
-        # age or identity check. So the write above, unaccompanied, left the
-        # document CC would never trust again — unlink the stamp so the next
-        # read takes the legacy branch. Missing is the normal case (an older
-        # host writes no stamp at all), so a missing file or any OSError here
-        # is silently fine; this runs off the sweep's own timer and must
-        # never fail it.
+        # the body on disk) reads "torn" and CC refuses the body outright; an
+        # ABSENT stamp reads "legacy" and CC serves the body verbatim — same
+        # as a genuine "match", just without a log line and an identity
+        # re-check that a file only this daemon writes has no use for. So
+        # the unlink is UNCONDITIONAL, not only on the branch that just
+        # wrote: an older binary never unlinked either, so a host upgrading
+        # onto this fix commonly finds `doc` already equal to whatever that
+        # binary last wrote, WITH a stale stamp still attached from before —
+        # exactly the reported defect — and the equal-body branch above
+        # would otherwise never touch it, leaving that host stuck until the
+        # server-side policy value itself happens to change. Placed AFTER
+        # any write (not before): mid-write the state is "new body, old
+        # stamp" -> torn -> refused, which is the safe direction (absent is
+        # DENIED) rather than "old body, no stamp" -> legacy -> serving a
+        # possibly wrong-account body verbatim for the transition. Missing
+        # is the normal case (an older host writes no stamp at all), so a
+        # missing file or any OSError here is silently fine; this runs off
+        # the sweep's own timer and must never fail it.
         try:
             path.with_name(path.name + ".stamp.json").unlink(missing_ok=True)
         except OSError:
             pass
-        _log_lifecycle("refreshed the org-policy cache for the account "
-                       "these sessions travel as")
-        return True
+        if wrote:
+            _log_lifecycle("refreshed the org-policy cache for the account "
+                           "these sessions travel as")
+        return wrote
 
     def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:
         """Unarchive the bridges a LIVE session on this machine still holds.

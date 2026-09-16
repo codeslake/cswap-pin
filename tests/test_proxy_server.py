@@ -4561,13 +4561,14 @@ class TestChainRediscovery:
     def case_a_hop_that_answers_non_200_is_not_asked_again(self, certdir):
         """MEASURED (sandbox privoxy 4.2.0, the owner's own config): no
         request form `_probe_next_hop` could send is both quiet on privoxy's
-        own log and answered by CCF, which matches origin-form
-        ``GET /health`` only — origin-form, absolute-form and ``OPTIONS *``
-        each trip privoxy's own "isn't configured to accept intercepted
-        requests" error, logged as THAT proxy's error, not ours to keep
-        causing. A hop that answers with a real HTTP response carrying a
-        non-200 status is exactly this shape — something is there, but it is
-        not a /health server — so once known it must not be probed again."""
+        own log and answered by the local cache proxy, which matches
+        origin-form ``GET /health`` only — origin-form, absolute-form and
+        ``OPTIONS *`` each trip privoxy's own "isn't configured to accept
+        intercepted requests" error, logged as THAT proxy's error, not ours
+        to keep causing. A hop that answers with a real HTTP response
+        carrying a 4xx status is exactly this shape — something is there,
+        but it is not a /health server — so once known it must not be
+        probed again."""
         import cswap_pin.proxy as pp
 
         srv = socket.socket()
@@ -4614,6 +4615,63 @@ class TestChainRediscovery:
             assert nxt2 is None
             assert handled == [1], (
                 "a hop already known to answer non-200 was asked again")
+        finally:
+            srv.close()
+
+    def case_a_hop_that_answers_5xx_is_still_reprobed(self, certdir):
+        """`nohealth` HAS NO EXPIRY, so it is scoped to 4xx (privoxy's own
+        answer, and the measured shape of "this isn't a /health server").
+        A 5xx is a genuine /health server having a bad moment — restarting,
+        its own upstream down — and must still be asked once it recovers,
+        not poisoned for good on one bad tick."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        handled = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                handled.append(1)
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = b"Internal Server Error"
+                    c.sendall(
+                        b"HTTP/1.1 500 Internal Server Error\r\n"
+                        b"Content-Type: text/plain\r\nContent-Length: "
+                        + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            nxt = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt is None
+            assert handled == [1], handled
+            assert pp._read_upstream(certdir, "nohealth") is None, (
+                "a 5xx was recorded as nohealth, poisoning a hop that is "
+                "merely having a bad moment")
+
+            # a second probe, same certdir: still asked, unlike the 4xx case.
+            nxt2 = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt2 is None
+            assert handled == [1, 1], (
+                "a 5xx hop was not reprobed on the second call")
         finally:
             srv.close()
 
