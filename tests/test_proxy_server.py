@@ -4558,6 +4558,409 @@ class TestChainRediscovery:
         hops = pp._chain_hops(certdir)
         assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
 
+    def case_a_hop_that_answers_4xx_is_not_asked_again(self, certdir):
+        """MEASURED (sandbox privoxy 4.2.0, the owner's own config): no
+        request form `_probe_next_hop` could send is both quiet on privoxy's
+        own log and answered by the local cache proxy, which matches
+        origin-form ``GET /health`` only — origin-form, absolute-form and
+        ``OPTIONS *`` each trip privoxy's own "isn't configured to accept
+        intercepted requests" error, logged as THAT proxy's error, not ours
+        to keep causing. A hop that answers with a real HTTP response
+        carrying a 4xx status is exactly this shape — something is there,
+        but it is not a /health server — so once known it must not be
+        probed again."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        handled = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                handled.append(1)
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = b"Error: invalid request"
+                    c.sendall(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            nxt = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt is None
+            assert handled == [1], handled
+
+            # A second probe, same certdir: the gate must return None
+            # without opening a socket at all.
+            nxt2 = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt2 is None
+            assert handled == [1], (
+                "a hop already known to answer non-200 was asked again")
+        finally:
+            srv.close()
+
+    def case_a_hop_that_answers_5xx_is_still_reprobed(self, certdir):
+        """`nohealth` HAS NO EXPIRY, so it is scoped to 4xx (privoxy's own
+        answer, and the measured shape of "this isn't a /health server").
+        A 5xx is a genuine /health server having a bad moment — restarting,
+        its own upstream down — and must still be asked once it recovers,
+        not poisoned for good on one bad tick."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        handled = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                handled.append(1)
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = b"Internal Server Error"
+                    c.sendall(
+                        b"HTTP/1.1 500 Internal Server Error\r\n"
+                        b"Content-Type: text/plain\r\nContent-Length: "
+                        + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            nxt = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt is None
+            assert handled == [1], handled
+            assert pp._read_upstream(certdir, "nohealth") is None, (
+                "a 5xx was recorded as nohealth, poisoning a hop that is "
+                "merely having a bad moment")
+
+            # a second probe, same certdir: still asked, unlike the 4xx case.
+            nxt2 = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt2 is None
+            assert handled == [1, 1], (
+                "a 5xx hop was not reprobed on the second call")
+        finally:
+            srv.close()
+
+    def case_a_dead_hop_records_nothing_and_is_reprobed_once_it_answers(
+        self, certdir
+    ):
+        """A CCF that is merely DOWN must still be asked when it comes back —
+        only a hop that positively answered something other than 200 is
+        remembered. Same address, dead first, then serving: nothing about the
+        earlier failure should have been written against it."""
+        import cswap_pin.proxy as pp
+
+        dead = self._dead_port()
+        nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}", certdir=certdir)
+        assert nxt is None
+        assert pp._read_upstream(certdir, "nohealth") is None, (
+            "a hop that never answered was recorded as nohealth")
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", dead))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://127.0.0.1:8118"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}", certdir=certdir)
+            assert nxt == "http://127.0.0.1:8118", (
+                "the earlier failure to answer at all must not have been "
+                "recorded against this address")
+        finally:
+            srv.close()
+
+    def case_write_upstream_hint_preserves_nohealth_across_a_re_stamp(
+        self, certdir
+    ):
+        """`write_upstream_hint` rewrites the whole record for its OWN
+        reasons (a new proxy/ca/next observed at launch) and has no opinion
+        on which hops answered /health — a re-stamp must carry that key
+        through unchanged, not drop it back to absent."""
+        import cswap_pin.proxy as pp
+
+        pp._mark_nohealth(certdir, "127.0.0.1:9999")
+        assert pp._read_upstream(certdir, "nohealth") == "127.0.0.1:9999"
+
+        pp.write_upstream_hint(certdir, "http://127.0.0.1:9901")
+        assert pp._read_upstream(certdir, "nohealth") == "127.0.0.1:9999", (
+            "a re-stamp for the proxy/ca/next fields erased the nohealth "
+            "record")
+
+    def case_a_hop_that_is_the_launchs_own_proxy_is_never_asked(self, certdir):
+        """A forward proxy answers a path-only request line with an error BY
+        DEFINITION, and writes that error into its own log — somebody else's
+        log, when that proxy is a machine's shared egress. Asking is only
+        useful when something wired this launch OVER the hop; when the hop
+        IS the launch's own proxy, nothing was wired over it, so the probe
+        can only cause the error, never learn anything from it.
+
+        The discriminator is connections accepted, not the return value: the
+        old code also returns None for a hop that never answers, so a bare
+        `is None` on the result would pass unchanged."""
+        import cswap_pin.proxy as pp
+
+        def health_server(next_hop):
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            accepted = []
+
+            def serve():
+                while True:
+                    try:
+                        c, _ = srv.accept()
+                    except OSError:
+                        return
+                    accepted.append(1)
+                    try:
+                        buf = b""
+                        while b"\r\n\r\n" not in buf:
+                            d = c.recv(4096)
+                            if not d:
+                                break
+                            buf += d
+                        body = json.dumps(
+                            {"status": "ok", "https_proxy": next_hop}
+                        ).encode()
+                        c.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            b"Content-Length: " + str(len(body)).encode()
+                            + b"\r\n\r\n" + body
+                        )
+                    except OSError:
+                        pass
+                    finally:
+                        c.close()
+
+            threading.Thread(target=serve, daemon=True).start()
+            return srv, accepted
+
+        ambient_srv, ambient_accepted = health_server("http://127.0.0.1:1")
+        other_srv, other_accepted = health_server("http://127.0.0.1:2")
+        try:
+            ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
+            other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
+
+            # The hop asked IS the launch's own ambient proxy: nothing wired
+            # this launch over it, so it is never even connected to.
+            nxt = pp._probe_next_hop(ambient_url, own_proxy=ambient_url)
+            time.sleep(0.2)
+            assert nxt is None
+            assert ambient_accepted == [], (
+                "the launch's own proxy was asked for /health anyway"
+            )
+
+            # Positive control: a hop that is NOT the ambient proxy is still
+            # asked, exactly once, and its answer still comes back. No sleep
+            # needed here: `_probe_next_hop` only returns after the response
+            # has already been read, so the accept is already recorded.
+            nxt = pp._probe_next_hop(other_url, own_proxy=ambient_url)
+            assert nxt == "http://127.0.0.1:2"
+            assert other_accepted == [1], other_accepted
+        finally:
+            ambient_srv.close()
+            other_srv.close()
+
+    def case_ensure_proxy_never_probes_the_shells_own_exported_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        """The call site, not the comparison in isolation. When this
+        launch's own shell exports HTTPS_PROXY directly at a hop — an
+        ordinary shell, or an ssh shell, whose only proxy is the
+        machine-wide egress the launcher itself chains to — `ensure_proxy`
+        resolves that hop as `ambient` unchanged (nothing recorded yet to
+        prefer instead), so it must never connect to it for `/health`
+        either."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        accepted = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                accepted.append(1)
+                c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            exported = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            monkeypatch.setenv("HTTPS_PROXY", exported)
+            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
+            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
+            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
+            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
+            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
+            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
+            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+
+            class _SW:
+                backup_dir = tmp_path
+
+                def resolve_account(self, email):
+                    return "1", email, None
+
+            got = pp.ensure_proxy(_SW())
+            time.sleep(0.2)
+            assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
+            assert accepted == [], (
+                "ensure_proxy asked its own shell's exported proxy for "
+                "/health"
+            )
+        finally:
+            srv.close()
+
+    def case_ensure_proxy_still_probes_a_preferred_inner_hop(
+        self, tmp_path, monkeypatch
+    ):
+        """Positive control for the previous case. An ordinary shell only
+        ever sees the outer egress proxy — but when a DIFFERENT, already
+        recorded inner hop is still serving, `_ambient_proxy` prefers it
+        over that shell value, and the two addresses now differ: this hop
+        is still probed."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        # `_ambient_proxy`'s own preference check opens a bare liveness
+        # connection to this hop (no HTTP request) before `_probe_next_hop`
+        # makes the real `/health` request — so the discriminator here is a
+        # RESPONSE actually sent, not merely a connection accepted.
+        served = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    if not buf:
+                        continue
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://192.0.2.1:3128"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                    served.append(1)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            inner = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            certdir = tmp_path / "pin-proxy"
+            certdir.mkdir(parents=True, exist_ok=True)
+            # A previous launch already recorded this inner hop.
+            pp.write_upstream_hint(certdir, inner)
+            # This shell only has the outer egress proxy — a reserved,
+            # documentation-only address (RFC 5737), never dialed here.
+            monkeypatch.setenv("HTTPS_PROXY", "http://192.0.2.1:3128")
+            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
+            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
+            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
+            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
+            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
+            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
+            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+
+            class _SW:
+                backup_dir = tmp_path
+
+                def resolve_account(self, email):
+                    return "1", email, None
+
+            got = pp.ensure_proxy(_SW())
+            time.sleep(0.2)
+            assert got == (41000, certdir / "ca.pem")
+            assert served == [1], (
+                "the preferred inner hop, distinct from the shell's own "
+                "export, was never asked"
+            )
+            assert pp._chain_hops(certdir)[-1].address == ("192.0.2.1", 3128)
+        finally:
+            srv.close()
 
 
 

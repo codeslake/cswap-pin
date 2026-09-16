@@ -7,6 +7,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import threading
@@ -633,6 +634,70 @@ class TestHistoryCarriesAcrossASwitch:
         assert _carry_history_pointers(home) == 1
         for line in path.read_text().splitlines():
             json.loads(line)          # every line still parses on its own
+
+
+_TEST_IDENTITY = hashlib.sha256(b"org:test-org").hexdigest()
+# T0681 ROUND 4: the fixed token/account pair `_seed_trusted_stamp` writes
+# into its witness by default. A case exercising the mint path monkeypatches
+# `_active_oauth_token`/`_active_pin_account_label` to these same two values
+# so the freshly-read witness matches the seeded one; a case wanting a
+# mismatch changes one side or the other.
+_TEST_TOKEN = "witness-active-token"
+_TEST_ACCOUNT_LABEL = "1"
+
+
+def _canon_sha(doc):
+    """`_canonical_body_sha(doc)`, recomputed here for a test's own seed
+    value -- see `_canonical_body_sha`'s own docstring for why
+    `ensure_ascii=False` is the one parameter that matters here.
+
+    NOT an independent check ON `_canonical_body_sha`: it is the same
+    algorithm run twice, so a bug shared by both sides still passes every
+    case that only ever compares one against the other (T0681 round 3
+    review). `case_canonical_body_sha_matches_a_known_value` is the one
+    case that does not go through this function.
+    """
+    canon = json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
+
+
+def _seed_trusted_stamp(cfg, old_doc, *, identity=_TEST_IDENTITY, kind="org",
+                        hipaa_seen=None, confirmed_at=1, witness=True):
+    """Leave `old_doc` on disk with a stamp CC itself could have minted for
+    it -- the ground truth `_trusted_stamp_identity` reuses (T0681
+    correctness review: no env var or credential-precedence guess is
+    trustworthy from outside CC's own process, so every case that wants the
+    "identity known" branch has to earn it this way, by construction).
+
+    ALSO SEEDS A MATCHING WITNESS by default (T0681 round 4): a mint now
+    requires, beside a trusted stamp, our own record of the account active
+    when it was last minted (`_sweep_witness`) -- a stamp CC alone wrote
+    carries none of ours, and correctly does not inherit (see
+    `case_a_cc_only_stamp_has_no_witness_and_falls_back`). Pass
+    `witness=False` for that case; every other caller that reaches the mint
+    branch (the fresh body differs from `old_doc`) must also monkeypatch
+    `_active_oauth_token`/`_active_pin_account_label` to `_TEST_TOKEN`/
+    `_TEST_ACCOUNT_LABEL`, or the freshly-read witness will not match this
+    seeded one either. A caller that never reaches the mint branch (the
+    skip path, or a write that fails) needs neither -- the witness is
+    consulted only where an identity is about to be carried onto a body it
+    was never confirmed against.
+
+    Returns `old_doc`'s canonical sha.
+    """
+    (cfg / "policy-limits.json").write_text(json.dumps(old_doc))
+    sha = _canon_sha(old_doc)
+    (cfg / "policy-limits.json.stamp.json").write_text(json.dumps({
+        "v": 1, "identity": identity, "kind": kind, "sha": sha,
+        "confirmed_at": confirmed_at, "hipaa_seen": hipaa_seen or [],
+    }))
+    if witness:
+        (cfg / "policy-limits.json.pin-witness.json").write_text(json.dumps({
+            "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
+            "account": _TEST_ACCOUNT_LABEL,
+        }))
+    return sha
 
 
 class TestLiveRemoteControlSessions:
@@ -1473,6 +1538,1069 @@ class TestLiveRemoteControlSessions:
         assert daemon.sweep_policy_once() is False
         assert json.loads(cache.read_text()) == stale, (
             "an unaskable policy cleared the cache, and absent is DENIED")
+
+    def case_a_write_removes_the_stamp_that_would_refuse_it(
+        self, tmp_path, monkeypatch
+    ):
+        """CC 2.1.271 GATES THE BODY ON A SIDECAR STAMP LEFT BY ITS OWN FETCH.
+
+        MEASURED (reading of the shipped bundle): the stamp records the SHA of
+        the body it was written for. When the sha on disk no longer matches
+        (exactly what our unaccompanied write produces — CC's stamp is for the
+        PREVIOUS body), `fe()` reads "unstamped": CC refuses the document
+        outright. So the write must remove the sidecar it just invalidated.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads((cfg / "policy-limits.json").read_text()) == doc
+        assert not stamp.exists(), (
+            "the stale stamp survived the write, so CC reads the fresh body "
+            "as unstamped and refuses it")
+
+    def case_a_skipped_write_still_removes_a_stale_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SKIP-WHEN-EQUAL PATH MUST STILL UNLINK AN UNTRUSTED STAMP.
+
+        An older binary never unlinked either, so a host upgrading onto this
+        fix commonly finds `doc` already equal to whatever that binary last
+        wrote — the equal-body branch fires on the VERY FIRST sweep tick
+        after the upgrade — while a stale stamp from before this fix shipped
+        is still attached. That is exactly the reported defect ("a document
+        left by a restricted org denied Remote Control ... for the better
+        part of a day"), and nothing about content already matching proves
+        the on-disk stamp is CC's own rather than a leftover: only the
+        unlink heals it without waiting for the policy value itself to
+        change. NOT unconditional since T0681 round 2: the stamp seeded here
+        is `{"sha": "stale"}`, which `_trusted_stamp_identity` refuses on
+        shape alone -- a genuinely trusted stamp on this same skip path
+        survives untouched instead (`case_a_matching_stamp_is_left_alone`).
+        Per CC's own gate, unlinking an untrusted one costs nothing: an
+        absent stamp reads "legacy" and serves the body verbatim, exactly
+        like "match" does.
+
+        ALSO THE POSITIVE CONTROL for `case_a_failed_heal_unlink_does_not_
+        log_a_removal`'s negative (round 5 correctness review): that case
+        only proves the log stays SILENT when the unlink fails; nothing
+        proved the log actually FIRES when the same unlink succeeds, so
+        hardwiring `healed = False` (or deleting the `elif healed:` log
+        arm entirely) would have passed both. This asserts the message IS
+        emitted here, where the unlink genuinely removes the stamp.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+        body_path = cfg / "policy-limits.json"
+        body_path.write_text(json.dumps(doc))
+        before = body_path.stat().st_mtime_ns
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False, (
+            "the skip-when-equal path must still report no write happened")
+        # The real discriminator for "no write happened": the file's own
+        # mtime, not its content, since the body written would be identical
+        # to what was already there either way.
+        assert body_path.stat().st_mtime_ns == before, (
+            "the skip path rewrote a body that already matched")
+        assert not stamp.exists(), (
+            "a stale stamp survived the skip path, stranding an upgraded "
+            "host stuck at torn until the server-side policy changes")
+        assert any("removed a stale policy-cache stamp" in m for m in lines), (
+            "the heal actually removed the stamp but the sweep never said so"
+        )
+
+    def case_a_failed_heal_unlink_does_not_log_a_removal(
+        self, tmp_path, monkeypatch
+    ):
+        """THE `healed`-ASSIGNED-BEFORE-THE-UNLINK-SUCCEEDS BUG (T0681 round
+        4 [m], fixed round 5). The skip path's `healed` flag was computed
+        from whether the stamp existed BEFORE the fallback ran, never from
+        whether the unlink that follows it actually removed it -- so a
+        permissions race that makes the unlink itself fail still logged
+        "removed a stale policy-cache stamp", when the stamp was in fact
+        untouched and still on disk. `case_a_skipped_write_still_removes_a_
+        stale_stamp` above is the positive control where the same unlink
+        succeeds and the log is earned; this is its OSError twin."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+        (cfg / "policy-limits.json").write_text(json.dumps(doc))
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        real_unlink = Path.unlink
+
+        def raising_unlink(self, *a, **kw):
+            if self.name.endswith(".stamp.json"):
+                raise OSError("simulated")
+            return real_unlink(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", raising_unlink)
+
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False, (
+            "the skip-when-equal path must still report no write happened")
+        assert stamp.exists(), (
+            "the unlink was made to fail, so the stamp must still be on "
+            "disk -- if this fails the test setup itself is broken"
+        )
+        assert not any("removed a stale policy-cache stamp" in m
+                       for m in lines), (
+            "the sweep logged a removal even though the unlink raised and "
+            "the stamp is still on disk"
+        )
+
+    def case_no_stamp_on_disk_is_the_normal_case(self, tmp_path, monkeypatch):
+        """OLDER HOSTS WRITE NO STAMP AT ALL. The unlink must be a quiet no-op
+        when there is nothing to remove, and the write itself must still
+        succeed."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads((cfg / "policy-limits.json").read_text()) == doc
+        assert not (cfg / "policy-limits.json.stamp.json").exists()
+
+    def case_the_unlink_raising_does_not_break_the_sweep(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SWEEP IS A TIMER CALLBACK and must stay non-fatal. An OSError
+        out of the unlink (e.g. a permissions race) must not propagate and
+        must not change the sweep's own return value."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        real_unlink = Path.unlink
+        called = []
+
+        def raising_unlink(self, *a, **kw):
+            if self.name.endswith(".stamp.json"):
+                called.append(1)
+                raise OSError("simulated")
+            return real_unlink(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", raising_unlink)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads((cfg / "policy-limits.json").read_text()) == doc
+        assert called, (
+            "the raising unlink was never reached, so this proved nothing "
+            "about the OSError being swallowed")
+
+    def case_a_failed_write_still_removes_the_stale_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        """AN UNTRUSTED STAMP IS UNLINKED EVEN WHEN THE BODY WRITE FAILS.
+
+        A write that keeps failing (a permissions race, a full disk) leaves
+        the OLD body on disk. Unlinking is exactly as harmless there as on
+        every other path — old body, no stamp, reads "legacy" — and this is
+        the one occasion the heal is needed most: skipping it would leave an
+        unstamped body for as long as the write keeps failing. NOT true of
+        every stamp: the one seeded here is `{"sha": "stale"}`, which
+        `_trusted_stamp_identity` refuses on shape alone --
+        `case_a_failed_write_leaves_a_trusted_prior_stamp_untouched` is the
+        control where a genuinely trusted stamp survives this same failure
+        untouched.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        different = {"restrictions": {"allow_remote_control": {"allowed": False}}}
+        (cfg / "policy-limits.json").write_text(json.dumps(different))
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+
+        doc = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        real_write_text = Path.write_text
+
+        def failing_write_text(self, *a, **kw):
+            if self.name.endswith(".json.tmp"):
+                raise OSError("simulated")
+            return real_write_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False, (
+            "a failed write must still report False")
+        assert json.loads((cfg / "policy-limits.json").read_text()) == different, (
+            "the body must be untouched when the write failed"
+        )
+        assert not stamp.exists(), (
+            "a stale stamp survived a failed write, so a body write that "
+            "keeps failing leaves the OLD body permanently torn"
+        )
+
+    def case_a_trusted_prior_stamp_carries_its_identity_onto_the_new_body(
+        self, tmp_path, monkeypatch
+    ):
+        """THE PIN OWES A STAMP-AWARE WRITE, NOT JUST AN UNLINK (T0681).
+
+        2.1.271 gates the body on `policy-limits.json.stamp.json`:
+        `stamp===null||stamp.sha!==bodySha` -> "unstamped" (refused);
+        `stamp.identity!==identity` -> "foreign" (refused); else "match"
+        (served). `identity` comes from the LOCAL credential, never from the
+        pin's bearer -- so a pin-target change with the active account
+        unchanged still reads "match" against the stale pinned body, and
+        the plain unlink (this file's stopgap since T0656) only ever buys
+        "legacy". Since 2.1.273's `restampConfirmedCache` stopped silently
+        restamping a body it did not mint, "legacy" does not self-heal into
+        "match" either -- the write has to mint the SAME stamp CC's own
+        `bzn`/`Poe`/`lK` would.
+
+        THE IDENTITY ITSELF IS REUSED, NOT GUESSED (T0681 correctness
+        review): a prior draft tried to re-derive `lve()`'s precedence from
+        outside CC's own process and that proved unreliable, so
+        `_trusted_stamp_identity` instead carries forward whatever identity
+        a PRIOR stamp -- one that already vouched for the body that was on
+        disk before this sweep touched anything -- was written with. Here
+        that is the seeded stamp `_seed_trusted_stamp` leaves for the OLD
+        body; the fresh fetch below is a DIFFERENT document (the T0681
+        scenario: a pin-target change, active account unchanged), so the
+        write must carry the SAME identity onto the NEW body's own sha.
+
+        THE ACCOUNT ALSO HAS TO CHECK OUT (T0681 round 4): the fixed
+        `_TEST_TOKEN`/`_TEST_ACCOUNT_LABEL` witness `_seed_trusted_stamp`
+        wrote alongside the seeded stamp must still be what
+        `_active_oauth_token`/`_active_pin_account_label` answer NOW, or
+        this falls back to the plain unlink instead -- see
+        `case_a_changed_account_label_does_not_inherit` and its siblings for
+        the negative space.
+
+        MEASURED (reading of the shipped 2.1.271 binary, not guessed):
+        `Poe(e){let n=lK(e),s=S(n);return`sha256:${sha256(s).hex}`}` where
+        `lK` sorts every object's keys recursively (arrays keep their
+        order) and `S` is a compact `JSON.stringify`.
+
+        This test reimplements CC's own three-way verdict (`fe`)
+        independently of whatever the production code computes internally,
+        against the stamp this write actually left on disk, and asserts it
+        reads "match" -- not merely that the production code is
+        self-consistent with itself.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        # `kind="key"`, NOT the default "org" every other case here uses:
+        # `_seed_trusted_stamp`'s own default is what every case but this
+        # one wants, so leaving it here would make `stamp["kind"] == "org"`
+        # true whether the mint actually carries `kind` forward or an
+        # implementation just hardcodes it (T0681 round 3 review).
+        _seed_trusted_stamp(cfg, old_doc, kind="key", confirmed_at=1)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {
+            "restrictions": {"allow_remote_control": {"allowed": True}},
+            "compliance_taints": [],
+        }
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        # THE INDEPENDENT REFERENCE for `confirmed_at`, read BEFORE the
+        # sweep runs: the seed's own `confirmed_at=1` would also satisfy a
+        # `>= 0` check, so an implementation that just copied the prior
+        # stamp's `confirmed_at` instead of minting `int(time.time()*1000)`
+        # would pass a check against that literal (T0681 round 3 review).
+        before_ms = int(time.time() * 1000)
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        stamp = json.loads(stamp_path.read_text())
+
+        # THE FULL SHAPE, not only sha/identity: read from the shipped
+        # 2.1.271 binary's own zod schema for `.stamp.json` --
+        # `{v:C(1),identity:/^[0-9a-f]{64}$/,kind:["org","key","wif","token"],
+        # sha:string(1..128),confirmed_at:nonnegative int,
+        # hipaa_seen:[/^[0-9a-f]{64}$/][0..8]}`. If CC validates the record
+        # BEFORE reaching the three-way verdict, a wrong shape reads
+        # "unstamped" regardless of a correct sha/identity.
+        assert stamp["v"] == 1
+        assert re.fullmatch(r"[0-9a-f]{64}", stamp["identity"])
+        assert stamp["kind"] == "key", (
+            "the seeded stamp's own kind was not carried onto the mint")
+        assert 1 <= len(stamp["sha"]) <= 128
+        assert isinstance(stamp["confirmed_at"], int)
+        assert stamp["confirmed_at"] >= before_ms, (
+            "confirmed_at looks copied from the seeded stamp rather than "
+            "freshly minted")
+        assert isinstance(stamp["hipaa_seen"], list) and len(stamp["hipaa_seen"]) <= 8
+
+        assert stamp["identity"] == _TEST_IDENTITY, (
+            "the identity a prior, trusted write proved correct was not "
+            "carried onto the new body"
+        )
+        witness = json.loads(
+            (cfg / "policy-limits.json.pin-witness.json").read_text())
+        assert witness == {
+            "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
+            "account": _TEST_ACCOUNT_LABEL,
+        }, "the mint did not record the witness the next sweep checks against"
+        body_sha = _canon_sha(fresh_doc)
+
+        def fe(stamp, identity, body_sha):
+            """CC's own verdict function, reimplemented from the binary."""
+            if stamp is None or stamp.get("sha") != body_sha:
+                return "unstamped"
+            if stamp.get("identity") != identity:
+                return "foreign"
+            return "match"
+
+        verdict = fe(stamp, _TEST_IDENTITY, body_sha)
+        assert verdict == "match", (
+            f"CC's own gate reads this stamp as {verdict!r}, not a match "
+            "-- exactly the refusal T0681 is about"
+        )
+
+    def case_a_matching_stamp_is_left_alone(self, tmp_path, monkeypatch):
+        """NO WRITE, NO CHURN -- same discipline as the body write above."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, doc)
+        body_path = cfg / "policy-limits.json"
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        body_before = body_path.stat().st_mtime_ns
+        stamp_before = stamp_path.stat().st_mtime_ns
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False
+        assert body_path.stat().st_mtime_ns == body_before
+        assert stamp_path.stat().st_mtime_ns == stamp_before, (
+            "a stamp that already named this body's sha and a trusted "
+            "identity was rewritten anyway"
+        )
+
+    def case_a_hipaa_taint_adds_this_identity_to_hipaa_seen(
+        self, tmp_path, monkeypatch
+    ):
+        """MIRRORS CC's OWN `bzn`: drop any earlier record of this identity,
+        re-add it only when the fresh body carries a "hipaa" taint. Fail
+        closed today, load-bearing the moment a pinned account's document
+        carries one (T0681's own framing). ALSO PROVES OTHER IDENTITIES'
+        history survives the filter: `bzn` drops only entries EQUAL to the
+        current identity, never the whole list."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        other = "f" * 64
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, hipaa_seen=[other])
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {}, "compliance_taints": ["hipaa"]}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp["hipaa_seen"] == [other, _TEST_IDENTITY]
+
+    def case_hipaa_seen_dedups_this_identity_instead_of_repeating_it(
+        self, tmp_path, monkeypatch
+    ):
+        """THE DEDUP ITSELF, not just the filter's effect on OTHER entries
+        (T0681 round 3 review: no case seeded `_TEST_IDENTITY` already
+        present, so `seen = list(prev_seen)` -- no filter at all -- passed
+        both the taint case above and its control). Seeding this identity's
+        OWN hash already in `hipaa_seen` and re-tainting the fresh body must
+        leave it appearing ONCE, not twice."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, hipaa_seen=[_TEST_IDENTITY])
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {}, "compliance_taints": ["hipaa"]}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp["hipaa_seen"] == [_TEST_IDENTITY], (
+            "the identity's own earlier record was not dropped before "
+            "being re-added, so it repeats instead of moving to the end")
+
+    def case_hipaa_seen_caps_at_eight_dropping_the_oldest(
+        self, tmp_path, monkeypatch
+    ):
+        """THE CAP (T0681 round 3 review named this untested too): CC's `ce`
+        keeps only the last 8. Seed 8 OTHER identities already at the cap,
+        taint the fresh body, and the 9th (this identity) must push out the
+        OLDEST (index 0), not truncate from the end or grow past 8."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        others = [f"{i:064x}" for i in range(8)]
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, hipaa_seen=list(others))
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {}, "compliance_taints": ["hipaa"]}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp["hipaa_seen"] == others[1:] + [_TEST_IDENTITY], (
+            "the cap did not drop the oldest entry when the 9th was added")
+
+    def case_a_malformed_hipaa_seen_entry_falls_back_to_the_unlink(
+        self, tmp_path, monkeypatch
+    ):
+        """THE PER-ELEMENT hipaa_seen REGEX HAS NO NEGATIVE CASE ABOVE
+        (T0681 round 5): every case above seeds `hipaa_seen` through
+        `_seed_trusted_stamp`, which only ever writes well-formed 64-hex
+        entries -- nothing exercises `re.fullmatch(...) for h in
+        hipaa_seen` actually REJECTING a malformed one. A single non-hex
+        entry must sink the whole stamp exactly like a bad `kind` or a
+        missing `v` already does: `_trusted_stamp_identity` returns None,
+        and the sweep falls back to the plain unlink instead of trusting a
+        record CC's own schema would never have produced.
+
+        SEEDED THROUGH `_seed_trusted_stamp`, WITH ITS MATCHING WITNESS
+        (round 5 correctness review): a hand-written stamp with no witness
+        of ours reaches the SAME plain-unlink outcome through the witness
+        gate's own mismatch fallback regardless of what `_trusted_stamp_
+        identity` decides, so deleting the hipaa_seen regex entirely left
+        this test green -- it was never exercising the regex at all. With
+        a matching witness AND matching active token/label, a stamp the
+        regex wrongly accepted would reach the mint branch and actually
+        write a new stamp, which is what the assertion below must be able
+        to catch.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, hipaa_seen=["not-a-64-hex-hash"])
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
+            "a hipaa_seen entry that is not a 64-hex hash still let the "
+            "stamp's identity through as trusted"
+        )
+
+    def case_a_failed_mint_falls_through_to_the_unlink(
+        self, tmp_path, monkeypatch
+    ):
+        """THE MINT'S OWN OSError BRANCH (T0681 round 3 review named this
+        untested too, "one of the longest justifying comments in the
+        range"): a trusted, witness-matching identity that fails to WRITE
+        must not leave the old, now-stale stamp attached to the new body --
+        that reads "unstamped" and refuses, exactly the direction every
+        other OSError on this path already avoids."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        real_write_text = Path.write_text
+
+        def failing_write_text(self, *a, **kw):
+            if ".stamp.json." in self.name and self.name.endswith(".tmp"):
+                raise OSError("simulated")
+            return real_write_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads(
+            (cfg / "policy-limits.json").read_text()) == fresh_doc, (
+            "the body write itself must still land")
+        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
+            "a mint that failed to write left the old stamp attached to "
+            "the new body instead of falling through to the unlink")
+
+    def case_no_hipaa_taint_leaves_hipaa_seen_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """THE CONTROL for the case above: an untainted body must not
+        fabricate a compliance-acknowledgement record."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_web_fetch": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp["hipaa_seen"] == []
+
+    def case_no_prior_stamp_falls_back_to_the_unlink(
+        self, tmp_path, monkeypatch
+    ):
+        """THE BOUNDARY THIS FIX DRAWS. Nothing on disk yet vouches for
+        anything (the very first sweep on a host, before CC has ever
+        written this sidecar itself) -- a WRONG identity would only buy
+        "foreign", which refuses exactly like "unstamped" does, so this
+        keeps the T0656 unlink as the honest fallback rather than guess."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not stamp.exists()
+
+    def case_a_cc_only_stamp_has_no_witness_and_falls_back(
+        self, tmp_path, monkeypatch
+    ):
+        """THE OTHER BOUNDARY THIS ROUND DRAWS, NARROWER THAN THE ONE ABOVE.
+        A stamp CC itself wrote passes `_trusted_stamp_identity` (sha and
+        shape both check out) but carries no witness of OURS -- we never
+        minted it, so there is nothing to compare the account against. The
+        identity becomes ours to carry forward only once WE have minted it
+        (and recorded its witness) at least once; the FIRST sweep to see any
+        given trusted stamp always falls back, and self-heals in one cycle
+        exactly like an untrusted one does."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, witness=False)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
+            "a stamp with no witness of ours still had its identity "
+            "inherited"
+        )
+
+    def case_an_unchanged_witness_inherits_the_identity(
+        self, tmp_path, monkeypatch
+    ):
+        """T0681 ROUND 4 DECISION, ITEM 3, THE POSITIVE CASE: the account
+        witness recorded beside the last stamp WE minted still matches what
+        `_active_oauth_token`/`_active_pin_account_label` answer now, so the
+        inherited identity is used exactly as it was before this round --
+        AND this sweep records its own witness in turn, which
+        `case_a_failed_mint_falls_through_to_the_unlink` and friends never
+        would if this round's bookkeeping did not exist yet."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)  # witness=True, matches the pair below
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp["identity"] == _TEST_IDENTITY, (
+            "an unchanged witness must still inherit the identity")
+        witness = json.loads(
+            (cfg / "policy-limits.json.pin-witness.json").read_text())
+        assert witness == {
+            "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
+            "account": _TEST_ACCOUNT_LABEL,
+        }, "the mint did not (re)record its own witness for the next sweep"
+
+    def case_a_changed_account_label_does_not_inherit(
+        self, tmp_path, monkeypatch
+    ):
+        """T0681 ROUND 4 DECISION, ITEM 2: BOTH halves of the witness are
+        required, because a `cswap switch` moves the account label even on
+        the token-collision edge a token-only witness would miss. The token
+        half is unchanged from the seeded witness; only the account label
+        moved -- that alone must refuse the inheritance."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: "a-different-account")
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
+            "the account label changed since the witness was recorded, but "
+            "the identity was inherited anyway"
+        )
+
+    def case_a_changed_token_hash_does_not_inherit(
+        self, tmp_path, monkeypatch
+    ):
+        """THE OTHER HALF of the same rule: the account label is unchanged,
+        only the token differs from what the witness recorded."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: "a-different-token")
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
+            "the token changed since the witness was recorded, but the "
+            "identity was inherited anyway"
+        )
+
+    def case_an_unreadable_witness_does_not_inherit(
+        self, tmp_path, monkeypatch
+    ):
+        """T0681 ROUND 4 DECISION, ITEM 3's PARENTHETICAL: a host running in
+        a mode with no oauth token (an API key, WIF, or apiKeyHelper setup)
+        has nothing for `_sweep_witness` to hash. That is not a claim the
+        account changed -- it is simply nothing to check -- and the total
+        rule treats it exactly like a mismatch: never inherit."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token", lambda: None)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
+            "a host with no oauth token to witness still inherited the "
+            "identity"
+        )
+
+    def case_the_witness_is_read_at_sweep_time_not_daemon_start(
+        self, tmp_path, monkeypatch
+    ):
+        """T0681 ROUND 4 DECISION, ITEM 4: a value captured once (at daemon
+        start, or anywhere else short of the sweep call itself) is the same
+        fossil the SECOND correctness pass rejected for the token. The
+        account changes BETWEEN two sweeps of the SAME daemon object here --
+        simulating a `cswap switch` that happens after everything was set
+        up, not at construction time -- and the SECOND sweep must see the
+        new value. A witness read once and cached anywhere would still see
+        the first sweep's account and wrongly inherit again."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc_v1 = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, doc_v1)
+
+        doc_v2 = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                  "compliance_taints": []}
+        doc_v3 = {"restrictions": {"allow_web_fetch": {"allowed": True}},
+                  "compliance_taints": []}
+        docs = [doc_v2]
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: docs[0])
+
+        label = {"value": _TEST_ACCOUNT_LABEL}
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: label["value"])
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+
+        # SWEEP 1: the account is still the one the seeded witness names --
+        # inherits, and records ITS OWN witness for doc_v2's sha.
+        assert daemon.sweep_policy_once() is True
+        stamp1 = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp1["identity"] == _TEST_IDENTITY
+
+        # BETWEEN THE TWO SWEEPS, the account changes and the pin target
+        # changes again -- both read fresh by the NEXT call, not by this one.
+        label["value"] = "a-different-account"
+        docs[0] = doc_v3
+
+        # SWEEP 2: if the label were read once and cached anywhere, this
+        # would still see `_TEST_ACCOUNT_LABEL` and wrongly inherit.
+        assert daemon.sweep_policy_once() is True
+        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
+            "the account changed between the two sweeps, but the second "
+            "sweep still inherited the identity -- the witness was read "
+            "once, not fresh"
+        )
+
+    def case_a_reachable_bootstrap_records_the_witness_then_inherits(
+        self, tmp_path, monkeypatch
+    ):
+        """T0681 ROUND 5, THE STATE PRODUCTION ACTUALLY REACHES -- not a
+        witness hand-seeded by the test harness. Every mint-path case above
+        drives the gate through `_seed_trusted_stamp`'s default
+        `witness=True`, which writes `policy-limits.json.pin-witness.json`
+        directly -- a state no real host is ever in on the FIRST sweep to
+        see any given trusted stamp: nothing on a fresh host has ever
+        minted that file. `case_a_cc_only_stamp_has_no_witness_and_falls_
+        back` is the one case that starts without it, but it stops at the
+        first fallback; this one carries a SECOND sweep forward, because
+        that is where round 4's actual defect lives -- `witness_path` was
+        written only inside the mint's own success branch, and the first
+        sweep's mismatch (`recorded=None != current`) is exactly what kept
+        that branch from ever running. So on a real host `recorded` reads
+        back None FOREVER, every sweep mismatches, and the mint can never
+        run at all: the fix this round makes reduces to T0656's plain
+        unlink otherwise.
+
+        SWEEP 1: a CC-only stamp, no witness of ours. Falls back to the
+        unlink (as `case_a_cc_only_stamp_has_no_witness_and_falls_back`
+        already covers) AND must record the witness even on this branch,
+        or nothing below it can ever change.
+
+        SWEEP 1.5, THE TICK PRODUCTION ACTUALLY TAKES NEXT, before CC has
+        any real chance to re-stamp inside one sweep interval (round 5
+        correctness review): the stamp is still absent, so this beat's
+        `trusted is None` and it has no witness of its own to read either
+        -- and it must not delete the one sweep 1 just recorded, or the
+        bootstrap is wiped again on the very next tick and the "costs one
+        cycle" bound in the decision is not real.
+
+        BETWEEN SWEEPS 1.5 AND 2: CC re-stamps the body now on disk -- the
+        reachable way a trusted stamp exists again ("resumes as soon as CC
+        writes its own stamp again"), not a second hand-seed of OUR
+        witness (`witness=False`: this must not touch the witness sweep 1
+        recorded and sweep 1.5 must have left alone).
+
+        SWEEP 2: the account is unchanged, so the witness sweep 1 recorded
+        matches what `_sweep_witness()` reads now -- the mint runs and the
+        identity is inherited.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc_v1 = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, doc_v1, witness=False)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        doc_v2 = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                  "compliance_taints": []}
+        doc_v3 = {"restrictions": {"allow_web_fetch": {"allowed": True}},
+                  "compliance_taints": []}
+        docs = [doc_v2]
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: docs[0])
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+
+        # SWEEP 1: no witness yet -- falls back to the unlink, and must
+        # record one or sweep 2 can never inherit.
+        assert daemon.sweep_policy_once() is True
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        assert not stamp_path.exists(), (
+            "a stamp with no witness of ours still had its identity "
+            "inherited on the very first sweep to see it"
+        )
+        witness_path = cfg / "policy-limits.json.pin-witness.json"
+        assert witness_path.exists(), (
+            "the fallback branch never recorded a witness -- no sweep "
+            "after the first can ever inherit, which is the T0681 round 4 "
+            "[C]: witness_path was written only inside the mint's own "
+            "success branch, which a real host's first sweep never reaches"
+        )
+        assert json.loads(witness_path.read_text()) == {
+            "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
+            "account": _TEST_ACCOUNT_LABEL,
+        }, "the recorded witness does not match the account active during sweep 1"
+
+        # SWEEP 1.5: the tick production actually takes next, before CC has
+        # re-stamped anything. The stamp is still absent (`trusted is
+        # None`), so this sweep reads no witness of its own -- it must
+        # leave the one sweep 1 recorded untouched.
+        assert daemon.sweep_policy_once() is False
+        assert witness_path.exists(), (
+            "a sweep with nothing new to trust deleted the witness the "
+            "FIRST sweep just recorded -- the bootstrap is wiped before CC "
+            "gets any real chance to re-stamp, so the decision's one-cycle "
+            "bound is not real. This is the T0681 round 5 correctness "
+            "review [C]: the `trusted is None` branch's fallback used to "
+            "unlink witness_path unconditionally"
+        )
+        assert json.loads(witness_path.read_text()) == {
+            "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
+            "account": _TEST_ACCOUNT_LABEL,
+        }, "the witness survived but was altered by a sweep that read none of its own"
+
+        # BETWEEN SWEEPS 1.5 AND 2: CC re-stamps the body now on disk -- the
+        # reachable way a trusted stamp exists again. `witness=False`:
+        # must not touch the witness sweep 1 recorded and sweep 1.5 left
+        # alone.
+        _seed_trusted_stamp(cfg, doc_v2, witness=False)
+        docs[0] = doc_v3
+
+        # SWEEP 2: the account is unchanged -- the recorded witness
+        # matches, so this inherits the identity onto doc_v3.
+        assert daemon.sweep_policy_once() is True
+        stamp = json.loads(stamp_path.read_text())
+        assert stamp["identity"] == _TEST_IDENTITY, (
+            "the second sweep did not inherit the identity even though "
+            "the witness sweep 1 recorded still matches the account now "
+            "active -- the bootstrap this round adds must cost exactly "
+            "one cycle, not every cycle forever"
+        )
+
+    def case_canonical_body_sha_matches_a_known_value(self):
+        """T0681 ROUND 3 REVIEW: `_canon_sha` above is a character-for-
+        character copy of `_canonical_body_sha`, not an independent check on
+        it -- the one decision that separates "match" from "unstamped" was
+        being checked against itself. This literal was computed once,
+        offline, for this exact fixed document (no numeric fields, where
+        `_canonical_body_sha`'s own docstring says `json.dumps` and
+        `JSON.stringify` agree) and hardcoded here, so a regression in
+        `_canonical_body_sha` cannot also regress this assertion."""
+        from cswap_pin.proxy import _canonical_body_sha
+
+        doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+               "compliance_taints": []}
+        assert _canonical_body_sha(doc) == (
+            "sha256:352eece8f3fa5a3da97948c5adeac54950a2bb59979ac817c41"
+            "77f285d712bff"
+        )
+
+    def case_a_failed_write_leaves_a_trusted_prior_stamp_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        """A FAILED WRITE MUST NOT DESTROY A STAMP THAT IS STILL RIGHT.
+
+        The fresh fetch differs from the OLD body, but the write of it
+        fails -- the OLD body is still what is really on disk, and the
+        seeded stamp already, correctly, vouches for exactly that body.
+        Unlinking it (T0656's old unconditional behaviour) would trade a
+        genuine "match" for "legacy" over nothing: no attacker, no drift,
+        just a filesystem fault the write already reported."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {"allow_remote_control": {"allowed": False}}}
+        _seed_trusted_stamp(cfg, old_doc)
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        stamp_before = stamp_path.read_text()
+
+        fresh_doc = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        real_write_text = Path.write_text
+
+        def failing_write_text(self, *a, **kw):
+            if self.name == "policy-limits.json.tmp":
+                raise OSError("simulated")
+            return real_write_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False
+        assert json.loads(
+            (cfg / "policy-limits.json").read_text()) == old_doc, (
+            "the body must be untouched when the write failed"
+        )
+        assert stamp_path.read_text() == stamp_before, (
+            "a stamp that still correctly vouched for the body actually on "
+            "disk was touched by a write that never landed"
+        )
 
     def case_a_live_sessions_archived_bridge_is_revived(self, monkeypatch):
         """AN ARCHIVED BRIDGE UNDER A LIVE SESSION IS A BROKEN RECONNECT.
@@ -20960,7 +22088,7 @@ class TestAHandoverIsNotAFailure:
         monkeypatch.setattr(pin_proxy, "_carry_history_pointers", lambda _cd: None)
         monkeypatch.setattr(pin_proxy, "_ambient_chain",
                             lambda certdir=None: (None, None))
-        monkeypatch.setattr(pin_proxy, "_probe_next_hop", lambda _a: None)
+        monkeypatch.setattr(pin_proxy, "_probe_next_hop", lambda *_a, **_k: None)
         monkeypatch.setattr(pin_proxy, "write_upstream_hint",
                             lambda *_a, **_k: None)
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *_a: "FP")

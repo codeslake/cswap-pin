@@ -129,7 +129,60 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     return parse_upstream_proxy(_read_upstream(certdir, "proxy"))
 
 
-def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
+def _mark_nohealth(certdir: Path, address: str) -> None:
+    """Record that ``address`` answered but is not a /health server.
+
+    MEASURED (sandbox privoxy 4.2.0, the owner's own config): no request form
+    is both quiet on privoxy's own log and answered by the local cache proxy
+    (which matches origin-form ``GET /health`` only) — origin-form,
+    absolute-form and ``OPTIONS *`` each trip privoxy's "isn't configured to
+    accept intercepted requests" error. A hop that answers with a 4xx status
+    is exactly that: something is there, but it is not a /health server, and
+    asking again on every launch (`ensure_proxy`) and every daemon
+    code-watch tick (`learn_next_hop`) repeats the same error for nothing.
+    Scoped to 4xx (see the caller) so a genuine /health server's bad moment
+    is not recorded here as permanent.
+
+    A merge-write, not ``write_upstream_hint``: that function rewrites
+    ``proxy``/``ca``/``next`` for a launch's own reasons and has no opinion on
+    this key, so it is written here directly, tmp+replace, preserving whatever
+    else is on disk.
+    """
+    # ponytail: the record never expires and nothing clears it but a manual
+    # edit of upstream.json, so an address that answers 4xx once stays
+    # unaskable even after whatever held that port is fixed or replaced.
+    # Narrowing to 4xx (see the caller) already excludes a /health server's
+    # own transient 5xx; a full fix (a TTL, or re-probing after N sweeps)
+    # is not something the task asked for and is not built here.
+    path = Path(certdir) / _UPSTREAM_FILE
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw["nohealth"] = address
+    # PID-SUFFIXED, matching this file's own convention elsewhere (e.g.
+    # `write_upstream_hint`'s neighbouring `.tmp`, unguarded, is a
+    # pre-existing gap this call is not the one to fix) — `_mark_nohealth`
+    # is a NEW writer of THIS file, reachable from `learn_next_hop`'s daemon
+    # timer at the same time a fresh `ensure_proxy` launch calls
+    # `write_upstream_hint`; two processes racing the same un-suffixed tmp
+    # name can have one's `replace` publish the other's half-written
+    # content, corrupting the whole record (proxy/ca/next all read back
+    # None — a direct dial into the corporate inspector).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(raw))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _probe_next_hop(
+    value: str | None, timeout: float = 1.0, *,
+    own_proxy: str | None = None, certdir: Path | None = None,
+) -> str | None:
     """The proxy the recorded hop is ITSELF chaining to, asked of that hop.
 
     A local cache proxy reports its own upstream on ``/health`` while it is
@@ -142,17 +195,59 @@ def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
     Loopback only. The next hop matters for a chain of local proxies; asking a
     remote corporate proxy for a /health it does not serve would spend the
     timeout on every launch.
+
+    ``own_proxy`` is the proxy this launch's own environment already named,
+    unrelated to any probing. A forward proxy answers a path-only request
+    line (what ``/health`` is, on the wire) with an error by definition — it
+    is not the origin-form request it was told to relay — and that error
+    lands in a log that is not ours to write into. Asking is only useful when
+    something wired this launch over the hop, so a hop that turns out to BE
+    the launch's own proxy is never asked at all: nothing was wired over it,
+    so there is no inner/outer distinction to learn, only the error to cause.
+
+    ``certdir``, when given, gates against ``upstream.json``'s ``"nohealth"``
+    record: a hop already known to answer a 4xx (this isn't a /health server
+    at all) is not asked again — no socket, no error, no repeat log line.
+    Scoped to 4xx, not every non-200: `nohealth` has no expiry, and a genuine
+    /health server having a bad moment (5xx, a redirect) is still worth
+    asking once it recovers, unlike privoxy's fixed "not configured to
+    accept intercepted requests" 400. A hop that answers 200 clears nothing
+    here (this function does not write a 200 result); a hop that never
+    answers at all (a dead port, a timeout, an unreadable body) is not
+    recorded either, because a cache proxy that is merely down must still be
+    asked once it comes back.
     """
     import http.client
 
     hop = parse_upstream_proxy(value)
-    if hop is None or hop.host not in _LOOPBACK or hop.tls:
+    if hop is None:
+        return None
+    own = parse_upstream_proxy(own_proxy)
+    if own is not None and own.address == hop.address:
+        return None
+    if hop.host not in _LOOPBACK or hop.tls:
+        return None
+    address = f"{hop.host}:{hop.port}"
+    if certdir is not None and _read_upstream(certdir, "nohealth") == address:
         return None
     try:
         conn = http.client.HTTPConnection(hop.host, hop.port, timeout=timeout)
         try:
             conn.request("GET", "/health")
-            body = json.loads(conn.getresponse().read())
+            resp = conn.getresponse()
+            if resp.status != 200:
+                # MEASURED: privoxy answers every form with 400, a client
+                # error — "this isn't what I accept", not "I am struggling
+                # right now". Recording is scoped to 4xx for that reason: a
+                # genuine /health server under load can answer 5xx or
+                # redirect, and that is a hop worth asking again once it
+                # recovers, not a hop that permanently isn't a /health
+                # server. `nohealth` has no expiry, so widening this to
+                # every non-200 would poison a hop for good on one bad tick.
+                if certdir is not None and 400 <= resp.status < 500:
+                    _mark_nohealth(certdir, address)
+                return None
+            body = json.loads(resp.read())
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 — an absent probe is "no next hop"
@@ -228,10 +323,16 @@ def write_upstream_hint(
         # so an authenticated or TLS corporate proxy survived exactly until the
         # next re-pin, then every pinned request 407'd.
         keep_proxy = _read_upstream(certdir, "proxy") or ""
+    # This function has no opinion on which hops answered /health — that is
+    # `_probe_next_hop`/`_mark_nohealth`'s record — so a re-stamp for
+    # proxy/ca/next reasons must carry it through unchanged rather than
+    # dropping it back to "".
+    keep_nohealth = _read_upstream(certdir, "nohealth") or ""
     try:
-        tmp.write_text(json.dumps(
-            {"proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next}
-        ))
+        tmp.write_text(json.dumps({
+            "proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next,
+            "nohealth": keep_nohealth,
+        }))
         tmp.replace(path)
     except OSError:
         pass
@@ -2311,6 +2412,27 @@ def _mode_of(path: Path, default: int) -> int:
         return default
 
 
+def _shell_proxy(env: dict[str, str] | None = None) -> str | None:
+    """The proxy this process's own environment already names, read fresh.
+
+    Never cached across calls: a probe's job is to learn what is wired over
+    a hop right now, and a value remembered from an earlier read can name a
+    different program a minute later.
+
+    Deliberately NOT `_wired_over_proxy()` or `_recorded_upstream()`: either
+    of those can equally be a corporate egress proxy (never worth probing)
+    or a local cache proxy discovered exactly BY a previous probe (the
+    thing `_ambient_proxy`'s own preference logic substitutes in ahead of
+    this value, when one is loopback, distinct, and still serving) — the
+    same address means opposite things in those two cases, and telling them
+    apart needs the hop's identity or a remembered probe result, both
+    forbidden. The shell's own raw export carries no such ambiguity: it is
+    what THIS launch was given, unmediated by anything the pin has learned.
+    """
+    src = os.environ if env is None else env
+    return src.get("HTTPS_PROXY") or src.get("https_proxy")
+
+
 def _ambient_chain(
     env: dict[str, str] | None = None, certdir: Path | None = None
 ) -> "tuple[str | None, str | None]":
@@ -2324,7 +2446,7 @@ def _ambient_chain(
     inner proxy to the outer one.
     """
     src = os.environ if env is None else env
-    shell_value = src.get("HTTPS_PROXY") or src.get("https_proxy")
+    shell_value = _shell_proxy(env)
     hop = _ambient_proxy(env, certdir)
     shell_parsed = parse_upstream_proxy(shell_value)
     hop_parsed = parse_upstream_proxy(hop)
@@ -6038,7 +6160,11 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         certdir,
         ambient,
         os.environ.get("NODE_EXTRA_CA_CERTS"),
-        next_hop=_probe_next_hop(ambient or _read_upstream(certdir, "proxy"))
+        next_hop=_probe_next_hop(
+            ambient or _read_upstream(certdir, "proxy"),
+            own_proxy=_shell_proxy(),
+            certdir=certdir,
+        )
         or observed_next,
     )
     fp = daemon_fingerprint(account_num, email)
@@ -11243,6 +11369,53 @@ def _active_oauth_token() -> "str | None":
         return None
 
 
+def _active_pin_account_label() -> "str | None":
+    """The account number cswap currently has active -- same source as
+    `_active_oauth_token`, read fresh every call, never cached.
+
+    Paired with the token hash in `_sweep_witness`: a `cswap switch` is
+    exactly what moves this, and it catches the (degenerate, but not
+    impossible in a test double) case where two different accounts would
+    otherwise hash to the same token.
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        num = sw.current_account_number()
+        return str(num) if num is not None else None
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return None
+
+
+def _sweep_witness() -> "dict | None":
+    """A fingerprint of the account active on THIS host, right now.
+
+    T0681 ROUND 4. `_trusted_stamp_identity` proves a stamp is one CC
+    itself could have minted for the body that was on disk -- but CC's own
+    `identity` is a function of the LOCAL credential, not of either file,
+    so a `cswap switch` between two sweeps moves it without touching a
+    single byte either file's sha covers. This is the second anchor: two
+    sweeps whose witness agrees have had the same local account the whole
+    time, so an identity a stamp already proved correct is still correct.
+
+    Both halves READ FRESH, at sweep time -- never a value captured once
+    at daemon start, which is the same fossil `_active_oauth_token`'s own
+    docstring already rejects for the token itself.
+
+    A WITNESS OF CHANGE, not a claim about which credential CC used: None
+    on a host with no oauth token to hash (API key, WIF, apiKeyHelper),
+    and the caller treats that exactly like a mismatch -- never inherit,
+    fall back to the unconditional unlink instead of guessing.
+    """
+    import hashlib
+
+    token = _active_oauth_token()
+    label = _active_pin_account_label()
+    if token is None or label is None:
+        return None
+    return {"token_sha": hashlib.sha256(token.encode()).hexdigest(),
+            "account": label}
+
+
 def _verifying_context() -> "ssl.SSLContext":
     """A context that trusts the pin's own MITM certificate.
 
@@ -11398,6 +11571,99 @@ def pin_profile_for(token: "str | None") -> "dict | None":
         return profile_identity_from(doc)
     except Exception:  # noqa: BLE001 — never take the daemon down
         return None
+
+
+def _canonical_body_sha(doc: dict) -> str:
+    """The `sha` CC's own gate computes for a `policy-limits.json` body.
+
+    Read from the shipped 2.1.271 binary: `Poe(e){let n=lK(e),s=S(n);
+    return`sha256:${sha256(s).hex}`}`, where `lK` sorts every object's keys
+    recursively (arrays keep their order) and `S` is a compact
+    `JSON.stringify` -- not this file's own on-disk formatting, which is
+    why this re-encodes `doc` rather than hashing whatever bytes we wrote.
+
+    EQUIVALENT for the value types a policy document actually carries
+    (booleans, strings, nested objects, string arrays, null): key order is
+    ASCII so code-point and UTF-16 sort agree, and short/control-character
+    escaping matches. NOT equivalent for numbers -- `json.dumps` and
+    `JSON.stringify` diverge on floats (`1.0` vs `1`), large exponents and
+    integers past 2**53 -- so a server-added numeric field would make every
+    mint read "unstamped" here while CC's own write would not. No such
+    field exists today; this is not handled.
+    """
+    import hashlib
+    canon = json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+#: The `kind` values CC's own `.stamp.json` schema admits (shipped 2.1.271
+#: binary: `kind:G(["org","key","wif","token"])`).
+_STAMP_KINDS = ("org", "key", "wif", "token")
+
+
+def _trusted_stamp_identity(existing, expected_sha):
+    """`(identity, kind, hipaa_seen)` from an EXISTING stamp CC itself can be
+    trusted to have written, or None.
+
+    GROUND TRUTH, not a guess. An earlier draft of this fix
+    (`_local_stamp_identity`) tried to re-derive `lve()`'s precedence -- an
+    API key, a WIF profile, an env/fd-overridden token, then the ordinary
+    oauth store -- from OUTSIDE CC's own process, using `_login_identity`'s
+    config-file read plus a check of the DAEMON's own `os.environ`.
+    Correctness review found that unreliable on two counts: the daemon's
+    environment is a fossil of whatever shell first spawned it (`_spawn_daemon`
+    copies it once, at launch), not the environment CC itself resolves
+    credentials in; and the guess covered neither `apiKeyHelper` nor WIF,
+    both of which `lve()` tries before the oauth-store branch. This instead
+    REUSES the identity CC's own last successful write already proved
+    correct for the credential active on THIS host -- nothing here is
+    derived independently of CC's own prior output.
+
+    Trusted only when the stamp's `sha` names `expected_sha` -- the body CC
+    actually validated it against, before this sweep does anything to
+    either file -- and the whole record still matches the shape CC's own
+    schema requires (`v`, `identity`, `kind`, `sha`, `confirmed_at`,
+    `hipaa_seen`, each element of the latter a 64-hex-char string);
+    anything else carries no assurance CC computed it at all.
+    `expected_sha` itself being unknown (the body was unreadable, or this
+    is the very first sweep) also trusts nothing: there is no claim to
+    check the stamp against.
+
+    THIS FUNCTION DOES NOT KNOW WHETHER THE ACCOUNT HAS CHANGED SINCE --
+    identity is a function of the LOCAL credential, and neither file's sha
+    moves when that does (a `cswap switch` with the pin target unchanged
+    is the case in point: T0681 round 3 correctness review). That anchor
+    lives one level up, in `sweep_policy_once`'s witness check
+    (`_sweep_witness`), which this function's caller applies on top of
+    whatever this one returns before ever using it to mint.
+
+    A WRONG identity would only buy "foreign", which refuses exactly like
+    "unstamped" does (see `sweep_policy_once`), so an indeterminate case
+    falls back to the plain unlink instead of guessing.
+    """
+    if (expected_sha is None or not isinstance(existing, dict)
+            or existing.get("sha") != expected_sha):
+        return None
+    identity = existing.get("identity")
+    kind = existing.get("kind")
+    hipaa_seen = existing.get("hipaa_seen")
+    confirmed_at = existing.get("confirmed_at")
+    if (existing.get("v") != 1
+            or not isinstance(identity, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", identity)
+            or kind not in _STAMP_KINDS
+            or not isinstance(existing["sha"], str)
+            or not (1 <= len(existing["sha"]) <= 128)
+            or not isinstance(confirmed_at, int)
+            or isinstance(confirmed_at, bool)
+            or confirmed_at < 0
+            or not isinstance(hipaa_seen, list)
+            or len(hipaa_seen) > 8
+            or not all(isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
+                       for h in hipaa_seen)):
+        return None
+    return identity, kind, hipaa_seen
 
 
 class PinProxy:
@@ -12147,21 +12413,217 @@ class PinProxy:
         if not isinstance(doc, dict):
             return False
         path = _config_home_for_policy() / "policy-limits.json"
+        # THE BODY THAT WAS ON DISK BEFORE THIS CALL TOUCHES ANYTHING,
+        # captured once, up front: it is what any EXISTING stamp is a claim
+        # about, and stays the right reference for that claim whether this
+        # call goes on to replace it, skip it (already equal) or fail to
+        # write it (see the stamp section below).
+        old_doc, old_body_sha = None, None
         try:
-            if path.exists() and json.loads(
-                    path.read_text(encoding="utf-8")) == doc:
-                return False       # already right; no write, no churn
-        except Exception:  # noqa: BLE001 — unreadable counts as "replace it"
+            if path.exists():
+                old_doc = json.loads(path.read_text(encoding="utf-8"))
+                old_body_sha = _canonical_body_sha(old_doc)
+        except Exception:  # noqa: BLE001 — unreadable: no reference sha
             pass
-        try:
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(doc), encoding="utf-8")
-            tmp.replace(path)      # atomic: no reader sees half a document
-        except OSError:
+        wrote = old_doc != doc
+        write_failed = False
+        if wrote:
+            try:
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(doc), encoding="utf-8")
+                tmp.replace(path)  # atomic: no reader sees half a document
+            except OSError:
+                write_failed = True
+        # CC gates this file on a sidecar, `policy-limits.json.stamp.json`.
+        # `Din()` reads the stamp FILE first: kind "absent" (no file at all)
+        # returns the body verbatim as "legacy" without ever consulting
+        # `fe()`. Only when a file exists (parsed or not) does `fe()` run:
+        # `stamp===null||stamp.sha!==bodySha` -> "unstamped" (refused) --
+        # `stamp` is null there for an unparseable/oversize file, not for a
+        # missing one -- `stamp.identity!==identity` -> "foreign" (refused),
+        # else "match" (served). CC derives `identity` from the LOCAL
+        # credential, never from the bearer this proxy swaps onto the wire
+        # — so a pin-target change with the active account unchanged still
+        # reads "match" against the stale pinned body, and this write is
+        # the one thing that can catch it.
+        #
+        # SO THE WRITE MINTS THE SAME STAMP CC WOULD (`_canonical_body_sha`,
+        # `_trusted_stamp_identity`), not merely an ABSENT one, WHEN THERE
+        # IS A TRUSTED IDENTITY TO MINT IT WITH -- see that function: this
+        # is ground truth REUSED from CC's own last successful write, never
+        # a guess at what `lve()` would derive from outside CC's process. An
+        # unlink (making the file truly absent, not just wrong) only ever
+        # buys "legacy" — fine while nothing restamps it, but 2.1.273's
+        # `restampConfirmedCache` stopped silently restamping a body it did
+        # not mint, so "legacy" no longer self-heals into "match" either.
+        # WITH NO TRUSTED IDENTITY (no prior stamp, or one that does not
+        # vouch for the body that was actually on disk) -- OR ONE THIS
+        # SWEEP CANNOT VOUCH IS STILL FOR THE SAME ACCOUNT (the witness
+        # gate below, T0681 round 4) -- this still falls back to the plain
+        # unlink: a WRONG identity would only buy "foreign", which refuses
+        # exactly like "unstamped" does, so guessing is never better than
+        # not guessing.
+        #
+        # THE BODY THIS MINT VOUCHES FOR is whatever is ACTUALLY on disk
+        # once the write step above is done: `doc` only if the write just
+        # landed (`wrote and not write_failed`); `old_body_sha` on the skip
+        # path (already equal) AND on a failed write, where the OLD body is
+        # still what is really there — `doc` was never persisted, so a
+        # stamp naming `doc`'s sha would vouch for a body that does not
+        # exist on disk. When the target sha equals `old_body_sha`, the
+        # trusted stamp (which names `old_body_sha` by construction, see
+        # `_trusted_stamp_identity`) is already exactly right — no write, no
+        # churn, same discipline as the body itself. Placed AFTER any write,
+        # not before: mid-write the state is "new stamp, old body" -> torn
+        # -> refused, the safe direction. Any OSError here is silently
+        # fine; this runs off the sweep's own timer and must never fail it.
+        stamp = path.with_name(path.name + ".stamp.json")
+        # T0681 ROUND 4: our OWN fingerprint of the account active when we
+        # last minted `stamp`, kept beside it -- see `_sweep_witness`. Never
+        # read by CC; consulted only below, at the one moment an identity
+        # is about to be carried onto a body it was never confirmed
+        # against (the skip path further down, where `target_sha` already
+        # equals `old_body_sha`, leaves an already-correct stamp untouched
+        # regardless of this file, exactly as before this round).
+        witness_path = path.with_name(path.name + ".pin-witness.json")
+        trusted = _trusted_stamp_identity(_read_json(stamp), old_body_sha)
+        target_sha = (_canonical_body_sha(doc)
+                      if wrote and not write_failed else old_body_sha)
+        healed = False
+
+        def _fall_back_to_unlink(witness: "dict | None" = None) -> None:
+            # THE SAME DIRECTION EVERY OTHER INDETERMINATE CASE ON THIS PATH
+            # TAKES: a wrong identity would only buy "foreign", which
+            # refuses exactly like "unstamped" does, so not being able to
+            # vouch for one is never better than not guessing.
+            #
+            # T0681 ROUND 5: `witness` -- the fresh `_sweep_witness()` read
+            # for THIS sweep, when the caller has one -- is RECORDED HERE
+            # TOO, not only on the mint's own success path. Without this a
+            # real host's `witness_path` is written nowhere at all: the
+            # gate above always compares against `recorded=None`, always
+            # mismatches, and the mint can never run once, ever -- this
+            # round's whole fix reduces to T0656's plain unlink. Recording
+            # it here costs exactly the one bootstrap cycle the decision
+            # already bounds this at: the NEXT sweep sees an unchanged
+            # witness and inherits.
+            #
+            # `witness=None` (nothing was read, or nothing could be)
+            # RECORDS NOTHING AND LEAVES ANY EXISTING FILE ALONE -- round 5
+            # correctness review caught an unconditional unlink here: the
+            # `trusted is None` caller below never reads a witness at all,
+            # so on the very next tick after a mismatch fallback bootstraps
+            # one, this branch (stamp now absent) deleted it again before
+            # CC had any real chance to re-stamp inside one sweep interval,
+            # which reopened the round-4 [C] this round exists to close.
+            # Leaving it untouched cannot cause a wrong inherit either: the
+            # gate only ever accepts a witness that matches a FRESH
+            # `_sweep_witness()` read at decision time, so a leftover value
+            # either still matches the live account (in which case
+            # inheriting is exactly correct) or it does not (falls back,
+            # same as if it had been deleted).
+            try:
+                stamp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if witness is not None:
+                try:
+                    wtmp = witness_path.with_name(
+                        f"{witness_path.name}.{os.getpid()}.tmp")
+                    wtmp.write_text(json.dumps(witness), encoding="utf-8")
+                    wtmp.replace(witness_path)
+                except OSError:
+                    pass
+
+        if trusted is not None and target_sha != old_body_sha:
+            # THE WITNESS GATE. Both halves read fresh, at sweep time --
+            # never a value captured once at daemon start, which is the
+            # fossil `_active_oauth_token`'s own docstring already rejects
+            # for the token half. `current` is None on a host with no
+            # oauth token to hash (API key, WIF, apiKeyHelper): nothing to
+            # compare, so this never inherits there. `recorded` is None on
+            # the first sweep to ever see THIS stamp -- nobody here minted
+            # it yet, so there is no witness to have agreed with either;
+            # the identity becomes ours to carry only once WE have minted
+            # it (and its witness) at least once.
+            current = _sweep_witness()
+            recorded = _read_json(witness_path)
+            if current is None or recorded != current:
+                _fall_back_to_unlink(current)
+            else:
+                identity_hex, kind, prev_seen = trusted
+                # hipaa_seen mirrors CC's own `bzn`: drop any earlier record
+                # of THIS identity, then re-add it only if the fresh body
+                # carries a "hipaa" taint, capped to the last 8 (CC's `ce`).
+                # `prev_seen` is already list-shaped --
+                # `_trusted_stamp_identity` checked -- so no further
+                # validation is owed here.
+                seen = [h for h in prev_seen if h != identity_hex]
+                if "hipaa" in (doc.get("compliance_taints") or []):
+                    seen.append(identity_hex)
+                new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
+                             "sha": target_sha,
+                             "confirmed_at": int(time.time() * 1000),
+                             "hipaa_seen": seen[-8:]}
+                try:
+                    # PID-SUFFIXED, matching `_mark_nohealth`'s convention:
+                    # CC mints this same sidecar, and a draining daemon plus
+                    # its successor both call this sweep against one config
+                    # home, so an un-suffixed tmp name lets one writer's
+                    # `replace` publish the other's half-written content.
+                    tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps(new_stamp), encoding="utf-8")
+                    tmp.replace(stamp)  # atomic: no reader sees half a stamp
+                    wtmp = witness_path.with_name(
+                        f"{witness_path.name}.{os.getpid()}.tmp")
+                    wtmp.write_text(json.dumps(current), encoding="utf-8")
+                    wtmp.replace(witness_path)
+                    # NOT `healed = not wrote`: reaching this branch at all
+                    # already requires `target_sha != old_body_sha`, which the
+                    # ternary above only produces when `wrote and not
+                    # write_failed` -- so a mint here never runs with `wrote`
+                    # false, and `wrote`'s own message below always fires
+                    # instead. `healed` stays for the unlink branch alone.
+                except OSError:
+                    # A MINT THAT FAILS MUST NOT LEAVE THE OLD STAMP ATTACHED
+                    # TO a body it no longer describes (its sha still names
+                    # `old_body_sha`, now stale) -- that reads "unstamped"
+                    # and refuses, where the unlink this falls through to
+                    # reads "legacy" and serves, exactly the direction every
+                    # other OSError on this path already takes. `current`
+                    # already matched `recorded` here (that is WHY the mint
+                    # was attempted) -- passing it on keeps that already-
+                    # good witness in place rather than discarding it over
+                    # a transient write failure on the stamp alone.
+                    _fall_back_to_unlink(current)
+        elif trusted is None:
+            # T0681 round 5: `healed` used to be set from whether a stamp
+            # existed BEFORE this unlink ran, not from whether the unlink
+            # actually removed it -- so a permissions race that made the
+            # unlink itself fail still logged "removed a stale
+            # policy-cache stamp" below, when the stamp was untouched and
+            # still on disk. Read again AFTER the attempt: `healed` is now
+            # true only where the removal actually happened.
+            had_stamp = not wrote and stamp.exists()  # the skip path, present
+            _fall_back_to_unlink()
+            healed = had_stamp and not stamp.exists()
+        if write_failed:
             return False
-        _log_lifecycle("refreshed the org-policy cache for the account "
-                       "these sessions travel as")
-        return True
+        if wrote:
+            _log_lifecycle("refreshed the org-policy cache for the account "
+                           "these sessions travel as")
+        elif healed:
+            # THE ONLY OBSERVABLE of the skip-path heal actually firing: the
+            # body needed no write, but a stamp was still there to remove
+            # (it did not vouch for the body that is really on disk, or
+            # `_trusted_stamp_identity` would have kept it and minted
+            # nothing here instead -- see the comment above `healed`'s
+            # unlink-branch assignment). `healed` is set only where the
+            # unlink that follows it actually succeeded, so a swallowed
+            # OSError logs nothing.
+            _log_lifecycle("removed a stale policy-cache stamp left by an "
+                           "earlier write")
+        return wrote
 
     def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:
         """Unarchive the bridges a LIVE session on this machine still holds.
@@ -16133,7 +16595,8 @@ class PinProxy:
         recorded = _read_upstream(self._certdir, "proxy")
         if not recorded:
             return
-        nxt = _probe_next_hop(recorded)
+        nxt = _probe_next_hop(
+            recorded, own_proxy=_shell_proxy(), certdir=self._certdir)
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down
         # would erase a next hop learned while it was up, at the moment it
