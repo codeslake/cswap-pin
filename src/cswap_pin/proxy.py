@@ -162,20 +162,23 @@ def _probe_next_hop(
     timeout on every launch.
 
     ``own_proxy`` is the proxy THIS CALLER's own environment already named,
-    unrelated to any probing. Passed only by ``ensure_proxy``: an ordinary or
-    an ssh shell commonly already has HTTPS_PROXY pointed at the machine-wide
-    egress, and when that is also the hop about to be probed, every launch
-    (a fresh process — ``_ASKED_NOHEALTH`` cannot amortise this) would send a
-    /health it already knows will 400. ``learn_next_hop`` does NOT pass this:
-    it runs inside the long-lived daemon, and BY CONSTRUCTION its own
-    inherited proxy can equal the very hop it is asking about — `_spawn_daemon`
-    copies the parent's ``os.environ`` into the child, minus the two hand-down
-    fd variables it scrubs, and ``ambient`` is that shell's own exported proxy
-    when it names one.
-    Passing ``own_proxy`` there would refuse the probe that lets the daemon
-    learn the hop behind it — the 9901→8118 case is the one ``learn_next_hop``'s
-    own docstring records from the actual 2026-08-04 upstream.json (no
-    ``next`` key a day later).
+    unrelated to any probing. Passed only by ``ensure_proxy``: a shell that
+    DOES export HTTPS_PROXY (an ssh shell forwarding the machine-wide egress
+    is the common shape of that) would, when that is also the hop about to
+    be probed, send a /health it already knows will 400 on every launch (a
+    fresh process — ``_ASKED_NOHEALTH`` cannot amortise this). ``learn_next_hop``
+    does NOT pass this: it runs inside the long-lived daemon, and BY
+    CONSTRUCTION its own inherited proxy can equal the very hop it is asking
+    about — `_spawn_daemon` copies the parent's ``os.environ`` into the
+    child, minus the two hand-down fd variables it scrubs, and ``ambient``
+    is that shell's own exported proxy when it names one. Passing
+    ``own_proxy`` there would refuse the probe that lets the daemon learn
+    the hop behind it. The MEASURED configuration this guards: the
+    2026-08-04 upstream.json ``learn_next_hop``'s own docstring records, 9901
+    chaining to 8118, no ``next`` key a day later — a daemon started with
+    its own HTTPS_PROXY equal to 9901 would, BY CONSTRUCTION rather than
+    anything measured there, have had this same guard refuse the probe that
+    finds 8118, had it been passed.
 
     Gated against ``_ASKED_NOHEALTH`` (see that set's own comment above for
     why the memo is process-local rather than a disk record). Scoped to 4xx,
@@ -192,21 +195,21 @@ def _probe_next_hop(
     hop = parse_upstream_proxy(value)
     if hop is None:
         return None
-    own = parse_upstream_proxy(own_proxy)
-    if own is not None and own.address == hop.address:
-        return None
-    # ponytail: ceiling, not closed here. This guard only helps when
-    # `own_proxy` is present AND equals the probed hop's address. The
-    # ORDINARY launch (`cswap pin` from a plain shell, per `_ambient_proxy`'s
-    # own docstring) exports nothing, so `own` is None here and the guard
-    # never fires at all; a launcher shell that DOES export one can still
-    # differ from `value`, because `_ambient_proxy` prefers a recorded
+    # ponytail: ceiling, not closed here. The own_proxy guard right below
+    # only helps when `own_proxy` is present AND equals the probed hop's
+    # address. The ORDINARY launch (`cswap pin` from a plain shell, per
+    # `_ambient_proxy`'s own docstring) exports nothing, so `own` is None and
+    # the guard never fires at all; a launcher shell that DOES export one can
+    # still differ from `value`, because `_ambient_proxy` prefers a recorded
     # serving loopback proxy over the shell's own HTTPS_PROXY. Either shape
     # leaves a 4xx hop getting one /health per launch, forever, because a
     # launch is a fresh process and `_ASKED_NOHEALTH` cannot amortise across
     # launches. The only mechanism that ever covered that gap was the
     # unexpirable disk `nohealth` record the owner withdrew; no replacement
     # is built here.
+    own = parse_upstream_proxy(own_proxy)
+    if own is not None and own.address == hop.address:
+        return None
     if hop.host not in _LOOPBACK or hop.tls:
         return None
     address = f"{hop.host}:{hop.port}"
