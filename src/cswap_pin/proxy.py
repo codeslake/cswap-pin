@@ -204,9 +204,8 @@ def _probe_next_hop(
     # serving loopback proxy over the shell's own HTTPS_PROXY. Either shape
     # leaves a 4xx hop getting one /health per launch, forever, because a
     # launch is a fresh process and `_ASKED_NOHEALTH` cannot amortise across
-    # launches. The only mechanism that ever covered that gap was the
-    # unexpirable disk `nohealth` record the owner withdrew; no replacement
-    # is built here.
+    # launches (see that set's own comment above for why nothing on disk
+    # covers it either). No replacement is built here.
     own = parse_upstream_proxy(own_proxy)
     if own is not None and own.address == hop.address:
         return None
