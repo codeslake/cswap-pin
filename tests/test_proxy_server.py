@@ -4638,6 +4638,11 @@ class TestChainRediscovery:
             # would pass whatever the probe did.
             raw = json.loads((certdir / pp._UPSTREAM_FILE).read_text())
             assert set(raw) == {"proxy", "ca", "next"}, raw
+            # THE SCHEMA CHECK ALONE MISSES A REGRESSION THAT RECORDS THE
+            # 4xx HOP INTO AN EXISTING KEY (e.g. a probe that calls
+            # `write_upstream_hint(certdir, address)`) rather than a new
+            # one. The baseline is untouched, too.
+            assert raw["proxy"] == "http://127.0.0.1:1", raw
         finally:
             pp._ASKED_NOHEALTH.discard(address)
             srv.close()
@@ -4888,16 +4893,17 @@ class TestChainRediscovery:
     def case_learn_next_hop_still_probes_when_the_daemons_own_proxy_matches(
         self, certdir, monkeypatch
     ):
-        """THE LAUNCHER-WITH-CACHE-PROXY CONFIGURATION, measured in
-        `learn_next_hop`'s own docstring: a daemon spawned with
+        """THE LAUNCHER-WITH-CACHE-PROXY CONFIGURATION: a daemon spawned with
         HTTPS_PROXY=<the very address it records as its chain> (a launcher
-        that starts a per-session cache proxy and exports it directly) could
-        not learn the hop behind it, because `_shell_proxy()` read back the
-        daemon's OWN inherited proxy, which equalled `recorded` -- an
-        `own_proxy` guard passed at this call site would refuse the probe
-        that matters. `ensure_proxy` still passes `own_proxy` (see the
-        previous two cases); `learn_next_hop` does not, and this is the
-        case that needs it not to."""
+        that starts a per-session cache proxy and exports it directly) is the
+        shape `learn_next_hop`'s own docstring measures -- the 2026-08-04
+        upstream.json, 9901 chaining to 8118. BY CONSTRUCTION, not measured
+        here: `_shell_proxy()` reads back whatever HTTPS_PROXY this process
+        inherited, so a daemon started with it equal to `recorded` would have
+        an `own_proxy` guard passed at this call site refuse the probe that
+        matters. `ensure_proxy` still passes `own_proxy` (see the previous two
+        cases); `learn_next_hop` does not, and this is the case that needs it
+        not to."""
         import cswap_pin.proxy as pp
 
         srv = socket.socket()

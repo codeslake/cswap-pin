@@ -169,8 +169,9 @@ def _probe_next_hop(
     /health it already knows will 400. ``learn_next_hop`` does NOT pass this:
     it runs inside the long-lived daemon, and BY CONSTRUCTION its own
     inherited proxy can equal the very hop it is asking about — `_spawn_daemon`
-    copies the parent's ``os.environ`` into the child verbatim (~proxy.py:9607),
-    and ``ambient`` is that shell's own exported proxy in the common case.
+    copies the parent's ``os.environ`` into the child, minus the two hand-down
+    fd variables it scrubs, and ``ambient`` is that shell's own exported proxy
+    in the common case.
     Passing ``own_proxy`` there would refuse the probe that lets the daemon
     learn the hop behind it — the 9901→8118 case is the one ``learn_next_hop``'s
     own docstring records from the actual 2026-08-04 upstream.json (no
