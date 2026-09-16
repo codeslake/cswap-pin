@@ -1590,6 +1590,14 @@ class TestLiveRemoteControlSessions:
         Per CC's own gate, unlinking an untrusted one costs nothing: an
         absent stamp reads "legacy" and serves the body verbatim, exactly
         like "match" does.
+
+        ALSO THE POSITIVE CONTROL for `case_a_failed_heal_unlink_does_not_
+        log_a_removal`'s negative (round 5 correctness review): that case
+        only proves the log stays SILENT when the unlink fails; nothing
+        proved the log actually FIRES when the same unlink succeeds, so
+        hardwiring `healed = False` (or deleting the `elif healed:` log
+        arm entirely) would have passed both. This asserts the message IS
+        emitted here, where the unlink genuinely removes the stamp.
         """
         from cswap_pin import proxy as pin_proxy
 
@@ -1605,6 +1613,9 @@ class TestLiveRemoteControlSessions:
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
         monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
 
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is False, (
@@ -1617,6 +1628,9 @@ class TestLiveRemoteControlSessions:
         assert not stamp.exists(), (
             "a stale stamp survived the skip path, stranding an upgraded "
             "host stuck at torn until the server-side policy changes")
+        assert any("removed a stale policy-cache stamp" in m for m in lines), (
+            "the heal actually removed the stamp but the sweep never said so"
+        )
 
     def case_a_failed_heal_unlink_does_not_log_a_removal(
         self, tmp_path, monkeypatch
@@ -2037,18 +2051,25 @@ class TestLiveRemoteControlSessions:
         entry must sink the whole stamp exactly like a bad `kind` or a
         missing `v` already does: `_trusted_stamp_identity` returns None,
         and the sweep falls back to the plain unlink instead of trusting a
-        record CC's own schema would never have produced."""
+        record CC's own schema would never have produced.
+
+        SEEDED THROUGH `_seed_trusted_stamp`, WITH ITS MATCHING WITNESS
+        (round 5 correctness review): a hand-written stamp with no witness
+        of ours reaches the SAME plain-unlink outcome through the witness
+        gate's own mismatch fallback regardless of what `_trusted_stamp_
+        identity` decides, so deleting the hipaa_seen regex entirely left
+        this test green -- it was never exercising the regex at all. With
+        a matching witness AND matching active token/label, a stamp the
+        regex wrongly accepted would reach the mint branch and actually
+        write a new stamp, which is what the assertion below must be able
+        to catch.
+        """
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
         cfg.mkdir()
         old_doc = {"restrictions": {}, "compliance_taints": []}
-        (cfg / "policy-limits.json").write_text(json.dumps(old_doc))
-        (cfg / "policy-limits.json.stamp.json").write_text(json.dumps({
-            "v": 1, "identity": _TEST_IDENTITY, "kind": "org",
-            "sha": _canon_sha(old_doc), "confirmed_at": 1,
-            "hipaa_seen": ["not-a-64-hex-hash"],
-        }))
+        _seed_trusted_stamp(cfg, old_doc, hipaa_seen=["not-a-64-hex-hash"])
         monkeypatch.setattr(pin_proxy, "_active_oauth_token",
                             lambda: _TEST_TOKEN)
         monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
@@ -2421,11 +2442,19 @@ class TestLiveRemoteControlSessions:
         already covers) AND must record the witness even on this branch,
         or nothing below it can ever change.
 
-        BETWEEN THE TWO SWEEPS: CC re-stamps the body now on disk -- the
+        SWEEP 1.5, THE TICK PRODUCTION ACTUALLY TAKES NEXT, before CC has
+        any real chance to re-stamp inside one sweep interval (round 5
+        correctness review): the stamp is still absent, so this beat's
+        `trusted is None` and it has no witness of its own to read either
+        -- and it must not delete the one sweep 1 just recorded, or the
+        bootstrap is wiped again on the very next tick and the "costs one
+        cycle" bound in the decision is not real.
+
+        BETWEEN SWEEPS 1.5 AND 2: CC re-stamps the body now on disk -- the
         reachable way a trusted stamp exists again ("resumes as soon as CC
         writes its own stamp again"), not a second hand-seed of OUR
         witness (`witness=False`: this must not touch the witness sweep 1
-        just recorded).
+        recorded and sweep 1.5 must have left alone).
 
         SWEEP 2: the account is unchanged, so the witness sweep 1 recorded
         matches what `_sweep_witness()` reads now -- the mint runs and the
@@ -2473,9 +2502,28 @@ class TestLiveRemoteControlSessions:
             "account": _TEST_ACCOUNT_LABEL,
         }, "the recorded witness does not match the account active during sweep 1"
 
-        # BETWEEN THE TWO SWEEPS: CC re-stamps the body now on disk -- the
+        # SWEEP 1.5: the tick production actually takes next, before CC has
+        # re-stamped anything. The stamp is still absent (`trusted is
+        # None`), so this sweep reads no witness of its own -- it must
+        # leave the one sweep 1 recorded untouched.
+        assert daemon.sweep_policy_once() is False
+        assert witness_path.exists(), (
+            "a sweep with nothing new to trust deleted the witness the "
+            "FIRST sweep just recorded -- the bootstrap is wiped before CC "
+            "gets any real chance to re-stamp, so the decision's one-cycle "
+            "bound is not real. This is the T0681 round 5 correctness "
+            "review [C]: the `trusted is None` branch's fallback used to "
+            "unlink witness_path unconditionally"
+        )
+        assert json.loads(witness_path.read_text()) == {
+            "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
+            "account": _TEST_ACCOUNT_LABEL,
+        }, "the witness survived but was altered by a sweep that read none of its own"
+
+        # BETWEEN SWEEPS 1.5 AND 2: CC re-stamps the body now on disk -- the
         # reachable way a trusted stamp exists again. `witness=False`:
-        # must not touch the witness sweep 1 just recorded.
+        # must not touch the witness sweep 1 recorded and sweep 1.5 left
+        # alone.
         _seed_trusted_stamp(cfg, doc_v2, witness=False)
         docs[0] = doc_v3
 

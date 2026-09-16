@@ -12506,10 +12506,22 @@ class PinProxy:
             # round's whole fix reduces to T0656's plain unlink. Recording
             # it here costs exactly the one bootstrap cycle the decision
             # already bounds this at: the NEXT sweep sees an unchanged
-            # witness and inherits. `witness=None` (nothing was read, or
-            # nothing could be) records nothing and removes any stale file
-            # instead -- a witness this sweep did not just verify must not
-            # silently outlive the fallback that could not check it.
+            # witness and inherits.
+            #
+            # `witness=None` (nothing was read, or nothing could be)
+            # RECORDS NOTHING AND LEAVES ANY EXISTING FILE ALONE -- round 5
+            # correctness review caught an unconditional unlink here: the
+            # `trusted is None` caller below never reads a witness at all,
+            # so on the very next tick after a mismatch fallback bootstraps
+            # one, this branch (stamp now absent) deleted it again before
+            # CC had any real chance to re-stamp inside one sweep interval,
+            # which reopened the round-4 [C] this round exists to close.
+            # Leaving it untouched cannot cause a wrong inherit either: the
+            # gate only ever accepts a witness that matches a FRESH
+            # `_sweep_witness()` read at decision time, so a leftover value
+            # either still matches the live account (in which case
+            # inheriting is exactly correct) or it does not (falls back,
+            # same as if it had been deleted).
             try:
                 stamp.unlink(missing_ok=True)
             except OSError:
@@ -12520,11 +12532,6 @@ class PinProxy:
                         f"{witness_path.name}.{os.getpid()}.tmp")
                     wtmp.write_text(json.dumps(witness), encoding="utf-8")
                     wtmp.replace(witness_path)
-                except OSError:
-                    pass
-            else:
-                try:
-                    witness_path.unlink(missing_ok=True)
                 except OSError:
                     pass
 
