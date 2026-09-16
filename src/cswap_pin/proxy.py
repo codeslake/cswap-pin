@@ -2336,22 +2336,19 @@ def _shell_proxy(env: dict[str, str] | None = None) -> str | None:
     Never cached across calls: a probe's job is to learn what is wired over
     a hop right now, and a value remembered from an earlier read can name a
     different program a minute later.
+
+    Deliberately NOT `_wired_over_proxy()` or `_recorded_upstream()`: either
+    of those can equally be a corporate egress proxy (never worth probing)
+    or a local cache proxy discovered exactly BY a previous probe (the
+    thing `_ambient_proxy`'s own preference logic substitutes in ahead of
+    this value, when one is loopback, distinct, and still serving) — the
+    same address means opposite things in those two cases, and telling them
+    apart needs the hop's identity or a remembered probe result, both
+    forbidden. The shell's own raw export carries no such ambiguity: it is
+    what THIS launch was given, unmediated by anything the pin has learned.
     """
     src = os.environ if env is None else env
     return src.get("HTTPS_PROXY") or src.get("https_proxy")
-
-
-def _launch_own_proxy(env: dict[str, str] | None = None) -> str | None:
-    """The proxy this launch already had, before the pin's own wiring.
-
-    The shell's own exported value when there is one. `cswap pin` normally
-    runs in a plain shell that exports neither variable — a launcher only
-    sets one in the environment it execs Claude Code with — so for that,
-    the ordinary, case: fall back to the proxy the pin's own env block is
-    currently displacing (`_wired_over_proxy`). Either way this is what the
-    launch already had; nothing wired it over.
-    """
-    return _shell_proxy(env) or _wired_over_proxy()
 
 
 def _ambient_chain(
@@ -6083,7 +6080,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         os.environ.get("NODE_EXTRA_CA_CERTS"),
         next_hop=_probe_next_hop(
             ambient or _read_upstream(certdir, "proxy"),
-            own_proxy=_launch_own_proxy(),
+            own_proxy=_shell_proxy(),
         )
         or observed_next,
     )
@@ -16179,7 +16176,7 @@ class PinProxy:
         recorded = _read_upstream(self._certdir, "proxy")
         if not recorded:
             return
-        nxt = _probe_next_hop(recorded, own_proxy=_launch_own_proxy())
+        nxt = _probe_next_hop(recorded, own_proxy=_shell_proxy())
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down
         # would erase a next hop learned while it was up, at the moment it

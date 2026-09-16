@@ -4634,20 +4634,17 @@ class TestChainRediscovery:
             ambient_srv.close()
             other_srv.close()
 
-    def case_ensure_proxy_never_probes_the_wired_over_proxy(
+    def case_ensure_proxy_never_probes_the_shells_own_exported_proxy(
         self, tmp_path, monkeypatch
     ):
-        """The call site, not the comparison in isolation. `cswap pin`
-        normally runs in a plain shell with neither HTTPS_PROXY nor
-        https_proxy set, so the launch's own proxy is not read straight out
-        of the environment there — it falls back to what the pin's own env
-        block is currently displacing (`_wired_over_proxy`). That is still
-        this launch's own already-had proxy, and `ensure_proxy` must never
-        connect to it for `/health` either."""
+        """The call site, not the comparison in isolation. When this
+        launch's own shell exports HTTPS_PROXY directly at a hop — an
+        ordinary shell, or an ssh shell, whose only proxy is the
+        machine-wide egress the launcher itself chains to — `ensure_proxy`
+        resolves that hop as `ambient` unchanged (nothing recorded yet to
+        prefer instead), so it must never connect to it for `/health`
+        either."""
         import cswap_pin.proxy as pp
-
-        monkeypatch.delenv("HTTPS_PROXY", raising=False)
-        monkeypatch.delenv("https_proxy", raising=False)
 
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -4666,8 +4663,8 @@ class TestChainRediscovery:
 
         threading.Thread(target=serve, daemon=True).start()
         try:
-            wired = f"http://127.0.0.1:{srv.getsockname()[1]}"
-            monkeypatch.setattr(pp, "_wired_over_proxy", lambda: wired)
+            exported = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            monkeypatch.setenv("HTTPS_PROXY", exported)
             monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
             monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
             monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
@@ -4686,9 +4683,93 @@ class TestChainRediscovery:
             time.sleep(0.2)
             assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
             assert accepted == [], (
-                "ensure_proxy asked the proxy this launch already had for "
+                "ensure_proxy asked its own shell's exported proxy for "
                 "/health"
             )
+        finally:
+            srv.close()
+
+    def case_ensure_proxy_still_probes_a_preferred_inner_hop(
+        self, tmp_path, monkeypatch
+    ):
+        """Positive control for the previous case. An ordinary shell only
+        ever sees the outer egress proxy — but when a DIFFERENT, already
+        recorded inner hop is still serving, `_ambient_proxy` prefers it
+        over that shell value, and the two addresses now differ: this hop
+        is still probed."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        # `_ambient_proxy`'s own preference check opens a bare liveness
+        # connection to this hop (no HTTP request) before `_probe_next_hop`
+        # makes the real `/health` request — so the discriminator here is a
+        # RESPONSE actually sent, not merely a connection accepted.
+        served = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    if not buf:
+                        continue
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://192.0.2.1:3128"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                    served.append(1)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            inner = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            certdir = tmp_path / "pin-proxy"
+            certdir.mkdir(parents=True, exist_ok=True)
+            # A previous launch already recorded this inner hop.
+            pp.write_upstream_hint(certdir, inner)
+            # This shell only has the outer egress proxy — a reserved,
+            # documentation-only address (RFC 5737), never dialed here.
+            monkeypatch.setenv("HTTPS_PROXY", "http://192.0.2.1:3128")
+            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
+            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
+            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
+            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
+            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
+            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
+            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+
+            class _SW:
+                backup_dir = tmp_path
+
+                def resolve_account(self, email):
+                    return "1", email, None
+
+            got = pp.ensure_proxy(_SW())
+            time.sleep(0.2)
+            assert got == (41000, certdir / "ca.pem")
+            assert served == [1], (
+                "the preferred inner hop, distinct from the shell's own "
+                "export, was never asked"
+            )
+            assert pp._chain_hops(certdir)[-1].address == ("192.0.2.1", 3128)
         finally:
             srv.close()
 
