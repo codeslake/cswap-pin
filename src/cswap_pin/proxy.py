@@ -167,17 +167,18 @@ def _probe_next_hop(
     egress, and when that is also the hop about to be probed, every launch
     (a fresh process — ``_ASKED_NOHEALTH`` cannot amortise this) would send a
     /health it already knows will 400. ``learn_next_hop`` does NOT pass this:
-    it runs inside the long-lived daemon, whose own inherited proxy can equal
-    the very hop it is asking about (MEASURED: a daemon spawned with
-    HTTPS_PROXY=127.0.0.1:9901, recorded proxy also 127.0.0.1:9901 — passing
-    own_proxy there refused the probe that would have learned the hop behind
-    it, http://127.0.0.1:8118, and the chain stayed single-hop until 9901
-    died and the walk fell straight to a direct dial).
+    it runs inside the long-lived daemon, and BY CONSTRUCTION its own
+    inherited proxy can equal the very hop it is asking about — `_spawn_daemon`
+    copies the parent's ``os.environ`` into the child verbatim (~proxy.py:9607),
+    and ``ambient`` is that shell's own exported proxy in the common case.
+    Passing ``own_proxy`` there would refuse the probe that lets the daemon
+    learn the hop behind it — the 9901→8118 case is the one ``learn_next_hop``'s
+    own docstring records from the actual 2026-08-04 upstream.json (no
+    ``next`` key a day later).
 
-    Gated against ``_ASKED_NOHEALTH``: an address already known, this
-    process, to answer a 4xx (this isn't a /health server at all) is not
-    asked again — no socket, no error, no repeat log line. Scoped to 4xx, not
-    every non-200: a genuine /health server having a bad moment (5xx, a
+    Gated against ``_ASKED_NOHEALTH`` (see that set's own comment above for
+    why the memo is process-local rather than a disk record). Scoped to 4xx,
+    not every non-200: a genuine /health server having a bad moment (5xx, a
     redirect) is still worth asking once it recovers, unlike privoxy's fixed
     "not configured to accept intercepted requests" 400. A hop that answers
     200 clears nothing here (this function does not write a 200 result); a
@@ -193,6 +194,15 @@ def _probe_next_hop(
     own = parse_upstream_proxy(own_proxy)
     if own is not None and own.address == hop.address:
         return None
+    # ponytail: ceiling, not closed here. `_ambient_proxy` can prefer a
+    # recorded serving loopback proxy over the shell's own HTTPS_PROXY, so
+    # `value` (what gets probed) and `own_proxy` (the shell's raw export)
+    # can be two different loopback addresses — this guard does not fire,
+    # and a hop already known to answer 4xx still gets one /health per
+    # launch, forever, because a launch is a fresh process and
+    # `_ASKED_NOHEALTH` cannot amortise across launches. The only mechanism
+    # that ever covered that gap was the unexpirable disk `nohealth` record
+    # the owner withdrew; no replacement is built here.
     if hop.host not in _LOOPBACK or hop.tls:
         return None
     address = f"{hop.host}:{hop.port}"
@@ -16555,10 +16565,9 @@ class PinProxy:
         recorded = _read_upstream(self._certdir, "proxy")
         if not recorded:
             return
-        # NO own_proxy HERE. This process is the daemon, not a launch — its
-        # own inherited HTTPS_PROXY can equal `recorded` itself (MEASURED
-        # above), and passing it would refuse the very probe this method
-        # exists to make. `ensure_proxy` passes it; this call site does not.
+        # NO own_proxy HERE — see `_probe_next_hop`'s own docstring for why:
+        # this process is the daemon, not a launch, and passing it would
+        # refuse the very probe this method exists to make.
         nxt = _probe_next_hop(recorded)
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down

@@ -4616,6 +4616,10 @@ class TestChainRediscovery:
         address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
             url = f"http://{address}"
+            # A baseline record on disk, written BEFORE either probe, so the
+            # read below sees only what the probes themselves did to it —
+            # not what a later re-stamp would carry regardless of the probe.
+            pp.write_upstream_hint(certdir, "http://127.0.0.1:1")
             nxt = pp._probe_next_hop(url)
             assert nxt is None
             assert handled == [1], handled
@@ -4627,11 +4631,13 @@ class TestChainRediscovery:
             assert handled == [1], (
                 "a hop already known to answer 4xx was asked again")
 
-            # And nothing about it reached disk — a launch's own re-stamp
-            # carries no record of which hops answered 4xx.
-            pp.write_upstream_hint(certdir, url)
+            # And nothing about it reached disk. Read the file directly, with
+            # no intervening `write_upstream_hint` call — that function only
+            # ever emits proxy/ca/next and would erase a `nohealth` key even
+            # if the probe had written one, so a re-stamp before this read
+            # would pass whatever the probe did.
             raw = json.loads((certdir / pp._UPSTREAM_FILE).read_text())
-            assert "nohealth" not in raw, raw
+            assert set(raw) == {"proxy", "ca", "next"}, raw
         finally:
             pp._ASKED_NOHEALTH.discard(address)
             srv.close()
