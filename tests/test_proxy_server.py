@@ -4579,8 +4579,6 @@ class TestChainRediscovery:
         `_probe_next_hop`) carries the same "don't ask again" behaviour for
         exactly as long as this process runs, and `write_upstream_hint`'s
         own record carries nothing about it forward."""
-        import json
-
         import cswap_pin.proxy as pp
 
         srv = socket.socket()
@@ -4749,17 +4747,93 @@ class TestChainRediscovery:
         finally:
             srv.close()
 
-    def case_ensure_proxy_still_probes_the_shells_own_exported_proxy(
+    def case_a_hop_that_is_the_launchs_own_proxy_is_never_asked(self, certdir):
+        """A forward proxy answers a path-only request line with an error BY
+        DEFINITION, and writes that error into its own log — somebody else's
+        log, when that proxy is a machine's shared egress. Asking is only
+        useful when something wired this launch OVER the hop; when the hop
+        IS the launch's own proxy, nothing was wired over it, so the probe
+        can only cause the error, never learn anything from it.
+
+        The discriminator is connections accepted, not the return value: the
+        old code also returns None for a hop that never answers, so a bare
+        `is None` on the result would pass unchanged."""
+        import cswap_pin.proxy as pp
+
+        def health_server(next_hop):
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            accepted = []
+
+            def serve():
+                while True:
+                    try:
+                        c, _ = srv.accept()
+                    except OSError:
+                        return
+                    accepted.append(1)
+                    try:
+                        buf = b""
+                        while b"\r\n\r\n" not in buf:
+                            d = c.recv(4096)
+                            if not d:
+                                break
+                            buf += d
+                        body = json.dumps(
+                            {"status": "ok", "https_proxy": next_hop}
+                        ).encode()
+                        c.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            b"Content-Length: " + str(len(body)).encode()
+                            + b"\r\n\r\n" + body
+                        )
+                    except OSError:
+                        pass
+                    finally:
+                        c.close()
+
+            threading.Thread(target=serve, daemon=True).start()
+            return srv, accepted
+
+        ambient_srv, ambient_accepted = health_server("http://127.0.0.1:1")
+        other_srv, other_accepted = health_server("http://127.0.0.1:2")
+        try:
+            ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
+            other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
+
+            # The hop asked IS the launch's own ambient proxy: nothing wired
+            # this launch over it, so it is never even connected to.
+            nxt = pp._probe_next_hop(ambient_url, own_proxy=ambient_url)
+            time.sleep(0.2)
+            assert nxt is None
+            assert ambient_accepted == [], (
+                "the launch's own proxy was asked for /health anyway"
+            )
+
+            # Positive control: a hop that is NOT the ambient proxy is still
+            # asked, exactly once, and its answer still comes back. No sleep
+            # needed here: `_probe_next_hop` only returns after the response
+            # has already been read, so the accept is already recorded.
+            nxt = pp._probe_next_hop(other_url, own_proxy=ambient_url)
+            assert nxt == "http://127.0.0.1:2"
+            assert other_accepted == [1], other_accepted
+        finally:
+            ambient_srv.close()
+            other_srv.close()
+
+    def case_ensure_proxy_never_probes_the_shells_own_exported_proxy(
         self, tmp_path, monkeypatch
     ):
-        """THE LAUNCHER-WITH-CACHE-PROXY CONFIGURATION (`learn_next_hop`'s
-        own docstring, the measured 9901 -> 8118 case): a shell whose only
-        visible proxy IS the hop `ensure_proxy` needs to walk further from.
-        An earlier `own_proxy` guard suppressed exactly this probe — a
-        no-op on the normal `cswap pin` path (a plain shell exports neither
-        HTTPS_PROXY nor https_proxy at all) that refused the one
-        configuration where the probe mattered. Removed: a hop is asked on
-        its own merits, whatever the shell happens to export."""
+        """The call site, not the comparison in isolation. When this
+        launch's own shell exports HTTPS_PROXY directly at a hop — an
+        ordinary shell, or an ssh shell, whose only proxy is the
+        machine-wide egress the launcher itself chains to — `ensure_proxy`
+        resolves that hop as `ambient` unchanged (nothing recorded yet to
+        prefer instead), so it must never connect to it for `/health`
+        either: a fresh launch is a fresh process, and `_ASKED_NOHEALTH`
+        cannot amortise a probe it would only ever make once."""
         import cswap_pin.proxy as pp
 
         srv = socket.socket()
@@ -4775,6 +4849,62 @@ class TestChainRediscovery:
                 except OSError:
                     return
                 accepted.append(1)
+                c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            exported = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            monkeypatch.setenv("HTTPS_PROXY", exported)
+            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
+            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
+            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
+            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
+            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
+            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
+            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+
+            class _SW:
+                backup_dir = tmp_path
+
+                def resolve_account(self, email):
+                    return "1", email, None
+
+            got = pp.ensure_proxy(_SW())
+            time.sleep(0.2)
+            assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
+            assert accepted == [], (
+                "ensure_proxy asked its own shell's exported proxy for "
+                "/health"
+            )
+        finally:
+            srv.close()
+
+    def case_learn_next_hop_still_probes_when_the_daemons_own_proxy_matches(
+        self, certdir, monkeypatch
+    ):
+        """THE LAUNCHER-WITH-CACHE-PROXY CONFIGURATION, measured in
+        `learn_next_hop`'s own docstring: a daemon spawned with
+        HTTPS_PROXY=<the very address it records as its chain> (a launcher
+        that starts a per-session cache proxy and exports it directly) could
+        not learn the hop behind it, because `_shell_proxy()` read back the
+        daemon's OWN inherited proxy, which equalled `recorded` -- an
+        `own_proxy` guard passed at this call site would refuse the probe
+        that matters. `ensure_proxy` still passes `own_proxy` (see the
+        previous two cases); `learn_next_hop` does not, and this is the
+        case that needs it not to."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
                 try:
                     buf = b""
                     while b"\r\n\r\n" not in buf:
@@ -4797,31 +4927,26 @@ class TestChainRediscovery:
 
         threading.Thread(target=serve, daemon=True).start()
         try:
-            exported = f"http://127.0.0.1:{srv.getsockname()[1]}"
-            monkeypatch.setenv("HTTPS_PROXY", exported)
-            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
-            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
-            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
-            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
-            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
-            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
-            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+            recorded = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            # The daemon's own environment inherits the same address it
+            # recorded as its chain -- the measured shape of the bug.
+            monkeypatch.setenv("HTTPS_PROXY", recorded)
+            pp.write_upstream_hint(certdir, recorded)
 
-            class _SW:
-                backup_dir = tmp_path
-
-                def resolve_account(self, email):
-                    return "1", email, None
-
-            got = pp.ensure_proxy(_SW())
-            assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
-            assert accepted == [1], (
-                "ensure_proxy never asked the shell's own exported proxy "
-                "for /health, so the outer hop a launcher-installed cache "
-                "proxy chains through can never be learned"
+            proxy = pp.PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: None,
+                upstream=("127.0.0.1", 1),
+                rediscover_chain=True,
             )
-            certdir = tmp_path / "pin-proxy"
-            assert pp._chain_hops(certdir)[-1].address == ("127.0.0.1", 8118)
+            proxy.port = 36301
+            proxy.learn_next_hop()
+            assert pp._read_upstream(certdir, "next") == (
+                "http://127.0.0.1:8118"
+            ), (
+                "the daemon's own inherited proxy matching the hop it "
+                "records blocked the probe that learns the chain behind it"
+            )
         finally:
             srv.close()
 

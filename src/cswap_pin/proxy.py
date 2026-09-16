@@ -136,11 +136,18 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
 # state avoids — a remembered failure outliving the process that observed it,
 # with no way to learn that the address now answers (a real /health server
 # taking a port privoxy used to hold). A set scoped to this process's
-# lifetime expires exactly when the process that made the observation does.
+# lifetime expires exactly when the process that made the observation does —
+# which is why this mainly pays off for the long-lived daemon's own timer
+# (`learn_next_hop`, called repeatedly against the same address); a launch
+# (`ensure_proxy`) calls this once and exits, so the memo never accumulates
+# a saving there, and a hop that is that launch's own exported proxy is kept
+# out of this path entirely by the ``own_proxy`` guard below instead.
 _ASKED_NOHEALTH: set[str] = set()
 
 
-def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
+def _probe_next_hop(
+    value: str | None, timeout: float = 1.0, *, own_proxy: str | None = None,
+) -> str | None:
     """The proxy the recorded hop is ITSELF chaining to, asked of that hop.
 
     A local cache proxy reports its own upstream on ``/health`` while it is
@@ -153,6 +160,19 @@ def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
     Loopback only. The next hop matters for a chain of local proxies; asking a
     remote corporate proxy for a /health it does not serve would spend the
     timeout on every launch.
+
+    ``own_proxy`` is the proxy THIS CALLER's own environment already named,
+    unrelated to any probing. Passed only by ``ensure_proxy``: an ordinary or
+    an ssh shell commonly already has HTTPS_PROXY pointed at the machine-wide
+    egress, and when that is also the hop about to be probed, every launch
+    (a fresh process — ``_ASKED_NOHEALTH`` cannot amortise this) would send a
+    /health it already knows will 400. ``learn_next_hop`` does NOT pass this:
+    it runs inside the long-lived daemon, whose own inherited proxy can equal
+    the very hop it is asking about (MEASURED: a daemon spawned with
+    HTTPS_PROXY=127.0.0.1:9901, recorded proxy also 127.0.0.1:9901 — passing
+    own_proxy there refused the probe that would have learned the hop behind
+    it, http://127.0.0.1:8118, and the chain stayed single-hop until 9901
+    died and the walk fell straight to a direct dial).
 
     Gated against ``_ASKED_NOHEALTH``: an address already known, this
     process, to answer a 4xx (this isn't a /health server at all) is not
@@ -169,6 +189,9 @@ def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
 
     hop = parse_upstream_proxy(value)
     if hop is None:
+        return None
+    own = parse_upstream_proxy(own_proxy)
+    if own is not None and own.address == hop.address:
         return None
     if hop.host not in _LOOPBACK or hop.tls:
         return None
@@ -6098,7 +6121,10 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         certdir,
         ambient,
         os.environ.get("NODE_EXTRA_CA_CERTS"),
-        next_hop=_probe_next_hop(ambient or _read_upstream(certdir, "proxy"))
+        next_hop=_probe_next_hop(
+            ambient or _read_upstream(certdir, "proxy"),
+            own_proxy=_shell_proxy(),
+        )
         or observed_next,
     )
     fp = daemon_fingerprint(account_num, email)
@@ -16529,6 +16555,10 @@ class PinProxy:
         recorded = _read_upstream(self._certdir, "proxy")
         if not recorded:
             return
+        # NO own_proxy HERE. This process is the daemon, not a launch — its
+        # own inherited HTTPS_PROXY can equal `recorded` itself (MEASURED
+        # above), and passing it would refuse the very probe this method
+        # exists to make. `ensure_proxy` passes it; this call site does not.
         nxt = _probe_next_hop(recorded)
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down
