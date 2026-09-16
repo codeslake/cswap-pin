@@ -12280,13 +12280,14 @@ class PinProxy:
                 wrote = False      # already right; no write, no churn
         except Exception:  # noqa: BLE001 — unreadable counts as "replace it"
             pass
+        write_failed = False
         if wrote:
             try:
                 tmp = path.with_suffix(".json.tmp")
                 tmp.write_text(json.dumps(doc), encoding="utf-8")
                 tmp.replace(path)  # atomic: no reader sees half a document
             except OSError:
-                return False
+                write_failed = True
         # CC gates this file on a sidecar, `policy-limits.json.stamp.json`,
         # left by ITS OWN last fetch. A stale stamp (`sha` no longer matching
         # the body on disk) reads "torn" and CC refuses the body outright; an
@@ -12307,12 +12308,21 @@ class PinProxy:
         # is the normal case (an older host writes no stamp at all), so a
         # missing file or any OSError here is silently fine; this runs off
         # the sweep's own timer and must never fail it.
+        #
+        # RUN EVEN WHEN THE WRITE FAILED. A failed write leaves the OLD body
+        # on disk, still with whatever stamp was there — unlinking is just
+        # as harmless on that path (old body, no stamp -> "legacy", served
+        # verbatim) as on every other, and skipping it here would be the one
+        # occasion this heal is needed most: a body write that keeps failing
+        # would otherwise leave a torn stamp on the old body forever.
         stamp = path.with_name(path.name + ".stamp.json")
         healed = not wrote and stamp.exists()  # the skip path, stamp present
         try:
             stamp.unlink(missing_ok=True)
         except OSError:
             pass
+        if write_failed:
+            return False
         if wrote:
             _log_lifecycle("refreshed the org-policy cache for the account "
                            "these sessions travel as")

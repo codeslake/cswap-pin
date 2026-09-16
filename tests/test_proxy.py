@@ -1603,6 +1603,51 @@ class TestLiveRemoteControlSessions:
             "the raising unlink was never reached, so this proved nothing "
             "about the OSError being swallowed")
 
+    def case_a_failed_write_still_removes_the_stale_stamp(
+        self, tmp_path, monkeypatch
+    ):
+        """THE UNLINK RUNS EVEN WHEN THE BODY WRITE ITSELF FAILS.
+
+        A write that keeps failing (a permissions race, a full disk) leaves
+        the OLD body on disk. Unlinking is exactly as harmless there as on
+        every other path — old body, no stamp, reads "legacy" — and this is
+        the one occasion the heal is needed most: skipping it would leave a
+        torn stamp on the old body for as long as the write keeps failing.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        different = {"restrictions": {"allow_remote_control": {"allowed": False}}}
+        (cfg / "policy-limits.json").write_text(json.dumps(different))
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+
+        doc = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        real_write_text = Path.write_text
+
+        def failing_write_text(self, *a, **kw):
+            if self.name.endswith(".json.tmp"):
+                raise OSError("simulated")
+            return real_write_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False, (
+            "a failed write must still report False")
+        assert json.loads((cfg / "policy-limits.json").read_text()) == different, (
+            "the body must be untouched when the write failed"
+        )
+        assert not stamp.exists(), (
+            "a stale stamp survived a failed write, so a body write that "
+            "keeps failing leaves the OLD body permanently torn"
+        )
+
     def case_a_live_sessions_archived_bridge_is_revived(self, monkeypatch):
         """AN ARCHIVED BRIDGE UNDER A LIVE SESSION IS A BROKEN RECONNECT.
 
