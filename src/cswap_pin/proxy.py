@@ -11369,6 +11369,53 @@ def _active_oauth_token() -> "str | None":
         return None
 
 
+def _active_pin_account_label() -> "str | None":
+    """The account number cswap currently has active -- same source as
+    `_active_oauth_token`, read fresh every call, never cached.
+
+    Paired with the token hash in `_sweep_witness`: a `cswap switch` is
+    exactly what moves this, and it catches the (degenerate, but not
+    impossible in a test double) case where two different accounts would
+    otherwise hash to the same token.
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        num = sw.current_account_number()
+        return str(num) if num is not None else None
+    except Exception:  # noqa: BLE001 — never take the daemon down
+        return None
+
+
+def _sweep_witness() -> "dict | None":
+    """A fingerprint of the account active on THIS host, right now.
+
+    T0681 ROUND 4. `_trusted_stamp_identity` proves a stamp is one CC
+    itself could have minted for the body that was on disk -- but CC's own
+    `identity` is a function of the LOCAL credential, not of either file,
+    so a `cswap switch` between two sweeps moves it without touching a
+    single byte either file's sha covers. This is the second anchor: two
+    sweeps whose witness agrees have had the same local account the whole
+    time, so an identity a stamp already proved correct is still correct.
+
+    Both halves READ FRESH, at sweep time -- never a value captured once
+    at daemon start, which is the same fossil `_active_oauth_token`'s own
+    docstring already rejects for the token itself.
+
+    A WITNESS OF CHANGE, not a claim about which credential CC used: None
+    on a host with no oauth token to hash (API key, WIF, apiKeyHelper),
+    and the caller treats that exactly like a mismatch -- never inherit,
+    fall back to the unconditional unlink instead of guessing.
+    """
+    import hashlib
+
+    token = _active_oauth_token()
+    label = _active_pin_account_label()
+    if token is None or label is None:
+        return None
+    return {"token_sha": hashlib.sha256(token.encode()).hexdigest(),
+            "account": label}
+
+
 def _verifying_context() -> "ssl.SSLContext":
     """A context that trusts the pin's own MITM certificate.
 
@@ -11577,11 +11624,19 @@ def _trusted_stamp_identity(existing, expected_sha):
     actually validated it against, before this sweep does anything to
     either file -- and the whole record still matches the shape CC's own
     schema requires (`v`, `identity`, `kind`, `sha`, `confirmed_at`,
-    `hipaa_seen`); anything else carries no assurance CC computed it at
-    all, or that the account has not changed since. `expected_sha` itself
-    being unknown (the body was unreadable, or this is the very first
-    sweep) also trusts nothing: there is no claim to check the stamp
-    against.
+    `hipaa_seen`, each element of the latter a 64-hex-char string);
+    anything else carries no assurance CC computed it at all.
+    `expected_sha` itself being unknown (the body was unreadable, or this
+    is the very first sweep) also trusts nothing: there is no claim to
+    check the stamp against.
+
+    THIS FUNCTION DOES NOT KNOW WHETHER THE ACCOUNT HAS CHANGED SINCE --
+    identity is a function of the LOCAL credential, and neither file's sha
+    moves when that does (a `cswap switch` with the pin target unchanged
+    is the case in point: T0681 round 3 correctness review). That anchor
+    lives one level up, in `sweep_policy_once`'s witness check
+    (`_sweep_witness`), which this function's caller applies on top of
+    whatever this one returns before ever using it to mint.
 
     A WRONG identity would only buy "foreign", which refuses exactly like
     "unstamped" does (see `sweep_policy_once`), so an indeterminate case
@@ -11604,7 +11659,9 @@ def _trusted_stamp_identity(existing, expected_sha):
             or isinstance(confirmed_at, bool)
             or confirmed_at < 0
             or not isinstance(hipaa_seen, list)
-            or len(hipaa_seen) > 8):
+            or len(hipaa_seen) > 8
+            or not all(isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
+                       for h in hipaa_seen)):
         return None
     return identity, kind, hipaa_seen
 
@@ -12400,10 +12457,12 @@ class PinProxy:
         # `restampConfirmedCache` stopped silently restamping a body it did
         # not mint, so "legacy" no longer self-heals into "match" either.
         # WITH NO TRUSTED IDENTITY (no prior stamp, or one that does not
-        # vouch for the body that was actually on disk), this still falls
-        # back to the plain unlink: a WRONG identity would only buy
-        # "foreign", which refuses exactly like "unstamped" does, so
-        # guessing is never better than not guessing.
+        # vouch for the body that was actually on disk) -- OR ONE THIS
+        # SWEEP CANNOT VOUCH IS STILL FOR THE SAME ACCOUNT (the witness
+        # gate below, T0681 round 4) -- this still falls back to the plain
+        # unlink: a WRONG identity would only buy "foreign", which refuses
+        # exactly like "unstamped" does, so guessing is never better than
+        # not guessing.
         #
         # THE BODY THIS MINT VOUCHES FOR is whatever is ACTUALLY on disk
         # once the write step above is done: `doc` only if the write just
@@ -12419,56 +12478,96 @@ class PinProxy:
         # -> refused, the safe direction. Any OSError here is silently
         # fine; this runs off the sweep's own timer and must never fail it.
         stamp = path.with_name(path.name + ".stamp.json")
+        # T0681 ROUND 4: our OWN fingerprint of the account active when we
+        # last minted `stamp`, kept beside it -- see `_sweep_witness`. Never
+        # read by CC; consulted only below, at the one moment an identity
+        # is about to be carried onto a body it was never confirmed
+        # against (the skip path further down, where `target_sha` already
+        # equals `old_body_sha`, leaves an already-correct stamp untouched
+        # regardless of this file, exactly as before this round).
+        witness_path = path.with_name(path.name + ".pin-witness.json")
         trusted = _trusted_stamp_identity(_read_json(stamp), old_body_sha)
         target_sha = (_canonical_body_sha(doc)
                       if wrote and not write_failed else old_body_sha)
         healed = False
-        if trusted is not None and target_sha != old_body_sha:
-            identity_hex, kind, prev_seen = trusted
-            # hipaa_seen mirrors CC's own `bzn`: drop any earlier record of
-            # THIS identity, then re-add it only if the fresh body carries a
-            # "hipaa" taint, capped to the last 8 (CC's `ce`). `prev_seen`
-            # is already list-shaped -- `_trusted_stamp_identity` checked --
-            # so no further validation is owed here.
-            seen = [h for h in prev_seen if h != identity_hex]
-            if "hipaa" in (doc.get("compliance_taints") or []):
-                seen.append(identity_hex)
-            new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
-                         "sha": target_sha,
-                         "confirmed_at": int(time.time() * 1000),
-                         "hipaa_seen": seen[-8:]}
-            try:
-                # PID-SUFFIXED, matching `_mark_nohealth`'s convention: CC
-                # mints this same sidecar, and a draining daemon plus its
-                # successor both call this sweep against one config home, so
-                # an un-suffixed tmp name lets one writer's `replace`
-                # publish the other's half-written content.
-                tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
-                tmp.write_text(json.dumps(new_stamp), encoding="utf-8")
-                tmp.replace(stamp)  # atomic: no reader sees half a stamp
-                # NOT `healed = not wrote`: reaching this branch at all
-                # already requires `target_sha != old_body_sha`, which the
-                # ternary above only produces when `wrote and not
-                # write_failed` -- so a mint here never runs with `wrote`
-                # false, and `wrote`'s own message below always fires
-                # instead. `healed` stays for the unlink branch alone.
-            except OSError:
-                # A MINT THAT FAILS MUST NOT LEAVE THE OLD STAMP ATTACHED TO
-                # a body it no longer describes (its sha still names
-                # `old_body_sha`, now stale) -- that reads "unstamped" and
-                # refuses, where the unlink this falls through to reads
-                # "legacy" and serves, exactly the direction every other
-                # OSError on this path already takes.
-                try:
-                    stamp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        elif trusted is None:
-            healed = not wrote and stamp.exists()  # the skip path, present
+
+        def _fall_back_to_unlink() -> None:
+            # THE SAME DIRECTION EVERY OTHER INDETERMINATE CASE ON THIS PATH
+            # TAKES: a wrong identity would only buy "foreign", which
+            # refuses exactly like "unstamped" does, so not being able to
+            # vouch for one is never better than not guessing. Costs one
+            # cycle of self-healing, resumed as soon as CC writes its own
+            # stamp again. The witness goes with it -- a stale record next
+            # to an absent stamp vouches for nothing.
             try:
                 stamp.unlink(missing_ok=True)
             except OSError:
                 pass
+            try:
+                witness_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if trusted is not None and target_sha != old_body_sha:
+            # THE WITNESS GATE. Both halves read fresh, at sweep time --
+            # never a value captured once at daemon start, which is the
+            # fossil `_active_oauth_token`'s own docstring already rejects
+            # for the token half. `current` is None on a host with no
+            # oauth token to hash (API key, WIF, apiKeyHelper): nothing to
+            # compare, so this never inherits there. `recorded` is None on
+            # the first sweep to ever see THIS stamp -- nobody here minted
+            # it yet, so there is no witness to have agreed with either;
+            # the identity becomes ours to carry only once WE have minted
+            # it (and its witness) at least once.
+            current = _sweep_witness()
+            recorded = _read_json(witness_path)
+            if current is None or recorded != current:
+                _fall_back_to_unlink()
+            else:
+                identity_hex, kind, prev_seen = trusted
+                # hipaa_seen mirrors CC's own `bzn`: drop any earlier record
+                # of THIS identity, then re-add it only if the fresh body
+                # carries a "hipaa" taint, capped to the last 8 (CC's `ce`).
+                # `prev_seen` is already list-shaped --
+                # `_trusted_stamp_identity` checked -- so no further
+                # validation is owed here.
+                seen = [h for h in prev_seen if h != identity_hex]
+                if "hipaa" in (doc.get("compliance_taints") or []):
+                    seen.append(identity_hex)
+                new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
+                             "sha": target_sha,
+                             "confirmed_at": int(time.time() * 1000),
+                             "hipaa_seen": seen[-8:]}
+                try:
+                    # PID-SUFFIXED, matching `_mark_nohealth`'s convention:
+                    # CC mints this same sidecar, and a draining daemon plus
+                    # its successor both call this sweep against one config
+                    # home, so an un-suffixed tmp name lets one writer's
+                    # `replace` publish the other's half-written content.
+                    tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps(new_stamp), encoding="utf-8")
+                    tmp.replace(stamp)  # atomic: no reader sees half a stamp
+                    wtmp = witness_path.with_name(
+                        f"{witness_path.name}.{os.getpid()}.tmp")
+                    wtmp.write_text(json.dumps(current), encoding="utf-8")
+                    wtmp.replace(witness_path)
+                    # NOT `healed = not wrote`: reaching this branch at all
+                    # already requires `target_sha != old_body_sha`, which the
+                    # ternary above only produces when `wrote and not
+                    # write_failed` -- so a mint here never runs with `wrote`
+                    # false, and `wrote`'s own message below always fires
+                    # instead. `healed` stays for the unlink branch alone.
+                except OSError:
+                    # A MINT THAT FAILS MUST NOT LEAVE THE OLD STAMP ATTACHED
+                    # TO a body it no longer describes (its sha still names
+                    # `old_body_sha`, now stale) -- that reads "unstamped"
+                    # and refuses, where the unlink this falls through to
+                    # reads "legacy" and serves, exactly the direction every
+                    # other OSError on this path already takes.
+                    _fall_back_to_unlink()
+        elif trusted is None:
+            healed = not wrote and stamp.exists()  # the skip path, present
+            _fall_back_to_unlink()
         if write_failed:
             return False
         if wrote:
