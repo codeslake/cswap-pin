@@ -11534,6 +11534,15 @@ def _canonical_body_sha(doc: dict) -> str:
     recursively (arrays keep their order) and `S` is a compact
     `JSON.stringify` -- not this file's own on-disk formatting, which is
     why this re-encodes `doc` rather than hashing whatever bytes we wrote.
+
+    EQUIVALENT for the value types a policy document actually carries
+    (booleans, strings, nested objects, string arrays, null): key order is
+    ASCII so code-point and UTF-16 sort agree, and short/control-character
+    escaping matches. NOT equivalent for numbers -- `json.dumps` and
+    `JSON.stringify` diverge on floats (`1.0` vs `1`), large exponents and
+    integers past 2**53 -- so a server-added numeric field would make every
+    mint read "unstamped" here while CC's own write would not. No such
+    field exists today; this is not handled.
     """
     import hashlib
     canon = json.dumps(doc, sort_keys=True, separators=(",", ":"),
@@ -11552,17 +11561,34 @@ def _local_stamp_identity() -> "tuple[str, str] | None":
     `_login_identity` already reads the same `oauthAccount` field CC's
     `zf()` does, for the bridge-pointer carry above.
 
-    Other branches (WIF, a token with no stored org, an env/fd override) are
-    not derived here: a WRONG identity would only buy "foreign", which
-    refuses exactly like "unstamped" does (see `sweep_policy_once`), so an
-    indeterminate case falls back to the plain unlink instead of guessing.
+    ONLY THE ORDINARY CASE. `lve()` tries an API key (`Th()`) and a WIF
+    profile (`lu()`) before it ever reaches the oauth-store branch, and
+    `Rn()` itself branches on where the active oauth token CAME from
+    (`yR()`: "store" | "env" | "fd" | "none") -- an env override derives a
+    DIFFERENT descriptor from `CLAUDE_CODE_ORGANIZATION_UUID`, not the
+    stored `oauthAccount`. `_login_identity`'s file can carry a stale
+    `organizationUuid` from a PREVIOUS oauth login while one of those other
+    modes is what is actually active, so an organizationUuid on disk is not
+    by itself evidence CC would derive identity this way -- narrowed here to
+    what is cheap to rule out: none of the known override variables set, and
+    the credential STORE itself (`_active_oauth_token`, not just the config
+    file) still names a real access token. WIF is not detected at all, and
+    a stale org left on a WIF or apiKeyHelper machine that clears neither
+    variable nor the stored token can still slip through. A WRONG identity
+    would only buy "foreign", which refuses exactly like "unstamped" does
+    (see `sweep_policy_once`), so an indeterminate case falls back to the
+    plain unlink instead of guessing.
     """
     import hashlib
+    if any(os.environ.get(name) for name in
+           ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN")):
+        return None
     login = _login_identity()
     if login is None:
         return None
     _account_uuid, org_uuid = login
-    if not org_uuid:
+    if not org_uuid or not _active_oauth_token():
         return None
     descriptor = f"org:{org_uuid.lower()}"
     return hashlib.sha256(descriptor.encode("utf-8")).hexdigest(), "org"
@@ -12330,19 +12356,23 @@ class PinProxy:
                 tmp.replace(path)  # atomic: no reader sees half a document
             except OSError:
                 write_failed = True
-        # CC gates this file on a sidecar, `policy-limits.json.stamp.json`,
-        # left by ITS OWN last fetch: `stamp===null||stamp.sha!==bodySha` ->
-        # "unstamped" (refused), `stamp.identity!==identity` -> "foreign"
-        # (refused), else "match" (served). CC derives `identity` from the
-        # LOCAL credential, never from the bearer this proxy swaps onto the
-        # wire — so a pin-target change with the active account unchanged
-        # still reads "match" against the stale pinned body, and this write
-        # is the one thing that can catch it.
+        # CC gates this file on a sidecar, `policy-limits.json.stamp.json`.
+        # `Din()` reads the stamp FILE first: kind "absent" (no file at all)
+        # returns the body verbatim as "legacy" without ever consulting
+        # `fe()`. Only when a file exists (parsed or not) does `fe()` run:
+        # `stamp===null||stamp.sha!==bodySha` -> "unstamped" (refused) --
+        # `stamp` is null there for an unparseable/oversize file, not for a
+        # missing one -- `stamp.identity!==identity` -> "foreign" (refused),
+        # else "match" (served). CC derives `identity` from the LOCAL
+        # credential, never from the bearer this proxy swaps onto the wire
+        # — so a pin-target change with the active account unchanged still
+        # reads "match" against the stale pinned body, and this write is
+        # the one thing that can catch it.
         #
         # SO THE WRITE MINTS THE SAME STAMP CC WOULD (`_canonical_body_sha`,
-        # `_local_stamp_identity`), not merely an ABSENT one. An unlink only
-        # ever buys "legacy" (no stamp, served verbatim like a genuine
-        # "match") — fine while nothing restamps it, but 2.1.273's
+        # `_local_stamp_identity`), not merely an ABSENT one. An unlink
+        # (making the file truly absent, not just wrong) only ever buys
+        # "legacy" — fine while nothing restamps it, but 2.1.273's
         # `restampConfirmedCache` stopped silently restamping a body it did
         # not mint, so "legacy" no longer self-heals into "match" either.
         # WHEN THE LOCAL IDENTITY CANNOT BE DERIVED (no login, or a
@@ -12375,10 +12405,19 @@ class PinProxy:
                               and existing.get("sha") == body_sha
                               and existing.get("identity") == identity_hex)
             if not already_right:
-                healed = not wrote
+                # hipaa_seen mirrors CC's own `bzn`: drop any earlier record
+                # of THIS identity, then re-add it only if the fresh body
+                # carries a "hipaa" taint, capped to the last 8 (CC's `ce`).
+                # Type-checked, not just truthy: a corrupt or foreign-shaped
+                # stamp (`hipaa_seen` not a list, e.g. a stray number) must
+                # not raise out of a timer callback that is swallowed
+                # upstream -- that would strand the heal permanently rather
+                # than just drop the one field's history.
                 prev_seen = existing.get("hipaa_seen") \
                     if isinstance(existing, dict) else None
-                seen = [h for h in (prev_seen or []) if h != identity_hex]
+                if not isinstance(prev_seen, list):
+                    prev_seen = []
+                seen = [h for h in prev_seen if h != identity_hex]
                 if "hipaa" in (doc.get("compliance_taints") or []):
                     seen.append(identity_hex)
                 new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
@@ -12386,9 +12425,16 @@ class PinProxy:
                              "confirmed_at": int(time.time() * 1000),
                              "hipaa_seen": seen[-8:]}
                 try:
-                    tmp = stamp.with_name(stamp.name + ".tmp")
+                    # PID-SUFFIXED, matching `_mark_nohealth`'s convention:
+                    # CC mints this same sidecar, and a draining daemon plus
+                    # its successor both call this sweep against one config
+                    # home, so an un-suffixed tmp name lets one writer's
+                    # `replace` publish the other's half-written content.
+                    tmp = stamp.with_name(
+                        f"{stamp.name}.{os.getpid()}.tmp")
                     tmp.write_text(json.dumps(new_stamp), encoding="utf-8")
                     tmp.replace(stamp)  # atomic: no reader sees half a stamp
+                    healed = not wrote
                 except OSError:
                     pass
         else:
@@ -12404,7 +12450,9 @@ class PinProxy:
                            "these sessions travel as")
         elif healed:
             # THE ONLY OBSERVABLE of the skip-path heal actually firing: the
-            # body needed no write, but the stamp was still wrong.
+            # body needed no write, but the stamp was still wrong. `healed`
+            # is set only where the write/unlink that follows it actually
+            # succeeded (see above), so a swallowed OSError logs nothing.
             _log_lifecycle(
                 "refreshed the policy-cache stamp so CC's own gate reads "
                 "it as a match" if local_identity is not None else
