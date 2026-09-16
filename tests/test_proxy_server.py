@@ -4637,12 +4637,11 @@ class TestChainRediscovery:
             # if the probe had written one, so a re-stamp before this read
             # would pass whatever the probe did.
             raw = json.loads((certdir / pp._UPSTREAM_FILE).read_text())
-            assert set(raw) == {"proxy", "ca", "next"}, raw
-            # THE SCHEMA CHECK ALONE MISSES A REGRESSION THAT RECORDS THE
-            # 4xx HOP INTO AN EXISTING KEY (e.g. a probe that calls
-            # `write_upstream_hint(certdir, address)`) rather than a new
-            # one. The baseline is untouched, too.
-            assert raw["proxy"] == "http://127.0.0.1:1", raw
+            # THE SCHEMA ALONE MISSES A REGRESSION THAT RECORDS THE 4xx HOP
+            # INTO AN EXISTING KEY (`proxy`, `ca`, or `next`) rather than a
+            # new one, so the values are pinned to the untouched baseline
+            # too, not just the key set.
+            assert raw == {"proxy": "http://127.0.0.1:1", "ca": "", "next": ""}, raw
         finally:
             pp._ASKED_NOHEALTH.discard(address)
             srv.close()
@@ -4896,14 +4895,14 @@ class TestChainRediscovery:
         """THE LAUNCHER-WITH-CACHE-PROXY CONFIGURATION: a daemon spawned with
         HTTPS_PROXY=<the very address it records as its chain> (a launcher
         that starts a per-session cache proxy and exports it directly) is the
-        shape `learn_next_hop`'s own docstring measures -- the 2026-08-04
-        upstream.json, 9901 chaining to 8118. BY CONSTRUCTION, not measured
-        here: `_shell_proxy()` reads back whatever HTTPS_PROXY this process
-        inherited, so a daemon started with it equal to `recorded` would have
-        an `own_proxy` guard passed at this call site refuse the probe that
-        matters. `ensure_proxy` still passes `own_proxy` (see the previous two
-        cases); `learn_next_hop` does not, and this is the case that needs it
-        not to."""
+        configuration `learn_next_hop`'s own docstring cites the 2026-08-04
+        upstream.json for -- 9901 chaining to 8118 is the MEASURED half.
+        BY CONSTRUCTION, not measured, is the rest: `_shell_proxy()` reads
+        back whatever HTTPS_PROXY this process inherited, so a daemon started
+        with it equal to `recorded` would have an `own_proxy` guard passed at
+        this call site refuse the probe that matters. `ensure_proxy` still
+        passes `own_proxy` (see the previous two cases); `learn_next_hop`
+        does not, and this is the case that needs it not to."""
         import cswap_pin.proxy as pp
 
         srv = socket.socket()
@@ -4941,7 +4940,8 @@ class TestChainRediscovery:
         try:
             recorded = f"http://127.0.0.1:{srv.getsockname()[1]}"
             # The daemon's own environment inherits the same address it
-            # recorded as its chain -- the measured shape of the bug.
+            # recorded as its chain -- constructed, not the measured half
+            # (see the case docstring: only the 9901->8118 chain is measured).
             monkeypatch.setenv("HTTPS_PROXY", recorded)
             pp.write_upstream_hint(certdir, recorded)
 
