@@ -12491,22 +12491,42 @@ class PinProxy:
                       if wrote and not write_failed else old_body_sha)
         healed = False
 
-        def _fall_back_to_unlink() -> None:
+        def _fall_back_to_unlink(witness: "dict | None" = None) -> None:
             # THE SAME DIRECTION EVERY OTHER INDETERMINATE CASE ON THIS PATH
             # TAKES: a wrong identity would only buy "foreign", which
             # refuses exactly like "unstamped" does, so not being able to
-            # vouch for one is never better than not guessing. Costs one
-            # cycle of self-healing, resumed as soon as CC writes its own
-            # stamp again. The witness goes with it -- a stale record next
-            # to an absent stamp vouches for nothing.
+            # vouch for one is never better than not guessing.
+            #
+            # T0681 ROUND 5: `witness` -- the fresh `_sweep_witness()` read
+            # for THIS sweep, when the caller has one -- is RECORDED HERE
+            # TOO, not only on the mint's own success path. Without this a
+            # real host's `witness_path` is written nowhere at all: the
+            # gate above always compares against `recorded=None`, always
+            # mismatches, and the mint can never run once, ever -- this
+            # round's whole fix reduces to T0656's plain unlink. Recording
+            # it here costs exactly the one bootstrap cycle the decision
+            # already bounds this at: the NEXT sweep sees an unchanged
+            # witness and inherits. `witness=None` (nothing was read, or
+            # nothing could be) records nothing and removes any stale file
+            # instead -- a witness this sweep did not just verify must not
+            # silently outlive the fallback that could not check it.
             try:
                 stamp.unlink(missing_ok=True)
             except OSError:
                 pass
-            try:
-                witness_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if witness is not None:
+                try:
+                    wtmp = witness_path.with_name(
+                        f"{witness_path.name}.{os.getpid()}.tmp")
+                    wtmp.write_text(json.dumps(witness), encoding="utf-8")
+                    wtmp.replace(witness_path)
+                except OSError:
+                    pass
+            else:
+                try:
+                    witness_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         if trusted is not None and target_sha != old_body_sha:
             # THE WITNESS GATE. Both halves read fresh, at sweep time --
@@ -12522,7 +12542,7 @@ class PinProxy:
             current = _sweep_witness()
             recorded = _read_json(witness_path)
             if current is None or recorded != current:
-                _fall_back_to_unlink()
+                _fall_back_to_unlink(current)
             else:
                 identity_hex, kind, prev_seen = trusted
                 # hipaa_seen mirrors CC's own `bzn`: drop any earlier record
@@ -12563,11 +12583,23 @@ class PinProxy:
                     # `old_body_sha`, now stale) -- that reads "unstamped"
                     # and refuses, where the unlink this falls through to
                     # reads "legacy" and serves, exactly the direction every
-                    # other OSError on this path already takes.
-                    _fall_back_to_unlink()
+                    # other OSError on this path already takes. `current`
+                    # already matched `recorded` here (that is WHY the mint
+                    # was attempted) -- passing it on keeps that already-
+                    # good witness in place rather than discarding it over
+                    # a transient write failure on the stamp alone.
+                    _fall_back_to_unlink(current)
         elif trusted is None:
-            healed = not wrote and stamp.exists()  # the skip path, present
+            # T0681 round 5: `healed` used to be set from whether a stamp
+            # existed BEFORE this unlink ran, not from whether the unlink
+            # actually removed it -- so a permissions race that made the
+            # unlink itself fail still logged "removed a stale
+            # policy-cache stamp" below, when the stamp was untouched and
+            # still on disk. Read again AFTER the attempt: `healed` is now
+            # true only where the removal actually happened.
+            had_stamp = not wrote and stamp.exists()  # the skip path, present
             _fall_back_to_unlink()
+            healed = had_stamp and not stamp.exists()
         if write_failed:
             return False
         if wrote:
