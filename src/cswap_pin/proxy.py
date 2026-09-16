@@ -11550,48 +11550,63 @@ def _canonical_body_sha(doc: dict) -> str:
     return "sha256:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
-def _local_stamp_identity() -> "tuple[str, str] | None":
-    """`(identity, kind)` CC's stamp gate derives for the LOCAL credential,
-    or None when this does not derive one.
+#: The `kind` values CC's own `.stamp.json` schema admits (shipped 2.1.271
+#: binary: `kind:G(["org","key","wif","token"])`).
+_STAMP_KINDS = ("org", "key", "wif", "token")
 
-    THE LOCAL credential, never the pin's bearer -- read from the shipped
-    binary's `lve()` -> `Rn()` -> `Z()`: for the ordinary signed-in case (an
-    oauth login with a stored `organizationUuid`, CC's "store" branch) the
-    descriptor is `org:<organizationUuid lower>`, sha256'd (`nve`).
-    `_login_identity` already reads the same `oauthAccount` field CC's
-    `zf()` does, for the bridge-pointer carry above.
 
-    ONLY THE ORDINARY CASE. `lve()` tries an API key (`Th()`) and a WIF
-    profile (`lu()`) before it ever reaches the oauth-store branch, and
-    `Rn()` itself branches on where the active oauth token CAME from
-    (`yR()`: "store" | "env" | "fd" | "none") -- an env override derives a
-    DIFFERENT descriptor from `CLAUDE_CODE_ORGANIZATION_UUID`, not the
-    stored `oauthAccount`. `_login_identity`'s file can carry a stale
-    `organizationUuid` from a PREVIOUS oauth login while one of those other
-    modes is what is actually active, so an organizationUuid on disk is not
-    by itself evidence CC would derive identity this way -- narrowed here to
-    what is cheap to rule out: none of the known override variables set, and
-    the credential STORE itself (`_active_oauth_token`, not just the config
-    file) still names a real access token. WIF is not detected at all, and
-    a stale org left on a WIF or apiKeyHelper machine that clears neither
-    variable nor the stored token can still slip through. A WRONG identity
-    would only buy "foreign", which refuses exactly like "unstamped" does
-    (see `sweep_policy_once`), so an indeterminate case falls back to the
-    plain unlink instead of guessing.
+def _trusted_stamp_identity(existing, expected_sha):
+    """`(identity, kind, hipaa_seen)` from an EXISTING stamp CC itself can be
+    trusted to have written, or None.
+
+    GROUND TRUTH, not a guess. An earlier draft of this fix
+    (`_local_stamp_identity`) tried to re-derive `lve()`'s precedence -- an
+    API key, a WIF profile, an env/fd-overridden token, then the ordinary
+    oauth store -- from OUTSIDE CC's own process, using `_login_identity`'s
+    config-file read plus a check of the DAEMON's own `os.environ`.
+    Correctness review found that unreliable on two counts: the daemon's
+    environment is a fossil of whatever shell first spawned it (`_spawn_daemon`
+    copies it once, at launch), not the environment CC itself resolves
+    credentials in; and the guess covered neither `apiKeyHelper` nor WIF,
+    both of which `lve()` tries before the oauth-store branch. This instead
+    REUSES the identity CC's own last successful write already proved
+    correct for the credential active on THIS host -- nothing here is
+    derived independently of CC's own prior output.
+
+    Trusted only when the stamp's `sha` names `expected_sha` -- the body CC
+    actually validated it against, before this sweep does anything to
+    either file -- and the whole record still matches the shape CC's own
+    schema requires (`v`, `identity`, `kind`, `sha`, `confirmed_at`,
+    `hipaa_seen`); anything else carries no assurance CC computed it at
+    all, or that the account has not changed since. `expected_sha` itself
+    being unknown (the body was unreadable, or this is the very first
+    sweep) also trusts nothing: there is no claim to check the stamp
+    against.
+
+    A WRONG identity would only buy "foreign", which refuses exactly like
+    "unstamped" does (see `sweep_policy_once`), so an indeterminate case
+    falls back to the plain unlink instead of guessing.
     """
-    import hashlib
-    if any(os.environ.get(name) for name in
-           ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN")):
+    if (expected_sha is None or not isinstance(existing, dict)
+            or existing.get("sha") != expected_sha):
         return None
-    login = _login_identity()
-    if login is None:
+    identity = existing.get("identity")
+    kind = existing.get("kind")
+    hipaa_seen = existing.get("hipaa_seen")
+    confirmed_at = existing.get("confirmed_at")
+    if (existing.get("v") != 1
+            or not isinstance(identity, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", identity)
+            or kind not in _STAMP_KINDS
+            or not isinstance(existing["sha"], str)
+            or not (1 <= len(existing["sha"]) <= 128)
+            or not isinstance(confirmed_at, int)
+            or isinstance(confirmed_at, bool)
+            or confirmed_at < 0
+            or not isinstance(hipaa_seen, list)
+            or len(hipaa_seen) > 8):
         return None
-    _account_uuid, org_uuid = login
-    if not org_uuid or not _active_oauth_token():
-        return None
-    descriptor = f"org:{org_uuid.lower()}"
-    return hashlib.sha256(descriptor.encode("utf-8")).hexdigest(), "org"
+    return identity, kind, hipaa_seen
 
 
 class PinProxy:
@@ -12341,13 +12356,19 @@ class PinProxy:
         if not isinstance(doc, dict):
             return False
         path = _config_home_for_policy() / "policy-limits.json"
-        wrote = True
+        # THE BODY THAT WAS ON DISK BEFORE THIS CALL TOUCHES ANYTHING,
+        # captured once, up front: it is what any EXISTING stamp is a claim
+        # about, and stays the right reference for that claim whether this
+        # call goes on to replace it, skip it (already equal) or fail to
+        # write it (see the stamp section below).
+        old_doc, old_body_sha = None, None
         try:
-            if path.exists() and json.loads(
-                    path.read_text(encoding="utf-8")) == doc:
-                wrote = False      # already right; no write, no churn
-        except Exception:  # noqa: BLE001 — unreadable counts as "replace it"
+            if path.exists():
+                old_doc = json.loads(path.read_text(encoding="utf-8"))
+                old_body_sha = _canonical_body_sha(old_doc)
+        except Exception:  # noqa: BLE001 — unreadable: no reference sha
             pass
+        wrote = old_doc != doc
         write_failed = False
         if wrote:
             try:
@@ -12370,74 +12391,79 @@ class PinProxy:
         # the one thing that can catch it.
         #
         # SO THE WRITE MINTS THE SAME STAMP CC WOULD (`_canonical_body_sha`,
-        # `_local_stamp_identity`), not merely an ABSENT one. An unlink
-        # (making the file truly absent, not just wrong) only ever buys
-        # "legacy" — fine while nothing restamps it, but 2.1.273's
+        # `_trusted_stamp_identity`), not merely an ABSENT one, WHEN THERE
+        # IS A TRUSTED IDENTITY TO MINT IT WITH -- see that function: this
+        # is ground truth REUSED from CC's own last successful write, never
+        # a guess at what `lve()` would derive from outside CC's process. An
+        # unlink (making the file truly absent, not just wrong) only ever
+        # buys "legacy" — fine while nothing restamps it, but 2.1.273's
         # `restampConfirmedCache` stopped silently restamping a body it did
         # not mint, so "legacy" no longer self-heals into "match" either.
-        # WHEN THE LOCAL IDENTITY CANNOT BE DERIVED (no login, or a
-        # credential shape `_local_stamp_identity` does not cover), this
-        # still falls back to the plain unlink: a WRONG identity would only
-        # buy "foreign", which refuses exactly like "unstamped" does, so
+        # WITH NO TRUSTED IDENTITY (no prior stamp, or one that does not
+        # vouch for the body that was actually on disk), this still falls
+        # back to the plain unlink: a WRONG identity would only buy
+        # "foreign", which refuses exactly like "unstamped" does, so
         # guessing is never better than not guessing.
         #
-        # Skipped when an existing stamp already names this body's sha and
-        # this identity — no write, no churn, same discipline as the body
-        # above. Placed AFTER any write, not before: mid-write the state is
-        # "new stamp, old body" -> torn -> refused, the safe direction.
-        #
-        # A FAILED WRITE FORCES THE PLAIN UNLINK, unconditionally, same as
-        # it always has: `doc` is the FRESH fetch, but a failed write left
-        # the OLD body on disk, so minting a stamp for `doc` here would vouch
-        # for a body that is not actually there. The unlink is exactly as
-        # harmless on that path as on every other: old body, no stamp,
-        # reads as "legacy" and is served verbatim. Any OSError here is
-        # silently fine; this runs off the sweep's own timer and must never
-        # fail it.
+        # THE BODY THIS MINT VOUCHES FOR is whatever is ACTUALLY on disk
+        # once the write step above is done: `doc` only if the write just
+        # landed (`wrote and not write_failed`); `old_body_sha` on the skip
+        # path (already equal) AND on a failed write, where the OLD body is
+        # still what is really there — `doc` was never persisted, so a
+        # stamp naming `doc`'s sha would vouch for a body that does not
+        # exist on disk. When the target sha equals `old_body_sha`, the
+        # trusted stamp (which names `old_body_sha` by construction, see
+        # `_trusted_stamp_identity`) is already exactly right — no write, no
+        # churn, same discipline as the body itself. Placed AFTER any write,
+        # not before: mid-write the state is "new stamp, old body" -> torn
+        # -> refused, the safe direction. Any OSError here is silently
+        # fine; this runs off the sweep's own timer and must never fail it.
         stamp = path.with_name(path.name + ".stamp.json")
-        local_identity = None if write_failed else _local_stamp_identity()
+        trusted = _trusted_stamp_identity(_read_json(stamp), old_body_sha)
+        target_sha = (_canonical_body_sha(doc)
+                      if wrote and not write_failed else old_body_sha)
         healed = False
-        if local_identity is not None:
-            identity_hex, kind = local_identity
-            body_sha = _canonical_body_sha(doc)
-            existing = _read_json(stamp)
-            already_right = (isinstance(existing, dict)
-                              and existing.get("sha") == body_sha
-                              and existing.get("identity") == identity_hex)
-            if not already_right:
-                # hipaa_seen mirrors CC's own `bzn`: drop any earlier record
-                # of THIS identity, then re-add it only if the fresh body
-                # carries a "hipaa" taint, capped to the last 8 (CC's `ce`).
-                # Type-checked, not just truthy: a corrupt or foreign-shaped
-                # stamp (`hipaa_seen` not a list, e.g. a stray number) must
-                # not raise out of a timer callback that is swallowed
-                # upstream -- that would strand the heal permanently rather
-                # than just drop the one field's history.
-                prev_seen = existing.get("hipaa_seen") \
-                    if isinstance(existing, dict) else None
-                if not isinstance(prev_seen, list):
-                    prev_seen = []
-                seen = [h for h in prev_seen if h != identity_hex]
-                if "hipaa" in (doc.get("compliance_taints") or []):
-                    seen.append(identity_hex)
-                new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
-                             "sha": body_sha,
-                             "confirmed_at": int(time.time() * 1000),
-                             "hipaa_seen": seen[-8:]}
+        if trusted is not None and target_sha != old_body_sha:
+            identity_hex, kind, prev_seen = trusted
+            # hipaa_seen mirrors CC's own `bzn`: drop any earlier record of
+            # THIS identity, then re-add it only if the fresh body carries a
+            # "hipaa" taint, capped to the last 8 (CC's `ce`). `prev_seen`
+            # is already list-shaped -- `_trusted_stamp_identity` checked --
+            # so no further validation is owed here.
+            seen = [h for h in prev_seen if h != identity_hex]
+            if "hipaa" in (doc.get("compliance_taints") or []):
+                seen.append(identity_hex)
+            new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
+                         "sha": target_sha,
+                         "confirmed_at": int(time.time() * 1000),
+                         "hipaa_seen": seen[-8:]}
+            try:
+                # PID-SUFFIXED, matching `_mark_nohealth`'s convention: CC
+                # mints this same sidecar, and a draining daemon plus its
+                # successor both call this sweep against one config home, so
+                # an un-suffixed tmp name lets one writer's `replace`
+                # publish the other's half-written content.
+                tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(new_stamp), encoding="utf-8")
+                tmp.replace(stamp)  # atomic: no reader sees half a stamp
+                # NOT `healed = not wrote`: reaching this branch at all
+                # already requires `target_sha != old_body_sha`, which the
+                # ternary above only produces when `wrote and not
+                # write_failed` -- so a mint here never runs with `wrote`
+                # false, and `wrote`'s own message below always fires
+                # instead. `healed` stays for the unlink branch alone.
+            except OSError:
+                # A MINT THAT FAILS MUST NOT LEAVE THE OLD STAMP ATTACHED TO
+                # a body it no longer describes (its sha still names
+                # `old_body_sha`, now stale) -- that reads "unstamped" and
+                # refuses, where the unlink this falls through to reads
+                # "legacy" and serves, exactly the direction every other
+                # OSError on this path already takes.
                 try:
-                    # PID-SUFFIXED, matching `_mark_nohealth`'s convention:
-                    # CC mints this same sidecar, and a draining daemon plus
-                    # its successor both call this sweep against one config
-                    # home, so an un-suffixed tmp name lets one writer's
-                    # `replace` publish the other's half-written content.
-                    tmp = stamp.with_name(
-                        f"{stamp.name}.{os.getpid()}.tmp")
-                    tmp.write_text(json.dumps(new_stamp), encoding="utf-8")
-                    tmp.replace(stamp)  # atomic: no reader sees half a stamp
-                    healed = not wrote
+                    stamp.unlink(missing_ok=True)
                 except OSError:
                     pass
-        else:
+        elif trusted is None:
             healed = not wrote and stamp.exists()  # the skip path, present
             try:
                 stamp.unlink(missing_ok=True)
@@ -12450,14 +12476,15 @@ class PinProxy:
                            "these sessions travel as")
         elif healed:
             # THE ONLY OBSERVABLE of the skip-path heal actually firing: the
-            # body needed no write, but the stamp was still wrong. `healed`
-            # is set only where the write/unlink that follows it actually
-            # succeeded (see above), so a swallowed OSError logs nothing.
-            _log_lifecycle(
-                "refreshed the policy-cache stamp so CC's own gate reads "
-                "it as a match" if local_identity is not None else
-                "removed a stale policy-cache stamp left by an earlier "
-                "write")
+            # body needed no write, but a stamp was still there to remove
+            # (it did not vouch for the body that is really on disk, or
+            # `_trusted_stamp_identity` would have kept it and minted
+            # nothing here instead -- see the comment above `healed`'s
+            # unlink-branch assignment). `healed` is set only where the
+            # unlink that follows it actually succeeded, so a swallowed
+            # OSError logs nothing.
+            _log_lifecycle("removed a stale policy-cache stamp left by an "
+                           "earlier write")
         return wrote
 
     def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:

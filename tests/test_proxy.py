@@ -636,24 +636,34 @@ class TestHistoryCarriesAcrossASwitch:
             json.loads(line)          # every line still parses on its own
 
 
-def _set_known_local_identity(pin_proxy, monkeypatch, cfg, doc):
-    """Wire a `sweep_policy_once` case toward the "identity known" branch.
+_TEST_IDENTITY = hashlib.sha256(b"org:test-org").hexdigest()
 
-    `_local_stamp_identity` also demands no override env var and a real
-    stored oauth token (T0681 correctness review) -- clearing the former and
-    stubbing the latter here so a developer's own shell (an exported
-    `ANTHROPIC_API_KEY`, say) cannot silently move a case into the fallback
-    branch instead.
+
+def _canon_sha(doc):
+    """`_canonical_body_sha(doc)`, computed independently for a test's own
+    reference value -- see `_canonical_body_sha`'s own docstring for why
+    `ensure_ascii=False` is the one parameter that matters here."""
+    canon = json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
+
+
+def _seed_trusted_stamp(cfg, old_doc, *, identity=_TEST_IDENTITY, kind="org",
+                        hipaa_seen=None, confirmed_at=1):
+    """Leave `old_doc` on disk with a stamp CC itself could have minted for
+    it -- the ground truth `_trusted_stamp_identity` reuses (T0681
+    correctness review: no env var or credential-precedence guess is
+    trustworthy from outside CC's own process, so every case that wants the
+    "identity known" branch has to earn it this way, by construction).
+    Returns `old_doc`'s canonical sha.
     """
-    monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
-    monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
-    monkeypatch.setattr(pin_proxy, "_login_identity",
-                        lambda: ("acct-1", "Org-UUID-ABC"))
-    monkeypatch.setattr(pin_proxy, "_active_oauth_token",
-                        lambda: "active-token")
-    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                 "CLAUDE_CODE_OAUTH_TOKEN"):
-        monkeypatch.delenv(name, raising=False)
+    (cfg / "policy-limits.json").write_text(json.dumps(old_doc))
+    sha = _canon_sha(old_doc)
+    (cfg / "policy-limits.json.stamp.json").write_text(json.dumps({
+        "v": 1, "identity": identity, "kind": kind, "sha": sha,
+        "confirmed_at": confirmed_at, "hipaa_seen": hipaa_seen or [],
+    }))
+    return sha
 
 
 class TestLiveRemoteControlSessions:
@@ -1669,7 +1679,7 @@ class TestLiveRemoteControlSessions:
             "keeps failing leaves the OLD body permanently torn"
         )
 
-    def case_a_known_local_identity_gets_a_stamp_ccs_own_gate_reads_as_match(
+    def case_a_trusted_prior_stamp_carries_its_identity_onto_the_new_body(
         self, tmp_path, monkeypatch
     ):
         """THE PIN OWES A STAMP-AWARE WRITE, NOT JUST AN UNLINK (T0681).
@@ -1677,8 +1687,7 @@ class TestLiveRemoteControlSessions:
         2.1.271 gates the body on `policy-limits.json.stamp.json`:
         `stamp===null||stamp.sha!==bodySha` -> "unstamped" (refused);
         `stamp.identity!==identity` -> "foreign" (refused); else "match"
-        (served). `identity` comes from the LOCAL credential
-        (`lve()`/`zf()`'s `oauthAccount.organizationUuid`), never from the
+        (served). `identity` comes from the LOCAL credential, never from the
         pin's bearer -- so a pin-target change with the active account
         unchanged still reads "match" against the stale pinned body, and
         the plain unlink (this file's stopgap since T0656) only ever buys
@@ -1687,13 +1696,21 @@ class TestLiveRemoteControlSessions:
         "match" either -- the write has to mint the SAME stamp CC's own
         `bzn`/`Poe`/`lK` would.
 
+        THE IDENTITY ITSELF IS REUSED, NOT GUESSED (T0681 correctness
+        review): a prior draft tried to re-derive `lve()`'s precedence from
+        outside CC's own process and that proved unreliable, so
+        `_trusted_stamp_identity` instead carries forward whatever identity
+        a PRIOR stamp -- one that already vouched for the body that was on
+        disk before this sweep touched anything -- was written with. Here
+        that is the seeded stamp `_seed_trusted_stamp` leaves for the OLD
+        body; the fresh fetch below is a DIFFERENT document (the T0681
+        scenario: a pin-target change, active account unchanged), so the
+        write must carry the SAME identity onto the NEW body's own sha.
+
         MEASURED (reading of the shipped 2.1.271 binary, not guessed):
         `Poe(e){let n=lK(e),s=S(n);return`sha256:${sha256(s).hex}`}` where
         `lK` sorts every object's keys recursively (arrays keep their
-        order) and `S` is a compact `JSON.stringify` -- and
-        `nve(e){return sha256(e.descriptor).hex}` with `Z(orgUuid)` ->
-        `descriptor:"org:"+orgUuid.toLowerCase()` for the ordinary
-        oauth-store case `lve()`/`Rn()` resolve to.
+        order) and `S` is a compact `JSON.stringify`.
 
         This test reimplements CC's own three-way verdict (`fe`)
         independently of whatever the production code computes internally,
@@ -1705,18 +1722,22 @@ class TestLiveRemoteControlSessions:
 
         cfg = tmp_path / "config"
         cfg.mkdir()
-        doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
-               "compliance_taints": []}
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
 
-        _set_known_local_identity(pin_proxy, monkeypatch, cfg, doc)
+        fresh_doc = {
+            "restrictions": {"allow_remote_control": {"allowed": True}},
+            "compliance_taints": [],
+        }
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is True
 
         stamp_path = cfg / "policy-limits.json.stamp.json"
-        assert stamp_path.exists(), (
-            "the fix must WRITE a matching stamp, not unlink it away")
         stamp = json.loads(stamp_path.read_text())
 
         # THE FULL SHAPE, not only sha/identity: read from the shipped
@@ -1733,10 +1754,11 @@ class TestLiveRemoteControlSessions:
         assert isinstance(stamp["confirmed_at"], int) and stamp["confirmed_at"] >= 0
         assert isinstance(stamp["hipaa_seen"], list) and len(stamp["hipaa_seen"]) <= 8
 
-        canon = json.dumps(doc, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False)
-        body_sha = "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
-        identity = hashlib.sha256(b"org:org-uuid-abc").hexdigest()
+        assert stamp["identity"] == _TEST_IDENTITY, (
+            "the identity a prior, trusted write proved correct was not "
+            "carried onto the new body"
+        )
+        body_sha = _canon_sha(fresh_doc)
 
         def fe(stamp, identity, body_sha):
             """CC's own verdict function, reimplemented from the binary."""
@@ -1746,7 +1768,7 @@ class TestLiveRemoteControlSessions:
                 return "foreign"
             return "match"
 
-        verdict = fe(stamp, identity, body_sha)
+        verdict = fe(stamp, _TEST_IDENTITY, body_sha)
         assert verdict == "match", (
             f"CC's own gate reads this stamp as {verdict!r}, not a match "
             "-- exactly the refusal T0681 is about"
@@ -1759,27 +1781,22 @@ class TestLiveRemoteControlSessions:
         cfg = tmp_path / "config"
         cfg.mkdir()
         doc = {"restrictions": {}, "compliance_taints": []}
-        (cfg / "policy-limits.json").write_text(json.dumps(doc))
-
-        canon = json.dumps(doc, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False)
-        body_sha = "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
-        identity = hashlib.sha256(b"org:org-uuid-abc").hexdigest()
+        _seed_trusted_stamp(cfg, doc)
+        body_path = cfg / "policy-limits.json"
         stamp_path = cfg / "policy-limits.json.stamp.json"
-        stamp_path.write_text(json.dumps({
-            "v": 1, "identity": identity, "kind": "org", "sha": body_sha,
-            "confirmed_at": 1, "hipaa_seen": [],
-        }))
-        before = stamp_path.stat().st_mtime_ns
+        body_before = body_path.stat().st_mtime_ns
+        stamp_before = stamp_path.stat().st_mtime_ns
 
-        _set_known_local_identity(pin_proxy, monkeypatch, cfg, doc)
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is False
-        assert stamp_path.stat().st_mtime_ns == before, (
-            "a stamp that already named this body's sha and this identity "
-            "was rewritten anyway"
+        assert body_path.stat().st_mtime_ns == body_before
+        assert stamp_path.stat().st_mtime_ns == stamp_before, (
+            "a stamp that already named this body's sha and a trusted "
+            "identity was rewritten anyway"
         )
 
     def case_a_hipaa_taint_adds_this_identity_to_hipaa_seen(
@@ -1788,14 +1805,21 @@ class TestLiveRemoteControlSessions:
         """MIRRORS CC's OWN `bzn`: drop any earlier record of this identity,
         re-add it only when the fresh body carries a "hipaa" taint. Fail
         closed today, load-bearing the moment a pinned account's document
-        carries one (T0681's own framing)."""
+        carries one (T0681's own framing). ALSO PROVES OTHER IDENTITIES'
+        history survives the filter: `bzn` drops only entries EQUAL to the
+        current identity, never the whole list."""
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
         cfg.mkdir()
-        doc = {"restrictions": {}, "compliance_taints": ["hipaa"]}
+        other = "f" * 64
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, hipaa_seen=[other])
 
-        _set_known_local_identity(pin_proxy, monkeypatch, cfg, doc)
+        fresh_doc = {"restrictions": {}, "compliance_taints": ["hipaa"]}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
@@ -1803,8 +1827,7 @@ class TestLiveRemoteControlSessions:
 
         stamp = json.loads(
             (cfg / "policy-limits.json.stamp.json").read_text())
-        identity = hashlib.sha256(b"org:org-uuid-abc").hexdigest()
-        assert stamp["hipaa_seen"] == [identity]
+        assert stamp["hipaa_seen"] == [other, _TEST_IDENTITY]
 
     def case_no_hipaa_taint_leaves_hipaa_seen_empty(
         self, tmp_path, monkeypatch
@@ -1815,9 +1838,14 @@ class TestLiveRemoteControlSessions:
 
         cfg = tmp_path / "config"
         cfg.mkdir()
-        doc = {"restrictions": {}, "compliance_taints": []}
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
 
-        _set_known_local_identity(pin_proxy, monkeypatch, cfg, doc)
+        fresh_doc = {"restrictions": {"allow_web_fetch": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
@@ -1827,14 +1855,14 @@ class TestLiveRemoteControlSessions:
             (cfg / "policy-limits.json.stamp.json").read_text())
         assert stamp["hipaa_seen"] == []
 
-    def case_no_local_identity_still_falls_back_to_the_unlink(
+    def case_no_prior_stamp_falls_back_to_the_unlink(
         self, tmp_path, monkeypatch
     ):
-        """THE BOUNDARY THIS FIX DRAWS. No local login (or none
-        `_login_identity` derives an organization from) mints no stamp -- a
-        WRONG identity would only buy "foreign", which refuses exactly like
-        "unstamped" does, so this keeps the T0656 unlink as the honest
-        fallback rather than guess."""
+        """THE BOUNDARY THIS FIX DRAWS. Nothing on disk yet vouches for
+        anything (the very first sweep on a host, before CC has ever
+        written this sidecar itself) -- a WRONG identity would only buy
+        "foreign", which refuses exactly like "unstamped" does, so this
+        keeps the T0656 unlink as the honest fallback rather than guess."""
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
@@ -1845,49 +1873,40 @@ class TestLiveRemoteControlSessions:
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
         monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
-        monkeypatch.setattr(pin_proxy, "_login_identity", lambda: None)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is True
         assert not stamp.exists()
 
-    def case_a_failed_write_with_a_known_identity_still_only_unlinks(
+    def case_a_failed_write_leaves_a_trusted_prior_stamp_untouched(
         self, tmp_path, monkeypatch
     ):
-        """A KNOWN IDENTITY MUST NOT MINT A STAMP FOR A BODY NOT ON DISK.
+        """A FAILED WRITE MUST NOT DESTROY A STAMP THAT IS STILL RIGHT.
 
-        `doc` is the fresh fetch, but a failed write leaves the OLD body on
-        disk -- minting a stamp for `doc` here would vouch for a body that
-        was never actually written, which is worse than the plain unlink
-        this path always took: an absent stamp reads "legacy" and serves
-        the OLD body verbatim; a stamp naming the wrong sha reads "torn"
-        and refuses the OLD body outright."""
+        The fresh fetch differs from the OLD body, but the write of it
+        fails -- the OLD body is still what is really on disk, and the
+        seeded stamp already, correctly, vouches for exactly that body.
+        Unlinking it (T0656's old unconditional behaviour) would trade a
+        genuine "match" for "legacy" over nothing: no attacker, no drift,
+        just a filesystem fault the write already reported."""
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
         cfg.mkdir()
-        different = {"restrictions": {"allow_remote_control": {"allowed": False}}}
-        (cfg / "policy-limits.json").write_text(json.dumps(different))
-        stamp = cfg / "policy-limits.json.stamp.json"
-        stamp.write_text(json.dumps({"sha": "stale"}))
+        old_doc = {"restrictions": {"allow_remote_control": {"allowed": False}}}
+        _seed_trusted_stamp(cfg, old_doc)
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        stamp_before = stamp_path.read_text()
 
-        doc = {"restrictions": {}, "compliance_taints": []}
+        fresh_doc = {"restrictions": {}, "compliance_taints": []}
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
-        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
-        monkeypatch.setattr(pin_proxy, "_login_identity",
-                            lambda: ("acct-1", "Org-UUID-ABC"))
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
 
         real_write_text = Path.write_text
 
         def failing_write_text(self, *a, **kw):
-            # THE BODY'S TMP NAME EXACTLY, not a ".json.tmp" suffix match:
-            # the stamp's own tmp (`policy-limits.json.stamp.json.<pid>.tmp`)
-            # ends in ".tmp" too but never ".json.tmp", so this must not
-            # also fault the mint -- a broken gate that tried to mint one
-            # needs the injected fault to leave it, and only it, alone, or
-            # the mint's own OSError would be indistinguishable from the
-            # gate correctly skipping it.
             if self.name == "policy-limits.json.tmp":
                 raise OSError("simulated")
             return real_write_text(self, *a, **kw)
@@ -1897,9 +1916,13 @@ class TestLiveRemoteControlSessions:
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is False
-        assert not stamp.exists(), (
-            "a known identity minted a stamp for a body the failed write "
-            "never actually put on disk"
+        assert json.loads(
+            (cfg / "policy-limits.json").read_text()) == old_doc, (
+            "the body must be untouched when the write failed"
+        )
+        assert stamp_path.read_text() == stamp_before, (
+            "a stamp that still correctly vouched for the body actually on "
+            "disk was touched by a write that never landed"
         )
 
     def case_a_live_sessions_archived_bridge_is_revived(self, monkeypatch):
