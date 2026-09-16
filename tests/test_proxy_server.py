@@ -4624,15 +4624,73 @@ class TestChainRediscovery:
             )
 
             # Positive control: a hop that is NOT the ambient proxy is still
-            # asked, exactly once, and its answer still comes back.
+            # asked, exactly once, and its answer still comes back. No sleep
+            # needed here: `_probe_next_hop` only returns after the response
+            # has already been read, so the accept is already recorded.
             nxt = pp._probe_next_hop(other_url, own_proxy=ambient_url)
-            time.sleep(0.2)
             assert nxt == "http://127.0.0.1:2"
             assert other_accepted == [1], other_accepted
         finally:
             ambient_srv.close()
             other_srv.close()
 
+    def case_ensure_proxy_never_probes_the_wired_over_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        """The call site, not the comparison in isolation. `cswap pin`
+        normally runs in a plain shell with neither HTTPS_PROXY nor
+        https_proxy set, so the launch's own proxy is not read straight out
+        of the environment there — it falls back to what the pin's own env
+        block is currently displacing (`_wired_over_proxy`). That is still
+        this launch's own already-had proxy, and `ensure_proxy` must never
+        connect to it for `/health` either."""
+        import cswap_pin.proxy as pp
+
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        monkeypatch.delenv("https_proxy", raising=False)
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        accepted = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                accepted.append(1)
+                c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            wired = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            monkeypatch.setattr(pp, "_wired_over_proxy", lambda: wired)
+            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
+            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
+            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
+            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
+            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
+            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
+            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+
+            class _SW:
+                backup_dir = tmp_path
+
+                def resolve_account(self, email):
+                    return "1", email, None
+
+            got = pp.ensure_proxy(_SW())
+            time.sleep(0.2)
+            assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
+            assert accepted == [], (
+                "ensure_proxy asked the proxy this launch already had for "
+                "/health"
+            )
+        finally:
+            srv.close()
 
 
 
