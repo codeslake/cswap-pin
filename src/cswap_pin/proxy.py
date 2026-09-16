@@ -129,7 +129,9 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     return parse_upstream_proxy(_read_upstream(certdir, "proxy"))
 
 
-def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
+def _probe_next_hop(
+    value: str | None, timeout: float = 1.0, *, own_proxy: str | None = None,
+) -> str | None:
     """The proxy the recorded hop is ITSELF chaining to, asked of that hop.
 
     A local cache proxy reports its own upstream on ``/health`` while it is
@@ -142,17 +144,34 @@ def _probe_next_hop(value: str | None, timeout: float = 1.0) -> str | None:
     Loopback only. The next hop matters for a chain of local proxies; asking a
     remote corporate proxy for a /health it does not serve would spend the
     timeout on every launch.
+
+    ``own_proxy`` is the proxy this launch's own environment already named,
+    unrelated to any probing. A forward proxy answers a path-only request
+    line (what ``/health`` is, on the wire) with an error by definition — it
+    is not the origin-form request it was told to relay — and that error
+    lands in a log that is not ours to write into. Asking is only useful when
+    something wired this launch over the hop, so a hop that turns out to BE
+    the launch's own proxy is never asked at all: nothing was wired over it,
+    so there is no inner/outer distinction to learn, only the error to cause.
     """
     import http.client
 
     hop = parse_upstream_proxy(value)
-    if hop is None or hop.host not in _LOOPBACK or hop.tls:
+    if hop is None:
+        return None
+    own = parse_upstream_proxy(own_proxy)
+    if own is not None and own.address == hop.address:
+        return None
+    if hop.host not in _LOOPBACK or hop.tls:
         return None
     try:
         conn = http.client.HTTPConnection(hop.host, hop.port, timeout=timeout)
         try:
             conn.request("GET", "/health")
-            body = json.loads(conn.getresponse().read())
+            resp = conn.getresponse()
+            if resp.status != 200:
+                return None
+            body = json.loads(resp.read())
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 — an absent probe is "no next hop"
@@ -2311,6 +2330,17 @@ def _mode_of(path: Path, default: int) -> int:
         return default
 
 
+def _shell_proxy(env: dict[str, str] | None = None) -> str | None:
+    """The proxy this process's own environment already names, read fresh.
+
+    Never cached across calls: a probe's job is to learn what is wired over
+    a hop right now, and a value remembered from an earlier read can name a
+    different program a minute later.
+    """
+    src = os.environ if env is None else env
+    return src.get("HTTPS_PROXY") or src.get("https_proxy")
+
+
 def _ambient_chain(
     env: dict[str, str] | None = None, certdir: Path | None = None
 ) -> "tuple[str | None, str | None]":
@@ -2324,7 +2354,7 @@ def _ambient_chain(
     inner proxy to the outer one.
     """
     src = os.environ if env is None else env
-    shell_value = src.get("HTTPS_PROXY") or src.get("https_proxy")
+    shell_value = _shell_proxy(env)
     hop = _ambient_proxy(env, certdir)
     shell_parsed = parse_upstream_proxy(shell_value)
     hop_parsed = parse_upstream_proxy(hop)
@@ -6038,7 +6068,10 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         certdir,
         ambient,
         os.environ.get("NODE_EXTRA_CA_CERTS"),
-        next_hop=_probe_next_hop(ambient or _read_upstream(certdir, "proxy"))
+        next_hop=_probe_next_hop(
+            ambient or _read_upstream(certdir, "proxy"),
+            own_proxy=_shell_proxy(),
+        )
         or observed_next,
     )
     fp = daemon_fingerprint(account_num, email)
@@ -16133,7 +16166,7 @@ class PinProxy:
         recorded = _read_upstream(self._certdir, "proxy")
         if not recorded:
             return
-        nxt = _probe_next_hop(recorded)
+        nxt = _probe_next_hop(recorded, own_proxy=_shell_proxy())
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down
         # would erase a next hop learned while it was up, at the moment it

@@ -4558,6 +4558,81 @@ class TestChainRediscovery:
         hops = pp._chain_hops(certdir)
         assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
 
+    def case_a_hop_that_is_the_launchs_own_proxy_is_never_asked(self, certdir):
+        """A forward proxy answers a path-only request line with an error BY
+        DEFINITION, and writes that error into its own log — somebody else's
+        log, when that proxy is a machine's shared egress. Asking is only
+        useful when something wired this launch OVER the hop; when the hop
+        IS the launch's own proxy, nothing was wired over it, so the probe
+        can only cause the error, never learn anything from it.
+
+        The discriminator is connections accepted, not the return value: the
+        old code also returns None for a hop that never answers, so a bare
+        `is None` on the result would pass unchanged."""
+        import cswap_pin.proxy as pp
+
+        def health_server(next_hop):
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            accepted = []
+
+            def serve():
+                while True:
+                    try:
+                        c, _ = srv.accept()
+                    except OSError:
+                        return
+                    accepted.append(1)
+                    try:
+                        buf = b""
+                        while b"\r\n\r\n" not in buf:
+                            d = c.recv(4096)
+                            if not d:
+                                break
+                            buf += d
+                        body = json.dumps(
+                            {"status": "ok", "https_proxy": next_hop}
+                        ).encode()
+                        c.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            b"Content-Length: " + str(len(body)).encode()
+                            + b"\r\n\r\n" + body
+                        )
+                    except OSError:
+                        pass
+                    finally:
+                        c.close()
+
+            threading.Thread(target=serve, daemon=True).start()
+            return srv, accepted
+
+        ambient_srv, ambient_accepted = health_server("http://127.0.0.1:1")
+        other_srv, other_accepted = health_server("http://127.0.0.1:2")
+        try:
+            ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
+            other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
+
+            # The hop asked IS the launch's own ambient proxy: nothing wired
+            # this launch over it, so it is never even connected to.
+            nxt = pp._probe_next_hop(ambient_url, own_proxy=ambient_url)
+            time.sleep(0.2)
+            assert nxt is None
+            assert ambient_accepted == [], (
+                "the launch's own proxy was asked for /health anyway"
+            )
+
+            # Positive control: a hop that is NOT the ambient proxy is still
+            # asked, exactly once, and its answer still comes back.
+            nxt = pp._probe_next_hop(other_url, own_proxy=ambient_url)
+            time.sleep(0.2)
+            assert nxt == "http://127.0.0.1:2"
+            assert other_accepted == [1], other_accepted
+        finally:
+            ambient_srv.close()
+            other_srv.close()
+
 
 
 

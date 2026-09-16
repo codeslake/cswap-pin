@@ -20960,7 +20960,7 @@ class TestAHandoverIsNotAFailure:
         monkeypatch.setattr(pin_proxy, "_carry_history_pointers", lambda _cd: None)
         monkeypatch.setattr(pin_proxy, "_ambient_chain",
                             lambda certdir=None: (None, None))
-        monkeypatch.setattr(pin_proxy, "_probe_next_hop", lambda _a: None)
+        monkeypatch.setattr(pin_proxy, "_probe_next_hop", lambda *_a, **_k: None)
         monkeypatch.setattr(pin_proxy, "write_upstream_hint",
                             lambda *_a, **_k: None)
         monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *_a: "FP")
