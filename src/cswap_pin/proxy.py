@@ -171,7 +171,7 @@ def _probe_next_hop(
     inherited proxy can equal the very hop it is asking about — `_spawn_daemon`
     copies the parent's ``os.environ`` into the child, minus the two hand-down
     fd variables it scrubs, and ``ambient`` is that shell's own exported proxy
-    in the common case.
+    when it names one.
     Passing ``own_proxy`` there would refuse the probe that lets the daemon
     learn the hop behind it — the 9901→8118 case is the one ``learn_next_hop``'s
     own docstring records from the actual 2026-08-04 upstream.json (no
@@ -195,15 +195,18 @@ def _probe_next_hop(
     own = parse_upstream_proxy(own_proxy)
     if own is not None and own.address == hop.address:
         return None
-    # ponytail: ceiling, not closed here. `_ambient_proxy` can prefer a
-    # recorded serving loopback proxy over the shell's own HTTPS_PROXY, so
-    # `value` (what gets probed) and `own_proxy` (the shell's raw export)
-    # can be two different loopback addresses — this guard does not fire,
-    # and a hop already known to answer 4xx still gets one /health per
-    # launch, forever, because a launch is a fresh process and
-    # `_ASKED_NOHEALTH` cannot amortise across launches. The only mechanism
-    # that ever covered that gap was the unexpirable disk `nohealth` record
-    # the owner withdrew; no replacement is built here.
+    # ponytail: ceiling, not closed here. This guard only helps when
+    # `own_proxy` is present AND equals the probed hop's address. The
+    # ORDINARY launch (`cswap pin` from a plain shell, per `_ambient_proxy`'s
+    # own docstring) exports nothing, so `own` is None here and the guard
+    # never fires at all; a launcher shell that DOES export one can still
+    # differ from `value`, because `_ambient_proxy` prefers a recorded
+    # serving loopback proxy over the shell's own HTTPS_PROXY. Either shape
+    # leaves a 4xx hop getting one /health per launch, forever, because a
+    # launch is a fresh process and `_ASKED_NOHEALTH` cannot amortise across
+    # launches. The only mechanism that ever covered that gap was the
+    # unexpirable disk `nohealth` record the owner withdrew; no replacement
+    # is built here.
     if hop.host not in _LOOPBACK or hop.tls:
         return None
     address = f"{hop.host}:{hop.port}"
