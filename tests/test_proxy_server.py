@@ -4558,6 +4558,137 @@ class TestChainRediscovery:
         hops = pp._chain_hops(certdir)
         assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
 
+    def case_a_hop_that_answers_non_200_is_not_asked_again(self, certdir):
+        """MEASURED (sandbox privoxy 4.2.0, the owner's own config): no
+        request form `_probe_next_hop` could send is both quiet on privoxy's
+        own log and answered by CCF, which matches origin-form
+        ``GET /health`` only — origin-form, absolute-form and ``OPTIONS *``
+        each trip privoxy's own "isn't configured to accept intercepted
+        requests" error, logged as THAT proxy's error, not ours to keep
+        causing. A hop that answers with a real HTTP response carrying a
+        non-200 status is exactly this shape — something is there, but it is
+        not a /health server — so once known it must not be probed again."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        handled = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                handled.append(1)
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = b"Error: invalid request"
+                    c.sendall(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            nxt = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt is None
+            assert handled == [1], handled
+
+            # A second probe, same certdir: the gate must return None
+            # without opening a socket at all.
+            nxt2 = pp._probe_next_hop(url, certdir=certdir)
+            assert nxt2 is None
+            assert handled == [1], (
+                "a hop already known to answer non-200 was asked again")
+        finally:
+            srv.close()
+
+    def case_a_dead_hop_records_nothing_and_is_reprobed_once_it_answers(
+        self, certdir
+    ):
+        """A CCF that is merely DOWN must still be asked when it comes back —
+        only a hop that positively answered something other than 200 is
+        remembered. Same address, dead first, then serving: nothing about the
+        earlier failure should have been written against it."""
+        import cswap_pin.proxy as pp
+
+        dead = self._dead_port()
+        nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}", certdir=certdir)
+        assert nxt is None
+        assert pp._read_upstream(certdir, "nohealth") is None, (
+            "a hop that never answered was recorded as nohealth")
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", dead))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://127.0.0.1:8118"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}", certdir=certdir)
+            assert nxt == "http://127.0.0.1:8118", (
+                "the earlier failure to answer at all must not have been "
+                "recorded against this address")
+        finally:
+            srv.close()
+
+    def case_write_upstream_hint_preserves_nohealth_across_a_re_stamp(
+        self, certdir
+    ):
+        """`write_upstream_hint` rewrites the whole record for its OWN
+        reasons (a new proxy/ca/next observed at launch) and has no opinion
+        on which hops answered /health — a re-stamp must carry that key
+        through unchanged, not drop it back to absent."""
+        import cswap_pin.proxy as pp
+
+        pp._mark_nohealth(certdir, "127.0.0.1:9999")
+        assert pp._read_upstream(certdir, "nohealth") == "127.0.0.1:9999"
+
+        pp.write_upstream_hint(certdir, "http://127.0.0.1:9901")
+        assert pp._read_upstream(certdir, "nohealth") == "127.0.0.1:9999", (
+            "a re-stamp for the proxy/ca/next fields erased the nohealth "
+            "record")
+
     def case_a_hop_that_is_the_launchs_own_proxy_is_never_asked(self, certdir):
         """A forward proxy answers a path-only request line with an error BY
         DEFINITION, and writes that error into its own log — somebody else's

@@ -129,8 +129,42 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     return parse_upstream_proxy(_read_upstream(certdir, "proxy"))
 
 
+def _mark_nohealth(certdir: Path, address: str) -> None:
+    """Record that ``address`` answered but is not a /health server.
+
+    MEASURED (sandbox privoxy 4.2.0, the owner's own config): no request form
+    is both quiet on privoxy's own log and answered by CCF (which matches
+    origin-form ``GET /health`` only) — origin-form, absolute-form and
+    ``OPTIONS *`` each trip privoxy's "isn't configured to accept intercepted
+    requests" error. A hop that answers with a non-200 status is exactly that:
+    something is there, but it is not a /health server, and asking again on
+    every launch (`ensure_proxy`) and every daemon code-watch tick
+    (`learn_next_hop`) repeats the same error for nothing.
+
+    A merge-write, not ``write_upstream_hint``: that function rewrites
+    ``proxy``/``ca``/``next`` for a launch's own reasons and has no opinion on
+    this key, so it is written here directly, tmp+replace, preserving whatever
+    else is on disk.
+    """
+    path = Path(certdir) / _UPSTREAM_FILE
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw["nohealth"] = address
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(raw))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
 def _probe_next_hop(
-    value: str | None, timeout: float = 1.0, *, own_proxy: str | None = None,
+    value: str | None, timeout: float = 1.0, *,
+    own_proxy: str | None = None, certdir: Path | None = None,
 ) -> str | None:
     """The proxy the recorded hop is ITSELF chaining to, asked of that hop.
 
@@ -153,6 +187,14 @@ def _probe_next_hop(
     something wired this launch over the hop, so a hop that turns out to BE
     the launch's own proxy is never asked at all: nothing was wired over it,
     so there is no inner/outer distinction to learn, only the error to cause.
+
+    ``certdir``, when given, gates against ``upstream.json``'s ``"nohealth"``
+    record: a hop already known to answer something other than a /health
+    server is not asked again — no socket, no error, no repeat log line. A
+    hop that answers 200 clears nothing here (this function does not write a
+    200 result); a hop that never answers at all (a dead port, a timeout, an
+    unreadable body) is not recorded either, because a CCF that is merely
+    down must still be asked once it comes back.
     """
     import http.client
 
@@ -164,12 +206,17 @@ def _probe_next_hop(
         return None
     if hop.host not in _LOOPBACK or hop.tls:
         return None
+    address = f"{hop.host}:{hop.port}"
+    if certdir is not None and _read_upstream(certdir, "nohealth") == address:
+        return None
     try:
         conn = http.client.HTTPConnection(hop.host, hop.port, timeout=timeout)
         try:
             conn.request("GET", "/health")
             resp = conn.getresponse()
             if resp.status != 200:
+                if certdir is not None:
+                    _mark_nohealth(certdir, address)
                 return None
             body = json.loads(resp.read())
         finally:
@@ -247,10 +294,16 @@ def write_upstream_hint(
         # so an authenticated or TLS corporate proxy survived exactly until the
         # next re-pin, then every pinned request 407'd.
         keep_proxy = _read_upstream(certdir, "proxy") or ""
+    # This function has no opinion on which hops answered /health — that is
+    # `_probe_next_hop`/`_mark_nohealth`'s record — so a re-stamp for
+    # proxy/ca/next reasons must carry it through unchanged rather than
+    # dropping it back to "".
+    keep_nohealth = _read_upstream(certdir, "nohealth") or ""
     try:
-        tmp.write_text(json.dumps(
-            {"proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next}
-        ))
+        tmp.write_text(json.dumps({
+            "proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next,
+            "nohealth": keep_nohealth,
+        }))
         tmp.replace(path)
     except OSError:
         pass
@@ -6081,6 +6134,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         next_hop=_probe_next_hop(
             ambient or _read_upstream(certdir, "proxy"),
             own_proxy=_shell_proxy(),
+            certdir=certdir,
         )
         or observed_next,
     )
@@ -12202,6 +12256,20 @@ class PinProxy:
             tmp.replace(path)      # atomic: no reader sees half a document
         except OSError:
             return False
+        # CC gates this file on a sidecar, `policy-limits.json.stamp.json`,
+        # left by ITS OWN last fetch. A stale stamp (`sha` no longer matching
+        # what we just wrote) reads "torn" and CC refuses the body outright;
+        # an ABSENT stamp reads "legacy" and CC serves the body verbatim, no
+        # age or identity check. So the write above, unaccompanied, left the
+        # document CC would never trust again — unlink the stamp so the next
+        # read takes the legacy branch. Missing is the normal case (an older
+        # host writes no stamp at all), so a missing file or any OSError here
+        # is silently fine; this runs off the sweep's own timer and must
+        # never fail it.
+        try:
+            path.with_name(path.name + ".stamp.json").unlink(missing_ok=True)
+        except OSError:
+            pass
         _log_lifecycle("refreshed the org-policy cache for the account "
                        "these sessions travel as")
         return True
@@ -16176,7 +16244,8 @@ class PinProxy:
         recorded = _read_upstream(self._certdir, "proxy")
         if not recorded:
             return
-        nxt = _probe_next_hop(recorded, own_proxy=_shell_proxy())
+        nxt = _probe_next_hop(
+            recorded, own_proxy=_shell_proxy(), certdir=self._certdir)
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down
         # would erase a next hop learned while it was up, at the moment it

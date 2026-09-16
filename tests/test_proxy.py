@@ -1474,6 +1474,111 @@ class TestLiveRemoteControlSessions:
         assert json.loads(cache.read_text()) == stale, (
             "an unaskable policy cleared the cache, and absent is DENIED")
 
+    def case_a_write_removes_the_stamp_that_would_refuse_it(
+        self, tmp_path, monkeypatch
+    ):
+        """CC 2.1.271 GATES THE BODY ON A SIDECAR STAMP LEFT BY ITS OWN FETCH.
+
+        MEASURED (reading of the shipped bundle): the stamp records the SHA of
+        the body it was written for. When the sha on disk no longer matches
+        (exactly what our unaccompanied write produces — CC's stamp is for the
+        PREVIOUS body), `fe()` reads "torn" and `Din()` returns null: CC
+        refuses the document outright. So the write must remove the sidecar it
+        just invalidated.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "stale"}))
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads((cfg / "policy-limits.json").read_text()) == doc
+        assert not stamp.exists(), (
+            "the stale stamp survived the write, so CC reads the fresh body "
+            "as torn and refuses it")
+
+    def case_a_skipped_write_leaves_the_stamp_alone(self, tmp_path, monkeypatch):
+        """THE SKIP-WHEN-EQUAL PATH NEVER WRITES, SO IT MUST NEVER UNLINK.
+
+        When the body on disk already matches, a stamp there is CC's OWN — it
+        vouches for exactly that body, reading "match". Removing it would
+        downgrade a body CC already trusts to "legacy" for nothing.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+        (cfg / "policy-limits.json").write_text(json.dumps(doc))
+        stamp = cfg / "policy-limits.json.stamp.json"
+        stamp.write_text(json.dumps({"sha": "current"}))
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is False
+        assert stamp.exists() and json.loads(stamp.read_text()) == {
+            "sha": "current"
+        }, "the skip-when-equal path touched a stamp it never wrote to"
+
+    def case_no_stamp_on_disk_is_the_normal_case(self, tmp_path, monkeypatch):
+        """OLDER HOSTS WRITE NO STAMP AT ALL. The unlink must be a quiet no-op
+        when there is nothing to remove, and the write itself must still
+        succeed."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads((cfg / "policy-limits.json").read_text()) == doc
+        assert not (cfg / "policy-limits.json.stamp.json").exists()
+
+    def case_the_unlink_raising_does_not_break_the_sweep(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SWEEP IS A TIMER CALLBACK and must stay non-fatal. An OSError
+        out of the unlink (e.g. a permissions race) must not propagate and
+        must not change the sweep's own return value."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        doc = {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        real_unlink = Path.unlink
+
+        def raising_unlink(self, *a, **kw):
+            if self.name.endswith(".stamp.json"):
+                raise OSError("simulated")
+            return real_unlink(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", raising_unlink)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads((cfg / "policy-limits.json").read_text()) == doc
+
     def case_a_live_sessions_archived_bridge_is_revived(self, monkeypatch):
         """AN ARCHIVED BRIDGE UNDER A LIVE SESSION IS A BROKEN RECONNECT.
 
