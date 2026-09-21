@@ -5079,7 +5079,17 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # real failure itself and answers False for both "could not write" and
     # "already correct", so an `except` around it guards a case that cannot
     # arrive -- a lock timeout, which this path can now hit, was silent here.
-    identity = remember_pin_identity(certdir, identity) or identity
+    #
+    # ONLY WHEN THERE IS SOMETHING NEW TO CACHE. `remember_pin_identity(...,
+    # None)` is the CLEAR call, and this is the SET arm -- a re-pin whose
+    # caller could not resolve an identity this time (`identity` arrives
+    # None; "only cswap can resolve one", see the docstring above) must not
+    # take that same branch and unlink whatever a PRIOR, successful arm
+    # already cached. `_current_target` now reads that file's mere presence
+    # as "this pin is still live", so wiping it here would misreport a live
+    # pin as cleared the next time settings.json itself goes unreadable.
+    if identity:
+        identity = remember_pin_identity(certdir, identity) or identity
     try:
         if not splice_config_identity(identity):
             now = _login_identity()
@@ -5116,10 +5126,20 @@ def remember_pin_identity(certdir, identity: dict | None) -> "dict | None":
     """
     p = Path(certdir) / _PIN_IDENTITY_NAME
     if not identity:
+        # `missing_ok=True` already absorbs "was never there" -- anything
+        # still raising here is a REFUSED unlink (permission denied, a
+        # read-only mount), and `_current_target` now reads this file's
+        # mere presence as "not a deliberate clear". A silent `pass` would
+        # make that clear un-clear forever with nothing to say why; loud
+        # instead, the same choice `apply_pin` already makes for a failed
+        # `splice_config_identity` a few lines above its own call here.
         try:
             p.unlink(missing_ok=True)
-        except OSError:
-            pass
+        except OSError as exc:
+            _log_lifecycle(
+                f"could not forget the cleared pin's remembered identity "
+                f"({exc!r}) -- it will keep reading as pinned until this "
+                "is removed by hand")
         return None
     kept = remembered_pin_identity(certdir)
     if (kept and kept.get("accountUuid") == identity.get("accountUuid")
@@ -5474,8 +5494,21 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         (`pin-identity.json`, in ITS OWN certdir -- never the rewritten
         backup-store checkout `load_pin` just failed to read) still names an
         account: a deliberate clear unlinks that file
-        (`remember_pin_identity(certdir, None)`), so a real clear and a lost
-        record can never both leave it standing."""
+        (`remember_pin_identity(certdir, None)`), while `apply_pin`'s SET arm
+        skips the write entirely rather than unlinking when it has no fresh
+        identity to cache -- so of the two writers, only a clear ever
+        removes it. (The one gap this cannot close from here: an unlink the
+        filesystem itself refuses. `remember_pin_identity` logs that loudly
+        instead of pretending it happened.)
+
+        RESOLVED THROUGH `remembered`, NOT `account_num`/`email`. Those are
+        this DAEMON's spawn-time account and go stale the moment `cswap pin
+        <other>` re-pins it without a respawn
+        (`case_provider_follows_a_repin_without_a_respawn`) -- falling back
+        to them here would splice yesterday's account into today's bearer.
+        The remembered identity is what the daemon itself last confirmed
+        pinning, so it is resolved the same way `pin[0]` is below.
+        """
         _exc = require("exceptions")
         AccountNotFoundError, ConfigError = _exc.AccountNotFoundError, _exc.ConfigError
 
@@ -5489,6 +5522,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 provider._lost_record = False
                 return None
             _note_lost_record()
+            ident = remembered.get("emailAddress") or remembered.get("accountUuid")
+            if ident:
+                try:
+                    num, mail, _ = switcher.resolve_account(ident)
+                    return num, mail
+                except (AccountNotFoundError, ConfigError, Exception):
+                    pass
             return account_num, email
         provider._lost_record = False
         try:
