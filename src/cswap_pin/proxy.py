@@ -5141,19 +5141,16 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             _log_lifecycle("could not clear the pin — the config lock was "
                            "not free, so the wiring and the record were "
                            "both left as they were; try again")
-            # THE ONE THING THAT DOES NOT STAND: `pin-identity.json`. This
-            # package's only in-tree caller does not trust this return value
-            # -- it re-reads the record itself and force-clears it when the
-            # record is still there, which undoes the "leave it standing"
-            # above regardless of what this function decided. Once that
-            # happens, `heal`'s wiring-receipt restore (see
-            # `_restore_record_from_wiring`) would otherwise rebuild the
-            # record from this file and silently re-pin a box the operator
-            # asked to clear. Dropping it here costs nothing when the record
-            # DOES survive (nothing reads it while a record exists) and is
-            # the only thing that keeps a clear a caller force-finishes from
-            # coming back.
-            remember_pin_identity(certdir, None)
+            # `pin-identity.json` STAYS, on purpose. This path leaves the pin
+            # recorded, wired and still serving -- exactly the state where
+            # `_pointer_owner`, `carry_live_pointers` and
+            # `_freshen_pin_identity` read this file to keep live sessions'
+            # bridge pointers attributed to the pinned account rather than
+            # falling back to whoever is logged in right now. Dropping it
+            # here would tear that off a pin that never stopped serving, to
+            # guard against a caller that force-clears the record anyway --
+            # if one does, the wiring is still the true state, and a later
+            # `heal` re-syncing the record to it is convergence, not a bug.
             return True
         save_pin(switcher.backup_dir, email, org_uuid)
         # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
@@ -5187,8 +5184,18 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             # same window exists again after this line, just smaller, and
             # closing it fully needs `heal` itself to re-check `load_pin`
             # immediately before it wires, not a fix in this arm.
-            wire_global_config(None, None)
-            _log_carry(certdir, "a racing re-wire was undone after the clear")
+            # THE RETURN, NOT AN ASSUMPTION: this call can lose the same
+            # lock the whole reorder is for, and "undone" printed over a
+            # wiring that is still dangling is the exact silence this
+            # change exists to end.
+            if wire_global_config(None, None):
+                _log_carry(certdir,
+                           "a racing re-wire was undone after the clear")
+            else:
+                _log_carry(certdir,
+                           "a racing re-wire could not be undone after the "
+                           "clear — the config may still point at the old "
+                           "pin")
         _log_carry(certdir, "cleared the pin: unwired .claude.json first, "
                              "then dropped the settings.json record")
         return False

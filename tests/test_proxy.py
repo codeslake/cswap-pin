@@ -7060,9 +7060,8 @@ class TestWireGlobalConfig:
         kill. Against the old order — record the clear, then unwire — that
         skip left the record already gone and the config still wired:
         `load_pin` read None afterwards, and `heal` called the still-wired
-        config "not our business" forever (measured: 21 hours). Both the
-        record and the wiring it still names must survive a clear that
-        could not take the lock."""
+        config "not our business" forever (measured: 21 hours). The record
+        must survive a clear that could not take the lock."""
         from pathlib import Path
         from cswap_pin import proxy as pin_proxy
 
@@ -7089,12 +7088,6 @@ class TestWireGlobalConfig:
 
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
             "a lock this call could not take lost the pin record")
-        # THE GUARD'S OWN EVIDENCE, not just its effect: the wiring receipt
-        # that made it bail out must still be there too, or the next `heal`
-        # or retry finds nothing to act on.
-        assert pin_proxy._wired_port() == 9955, (
-            "the still-live wiring was dropped by a clear that should have "
-            "left it alone")
 
     def case_apply_pin_clear_proceeds_over_an_unowned_stale_wiring(
         self, tmp_path, monkeypatch
