@@ -5128,7 +5128,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             # that as "still wired" here would refuse every future clear on
             # a host in that state forever. Recording the clear anyway would
             # drop the only place a retry or `heal` can still find a wiring
-            # that IS still ours. Leave everything standing so the next
+            # that IS still ours. Leave the record standing so the next
             # attempt finds the pin exactly as it was.
             # BOTH CHANNELS: `_log_carry` outlives the launch that wrote it,
             # but a hand-run `--clear` is not about to `os.execvpe` into
@@ -5141,6 +5141,19 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             _log_lifecycle("could not clear the pin — the config lock was "
                            "not free, so the wiring and the record were "
                            "both left as they were; try again")
+            # THE ONE THING THAT DOES NOT STAND: `pin-identity.json`. This
+            # package's only in-tree caller does not trust this return value
+            # -- it re-reads the record itself and force-clears it when the
+            # record is still there, which undoes the "leave it standing"
+            # above regardless of what this function decided. Once that
+            # happens, `heal`'s wiring-receipt restore (see
+            # `_restore_record_from_wiring`) would otherwise rebuild the
+            # record from this file and silently re-pin a box the operator
+            # asked to clear. Dropping it here costs nothing when the record
+            # DOES survive (nothing reads it while a record exists) and is
+            # the only thing that keeps a clear a caller force-finishes from
+            # coming back.
+            remember_pin_identity(certdir, None)
             return True
         save_pin(switcher.backup_dir, email, org_uuid)
         # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
@@ -5157,20 +5170,23 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                            "config — bridges keep its owner until the next "
                            "switch")
         remember_pin_identity(certdir, None)
-        if _wired_port() is not None:
+        if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
             # A RACING `heal`, NOT A RETRY OF OURS. `heal` reads `load_pin`
             # once per launch and re-wires a pinned-but-unwired host on its
             # own account -- it has no way to know a clear is in flight, and
             # the window this reorder opens (wiring gone, record still
-            # there) is exactly the shape it repairs. `wire_global_config`
-            # is safe to call again regardless of who wrote what is there
-            # now: it only ever touches a key it can prove is its own, so
-            # this either undoes a re-wire landed in that window or is a
-            # harmless no-op. Narrows the remaining race rather than closing
-            # it -- the same window exists again after this line, just
-            # smaller, and closing it fully needs `heal` itself to
-            # re-check `load_pin` immediately before it wires, not a fix in
-            # this arm.
+            # there) is exactly the shape it repairs. THE SAME RECEIPT AS
+            # THE GUARD ABOVE, not `_wired_port()`: a stale-unowned-keys host
+            # that guard already lets through would otherwise trip this
+            # check too, calling a no-op `wire_global_config` and logging a
+            # "re-wire undone" that never happened. `wire_global_config` is
+            # safe to call again regardless of who wrote what is there now:
+            # it only ever touches a key it can prove is its own, so this
+            # either undoes a re-wire landed in that window or is a harmless
+            # no-op. Narrows the remaining race rather than closing it -- the
+            # same window exists again after this line, just smaller, and
+            # closing it fully needs `heal` itself to re-check `load_pin`
+            # immediately before it wires, not a fix in this arm.
             wire_global_config(None, None)
             _log_carry(certdir, "a racing re-wire was undone after the clear")
         _log_carry(certdir, "cleared the pin: unwired .claude.json first, "
@@ -5308,14 +5324,20 @@ def _restore_record_from_wiring(
 
     Never raises: called from `heal`, which runs from an rc hook before
     every launch.
+
+    THE CHEAP MISS FIRST. `rewire_if_version_changed`'s own contract is "an
+    unwired machine must not pay for this" (see that function) -- a machine
+    that never pinned has no `pin-identity.json` at all, so checking it
+    first answers with one small file read instead of parsing the whole
+    global config on every `pin --ensure` a never-pinned host runs.
     """
     try:
+        ident = remembered_pin_identity(certdir)
+        if not ident or not ident.get("emailAddress"):
+            return None
         cfg = require("paths").get_global_config_path()
         raw = _read_json(cfg)
         if not _read_ledger(cfg, raw).get(_WIRE_MARK):
-            return None
-        ident = remembered_pin_identity(certdir)
-        if not ident or not ident.get("emailAddress"):
             return None
         email = str(ident["emailAddress"])
         org = str(ident.get("organizationUuid") or "")

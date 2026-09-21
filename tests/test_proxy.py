@@ -7096,6 +7096,39 @@ class TestWireGlobalConfig:
             "the still-live wiring was dropped by a clear that should have "
             "left it alone")
 
+    def case_apply_pin_clear_proceeds_over_an_unowned_stale_wiring(
+        self, tmp_path, monkeypatch
+    ):
+        """THE DISCRIMINATOR the guard above needs: a bare `CSWAP_PIN_PORT`
+        in the config is not proof the wiring is ours. A host whose receipt
+        for an old wiring was lost some other way still carries the keys in
+        `.claude.json`, but neither the sidecar nor the config names
+        `_cswapPinWiredKeys` -- `wire_global_config` itself already refuses
+        to touch keys it cannot prove are its to remove, and answers False
+        for that exactly as it does for a lock it could not take. A guard
+        keyed on the bare port would read this as "still wired" and refuse
+        this host's every future clear forever; keyed on the receipt, it
+        must let the clear through."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        self._config(tmp_path, monkeypatch, {
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:9999",
+                    "CSWAP_PIN_PORT": "9999"},
+        })
+        backup = Path(tmp_path)
+        pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        pin_proxy.apply_pin(_Sw(), None, None)
+
+        assert pin_proxy.load_pin(backup) is None, (
+            "an unowned, receipt-less wiring refused the clear forever")
+
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
         from cswap_pin.proxy import wire_global_config
@@ -14641,10 +14674,16 @@ class TestHealRestoresWithoutRestart:
         # config path, not `cfg` reused -- the sidecar the first heal call
         # just wrote is keyed by config path and would outlive overwriting
         # `cfg`'s own text, silently carrying "wired" into this half too.
+        # CARRIES `CSWAP_PIN_PORT` on purpose: a bare port read would answer
+        # non-None here too, so leaving it out would let a restore keyed on
+        # `_wired_port()` pass this control by accident -- the receipt is
+        # what must be doing the refusing, and only a port alongside its
+        # absence proves that.
         import claude_swap.paths as paths
         foreign_cfg = tmp_path / "foreign.claude.json"
         foreign_cfg.write_text(json.dumps(
-            {"env": {"HTTPS_PROXY": "http://127.0.0.1:8888"}}))
+            {"env": {"HTTPS_PROXY": "http://127.0.0.1:8888",
+                     "CSWAP_PIN_PORT": "8888"}}))
         monkeypatch.setattr(paths, "get_global_config_path", lambda: foreign_cfg)
         pin_proxy.save_pin(root, None, None)
 
