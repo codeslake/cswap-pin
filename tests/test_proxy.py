@@ -7105,7 +7105,7 @@ class TestWireGlobalConfig:
         # A refused clear leaves the OLD pin serving, unlike every other
         # clear in this suite, which asserts `is False`.
         assert result is True, "a refused clear must report the pin as still serving"
-        assert any("could not clear the pin" in ln for ln in lifecycle_lines), (
+        assert any("the clear did not take" in ln for ln in lifecycle_lines), (
             "a hand-run --clear got no stderr line when it silently failed")
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
             "a lock this call could not take lost the pin record")

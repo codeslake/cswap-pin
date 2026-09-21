@@ -1700,9 +1700,13 @@ def heal(backup_root: Path, identity: dict | None = None,
             return False  # nothing pinned — not our business
         # NO ADDRESS IN THE LINE: this log ships on other people's machines
         # (see the same rule beside `splice_config_identity`'s own line),
-        # and the fact that a record was restored is the payload.
-        _log_carry(certdir, "restored the pin record from the wiring "
-                             "receipt — settings.json had lost it")
+        # and the fact that a record was restored is the payload. NOR A
+        # GUESSED CAUSE: "settings.json had lost it" states a loss this
+        # function's own docstring says it cannot tell apart from a
+        # deliberate clear that lost its own race (see there). Say what was
+        # observed -- the wiring is still ours and nothing named it.
+        _log_carry(certdir, "restored the pin record: the wiring is still "
+                             "ours and settings.json named no pin")
     email = pin[0]
     # THE CONFIG HALF OF THE SAME RULE the block below states for the DAEMON. A
     # release that ADDS an env key kept the old key set in `.claude.json` until
@@ -5157,9 +5161,15 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             _log_carry(certdir, "clear did not take: the config still "
                                  "carries our wiring receipt, left the pin "
                                  "record standing")
-            _log_lifecycle("could not clear the pin — the config lock was "
-                           "not free, so the wiring and the record were "
-                           "both left as they were; try again")
+            # THE OBSERVATION, NOT A GUESSED CAUSE: this guard reads only
+            # the receipt, and `wire_global_config` answers False for more
+            # than a busy lock -- an unreadable config, or a failed
+            # `_write_ledger` (which prints its OWN line already). Naming
+            # the lock specifically here would give two stderr sentences
+            # blaming two different things on the host where the other one
+            # actually happened.
+            _log_lifecycle("the clear did not take — the wiring and the "
+                           "record were both left as they were; try again")
             # `pin-identity.json` STAYS, on purpose. This path leaves the pin
             # recorded, wired and still serving -- exactly the state where
             # `_pointer_owner`, `carry_live_pointers` and
@@ -5170,6 +5180,20 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             # guard against a caller that force-clears the record anyway --
             # if one does, the wiring is still the true state, and a later
             # `heal` re-syncing the record to it is convergence, not a bug.
+            #
+            # ponytail: on a host whose lock stays contended across EVERY
+            # retry -- this arm's AND a caller's own separate unwire retry,
+            # both -- that convergence can repeat every launch, so `--clear`
+            # never durably takes while the contention lasts. Dropping the
+            # memo here instead would trade that for a certain, immediate
+            # bug: it would tear live sessions' bridge-pointer attribution
+            # off a pin that has not stopped serving (see above), for a
+            # caller-specific compound failure this repo cannot verify or
+            # fix -- the caller that force-clears without trusting this
+            # return value is in another repository. Closing both needs
+            # that caller to trust `True` here rather than re-reading the
+            # record itself, or a new, out-of-scope clear-intent marker;
+            # neither belongs in this arm.
             return True
         # CAPTURED BEFORE THE DROP, so a failed racing-undo below can put
         # this exact pair straight back rather than lean on `heal` finding
@@ -5241,7 +5265,13 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                                "may still point at the old pin; try again")
                 if prior:
                     save_pin(switcher.backup_dir, prior[0], prior[1])
-                still_pinned = True
+                    still_pinned = True
+                # NO `prior`: this box was never pinned by US to begin with
+                # (a clear called on an already-clear pin), so there is
+                # nothing to put back and nothing this arm can call
+                # "serving" -- `still_pinned` stays False and the memo drop
+                # below still runs, matching every other already-clear
+                # case in this arm.
         # THE RECORD IS ALREADY RIGHT EITHER WAY BY HERE: `save_pin` above
         # put it back when the undo failed, so only the identity memo
         # itself is left to reconcile, and only once the wiring is
