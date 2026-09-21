@@ -1695,7 +1695,12 @@ def heal(backup_root: Path, identity: dict | None = None,
     except Exception:
         return False
     if not pin:
-        return False  # nothing pinned — not our business
+        pin = _restore_record_from_wiring(backup_root, certdir)
+        if not pin:
+            return False  # nothing pinned — not our business
+        _log_carry(certdir, f"restored the pin record for {pin[0]} — the "
+                             "wiring receipt named it but settings.json had "
+                             "lost it")
     email = pin[0]
     # THE CONFIG HALF OF THE SAME RULE the block below states for the DAEMON. A
     # release that ADDS an env key kept the old key set in `.claude.json` until
@@ -5088,9 +5093,25 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     Both entry points (the CLI and the TUI menu) go through here so they
     cannot drift apart again. Returns whether a proxy is now serving.
     """
-    save_pin(switcher.backup_dir, email, org_uuid)
+    certdir = switcher.backup_dir / "pin-proxy"
     if not email:
+        # THE ORDER IS REVERSED FROM THE SET ARM BELOW, ON PURPOSE. Whichever
+        # of the two writes here runs second is the one a kill between them
+        # loses — `wire_global_config` takes the `.claude.json` lock on a 5s
+        # budget, and a host that holds that lock near-continuously kills the
+        # waiter before it ever gets there. Recording the clear FIRST used to
+        # mean exactly that kill left `save_pin` already run and the wiring
+        # untouched: `load_pin` reads "nothing pinned", `heal` calls the
+        # dangling wiring "not our business" and leaves it dangling forever
+        # (measured: 21 hours, `remoteControl` gone, `.claude.json` still
+        # wired). Unwiring FIRST instead means a kill here leaves the record
+        # still naming the old pin — `heal` reads that as still-pinned and
+        # just re-wires, the same recoverable gap the set arm already lives
+        # with. So the record is the durable half of a clear and the wiring
+        # is the disposable one, same as the wiring is the disposable half of
+        # a set: whichever write can be lost is the one that runs last.
         wire_global_config(None, None)
+        save_pin(switcher.backup_dir, email, org_uuid)
         # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
         # the ex-pin until some later switch happened to rewrite it. `identity`
         # is the caller's to supply here exactly as it is when setting: only
@@ -5104,9 +5125,11 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             _log_lifecycle("could not un-name the cleared pin in the live "
                            "config — bridges keep its owner until the next "
                            "switch")
-        remember_pin_identity(switcher.backup_dir / "pin-proxy", None)
+        remember_pin_identity(certdir, None)
+        _log_carry(certdir, "cleared the pin: unwired .claude.json first, "
+                             "then dropped the settings.json record")
         return False
-    certdir = switcher.backup_dir / "pin-proxy"
+    save_pin(switcher.backup_dir, email, org_uuid)
     try:
         certdir.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -5203,6 +5226,56 @@ def remembered_pin_identity(certdir) -> dict | None:
     except (OSError, ValueError, TypeError):
         return None
     return d if isinstance(d, dict) and d.get("accountUuid") else None
+
+
+def _restore_record_from_wiring(
+    backup_root: Path, certdir: Path
+) -> "tuple[str, str] | None":
+    """Rebuild a lost `remoteControl` record from a wiring `heal` can prove
+    is ours, or None when it cannot.
+
+    THE GAP THIS CLOSES. `settings.json`'s pin record and `.claude.json`'s
+    wiring are two files, written by two separate calls, and either can be
+    lost without the other — `apply_pin`'s own clear arm now orders its two
+    writes so a kill between them never loses the record while the wiring
+    stands (see the comment there), but that is one producer among many:
+    `.claude.json` is a single global file every switch rewrites, and
+    nothing stops it being overwritten or truncated out from under a pin
+    record that never moved. Either way, `heal` used to read `load_pin` ->
+    None and return -- "nothing pinned, not our business" -- exactly wrong
+    when the wiring says otherwise.
+
+    THE RECEIPT, NOT A BARE PROXY VAR. `_read_ledger(...).get(_WIRE_MARK)` is
+    the same test `rewire_if_version_changed` already trusts to mean "this
+    wiring is OURS" (see that function). A proxy the user or their launcher
+    configured for themselves carries no such mark and must be left alone.
+
+    THE RECORD ONLY, NEVER THE WIRING, AND ONLY FROM `pin-identity.json`.
+    `heal`'s caller already re-wires once a record exists, so restoring the
+    wiring here too would just race that path. And `.claude.json`'s own
+    `oauthAccount` names whoever happens to be logged in right now -- on an
+    UNPINNED box that is not ours to read, and re-pinning from it would pin
+    the wrong account. `pin-identity.json` is this package's own receipt for
+    the account IT pinned, written only while a pin was live, so it is the
+    one source this is allowed to trust.
+
+    Never raises: called from `heal`, which runs from an rc hook before
+    every launch.
+    """
+    try:
+        cfg = require("paths").get_global_config_path()
+        raw = _read_json(cfg)
+        if not _read_ledger(cfg, raw).get(_WIRE_MARK):
+            return None
+        ident = remembered_pin_identity(certdir)
+        if not ident or not ident.get("emailAddress"):
+            return None
+        email = str(ident["emailAddress"])
+        org = str(ident.get("organizationUuid") or "")
+        save_pin(backup_root, email, org)
+        return email, org
+    except Exception:  # noqa: BLE001 — heal must never fail on this repair
+        return None
 
 
 def live_pin_identity_state(ident: dict) -> "tuple[bool, str]":
