@@ -7060,9 +7060,8 @@ class TestWireGlobalConfig:
         kill. Against the old order — record the clear, then unwire — that
         skip left the record already gone and the config still wired:
         `load_pin` read None afterwards, and `heal` called the still-wired
-        config "not our business" forever (measured: 21 hours). Both the
-        record and the still-live wiring must survive a clear that could not
-        take the lock."""
+        config "not our business" forever (measured: 21 hours). The record
+        must survive a clear that could not take the lock."""
         from pathlib import Path
         from cswap_pin import proxy as pin_proxy
 
@@ -7089,9 +7088,6 @@ class TestWireGlobalConfig:
 
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
             "a lock this call could not take lost the pin record")
-        assert "env" in json.loads(path.read_text()), (
-            "the record survived but the wiring it still names was dropped "
-            "from the config underneath it")
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path

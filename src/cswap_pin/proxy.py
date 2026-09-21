@@ -5120,9 +5120,17 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             # drop the only place a retry or `heal` can still find the
             # wiring that is, per this read, still live. Leave everything
             # standing so the next attempt finds the pin exactly as it was.
+            # BOTH CHANNELS: `_log_carry` outlives the launch that wrote it,
+            # but a hand-run `--clear` is not about to `os.execvpe` into
+            # anything, so its terminal is not "painted over" the way the
+            # launch path's is -- the operator needs to see, right now, that
+            # the clear they just asked for did not happen.
             _log_carry(certdir, "clear did not take: the config still "
                                  "names a wired port, left the pin record "
                                  "standing")
+            _log_lifecycle("could not clear the pin — the config lock was "
+                           "not free, so the wiring and the record were "
+                           "both left as they were; try again")
             return True
         save_pin(switcher.backup_dir, email, org_uuid)
         # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
