@@ -2382,10 +2382,12 @@ def _wire_global_config_locked(
         # order fails the other way, which is why the write above is first.
         # ONLY FOR `port is not None` (a set), though: on an unwire the
         # receipt instead UNDERSTATES here (it was just written `[]`, "not
-        # wired", while `env` above still carries the keys this replace
-        # never removed) -- `apply_pin`'s clear arm names this same gap in
-        # its own `# ponytail:` note, since a receipt read there cannot see
-        # it either.
+        # wired", while the FILE ON DISK still carries the keys this failed
+        # replace never removed -- the local `env` above already had them
+        # popped, it is `path` that never got the new copy) --
+        # `apply_pin`'s clear arm names this same gap in its own
+        # `# ponytail:` note, since a receipt read there cannot see it
+        # either.
         return False
     return True
 
@@ -5169,6 +5171,14 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             # if one does, the wiring is still the true state, and a later
             # `heal` re-syncing the record to it is convergence, not a bug.
             return True
+        # CAPTURED BEFORE THE DROP, so a failed racing-undo below can put
+        # this exact pair straight back rather than lean on `heal` finding
+        # its own way there. `pin-identity.json` is NOT that fallback: the
+        # set arm unlinks it on any call with no `identity` -- which a
+        # rollback (`apply_pin(switcher, *before)`, no identity) does on
+        # this same host -- so a memo this arm merely left alone can still
+        # be gone by the time anything reads it.
+        prior = load_pin(switcher.backup_dir)
         save_pin(switcher.backup_dir, email, org_uuid)
         # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
         # the ex-pin until some later switch happened to rewrite it. `identity`
@@ -5209,20 +5219,19 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                 _log_carry(certdir,
                            "a racing re-wire was undone after the clear")
             else:
-                # THE IDENTITY MEMO STAYS, same reasoning as the bail-out
-                # above: the wiring is, per this read, still live, so
-                # dropping the record earlier in this arm was the wrong
-                # half to have gone through with -- a later `heal`
-                # restoring it from this file is convergence, not the
-                # resurrection the memo-drop below guards against. Dropping
-                # the memo here too would recreate this whole change's own
-                # defect: wiring live, record AND its one recovery source
-                # both gone, unrecoverable.
+                # PUT THE RECORD STRAIGHT BACK, from `prior` captured before
+                # this arm dropped it -- not the identity memo, which is not
+                # durable enough to lean on here (see the capture site).
+                # The wiring is, per this read, still live, so a dropped
+                # record was the wrong half to have gone through with; this
+                # converges the state to "still pinned", the same one the
+                # first bail-out above returns without ever touching the
+                # record at all.
                 # BOTH CHANNELS, same as the bail-out above and for the same
-                # reason: this is the one path left where a `heal` will
-                # silently re-pin the box from the kept memo, so it must be
-                # the one that tells the operator something, not the one
-                # that stays quiet on stderr.
+                # reason: this is the one path left where the wiring could
+                # otherwise outlive the record with nothing to reconnect
+                # them, so it must be the one that tells the operator
+                # something, not the one that stays quiet on stderr.
                 _log_carry(certdir,
                            "a racing re-wire could not be undone after the "
                            "clear — the config may still point at the old "
@@ -5230,12 +5239,14 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                 _log_lifecycle("could not fully clear the pin — a racing "
                                "re-wire could not be undone, so the config "
                                "may still point at the old pin; try again")
+                if prior:
+                    save_pin(switcher.backup_dir, prior[0], prior[1])
                 still_pinned = True
-        # THE MEMO DROPS ONLY NOW THE WIRING IS CONFIRMED GONE, either
-        # because it never raced or because the undo above just took.
-        # Dropping it any earlier could beat a failed undo to the punch (see
-        # the branch above) and leave nothing for `heal` to recover a
-        # still-live pin from.
+        # THE RECORD IS ALREADY RIGHT EITHER WAY BY HERE: `save_pin` above
+        # put it back when the undo failed, so only the identity memo
+        # itself is left to reconcile, and only once the wiring is
+        # confirmed gone -- either because it never raced or because the
+        # undo above just took.
         if not still_pinned:
             remember_pin_identity(certdir, None)
             _log_carry(certdir, "cleared the pin: unwired .claude.json "
@@ -5363,6 +5374,14 @@ def _restore_record_from_wiring(
     wiring is OURS" (see that function). A proxy the user or their launcher
     configured for themselves carries no such mark and must be left alone.
 
+    AND AT LEAST ONE OF ITS OWN KEYS, STILL LIVE. A receipt can outlive the
+    wiring it once named -- this same module's own `_read_ledger` docstring
+    describes an emptied sidecar beside a config marker that survived it, and
+    the reverse happens too: a config truncated or hand-edited out from under
+    a receipt that never got the news. Trusting the mark alone there would
+    re-pin and re-wire a box the operator emptied by hand, from a receipt for
+    a wiring that no longer exists.
+
     THE RECORD ONLY, NEVER THE WIRING, AND ONLY FROM `pin-identity.json`.
     `heal` ITSELF already re-wires once a record exists (its own code below
     this call), so restoring the wiring here too would just race that path.
@@ -5381,6 +5400,13 @@ def _restore_record_from_wiring(
     that never pinned has no `pin-identity.json` at all, so checking it
     first answers with one small file read instead of parsing the whole
     global config on every `pin --ensure` a never-pinned host runs.
+
+    A DELIBERATE CLEAR THAT LOST ITS OWN RACE READS THE SAME AS A LOST
+    RECORD, on purpose -- this function cannot tell "the record vanished
+    from under a live pin" from "a clear meant to remove it but its own
+    racing-undo failed" (see `apply_pin`'s clear arm), and it is not
+    supposed to: both leave the wiring genuinely still live, which is the
+    one fact this function checks for.
     """
     try:
         ident = remembered_pin_identity(certdir)
@@ -5388,7 +5414,11 @@ def _restore_record_from_wiring(
             return None
         cfg = require("paths").get_global_config_path()
         raw = _read_json(cfg)
-        if not _read_ledger(cfg, raw).get(_WIRE_MARK):
+        mark = _read_ledger(cfg, raw).get(_WIRE_MARK)
+        if not mark:
+            return None
+        env = raw.get("env") if isinstance(raw, dict) else None
+        if not isinstance(env, dict) or not any(k in env for k in mark):
             return None
         email = str(ident["emailAddress"])
         org = str(ident.get("organizationUuid") or "")

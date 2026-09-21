@@ -7096,9 +7096,17 @@ class TestWireGlobalConfig:
         # inside `wire_global_config` itself and turned into a plain False —
         # never an exception a caller could catch.
         monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: False)
+        lifecycle_lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lifecycle_lines.append)
 
-        pin_proxy.apply_pin(_Sw(), None, None)
+        result = pin_proxy.apply_pin(_Sw(), None, None)
 
+        # THE DOCUMENTED CONTRACT: "Returns whether a proxy is now serving".
+        # A refused clear leaves the OLD pin serving, unlike every other
+        # clear in this suite, which asserts `is False`.
+        assert result is True, "a refused clear must report the pin as still serving"
+        assert any("could not clear the pin" in ln for ln in lifecycle_lines), (
+            "a hand-run --clear got no stderr line when it silently failed")
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
             "a lock this call could not take lost the pin record")
         # THE BAIL-OUT'S OWN LOAD-BEARING CLAIM: the pin is still serving,
@@ -7192,21 +7200,35 @@ class TestWireGlobalConfig:
                 return True if len(wired) == 1 else follow_up_result
             monkeypatch.setattr(pin_proxy, "wire_global_config", _wire)
 
-            pin_proxy.apply_pin(_Sw(), None, None)
-            assert wired == [None, None], "the racing re-wire was not re-checked"
+            lifecycle_lines = []
+            monkeypatch.setattr(pin_proxy, "_log_lifecycle", lifecycle_lines.append)
 
-        _run(follow_up_result=True)
+            result = pin_proxy.apply_pin(_Sw(), None, None)
+            assert wired == [None, None], "the racing re-wire was not re-checked"
+            return result, lifecycle_lines
+
+        result, _ = _run(follow_up_result=True)
         assert "a racing re-wire was undone after the clear" in log.read_text()
         assert not ident_path.exists(), (
             "a fully undone race must still drop the identity memo")
+        assert result is False, "an undone race must report the clear as final"
+        assert pin_proxy.load_pin(backup) is None, (
+            "an undone race must leave the pin cleared")
 
         log.write_text("")
-        _run(follow_up_result=False)
+        result, lifecycle_lines = _run(follow_up_result=False)
         assert "a racing re-wire could not be undone after the clear" in (
             log.read_text())
         assert ident_path.exists(), (
             "a race that could not be undone must leave the identity memo "
             "standing, or the pin becomes unrecoverable")
+        assert result is True, "a race that could not be undone is still pinned"
+        assert any("could not fully clear the pin" in ln for ln in lifecycle_lines), (
+            "a race that could not be undone got no stderr line either"
+        )
+        assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
+            "a race that could not be undone must put the record straight "
+            "back, not leave it to a later heal that may never run")
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
@@ -14770,6 +14792,25 @@ class TestHealRestoresWithoutRestart:
 
         assert pin_proxy.load_pin(root) is None, (
             "a foreign proxy with no wiring receipt was mistaken for ours")
+
+        # A SECOND CONTROL: a STALE receipt, still naming keys, over a
+        # config that carries none of them -- a receipt can outlive the
+        # wiring it once named just as easily as a record can outlive its
+        # wiring. `pin-identity.json` from the first half is still on disk;
+        # only the env check should be what refuses this one.
+        stale_cfg = tmp_path / "stale.claude.json"
+        stale_cfg.write_text(json.dumps({
+            "env": {},
+            pin_proxy._WIRE_MARK: ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: stale_cfg)
+        pin_proxy.save_pin(root, None, None)
+
+        pin_proxy.heal(root)
+
+        assert pin_proxy.load_pin(root) is None, (
+            "a stale receipt with none of its own keys in the config was "
+            "mistaken for a live wiring")
 
 
 class TestTheGateDisarmsWhenThePinIsCleared:
