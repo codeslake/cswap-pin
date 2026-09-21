@@ -5106,28 +5106,38 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # (measured: 21 hours, `remoteControl` gone, `.claude.json` still
         # wired). Unwiring FIRST instead means a kill here leaves the record
         # still naming the old pin — `heal` reads that as still-pinned and
-        # just re-wires, the same recoverable gap the set arm already lives
-        # with. So the record is the durable half of a clear and the wiring
-        # is the disposable one, same as the wiring is the disposable half of
-        # a set: whichever write can be lost is the one that runs last.
+        # just re-wires. NOT THE SAME SHAPE AS A LOST SET, though both are
+        # recoverable: a lost set converges to what the operator asked for,
+        # a lost clear converges back to PINNED -- `heal` silently undoes
+        # the clear rather than merely delaying it. So the record is the
+        # durable half of a clear and the wiring is the disposable one,
+        # same as the wiring is the disposable half of a set: whichever
+        # write can be lost is the one that runs last.
         wire_global_config(None, None)
-        if _wired_port() is not None:
+        cfg = require("paths").get_global_config_path()
+        if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
             # THE UNWIRE DID NOT TAKE, and not only from a kill.
             # `wire_global_config` degrades a lock it cannot get inside its
             # own budget to "skip the write" and returns False — no
             # exception to catch — which is exactly the near-continuous-lock
-            # host this reorder is for. Recording the clear anyway would
-            # drop the only place a retry or `heal` can still find the
-            # wiring that is, per this read, still live. Leave everything
-            # standing so the next attempt finds the pin exactly as it was.
+            # host this reorder is for. THE SAME RECEIPT `heal` and
+            # `rewire_if_version_changed` already trust for "this wiring is
+            # ours", not a bare port read: a leftover key this package lost
+            # the receipt for is left untouched by `wire_global_config`
+            # itself (it cannot prove the key is its to remove), and reading
+            # that as "still wired" here would refuse every future clear on
+            # a host in that state forever. Recording the clear anyway would
+            # drop the only place a retry or `heal` can still find a wiring
+            # that IS still ours. Leave everything standing so the next
+            # attempt finds the pin exactly as it was.
             # BOTH CHANNELS: `_log_carry` outlives the launch that wrote it,
             # but a hand-run `--clear` is not about to `os.execvpe` into
             # anything, so its terminal is not "painted over" the way the
             # launch path's is -- the operator needs to see, right now, that
             # the clear they just asked for did not happen.
             _log_carry(certdir, "clear did not take: the config still "
-                                 "names a wired port, left the pin record "
-                                 "standing")
+                                 "carries our wiring receipt, left the pin "
+                                 "record standing")
             _log_lifecycle("could not clear the pin — the config lock was "
                            "not free, so the wiring and the record were "
                            "both left as they were; try again")
@@ -5147,6 +5157,22 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                            "config — bridges keep its owner until the next "
                            "switch")
         remember_pin_identity(certdir, None)
+        if _wired_port() is not None:
+            # A RACING `heal`, NOT A RETRY OF OURS. `heal` reads `load_pin`
+            # once per launch and re-wires a pinned-but-unwired host on its
+            # own account -- it has no way to know a clear is in flight, and
+            # the window this reorder opens (wiring gone, record still
+            # there) is exactly the shape it repairs. `wire_global_config`
+            # is safe to call again regardless of who wrote what is there
+            # now: it only ever touches a key it can prove is its own, so
+            # this either undoes a re-wire landed in that window or is a
+            # harmless no-op. Narrows the remaining race rather than closing
+            # it -- the same window exists again after this line, just
+            # smaller, and closing it fully needs `heal` itself to
+            # re-check `load_pin` immediately before it wires, not a fix in
+            # this arm.
+            wire_global_config(None, None)
+            _log_carry(certdir, "a racing re-wire was undone after the clear")
         _log_carry(certdir, "cleared the pin: unwired .claude.json first, "
                              "then dropped the settings.json record")
         return False
