@@ -1653,8 +1653,12 @@ def heal(backup_root: Path, identity: dict | None = None,
     is a deadlock, and it is exactly what was measured: a human had to
     re-pin by hand.
 
-    So this needs no switcher: the pinned identity comes from settings.json and
-    the slot from the account registry, both on disk. The repair itself is
+    So this needs no switcher: the pinned identity comes from settings.json
+    and the slot from the account registry, both on disk -- and when
+    settings.json itself has lost the record, `_restore_record_from_wiring`
+    (below) rebuilds it from the wiring receipt and `pin-identity.json`
+    before this function reads it, which makes `heal` a WRITER of
+    settings.json too, not only a reader. The repair itself is
     cheap when healthy — a state read plus one loopback connect, and it returns
     immediately — but this is no longer the whole cost: since 0.1.81 the bridge
     pointer sweep runs first on every call. It always reads the registry and
@@ -5175,93 +5179,45 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             # actually happened.
             _log_lifecycle("the clear did not take — the wiring and the "
                            "record were both left as they were; try again")
-            # `pin-identity.json` STAYS, on purpose. This path leaves the pin
-            # recorded, wired and still serving -- exactly the state where
+            # `pin-identity.json` STAYS, on purpose. This path leaves the
+            # pin recorded, wired and still serving -- exactly the state
             # `_pointer_owner`, `carry_live_pointers` and
-            # `_freshen_pin_identity` read this file to keep live sessions'
-            # bridge pointers attributed to the pinned account rather than
-            # falling back to whoever is logged in right now. Dropping it
-            # here would tear that off a pin that never stopped serving, to
-            # guard against a caller that force-clears the record anyway --
-            # if one does, the wiring is still the true state, and a later
-            # `heal` re-syncing the record to it is convergence, not a bug.
+            # `_freshen_pin_identity` read this file in, to keep live
+            # sessions' bridge pointers attributed to the pinned account
+            # rather than whoever is logged in right now. Dropping it would
+            # tear that off a pin that never stopped serving.
             #
-            # ponytail: on a host whose lock stays contended across EVERY
-            # retry -- this arm's AND a caller's own separate unwire retry,
-            # both -- that convergence can repeat every launch, so `--clear`
-            # never durably takes while the contention lasts. Dropping the
-            # memo here instead would trade that for a certain, immediate
-            # bug: it would tear live sessions' bridge-pointer attribution
-            # off a pin that has not stopped serving (see above), for a
-            # caller-specific compound failure this repo cannot verify or
-            # fix -- the caller that force-clears without trusting this
-            # return value is in another repository. Closing both needs
-            # that caller to trust `True` here rather than re-reading the
-            # record itself, or a new, out-of-scope clear-intent marker;
-            # neither belongs in this arm.
+            # ponytail: a caller that force-clears the record without
+            # trusting this return value can make `--clear` never durably
+            # take on a host whose lock stays contended across every retry
+            # -- `heal` re-syncs the record back from this memo every
+            # launch. Fixing that needs the caller to trust `True` here, or
+            # a new clear-intent marker; both are out of this arm's scope,
+            # and the caller is in another repository.
             return True
         # CAPTURED BEFORE THE DROP, so a failed racing-undo below can put
-        # this exact pair straight back rather than lean on `heal` finding
-        # its own way there. `pin-identity.json` is NOT that fallback: the
-        # set arm unlinks it on any call with no `identity` -- which a
-        # rollback (`apply_pin(switcher, *before)`, no identity) does on
-        # this same host -- so a memo this arm merely left alone can still
-        # be gone by the time anything reads it.
+        # this exact pair straight back. Not `pin-identity.json`: the set
+        # arm unlinks it on any call with no `identity` (a rollback does
+        # exactly that), so a memo merely left alone is not durable enough
+        # to lean on here.
         prior = load_pin(switcher.backup_dir)
         save_pin(switcher.backup_dir, email, org_uuid)
-        # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
-        # the ex-pin until some later switch happened to rewrite it. `identity`
-        # is the caller's to supply here exactly as it is when setting: only
-        # cswap can resolve an account in its own backup store. None therefore
-        # means "could not look one up", and the splice leaves the field alone
-        # rather than erasing it — cswap's own switch rewrites it on the next
-        # rotation, and a blank owner is worse than a stale one.
-        try:
-            splice_config_identity(identity)
-        except Exception:  # noqa: BLE001 — the clear must work regardless
-            _log_lifecycle("could not un-name the cleared pin in the live "
-                           "config — bridges keep its owner until the next "
-                           "switch")
-        still_pinned = False
         wiring_confirmed_gone = True
         if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
-            # A RACING `heal`, NOT A RETRY OF OURS. `heal` reads `load_pin`
-            # once per launch and re-wires a pinned-but-unwired host on its
-            # own account -- it has no way to know a clear is in flight, and
-            # the window this reorder opens (wiring gone, record still
-            # there) is exactly the shape it repairs. THE SAME RECEIPT AS
-            # THE GUARD ABOVE, not `_wired_port()`: a stale-unowned-keys host
-            # that guard already lets through would otherwise trip this
-            # check too, calling a no-op `wire_global_config` and logging a
-            # "re-wire undone" that never happened. `wire_global_config` is
-            # safe to call again regardless of who wrote what is there now:
-            # it only ever touches a key it can prove is its own, so this
-            # either undoes a re-wire landed in that window or is a harmless
-            # no-op. Narrows the remaining race rather than closing it -- the
-            # same window exists again after this line, just smaller, and
-            # closing it fully needs `heal` itself to re-check `load_pin`
-            # immediately before it wires, not a fix in this arm.
-            # THE RETURN, NOT AN ASSUMPTION: this call can lose the same
-            # lock the whole reorder is for, and "undone" printed over a
-            # wiring that is still dangling is the exact silence this
-            # change exists to end.
+            # A RACING `heal`, NOT A RETRY OF OURS -- same receipt as the
+            # guard above, one step later: the window this reorder opens
+            # (wiring gone, record still there) is exactly the shape `heal`
+            # repairs on its own account, with no way to know a clear is in
+            # flight. `wire_global_config` is safe to call again regardless
+            # of who wrote what is there now -- it only touches a key it
+            # can prove is its own -- so this either undoes a re-wire
+            # landed in that window or is a harmless no-op. Narrows the
+            # race rather than closing it; closing it needs `heal` itself
+            # to re-check `load_pin` immediately before it wires.
             if wire_global_config(None, None):
                 _log_carry(certdir,
                            "a racing re-wire was undone after the clear")
             else:
-                # PUT THE RECORD STRAIGHT BACK, from `prior` captured before
-                # this arm dropped it -- not the identity memo, which is not
-                # durable enough to lean on here (see the capture site).
-                # The wiring is, per this read, still live, so a dropped
-                # record was the wrong half to have gone through with; this
-                # converges the state to "still pinned", the same one the
-                # first bail-out above returns without ever touching the
-                # record at all.
-                # BOTH CHANNELS, same as the bail-out above and for the same
-                # reason: this is the one path left where the wiring could
-                # otherwise outlive the record with nothing to reconnect
-                # them, so it must be the one that tells the operator
-                # something, not the one that stays quiet on stderr.
                 _log_carry(certdir,
                            "a racing re-wire could not be undone after the "
                            "clear — the config may still point at the old "
@@ -5269,38 +5225,33 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                 _log_lifecycle("could not fully clear the pin — a racing "
                                "re-wire could not be undone, so the config "
                                "may still point at the old pin; try again")
-                # TWO SEPARATE QUESTIONS, TWO SEPARATE FLAGS. Whether the
-                # WIRING is confirmed gone decides if the memo below is safe
-                # to drop -- true here means "no", full stop, whether or not
-                # there was a `prior` to restore. Whether THIS ARM ended up
-                # "still pinned" (the return value) is a narrower question
-                # that also needs a `prior` to restore. Collapsing them into
-                # one flag tied to `prior` alone made a clear called on an
-                # already-clear pin drop the memo here too -- with the
-                # wiring left standing and the record already gone, that is
-                # `_restore_record_from_wiring`'s only remaining input, and
-                # losing it recreates the exact unrecoverable outage this
-                # whole change exists to end.
+                # THE MEMO STAYS whenever the wiring is not confirmed gone,
+                # `prior` or not: a clear on an already-clear pin has none
+                # to restore, but the wiring here is exactly as live either
+                # way, and the memo is `_restore_record_from_wiring`'s only
+                # remaining input.
                 wiring_confirmed_gone = False
                 if prior:
                     save_pin(switcher.backup_dir, prior[0], prior[1])
-                    still_pinned = True
-                # NO `prior`: this box was never pinned by US to begin with
-                # (a clear called on an already-clear pin), so there is
-                # nothing to put back and nothing this arm can call
-                # "serving" -- `still_pinned` stays False, but the memo
-                # STAYS too (`wiring_confirmed_gone` is False either way).
-        # THE RECORD IS ALREADY RIGHT EITHER WAY BY HERE: `save_pin` above
-        # put it back when the undo failed and there was a `prior`, so only
-        # the identity memo itself is left to reconcile, and only once the
-        # wiring is confirmed gone -- either because it never raced or
-        # because the undo above just took.
         if wiring_confirmed_gone:
+            # THE OWNER SPLICE MOVES HERE TOO, not before the race check:
+            # naming a different account in `.claude.json` and then putting
+            # the OLD pin's record back above (a failed undo, `prior`
+            # restored) would leave a still-serving pin under the wrong
+            # `oauthAccount` until the next switch.
+            try:
+                splice_config_identity(identity)
+            except Exception:  # noqa: BLE001 — the clear must work regardless
+                _log_lifecycle("could not un-name the cleared pin in the "
+                               "live config — bridges keep its owner until "
+                               "the next switch")
             remember_pin_identity(certdir, None)
             _log_carry(certdir, "cleared the pin: unwired .claude.json "
                                  "first, then dropped the settings.json "
                                  "record")
-        return still_pinned
+        # NOT MEASURED, same as the bail-out above: this reads the receipt,
+        # it does not probe a daemon (see this function's own docstring).
+        return not wiring_confirmed_gone
     save_pin(switcher.backup_dir, email, org_uuid)
     try:
         certdir.mkdir(parents=True, exist_ok=True)

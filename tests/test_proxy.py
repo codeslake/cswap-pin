@@ -7233,17 +7233,17 @@ class TestWireGlobalConfig:
             "back, not leave it to a later heal that may never run")
 
         # THE THIRD SHAPE: no `prior` to restore (a clear called on an
-        # already-clear pin) AND the undo still fails. `still_pinned` (the
-        # return value) has nothing to be True about here, but the memo
-        # must survive regardless -- it is `_restore_record_from_wiring`'s
-        # only remaining input, and the wiring is, per this same read,
-        # still standing.
+        # already-clear pin) AND the undo still fails. Nothing of OURS gets
+        # restored, but the wiring is, per this same read, exactly as live
+        # as the other failed-undo case -- the return and the memo must
+        # both answer the same way regardless of whether there was a
+        # `prior` to put back.
         log.write_text("")
         pin_proxy.save_pin(backup, None, None)  # the previous run's own
         # restore, or `prior` here would read IT back, not "nothing pinned"
         assert pin_proxy.load_pin(backup) is None
         result, _ = _run(follow_up_result=False, plant_prior=False)
-        assert result is False, "nothing was restored, so nothing is pinned"
+        assert result is True, "the wiring is still live even with nothing of ours to restore"
         assert ident_path.exists(), (
             "the memo must survive even with no prior record to restore, "
             "or the still-standing wiring becomes unrecoverable")
