@@ -7101,10 +7101,11 @@ class TestWireGlobalConfig:
 
         result = pin_proxy.apply_pin(_Sw(), None, None)
 
-        # THE DOCUMENTED CONTRACT: "Returns whether a proxy is now serving".
-        # A refused clear leaves the OLD pin serving, unlike every other
-        # clear in this suite, which asserts `is False`.
-        assert result is True, "a refused clear must report the pin as still serving"
+        # THE ONLY VERDICT THIS GUARD HAS: the receipt still names a
+        # wiring, so this reports "still pinned", unlike every other clear
+        # in this suite (`is False`) -- inferred from that read, not a live
+        # daemon probe (see `apply_pin`'s own docstring on the distinction).
+        assert result is True, "a refused clear must report the pin as still pinned"
         assert any("the clear did not take" in ln for ln in lifecycle_lines), (
             "a hand-run --clear got no stderr line when it silently failed")
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
@@ -7179,8 +7180,9 @@ class TestWireGlobalConfig:
         log = backup / "pin-proxy" / "daemon.log"
         ident_path = backup / "pin-proxy" / pin_proxy._PIN_IDENTITY_NAME
 
-        def _run(follow_up_result):
-            pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+        def _run(follow_up_result, plant_prior=True):
+            if plant_prior:
+                pin_proxy.save_pin(backup, "pin@example.com", "org-1")
             pin_proxy.remember_pin_identity(
                 backup / "pin-proxy",
                 {"emailAddress": "pin@example.com", "accountUuid": "uuid-pin",
@@ -7229,6 +7231,22 @@ class TestWireGlobalConfig:
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
             "a race that could not be undone must put the record straight "
             "back, not leave it to a later heal that may never run")
+
+        # THE THIRD SHAPE: no `prior` to restore (a clear called on an
+        # already-clear pin) AND the undo still fails. `still_pinned` (the
+        # return value) has nothing to be True about here, but the memo
+        # must survive regardless -- it is `_restore_record_from_wiring`'s
+        # only remaining input, and the wiring is, per this same read,
+        # still standing.
+        log.write_text("")
+        pin_proxy.save_pin(backup, None, None)  # the previous run's own
+        # restore, or `prior` here would read IT back, not "nothing pinned"
+        assert pin_proxy.load_pin(backup) is None
+        result, _ = _run(follow_up_result=False, plant_prior=False)
+        assert result is False, "nothing was restored, so nothing is pinned"
+        assert ident_path.exists(), (
+            "the memo must survive even with no prior record to restore, "
+            "or the still-standing wiring becomes unrecoverable")
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path

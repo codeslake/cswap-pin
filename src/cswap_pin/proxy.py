@@ -5105,7 +5105,12 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     `claude` with no way back but editing the file by hand.
 
     Both entry points (the CLI and the TUI menu) go through here so they
-    cannot drift apart again. Returns whether a proxy is now serving.
+    cannot drift apart again. Returns whether a proxy is now serving --
+    MEASURED on the set arm (`ensure_proxy(...) is not None`), but only
+    INFERRED on the clear arm's two "the wiring is still there" returns
+    (a receipt read, not a live probe): a pinned-and-wired host with no
+    daemon actually listening is exactly the state `heal` exists to
+    notice and repair, not this call.
     """
     certdir = switcher.backup_dir / "pin-proxy"
     if not email:
@@ -5218,6 +5223,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                            "config — bridges keep its owner until the next "
                            "switch")
         still_pinned = False
+        wiring_confirmed_gone = True
         if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
             # A RACING `heal`, NOT A RETRY OF OURS. `heal` reads `load_pin`
             # once per launch and re-wires a pinned-but-unwired host on its
@@ -5263,21 +5269,33 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                 _log_lifecycle("could not fully clear the pin — a racing "
                                "re-wire could not be undone, so the config "
                                "may still point at the old pin; try again")
+                # TWO SEPARATE QUESTIONS, TWO SEPARATE FLAGS. Whether the
+                # WIRING is confirmed gone decides if the memo below is safe
+                # to drop -- true here means "no", full stop, whether or not
+                # there was a `prior` to restore. Whether THIS ARM ended up
+                # "still pinned" (the return value) is a narrower question
+                # that also needs a `prior` to restore. Collapsing them into
+                # one flag tied to `prior` alone made a clear called on an
+                # already-clear pin drop the memo here too -- with the
+                # wiring left standing and the record already gone, that is
+                # `_restore_record_from_wiring`'s only remaining input, and
+                # losing it recreates the exact unrecoverable outage this
+                # whole change exists to end.
+                wiring_confirmed_gone = False
                 if prior:
                     save_pin(switcher.backup_dir, prior[0], prior[1])
                     still_pinned = True
                 # NO `prior`: this box was never pinned by US to begin with
                 # (a clear called on an already-clear pin), so there is
                 # nothing to put back and nothing this arm can call
-                # "serving" -- `still_pinned` stays False and the memo drop
-                # below still runs, matching every other already-clear
-                # case in this arm.
+                # "serving" -- `still_pinned` stays False, but the memo
+                # STAYS too (`wiring_confirmed_gone` is False either way).
         # THE RECORD IS ALREADY RIGHT EITHER WAY BY HERE: `save_pin` above
-        # put it back when the undo failed, so only the identity memo
-        # itself is left to reconcile, and only once the wiring is
-        # confirmed gone -- either because it never raced or because the
-        # undo above just took.
-        if not still_pinned:
+        # put it back when the undo failed and there was a `prior`, so only
+        # the identity memo itself is left to reconcile, and only once the
+        # wiring is confirmed gone -- either because it never raced or
+        # because the undo above just took.
+        if wiring_confirmed_gone:
             remember_pin_identity(certdir, None)
             _log_carry(certdir, "cleared the pin: unwired .claude.json "
                                  "first, then dropped the settings.json "
