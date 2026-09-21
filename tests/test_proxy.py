@@ -7169,9 +7169,14 @@ class TestWireGlobalConfig:
                 return ("2", "pin@example.com", "org-1")
 
         log = backup / "pin-proxy" / "daemon.log"
+        ident_path = backup / "pin-proxy" / pin_proxy._PIN_IDENTITY_NAME
 
         def _run(follow_up_result):
             pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+            pin_proxy.remember_pin_identity(
+                backup / "pin-proxy",
+                {"emailAddress": "pin@example.com", "accountUuid": "uuid-pin",
+                 "organizationUuid": "org-1"})
             calls = []
 
             def _ledger(cfg, raw):
@@ -7192,11 +7197,16 @@ class TestWireGlobalConfig:
 
         _run(follow_up_result=True)
         assert "a racing re-wire was undone after the clear" in log.read_text()
+        assert not ident_path.exists(), (
+            "a fully undone race must still drop the identity memo")
 
         log.write_text("")
         _run(follow_up_result=False)
         assert "a racing re-wire could not be undone after the clear" in (
             log.read_text())
+        assert ident_path.exists(), (
+            "a race that could not be undone must leave the identity memo "
+            "standing, or the pin becomes unrecoverable")
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path

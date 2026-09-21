@@ -5183,7 +5183,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             _log_lifecycle("could not un-name the cleared pin in the live "
                            "config — bridges keep its owner until the next "
                            "switch")
-        wiring_confirmed_gone = True
+        still_pinned = False
         if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
             # A RACING `heal`, NOT A RETRY OF OURS. `heal` reads `load_pin`
             # once per launch and re-wires a pinned-but-unwired host on its
@@ -5210,28 +5210,38 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                            "a racing re-wire was undone after the clear")
             else:
                 # THE IDENTITY MEMO STAYS, same reasoning as the bail-out
-                # above: the wiring is, per this read, still live, so the
-                # record this arm already dropped is now the wrong half to
-                # have kept -- a later `heal` restoring it from this file is
-                # convergence, not the resurrection the memo-drop below
-                # guards against. Dropping it here instead would recreate
-                # this whole change's own defect: wiring live, record AND
-                # its one recovery source both gone, unrecoverable.
+                # above: the wiring is, per this read, still live, so
+                # dropping the record earlier in this arm was the wrong
+                # half to have gone through with -- a later `heal`
+                # restoring it from this file is convergence, not the
+                # resurrection the memo-drop below guards against. Dropping
+                # the memo here too would recreate this whole change's own
+                # defect: wiring live, record AND its one recovery source
+                # both gone, unrecoverable.
+                # BOTH CHANNELS, same as the bail-out above and for the same
+                # reason: this is the one path left where a `heal` will
+                # silently re-pin the box from the kept memo, so it must be
+                # the one that tells the operator something, not the one
+                # that stays quiet on stderr.
                 _log_carry(certdir,
                            "a racing re-wire could not be undone after the "
                            "clear — the config may still point at the old "
                            "pin")
-                wiring_confirmed_gone = False
+                _log_lifecycle("could not fully clear the pin — a racing "
+                               "re-wire could not be undone, so the config "
+                               "may still point at the old pin; try again")
+                still_pinned = True
         # THE MEMO DROPS ONLY NOW THE WIRING IS CONFIRMED GONE, either
         # because it never raced or because the undo above just took.
         # Dropping it any earlier could beat a failed undo to the punch (see
         # the branch above) and leave nothing for `heal` to recover a
         # still-live pin from.
-        if wiring_confirmed_gone:
+        if not still_pinned:
             remember_pin_identity(certdir, None)
-        _log_carry(certdir, "cleared the pin: unwired .claude.json first, "
-                             "then dropped the settings.json record")
-        return False
+            _log_carry(certdir, "cleared the pin: unwired .claude.json "
+                                 "first, then dropped the settings.json "
+                                 "record")
+        return still_pinned
     save_pin(switcher.backup_dir, email, org_uuid)
     try:
         certdir.mkdir(parents=True, exist_ok=True)
