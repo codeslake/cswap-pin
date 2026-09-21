@@ -4979,10 +4979,17 @@ def should_wait_for_pin(method: str, path: str) -> bool:
     answer here is only whether to RETRY briefly; the caller still gives up
     and sends, because a launch that hangs is worse than a session on the
     wrong account.
+
+    THE RETRY ITSELF NEVER RUNS FOR `consume-busy`: that flips `pin_is_noop()`
+    True, and `_wait_for_pin_token` returns before its loop starts, so the
+    wait only covers a miss where `pin_is_noop()` is False -- an unreadable
+    credential, a stalled mint. That ceiling predates the bridge attach: it
+    was already true for the other two routes above before this one joined
+    them.
     """
-    bare = path.split("?", 1)[0].rstrip("/")
     if method != "POST":
         return False
+    bare = path.split("?", 1)[0].rstrip("/")
     # `POST /v1/environments/bridge` is the same bargain one subtree over: it
     # is where `claude remote-control` fixes the ENVIRONMENT's owner, and an
     # environment registered on the wrong account cannot be moved either — the

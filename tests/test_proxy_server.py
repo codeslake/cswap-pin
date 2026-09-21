@@ -4131,7 +4131,7 @@ class TestChainRediscovery:
             "the bridge create reached the chain on a blind mint — this "
             f"bridge is now owned by the ACTIVE account permanently: {seen!r}")
 
-    def case_the_bridge_attach_waits_then_relays_untokened_and_logs(
+    def case_the_bridge_attach_waits_on_an_unexplained_miss_then_relays_untokened_and_logs(
         self, certdir
     ):
         """`should_wait_for_pin` now covers the bridge ATTACH too (T0867) —
@@ -4142,11 +4142,13 @@ class TestChainRediscovery:
         straight back because `should_wait_for_pin` said this route was not
         worth waiting for.
 
-        A momentary miss with no `blind_reason` (the `consume-busy` shape —
-        a lock held for an instant, not a real failed mint) must still
-        retry `_PIN_WAIT_TRIES` times and then keep today's fail-open
-        relay unchanged — but it must now also say so, which it could not
-        before this route was reachable."""
+        NOT `consume-busy`: that shape sets `_deferred`, which makes
+        `pin_is_noop()` read True for the whole window, so `_wait_for_pin_token`
+        returns before this retry loop ever starts (see `should_wait_for_pin`'s
+        docstring). A miss that leaves `blind_reason` unset and `pin_is_noop()`
+        False — the shape this case drives — must still retry `_PIN_WAIT_TRIES`
+        times and then keep today's fail-open relay unchanged — but it must
+        now also say so, which it could not before this route was reachable."""
         import cswap_pin.proxy as pp
 
         lines = []
