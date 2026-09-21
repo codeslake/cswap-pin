@@ -395,7 +395,8 @@ class TestPinProxyServer:
 
     def _bridge_post(self, certdir, monkeypatch, seed_verdict, expect_swapped,
                       profile_answer=lambda token: {
-                          "emailAddress": "pin@example.com"}):
+                          "emailAddress": "pin@example.com"},
+                      expect_refused=False):
         """Drives a REAL `make_pin_token_provider` through the actual HTTP
         egress path (`PinProxy` end to end, real upstream TLS) for a pinned
         `.../bridge` POST. `seed_verdict(pp, provider)` seeds whatever the
@@ -406,7 +407,17 @@ class TestPinProxyServer:
         api.anthropic.com, it must just get an "ok" verdict from the
         default. `expect_swapped` picks which invariant this drive proves:
         `swapped=True` (a healthy verdict DOES splice) or `swapped=False`
-        (a foreign one never does).
+        (a foreign one never does, and never relays either -- see
+        `expect_refused`).
+
+        `expect_refused`: the bridge ATTACH is now a `should_wait_for_pin`
+        route (T0867), so a real failed mint -- a foreign verdict included,
+        it sets `blind_reason` exactly like a missing credential does --
+        raises `_BlindMintRefusal` after the bounded retry instead of
+        falling through to the old silent relay. Relaying a foreign bearer
+        here would still give the bridge to whichever account is active,
+        permanently -- the same fault class the create route is already
+        guarded against.
 
         Not the provider in isolation: a provider-level-only test would still
         pass if a future splice site read the credential store directly
@@ -449,6 +460,15 @@ class TestPinProxyServer:
                 proxy.port, certdir / "ca.pem",
                 "/v1/code/sessions/SID123/bridge", bearer="client-own-token",
             )
+            if expect_refused:
+                assert status == 503, (
+                    f"a foreign verdict on the bridge attach was relayed "
+                    f"({status}) instead of refused -- the same permanent "
+                    "give-away the create route is already guarded against")
+                assert upstream.seen_auth is None, (
+                    "the bridge attach reached upstream on a foreign "
+                    f"bearer: {upstream.seen_auth!r}")
+                return
             assert status == 200
             want = "Bearer pin-live-token" if expect_swapped else "Bearer client-own-token"
             assert upstream.seen_auth == want, (
@@ -480,20 +500,25 @@ class TestPinProxyServer:
             expect_swapped=True,
         )
 
-    def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
+    def case_a_foreign_verdict_refuses_the_bridge_post(
             self, certdir, monkeypatch):
         """A foreign verdict from the MINT-time probe (`_identity_ok`, via
         `pin_profile_for`) must never splice -- see `_identity_ok`'s
-        invariant."""
+        invariant. Since T0867 the bridge attach also waits and then
+        refuses (503) rather than relaying on the foreign bearer -- see
+        `_bridge_post`'s `expect_refused`; before that it silently gave the
+        bridge to whichever account was active, unswapped and unrecorded,
+        which is the same permanent loss the create route already closed."""
         self._bridge_post(
             certdir, monkeypatch,
             seed_verdict=lambda pp, provider: None,
             expect_swapped=False,
             profile_answer=lambda token: {
                 "emailAddress": "someone-else@example.com"},
+            expect_refused=True,
         )
 
-    def case_a_foreign_verdict_from_the_identity_beat_leaves_the_bridge_post_unswapped(
+    def case_a_foreign_verdict_from_the_identity_beat_refuses_the_bridge_post(
             self, certdir, monkeypatch):
         """The INCIDENT's own path: the 12h identity beat
         (`_freshen_pin_identity`) reports a foreign verdict through
@@ -504,12 +529,15 @@ class TestPinProxyServer:
         stays the healthy default: if the cache key shape ever moved and the
         mint fell through to a real probe, this case must still never dial
         out, and a healthy answer there is also the correct one -- the
-        provider ignores it while its own foreign verdict stands."""
+        provider ignores it while its own foreign verdict stands. Since
+        T0867 the bridge attach also waits and then refuses (503) rather
+        than relaying on the foreign bearer -- see `expect_refused`."""
         self._bridge_post(
             certdir, monkeypatch,
             seed_verdict=lambda pp, provider: provider.note_verdict(
                 "pin-live-token", "foreign"),
             expect_swapped=False,
+            expect_refused=True,
         )
 
 
@@ -4102,6 +4130,75 @@ class TestChainRediscovery:
         assert not any(b"Bearer ACTIVE" in s for s in seen), (
             "the bridge create reached the chain on a blind mint — this "
             f"bridge is now owned by the ACTIVE account permanently: {seen!r}")
+
+    def case_the_bridge_attach_waits_on_an_unexplained_miss_then_relays_untokened_and_logs(
+        self, certdir
+    ):
+        """`should_wait_for_pin` now covers the bridge ATTACH too (T0867) —
+        previously missing even though `is_pinned_route` already matches it
+        (a prefix match on `/v1/code/sessions/`), so a token miss on this
+        route relayed on Claude Code's own bearer with no retry and no
+        record at all: `_wait_for_pin_token` returned the falsy token
+        straight back because `should_wait_for_pin` said this route was not
+        worth waiting for.
+
+        NOT `consume-busy`: that shape sets `_deferred`, which makes
+        `pin_is_noop()` read True for the whole window, so `_wait_for_pin_token`
+        returns before this retry loop ever starts (see `should_wait_for_pin`'s
+        docstring). A miss that leaves `blind_reason` unset and `pin_is_noop()`
+        False — the shape this case drives — must still retry `_PIN_WAIT_TRIES`
+        times and then keep today's fail-open relay unchanged — but it must
+        now also say so, which it could not before this route was reachable."""
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            provider = self._blind_provider()  # blind_reason="" — a miss
+            got, seen = self._post_bridge_create(
+                certdir, provider, path="/v1/code/sessions/cse_x/bridge")
+            assert got.startswith(b"HTTP/1.1 200"), (
+                f"a momentary miss with no blind_reason must still fail "
+                f"open, not hang or refuse: {got[:60]!r}")
+            assert any(b"Bearer ACTIVE" in s for s in seen), (
+                "the exhausted retry did not fall back to the untokened "
+                f"relay today's fail-open promises: {seen!r}")
+            assert provider.calls >= pp._PIN_WAIT_TRIES, (
+                f"only {provider.calls} provider() call(s) — the retry "
+                "loop this route now arms never ran")
+            assert any(
+                "a bridge was created without the pin" in l for l in lines
+            ), (
+                "the pin stayed silent about an unpinned bridge attach — "
+                "the exact gap this route closes")
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_a_stalled_mint_refuses_the_bridge_attach_fast_too(self, certdir):
+        """The absolute-form path's `mint_stalled()` pre-check (see
+        `case_a_stalled_mint_is_refused_fast_not_relayed`) now also gates
+        the bridge ATTACH (T0867), since that route only just became a
+        `should_wait_for_pin` route: a stalled store must 503 immediately
+        rather than pay `_wait_for_pin_token`'s three retries first, and
+        rather than relay unpinned — the permanent give-away this whole
+        route table exists to close."""
+        provider = self._blind_provider(
+            blind_reason="mint stalled: the refresh lock has been held "
+                         "over 45s for slot 1 (a@example.com)",
+            stalled=True)
+        got, seen = self._post_bridge_create(
+            certdir, provider, path="/v1/code/sessions/cse_x/bridge")
+        assert got.startswith(b"HTTP/1.1 503"), (
+            f"a stalled mint on the attach was relayed instead of "
+            f"refused: {got[:60]!r}")
+        assert b"Connection: close" in got, (
+            f"a closed connection advertised keep-alive: {got!r}")
+        assert not any(b"Bearer ACTIVE" in s for s in seen), (
+            f"a stalled mint reached the chain on the bridge attach: {seen!r}")
+        assert provider.calls <= 2, (
+            f"{provider.calls} provider() call(s) — the retry loop ran "
+            "instead of the fast pre-check refusing immediately")
 
     def case_a_noop_pin_still_relays_unpinned_not_503(self, certdir):
         """A no-op pin (`pin_is_noop()` True — the pinned account IS the

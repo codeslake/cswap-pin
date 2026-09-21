@@ -4921,6 +4921,20 @@ def _host_slug() -> str:
     return re.sub(r"[^a-z0-9]+", "-", raw.split(".")[0].lower()).strip("-")
 
 
+# Boundary for the bridge ATTACH route `should_wait_for_pin` guards below:
+# exactly one non-empty `<sid>` segment and nothing after `bridge` — so
+# `/v1/code/sessionsXYZ/<sid>/bridge` (not this subtree), `/v1/code/sessions/
+# /bridge` (empty sid) and `/v1/code/sessions/<sid>/bridge/extra` (a sibling
+# call, e.g. `/worker`) all stay outside it, the same discipline the two
+# exact-match entries below keep. `(?:code/)?` matches the SAME optional
+# prefix every sibling route regex in this file carries for this subtree
+# (`_PRESENCE`, `_WORKER_SUBTREE`, `_BRIDGE_REGISTER`, `_BRIDGE_ID`) and
+# `is_pinned_route` already treats identically (its own `/v1/sessions/`
+# prefix row): `POST /v1/sessions/<sid>/bridge` is the same permanent
+# give-away under the sibling spelling, not a different route.
+_BRIDGE_ATTACH = re.compile(r"^/v1/(?:code/)?sessions/[^/]+/bridge$")
+
+
 def should_wait_for_pin(method: str, path: str) -> bool:
     """Is this the request where failing open costs something PERMANENT?
 
@@ -4928,10 +4942,25 @@ def should_wait_for_pin(method: str, path: str) -> bool:
     never block work — and that is right for `/v1/messages`: the request bills
     the other account and the next one is fine.
 
-    Creating a bridge is the exception. `POST /v1/code/sessions` is where the
-    server fixes the session's owner, and there is no transfer afterwards, so
-    one lost race gives a session away for good: its name, its history, and
-    the account it appears under.
+    Three routes are the exception, because each is where the server fixes an
+    owner for good and there is no transfer afterwards:
+
+    `POST /v1/code/sessions` is the session CREATE — where the server fixes
+    the session's owner, so one lost race gives the session away for good:
+    its name, its history, and the account it appears under.
+
+    `POST /v1/code/sessions/<sid>/bridge` is a SEPARATE route: attaching a
+    Remote Control bridge to an EXISTING session, not creating one. It was
+    missing here even though `is_pinned_route` already matches it (that
+    route is a prefix match on `/v1/code/sessions/`, so it covers the attach
+    too) — `bare` above only ever compared the FULL attach path against the
+    bare create path, so the exact-membership check never saw it. A token
+    miss at that instant relayed the attach on Claude Code's own bearer
+    instead of retrying, and the bridge then belonged to whichever account
+    was active, not the pinned one, with no way back.
+
+    `POST /v1/environments/bridge` is the same bargain one subtree over: see
+    the comment on the return below.
 
     THE "12 OF 14" THAT USED TO BE CITED HERE WAS NOT THIS. That count came
     from a health check reading `ownerAccountUuid` out of transcripts, and
@@ -4951,13 +4980,16 @@ def should_wait_for_pin(method: str, path: str) -> bool:
     and sends, because a launch that hangs is worse than a session on the
     wrong account.
     """
+    if method != "POST":
+        return False
     bare = path.split("?", 1)[0].rstrip("/")
     # `POST /v1/environments/bridge` is the same bargain one subtree over: it
     # is where `claude remote-control` fixes the ENVIRONMENT's owner, and an
     # environment registered on the wrong account cannot be moved either — the
     # machine simply never appears on the pinned account's claude.ai.
-    return method == "POST" and bare in (
-        "/v1/code/sessions", "/v1/environments/bridge")
+    if bare in ("/v1/code/sessions", "/v1/environments/bridge"):
+        return True
+    return bool(_BRIDGE_ATTACH.match(bare))
 
 
 #: Titles this pin has PUT, keyed by bridge id. The one thing that separates
