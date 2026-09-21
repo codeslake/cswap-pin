@@ -5115,6 +5115,15 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # write can be lost is the one that runs last.
         wire_global_config(None, None)
         cfg = require("paths").get_global_config_path()
+        # ponytail: this receipt read is blind to ONE narrower failure inside
+        # `_wire_global_config_locked` itself -- it writes the sidecar
+        # receipt first and can still fail the `.claude.json` replace after
+        # (a pre-existing ordering, not something this arm introduced; see
+        # its own `except OSError` there), which leaves the sidecar saying
+        # "not wired" while the config is not actually touched. Closing that
+        # needs this guard to compare the PRE-CALL receipt's own keys against
+        # their live values, not just read the post-call receipt -- upgrade
+        # if a host measures it, not speculatively here.
         if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
             # THE UNWIRE DID NOT TAKE, and not only from a kill.
             # `wire_global_config` degrades a lock it cannot get inside its

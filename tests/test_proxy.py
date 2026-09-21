@@ -7042,15 +7042,24 @@ class TestWireGlobalConfig:
             def resolve_account(self, identifier):
                 return ("2", "pin@example.com", "org-1")
 
+        identity = {"emailAddress": "pin@example.com", "accountUuid": "uuid-pin",
+                    "organizationUuid": "org-1"}
         monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, Path("/x/ca.pem")))
-        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1")
+        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1", identity=identity)
         pin_proxy.wire_global_config(9955, Path(tmp_path) / "ca.pem")
         assert "env" in json.loads(path.read_text())
+        ident_path = backup / "pin-proxy" / pin_proxy._PIN_IDENTITY_NAME
+        assert ident_path.exists()
 
         pin_proxy.apply_pin(_Sw(), None, None)
         raw = json.loads(path.read_text())
         assert "env" not in raw, "clearing the pin left the proxy wired"
         assert pin_proxy.load_pin(backup) is None
+        # THE CONTROL for the bail-out case below: a clear that DOES take
+        # must drop `pin-identity.json` too, or an old identity outlives
+        # every pin it named.
+        assert not ident_path.exists(), (
+            "a clear that took left the old identity memo behind")
 
     def case_apply_pin_clear_survives_a_lock_it_cannot_take(self, tmp_path, monkeypatch):
         """`wire_global_config` takes the `.claude.json` lock on a 5s budget
@@ -7073,11 +7082,15 @@ class TestWireGlobalConfig:
             def resolve_account(self, identifier):
                 return ("2", "pin@example.com", "org-1")
 
+        identity = {"emailAddress": "pin@example.com", "accountUuid": "uuid-pin",
+                    "organizationUuid": "org-1"}
         monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, Path("/x/ca.pem")))
-        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1")
+        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1", identity=identity)
         pin_proxy.wire_global_config(9955, Path(tmp_path) / "ca.pem")
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1")
         assert "env" in json.loads(path.read_text())
+        ident_path = backup / "pin-proxy" / pin_proxy._PIN_IDENTITY_NAME
+        assert ident_path.exists()
 
         # THE REAL SHAPE OF THE FAILURE: a lock it could not take, caught
         # inside `wire_global_config` itself and turned into a plain False —
@@ -7088,6 +7101,13 @@ class TestWireGlobalConfig:
 
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
             "a lock this call could not take lost the pin record")
+        # THE BAIL-OUT'S OWN LOAD-BEARING CLAIM: the pin is still serving,
+        # so `pin-identity.json` must survive too, or live sessions' bridge
+        # pointers lose their pinned owner while the pin is still up. The
+        # control is the clean clear above, which must drop this same file.
+        assert ident_path.exists(), (
+            "pin-identity.json was dropped by a clear that should have "
+            "left it alone")
 
     def case_apply_pin_clear_proceeds_over_an_unowned_stale_wiring(
         self, tmp_path, monkeypatch
@@ -7121,6 +7141,57 @@ class TestWireGlobalConfig:
 
         assert pin_proxy.load_pin(backup) is None, (
             "an unowned, receipt-less wiring refused the clear forever")
+
+    def case_apply_pin_clear_undoes_a_racing_rewire(self, tmp_path, monkeypatch):
+        """The window this reorder opens (wiring gone, record still there)
+        is exactly the shape a concurrently-running `heal` repairs -- it can
+        land a re-wire before this arm drops the record. The clear arm
+        re-checks the receipt once the record is gone and undoes a re-wire
+        it finds. Stubs `_read_ledger` to answer falsy (nothing wired, let
+        the clear proceed) then truthy (a race landed) across the two calls
+        this arm makes, and `wire_global_config` to succeed then fail on
+        the follow-up call, to reach and prove both of the two log lines."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        self._config(tmp_path, monkeypatch, {"projects": {}})
+        backup = Path(tmp_path)
+        (backup / "pin-proxy").mkdir(parents=True)
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        log = backup / "pin-proxy" / "daemon.log"
+
+        def _run(follow_up_result):
+            pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+            calls = []
+
+            def _ledger(cfg, raw):
+                calls.append(1)
+                mark = [] if len(calls) == 1 else ["HTTPS_PROXY"]
+                return {pin_proxy._WIRE_MARK: mark}
+            monkeypatch.setattr(pin_proxy, "_read_ledger", _ledger)
+
+            wired = []
+
+            def _wire(port, ca):
+                wired.append(port)
+                return True if len(wired) == 1 else follow_up_result
+            monkeypatch.setattr(pin_proxy, "wire_global_config", _wire)
+
+            pin_proxy.apply_pin(_Sw(), None, None)
+            assert wired == [None, None], "the racing re-wire was not re-checked"
+
+        _run(follow_up_result=True)
+        assert "a racing re-wire was undone after the clear" in log.read_text()
+
+        log.write_text("")
+        _run(follow_up_result=False)
+        assert "a racing re-wire could not be undone after the clear" in (
+            log.read_text())
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
