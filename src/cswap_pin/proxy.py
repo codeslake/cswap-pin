@@ -1698,9 +1698,11 @@ def heal(backup_root: Path, identity: dict | None = None,
         pin = _restore_record_from_wiring(backup_root, certdir)
         if not pin:
             return False  # nothing pinned — not our business
-        _log_carry(certdir, f"restored the pin record for {pin[0]} — the "
-                             "wiring receipt named it but settings.json had "
-                             "lost it")
+        # NO ADDRESS IN THE LINE: this log ships on other people's machines
+        # (see the same rule beside `splice_config_identity`'s own line),
+        # and the fact that a record was restored is the payload.
+        _log_carry(certdir, "restored the pin record from the wiring "
+                             "receipt — settings.json had lost it")
     email = pin[0]
     # THE CONFIG HALF OF THE SAME RULE the block below states for the DAEMON. A
     # release that ADDS an env key kept the old key set in `.claude.json` until
@@ -2378,6 +2380,12 @@ def _wire_global_config_locked(
         # keys are ours that the config does not carry, so `--clear` removes
         # nothing and reports nothing — a no-op, not an outage. The opposite
         # order fails the other way, which is why the write above is first.
+        # ONLY FOR `port is not None` (a set), though: on an unwire the
+        # receipt instead UNDERSTATES here (it was just written `[]`, "not
+        # wired", while `env` above still carries the keys this replace
+        # never removed) -- `apply_pin`'s clear arm names this same gap in
+        # its own `# ponytail:` note, since a receipt read there cannot see
+        # it either.
         return False
     return True
 
@@ -5175,7 +5183,7 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             _log_lifecycle("could not un-name the cleared pin in the live "
                            "config — bridges keep its owner until the next "
                            "switch")
-        remember_pin_identity(certdir, None)
+        wiring_confirmed_gone = True
         if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
             # A RACING `heal`, NOT A RETRY OF OURS. `heal` reads `load_pin`
             # once per launch and re-wires a pinned-but-unwired host on its
@@ -5201,10 +5209,26 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                 _log_carry(certdir,
                            "a racing re-wire was undone after the clear")
             else:
+                # THE IDENTITY MEMO STAYS, same reasoning as the bail-out
+                # above: the wiring is, per this read, still live, so the
+                # record this arm already dropped is now the wrong half to
+                # have kept -- a later `heal` restoring it from this file is
+                # convergence, not the resurrection the memo-drop below
+                # guards against. Dropping it here instead would recreate
+                # this whole change's own defect: wiring live, record AND
+                # its one recovery source both gone, unrecoverable.
                 _log_carry(certdir,
                            "a racing re-wire could not be undone after the "
                            "clear — the config may still point at the old "
                            "pin")
+                wiring_confirmed_gone = False
+        # THE MEMO DROPS ONLY NOW THE WIRING IS CONFIRMED GONE, either
+        # because it never raced or because the undo above just took.
+        # Dropping it any earlier could beat a failed undo to the punch (see
+        # the branch above) and leave nothing for `heal` to recover a
+        # still-live pin from.
+        if wiring_confirmed_gone:
+            remember_pin_identity(certdir, None)
         _log_carry(certdir, "cleared the pin: unwired .claude.json first, "
                              "then dropped the settings.json record")
         return False
@@ -5330,8 +5354,9 @@ def _restore_record_from_wiring(
     configured for themselves carries no such mark and must be left alone.
 
     THE RECORD ONLY, NEVER THE WIRING, AND ONLY FROM `pin-identity.json`.
-    `heal`'s caller already re-wires once a record exists, so restoring the
-    wiring here too would just race that path. And `.claude.json`'s own
+    `heal` ITSELF already re-wires once a record exists (its own code below
+    this call), so restoring the wiring here too would just race that path.
+    And `.claude.json`'s own
     `oauthAccount` names whoever happens to be logged in right now -- on an
     UNPINNED box that is not ours to read, and re-pinning from it would pin
     the wrong account. `pin-identity.json` is this package's own receipt for

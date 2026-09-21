@@ -7108,6 +7108,11 @@ class TestWireGlobalConfig:
         assert ident_path.exists(), (
             "pin-identity.json was dropped by a clear that should have "
             "left it alone")
+        # THE ARM WAS ACTUALLY REACHED. The two assertions above pass just
+        # as well if `apply_pin` did nothing at all; this is the one
+        # observable that is unique to the bail-out itself.
+        log = (backup / "pin-proxy" / "daemon.log").read_text()
+        assert "clear did not take" in log
 
     def case_apply_pin_clear_proceeds_over_an_unowned_stale_wiring(
         self, tmp_path, monkeypatch
