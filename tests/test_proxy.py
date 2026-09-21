@@ -1057,6 +1057,46 @@ class TestLiveRemoteControlSessions:
         # merely CONTAINS the pinned one is still a different route.
         assert should_wait_for_pin("POST", "/v1/code/sessionsX?x=1") is False
 
+    def case_attaching_a_bridge_is_worth_waiting_for_a_token_too(self):
+        """`POST /v1/code/sessions/<sid>/bridge` is a SEPARATE route from
+        `POST /v1/code/sessions` (the session create): it is what Claude
+        Code calls to give an EXISTING session a Remote Control bridge. It
+        is just as permanent a fix of ownership, and `is_pinned_route`
+        already matches it (a prefix match on `/v1/code/sessions/`) — so a
+        token miss at that instant used to relay the attach on Claude
+        Code's own bearer with no retry at all, the same permanent
+        give-away the create route is guarded against.
+
+        The boundary discipline matches the rest of this file: exactly one
+        non-empty `<sid>` segment, and nothing after `bridge`.
+        """
+        from cswap_pin.proxy import should_wait_for_pin
+
+        assert should_wait_for_pin(
+            "POST", "/v1/code/sessions/cse_x/bridge") is True
+        # Trailing slash and query string, same discipline as the two
+        # entries above.
+        assert should_wait_for_pin(
+            "POST", "/v1/code/sessions/cse_x/bridge/") is True
+        assert should_wait_for_pin(
+            "POST", "/v1/code/sessions/cse_x/bridge?x=1") is True
+        # A GET never waits — only a POST fixes ownership.
+        assert should_wait_for_pin(
+            "GET", "/v1/code/sessions/cse_x/bridge") is False
+        # Not a prefix match on `sessions`: a different route that merely
+        # starts the same way is still a different route.
+        assert should_wait_for_pin(
+            "POST", "/v1/code/sessionsXYZ/cse_x/bridge") is False
+        # An EMPTY `<sid>` segment is not one non-empty segment.
+        assert should_wait_for_pin(
+            "POST", "/v1/code/sessions//bridge") is False
+        # Nothing after `bridge` — the worker subtree, and any other
+        # sibling call on the same session, are not this route.
+        assert should_wait_for_pin(
+            "POST", "/v1/code/sessions/cse_x/bridge/extra") is False
+        assert should_wait_for_pin(
+            "POST", "/v1/code/sessions/cse_x/worker") is False
+
     def case_a_name_the_user_typed_on_the_web_is_never_overwritten(
         self, monkeypatch
     ):
