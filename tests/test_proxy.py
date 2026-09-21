@@ -1083,6 +1083,13 @@ class TestLiveRemoteControlSessions:
         # one exposed to the identical permanent give-away.
         assert should_wait_for_pin(
             "POST", "/v1/sessions/cse_x/bridge") is True
+        # THE OPTIONAL GROUP IS THE LITERAL `code/`, NOT ANY SEGMENT. Every
+        # row above and below uses only the `code/` or bare spelling, so a
+        # regex whose group had widened to `[^/]+/` (matching an arbitrary
+        # prefix ahead of `sessions/`) would pass every one of them too —
+        # this is the row that tells the two apart.
+        assert should_wait_for_pin(
+            "POST", "/v1/api/sessions/cse_x/bridge") is False
         # Trailing slash and query string, same discipline as the two
         # entries above.
         assert should_wait_for_pin(
