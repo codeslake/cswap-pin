@@ -1653,8 +1653,12 @@ def heal(backup_root: Path, identity: dict | None = None,
     is a deadlock, and it is exactly what was measured: a human had to
     re-pin by hand.
 
-    So this needs no switcher: the pinned identity comes from settings.json and
-    the slot from the account registry, both on disk. The repair itself is
+    So this needs no switcher: the pinned identity comes from settings.json
+    and the slot from the account registry, both on disk -- and when
+    settings.json itself has lost the record, `_restore_record_from_wiring`
+    (below) rebuilds it from the wiring receipt and `pin-identity.json`
+    before this function reads it, which makes `heal` a WRITER of
+    settings.json too, not only a reader. The repair itself is
     cheap when healthy — a state read plus one loopback connect, and it returns
     immediately — but this is no longer the whole cost: since 0.1.81 the bridge
     pointer sweep runs first on every call. It always reads the registry and
@@ -1695,7 +1699,18 @@ def heal(backup_root: Path, identity: dict | None = None,
     except Exception:
         return False
     if not pin:
-        return False  # nothing pinned — not our business
+        pin = _restore_record_from_wiring(backup_root, certdir)
+        if not pin:
+            return False  # nothing pinned — not our business
+        # NO ADDRESS IN THE LINE: this log ships on other people's machines
+        # (see the same rule beside `splice_config_identity`'s own line),
+        # and the fact that a record was restored is the payload. NOR A
+        # GUESSED CAUSE: "settings.json had lost it" states a loss this
+        # function's own docstring says it cannot tell apart from a
+        # deliberate clear that lost its own race (see there). Say what was
+        # observed -- the wiring is still ours and nothing named it.
+        _log_carry(certdir, "restored the pin record: the wiring is still "
+                             "ours and settings.json named no pin")
     email = pin[0]
     # THE CONFIG HALF OF THE SAME RULE the block below states for the DAEMON. A
     # release that ADDS an env key kept the old key set in `.claude.json` until
@@ -2373,6 +2388,14 @@ def _wire_global_config_locked(
         # keys are ours that the config does not carry, so `--clear` removes
         # nothing and reports nothing — a no-op, not an outage. The opposite
         # order fails the other way, which is why the write above is first.
+        # ONLY FOR `port is not None` (a set), though: on an unwire the
+        # receipt instead UNDERSTATES here (it was just written `[]`, "not
+        # wired", while the FILE ON DISK still carries the keys this failed
+        # replace never removed -- the local `env` above already had them
+        # popped, it is `path` that never got the new copy) --
+        # `apply_pin`'s clear arm names this same gap in its own
+        # `# ponytail:` note, since a receipt read there cannot see it
+        # either.
         return False
     return True
 
@@ -5086,27 +5109,150 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     `claude` with no way back but editing the file by hand.
 
     Both entry points (the CLI and the TUI menu) go through here so they
-    cannot drift apart again. Returns whether a proxy is now serving.
+    cannot drift apart again. Returns whether a proxy is now serving --
+    MEASURED on the set arm (`ensure_proxy(...) is not None`), but only
+    INFERRED on the clear arm's two "the wiring is still there" returns
+    (a receipt read, not a live probe): a pinned-and-wired host with no
+    daemon actually listening is exactly the state `heal` exists to
+    notice and repair, not this call.
     """
-    save_pin(switcher.backup_dir, email, org_uuid)
-    if not email:
-        wire_global_config(None, None)
-        # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
-        # the ex-pin until some later switch happened to rewrite it. `identity`
-        # is the caller's to supply here exactly as it is when setting: only
-        # cswap can resolve an account in its own backup store. None therefore
-        # means "could not look one up", and the splice leaves the field alone
-        # rather than erasing it — cswap's own switch rewrites it on the next
-        # rotation, and a blank owner is worse than a stale one.
-        try:
-            splice_config_identity(identity)
-        except Exception:  # noqa: BLE001 — the clear must work regardless
-            _log_lifecycle("could not un-name the cleared pin in the live "
-                           "config — bridges keep its owner until the next "
-                           "switch")
-        remember_pin_identity(switcher.backup_dir / "pin-proxy", None)
-        return False
     certdir = switcher.backup_dir / "pin-proxy"
+    if not email:
+        # THE ORDER IS REVERSED FROM THE SET ARM BELOW, ON PURPOSE. Whichever
+        # of the two writes here runs second is the one a kill between them
+        # loses — `wire_global_config` takes the `.claude.json` lock on a 5s
+        # budget, and a host that holds that lock near-continuously kills the
+        # waiter before it ever gets there. Recording the clear FIRST used to
+        # mean exactly that kill left `save_pin` already run and the wiring
+        # untouched: `load_pin` reads "nothing pinned", `heal` calls the
+        # dangling wiring "not our business" and leaves it dangling forever
+        # (measured: 21 hours, `remoteControl` gone, `.claude.json` still
+        # wired). Unwiring FIRST instead means a kill here leaves the record
+        # still naming the old pin — `heal` reads that as still-pinned and
+        # just re-wires. NOT THE SAME SHAPE AS A LOST SET, though both are
+        # recoverable: a lost set converges to what the operator asked for,
+        # a lost clear converges back to PINNED -- `heal` silently undoes
+        # the clear rather than merely delaying it. So the record is the
+        # durable half of a clear and the wiring is the disposable one,
+        # same as the wiring is the disposable half of a set: whichever
+        # write can be lost is the one that runs last.
+        wire_global_config(None, None)
+        cfg = require("paths").get_global_config_path()
+        # ponytail: this receipt read is blind to ONE narrower failure inside
+        # `_wire_global_config_locked` itself -- it writes the sidecar
+        # receipt first and can still fail the `.claude.json` replace after
+        # (a pre-existing ordering, not something this arm introduced; see
+        # its own `except OSError` there), which leaves the sidecar saying
+        # "not wired" while the config is not actually touched. Closing that
+        # needs this guard to compare the PRE-CALL receipt's own keys against
+        # their live values, not just read the post-call receipt -- upgrade
+        # if a host measures it, not speculatively here.
+        if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
+            # THE UNWIRE DID NOT TAKE, and not only from a kill.
+            # `wire_global_config` degrades a lock it cannot get inside its
+            # own budget to "skip the write" and returns False — no
+            # exception to catch — which is exactly the near-continuous-lock
+            # host this reorder is for. THE SAME RECEIPT `heal` and
+            # `rewire_if_version_changed` already trust for "this wiring is
+            # ours", not a bare port read: a leftover key this package lost
+            # the receipt for is left untouched by `wire_global_config`
+            # itself (it cannot prove the key is its to remove), and reading
+            # that as "still wired" here would refuse every future clear on
+            # a host in that state forever. Recording the clear anyway would
+            # drop the only place a retry or `heal` can still find a wiring
+            # that IS still ours. Leave the record standing so the next
+            # attempt finds the pin exactly as it was.
+            # BOTH CHANNELS: `_log_carry` outlives the launch that wrote it,
+            # but a hand-run `--clear` is not about to `os.execvpe` into
+            # anything, so its terminal is not "painted over" the way the
+            # launch path's is -- the operator needs to see, right now, that
+            # the clear they just asked for did not happen.
+            _log_carry(certdir, "clear did not take: the config still "
+                                 "carries our wiring receipt, left the pin "
+                                 "record standing")
+            # THE OBSERVATION, NOT A GUESSED CAUSE: this guard reads only
+            # the receipt, and `wire_global_config` answers False for more
+            # than a busy lock -- an unreadable config, or a failed
+            # `_write_ledger` (which prints its OWN line already). Naming
+            # the lock specifically here would give two stderr sentences
+            # blaming two different things on the host where the other one
+            # actually happened.
+            _log_lifecycle("the clear did not take — the wiring and the "
+                           "record were both left as they were; try again")
+            # `pin-identity.json` STAYS, on purpose. This path leaves the
+            # pin recorded, wired and still serving -- exactly the state
+            # `_pointer_owner`, `carry_live_pointers` and
+            # `_freshen_pin_identity` read this file in, to keep live
+            # sessions' bridge pointers attributed to the pinned account
+            # rather than whoever is logged in right now. Dropping it would
+            # tear that off a pin that never stopped serving.
+            #
+            # ponytail: a caller that force-clears the record without
+            # trusting this return value can make `--clear` never durably
+            # take on a host whose lock stays contended across every retry
+            # -- `heal` re-syncs the record back from this memo every
+            # launch. Fixing that needs the caller to trust `True` here, or
+            # a new clear-intent marker; both are out of this arm's scope,
+            # and the caller is in another repository.
+            return True
+        # CAPTURED BEFORE THE DROP, so a failed racing-undo below can put
+        # this exact pair straight back. Not `pin-identity.json`: the set
+        # arm unlinks it on any call with no `identity` (a rollback does
+        # exactly that), so a memo merely left alone is not durable enough
+        # to lean on here.
+        prior = load_pin(switcher.backup_dir)
+        save_pin(switcher.backup_dir, email, org_uuid)
+        wiring_confirmed_gone = True
+        if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
+            # A RACING `heal`, NOT A RETRY OF OURS -- same receipt as the
+            # guard above, one step later: the window this reorder opens
+            # (wiring gone, record still there) is exactly the shape `heal`
+            # repairs on its own account, with no way to know a clear is in
+            # flight. `wire_global_config` is safe to call again regardless
+            # of who wrote what is there now -- it only touches a key it
+            # can prove is its own -- so this either undoes a re-wire
+            # landed in that window or is a harmless no-op. Narrows the
+            # race rather than closing it; closing it needs `heal` itself
+            # to re-check `load_pin` immediately before it wires.
+            if wire_global_config(None, None):
+                _log_carry(certdir,
+                           "a racing re-wire was undone after the clear")
+            else:
+                _log_carry(certdir,
+                           "a racing re-wire could not be undone after the "
+                           "clear — the config may still point at the old "
+                           "pin")
+                _log_lifecycle("could not fully clear the pin — a racing "
+                               "re-wire could not be undone, so the config "
+                               "may still point at the old pin; try again")
+                # THE MEMO STAYS whenever the wiring is not confirmed gone,
+                # `prior` or not: a clear on an already-clear pin has none
+                # to restore, but the wiring here is exactly as live either
+                # way, and the memo is `_restore_record_from_wiring`'s only
+                # remaining input.
+                wiring_confirmed_gone = False
+                if prior:
+                    save_pin(switcher.backup_dir, prior[0], prior[1])
+        if wiring_confirmed_gone:
+            # THE OWNER SPLICE MOVES HERE TOO, not before the race check:
+            # naming a different account in `.claude.json` and then putting
+            # the OLD pin's record back above (a failed undo, `prior`
+            # restored) would leave a still-serving pin under the wrong
+            # `oauthAccount` until the next switch.
+            try:
+                splice_config_identity(identity)
+            except Exception:  # noqa: BLE001 — the clear must work regardless
+                _log_lifecycle("could not un-name the cleared pin in the "
+                               "live config — bridges keep its owner until "
+                               "the next switch")
+            remember_pin_identity(certdir, None)
+            _log_carry(certdir, "cleared the pin: unwired .claude.json "
+                                 "first, then dropped the settings.json "
+                                 "record")
+        # NOT MEASURED, same as the bail-out above: this reads the receipt,
+        # it does not probe a daemon (see this function's own docstring).
+        return not wiring_confirmed_gone
+    save_pin(switcher.backup_dir, email, org_uuid)
     try:
         certdir.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -5203,6 +5349,82 @@ def remembered_pin_identity(certdir) -> dict | None:
     except (OSError, ValueError, TypeError):
         return None
     return d if isinstance(d, dict) and d.get("accountUuid") else None
+
+
+def _restore_record_from_wiring(
+    backup_root: Path, certdir: Path
+) -> "tuple[str, str] | None":
+    """Rebuild a lost `remoteControl` record from a wiring `heal` can prove
+    is ours, or None when it cannot.
+
+    THE GAP THIS CLOSES. `settings.json`'s pin record and `.claude.json`'s
+    wiring are two files, written by two separate calls, and either can be
+    lost without the other — `apply_pin`'s own clear arm now orders its two
+    writes so a kill between them never loses the record while the wiring
+    stands (see the comment there), but that is one producer among many:
+    `.claude.json` is a single global file every switch rewrites, and
+    nothing stops it being overwritten or truncated out from under a pin
+    record that never moved. Either way, `heal` used to read `load_pin` ->
+    None and return -- "nothing pinned, not our business" -- exactly wrong
+    when the wiring says otherwise.
+
+    THE RECEIPT, NOT A BARE PROXY VAR. `_read_ledger(...).get(_WIRE_MARK)` is
+    the same test `rewire_if_version_changed` already trusts to mean "this
+    wiring is OURS" (see that function). A proxy the user or their launcher
+    configured for themselves carries no such mark and must be left alone.
+
+    AND AT LEAST ONE OF ITS OWN KEYS, STILL LIVE. A receipt can outlive the
+    wiring it once named -- this same module's own `_read_ledger` docstring
+    describes an emptied sidecar beside a config marker that survived it, and
+    the reverse happens too: a config truncated or hand-edited out from under
+    a receipt that never got the news. Trusting the mark alone there would
+    re-pin and re-wire a box the operator emptied by hand, from a receipt for
+    a wiring that no longer exists.
+
+    THE RECORD ONLY, NEVER THE WIRING, AND ONLY FROM `pin-identity.json`.
+    `heal` ITSELF already re-wires once a record exists (its own code below
+    this call), so restoring the wiring here too would just race that path.
+    And `.claude.json`'s own
+    `oauthAccount` names whoever happens to be logged in right now -- on an
+    UNPINNED box that is not ours to read, and re-pinning from it would pin
+    the wrong account. `pin-identity.json` is this package's own receipt for
+    the account IT pinned, written only while a pin was live, so it is the
+    one source this is allowed to trust.
+
+    Never raises: called from `heal`, which runs from an rc hook before
+    every launch.
+
+    THE CHEAP MISS FIRST. `rewire_if_version_changed`'s own contract is "an
+    unwired machine must not pay for this" (see that function) -- a machine
+    that never pinned has no `pin-identity.json` at all, so checking it
+    first answers with one small file read instead of parsing the whole
+    global config on every `pin --ensure` a never-pinned host runs.
+
+    A DELIBERATE CLEAR THAT LOST ITS OWN RACE READS THE SAME AS A LOST
+    RECORD, on purpose -- this function cannot tell "the record vanished
+    from under a live pin" from "a clear meant to remove it but its own
+    racing-undo failed" (see `apply_pin`'s clear arm), and it is not
+    supposed to: both leave the wiring genuinely still live, which is the
+    one fact this function checks for.
+    """
+    try:
+        ident = remembered_pin_identity(certdir)
+        if not ident or not ident.get("emailAddress"):
+            return None
+        cfg = require("paths").get_global_config_path()
+        raw = _read_json(cfg)
+        mark = _read_ledger(cfg, raw).get(_WIRE_MARK)
+        if not mark:
+            return None
+        env = raw.get("env") if isinstance(raw, dict) else None
+        if not isinstance(env, dict) or not any(k in env for k in mark):
+            return None
+        email = str(ident["emailAddress"])
+        org = str(ident.get("organizationUuid") or "")
+        save_pin(backup_root, email, org)
+        return email, org
+    except Exception:  # noqa: BLE001 — heal must never fail on this repair
+        return None
 
 
 def live_pin_identity_state(ident: dict) -> "tuple[bool, str]":

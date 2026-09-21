@@ -7042,15 +7042,211 @@ class TestWireGlobalConfig:
             def resolve_account(self, identifier):
                 return ("2", "pin@example.com", "org-1")
 
+        identity = {"emailAddress": "pin@example.com", "accountUuid": "uuid-pin",
+                    "organizationUuid": "org-1"}
         monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, Path("/x/ca.pem")))
-        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1")
+        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1", identity=identity)
         pin_proxy.wire_global_config(9955, Path(tmp_path) / "ca.pem")
         assert "env" in json.loads(path.read_text())
+        ident_path = backup / "pin-proxy" / pin_proxy._PIN_IDENTITY_NAME
+        assert ident_path.exists()
 
         pin_proxy.apply_pin(_Sw(), None, None)
         raw = json.loads(path.read_text())
         assert "env" not in raw, "clearing the pin left the proxy wired"
         assert pin_proxy.load_pin(backup) is None
+        # THE CONTROL for the bail-out case below: a clear that DOES take
+        # must drop `pin-identity.json` too, or an old identity outlives
+        # every pin it named.
+        assert not ident_path.exists(), (
+            "a clear that took left the old identity memo behind")
+
+    def case_apply_pin_clear_survives_a_lock_it_cannot_take(self, tmp_path, monkeypatch):
+        """`wire_global_config` takes the `.claude.json` lock on a 5s budget
+        and, when it cannot get it, degrades to "skip the write" and RETURNS
+        FALSE — it does not raise, so a host that holds the lock
+        near-continuously hits this on ordinary execution, not only on a
+        kill. Against the old order — record the clear, then unwire — that
+        skip left the record already gone and the config still wired:
+        `load_pin` read None afterwards, and `heal` called the still-wired
+        config "not our business" forever (measured: 21 hours). The record
+        must survive a clear that could not take the lock."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
+        backup = Path(tmp_path)
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        identity = {"emailAddress": "pin@example.com", "accountUuid": "uuid-pin",
+                    "organizationUuid": "org-1"}
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, Path("/x/ca.pem")))
+        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1", identity=identity)
+        pin_proxy.wire_global_config(9955, Path(tmp_path) / "ca.pem")
+        assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1")
+        assert "env" in json.loads(path.read_text())
+        ident_path = backup / "pin-proxy" / pin_proxy._PIN_IDENTITY_NAME
+        assert ident_path.exists()
+
+        # THE REAL SHAPE OF THE FAILURE: a lock it could not take, caught
+        # inside `wire_global_config` itself and turned into a plain False —
+        # never an exception a caller could catch.
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: False)
+        lifecycle_lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lifecycle_lines.append)
+
+        result = pin_proxy.apply_pin(_Sw(), None, None)
+
+        # THE ONLY VERDICT THIS GUARD HAS: the receipt still names a
+        # wiring, so this reports "still pinned", unlike every other clear
+        # in this suite (`is False`) -- inferred from that read, not a live
+        # daemon probe (see `apply_pin`'s own docstring on the distinction).
+        assert result is True, "a refused clear must report the pin as still pinned"
+        assert any("the clear did not take" in ln for ln in lifecycle_lines), (
+            "a hand-run --clear got no stderr line when it silently failed")
+        assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
+            "a lock this call could not take lost the pin record")
+        # THE BAIL-OUT'S OWN LOAD-BEARING CLAIM: the pin is still serving,
+        # so `pin-identity.json` must survive too, or live sessions' bridge
+        # pointers lose their pinned owner while the pin is still up. The
+        # control is the clean clear above, which must drop this same file.
+        assert ident_path.exists(), (
+            "pin-identity.json was dropped by a clear that should have "
+            "left it alone")
+        # THE ARM WAS ACTUALLY REACHED. The two assertions above pass just
+        # as well if `apply_pin` did nothing at all; this is the one
+        # observable that is unique to the bail-out itself.
+        log = (backup / "pin-proxy" / "daemon.log").read_text()
+        assert "clear did not take" in log
+
+    def case_apply_pin_clear_proceeds_over_an_unowned_stale_wiring(
+        self, tmp_path, monkeypatch
+    ):
+        """THE DISCRIMINATOR the guard above needs: a bare `CSWAP_PIN_PORT`
+        in the config is not proof the wiring is ours. A host whose receipt
+        for an old wiring was lost some other way still carries the keys in
+        `.claude.json`, but neither the sidecar nor the config names
+        `_cswapPinWiredKeys` -- `wire_global_config` itself already refuses
+        to touch keys it cannot prove are its to remove, and answers False
+        for that exactly as it does for a lock it could not take. A guard
+        keyed on the bare port would read this as "still wired" and refuse
+        this host's every future clear forever; keyed on the receipt, it
+        must let the clear through."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        self._config(tmp_path, monkeypatch, {
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:9999",
+                    "CSWAP_PIN_PORT": "9999"},
+        })
+        backup = Path(tmp_path)
+        pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        pin_proxy.apply_pin(_Sw(), None, None)
+
+        assert pin_proxy.load_pin(backup) is None, (
+            "an unowned, receipt-less wiring refused the clear forever")
+
+    def case_apply_pin_clear_undoes_a_racing_rewire(self, tmp_path, monkeypatch):
+        """The window this reorder opens (wiring gone, record still there)
+        is exactly the shape a concurrently-running `heal` repairs -- it can
+        land a re-wire before this arm drops the record. The clear arm
+        re-checks the receipt once the record is gone and undoes a re-wire
+        it finds. Stubs `_read_ledger` to answer falsy (nothing wired, let
+        the clear proceed) then truthy (a race landed) across the two calls
+        this arm makes, and `wire_global_config` to succeed then fail on
+        the follow-up call, to reach and prove both of the two log lines."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        self._config(tmp_path, monkeypatch, {"projects": {}})
+        backup = Path(tmp_path)
+        (backup / "pin-proxy").mkdir(parents=True)
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        log = backup / "pin-proxy" / "daemon.log"
+        ident_path = backup / "pin-proxy" / pin_proxy._PIN_IDENTITY_NAME
+
+        def _run(follow_up_result, plant_prior=True):
+            if plant_prior:
+                pin_proxy.save_pin(backup, "pin@example.com", "org-1")
+            pin_proxy.remember_pin_identity(
+                backup / "pin-proxy",
+                {"emailAddress": "pin@example.com", "accountUuid": "uuid-pin",
+                 "organizationUuid": "org-1"})
+            calls = []
+
+            def _ledger(cfg, raw):
+                calls.append(1)
+                mark = [] if len(calls) == 1 else ["HTTPS_PROXY"]
+                return {pin_proxy._WIRE_MARK: mark}
+            monkeypatch.setattr(pin_proxy, "_read_ledger", _ledger)
+
+            wired = []
+
+            def _wire(port, ca):
+                wired.append(port)
+                return True if len(wired) == 1 else follow_up_result
+            monkeypatch.setattr(pin_proxy, "wire_global_config", _wire)
+
+            lifecycle_lines = []
+            monkeypatch.setattr(pin_proxy, "_log_lifecycle", lifecycle_lines.append)
+
+            result = pin_proxy.apply_pin(_Sw(), None, None)
+            assert wired == [None, None], "the racing re-wire was not re-checked"
+            return result, lifecycle_lines
+
+        result, _ = _run(follow_up_result=True)
+        assert "a racing re-wire was undone after the clear" in log.read_text()
+        assert not ident_path.exists(), (
+            "a fully undone race must still drop the identity memo")
+        assert result is False, "an undone race must report the clear as final"
+        assert pin_proxy.load_pin(backup) is None, (
+            "an undone race must leave the pin cleared")
+
+        log.write_text("")
+        result, lifecycle_lines = _run(follow_up_result=False)
+        assert "a racing re-wire could not be undone after the clear" in (
+            log.read_text())
+        assert ident_path.exists(), (
+            "a race that could not be undone must leave the identity memo "
+            "standing, or the pin becomes unrecoverable")
+        assert result is True, "a race that could not be undone is still pinned"
+        assert any("could not fully clear the pin" in ln for ln in lifecycle_lines), (
+            "a race that could not be undone got no stderr line either"
+        )
+        assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
+            "a race that could not be undone must put the record straight "
+            "back, not leave it to a later heal that may never run")
+
+        # THE THIRD SHAPE: no `prior` to restore (a clear called on an
+        # already-clear pin) AND the undo still fails. Nothing of OURS gets
+        # restored, but the wiring is, per this same read, exactly as live
+        # as the other failed-undo case -- the return and the memo must
+        # both answer the same way regardless of whether there was a
+        # `prior` to put back.
+        log.write_text("")
+        pin_proxy.save_pin(backup, None, None)  # the previous run's own
+        # restore, or `prior` here would read IT back, not "nothing pinned"
+        assert pin_proxy.load_pin(backup) is None
+        result, _ = _run(follow_up_result=False, plant_prior=False)
+        assert result is True, "the wiring is still live even with nothing of ours to restore"
+        assert ident_path.exists(), (
+            "the memo must survive even with no prior record to restore, "
+            "or the still-standing wiring becomes unrecoverable")
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
@@ -14553,6 +14749,86 @@ class TestHealRestoresWithoutRestart:
         assert pin_proxy.heal(root) is False
         assert json.loads(cfg.read_text()).get("env", {}) == {}
 
+    def case_a_lost_record_is_restored_from_the_wiring_receipt(
+        self, tmp_path, monkeypatch
+    ):
+        """`.claude.json` is a single global file every switch and every pin
+        rewrites, so its wiring can outlive the `settings.json` record that
+        named it — measured: the `remoteControl` section gone, the wiring
+        untouched, 21 hours with nothing to bring it back. `heal` used to
+        read `load_pin` -> None and call the dangling wiring "not our
+        business" forever. `pin-identity.json` is this package's own
+        receipt for the account it pinned, so a wiring receipt (`heal`'s
+        same test for "this wiring is ours") plus that file is enough to
+        rebuild the record.
+
+        THE CONTROL, in the same test so it gives the first half its
+        discriminating power: a config naming some OTHER proxy, with no
+        `_cswapPinWiredKeys` receipt at all, is not ours to read and must be
+        left unpinned even though `pin-identity.json` still exists.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        root, cfg = self._root(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        ident = {"emailAddress": "a@example.com", "accountUuid": "uuid-pin",
+                  "organizationUuid": "org-1"}
+        (certdir / pin_proxy._PIN_IDENTITY_NAME).write_text(json.dumps(ident))
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a: 1)
+
+        pin_proxy.save_pin(root, None, None)  # the loss under test
+        assert pin_proxy.load_pin(root) is None
+        cfg.write_text(json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:9999",
+                    "CSWAP_PIN_PORT": "9999"},
+            pin_proxy._WIRE_MARK: ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+
+        pin_proxy.heal(root)
+
+        assert pin_proxy.load_pin(root) == ("a@example.com", "org-1"), (
+            "the record was not rebuilt from pin-identity.json")
+
+        # THE CONTROL: a foreign proxy with no receipt of ours. A FRESH
+        # config path, not `cfg` reused -- the sidecar the first heal call
+        # just wrote is keyed by config path and would outlive overwriting
+        # `cfg`'s own text, silently carrying "wired" into this half too.
+        # CARRIES `CSWAP_PIN_PORT` on purpose: a bare port read would answer
+        # non-None here too, so leaving it out would let a restore keyed on
+        # `_wired_port()` pass this control by accident -- the receipt is
+        # what must be doing the refusing, and only a port alongside its
+        # absence proves that.
+        import claude_swap.paths as paths
+        foreign_cfg = tmp_path / "foreign.claude.json"
+        foreign_cfg.write_text(json.dumps(
+            {"env": {"HTTPS_PROXY": "http://127.0.0.1:8888",
+                     "CSWAP_PIN_PORT": "8888"}}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: foreign_cfg)
+        pin_proxy.save_pin(root, None, None)
+
+        pin_proxy.heal(root)
+
+        assert pin_proxy.load_pin(root) is None, (
+            "a foreign proxy with no wiring receipt was mistaken for ours")
+
+        # A SECOND CONTROL: a STALE receipt, still naming keys, over a
+        # config that carries none of them -- a receipt can outlive the
+        # wiring it once named just as easily as a record can outlive its
+        # wiring. `pin-identity.json` from the first half is still on disk;
+        # only the env check should be what refuses this one.
+        stale_cfg = tmp_path / "stale.claude.json"
+        stale_cfg.write_text(json.dumps({
+            "env": {},
+            pin_proxy._WIRE_MARK: ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: stale_cfg)
+        pin_proxy.save_pin(root, None, None)
+
+        pin_proxy.heal(root)
+
+        assert pin_proxy.load_pin(root) is None, (
+            "a stale receipt with none of its own keys in the config was "
+            "mistaken for a live wiring")
 
 
 class TestTheGateDisarmsWhenThePinIsCleared:
