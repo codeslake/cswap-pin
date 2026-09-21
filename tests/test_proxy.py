@@ -2030,6 +2030,80 @@ class TestRepinIsLive:
         save_pin(tmp_path, None, None)
         assert provider() is None
 
+    def case_a_lost_record_still_pins_the_remembered_account(self, tmp_path):
+        """RED for T0903: `_read_raw` degrades a missing or unreadable
+        settings.json to `{}` -- exactly what it reads after a deliberate
+        `cswap pin --clear` too. Measured live: a relink racing a checkout
+        fast-forward left settings.json reading empty for ~36s, `load_pin`
+        returned None, `pin_is_noop()` called that a deliberate clear, and
+        seven live Remote Control bridges validated on the just-switched-to
+        account and were killed as `swapped=True`.
+
+        This daemon's OWN remembered identity (`pin-identity.json`, in its
+        own certdir, never the settings.json checkout that just failed to
+        read) still naming the pinned account is what tells a LOST RECORD
+        apart from a real clear -- and it must win: the provider keeps
+        pinning instead of silently relaying the active account's bearer.
+        """
+        from cswap_pin.proxy import make_pin_token_provider, remember_pin_identity
+
+        sw = self._Sw(tmp_path)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        remember_pin_identity(certdir, {
+            "accountUuid": "u1", "organizationUuid": "org",
+            "emailAddress": "one@example.com"})
+        # Nothing saved to settings.json: `load_pin` degrades this exactly
+        # like an unreadable file, per `_read_raw`.
+        provider = make_pin_token_provider(sw, "1", "one@example.com")
+
+        assert provider() == "TOK-1", (
+            "a lost pin record relayed on the active account's bearer "
+            "instead of the pin this daemon was told to keep")
+        assert provider.pin_is_noop() is False, (
+            "pin_is_noop() read a lost record as a deliberate clear")
+
+    def case_a_real_clear_with_no_remembered_identity_stays_a_no_op(
+            self, tmp_path):
+        """The negative control the fix above must not break: no pin in
+        settings.json AND no remembered identity -- this daemon was never
+        pinned, or a real clear already unlinked the identity file (see
+        `remember_pin_identity`'s own clear path) -- must still read as a
+        deliberate clear, exactly as before this change."""
+        from cswap_pin.proxy import make_pin_token_provider
+
+        sw = self._Sw(tmp_path)
+        provider = make_pin_token_provider(sw, "1", "one@example.com")
+
+        assert provider() is None
+        assert provider.pin_is_noop() is True, (
+            "a genuine clear started relaying a fallback account instead "
+            "of leaving every bearer alone")
+
+    def case_a_lost_record_is_logged_once(self, tmp_path, capsys):
+        """The daemon only noticed the lost record 15 minutes after the
+        damage, live, because nothing logged it happening. `_current_target`
+        runs on every request; the fix must log the LOST RECORD once per
+        window, not once per request."""
+        from cswap_pin.proxy import make_pin_token_provider, remember_pin_identity
+
+        sw = self._Sw(tmp_path)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        remember_pin_identity(certdir, {
+            "accountUuid": "u1", "organizationUuid": "org",
+            "emailAddress": "one@example.com"})
+        provider = make_pin_token_provider(sw, "1", "one@example.com")
+
+        provider()
+        provider()
+        provider()
+
+        err = capsys.readouterr().err
+        assert err.count("LOST RECORD") == 1, (
+            f"expected exactly one lost-record line across three requests, "
+            f"got {err.count('LOST RECORD')} in: {err!r}")
+
     def case_fingerprint_ignores_the_account(self, tmp_path):
         """Including the account would recycle the daemon on every re-pin,
         and a recycle is exactly what a live session must not need."""

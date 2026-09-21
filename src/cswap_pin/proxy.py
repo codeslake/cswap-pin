@@ -5464,7 +5464,18 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         """The account to pin RIGHT NOW, re-read so `cswap pin <other>` takes
         effect without restarting anything. Falls back to the one this daemon
         was spawned for when the pin is unreadable, and returns None when the
-        pin was cleared outright (leave every bearer alone)."""
+        pin was cleared outright (leave every bearer alone).
+
+        `load_pin` returning None is ambiguous by itself: `_read_raw`
+        degrades a missing or unreadable settings.json to `{}` the same way
+        it reads after a deliberate `cswap pin --clear` -- a relink racing a
+        checkout fast-forward reads exactly like a clear. Told apart by
+        whether THIS DAEMON's own remembered identity
+        (`pin-identity.json`, in ITS OWN certdir -- never the rewritten
+        backup-store checkout `load_pin` just failed to read) still names an
+        account: a deliberate clear unlinks that file
+        (`remember_pin_identity(certdir, None)`), so a real clear and a lost
+        record can never both leave it standing."""
         _exc = require("exceptions")
         AccountNotFoundError, ConfigError = _exc.AccountNotFoundError, _exc.ConfigError
 
@@ -5473,12 +5484,32 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         except Exception:
             return account_num, email
         if pin is None:
-            return None
+            remembered = remembered_pin_identity(switcher.backup_dir / "pin-proxy")
+            if remembered is None:
+                provider._lost_record = False
+                return None
+            _note_lost_record()
+            return account_num, email
+        provider._lost_record = False
         try:
             num, mail, _ = switcher.resolve_account(pin[0])
             return num, mail
         except (AccountNotFoundError, ConfigError, Exception):
             return account_num, email
+
+    def _note_lost_record() -> None:
+        """Loud once per LOST-RECORD window, edge-triggered exactly like
+        `_set_identity` below -- `_current_target` runs every request, and
+        the window this covers is a race (a relink, a fast-forward), not a
+        steady state that should get one log line per request."""
+        if provider._lost_record:
+            return
+        provider._lost_record = True
+        _log_lifecycle(
+            "settings.json names no pin but this daemon's own remembered "
+            "identity still does -- a LOST RECORD, not a clear; keeping "
+            "the pin instead of silently relaying on the active account's "
+            "bearer")
 
     def _pin_is_the_live_login(num: str) -> bool:
         """Whether slot ``num`` really holds the live login.
@@ -5874,6 +5905,11 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.identity_mismatch = None
     provider._tls = threading.local()
     provider.note_verdict = _note_verdict
+    # Edge-trigger for `_note_lost_record`: True while settings.json reads
+    # as cleared but this daemon's own remembered identity still names an
+    # account, so the loud line above logs once per window instead of once
+    # per request.
+    provider._lost_record = False
     return provider
 
 
