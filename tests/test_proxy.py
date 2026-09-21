@@ -1074,6 +1074,15 @@ class TestLiveRemoteControlSessions:
 
         assert should_wait_for_pin(
             "POST", "/v1/code/sessions/cse_x/bridge") is True
+        # THE SIBLING SPELLING, without `code/` — `is_pinned_route` treats
+        # `/v1/sessions/` exactly like `/v1/code/sessions/` (both are RC
+        # session-lifecycle routes, see that function's own docstring), and
+        # the daemon's own bridge-register bookkeeping already recognizes
+        # both spellings as a birth (`_BRIDGE_REGISTER`'s `(code/)?`). A
+        # predicate that only covered the `code/` spelling would leave this
+        # one exposed to the identical permanent give-away.
+        assert should_wait_for_pin(
+            "POST", "/v1/sessions/cse_x/bridge") is True
         # Trailing slash and query string, same discipline as the two
         # entries above.
         assert should_wait_for_pin(

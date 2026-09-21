@@ -4926,8 +4926,13 @@ def _host_slug() -> str:
 # `/v1/code/sessionsXYZ/<sid>/bridge` (not this subtree), `/v1/code/sessions/
 # /bridge` (empty sid) and `/v1/code/sessions/<sid>/bridge/extra` (a sibling
 # call, e.g. `/worker`) all stay outside it, the same discipline the two
-# exact-match entries below keep.
-_BRIDGE_ATTACH = re.compile(r"^/v1/code/sessions/[^/]+/bridge$")
+# exact-match entries below keep. `(?:code/)?` matches the SAME optional
+# prefix every sibling route regex in this file carries for this subtree
+# (`_PRESENCE`, `_WORKER_SUBTREE`, `_BRIDGE_REGISTER`, `_BRIDGE_ID`) and
+# `is_pinned_route` already treats identically (its own `/v1/sessions/`
+# prefix row): `POST /v1/sessions/<sid>/bridge` is the same permanent
+# give-away under the sibling spelling, not a different route.
+_BRIDGE_ATTACH = re.compile(r"^/v1/(?:code/)?sessions/[^/]+/bridge$")
 
 
 def should_wait_for_pin(method: str, path: str) -> bool:

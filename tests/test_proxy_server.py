@@ -500,7 +500,7 @@ class TestPinProxyServer:
             expect_swapped=True,
         )
 
-    def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
+    def case_a_foreign_verdict_refuses_the_bridge_post(
             self, certdir, monkeypatch):
         """A foreign verdict from the MINT-time probe (`_identity_ok`, via
         `pin_profile_for`) must never splice -- see `_identity_ok`'s
@@ -518,7 +518,7 @@ class TestPinProxyServer:
             expect_refused=True,
         )
 
-    def case_a_foreign_verdict_from_the_identity_beat_leaves_the_bridge_post_unswapped(
+    def case_a_foreign_verdict_from_the_identity_beat_refuses_the_bridge_post(
             self, certdir, monkeypatch):
         """The INCIDENT's own path: the 12h identity beat
         (`_freshen_pin_identity`) reports a foreign verdict through
