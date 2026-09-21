@@ -7052,19 +7052,21 @@ class TestWireGlobalConfig:
         assert "env" not in raw, "clearing the pin left the proxy wired"
         assert pin_proxy.load_pin(backup) is None
 
-    def case_apply_pin_clear_survives_a_killed_unwire(self, tmp_path, monkeypatch):
-        """`wire_global_config` takes the `.claude.json` lock on a 5s budget,
-        and a host that holds that lock near-continuously kills the waiter
-        before it ever gets there (measured). Whichever of the
-        clear's two writes runs SECOND is the one such a kill loses. Against
-        the old order — record the clear, then unwire — the kill lands with
-        the record already gone: `load_pin` reads None afterwards, and
-        `heal` then calls the still-wired config "not our business" forever
-        (measured: 21 hours). The record must still be there after."""
+    def case_apply_pin_clear_survives_a_lock_it_cannot_take(self, tmp_path, monkeypatch):
+        """`wire_global_config` takes the `.claude.json` lock on a 5s budget
+        and, when it cannot get it, degrades to "skip the write" and RETURNS
+        FALSE — it does not raise, so a host that holds the lock
+        near-continuously hits this on ordinary execution, not only on a
+        kill. Against the old order — record the clear, then unwire — that
+        skip left the record already gone and the config still wired:
+        `load_pin` read None afterwards, and `heal` called the still-wired
+        config "not our business" forever (measured: 21 hours). Both the
+        record and the still-live wiring must survive a clear that could not
+        take the lock."""
         from pathlib import Path
         from cswap_pin import proxy as pin_proxy
 
-        self._config(tmp_path, monkeypatch, {"projects": {}})
+        path = self._config(tmp_path, monkeypatch, {"projects": {}})
         backup = Path(tmp_path)
 
         class _Sw:
@@ -7074,18 +7076,22 @@ class TestWireGlobalConfig:
 
         monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, Path("/x/ca.pem")))
         pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1")
+        pin_proxy.wire_global_config(9955, Path(tmp_path) / "ca.pem")
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1")
+        assert "env" in json.loads(path.read_text())
 
-        def _killed_waiting_on_the_lock(*a, **k):
-            raise TimeoutError("simulated: killed waiting on the config lock")
+        # THE REAL SHAPE OF THE FAILURE: a lock it could not take, caught
+        # inside `wire_global_config` itself and turned into a plain False —
+        # never an exception a caller could catch.
+        monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *a, **k: False)
 
-        monkeypatch.setattr(pin_proxy, "wire_global_config", _killed_waiting_on_the_lock)
-
-        with pytest.raises(TimeoutError):
-            pin_proxy.apply_pin(_Sw(), None, None)
+        pin_proxy.apply_pin(_Sw(), None, None)
 
         assert pin_proxy.load_pin(backup) == ("pin@example.com", "org-1"), (
-            "a kill during the unwire lost the pin record")
+            "a lock this call could not take lost the pin record")
+        assert "env" in json.loads(path.read_text()), (
+            "the record survived but the wiring it still names was dropped "
+            "from the config underneath it")
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path

@@ -5111,6 +5111,19 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # is the disposable one, same as the wiring is the disposable half of
         # a set: whichever write can be lost is the one that runs last.
         wire_global_config(None, None)
+        if _wired_port() is not None:
+            # THE UNWIRE DID NOT TAKE, and not only from a kill.
+            # `wire_global_config` degrades a lock it cannot get inside its
+            # own budget to "skip the write" and returns False — no
+            # exception to catch — which is exactly the near-continuous-lock
+            # host this reorder is for. Recording the clear anyway would
+            # drop the only place a retry or `heal` can still find the
+            # wiring that is, per this read, still live. Leave everything
+            # standing so the next attempt finds the pin exactly as it was.
+            _log_carry(certdir, "clear did not take: the config still "
+                                 "names a wired port, left the pin record "
+                                 "standing")
+            return True
         save_pin(switcher.backup_dir, email, org_uuid)
         # AND STOP NAMING THE EX-PIN. An unpinned machine kept minting under
         # the ex-pin until some later switch happened to rewrite it. `identity`
