@@ -411,6 +411,7 @@ class _StatusThenHoldChain:
 
     def __init__(self):
         self.release = threading.Event()
+        self.status_gate = threading.Event()
         self.received: list[bytes] = []
         self.status_sent_at: list[float] = []
         self._srv = socket.socket()
@@ -451,6 +452,11 @@ class _StatusThenHoldChain:
                     break
                 rest += chunk
             self.received.append(bytes(rest))
+            if b"STALL" in rest:
+                # HELD BEFORE THE STATUS LINE ITSELF -- proves the caller's
+                # own hold (not this chain) is what keeps a same-cse sibling
+                # off the wire until this gate opens.
+                self.status_gate.wait(timeout=10)
             # THE STATUS LINE AND HEADERS ARRIVE NOW, chunked body still
             # to come -- the exchange has not SETTLED yet even though a
             # caller can already classify the response.
@@ -720,7 +726,7 @@ class TestPinProxyServer:
         )
 
     def case_a_stalled_bridge_attach_is_not_overtaken_by_its_own_retry(
-            self, certdir):
+            self, certdir, monkeypatch):
         """T0955. Claude Code POSTs `.../bridge` with a 10s timeout, ABORTS
         the socket on timeout and retries -- but the pin kept relaying the
         aborted request upstream regardless, so during a hop stall the
@@ -728,11 +734,21 @@ class TestPinProxyServer:
         the newest worker registration, 409ing the retry off its own
         session. The retry's own POST for the SAME cse must not reach
         upstream before the first attempt's exchange has settled."""
-        from cswap_pin.proxy import PinProxy
+        import cswap_pin.proxy as pp
+
+        holds: list[tuple[str, bool]] = []
+        real_hold = pp.PinProxy._hold_bridge_attach
+
+        def _spy_hold(self, cse):
+            event, waited = real_hold(self, cse)
+            holds.append((cse, waited))
+            return event, waited
+
+        monkeypatch.setattr(pp.PinProxy, "_hold_bridge_attach", _spy_hold)
 
         upstream = _StallableBridgeUpstream(certdir)
-        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
-                          upstream=("127.0.0.1", upstream.port))
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
+                            upstream=("127.0.0.1", upstream.port))
         proxy.start()
         try:
             results = {}
@@ -766,6 +782,15 @@ class TestPinProxyServer:
             t1.join(timeout=5)
             t2.join(timeout=5)
             assert results.get("first") == 200 and results.get("second") == 200, results
+            # THE SPY MARKER, checked only now that both are done: a slow
+            # box that let t2 schedule late enough to pass the timed check
+            # above vacuously (never even reaching the hold in that 0.3s)
+            # could still not fake ("cse_X", True) here -- `_hold_bridge_attach`
+            # only returns it once t2 actually registered on cse_X AND
+            # found the first one still there to wait on.
+            assert ("cse_X", True) in holds, (
+                "the second request never actually reached the hold and "
+                f"registered as waiting on the first: {holds}")
 
             assert len(upstream.received) == 2, upstream.received
             bodies = [b for b, _ in upstream.received]
@@ -843,6 +868,34 @@ class TestPinProxyServer:
                 "the abandoned request never actually parsed far enough "
                 f"to hold on cse_X and find the first one still there: "
                 f"{holds}")
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def case_the_very_first_attempt_for_a_cse_still_checks_hung_up(
+            self, certdir):
+        """T0955 [I]. The hung-up check used to run only when
+        `_hold_bridge_attach` found something to wait on -- but order at
+        the hold is the order requests REACH it, not the order they
+        arrived: a retry can reach the hold first (its sibling stalled
+        earlier, in `_wait_for_pin_token`) and settle before the ORIGINAL
+        attempt gets there, leaving that original with `prev is None`
+        just like any genuine first attempt. A hung-up client on THAT
+        attempt -- no earlier entry to wait on at all -- must still be
+        dropped, never relayed."""
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _StallableBridgeUpstream(certdir)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
+                          upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            _post_and_abandon(proxy.port, certdir / "ca.pem",
+                              "/v1/code/sessions/cse_first/bridge", "FIRST")
+            time.sleep(0.5)  # let the abandoned send actually land
+            assert upstream.received == [], (
+                "a first attempt (no earlier hold entry) whose client "
+                f"hung up was relayed anyway: {upstream.received}")
         finally:
             proxy.stop()
             upstream.stop()
@@ -932,7 +985,11 @@ class TestPinProxyServer:
         whole keep-alive connection's lifetime, not the moment the
         exchange actually settled. A same-cse retry on a NEW connection
         must proceed once the status line is read, not once this
-        connection's body finishes."""
+        connection's body finishes -- and must NOT proceed before then:
+        the chain holds the first request's own status line behind
+        `status_gate`, so the second reaching it at all proves the
+        absolute-form hold (`_hold_bridge_attach` at the MITM entry
+        point) is doing the blocking, not merely releasing early."""
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         chain = _StatusThenHoldChain()
@@ -972,26 +1029,39 @@ class TestPinProxyServer:
                                   daemon=True)
             t1.start()
             deadline = time.monotonic() + 5
-            while not chain.status_sent_at and time.monotonic() < deadline:
+            while not chain.received and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert chain.status_sent_at, (
-                "the first request's status line never reached the chain")
+            assert chain.received, (
+                "the first request never reached the chain")
 
-            # THE SECOND, SAME CSE, A NEW CONNECTION: must reach the chain
-            # promptly -- the status line already settled the hold's own
-            # question, even though the first connection stays open,
-            # still streaming its chunked body.
+            # THE SECOND, SAME CSE: the chain is holding the first's status
+            # line behind `status_gate`, so only the PROXY's own
+            # `_hold_bridge_attach` -- not the chain -- can still be
+            # keeping this off the wire. Proves the hold itself blocks,
+            # not just that it releases early.
             t2 = threading.Thread(target=_run, args=("second", "SECOND"),
                                   daemon=True)
             t2.start()
-            t2.join(timeout=5)
+            time.sleep(0.3)
+            assert len(chain.received) == 1, (
+                "the second request reached the chain before the first's "
+                f"status line was even sent: {chain.received}")
+
+            # AND NOW OPEN IT: the second must reach the chain once the
+            # status line settles the hold's own question, even though the
+            # first connection stays open, still streaming its chunked
+            # body.
+            chain.status_gate.set()
+            deadline = time.monotonic() + 5
+            while len(chain.received) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
             assert len(chain.received) == 2, (
-                "the second request never reached the chain before the "
-                "first's connection closed -- the hold outlived the "
-                f"status line: {chain.received}")
+                "the second request never reached the chain after the "
+                f"status-line gate opened: {chain.received}")
 
             chain.release.set()
             t1.join(timeout=5)
+            t2.join(timeout=5)
             assert results.get("first", b"").startswith(b"HTTP/1.1 200"), (
                 results.get("first"))
             assert results.get("second", b"").startswith(b"HTTP/1.1 200"), (

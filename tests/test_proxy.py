@@ -20335,6 +20335,32 @@ class TestTheSweepClosesAReplacedTwin:
             f"a record with no stamped pid closed a twin: {deleted}")
         assert closed == 0
 
+    def case_a_negative_pid_keeps_the_twin(
+            self, tmp_path, monkeypatch):
+        """PROOF 1's `pid > 0` half: a negative pid names a process GROUP
+        to `os.kill`, and a missing one raises the same `ProcessLookupError`
+        a dead process would -- so without this half of the guard, a
+        stamped `-424242` would read as dead and condemn the twin on a
+        signal that never even asked about a real process."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._live_job(home, "j1", os.getpid(), "s1-live")
+        (home / "sessions" / "s1-old.json").write_text(json.dumps({
+            "pid": -424242, "jobId": "j1", "sessionId": "s1-old",
+            "bridgeSessionId": "cse_twin"}))
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
+                            lambda: set())
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == [], (
+            f"a negative pid closed a twin: {deleted}")
+        assert closed == 0
+
     def case_an_EPERM_signal_keeps_the_twin(self, tmp_path, monkeypatch):
         """PROOF 1's own discipline, mirrored from `_dead_creator_bridge_ids`:
         `PermissionError` -- a reused pid now owned by someone else -- is

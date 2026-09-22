@@ -15707,9 +15707,11 @@ class PinProxy:
         lock, so nothing can slip between "read the previous holder" and
         "become the new one") — a still-later request then waits on us
         rather than on whichever attempt was first. Returns whether there
-        was anything to wait on, since only a request that actually waited
-        needs the hung-up check below: the very first attempt for a cse has
-        nothing stale in front of it to be overtaken by.
+        was anything to wait on -- but order at the hold is the order
+        requests REACH it, not the order they arrived: a request that
+        never waited here (`prev is None`) can still have been overtaken
+        earlier, in `_wait_for_pin_token`, so the hung-up check below runs
+        every time, not only when this returns True.
         """
         mine = threading.Event()
         with self._bridge_attach_lock:
@@ -16195,8 +16197,8 @@ class PinProxy:
                        if host == UPSTREAM_HOST and secure else None)
         _bridge_event = None
         if _bridge_cse:
-            _bridge_event, _bridge_waited = self._hold_bridge_attach(_bridge_cse)
-            if _bridge_waited and _client_hung_up(conn):
+            _bridge_event, _ = self._hold_bridge_attach(_bridge_cse)
+            if _client_hung_up(conn):
                 self._release_bridge_attach(_bridge_cse, _bridge_event)
                 conn.close()
                 return
@@ -16575,8 +16577,8 @@ class PinProxy:
         _bridge_cse = _bridge_attach_cse(method, path)
         _bridge_hold = None
         if _bridge_cse:
-            _bridge_event, _bridge_waited = self._hold_bridge_attach(_bridge_cse)
-            if _bridge_waited and _client_hung_up(tls):
+            _bridge_event, _ = self._hold_bridge_attach(_bridge_cse)
+            if _client_hung_up(tls):
                 # The client that sent THIS request is already gone — relay
                 # it anyway and it becomes the stray newest registration the
                 # hold exists to prevent, with nobody left to hear the
