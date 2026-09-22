@@ -4564,9 +4564,10 @@ def _transcript_bridge_history(session_id: str) -> set[str]:
     reads -- not just the newest, which is the CURRENT bridge and by
     definition never the twin `_replaced_twin_bridge_ids` is looking for.
 
-    Same one-file rule as `_last_pointer`: two transcripts claiming this
-    session id is exactly the shape that function declines on, and a proof
-    used to CLOSE something must decline exactly where that one does.
+    Same one-file rule as `_last_pointer`, but STRICTER: this declines
+    whenever a SECOND transcript file for the session id exists at all,
+    whether or not it carries a pointer -- `_last_pointer` declines only
+    when two files EACH carry one.
     """
     found = list((require("paths").get_claude_config_home() / "projects")
                  .glob(f"*/{session_id}.jsonl"))
@@ -5135,11 +5136,21 @@ def _client_hung_up(sock) -> bool:
     blocks for the reply). Consuming the byte to disambiguate would need
     `_Prefixed`-style push-back on an SSL socket (`MSG_PEEK` is refused --
     see `_tunnel_is_open`'s own note); not worth it for a route this narrow.
+
+    `select.poll()`, not `select.select()`: `select.select` raises
+    ValueError for any fd >= FD_SETSIZE (1024), and the pin caps no
+    RLIMIT_NOFILE, so a fd past that point (what a hop stall's fd pile-up
+    produces) failed here on every live client past 1024 open fds. On any
+    error this fails OPEN (relay it) rather than closed (drop it): the
+    hold this feeds already orders a relayed dead request ahead of the
+    retry waiting on it.
     """
     try:
-        ready, _, _ = select.select([sock], [], [], 0)
+        poller = select.poll()
+        poller.register(sock, select.POLLIN)
+        ready = poller.poll(0)
     except (OSError, ValueError):
-        return True  # cannot even ask -- the safe direction is "gone"
+        return False  # cannot even ask -- fail open, the hold covers it
     return bool(ready)
 
 

@@ -873,7 +873,7 @@ class TestPinProxyServer:
             upstream.stop()
 
     def case_the_very_first_attempt_for_a_cse_still_checks_hung_up(
-            self, certdir):
+            self, certdir, monkeypatch):
         """T0955 [I]. The hung-up check used to run only when
         `_hold_bridge_attach` found something to wait on -- but order at
         the hold is the order requests REACH it, not the order they
@@ -883,11 +883,21 @@ class TestPinProxyServer:
         just like any genuine first attempt. A hung-up client on THAT
         attempt -- no earlier entry to wait on at all -- must still be
         dropped, never relayed."""
-        from cswap_pin.proxy import PinProxy
+        import cswap_pin.proxy as pp
+
+        holds: list[tuple[str, bool]] = []
+        real_hold = pp.PinProxy._hold_bridge_attach
+
+        def _spy_hold(self, cse):
+            event, waited = real_hold(self, cse)
+            holds.append((cse, waited))
+            return event, waited
+
+        monkeypatch.setattr(pp.PinProxy, "_hold_bridge_attach", _spy_hold)
 
         upstream = _StallableBridgeUpstream(certdir)
-        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
-                          upstream=("127.0.0.1", upstream.port))
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
+                            upstream=("127.0.0.1", upstream.port))
         proxy.start()
         try:
             _post_and_abandon(proxy.port, certdir / "ca.pem",
@@ -896,6 +906,14 @@ class TestPinProxyServer:
             assert upstream.received == [], (
                 "a first attempt (no earlier hold entry) whose client "
                 f"hung up was relayed anyway: {upstream.received}")
+            # THE SPY MARKER, proving the abandoned request actually parsed
+            # far enough to reach the hold for cse_first and find NOTHING
+            # to wait on (`waited=False`) -- so the drop above is the
+            # first-attempt hung-up check doing its job, not a parse
+            # failure that never got this far.
+            assert ("cse_first", False) in holds, (
+                "the abandoned request never actually reached the hold "
+                f"as a genuine first attempt: {holds}")
         finally:
             proxy.stop()
             upstream.stop()
@@ -1070,6 +1088,38 @@ class TestPinProxyServer:
             if proxy:
                 proxy.stop()
             chain.stop()
+
+    def case_a_client_past_fd_setsize_is_not_read_as_hung_up(self):
+        """T0955 [I]. `_client_hung_up` used a `select.select` readable
+        check, which raises ValueError for any fd >= FD_SETSIZE (1024).
+        The pin caps no RLIMIT_NOFILE, so a pin that has piled up past
+        1024 open fds (what a hop stall produces) read a still-connected
+        client's fd as an error and, on the fail-CLOSED branch, as
+        "gone" -- dropping a LIVE client's own /bridge POST. A client
+        fd >= 1024 that is still connected and has sent nothing must
+        read as NOT hung up."""
+        import os
+
+        from cswap_pin.proxy import _client_hung_up
+
+        a, b = socket.socketpair()
+        target = 2000
+        while True:
+            try:
+                os.fstat(target)
+            except OSError:
+                break
+            target += 1
+        os.dup2(a.fileno(), target)
+        high = socket.socket(fileno=target)
+        try:
+            assert high.fileno() >= 1024, high.fileno()
+            assert _client_hung_up(high) is False, (
+                "a live client past FD_SETSIZE was read as hung up")
+        finally:
+            high.close()
+            a.close()
+            b.close()
 
 
 class _StreamingUpstream:
