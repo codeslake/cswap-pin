@@ -5229,9 +5229,10 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             return True
         # CAPTURED BEFORE THE DROP, so a failed racing-undo below can put
         # this exact pair straight back. Not `pin-identity.json`: the set
-        # arm unlinks it on any call with no `identity` (a rollback does
-        # exactly that), so a memo merely left alone is not durable enough
-        # to lean on here.
+        # arm unlinks it only when it names a DIFFERENT account than the
+        # one it is pinning (a rollback does exactly that), so a memo
+        # already naming the right account is left standing -- still not
+        # durable enough to lean on here.
         prior = load_pin(switcher.backup_dir)
         save_pin(switcher.backup_dir, email, org_uuid)
         wiring_confirmed_gone = True
@@ -5320,7 +5321,25 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # real failure itself and answers False for both "could not write" and
     # "already correct", so an `except` around it guards a case that cannot
     # arrive -- a lock timeout, which this path can now hit, was silent here.
-    identity = remember_pin_identity(certdir, identity) or identity
+    #
+    # ONLY WHEN THERE IS SOMETHING NEW TO CACHE. `remember_pin_identity(...,
+    # None)` is the CLEAR call, and this is the SET arm -- a re-pin whose
+    # caller could not resolve an identity this time (`identity` arrives
+    # None; "only cswap can resolve one", see the docstring above) must not
+    # wipe a memo that already names THIS email: `_current_target` reads
+    # that file's mere presence as "this pin is still live", so dropping a
+    # memo that already matches would misreport a live pin as cleared the
+    # next time settings.json itself goes unreadable. BUT a memo naming a
+    # DIFFERENT account is stale, not live: `_restore_pin`'s rollback calls
+    # this exact arm with `identity=None` after a failed `cswap pin B`
+    # already wrote B's memo, and leaving that standing would splice B into
+    # every bridge minted while A is the pin -- the incident's own harm
+    # class. Unlink it rather than merely skip the write.
+    if identity:
+        identity = remember_pin_identity(certdir, identity) or identity
+    elif ((remembered_pin_identity(certdir) or {}).get("emailAddress") or ""
+          ).lower() != email.lower():
+        remember_pin_identity(certdir, None, stale_only=True)
     try:
         if not splice_config_identity(identity):
             now = _login_identity()
@@ -5337,7 +5356,8 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
 _PIN_IDENTITY_NAME = "pin-identity.json"
 
 
-def remember_pin_identity(certdir, identity: dict | None) -> "dict | None":
+def remember_pin_identity(certdir, identity: dict | None, *,
+                           stale_only: bool = False) -> "dict | None":
     """Leave the pinned ``oauthAccount`` where the daemon can re-apply it.
 
     THE PACKAGE NEVER DERIVES THIS. ``identity_for_config`` lives host-side on
@@ -5357,10 +5377,26 @@ def remember_pin_identity(certdir, identity: dict | None) -> "dict | None":
     """
     p = Path(certdir) / _PIN_IDENTITY_NAME
     if not identity:
+        # `missing_ok=True` already absorbs "was never there" -- anything
+        # still raising here is a REFUSED unlink (permission denied, a
+        # read-only mount), and `_current_target` now reads this file's
+        # mere presence as "not a deliberate clear". A silent `pass` would
+        # make that clear un-clear forever with nothing to say why; loud
+        # instead, the same choice `apply_pin` already makes for a failed
+        # `splice_config_identity` a few lines above its own call here.
         try:
             p.unlink(missing_ok=True)
-        except OSError:
-            pass
+        except OSError as exc:
+            if stale_only:
+                _log_lifecycle(
+                    f"a stale memo for a different account could not be "
+                    f"removed ({exc!r}) -- bridges may be minted under it "
+                    "until this is removed by hand")
+            else:
+                _log_lifecycle(
+                    f"could not forget the cleared pin's remembered identity "
+                    f"({exc!r}) -- it will keep reading as pinned until this "
+                    "is removed by hand")
         return None
     kept = remembered_pin_identity(certdir)
     if (kept and kept.get("accountUuid") == identity.get("accountUuid")
@@ -5763,7 +5799,39 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         """The account to pin RIGHT NOW, re-read so `cswap pin <other>` takes
         effect without restarting anything. Falls back to the one this daemon
         was spawned for when the pin is unreadable, and returns None when the
-        pin was cleared outright (leave every bearer alone)."""
+        pin was cleared outright (leave every bearer alone).
+
+        `load_pin` returning None is ambiguous by itself: `_read_raw`
+        degrades a missing or unreadable settings.json to `{}` the same way
+        it reads after a deliberate `cswap pin --clear` -- a relink racing a
+        checkout fast-forward reads exactly like a clear. Told apart by
+        whether THIS DAEMON's own remembered identity
+        (`pin-identity.json`, in ITS OWN certdir -- never the rewritten
+        backup-store checkout `load_pin` just failed to read) still names an
+        account: a deliberate clear unlinks that file
+        (`remember_pin_identity(certdir, None)`), while `apply_pin`'s SET arm
+        skips the write entirely rather than unlinking when it has no fresh
+        identity to cache -- so of the two writers, only a clear ever
+        removes it. (The one gap this cannot close from here: an unlink the
+        filesystem itself refuses. `remember_pin_identity` logs that loudly
+        instead of pretending it happened.)
+
+        THE MEMO ALONE IS NOT ENOUGH, though: it is also gated on a wiring
+        receipt still naming a live key in `env`, the same test `heal`'s
+        `_restore_record_from_wiring` already makes before it will trust
+        this file. That closes most of the parenthetical gap above too --
+        a clear whose unlink was refused still ran its unwire first, so
+        the receipt reads dead and this returns None regardless of the
+        leftover memo.
+
+        RESOLVED THROUGH `remembered`, NOT `account_num`/`email`. Those are
+        this DAEMON's spawn-time account and go stale the moment `cswap pin
+        <other>` re-pins it without a respawn
+        (`case_provider_follows_a_repin_without_a_respawn`) -- falling back
+        to them here would splice yesterday's account into today's bearer.
+        The remembered identity is what the daemon itself last confirmed
+        pinning, so it is resolved the same way `pin[0]` is below.
+        """
         _exc = require("exceptions")
         AccountNotFoundError, ConfigError = _exc.AccountNotFoundError, _exc.ConfigError
 
@@ -5772,12 +5840,52 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         except Exception:
             return account_num, email
         if pin is None:
-            return None
+            remembered = remembered_pin_identity(switcher.backup_dir / "pin-proxy")
+            if remembered is None or not remembered.get("emailAddress"):
+                provider._lost_record = False
+                return None
+            # THE WIRING RECEIPT, NOT THE MEMO ALONE. A DELIBERATE clear
+            # that finished can leave `pin-identity.json` standing behind
+            # (an unlink the filesystem refused, see `remember_pin_identity`)
+            # -- trusting the memo by itself there re-pins a box the
+            # operator genuinely cleared. Same test `_restore_record_from_
+            # wiring` already makes before `heal` will trust this file:
+            # `_read_ledger`'s receipt, plus one of its own keys still live
+            # in `env`.
+            cfg = require("paths").get_global_config_path()
+            raw = _read_json(cfg)
+            mark = _read_ledger(cfg, raw).get(_WIRE_MARK)
+            env = raw.get("env") if isinstance(raw, dict) else None
+            if not mark or not isinstance(env, dict) or not any(k in env for k in mark):
+                provider._lost_record = False
+                return None
+            _note_lost_record()
+            try:
+                num, mail, _ = switcher.resolve_account(remembered["emailAddress"])
+                return num, mail
+            except (AccountNotFoundError, ConfigError, Exception):
+                pass
+            return account_num, email
+        provider._lost_record = False
         try:
             num, mail, _ = switcher.resolve_account(pin[0])
             return num, mail
         except (AccountNotFoundError, ConfigError, Exception):
             return account_num, email
+
+    def _note_lost_record() -> None:
+        """Loud once per LOST-RECORD window, edge-triggered exactly like
+        `_set_identity` below -- `_current_target` runs every request, and
+        the window this covers is a race (a relink, a fast-forward), not a
+        steady state that should get one log line per request."""
+        if provider._lost_record:
+            return
+        provider._lost_record = True
+        _log_lifecycle(
+            "settings.json names no pin but this daemon's own remembered "
+            "identity still does -- a LOST RECORD, not a clear; keeping "
+            "the pin instead of silently relaying on the active account's "
+            "bearer")
 
     def _pin_is_the_live_login(num: str) -> bool:
         """Whether slot ``num`` really holds the live login.
@@ -6208,6 +6316,11 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.identity_mismatch = None
     provider._tls = threading.local()
     provider.note_verdict = _note_verdict
+    # Edge-trigger for `_note_lost_record`: True while settings.json reads
+    # as cleared but this daemon's own remembered identity still names an
+    # account, so the loud line above logs once per window instead of once
+    # per request.
+    provider._lost_record = False
     return provider
 
 
