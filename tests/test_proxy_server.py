@@ -398,6 +398,82 @@ class _StallableBridgeUpstream:
         self._thr.join(timeout=2.0)
 
 
+class _StatusThenHoldChain:
+    """A plain-HTTP chain hop (see `_RecordingChain`), but concurrent and
+    able to hold a connection open PAST its own status line: it answers
+    with headers only (chunked, no body yet), records when that happened
+    in ``status_sent_at``, then blocks on ``release`` before writing the
+    chunked body and closing. Lets a case prove a caller distinguishes
+    "the status line arrived" from "the exchange, and this connection,
+    are over" -- the same distinction `_StallableBridgeUpstream` lets a
+    case draw on the MITM path's own upstream.
+    """
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.received: list[bytes] = []
+        self.status_sent_at: list[float] = []
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(8)
+        self.port = self._srv.getsockname()[1]
+        self._stop = False
+        self._thr = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thr.start()
+
+    def _accept_loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            if self._stop:
+                conn.close()
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            m = [l for l in head.lower().split(b"\r\n")
+                 if l.startswith(b"content-length:")]
+            want = int(m[0].split(b":")[1]) if m else 0
+            while len(rest) < want:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                rest += chunk
+            self.received.append(bytes(rest))
+            # THE STATUS LINE AND HEADERS ARRIVE NOW, chunked body still
+            # to come -- the exchange has not SETTLED yet even though a
+            # caller can already classify the response.
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            self.status_sent_at.append(time.monotonic())
+            self.release.wait(timeout=10)
+            conn.sendall(b"2\r\nok\r\n0\r\n\r\n")
+            conn.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            with socket.create_connection(self._srv.getsockname(), timeout=0.2):
+                pass
+        except OSError:
+            pass
+        self._srv.close()
+        self._thr.join(timeout=2.0)
+
+
 class TestPinProxyServer:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
@@ -700,16 +776,34 @@ class TestPinProxyServer:
             upstream.stop()
 
     def case_a_held_request_whose_client_hung_up_is_never_relayed(
-            self, certdir):
+            self, certdir, monkeypatch):
         """T0955. A held request settles only when the hold releases; if
         the client that sent it is already gone by then, relaying it
         anyway would make IT the stray newest registration -- the exact
-        fault the hold exists to prevent, just moved one request later."""
-        from cswap_pin.proxy import PinProxy
+        fault the hold exists to prevent, just moved one request later.
+
+        THE ABSENCE ALONE IS NOT ENOUGH: a request that never even PARSED
+        (a bad CONNECT, say) would also leave `upstream.received` at one
+        entry and pass. The spy on `_hold_bridge_attach` proves the
+        abandoned request was actually read far enough to reach the hold
+        for cse_X and find one already in place (`waited=True`) -- so the
+        drop below is the hold doing its job, not a parse failure that
+        never got this far."""
+        import cswap_pin.proxy as pp
+
+        holds: list[tuple[str, bool]] = []
+        real_hold = pp.PinProxy._hold_bridge_attach
+
+        def _spy_hold(self, cse):
+            event, waited = real_hold(self, cse)
+            holds.append((cse, waited))
+            return event, waited
+
+        monkeypatch.setattr(pp.PinProxy, "_hold_bridge_attach", _spy_hold)
 
         upstream = _StallableBridgeUpstream(certdir)
-        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
-                          upstream=("127.0.0.1", upstream.port))
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
+                            upstream=("127.0.0.1", upstream.port))
         proxy.start()
         try:
             results = {}
@@ -745,6 +839,10 @@ class TestPinProxyServer:
             assert bodies == [b"STALL"], (
                 "a held request whose client hung up reached upstream "
                 f"anyway: {bodies}")
+            assert ("cse_X", True) in holds, (
+                "the abandoned request never actually parsed far enough "
+                f"to hold on cse_X and find the first one still there: "
+                f"{holds}")
         finally:
             proxy.stop()
             upstream.stop()
@@ -826,6 +924,82 @@ class TestPinProxyServer:
         finally:
             proxy.stop()
             upstream.stop()
+
+    def case_the_absolute_form_hold_releases_at_the_status_line(
+            self, certdir):
+        """T0955 [I]. `_plain_relay` used to release the bridge-attach hold
+        only when `_pump` RETURNED -- for a swapped request that is the
+        whole keep-alive connection's lifetime, not the moment the
+        exchange actually settled. A same-cse retry on a NEW connection
+        must proceed once the status line is read, not once this
+        connection's body finishes."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _StatusThenHoldChain()
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "TESTTOK",
+                             rediscover_chain=True)
+            proxy.start()
+
+            results = {}
+
+            def _run(name, body):
+                c = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                try:
+                    body_b = body.encode()
+                    c.sendall(
+                        b"POST https://api.anthropic.com/v1/code/sessions"
+                        b"/cse_X/bridge HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        b"Authorization: Bearer ACTIVE\r\n"
+                        + f"Content-Length: {len(body_b)}\r\n\r\n".encode()
+                        + body_b)
+                    c.settimeout(10)
+                    got = b""
+                    while True:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        got += d
+                    results[name] = got
+                finally:
+                    c.close()
+
+            t1 = threading.Thread(target=_run, args=("first", "STALL"),
+                                  daemon=True)
+            t1.start()
+            deadline = time.monotonic() + 5
+            while not chain.status_sent_at and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert chain.status_sent_at, (
+                "the first request's status line never reached the chain")
+
+            # THE SECOND, SAME CSE, A NEW CONNECTION: must reach the chain
+            # promptly -- the status line already settled the hold's own
+            # question, even though the first connection stays open,
+            # still streaming its chunked body.
+            t2 = threading.Thread(target=_run, args=("second", "SECOND"),
+                                  daemon=True)
+            t2.start()
+            t2.join(timeout=5)
+            assert len(chain.received) == 2, (
+                "the second request never reached the chain before the "
+                "first's connection closed -- the hold outlived the "
+                f"status line: {chain.received}")
+
+            chain.release.set()
+            t1.join(timeout=5)
+            assert results.get("first", b"").startswith(b"HTTP/1.1 200"), (
+                results.get("first"))
+            assert results.get("second", b"").startswith(b"HTTP/1.1 200"), (
+                results.get("second"))
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
 
 
 class _StreamingUpstream:

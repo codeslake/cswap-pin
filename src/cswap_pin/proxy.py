@@ -4587,9 +4587,15 @@ def _transcript_bridge_history(session_id: str) -> set[str]:
             rec = json.loads(raw)
         except ValueError:
             continue  # also swallows the leading partial line
-        if isinstance(rec, dict) and rec.get("type") == "bridge-session" \
-                and rec.get("bridgeSessionId"):
-            out.update(_both_spellings(str(rec["bridgeSessionId"])))
+        if not isinstance(rec, dict) or rec.get("type") != "bridge-session" \
+                or not rec.get("bridgeSessionId"):
+            continue
+        # SAME FILTER AS `_last_pointer` (4174): a proof used to CLOSE a
+        # bridge must decline at least as strictly as the one used to
+        # CARRY one.
+        if rec.get("sessionId") not in (None, session_id):
+            continue
+        out.update(_both_spellings(str(rec["bridgeSessionId"])))
     return out
 
 
@@ -4639,9 +4645,20 @@ def _replaced_twin_bridge_ids() -> set[str]:
                             rec.get("pid"))
         if not bridge or not job or str(job) not in live_jobs:
             continue
-        if isinstance(pid, int) and _pid_alive(pid):
-            continue  # the live job's OWN current record -- not a leftover
-        out.update(_both_spellings(str(bridge)))
+        # POSITIVE EVIDENCE ONLY, same as `_dead_creator_bridge_ids` (see
+        # its own note above): a missing/non-int/<=0 pid, or an `os.kill`
+        # that answers anything but `ProcessLookupError` (most of all
+        # `PermissionError` -- a reused pid now owned by someone else),
+        # proves nothing dead and must KEEP the bridge, not condemn it.
+        if not (isinstance(pid, int) and pid > 0):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            out.update(_both_spellings(str(bridge)))
+        except Exception:  # noqa: BLE001 — unknown errno: KEEP
+            pass
+        # alive (no exception): the live job's OWN current record -- KEEP
 
     for job in live_jobs:
         st = _read_json(home / "jobs" / str(job) / "state.json")
@@ -16228,15 +16245,27 @@ class PinProxy:
                     # dead.
                     up.settimeout(None)
                     up.sendall(head.encode("latin1") + body)
-                    if retry:
+                    seen = b""
+                    if retry or _bridge_cse:
                         code, seen = _peek_status(up)
-                        if code in (401, 403, 404):
+                        if retry and code in (401, 403, 404):
                             self._tunnel_trace(
                                 f"{method} {rel} swap refused ({code}) — "
                                 "retrying as it arrived (absolute-form)")
                             continue
-                        if seen:
-                            conn.sendall(seen)
+                    # RELEASED HERE, THE MOMENT THE STATUS LINE IS IN HAND —
+                    # same discipline as the MITM path's `on_status` (see
+                    # `_forward`): the outer `finally` below is only the
+                    # backstop for a dial failure or an exception before this
+                    # point. Waiting for `_pump` to return instead held this
+                    # past a whole keep-alive connection's lifetime, or
+                    # released it EARLY on the client's own abort while the
+                    # request was still live in a stalled hop — either way
+                    # not "the exchange settled". (`_release_bridge_hold`
+                    # is already a no-op with no `_bridge_cse`.)
+                    _release_bridge_hold()
+                    if seen:
+                        conn.sendall(seen)
                     _pump(conn, up)
                     return
                 finally:

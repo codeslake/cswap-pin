@@ -20248,17 +20248,61 @@ class TestTheSweepClosesAReplacedTwin:
         assert deleted == ["cse_twin"], deleted
         assert closed == 1
 
-    def case_without_any_host_local_proof_the_twin_is_kept(self, monkeypatch):
-        """The sleeping-Mac case, same as `_dead_creator_bridge_ids`'s: no
-        process here either, but nothing local says a job of ours held this
-        bridge before -- must be left alone."""
+    def case_a_transcript_record_naming_a_different_session_is_ignored(
+            self, tmp_path, monkeypatch):
+        """PROOF 2 must not reach for a `bridge-session` record whose OWN
+        `sessionId` names a DIFFERENT session, even sitting in the live
+        job's own transcript file -- same filter `_last_pointer` applies
+        (4174), and a proof used to CLOSE a bridge must decline at least
+        as strictly as one used to CARRY one."""
         from cswap_pin import proxy as pin_proxy
 
+        home = self._home(tmp_path, monkeypatch)
+        self._live_job(home, "j2", os.getpid(), "s2-live")
+        transcript = home / "projects" / "proj" / "s2-live.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "bridge-session", "sessionId": "OTHER",
+                        "bridgeSessionId": "cse_twin"}) + "\n")
         monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
                             lambda: {"cse_newer"})
         monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
                             lambda: set())
-        monkeypatch.setattr(pin_proxy, "_replaced_twin_bridge_ids",
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == [], (
+            "a transcript record naming a different session closed the "
+            f"twin: {deleted}")
+        assert closed == 0
+
+    def case_without_any_host_local_proof_the_twin_is_kept(
+            self, tmp_path, monkeypatch):
+        """The sleeping-Mac case, same as `_dead_creator_bridge_ids`'s: no
+        process here either, but nothing local says a job of ours held this
+        bridge before -- must be left alone. Runs the REAL
+        `_replaced_twin_bridge_ids`: a same-title twin whose only local
+        traces (a registry record, a transcript record) name a DIFFERENT
+        job and a DIFFERENT session, so neither of its two proofs can
+        reach for it -- a stub returning `set()` cannot fail this."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._live_job(home, "j1", os.getpid(), "s1-live")
+        # Names cse_twin, but for an UNRELATED job -- proof 1 must not
+        # reach for it just because the bridge id happens to match.
+        (home / "sessions" / "s-other.json").write_text(json.dumps({
+            "pid": 999999,  # not a real pid on this box
+            "jobId": "j-other", "sessionId": "s-other",
+            "bridgeSessionId": "cse_twin"}))
+        # Names cse_twin too, but in an UNRELATED session's transcript --
+        # proof 2 must not reach for it either.
+        (home / "projects" / "proj" / "s-other.jsonl").write_text(
+            json.dumps({"type": "bridge-session", "sessionId": "s-other",
+                        "bridgeSessionId": "cse_twin"}) + "\n")
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
                             lambda: set())
         deleted: list[str] = []
         closed = self._daemon(
@@ -20266,6 +20310,61 @@ class TestTheSweepClosesAReplacedTwin:
         ).sweep_superseded_bridges("tok")
         assert deleted == [], (
             f"closed a twin with no host-local record naming it: {deleted}")
+        assert closed == 0
+
+    def case_a_registry_record_missing_pid_keeps_the_twin(
+            self, tmp_path, monkeypatch):
+        """PROOF 1 must not condemn a record that never stamped a pid at
+        all -- absence proves nothing, same as no record at all."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._live_job(home, "j1", os.getpid(), "s1-live")
+        (home / "sessions" / "s1-old.json").write_text(json.dumps({
+            "jobId": "j1", "sessionId": "s1-old",
+            "bridgeSessionId": "cse_twin"}))  # no "pid" field
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
+                            lambda: set())
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == [], (
+            f"a record with no stamped pid closed a twin: {deleted}")
+        assert closed == 0
+
+    def case_an_EPERM_signal_keeps_the_twin(self, tmp_path, monkeypatch):
+        """PROOF 1's own discipline, mirrored from `_dead_creator_bridge_ids`:
+        `PermissionError` -- a reused pid now owned by someone else -- is
+        not `ProcessLookupError` and must KEEP, never condemn."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._live_job(home, "j1", os.getpid(), "s1-live")
+        (home / "sessions" / "s1-old.json").write_text(json.dumps({
+            "pid": 424242, "jobId": "j1", "sessionId": "s1-old",
+            "bridgeSessionId": "cse_twin"}))
+        real_kill = os.kill
+
+        def _fake_kill(pid, sig):
+            if pid == 424242:
+                raise PermissionError()
+            return real_kill(pid, sig)
+
+        monkeypatch.setattr(pin_proxy.os, "kill", _fake_kill)
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
+                            lambda: set())
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == [], (
+            f"an EPERM signal closed a twin whose pid may now belong to "
+            f"someone else's reused one: {deleted}")
         assert closed == 0
 
     def case_an_archived_twin_is_history_not_a_duplicate(self, monkeypatch):
