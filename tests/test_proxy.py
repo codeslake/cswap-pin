@@ -20143,6 +20143,154 @@ class TestTheSweepClosesADeadCreatorsTwin:
         assert closed == 1
 
 
+class TestTheSweepClosesAReplacedTwin:
+    """A twin a LIVE job replaced with its own newer bridge is closed too --
+    `_dead_creator_bridge_ids` only ever speaks for a job whose CREATOR is
+    gone, and a job simply holding a newer bridge now never appears there.
+    Same POSITIVE-evidence discipline as that function: a record THIS HOST
+    itself wrote, never "no process holds it" alone.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _home(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        (home / "sessions").mkdir(parents=True)
+        (home / "jobs").mkdir(parents=True)
+        (home / "projects" / "proj").mkdir(parents=True)
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
+                            lambda: home)
+        return home
+
+    def _live_job(self, home, job_id, pid, session_id):
+        """A job THIS HOST has live right now, holding `cse_newer`."""
+        (home / "jobs" / job_id).mkdir(parents=True, exist_ok=True)
+        (home / "jobs" / job_id / "state.json").write_text(json.dumps({
+            "bridgeSessionId": "cse_newer", "sessionId": session_id}))
+        (home / "sessions" / f"{session_id}.json").write_text(json.dumps({
+            "pid": pid, "jobId": job_id, "sessionId": session_id,
+            "bridgeSessionId": "cse_newer"}))
+
+    def _daemon(self, sessions, deleted):
+        from cswap_pin import proxy as pin_proxy
+
+        d = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        d._list_bridges = lambda tok: sessions
+        d._listing_complete = True
+        d._restore_bridge_titles = lambda s, tok: None
+        d._bridge_api = lambda m, path, tok, **kw: (
+            deleted.append(path.rsplit("/", 1)[-1]) or {"ok": True}
+        )
+        return d
+
+    def _roster(self, victim_status, victim_connection_status):
+        return [
+            {"id": "cse_newer", "title": "cswap", "status": "active",
+             "connection_status": "connected", "worker_status": "idle",
+             "last_event_at": "2026-01-02T00:00:00Z"},
+            {"id": "cse_twin", "title": "cswap",
+             "status": victim_status,
+             "connection_status": victim_connection_status,
+             "worker_status": "running",
+             "last_event_at": "2026-01-01T00:00:00Z"},
+        ]
+
+    def case_a_dead_same_jobid_registry_record_closes_the_twin(
+            self, tmp_path, monkeypatch):
+        """PROOF 1: an earlier resume under the SAME job, its own process
+        gone, whose registry record still names the twin. Runs
+        `_replaced_twin_bridge_ids` FOR REAL -- proves the sweep is wired
+        to what it actually returns, not to a name that happens to match."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._live_job(home, "j1", os.getpid(), "s1-new")
+        (home / "sessions" / "s1-old.json").write_text(json.dumps({
+            "pid": 999999,  # not a real pid on this box
+            "jobId": "j1", "sessionId": "s1-old",
+            "bridgeSessionId": "cse_twin"}))
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
+                            lambda: set())
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == ["cse_twin"], deleted
+        assert closed == 1
+
+    def case_a_transcript_bridge_session_record_closes_the_twin(
+            self, tmp_path, monkeypatch):
+        """PROOF 2: no registry leftover (GC'd, or never one), but the live
+        job's OWN transcript once pointed at the twin before Claude Code
+        minted the bridge it holds now -- the newest record in the same
+        file. Real `_replaced_twin_bridge_ids` again."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._live_job(home, "j2", os.getpid(), "s2-live")
+        transcript = home / "projects" / "proj" / "s2-live.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "bridge-session", "sessionId": "s2-live",
+                        "bridgeSessionId": "cse_twin"}) + "\n"
+            + json.dumps({"type": "bridge-session", "sessionId": "s2-live",
+                          "bridgeSessionId": "cse_newer"}) + "\n")
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
+                            lambda: set())
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == ["cse_twin"], deleted
+        assert closed == 1
+
+    def case_without_any_host_local_proof_the_twin_is_kept(self, monkeypatch):
+        """The sleeping-Mac case, same as `_dead_creator_bridge_ids`'s: no
+        process here either, but nothing local says a job of ours held this
+        bridge before -- must be left alone."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
+                            lambda: set())
+        monkeypatch.setattr(pin_proxy, "_replaced_twin_bridge_ids",
+                            lambda: set())
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("active", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == [], (
+            f"closed a twin with no host-local record naming it: {deleted}")
+        assert closed == 0
+
+    def case_an_archived_twin_is_history_not_a_duplicate(self, monkeypatch):
+        """CONTROL: the identical twin, only `archived` instead of `active`
+        -- the owner's claude.ai history, kept on purpose. The
+        replaced-twin path must never reach for it, whatever the local
+        record says -- even with a proof that WOULD otherwise admit it."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids",
+                            lambda: {"cse_newer"})
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids",
+                            lambda: set())
+        monkeypatch.setattr(pin_proxy, "_replaced_twin_bridge_ids",
+                            lambda: {"cse_twin"})
+        deleted: list[str] = []
+        closed = self._daemon(
+            self._roster("archived", "disconnected"), deleted
+        ).sweep_superseded_bridges("tok")
+        assert deleted == [], (
+            "an archived twin was closed by the replaced-twin path -- "
+            f"archived is history, never a duplicate: {deleted}")
+        assert closed == 0
+
+
 #: THE LONGEST BYTE-FREE WAIT IN THE FLEET WATCHER'S CORPUS -- not the longest
 #: ever seen. A 140s sample was reported before the corpus file existed, which
 #: is why the watcher banks them: the daemon log rotates and loses them. Only
