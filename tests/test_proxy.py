@@ -3324,6 +3324,39 @@ class TestRepinIsLive:
             "LOST RECORD instead of a genuine clear")
         assert provider.pin_is_noop() is True
 
+    def case_a_memo_with_no_emailaddress_stays_a_no_op(
+            self, tmp_path, monkeypatch):
+        """RED for T0903's [m3] finding: the memo survives, with a live
+        wiring receipt behind it (the LOST gate is otherwise open), but
+        carries no `emailAddress` key at all. Without the guard that checks
+        for it, `remembered["emailAddress"]` raises KeyError inside
+        `_current_target`'s own try/except a few lines below, the except
+        there swallows it, and execution falls through to the spawn-time
+        account instead of declining -- the one arm of the LOST path this
+        suite had never run a check against."""
+        import claude_swap.paths as paths
+
+        from cswap_pin.proxy import (_WIRE_MARK, make_pin_token_provider,
+                                      remember_pin_identity)
+
+        sw = self._Sw(tmp_path)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        remember_pin_identity(certdir, {
+            "accountUuid": "u2", "organizationUuid": "org"})
+        (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
+        cfg = tmp_path / "global.claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:9999"},
+            _WIRE_MARK: ["HTTPS_PROXY"]}), encoding="utf-8")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        provider = make_pin_token_provider(sw, "1", "one@example.com")
+
+        assert provider() is None, (
+            "an email-less memo was trusted as the LOST RECORD's account "
+            "and relayed the spawn-time bearer (TOK-1) instead of declining")
+        assert provider.pin_is_noop() is True
+
     def case_a_lost_record_is_logged_once(self, tmp_path, monkeypatch, capsys):
         """The daemon only noticed the lost record 15 minutes after the
         damage, live, because nothing logged it happening. `_current_target`

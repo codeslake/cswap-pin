@@ -5337,8 +5337,9 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # class. Unlink it rather than merely skip the write.
     if identity:
         identity = remember_pin_identity(certdir, identity) or identity
-    elif (remembered_pin_identity(certdir) or {}).get("emailAddress") != email:
-        remember_pin_identity(certdir, None)
+    elif ((remembered_pin_identity(certdir) or {}).get("emailAddress") or ""
+          ).lower() != email.lower():
+        remember_pin_identity(certdir, None, stale_only=True)
     try:
         if not splice_config_identity(identity):
             now = _login_identity()
@@ -5355,7 +5356,8 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
 _PIN_IDENTITY_NAME = "pin-identity.json"
 
 
-def remember_pin_identity(certdir, identity: dict | None) -> "dict | None":
+def remember_pin_identity(certdir, identity: dict | None, *,
+                           stale_only: bool = False) -> "dict | None":
     """Leave the pinned ``oauthAccount`` where the daemon can re-apply it.
 
     THE PACKAGE NEVER DERIVES THIS. ``identity_for_config`` lives host-side on
@@ -5385,10 +5387,16 @@ def remember_pin_identity(certdir, identity: dict | None) -> "dict | None":
         try:
             p.unlink(missing_ok=True)
         except OSError as exc:
-            _log_lifecycle(
-                f"could not forget the cleared pin's remembered identity "
-                f"({exc!r}) -- it will keep reading as pinned until this "
-                "is removed by hand")
+            if stale_only:
+                _log_lifecycle(
+                    f"a stale memo for a different account could not be "
+                    f"removed ({exc!r}) -- bridges may be minted under it "
+                    "until this is removed by hand")
+            else:
+                _log_lifecycle(
+                    f"could not forget the cleared pin's remembered identity "
+                    f"({exc!r}) -- it will keep reading as pinned until this "
+                    "is removed by hand")
         return None
     kept = remembered_pin_identity(certdir)
     if (kept and kept.get("accountUuid") == identity.get("accountUuid")
