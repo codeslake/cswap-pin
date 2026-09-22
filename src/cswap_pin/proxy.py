@@ -5229,9 +5229,10 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             return True
         # CAPTURED BEFORE THE DROP, so a failed racing-undo below can put
         # this exact pair straight back. Not `pin-identity.json`: the set
-        # arm unlinks it on any call with no `identity` (a rollback does
-        # exactly that), so a memo merely left alone is not durable enough
-        # to lean on here.
+        # arm unlinks it only when it names a DIFFERENT account than the
+        # one it is pinning (a rollback does exactly that), so a memo
+        # already naming the right account is left standing -- still not
+        # durable enough to lean on here.
         prior = load_pin(switcher.backup_dir)
         save_pin(switcher.backup_dir, email, org_uuid)
         wiring_confirmed_gone = True
@@ -5325,12 +5326,19 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     # None)` is the CLEAR call, and this is the SET arm -- a re-pin whose
     # caller could not resolve an identity this time (`identity` arrives
     # None; "only cswap can resolve one", see the docstring above) must not
-    # take that same branch and unlink whatever a PRIOR, successful arm
-    # already cached. `_current_target` now reads that file's mere presence
-    # as "this pin is still live", so wiping it here would misreport a live
-    # pin as cleared the next time settings.json itself goes unreadable.
+    # wipe a memo that already names THIS email: `_current_target` reads
+    # that file's mere presence as "this pin is still live", so dropping a
+    # memo that already matches would misreport a live pin as cleared the
+    # next time settings.json itself goes unreadable. BUT a memo naming a
+    # DIFFERENT account is stale, not live: `_restore_pin`'s rollback calls
+    # this exact arm with `identity=None` after a failed `cswap pin B`
+    # already wrote B's memo, and leaving that standing would splice B into
+    # every bridge minted while A is the pin -- the incident's own harm
+    # class. Unlink it rather than merely skip the write.
     if identity:
         identity = remember_pin_identity(certdir, identity) or identity
+    elif (remembered_pin_identity(certdir) or {}).get("emailAddress") != email:
+        remember_pin_identity(certdir, None)
     try:
         if not splice_config_identity(identity):
             now = _login_identity()
@@ -5800,6 +5808,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         filesystem itself refuses. `remember_pin_identity` logs that loudly
         instead of pretending it happened.)
 
+        THE MEMO ALONE IS NOT ENOUGH, though: it is also gated on a wiring
+        receipt still naming a live key in `env`, the same test `heal`'s
+        `_restore_record_from_wiring` already makes before it will trust
+        this file. That closes most of the parenthetical gap above too --
+        a clear whose unlink was refused still ran its unwire first, so
+        the receipt reads dead and this returns None regardless of the
+        leftover memo.
+
         RESOLVED THROUGH `remembered`, NOT `account_num`/`email`. Those are
         this DAEMON's spawn-time account and go stale the moment `cswap pin
         <other>` re-pins it without a respawn
@@ -5817,17 +5833,30 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return account_num, email
         if pin is None:
             remembered = remembered_pin_identity(switcher.backup_dir / "pin-proxy")
-            if remembered is None:
+            if remembered is None or not remembered.get("emailAddress"):
+                provider._lost_record = False
+                return None
+            # THE WIRING RECEIPT, NOT THE MEMO ALONE. A DELIBERATE clear
+            # that finished can leave `pin-identity.json` standing behind
+            # (an unlink the filesystem refused, see `remember_pin_identity`)
+            # -- trusting the memo by itself there re-pins a box the
+            # operator genuinely cleared. Same test `_restore_record_from_
+            # wiring` already makes before `heal` will trust this file:
+            # `_read_ledger`'s receipt, plus one of its own keys still live
+            # in `env`.
+            cfg = require("paths").get_global_config_path()
+            raw = _read_json(cfg)
+            mark = _read_ledger(cfg, raw).get(_WIRE_MARK)
+            env = raw.get("env") if isinstance(raw, dict) else None
+            if not mark or not isinstance(env, dict) or not any(k in env for k in mark):
                 provider._lost_record = False
                 return None
             _note_lost_record()
-            ident = remembered.get("emailAddress") or remembered.get("accountUuid")
-            if ident:
-                try:
-                    num, mail, _ = switcher.resolve_account(ident)
-                    return num, mail
-                except (AccountNotFoundError, ConfigError, Exception):
-                    pass
+            try:
+                num, mail, _ = switcher.resolve_account(remembered["emailAddress"])
+                return num, mail
+            except (AccountNotFoundError, ConfigError, Exception):
+                pass
             return account_num, email
         provider._lost_record = False
         try:

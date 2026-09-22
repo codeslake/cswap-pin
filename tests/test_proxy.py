@@ -3214,18 +3214,21 @@ class TestRepinIsLive:
         save_pin(tmp_path, None, None)
         assert provider() is None
 
-    def case_a_lost_record_still_pins_the_remembered_account(self, tmp_path):
-        """RED for T0903: `_read_raw` degrades a missing or unreadable
-        settings.json to `{}` -- exactly what it reads after a deliberate
-        `cswap pin --clear` too. Measured live: a relink racing a checkout
-        fast-forward left settings.json reading empty for ~36s, `load_pin`
-        returned None, `pin_is_noop()` called that a deliberate clear, and
-        seven live Remote Control bridges validated on the just-switched-to
-        account and were killed as `swapped=True`.
+    def case_a_lost_record_still_pins_the_remembered_account(
+            self, tmp_path, monkeypatch):
+        """RED for T0903: the measured incident is settings.json EXISTING
+        and reading as a literal `{}` -- a relink racing a checkout
+        fast-forward left it reading empty for ~36s, `load_pin` returned
+        None, `pin_is_noop()` called that a deliberate clear, and seven live
+        Remote Control bridges validated on the just-switched-to account and
+        were killed as `swapped=True`. (Settings.json simply not existing
+        yet is the unrelated never-pinned case; see the negative control
+        below.)
 
         This daemon's OWN remembered identity (`pin-identity.json`, in its
-        own certdir, never the settings.json checkout that just failed to
-        read) still naming the pinned account is what tells a LOST RECORD
+        own certdir, never the settings.json checkout that just read empty)
+        still naming the pinned account, ALONGSIDE a wiring receipt
+        `.claude.json` still carries live, is what tells a LOST RECORD
         apart from a real clear -- and it must win: the provider keeps
         pinning instead of silently relaying the active account's bearer.
 
@@ -3239,7 +3242,10 @@ class TestRepinIsLive:
         (TOK-2) -- the assertion below is blind to that bug unless the two
         accounts differ.
         """
-        from cswap_pin.proxy import make_pin_token_provider, remember_pin_identity
+        import claude_swap.paths as paths
+
+        from cswap_pin.proxy import (_WIRE_MARK, make_pin_token_provider,
+                                      remember_pin_identity)
 
         sw = self._Sw(tmp_path)
         certdir = tmp_path / "pin-proxy"
@@ -3247,8 +3253,17 @@ class TestRepinIsLive:
         remember_pin_identity(certdir, {
             "accountUuid": "u2", "organizationUuid": "org",
             "emailAddress": "two@example.com"})
-        # Nothing saved to settings.json: `load_pin` degrades this exactly
-        # like an unreadable file, per `_read_raw`.
+        # THE MEASURED ARM: settings.json EXISTS and reads as an empty
+        # object, exactly what the relinked symlink read live.
+        (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
+        # The wiring receipt this daemon's own gate now requires before it
+        # will trust the memo -- same test `_restore_record_from_wiring`
+        # already makes for `heal`.
+        cfg = tmp_path / "global.claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:9999"},
+            _WIRE_MARK: ["HTTPS_PROXY"]}), encoding="utf-8")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         provider = make_pin_token_provider(sw, "1", "one@example.com")
 
         assert provider() == "TOK-2", (
@@ -3276,7 +3291,40 @@ class TestRepinIsLive:
             "a genuine clear started relaying a fallback account instead "
             "of leaving every bearer alone")
 
-    def case_a_lost_record_is_logged_once(self, tmp_path, capsys):
+    def case_a_lost_record_with_no_wiring_receipt_stays_a_no_op(
+            self, tmp_path, monkeypatch):
+        """RED for T0903's [I] finding: the memo survives, but the wiring
+        receipt it must now be checked against does not.
+
+        `pin-identity.json` can outlive a config that was truncated or
+        hand-edited out from under it -- an unlink the filesystem refused
+        (see `remember_pin_identity`), or simply a host the operator emptied
+        by hand. Trusting the memo alone there would re-pin a box that is
+        genuinely clear, from a receipt for a wiring that no longer exists.
+        Same test `_restore_record_from_wiring` already makes before `heal`
+        will trust this file."""
+        import claude_swap.paths as paths
+
+        from cswap_pin.proxy import make_pin_token_provider, remember_pin_identity
+
+        sw = self._Sw(tmp_path)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        remember_pin_identity(certdir, {
+            "accountUuid": "u2", "organizationUuid": "org",
+            "emailAddress": "two@example.com"})
+        (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
+        cfg = tmp_path / "global.claude.json"
+        cfg.write_text("{}", encoding="utf-8")  # no wiring receipt at all
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        provider = make_pin_token_provider(sw, "1", "one@example.com")
+
+        assert provider() is None, (
+            "a memo with no live wiring receipt behind it was trusted as a "
+            "LOST RECORD instead of a genuine clear")
+        assert provider.pin_is_noop() is True
+
+    def case_a_lost_record_is_logged_once(self, tmp_path, monkeypatch, capsys):
         """The daemon only noticed the lost record 15 minutes after the
         damage, live, because nothing logged it happening. `_current_target`
         runs on every request; the fix must log the LOST RECORD once per
@@ -3284,7 +3332,9 @@ class TestRepinIsLive:
         record is readable again, or a second, later window logs nothing
         (an implementation that logs once EVER, and never resets, would
         pass the three-call check alone)."""
-        from cswap_pin.proxy import (make_pin_token_provider,
+        import claude_swap.paths as paths
+
+        from cswap_pin.proxy import (_WIRE_MARK, make_pin_token_provider,
                                       remember_pin_identity, save_pin)
 
         sw = self._Sw(tmp_path)
@@ -3293,6 +3343,12 @@ class TestRepinIsLive:
         remember_pin_identity(certdir, {
             "accountUuid": "u1", "organizationUuid": "org",
             "emailAddress": "one@example.com"})
+        # A live wiring receipt, or the LOST-record gate never fires.
+        cfg = tmp_path / "global.claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:9999"},
+            _WIRE_MARK: ["HTTPS_PROXY"]}), encoding="utf-8")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         provider = make_pin_token_provider(sw, "1", "one@example.com")
 
         provider()
@@ -7442,6 +7498,47 @@ class TestWireGlobalConfig:
         assert pin_proxy.remembered_pin_identity(certdir) is not None, (
             "a re-pin with no resolved identity wiped the cache a prior, "
             "successful arm had written -- the pin is still live")
+
+    def case_a_rollback_to_a_different_account_drops_the_stale_memo(
+            self, tmp_path, monkeypatch):
+        """RED for T0903's [C] finding: `_restore_pin` rolls a failed
+        `cswap pin B` back with `apply_pin(switcher, *(before or (None,
+        None)))` -- account A, identity=None -- but the failed attempt
+        already wrote the memo as B before it failed. The old `if identity:`
+        guard only ever wrote the memo, never unlinked it, so the host ended
+        up recorded as A in settings.json with `pin-identity.json` still
+        naming B: `_reassert_pin_identity` then splices B onto every bridge
+        minted while A is the pin -- the incident's own harm class in
+        miniature."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        self._config(tmp_path, monkeypatch, {"projects": {}})
+        backup = Path(tmp_path)
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        monkeypatch.setattr(pin_proxy, "ensure_proxy",
+                             lambda sw: (9955, Path("/x/ca.pem")))
+        certdir = backup / "pin-proxy"
+
+        # The failed `cswap pin B` already wrote B's memo.
+        pin_proxy.apply_pin(_Sw(), "b@example.com", "org-1", identity={
+            "accountUuid": "u-b", "organizationUuid": "org-1",
+            "emailAddress": "b@example.com"})
+        assert pin_proxy.remembered_pin_identity(certdir).get(
+            "emailAddress") == "b@example.com"
+
+        # `_restore_pin`'s rollback: back to A, with identity=None.
+        pin_proxy.apply_pin(_Sw(), "a@example.com", "org-1", identity=None)
+
+        kept = pin_proxy.remembered_pin_identity(certdir)
+        assert kept is None or kept.get("emailAddress") != "b@example.com", (
+            "a rollback to A left B's memo standing -- every bridge minted "
+            "while A is pinned gets spliced onto B instead")
 
     def case_missing_config_is_not_an_error(self, tmp_path, monkeypatch):
         from pathlib import Path
