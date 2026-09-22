@@ -395,7 +395,8 @@ class TestPinProxyServer:
 
     def _bridge_post(self, certdir, monkeypatch, seed_verdict, expect_swapped,
                       profile_answer=lambda token: {
-                          "emailAddress": "pin@example.com"}):
+                          "emailAddress": "pin@example.com"},
+                      expect_refused=False):
         """Drives a REAL `make_pin_token_provider` through the actual HTTP
         egress path (`PinProxy` end to end, real upstream TLS) for a pinned
         `.../bridge` POST. `seed_verdict(pp, provider)` seeds whatever the
@@ -406,7 +407,17 @@ class TestPinProxyServer:
         api.anthropic.com, it must just get an "ok" verdict from the
         default. `expect_swapped` picks which invariant this drive proves:
         `swapped=True` (a healthy verdict DOES splice) or `swapped=False`
-        (a foreign one never does).
+        (a foreign one never does, and never relays either -- see
+        `expect_refused`).
+
+        `expect_refused`: the bridge ATTACH is now a `should_wait_for_pin`
+        route (T0867), so a real failed mint -- a foreign verdict included,
+        it sets `blind_reason` exactly like a missing credential does --
+        raises `_BlindMintRefusal` after the bounded retry instead of
+        falling through to the old silent relay. Relaying a foreign bearer
+        here would still give the bridge to whichever account is active,
+        permanently -- the same fault class the create route is already
+        guarded against.
 
         Not the provider in isolation: a provider-level-only test would still
         pass if a future splice site read the credential store directly
@@ -449,6 +460,15 @@ class TestPinProxyServer:
                 proxy.port, certdir / "ca.pem",
                 "/v1/code/sessions/SID123/bridge", bearer="client-own-token",
             )
+            if expect_refused:
+                assert status == 503, (
+                    f"a foreign verdict on the bridge attach was relayed "
+                    f"({status}) instead of refused -- the same permanent "
+                    "give-away the create route is already guarded against")
+                assert upstream.seen_auth is None, (
+                    "the bridge attach reached upstream on a foreign "
+                    f"bearer: {upstream.seen_auth!r}")
+                return
             assert status == 200
             want = "Bearer pin-live-token" if expect_swapped else "Bearer client-own-token"
             assert upstream.seen_auth == want, (
@@ -480,20 +500,25 @@ class TestPinProxyServer:
             expect_swapped=True,
         )
 
-    def case_a_foreign_verdict_leaves_the_bridge_post_unswapped(
+    def case_a_foreign_verdict_refuses_the_bridge_post(
             self, certdir, monkeypatch):
         """A foreign verdict from the MINT-time probe (`_identity_ok`, via
         `pin_profile_for`) must never splice -- see `_identity_ok`'s
-        invariant."""
+        invariant. Since T0867 the bridge attach also waits and then
+        refuses (503) rather than relaying on the foreign bearer -- see
+        `_bridge_post`'s `expect_refused`; before that it silently gave the
+        bridge to whichever account was active, unswapped and unrecorded,
+        which is the same permanent loss the create route already closed."""
         self._bridge_post(
             certdir, monkeypatch,
             seed_verdict=lambda pp, provider: None,
             expect_swapped=False,
             profile_answer=lambda token: {
                 "emailAddress": "someone-else@example.com"},
+            expect_refused=True,
         )
 
-    def case_a_foreign_verdict_from_the_identity_beat_leaves_the_bridge_post_unswapped(
+    def case_a_foreign_verdict_from_the_identity_beat_refuses_the_bridge_post(
             self, certdir, monkeypatch):
         """The INCIDENT's own path: the 12h identity beat
         (`_freshen_pin_identity`) reports a foreign verdict through
@@ -504,12 +529,15 @@ class TestPinProxyServer:
         stays the healthy default: if the cache key shape ever moved and the
         mint fell through to a real probe, this case must still never dial
         out, and a healthy answer there is also the correct one -- the
-        provider ignores it while its own foreign verdict stands."""
+        provider ignores it while its own foreign verdict stands. Since
+        T0867 the bridge attach also waits and then refuses (503) rather
+        than relaying on the foreign bearer -- see `expect_refused`."""
         self._bridge_post(
             certdir, monkeypatch,
             seed_verdict=lambda pp, provider: provider.note_verdict(
                 "pin-live-token", "foreign"),
             expect_swapped=False,
+            expect_refused=True,
         )
 
 
@@ -1365,6 +1393,74 @@ class TestTheChainsCredentialIsSent:
         assert f"Proxy-Authorization: Basic {expected}" in seen[0], (
             "the CONNECT went out unauthenticated — an authenticated "
             f"corporate proxy answers 407 to this:\n{seen[0]!r}"
+        )
+
+    def case_the_plain_relay_carries_it_too_with_no_client_credential(
+        self, certdir
+    ):
+        """The absolute-form path (`_plain_relay`) used to demand a
+        credential from the CLIENT before it would relay at all. That demand
+        is gone; this is the CONTROL proving authorization did not stop
+        working with it — the chain's OWN credential, configured through
+        `upstream.json`, must still reach the next hop, from a client that
+        never sent a `Proxy-Authorization` header of its own.
+
+        Deliberately broken (a wrong `write_upstream_hint` password) this
+        assertion fails, which is what makes it a control and not a shape
+        check: verified by hand while writing this case, not kept as a
+        second test that fails on purpose.
+        """
+        import base64
+        import secrets
+
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        # A proxy.secret DOES exist in this cert dir — a stale one, or one an
+        # older install minted — which is the case today's gate is armed
+        # by. Written directly rather than through `ensure_proxy_secret`,
+        # which this change deletes.
+        (certdir / "proxy.secret").write_text(secrets.token_urlsafe(32))
+        srv, port, seen = self._recording_chain()
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        write_upstream_hint(certdir, f"http://alice:s3cr3t@127.0.0.1:{port}")
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            # NO Proxy-Authorization header at all — the row that separates
+            # "the credential left the environment" from "the daemon still
+            # requires one".
+            raw.sendall(
+                b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            )
+            deadline = time.monotonic() + 5
+            while not seen and time.monotonic() < deadline:
+                time.sleep(0.02)
+            raw.settimeout(5)
+            try:
+                client_saw = raw.recv(64)
+            except OSError:
+                client_saw = b""
+            raw.close()
+        finally:
+            proxy.stop()
+            srv.close()
+
+        assert b"407" not in client_saw, (
+            f"a credential-less client was answered 407: {client_saw!r}"
+        )
+        assert seen, (
+            "the plain relay never reached the chain — a credential-less "
+            "client was refused instead of served"
+        )
+        expected = base64.b64encode(b"alice:s3cr3t").decode()
+        assert f"Proxy-Authorization: Basic {expected}" in seen[0], (
+            "the chain's own credential did not reach the next hop — "
+            f"authorization stopped working, not just left the client's "
+            f"environment:\n{seen[0]!r}"
         )
 
 
@@ -2931,8 +3027,498 @@ class TestChainRediscovery:
                 "a hop that ANSWERED was reported as a dead port — the two "
                 "faults are indistinguishable again")
             assert "502" in wrong_lines[0], wrong_lines
+            assert "api.anthropic.com:443" in wrong_lines[0], wrong_lines
         finally:
             rude.close()
+
+    def case_the_absolute_form_dial_logs_the_hop_reason_before_REFUSED(
+        self, certdir, monkeypatch
+    ):
+        """`_plain_relay`'s own `dial()` walks the chain exactly like
+        `_walk_chain_once`, but its `except (OSError, ssl.SSLError): continue`
+        never called `_note_hop_unusable` — so the `egress REFUSED` line this
+        path also emits landed with no hop reason above it to explain why.
+        """
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        dead = self._dead_port()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", dead),
+            rediscover_chain=True,
+        )
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"GET http://example.com/x HTTP/1.1\r\n"
+                    b"Host: example.com\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{dead} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert "dial failed" in lines[unusable[0]], lines[unusable[0]]
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_the_blind_tunnel_dial_failure_logs_before_REFUSED(
+        self, certdir, monkeypatch
+    ):
+        """`_blind_tunnel` is the OTHER walk that can emit `egress REFUSED`
+        (Remote Control's own path). A dead hop's dial failure must reach
+        `_note_hop_unusable`, not just the trace FILE (`_tunnel_trace`), so
+        the REFUSED line it also emits carries a hop reason in the daemon
+        log above it."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        dead = self._dead_port()
+        write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{dead} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert "dial failed" in lines[unusable[0]], lines[unusable[0]]
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_the_blind_tunnel_CONNECT_refusal_names_the_reason(
+        self, certdir, monkeypatch
+    ):
+        """A second `_blind_tunnel` fall-through, distinct from a dead dial:
+        a hop that ACCEPTS the CONNECT and answers non-200 — a cache proxy
+        mid-restart. The reason logged must say so, not read as a dead
+        port."""
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        wrong_lines = [
+            l for l in buf.getvalue().splitlines()
+            if f"{refusing_port} unusable" in l
+        ]
+        assert wrong_lines, (
+            f"a hop that answered and refused to tunnel was skipped "
+            f"silently: {buf.getvalue()!r}")
+        assert "dial failed" not in wrong_lines[0], (
+            "a hop that ANSWERED was reported as a dead port")
+        assert "accepted but did not tunnel" in wrong_lines[0], wrong_lines
+        assert "CONNECT ->" in wrong_lines[0], wrong_lines
+        assert "rc-ingress.example.com:443" in wrong_lines[0], wrong_lines
+
+    def case_an_empty_authority_CONNECT_is_refused_400_and_judges_no_hop(
+        self, certdir, monkeypatch
+    ):
+        """Measured on lmd42-docker, 2026-09-15: some client on the host sent
+        a 17-byte `CONNECT  HTTP/1.1` (empty authority — 3 tokens: `CONNECT`,
+        ``, `HTTP/1.1`). `_handle_client` used to trace-log it and still hand
+        the empty target to `_blind_tunnel`, which dialled every hop with
+        `CONNECT  HTTP/1.1`; each hop refused in its own dialect, writing two
+        FALSE `hop unusable` lines and one FALSE `egress REFUSED`, and the
+        client got a 503 — one garbage request marking the whole pin's
+        egress refused. It must now be answered 400 before any hop is asked.
+        """
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(b"CONNECT  HTTP/1.1\r\n\r\n")
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        assert resp.startswith(b"HTTP/1.1 400 Bad Request"), resp
+        lines = buf.getvalue().splitlines()
+        assert not [l for l in lines if "unusable" in l], (
+            f"an empty-authority CONNECT judged a hop: {buf.getvalue()!r}")
+        assert not [l for l in lines if "egress REFUSED" in l], (
+            f"an empty-authority CONNECT marked egress refused: "
+            f"{buf.getvalue()!r}")
+        assert proxy._egress_refused is False
+        assert seen == [], "a hop was dialled for an empty-authority CONNECT"
+
+    def case_an_empty_host_with_a_port_is_refused_the_same_way(
+        self, certdir, monkeypatch
+    ):
+        """`CONNECT :443 HTTP/1.1` has a non-empty TARGET (`:443`) but an
+        EMPTY HOST once split on `:` — the same host `_blind_tunnel` would
+        dial as the fully-empty shape. A check on `target` alone lets this
+        one through; the check has to read the host `_blind_tunnel` actually
+        uses."""
+        refusing, refusing_port, seen = self._refusing_chain()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{refusing_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(b"CONNECT :443 HTTP/1.1\r\nHost: :443\r\n\r\n")
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            refusing.close()
+        assert resp.startswith(b"HTTP/1.1 400 Bad Request"), resp
+        assert seen == [], "a hop was dialled for an empty-host CONNECT"
+
+    def case_the_blind_tunnel_EOF_after_200_logs_the_reason(
+        self, certdir, monkeypatch
+    ):
+        """A FOURTH fall-through in the same function: a hop that ACCEPTS the
+        CONNECT, answers 200, and then closes before carrying anything — a
+        filtering proxy that answers optimistically and dials afterwards,
+        closing when that dial fails (`_tunnel_is_open` catches exactly
+        this). That path also fell through to `egress REFUSED` with no hop
+        reason above it.
+        """
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        srv_port = srv.getsockname()[1]
+
+        def _serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    seen = b""
+                    while b"\r\n\r\n" not in seen:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        seen += d
+                    c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                except OSError:
+                    pass
+                finally:
+                    c.close()  # accepted, answered 200, and EOF right after
+
+        threading.Thread(target=_serve, daemon=True).start()
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        write_upstream_hint(certdir, f"http://127.0.0.1:{srv_port}")
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(
+            certdir=certdir, pin_token_provider=lambda: None,
+            rediscover_chain=True,
+        )
+        proxy.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                raw.settimeout(10)
+                raw.sendall(
+                    b"CONNECT rc-ingress.example.com:443 HTTP/1.1\r\n"
+                    b"Host: rc-ingress.example.com:443\r\n\r\n"
+                )
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = raw.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                finally:
+                    raw.close()
+        finally:
+            proxy.stop()
+            srv.close()
+        lines = buf.getvalue().splitlines()
+        unusable = [i for i, l in enumerate(lines) if f"{srv_port} unusable" in l]
+        refused = [i for i, l in enumerate(lines) if "egress REFUSED" in l]
+        assert unusable, f"no hop-unusable line at all: {buf.getvalue()!r}"
+        assert "EOF" in lines[unusable[0]], lines[unusable[0]]
+        assert "rc-ingress.example.com:443" in lines[unusable[0]], (
+            lines[unusable[0]])
+        assert refused, f"no REFUSED line at all: {buf.getvalue()!r}"
+        assert unusable[0] < refused[0], (
+            "the hop reason must precede the REFUSED it explains: "
+            f"{buf.getvalue()!r}")
+
+    def case_a_hop_that_recovers_then_faults_again_logs_a_second_line(
+        self, certdir
+    ):
+        """`_hop_fault`'s dedup is on the (hop, reason) TRANSITION, and must
+        be reset by that hop's own recovery — so a hop that goes down, comes
+        back and carries a request, then goes down again with the SAME
+        reason logs a second time, not silence. On a real daemon.log that
+        read 12 REFUSED lines behind 3 `unusable` lines, and the incident
+        could not be attributed to a specific outage window.
+
+        THE SAME HOP, not a different one behind it: reset the dedup for
+        every carrying hop and a chain with a persistently dead FIRST hop and
+        a healthy SECOND one floods a line per connection again — the exact
+        shape the dedup exists to prevent. So this pins the port itself going
+        down, up, then down again, not two different candidates.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens here yet — the hop starts DOWN
+
+        relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+        relay._chain_candidates = lambda: [
+            pin_proxy._as_chain(("127.0.0.1", port))
+        ]
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            except OSError:
+                pass
+        first = [
+            l for l in buf.getvalue().splitlines() if f"{port} unusable" in l
+        ]
+        assert first, f"the first fault was not logged: {buf.getvalue()!r}"
+
+        # THE SAME PORT RECOVERS: a listener bound to the identical address.
+        good = socket.socket()
+        good.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        good.bind(("127.0.0.1", port))
+        good.listen(4)
+
+        def _answer():
+            while True:
+                try:
+                    conn, _ = good.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+        threading.Thread(target=_answer, daemon=True).start()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            # premise: the hop carried, which is what should reset the dedup
+        finally:
+            good.close()
+
+        # CONFIRM THE PORT IS ACTUALLY DOWN before the next walk — closing a
+        # listening socket and a fresh connect racing it is not instantaneous
+        # everywhere, and `_connect_upstream` itself retries for 2.5s, which
+        # would silently ride out a slow teardown and mask the very thing
+        # this phase means to pin.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            except OSError:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"port {port} never closed after good.close()")
+
+        # THE SAME PORT GOES DOWN AGAIN, the identical reason.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            except OSError:
+                pass
+        second = [
+            l for l in buf.getvalue().splitlines() if f"{port} unusable" in l
+        ]
+        assert second, (
+            "the SAME fault recurring after the SAME hop recovered was "
+            f"suppressed — _hop_fault's dedup is never reset by that hop's "
+            f"own recovery: {buf.getvalue()!r}")
+
+    def case_a_persistently_dead_first_hop_does_not_flood_once_the_second_carries(
+        self, certdir
+    ):
+        """A reset that clears `_hop_fault` on ANY hop carrying — not just the
+        one that faulted — reintroduces the flood the dedup exists to
+        prevent: a chain [A dead, B up] would re-log A's fault on every
+        connection, because B's carry re-arms the dedup before the next
+        walk. The reset must be scoped to the hop that just recovered.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+
+        good = socket.socket()
+        good.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        good.bind(("127.0.0.1", 0))
+        good.listen(4)
+        good_port = good.getsockname()[1]
+
+        def _answer():
+            while True:
+                try:
+                    conn, _ = good.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                except OSError:
+                    pass
+
+        threading.Thread(target=_answer, daemon=True).start()
+        try:
+            relay = pin_proxy.PinProxy(certdir, lambda: "tok")
+            relay._chain_candidates = lambda: [
+                pin_proxy._as_chain(("127.0.0.1", dead_port)),
+                pin_proxy._as_chain(("127.0.0.1", good_port)),
+            ]
+
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            first = [
+                l for l in buf.getvalue().splitlines()
+                if f"{dead_port} unusable" in l
+            ]
+            assert first, f"the first fault was not logged: {buf.getvalue()!r}"
+
+            # SAME unchanged chain, again: A is still dead, B still carries.
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                sock, _ = relay._connect_upstream()
+                sock.close()
+            second = [
+                l for l in buf.getvalue().splitlines()
+                if f"{dead_port} unusable" in l
+            ]
+            assert not second, (
+                "A's fault was re-logged after B merely carried again — B "
+                f"recovering does not mean A did: {buf.getvalue()!r}")
+        finally:
+            good.close()
 
     def case_D1_a_chain_that_refuses_the_dial_uses_the_next_hop(
         self, certdir, tmp_path, monkeypatch
@@ -3168,9 +3754,8 @@ class TestChainRediscovery:
         and D3 for the blind tunnel. On a host with no direct route out that
         is not a downgrade, it is a failure.
         """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         dead = self._dead_port()
         inner = _LoopbackConnectProxy(("127.0.0.1", 1))
         proxy = None
@@ -3188,15 +3773,11 @@ class TestChainRediscovery:
             proxy.start()
             assert proxy.port != 36301, proxy.port
 
-            import base64
-
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             try:
                 c.sendall(
                     b"GET http://example.com/x HTTP/1.1\r\n"
-                    b"Host: example.com\r\n"
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                    b"Host: example.com\r\n\r\n"
                 )
                 c.settimeout(10)
                 try:
@@ -3232,9 +3813,8 @@ class TestChainRediscovery:
         import socket as socket_module
 
         from cswap_pin import proxy as pin_proxy
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         # A configured hop nothing listens on: port 1 refuses instantly, and
         # `_chain_candidates()` is non-empty — the premise the guard is on.
         write_upstream_hint(certdir, "http://127.0.0.1:1")
@@ -3263,10 +3843,6 @@ class TestChainRediscovery:
         assert proxy._chain_candidates(), "premise: this host has a chain"
         proxy.start()
         try:
-            import base64
-
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
-
             def _send():
                 raw = socket_module.socket(
                     socket_module.AF_INET, socket_module.SOCK_STREAM
@@ -3275,8 +3851,7 @@ class TestChainRediscovery:
                 raw.connect(("127.0.0.1", proxy.port))
                 raw.sendall(
                     b"GET http://example.com/x HTTP/1.1\r\n"
-                    b"Host: example.com\r\n"
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                    b"Host: example.com\r\n\r\n"
                 )
                 resp = b""
                 while b"\r\n\r\n" not in resp:
@@ -3326,10 +3901,8 @@ class TestChainRediscovery:
         once: it fires for a pinned route, it does NOT fire for inference on
         the same host, and it does NOT fire for another host at all.
         """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
-        import base64
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         chain = _RecordingChain(
             lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
         seen = chain.seen
@@ -3341,7 +3914,6 @@ class TestChainRediscovery:
                              pin_token_provider=lambda: "PINTOKEN",
                              rediscover_chain=True)
             proxy.start()
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
 
             def ask(url, host):
                 c = socket.create_connection(("127.0.0.1", proxy.port),
@@ -3349,8 +3921,7 @@ class TestChainRediscovery:
                 try:
                     c.sendall(
                         f"POST {url} HTTP/1.1\r\nHost: {host}\r\n"
-                        f"Authorization: Bearer ACTIVE\r\n"
-                        f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                        f"Authorization: Bearer ACTIVE\r\n\r\n".encode())
                     c.settimeout(10)
                     try:
                         c.recv(256)
@@ -3402,10 +3973,8 @@ class TestChainRediscovery:
         server fixes the owner at registration and offers no transfer — so an
         unreachable retry is a permanent loss with a guard in front of it.
         """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
-        import base64
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         chain = _RecordingChain(
             lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
         # The `consume-busy` race exactly: the first ask finds the slot's
@@ -3422,14 +3991,12 @@ class TestChainRediscovery:
             proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
                              rediscover_chain=True)
             proxy.start()
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             try:
                 c.sendall(
                     b"POST https://api.anthropic.com/v1/environments/bridge"
                     b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-                    b"Authorization: Bearer ACTIVE\r\n"
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                    b"Authorization: Bearer ACTIVE\r\n\r\n")
                 c.settimeout(10)
                 try:
                     c.recv(256)
@@ -3506,10 +4073,8 @@ class TestChainRediscovery:
         need — chain, secret, proxy, socket, read the status line —
         differing only in the provider they hand the daemon and, for the
         scope-of-the-guard case, the path."""
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
-        import base64
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         chain = _RecordingChain(
             lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
         proxy = None
@@ -3518,15 +4083,13 @@ class TestChainRediscovery:
             proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
                              rediscover_chain=True)
             proxy.start()
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             got = b""
             try:
                 c.sendall(
                     f"POST https://api.anthropic.com{path}"
                     " HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-                    "Authorization: Bearer ACTIVE\r\n".encode()
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                    "Authorization: Bearer ACTIVE\r\n\r\n".encode())
                 c.settimeout(10)
                 while b"\r\n\r\n" not in got:
                     d = c.recv(4096)
@@ -3568,6 +4131,75 @@ class TestChainRediscovery:
             "the bridge create reached the chain on a blind mint — this "
             f"bridge is now owned by the ACTIVE account permanently: {seen!r}")
 
+    def case_the_bridge_attach_waits_on_an_unexplained_miss_then_relays_untokened_and_logs(
+        self, certdir
+    ):
+        """`should_wait_for_pin` now covers the bridge ATTACH too (T0867) —
+        previously missing even though `is_pinned_route` already matches it
+        (a prefix match on `/v1/code/sessions/`), so a token miss on this
+        route relayed on Claude Code's own bearer with no retry and no
+        record at all: `_wait_for_pin_token` returned the falsy token
+        straight back because `should_wait_for_pin` said this route was not
+        worth waiting for.
+
+        NOT `consume-busy`: that shape sets `_deferred`, which makes
+        `pin_is_noop()` read True for the whole window, so `_wait_for_pin_token`
+        returns before this retry loop ever starts (see `should_wait_for_pin`'s
+        docstring). A miss that leaves `blind_reason` unset and `pin_is_noop()`
+        False — the shape this case drives — must still retry `_PIN_WAIT_TRIES`
+        times and then keep today's fail-open relay unchanged — but it must
+        now also say so, which it could not before this route was reachable."""
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            provider = self._blind_provider()  # blind_reason="" — a miss
+            got, seen = self._post_bridge_create(
+                certdir, provider, path="/v1/code/sessions/cse_x/bridge")
+            assert got.startswith(b"HTTP/1.1 200"), (
+                f"a momentary miss with no blind_reason must still fail "
+                f"open, not hang or refuse: {got[:60]!r}")
+            assert any(b"Bearer ACTIVE" in s for s in seen), (
+                "the exhausted retry did not fall back to the untokened "
+                f"relay today's fail-open promises: {seen!r}")
+            assert provider.calls >= pp._PIN_WAIT_TRIES, (
+                f"only {provider.calls} provider() call(s) — the retry "
+                "loop this route now arms never ran")
+            assert any(
+                "a bridge was created without the pin" in l for l in lines
+            ), (
+                "the pin stayed silent about an unpinned bridge attach — "
+                "the exact gap this route closes")
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_a_stalled_mint_refuses_the_bridge_attach_fast_too(self, certdir):
+        """The absolute-form path's `mint_stalled()` pre-check (see
+        `case_a_stalled_mint_is_refused_fast_not_relayed`) now also gates
+        the bridge ATTACH (T0867), since that route only just became a
+        `should_wait_for_pin` route: a stalled store must 503 immediately
+        rather than pay `_wait_for_pin_token`'s three retries first, and
+        rather than relay unpinned — the permanent give-away this whole
+        route table exists to close."""
+        provider = self._blind_provider(
+            blind_reason="mint stalled: the refresh lock has been held "
+                         "over 45s for slot 1 (a@example.com)",
+            stalled=True)
+        got, seen = self._post_bridge_create(
+            certdir, provider, path="/v1/code/sessions/cse_x/bridge")
+        assert got.startswith(b"HTTP/1.1 503"), (
+            f"a stalled mint on the attach was relayed instead of "
+            f"refused: {got[:60]!r}")
+        assert b"Connection: close" in got, (
+            f"a closed connection advertised keep-alive: {got!r}")
+        assert not any(b"Bearer ACTIVE" in s for s in seen), (
+            f"a stalled mint reached the chain on the bridge attach: {seen!r}")
+        assert provider.calls <= 2, (
+            f"{provider.calls} provider() call(s) — the retry loop ran "
+            "instead of the fast pre-check refusing immediately")
+
     def case_a_noop_pin_still_relays_unpinned_not_503(self, certdir):
         """A no-op pin (`pin_is_noop()` True — the pinned account IS the
         active one, or the pin is cleared) has nothing to swap; today's
@@ -3600,8 +4232,9 @@ class TestChainRediscovery:
         connection server with no cap — paid ONCE before this whole round,
         but every backoff respawn since the guard 503s the bridge worker
         instead of relaying. `provider.calls == 1` proves the retry loop
-        never ran; `Connection: close` matches the neighbouring
-        `_refuse_unauthorized` on this same non-keep-alive path."""
+        never ran; `Connection: close` matches this same non-keep-alive
+        path's neighbouring refusals (`_refuse_stalled_mint`'s own
+        `close=True` note)."""
         provider = self._blind_provider(
             blind_reason="mint stalled: the refresh lock has been held over "
                          "45s for slot 1 (a@example.com)",
@@ -3708,10 +4341,8 @@ class TestChainRediscovery:
         which no deploy is allowed to do. The MITM path has always taken a
         refused swap back; this one did not, and the gap cost exactly that.
         """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
-        import base64
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         # The pin's bearer is refused; the one that arrived is not.
         chain = _RecordingChain(
             lambda req: (b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"
@@ -3726,7 +4357,6 @@ class TestChainRediscovery:
                              pin_token_provider=lambda: "PINTOKEN",
                              rediscover_chain=True)
             proxy.start()
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             got = b""
             try:
@@ -3739,8 +4369,7 @@ class TestChainRediscovery:
                     b"POST https://api.anthropic.com/v1/environments/env_1"
                     b"/bridge/reconnect HTTP/1.1\r\nHost: api.anthropic.com\r\n"
                     b"Authorization: Bearer ACTIVE\r\n"
-                    + f"Content-Length: {len(rbody)}\r\n".encode()
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                    + f"Content-Length: {len(rbody)}\r\n\r\n".encode()
                     + rbody)
                 c.settimeout(10)
                 while b"\r\n\r\n" not in got:
@@ -3811,10 +4440,7 @@ class TestChainRediscovery:
         WHOLE request on the client's bearer whenever the origin has a bad
         minute — a 500 is the origin's own answer and belongs to it.
         """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
-        import base64
-
-        secret = ensure_proxy_secret(certdir)
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         def ask(code):
             chain = _RecordingChain(
@@ -3829,15 +4455,13 @@ class TestChainRediscovery:
                                  pin_token_provider=lambda: "PINTOKEN",
                                  rediscover_chain=True)
                 proxy.start()
-                cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
                 c = socket.create_connection(("127.0.0.1", proxy.port),
                                              timeout=10)
                 try:
                     c.sendall(
                         b"POST https://api.anthropic.com/v1/environments/bridge"
                         b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-                        b"Authorization: Bearer ACTIVE\r\n"
-                        + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                        b"Authorization: Bearer ACTIVE\r\n\r\n")
                     c.settimeout(10)
                     try:
                         c.recv(256)
@@ -3872,10 +4496,8 @@ class TestChainRediscovery:
         The bodyless cases next door pass either way, which is exactly why
         this one exists.
         """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
-        import base64
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         chain = _RecordingChain(
             lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
         seen = chain.seen
@@ -3887,7 +4509,6 @@ class TestChainRediscovery:
                              pin_token_provider=lambda: "PINTOKEN",
                              rediscover_chain=True)
             proxy.start()
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
             payload = b'{"machine_name":"m","max_sessions":32}'
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             got = b""
@@ -3896,8 +4517,7 @@ class TestChainRediscovery:
                     b"POST https://api.anthropic.com/v1/environments/bridge"
                     b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
                     b"Authorization: Bearer ACTIVE\r\n"
-                    + f"Content-Length: {len(payload)}\r\n".encode()
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode()
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode()
                     + payload)
                 c.settimeout(10)
                 while b"\r\n\r\n" not in got:
@@ -3929,10 +4549,8 @@ class TestChainRediscovery:
         token onto a bare TCP socket. The MITM path cannot do this — it always
         wraps the upstream — so the exposure would have been this path's alone.
         """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, write_upstream_hint
-        import base64
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
 
-        secret = ensure_proxy_secret(certdir)
         chain = _RecordingChain(
             lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
         seen = chain.seen
@@ -3944,14 +4562,12 @@ class TestChainRediscovery:
                              pin_token_provider=lambda: "PINTOKEN",
                              rediscover_chain=True)
             proxy.start()
-            cred = base64.b64encode(f"cswap:{secret}".encode()).decode()
             c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             try:
                 c.sendall(
                     b"POST http://api.anthropic.com/v1/environments/bridge"
                     b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-                    b"Authorization: Bearer ACTIVE\r\n"
-                    + f"Proxy-Authorization: Basic {cred}\r\n\r\n".encode())
+                    b"Authorization: Bearer ACTIVE\r\n\r\n")
                 c.settimeout(10)
                 try:
                     c.recv(256)
@@ -4039,6 +4655,493 @@ class TestChainRediscovery:
         hops = pp._chain_hops(certdir)
         assert [h.address for h in hops] == [("127.0.0.1", dead)], hops
 
+    def case_a_hop_that_answers_4xx_is_asked_once_and_leaves_no_disk_record(
+        self, certdir
+    ):
+        """MEASURED (sandbox privoxy 4.2.0, the owner's own config): no
+        request form `_probe_next_hop` could send is both quiet on privoxy's
+        own log and answered by the local cache proxy, which matches
+        origin-form ``GET /health`` only — origin-form, absolute-form and
+        ``OPTIONS *`` each trip privoxy's own "isn't configured to accept
+        intercepted requests" error, logged as THAT proxy's error, not ours
+        to keep causing. A hop that answers with a real HTTP response
+        carrying a 4xx status is exactly this shape — something is there,
+        but it is not a /health server — so once known it must not be probed
+        again.
+
+        THE MEMO IS PROCESS-LOCAL, NOT ON DISK. The owner withdrew the
+        earlier disk-persisted record for the shape of bug it was: it never
+        expired, so one 400 poisoned an address for good, including after a
+        real /health server took that port. `_ASKED_NOHEALTH` (see
+        `_probe_next_hop`) carries the same "don't ask again" behaviour for
+        exactly as long as this process runs, and `write_upstream_hint`'s
+        own record carries nothing about it forward."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        handled = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                handled.append(1)
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = b"Error: invalid request"
+                    c.sendall(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        address = f"127.0.0.1:{srv.getsockname()[1]}"
+        try:
+            url = f"http://{address}"
+            # A baseline record on disk, written BEFORE either probe, so the
+            # read below sees only what the probes themselves did to it —
+            # not what a later re-stamp would carry regardless of the probe.
+            pp.write_upstream_hint(certdir, "http://127.0.0.1:1")
+            nxt = pp._probe_next_hop(url)
+            assert nxt is None
+            assert handled == [1], handled
+
+            # A second probe of the same address: the process-local memo
+            # must return None without opening a socket at all.
+            nxt2 = pp._probe_next_hop(url)
+            assert nxt2 is None
+            assert handled == [1], (
+                "a hop already known to answer 4xx was asked again")
+
+            # And nothing about it reached disk. Read the file directly, with
+            # no intervening `write_upstream_hint` call — that function only
+            # ever emits proxy/ca/next and would erase a `nohealth` key even
+            # if the probe had written one, so a re-stamp before this read
+            # would pass whatever the probe did.
+            raw = json.loads((certdir / pp._UPSTREAM_FILE).read_text())
+            # THE SCHEMA ALONE MISSES A REGRESSION THAT RECORDS THE 4xx HOP
+            # INTO AN EXISTING KEY (`proxy`, `ca`, or `next`) rather than a
+            # new one, so the values are pinned to the untouched baseline
+            # too, not just the key set.
+            assert raw == {"proxy": "http://127.0.0.1:1", "ca": "", "next": ""}, raw
+        finally:
+            pp._ASKED_NOHEALTH.discard(address)
+            srv.close()
+
+    def case_a_hop_that_answers_5xx_is_still_reprobed(self):
+        """The process-local memo (see `_probe_next_hop`) is scoped to 4xx
+        (privoxy's own answer, and the measured shape of "this isn't a
+        /health server"). A 5xx is a genuine /health server having a bad
+        moment — restarting, its own upstream down — and must still be
+        asked once it recovers, not poisoned for good on one bad tick."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        handled = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                handled.append(1)
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = b"Internal Server Error"
+                    c.sendall(
+                        b"HTTP/1.1 500 Internal Server Error\r\n"
+                        b"Content-Type: text/plain\r\nContent-Length: "
+                        + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        address = f"127.0.0.1:{srv.getsockname()[1]}"
+        try:
+            url = f"http://{address}"
+            nxt = pp._probe_next_hop(url)
+            assert nxt is None
+            assert handled == [1], handled
+            assert address not in pp._ASKED_NOHEALTH, (
+                "a 5xx was memoized as 4xx, poisoning a hop that is merely "
+                "having a bad moment")
+
+            # a second probe, same address: still asked, unlike the 4xx case.
+            nxt2 = pp._probe_next_hop(url)
+            assert nxt2 is None
+            assert handled == [1, 1], (
+                "a 5xx hop was not reprobed on the second call")
+        finally:
+            srv.close()
+
+    def case_a_dead_hop_records_nothing_and_is_reprobed_once_it_answers(self):
+        """A CCF that is merely DOWN must still be asked when it comes back —
+        only a hop that positively answered something other than 200 is
+        remembered. Same address, dead first, then serving: nothing about the
+        earlier failure should have excluded it from being asked again."""
+        import cswap_pin.proxy as pp
+
+        dead = self._dead_port()
+        nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}")
+        assert nxt is None
+        assert f"127.0.0.1:{dead}" not in pp._ASKED_NOHEALTH, (
+            "a hop that never answered was memoized as 4xx")
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", dead))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://127.0.0.1:8118"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}")
+            assert nxt == "http://127.0.0.1:8118", (
+                "the earlier failure to answer at all must not have "
+                "excluded this address")
+        finally:
+            srv.close()
+
+    def case_a_hop_that_is_the_launchs_own_proxy_is_never_asked(self, certdir):
+        """A forward proxy answers a path-only request line with an error BY
+        DEFINITION, and writes that error into its own log — somebody else's
+        log, when that proxy is a machine's shared egress. Asking is only
+        useful when something wired this launch OVER the hop; when the hop
+        IS the launch's own proxy, nothing was wired over it, so the probe
+        can only cause the error, never learn anything from it.
+
+        The discriminator is connections accepted, not the return value: the
+        old code also returns None for a hop that never answers, so a bare
+        `is None` on the result would pass unchanged."""
+        import cswap_pin.proxy as pp
+
+        def health_server(next_hop):
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            accepted = []
+
+            def serve():
+                while True:
+                    try:
+                        c, _ = srv.accept()
+                    except OSError:
+                        return
+                    accepted.append(1)
+                    try:
+                        buf = b""
+                        while b"\r\n\r\n" not in buf:
+                            d = c.recv(4096)
+                            if not d:
+                                break
+                            buf += d
+                        body = json.dumps(
+                            {"status": "ok", "https_proxy": next_hop}
+                        ).encode()
+                        c.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            b"Content-Length: " + str(len(body)).encode()
+                            + b"\r\n\r\n" + body
+                        )
+                    except OSError:
+                        pass
+                    finally:
+                        c.close()
+
+            threading.Thread(target=serve, daemon=True).start()
+            return srv, accepted
+
+        ambient_srv, ambient_accepted = health_server("http://127.0.0.1:1")
+        other_srv, other_accepted = health_server("http://127.0.0.1:2")
+        try:
+            ambient_url = f"http://127.0.0.1:{ambient_srv.getsockname()[1]}"
+            other_url = f"http://127.0.0.1:{other_srv.getsockname()[1]}"
+
+            # The hop asked IS the launch's own ambient proxy: nothing wired
+            # this launch over it, so it is never even connected to.
+            nxt = pp._probe_next_hop(ambient_url, own_proxy=ambient_url)
+            time.sleep(0.2)
+            assert nxt is None
+            assert ambient_accepted == [], (
+                "the launch's own proxy was asked for /health anyway"
+            )
+
+            # Positive control: a hop that is NOT the ambient proxy is still
+            # asked, exactly once, and its answer still comes back. No sleep
+            # needed here: `_probe_next_hop` only returns after the response
+            # has already been read, so the accept is already recorded.
+            nxt = pp._probe_next_hop(other_url, own_proxy=ambient_url)
+            assert nxt == "http://127.0.0.1:2"
+            assert other_accepted == [1], other_accepted
+        finally:
+            ambient_srv.close()
+            other_srv.close()
+
+    def case_ensure_proxy_never_probes_the_shells_own_exported_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        """The call site, not the comparison in isolation. When this
+        launch's own shell exports HTTPS_PROXY directly at a hop — an
+        ordinary shell, or an ssh shell, whose only proxy is the
+        machine-wide egress the launcher itself chains to — `ensure_proxy`
+        resolves that hop as `ambient` unchanged (nothing recorded yet to
+        prefer instead), so it must never connect to it for `/health`
+        either: a fresh launch is a fresh process, and `_ASKED_NOHEALTH`
+        cannot amortise a probe it would only ever make once."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        accepted = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                accepted.append(1)
+                c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            exported = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            monkeypatch.setenv("HTTPS_PROXY", exported)
+            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
+            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
+            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
+            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
+            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
+            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
+            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+
+            class _SW:
+                backup_dir = tmp_path
+
+                def resolve_account(self, email):
+                    return "1", email, None
+
+            got = pp.ensure_proxy(_SW())
+            time.sleep(0.2)
+            assert got == (41000, tmp_path / "pin-proxy" / "ca.pem")
+            assert accepted == [], (
+                "ensure_proxy asked its own shell's exported proxy for "
+                "/health"
+            )
+        finally:
+            srv.close()
+
+    def case_learn_next_hop_still_probes_when_the_daemons_own_proxy_matches(
+        self, certdir, monkeypatch
+    ):
+        """THE LAUNCHER-WITH-CACHE-PROXY CONFIGURATION: a daemon spawned with
+        HTTPS_PROXY=<the very address it records as its chain> (a launcher
+        that starts a per-session cache proxy and exports it directly) is the
+        configuration `learn_next_hop`'s own docstring cites the 2026-08-04
+        upstream.json for -- 9901 chaining to 8118 is the MEASURED half.
+        BY CONSTRUCTION, not measured, is the rest: `_shell_proxy()` reads
+        back whatever HTTPS_PROXY this process inherited, so a daemon started
+        with it equal to `recorded` would have an `own_proxy` guard passed at
+        this call site refuse the probe that matters. `ensure_proxy` still
+        passes `own_proxy` (see the previous two cases); `learn_next_hop`
+        does not, and this is the case that needs it not to."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://127.0.0.1:8118"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            recorded = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            # The daemon's own environment inherits the same address it
+            # recorded as its chain -- constructed, not the measured half
+            # (see the case docstring: only the 9901->8118 chain is measured).
+            monkeypatch.setenv("HTTPS_PROXY", recorded)
+            pp.write_upstream_hint(certdir, recorded)
+
+            proxy = pp.PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: None,
+                upstream=("127.0.0.1", 1),
+                rediscover_chain=True,
+            )
+            proxy.port = 36301
+            proxy.learn_next_hop()
+            assert pp._read_upstream(certdir, "next") == (
+                "http://127.0.0.1:8118"
+            ), (
+                "the daemon's own inherited proxy matching the hop it "
+                "records blocked the probe that learns the chain behind it"
+            )
+        finally:
+            srv.close()
+
+    def case_ensure_proxy_still_probes_a_preferred_inner_hop(
+        self, tmp_path, monkeypatch
+    ):
+        """Positive control for the previous case. An ordinary shell only
+        ever sees the outer egress proxy — but when a DIFFERENT, already
+        recorded inner hop is still serving, `_ambient_proxy` prefers it
+        over that shell value, and the two addresses now differ: this hop
+        is still probed."""
+        import cswap_pin.proxy as pp
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        # `_ambient_proxy`'s own preference check opens a bare liveness
+        # connection to this hop (no HTTP request) before `_probe_next_hop`
+        # makes the real `/health` request — so the discriminator here is a
+        # RESPONSE actually sent, not merely a connection accepted.
+        served = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        buf += d
+                    if not buf:
+                        continue
+                    body = json.dumps(
+                        {"status": "ok", "https_proxy": "http://192.0.2.1:3128"}
+                    ).encode()
+                    c.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body
+                    )
+                    served.append(1)
+                except OSError:
+                    pass
+                finally:
+                    c.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            inner = f"http://127.0.0.1:{srv.getsockname()[1]}"
+            certdir = tmp_path / "pin-proxy"
+            certdir.mkdir(parents=True, exist_ok=True)
+            # A previous launch already recorded this inner hop.
+            pp.write_upstream_hint(certdir, inner)
+            # This shell only has the outer egress proxy — a reserved,
+            # documentation-only address (RFC 5737), never dialed here.
+            monkeypatch.setenv("HTTPS_PROXY", "http://192.0.2.1:3128")
+            monkeypatch.setattr(pp, "load_pin", lambda _bd: ("a@b.c", ""))
+            monkeypatch.setattr(pp, "_carry_history_pointers", lambda _cd: None)
+            monkeypatch.setattr(pp, "daemon_fingerprint", lambda *_a: "FP")
+            monkeypatch.setattr(pp, "ensure_ca", lambda *_a: None)
+            monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
+            monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
+            monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+
+            class _SW:
+                backup_dir = tmp_path
+
+                def resolve_account(self, email):
+                    return "1", email, None
+
+            got = pp.ensure_proxy(_SW())
+            time.sleep(0.2)
+            assert got == (41000, certdir / "ca.pem")
+            assert served == [1], (
+                "the preferred inner hop, distinct from the shell's own "
+                "export, was never asked"
+            )
+            assert pp._chain_hops(certdir)[-1].address == ("192.0.2.1", 3128)
+        finally:
+            srv.close()
 
 
 
@@ -4096,43 +5199,6 @@ class TestAbsoluteFormPassthrough:
         finally:
             proxy.stop()
             srv.close()
-
-    def case_an_unauthorized_caller_is_refused_before_its_body_is_read(
-        self, certdir
-    ):
-        """The credential gate must not wait on bytes the client may never send.
-
-        `_read_body` trusts the client's `Content-Length` and loops until it
-        has that many bytes. Reading it AHEAD of the gate lets an
-        unauthenticated caller hold a thread and an unbounded buffer by
-        announcing a body and sending none — no credential required, which is
-        the one thing this gate exists to require.
-        """
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret
-
-        ensure_proxy_secret(certdir)  # arm the gate; without it the proxy is open
-        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
-        proxy.start()
-        try:
-            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
-            try:
-                c.sendall(
-                    b"POST https://api.anthropic.com/v1/messages HTTP/1.1\r\n"
-                    b"Host: api.anthropic.com\r\n"
-                    b"Content-Length: 100000000\r\n\r\n" + b"x" * 10)
-                c.settimeout(5)
-                try:
-                    got = c.recv(200)
-                except (socket.timeout, TimeoutError, OSError):
-                    got = b""
-            finally:
-                c.close()
-            assert got.startswith(b"HTTP/1.1 407"), (
-                f"got {got[:40]!r}: the credential check waited on a body the "
-                "client never sent, so an unauthenticated caller can hold a "
-                "thread and an unbounded buffer")
-        finally:
-            proxy.stop()
 
 
 class TestHealthEndpoint:
@@ -4485,6 +5551,53 @@ class TestHealthEndpoint:
             )
         finally:
             proxy.stop()
+
+    def case_health_names_its_own_pid_not_the_holders(self, certdir):
+        """`pid` is THIS process's own os.getpid(), the one number
+        comparable against proxy.json's `pid` (the daemon's own, self-
+        written at start) -- `holder_pid` above answers a different
+        question and stays constant across every generation one
+        long-lived holder spawns in turn, so it cannot say whether THIS
+        answer came from the generation proxy.json currently calls live."""
+        import json as _json
+        import os as _os
+
+        from cswap_pin.proxy import PinProxy
+
+        def _payload(proxy):
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            try:
+                raw.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                raw.settimeout(5)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                body = resp.split(b"\r\n\r\n", 1)[1]
+                try:
+                    body += raw.recv(4096)
+                except OSError:
+                    pass
+            finally:
+                raw.close()
+            return _json.loads(body.decode() or "{}")
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+        )
+        proxy.start()
+        try:
+            got = _payload(proxy)["pid"]
+        finally:
+            proxy.stop()
+        assert got == _os.getpid(), (
+            f"/health named pid {got!r}, expected this process's own "
+            f"{_os.getpid()}"
+        )
 
     def case_a_hop_that_self_heals_leaves_a_record(self, certdir):
         """A fall-through to a LATER hop, in a tense a later probe can read.
@@ -8710,6 +9823,106 @@ class TestDrainReportsWhatItCut:
             pp._log_lifecycle = real_log
             pp._pin_daemon_pids = real_pids
 
+    def case_a_deaf_verdict_inside_a_refusal_window_is_blind_not_a_mark(
+            self, monkeypatch):
+        """A bridge's post is stamped the moment the request LINE arrives,
+        before the pin dials upstream. During an egress refusal the pin
+        answers 503 without ever posting to claude.ai, so a post stamped
+        inside that window may never have reached the server at all -- a
+        DEAF verdict taken from it is unproven and must read BLIND, not
+        the ordinary MARK.
+
+        Measured on an egress outage: `_report_deaf_bridges` fired MARK
+        four times across a 76-minute refusal on the same pin process and
+        cleared the moment the chain returned, with no restart in between
+        -- the bridges were never deaf, their posts just never landed.
+
+        Once the refusal window passes and the deaf set is unchanged, the
+        MARK must return -- the BLIND must not dedupe-silence it forever,
+        same shape as the draining-BLIND case above.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._egress_refused = False
+            srv._egress_refused_last = None
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1000.0)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_MAYBE/worker/messages")
+            srv._connected_bridges = {"cse_MAYBE"}
+            srv._note_egress_refused()
+
+            # (a) INSIDE THE WINDOW: BLIND, not MARK.
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1010.0)
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_BLIND in lines[-1], (
+                "a deaf verdict inside a refusal window was not BLIND: "
+                + repr(lines))
+            assert pp.DEAF_REPORT_MARK not in lines[-1], lines[-1]
+            assert "cse_MAYBE" in lines[-1], lines[-1]
+
+            # (b) PAST THE WINDOW, the bridge still posting (egress healthy
+            # again) and still no stream: the MARK must return, not stay
+            # dedupe-silenced by the BLIND above.
+            past_window = 1010.0 + pp._DEAF_WINDOW_S + 1.0
+            monkeypatch.setattr(pp.time, "monotonic", lambda: past_window)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_MAYBE/worker/messages")
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) > before, (
+                "the refusal-BLIND latched permanently -- no MARK ever "
+                "followed for a bridge that is genuinely still deaf")
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+
+            # THE ORDINARY DEDUPE STILL APPLIES once the MARK itself stands.
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) == before, (
+                "an unchanged MARK was re-logged; the refusal-window fix "
+                "must not defeat the dedupe generally")
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_CONTROL_no_refusal_ever_marks_exactly_as_before(self):
+        """No refusal recorded at all: the same deaf set must MARK exactly
+        as before this change -- the control that proves the refusal check
+        does not swallow every verdict."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_PLAIN/worker/messages")
+            srv._connected_bridges = {"cse_PLAIN"}
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], (
+                "with no refusal ever recorded, an ordinary deaf bridge "
+                f"must still MARK: {lines!r}")
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
         """Nothing recorded whether a claude.ai attachment ever downloaded.
 
@@ -12039,351 +13252,6 @@ class TestTheRequestPathNeverOpensTheTraceFile:
             "into the relay")
 
 
-class TestProxyRequiresACredential:
-    """The daemon listens on unauthenticated loopback and swaps the bearer of
-    any request matching a pinned route. Loopback carries no identity — the
-    kernel does not check uid on a TCP connect — so without a credential ANY
-    local process can CONNECT with a junk bearer and get one minted from the
-    pinned account. cswap keeps that credential at 0700/0600 precisely so it
-    cannot be read; the proxy was handing out its effect to anyone who asked.
-    """
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
-
-    def _proxy(self, certdir, provider=lambda: "PINNED-TOKEN"):
-        from cswap_pin.proxy import PinProxy
-        return PinProxy(certdir=certdir, pin_token_provider=provider,
-                        upstream=("127.0.0.1", 1))
-
-    def _connect(self, port, cred=None, target="api.anthropic.com:443"):
-        """Send one CONNECT and return the status line."""
-        import base64, socket as _s
-        c = _s.create_connection(("127.0.0.1", port), timeout=10)
-        req = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
-        if cred is not None:
-            blob = base64.b64encode(f"cswap:{cred}".encode()).decode()
-            req += f"Proxy-Authorization: Basic {blob}\r\n"
-        req += "\r\n"
-        c.sendall(req.encode())
-        c.settimeout(5)
-        try:
-            data = c.recv(256)
-        except OSError:
-            data = b""
-        c.close()
-        return data.decode("latin1", "replace").split("\r\n")[0]
-
-    def case_an_unauthenticated_connect_is_served_but_never_pinned(self, certdir):
-        """The property is "no credential, no bearer" — NOT "no credential, no
-        service".
-
-        Refusing the connection protected the bearer, but it also made turning
-        the pin ON destructive: HTTPS_PROXY is fixed at exec, so every session
-        that started before the credential existed got 407 and only a relaunch
-        fixed it (measured: 313 processes, including the one that ran the
-        command). Serving unauthorized callers UNPINNED protects the same asset
-        — they are simply not acted for — while a running session keeps working
-        through a pin being turned on or off.
-        """
-        from cswap_pin.proxy import ensure_proxy_secret, _proxy_authorized
-        ensure_proxy_secret(certdir)
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            assert "407" not in self._connect(p.port), (
-                "an unauthorized caller was cut off — turning the pin on kills "
-                "every session that predates the credential"
-            )
-        finally:
-            p.stop()
-        # and the bearer is still withheld from it
-        secret = ensure_proxy_secret(certdir)
-        assert _proxy_authorized([], secret) is False
-        assert _proxy_authorized(
-            [("Proxy-Authorization", "Basic " + __import__("base64")
-              .b64encode(f"cswap:{secret}".encode()).decode())], secret) is True
-
-    def case_a_wrong_credential_is_served_but_never_pinned(self, certdir):
-        from cswap_pin.proxy import ensure_proxy_secret, _proxy_authorized
-        secret = ensure_proxy_secret(certdir)
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            assert "407" not in self._connect(p.port, cred="not-the-secret")
-        finally:
-            p.stop()
-        import base64
-        wrong = base64.b64encode(b"cswap:not-the-secret").decode()
-        assert _proxy_authorized(
-            [("Proxy-Authorization", f"Basic {wrong}")], secret) is False
-
-    def case_the_real_credential_is_accepted(self, certdir):
-        """The credential must not lock out the sessions it is meant to serve.
-
-        Getting past the gate means the CONNECT proceeds to the MITM, whose
-        upstream is port 1 and therefore fails — a closed connection with no
-        407 is the pass condition here.
-        """
-        from cswap_pin.proxy import ensure_proxy_secret
-        secret = ensure_proxy_secret(certdir)
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            assert "407" not in self._connect(p.port, cred=secret)
-        finally:
-            p.stop()
-
-    def case_a_blind_tunnel_is_not_gated(self, certdir):
-        """It used to be, on "otherwise we are an open forward proxy". That
-        assumes the port is reachable; it binds 127.0.0.1 only, so the
-        population it could refuse is the same-user processes that can read
-        the 0600 secret anyway.
-
-        What it cost is the reason it is gone. EVERY host that is not
-        api.anthropic.com takes this branch — git, pip, npm, the auto-updater
-        — so with the pin on, a session wired before the credential existed
-        got 200 for Claude and 407 for the entire rest of the internet.
-        Measured on host-a: github.com, pypi.org and registry.npmjs.org all
-        407 while api.anthropic.com was 200. That reads as "the network
-        broke", and it broke this project's own `git push`.
-        """
-        from cswap_pin.proxy import ensure_proxy_secret
-        ensure_proxy_secret(certdir)
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            assert "407" not in self._connect(p.port, target="example.com:443"), (
-                "turning the pin on severed general internet for live sessions"
-            )
-        finally:
-            p.stop()
-
-    def case_absolute_form_also_needs_the_credential(self, certdir):
-        """The plain-proxy path must not be a way around the CONNECT gate."""
-        import socket as _s
-        from cswap_pin.proxy import ensure_proxy_secret
-        ensure_proxy_secret(certdir)
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
-            c.sendall(b"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n")
-            c.settimeout(5)
-            try:
-                data = c.recv(256)
-            except OSError:
-                data = b""
-            c.close()
-            assert "407" in data.decode("latin1", "replace")
-        finally:
-            p.stop()
-
-    def case_health_stays_open(self, certdir):
-        """The statusline and cc-update probe /health with no credential.
-
-        Gating it would make a working pin read as a dead one on every
-        machine, which is the failure the liveness work just finished fixing.
-        """
-        import json as _json, socket as _s
-        from cswap_pin.proxy import ensure_proxy_secret
-        ensure_proxy_secret(certdir)
-        p = self._proxy(certdir)
-        p.start()
-        try:
-            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
-            c.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                d = c.recv(4096)
-                if not d:
-                    break
-                buf += d
-            body = buf.partition(b"\r\n\r\n")[2]
-            while not body.endswith(b"}"):
-                d = c.recv(4096)
-                if not d:
-                    break
-                body += d
-            c.close()
-            assert _json.loads(body)["pin_proxy"] is True
-        finally:
-            p.stop()
-
-    def case_a_daemon_without_a_secret_still_serves(self, certdir):
-        """A pin that starts refusing traffic after an upgrade is worse than
-        the exposure it closes. No secret on disk => no auth required."""
-        p = self._proxy(certdir)  # nothing minted
-        p.start()
-        try:
-            assert "407" not in self._connect(p.port)
-        finally:
-            p.stop()
-
-    def case_the_secret_is_not_world_readable(self, certdir):
-        import stat
-        from cswap_pin.proxy import ensure_proxy_secret, proxy_secret_path
-        ensure_proxy_secret(certdir)
-        mode = proxy_secret_path(certdir).stat().st_mode
-        assert not (mode & (stat.S_IRGRP | stat.S_IROTH)), (
-            "the credential is readable by other users — it protects nothing"
-        )
-
-    def case_the_secret_is_stable_across_respawns(self, certdir):
-        """A new secret each spawn would strand every live session: their
-        HTTPS_PROXY is fixed at exec time and would carry the old one."""
-        from cswap_pin.proxy import ensure_proxy_secret
-        assert ensure_proxy_secret(certdir) == ensure_proxy_secret(certdir)
-
-    def case_the_wiring_hands_clients_the_credential(self, certdir):
-        """Measured: the real Claude Code client sends Proxy-Authorization on
-        CONNECT only when HTTPS_PROXY carries user:pass. If the wiring does
-        not embed it, enforcing auth cuts off every session."""
-        from cswap_pin.proxy import ensure_proxy_secret, wire_env
-        secret = ensure_proxy_secret(certdir)
-        env = wire_env({}, 9955, certdir / "ca.pem", open_refcount=False)
-        assert secret in env["HTTPS_PROXY"]
-        assert "@127.0.0.1:9955" in env["HTTPS_PROXY"]
-
-    def case_the_credential_is_not_forwarded_upstream(self, certdir):
-        """It authenticates to THIS proxy and stops here (hop-by-hop).
-
-        The absolute-form path relays client headers verbatim to the chain, so
-        without stripping it we would hand CCF or a corporate proxy a working
-        credential for the pinned account's proxy.
-        """
-        import socket as _s, base64, threading
-        from cswap_pin.proxy import ensure_proxy_secret
-        secret = ensure_proxy_secret(certdir)
-        seen = []
-        srv = _s.socket()
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(1)
-        chain_port = srv.getsockname()[1]
-
-        def accept():
-            c, _ = srv.accept()
-            buf = b""
-            try:
-                while b"\r\n\r\n" not in buf:
-                    d = c.recv(4096)
-                    if not d:
-                        break
-                    buf += d
-            except OSError:
-                pass
-            seen.append(buf.decode("latin1", "replace"))
-            try:
-                c.close()
-            except OSError:
-                pass
-
-        t = threading.Thread(target=accept, daemon=True)
-        t.start()
-        p = self._proxy(certdir)
-        p._chain = ("127.0.0.1", chain_port)
-        p._rediscover_chain = False
-        p.start()
-        try:
-            c = _s.create_connection(("127.0.0.1", p.port), timeout=10)
-            blob = base64.b64encode(f"cswap:{secret}".encode()).decode()
-            c.sendall(
-                f"GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n"
-                f"Proxy-Authorization: Basic {blob}\r\n\r\n".encode()
-            )
-            t.join(timeout=5)
-            c.close()
-        finally:
-            p.stop()
-            srv.close()
-        assert seen, "the relay never reached the chain"
-        # Match on the header, not on the raw secret: it travels base64-encoded,
-        # so `secret not in text` passes even when the credential IS forwarded.
-        # (Measured — that assertion alone did not fail when the strip was
-        # removed, and the chain had received the full Proxy-Authorization.)
-        assert "proxy-authorization" not in seen[0].lower(), (
-            "leaked our proxy credential to the chain"
-        )
-        assert base64.b64encode(f"cswap:{secret}".encode()).decode() not in seen[0]
-
-    def case_a_secret_written_under_a_running_daemon_takes_effect(self, certdir):
-        """The gate must arm when the secret is WRITTEN, not on a later respawn.
-
-        Measured by the cswap owner on linux, which is why this test exists:
-            07:04:19  daemon 3123508 respawned (no secret yet)
-            07:04:27  cswap pin -> proxy.secret written, .claude.json rewired
-                      daemon pid after the pin: 3123508 — THE SAME ONE
-            raw CONNECT, no credential, after the pin: 200 Connection Established
-        `cswap pin` goes through ensure_proxy, which reuses a live daemon with
-        a matching fingerprint. Caching the secret at construction meant the
-        running daemon held None and kept serving unauthenticated, so the gate
-        actually armed on the NEXT respawn — a fingerprint recycle, a deploy,
-        an idle teardown — with nothing a human would connect to the 407s.
-
-        The observable changed since: arming no longer 407s an unauthorized
-        caller, it serves it unpinned. So this asserts what the daemon READS.
-        The per-connection re-read is the property; the refusal was only ever
-        how we could see it.
-        """
-        from cswap_pin.proxy import ensure_proxy_secret
-        p = self._proxy(certdir)
-        p.start()                      # constructed with NO secret on disk
-        try:
-            assert p._current_secret() is None
-            secret = ensure_proxy_secret(certdir)   # `cswap pin`, same daemon
-            assert p._current_secret() == secret, (
-                "the running daemon ignored the new secret — it would only "
-                "arm on some later respawn"
-            )
-            assert "407" not in self._connect(p.port, cred=secret)
-        finally:
-            p.stop()
-
-    def case_a_respawn_does_not_arm_the_gate(self, certdir, monkeypatch):
-        """The upgrade must not cut off sessions wired before it.
-
-        A live session's HTTPS_PROXY is fixed at exec time, so one started
-        before this change carries a URL with no credential. If a daemon
-        respawn (a fingerprint recycle, a deploy) minted the secret, every such
-        session would start getting 407 on its next request. Measured on linux
-        before landing this: .claude.json wired "http://127.0.0.1:36301" with
-        no userinfo and pid 142172 live on it.
-
-        Only apply_pin — the path that also REWRITES the wiring — may mint it,
-        so the gate and the URL that satisfies it arrive together.
-        """
-        import cswap_pin.proxy as pp
-        from cswap_pin.proxy import proxy_secret_path
-        monkeypatch.setattr(pp, "PinProxy", lambda **kw: (_ for _ in ()).throw(
-            _StopDaemon()))
-        try:
-            pp.daemon_main("1", "a@b.c", certdir)
-        except _StopDaemon:
-            pass
-        except Exception:
-            pass
-        assert not proxy_secret_path(certdir).exists(), (
-            "a respawn minted the credential — every live session would 407"
-        )
-
-    def case_apply_pin_mints_the_credential(self, certdir, monkeypatch):
-        """...and the path that rewrites the wiring DOES arm it."""
-        import cswap_pin.proxy as pp
-        from cswap_pin.proxy import apply_pin, proxy_secret_path
-
-        class _Sw:
-            backup_dir = certdir.parent
-
-        monkeypatch.setattr(pp, "save_pin", lambda *a, **k: None)
-        monkeypatch.setattr(pp, "ensure_proxy", lambda sw: None)
-        apply_pin(_Sw(), "a@b.c", "org")
-        assert proxy_secret_path(certdir.parent / "pin-proxy").exists()
-
-
-class _StopDaemon(Exception):
-    """Cuts daemon_main off once it is past the point under test."""
-
-
 class TestTogglingThePinMidSessionActuallyWorks:
     """THE requirement, both halves: no restart, and the pin APPLIES.
 
@@ -12408,7 +13276,7 @@ class TestTogglingThePinMidSessionActuallyWorks:
     def case_rc_swaps_and_inference_does_not_for_an_uncredentialed_session(
         self, certdir
     ):
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret
+        from cswap_pin.proxy import PinProxy
 
         upstream = _FakeUpstream(certdir)
         proxy = PinProxy(
@@ -12418,9 +13286,6 @@ class TestTogglingThePinMidSessionActuallyWorks:
         )
         proxy.start()
         try:
-            # `cswap pin 1` mints the secret under a session that has none.
-            ensure_proxy_secret(certdir)
-
             assert _request_through_proxy(
                 proxy.port, certdir / "ca.pem",
                 "/v1/code/sessions", bearer="disk-token",
@@ -12443,7 +13308,7 @@ class TestTogglingThePinMidSessionActuallyWorks:
             upstream.stop()
 
     def case_clearing_returns_rc_to_the_active_account(self, certdir):
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, proxy_secret_path
+        from cswap_pin.proxy import PinProxy
 
         upstream = _FakeUpstream(certdir)
         token = {"v": "PIN-TOKEN"}
@@ -12454,14 +13319,12 @@ class TestTogglingThePinMidSessionActuallyWorks:
         )
         proxy.start()
         try:
-            ensure_proxy_secret(certdir)
             _request_through_proxy(proxy.port, certdir / "ca.pem",
                                    "/v1/code/sessions", bearer="disk-token")
             assert upstream.seen_auth == "Bearer PIN-TOKEN"
 
             # `cswap pin --clear`: the record goes, so the provider yields
             # nothing and the route falls back to the request's own bearer.
-            proxy_secret_path(certdir).unlink()
             token["v"] = None
             assert _request_through_proxy(
                 proxy.port, certdir / "ca.pem",
@@ -12470,44 +13333,6 @@ class TestTogglingThePinMidSessionActuallyWorks:
             assert upstream.seen_auth == "Bearer disk-token", (
                 "clearing the pin left RC on the pinned account"
             )
-        finally:
-            proxy.stop()
-            upstream.stop()
-
-    def case_no_407_in_either_direction(self, certdir):
-        """The 407 itself, asserted directly: a raw CONNECT with no credential
-        must succeed before AND after arming."""
-        import base64
-        import socket as _s
-
-        from cswap_pin.proxy import PinProxy, ensure_proxy_secret, proxy_secret_path
-
-        upstream = _FakeUpstream(certdir)
-        proxy = PinProxy(
-            certdir=certdir,
-            pin_token_provider=lambda: "PIN-TOKEN",
-            upstream=("127.0.0.1", upstream.port),
-        )
-        proxy.start()
-
-        def raw_connect():
-            c = _s.create_connection(("127.0.0.1", proxy.port), timeout=5)
-            c.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
-                      b"Host: api.anthropic.com:443\r\n\r\n")
-            c.settimeout(5)
-            try:
-                line = c.recv(128).decode("latin1", "replace").split("\r\n")[0]
-            except OSError:
-                line = "(closed)"
-            c.close()
-            return line
-
-        try:
-            assert "407" not in raw_connect()
-            ensure_proxy_secret(certdir)
-            assert "407" not in raw_connect(), "arming the pin 407'd a live session"
-            proxy_secret_path(certdir).unlink()
-            assert "407" not in raw_connect(), "clearing the pin 407'd a live session"
         finally:
             proxy.stop()
             upstream.stop()
@@ -12974,16 +13799,31 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     RETRY_AFTER = b"retry-after: 3600"
     UNIFIED_STATUS = b"anthropic-ratelimit-unified-status: allowed_warning"
     SHOULD_RETRY = b"x-should-retry: true"
+    LIVE = "live-account-token"
+    HEADROOM = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
+    NO_HEADROOM = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}}
 
     @staticmethod
     def _wire(monkeypatch, switched, raises_once=None, needs_login=False,
-              validated=True, before=None):
+              validated=True, before=None, live_token=None, usage=None,
+              snap=None, live_num="1"):
         """Stub claude_swap's switcher so no real account store is touched.
 
         ``validated=None`` omits the key entirely (an older cswap that never
         probed the landing credential, or a probe that never ran). ``before``
         runs at the top of `switch()`, for a case that needs to block or fail
         inside it.
+
+        ``live_token`` is the access token the credential store hands back for
+        the account cswap has ACTIVE; ``None`` (the default every case that
+        predates the bearer test gets) makes the store unreadable, which is
+        also what a real host with a broken store gives. ``usage`` is the
+        live slot's decision-grade usage value — ``None`` for "no reading",
+        a sentinel string, or a window dict. ``snap`` collects each
+        ``usage_entries_by_account`` ``fetch=`` argument. ``live_num`` is what
+        `current_account_number()` answers, or a CALLABLE when a case needs it
+        to change between relays; ``None`` is an UNMANAGED live login, which
+        cswap refuses to evaluate the usage of.
 
         The returned list holds the ``models=`` basis of each `switch()` call,
         so `len(calls)` still counts calls AND a case can assert WHICH windows
@@ -13012,16 +13852,47 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 result["validated"] = validated
             return result
 
+        def _read_credentials():
+            if live_token is None:
+                raise OSError("credential store unreadable")
+            return json.dumps({"claudeAiOauth": {"accessToken": live_token}})
+
+        def _usage_entries_by_account(fetch=None):
+            if snap is not None:
+                snap.append(fetch)
+            # Decoy rows with full headroom: a read that takes any row but
+            # the live slot answers "there is headroom" on a fleet where only
+            # the walled account is live.
+            return {
+                # Without a row here `[None]` raises KeyError into the
+                # helper's own `except` and the unmanaged-login case passes
+                # whatever the code does.
+                None: types.SimpleNamespace(
+                    decision_value=lambda models=(): {
+                        "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
+                "2": types.SimpleNamespace(
+                    decision_value=lambda models=(): {
+                        "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
+                "1": types.SimpleNamespace(
+                    decision_value=lambda models=(): usage),
+            }
+
         fake_module = type("M", (), {
             "ClaudeAccountSwitcher": staticmethod(
-                lambda: types.SimpleNamespace(switch=_switch)),
+                lambda: types.SimpleNamespace(
+                    switch=_switch,
+                    _read_credentials=_read_credentials,
+                    current_account_number=(
+                        live_num if callable(live_num) else lambda: live_num),
+                    usage_entries_by_account=_usage_entries_by_account)),
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
         return calls
 
     @classmethod
-    def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests"):
+    def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests",
+               auth=""):
         import socket as _s
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
@@ -13034,7 +13905,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                      + cls.SHOULD_RETRY + b"\r\nContent-Length: 2\r\n\r\nno")
             up_b.sendall(head)
             up_b.shutdown(_s.SHUT_WR)
-            pp._relay_response(up_a, cl_a, 0, method="POST", path=path)
+            pp._relay_response(up_a, cl_a, 0, method="POST", path=path,
+                               auth=auth)
             cl_a.shutdown(_s.SHUT_WR)
             return cl_b.recv(4096)
         finally:
@@ -13061,13 +13933,23 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.UNIFIED_STATUS not in got, got[:80]
         assert self.SHOULD_RETRY not in got, got[:80]
 
-    def case_no_headroom_anywhere_relays_the_429_untouched(self, monkeypatch):
+    def case_no_headroom_anywhere_relays_the_429_with_rate_limit_headers_stripped(
+        self, monkeypatch,
+    ):
+        """A relayed wall the pin could not convert must not carry a reset
+        the client would sleep the whole window for — nor a header it would
+        render as a false 'resets in ~Ns' into its own transcript.
+        `x-should-retry` is stripped too: a bare `false` would stop the
+        retry this fix depends on, and absent or `true` both fall back to
+        the client's own default retry on a 429, so stripping costs
+        nothing and removes the one case that would regress."""
         calls = self._wire(monkeypatch, switched=False)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER in got, got[:80]
-        assert self.UNIFIED_STATUS in got, got[:80]
-        assert self.SHOULD_RETRY in got, got[:80]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert self.UNIFIED_STATUS not in got, got[:80]
+        assert self.RETRY_AFTER not in got, got[:80]
+        assert self.SHOULD_RETRY not in got, got[:80]
         assert len(calls) == 1, len(calls)
 
     def case_a_raising_switch_releases_the_slot_for_a_retry(self, monkeypatch):
@@ -13194,16 +14076,531 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         it also has to stop a storm of retries on a wall with no headroom
         anywhere. A debounce hit must only forge a 401 for a wall this
         daemon actually switched off; one that never succeeded must keep
-        relaying the 429 untouched on every repeat, not just the first."""
+        relaying the 429, headers stripped, on every repeat, not just the
+        first."""
         calls = self._wire(monkeypatch, switched=False)
         first = self._relay()
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
-        assert self.RESET_HEADER in second, second[:80]
+        assert self.RESET_HEADER not in second, second[:80]
         assert len(calls) == 1, len(calls)
 
-    def case_a_switch_without_a_validated_landing_relays_the_429_unchanged(
+    def case_a_settled_negative_expires_so_the_next_429_re_attempts(
+        self, monkeypatch,
+    ):
+        """THE 28-LINE DEFECT, 2026-09-09 03:22:07Z-03:23:48Z.
+
+        `switched=False` was recorded with `retry_at=None`, and the read
+        treats None as NEVER RETRY — so one "nowhere to land" answer silenced
+        the wall for its whole window and every later 429 was relayed raw.
+        A raise already got `_WALLED_SWITCH_RAISE_TTL`; `switched=False` is
+        exactly as transient (it means nowhere to land YET) and must expire
+        the same way. The case next door, on the unpatched TTL, is the
+        control that the debounce still holds inside it."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
+        calls = self._wire(monkeypatch, switched=False)
+        first = self._relay()
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        second = self._relay()
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 2, (
+            "a settled negative must expire like a raise does, or the wall's "
+            f"one attempt is spent forever: {len(calls)}")
+
+    def case_a_settled_conversion_never_expires(self, monkeypatch):
+        """ONLY A NEGATIVE EXPIRES. The account for this wall really is
+        switched off, so re-running `switch()` on a later repeat would churn
+        accounts for nothing — and `current_at_limit=True` would then pin the
+        HEALTHY account it just landed on to 0.0."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
+        calls = self._wire(monkeypatch, switched=True)
+        for _ in range(3):
+            got = self._relay()
+            assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert len(calls) == 1, (
+            "a wall this daemon already converted is settled forever: "
+            f"{len(calls)}")
+
+    def case_a_stale_bearer_converts_without_switching(self, monkeypatch):
+        """THE HALF THAT RELEASES THE SESSION, 2026-09-09 03:25:25Z.
+
+        A third writer (a hand `cswap switch`, or the engine) moved the host
+        to a healthy account 97s after the last 429. A 429 never rebuilds
+        Claude Code's client, so its next retry re-sent the FROZEN bearer of
+        the walled account and walled again — while `switch()` would answer
+        `switched=False` forever, because `current_at_limit=True` pins the
+        CURRENTLY ACTIVE account (by then the healthy one) to 0.0 and nothing
+        beats it.
+
+        So the precondition is not "did I just switch?" but "is the client's
+        bearer still the live account?". When the host has already moved, the
+        401 IS the whole fix. `switched=False` is wired deliberately: the 401
+        here cannot have come from a switch."""
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert not calls, (
+            "the host has already moved off the walled account, so a 401 "
+            f"alone fixes it and no switch is needed: {calls}")
+
+    def case_a_bearer_that_is_still_the_live_account_switches_as_before(
+        self, monkeypatch,
+    ):
+        """THE CONTROL. Without it the case above passes on a relay that
+        answers 401 to every wall it sees. A bearer that IS the live account
+        is the ordinary wall: nothing has moved underneath the client, so a
+        401 would rebuild it straight back onto the account that just walled
+        and only `switch()` can help."""
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, (
+            "the client is on the account that walled; the switch is the "
+            f"only path and must still be attempted: {len(calls)}")
+        # AND THE SCHEME IS CASE-INSENSITIVE. Without this the `.lower()` in
+        # the prefix strip is never executed by any case.
+        lower = self._relay(reset=self.RESET_HEADER_2,
+                            auth="bearer " + self.LIVE)
+        assert lower.startswith(b"HTTP/1.1 429"), lower[:40]
+
+    def case_a_stale_bearer_onto_a_full_live_account_is_relayed(
+        self, monkeypatch,
+    ):
+        """A 401 THAT FIRES WHEN THE RETRY CANNOT LAND KILLS EVERY SUBAGENT
+        (2026-09-07, three leads on `authentication_failed`, a reason absent
+        from Claude Code's partial-result set). The bearer being stale says
+        the client would rebuild; it says nothing about whether what it
+        rebuilds onto can serve. A relayed 429 costs a sleep the owner can
+        Esc; this must fall through to `switch()` and look for somewhere
+        better instead of forging the 401."""
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.NO_HEADROOM)
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, (
+            "no headroom on the live account is not a verdict to answer 401 "
+            f"on; the switch still owes an attempt: {len(calls)}")
+
+    def case_an_unknown_headroom_reading_fails_closed(self, monkeypatch):
+        """`decision_value` returns None for "no reading recent enough to
+        act on" — a property of the CACHE, not evidence of headroom. Read as
+        "no limit anywhere" it hands out a 401 on a cold cache, which is the
+        opus Critical of 2026-09-07 in the other direction."""
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=None)
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_the_headroom_read_refetches_rather_than_trusting_the_cache(
+        self, monkeypatch,
+    ):
+        """`fetch=set()` forbids every fetch, so `decision_value` is None on
+        any account nobody polled inside `STALE_OK_S` (300s) — and a wall is
+        exactly when nobody has. `switch()` itself refetches; so must this,
+        or the conversion is unavailable at the only moment it is needed."""
+        snap = []
+        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                   usage=self.HEADROOM, snap=snap)
+        self._relay(auth="Bearer stale-account-token")
+        assert snap == [{"1"}], (
+            "the read must name the live slot: `fetch=None` reserves with "
+            "`respect_plans=True`, so a row that is stale but not yet "
+            "poll-due is NOT refetched and the reading can describe the "
+            "account as it was before it walled — and it sweeps every managed "
+            f"account over the network to do it: {snap}")
+
+    def case_a_request_with_no_bearer_never_converts(self, monkeypatch):
+        """NOTHING KILLED THE `token and` GUARD. Every case that predates the
+        bearer test sends no `Authorization`, but also has an unreadable
+        store, so `live` is falsy and the comparison is never reached — drop
+        `token and` and they all still pass. A request the pin forwarded
+        without a bearer (an `x-api-key` client) would then have its wall
+        converted on the strength of an OAuth account's headroom that has
+        nothing to do with it: the fail-open shape this round exists to end."""
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        got = self._relay(auth="")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_an_unmanaged_live_login_never_converts(self, monkeypatch):
+        """`current_account_number()` answers None for a live login cswap does
+        not own — deliberately, with no fallback to the recorded
+        `activeAccountNumber`, so nobody evaluates the wrong account's usage.
+        There is then no live account to read headroom for."""
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage=self.HEADROOM, live_num=None)
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_an_unreadable_live_account_never_converts(self, monkeypatch):
+        """The identity half fails closed too: with no answer to "which
+        account is live" there is no evidence the bearer is stale, and a
+        difference against nothing is not a difference."""
+        calls = self._wire(monkeypatch, switched=False, usage=self.HEADROOM)
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_a_bearer_conversion_is_not_a_standing_401(self, monkeypatch):
+        """THE 401 LOOP WITH NO SLEEP, and it is this path's own to prevent.
+
+        A SECOND 429 CARRYING THE SAME RESET IS PROOF THE CONVERSION DID NOT
+        LAND: the epoch is per (account, window), so a client that really
+        rebuilt onto another account cannot re-earn it. Recording the bearer
+        path's answer as a settled TRUE made the memo re-answer 401 to that
+        proof forever, without re-reading the bearer or the headroom — and a
+        same-account token ROTATION reaches it (bearer != live, account
+        unchanged and still walled), giving 401 -> 429 -> 401 with no sleep
+        until the retry loop exhausts into `authentication_failed`.
+
+        So the wall converts at most once per `_WALLED_SWITCH_RAISE_TTL` out
+        of this path; every 429 in between relays, which is a sleep the client
+        survives. Not once and never again -- the entry expires like any other
+        negative, so a straggler still on the old bearer is not starved."""
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        first = self._relay(auth="Bearer stale-account-token")
+        assert first.startswith(b"HTTP/1.1 401"), first[:40]
+        for n in (2, 3):
+            again = self._relay(auth="Bearer stale-account-token")
+            assert again.startswith(b"HTTP/1.1 429"), (
+                f"relay {n} of the same wall on the same bearer: the client "
+                f"did not move, so a second 401 only spends its retries "
+                f"faster: {again[:40]!r}")
+        assert not calls, (
+            f"no repeat may reach `switch()` inside the debounce: {calls}")
+
+    def case_a_reading_missing_a_base_window_is_unknown(self, monkeypatch):
+        """`oauth.relevant_windows` appends 5h and 7d only when each is
+        present, and `account_headroom` is `100 - max(pct)` over whatever came
+        back — so a reading carrying 5h alone scores 90 while the 7d window
+        that actually gates the account was never weighed. Both base windows,
+        or the reading is unknown."""
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage={"five_hour": {"pct": 10.0}})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_a_scoped_only_reading_is_unknown(self, monkeypatch):
+        """`("all",)` folds every per-model weekly window in, which is what
+        makes a full one able to STOP a conversion — but on an account
+        reporting only scoped windows it also manufactures a headroom number
+        out of them with no 5h/7d measured at all, and answers 401 on it.
+        `oauth.py` writes `five_hour`/`seven_day` conditionally, so this shape
+        is permitted by the host."""
+        calls = self._wire(
+            monkeypatch, switched=False, live_token=self.LIVE,
+            usage={"scoped": [{"name": "Fable", "pct": 10.0}]})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_an_over_limit_reading_fails_closed(self, monkeypatch):
+        """A window past 100% gives a NEGATIVE headroom. `> 0` is the test,
+        not `is not None`, and not `>= 0`."""
+        calls = self._wire(
+            monkeypatch, switched=False, live_token=self.LIVE,
+            usage={"five_hour": {"pct": 120.0}, "seven_day": {"pct": 20.0}})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_a_sentinel_reading_fails_closed(self, monkeypatch):
+        """`decision_value` returns a SENTINEL STRING as well as a dict or
+        None — a rate-limited row says so that way. Not a dict, so not a
+        number, so not evidence of headroom."""
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage="rate_limited")
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_only_a_bearer_scheme_carries_a_bearer(self, monkeypatch):
+        """Stripping `bearer ` and treating whatever is left as the token
+        makes EVERY other scheme's whole value a token that can never equal
+        the live one — so `Basic <b64>` converts unconditionally. Not a shape
+        Claude Code sends on `/v1/messages`, which is exactly why it would
+        have sat here unnoticed."""
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        got = self._relay(auth="Basic dXNlcjpwYXNz")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, len(calls)
+
+    def case_the_bearer_paths_own_negative_expires(self, monkeypatch):
+        """m1: NOTHING ASSERTED THAT THIS PATH'S ENTRY EXPIRES. Writing
+        `(False, None)` instead of going through `_remember_walled_switch`
+        left all 38 cases green, so "at most once per TTL" was enforced by
+        nobody. The case next door pins the debounce INSIDE the TTL; this one
+        pins that the TTL ends. A straggler still holding the old bearer must
+        get another chance to be told to rebuild."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        for n in (1, 2):
+            got = self._relay(auth="Bearer stale-account-token")
+            assert got.startswith(b"HTTP/1.1 401"), (
+                f"relay {n}: the bearer path's negative must expire like "
+                f"every other one: {got[:40]!r}")
+        assert not calls, calls
+
+    def case_a_hairline_headroom_converts_and_the_rebuild_closes_it(
+        self, monkeypatch,
+    ):
+        """I1: THE (0, 1) BAND WAS UNASSERTED. `account_headroom` is
+        `100 - max(pct)`, so a live account at 99.9% scores 0.1 and this
+        branch answers 401; the full-account case pins exactly 100.0, which
+        says nothing about the band below it.
+
+        It converts, and that is deliberate: 0.1% is not "at limit", the
+        retry lands, and what bounds the danger is not the size of the number
+        but the REBUILD. Once the client is on the live account its bearer
+        equals the live token, so this path cannot fire again -- a second 401
+        needs a bearer that is still stale. That is the mechanism, asserted
+        rather than argued."""
+        calls = self._wire(
+            monkeypatch, switched=False, live_token=self.LIVE,
+            usage={"five_hour": {"pct": 99.9}, "seven_day": {"pct": 20.0}})
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert not calls, calls
+        # The client rebuilt: its bearer IS the live account now.
+        after = self._relay(reset=self.RESET_HEADER_2,
+                            auth="Bearer " + self.LIVE)
+        assert after.startswith(b"HTTP/1.1 429"), (
+            "once the client is on the live account this path is closed, so "
+            f"no 401 can repeat and the retry loop cannot exhaust: {after[:40]!r}")
+        # AND IT REACHED THE SWITCH. `switched=False` makes 429 the answer from
+        # the switch path too, so the status alone also passes if the function
+        # returned False at the top (a RESET_HEADER_2 that stopped parsing).
+        # This pins that the BEARER branch is what was skipped.
+        assert len(calls) == 1, (
+            f"the second wall never reached switch(), so the 429 above does "
+            f"not show the bearer branch was closed: {calls}")
+
+    def case_a_hairline_headroom_is_logged_as_itself(self, monkeypatch):
+        """I1: `{headroom:.0f}` printed "0% headroom; relaying a 401" for the
+        very band the branch was taken on, so the only post-hoc evidence
+        contradicted the decision it recorded. This round's own event took two
+        analyzers to read out of daemon.log; a line that lies costs a third."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                   usage={"five_hour": {"pct": 99.9}, "seven_day": {"pct": 20.0}})
+        self._relay(auth="Bearer stale-account-token")
+        line = next(m for m in logged if "no longer the live account" in m)
+        assert "0.1% headroom" in line, (
+            f"the headroom that decided the branch must be readable: {line!r}")
+        assert "0% headroom" not in line, line
+
+    def case_two_accounts_sharing_a_reset_epoch_decide_separately(
+        self, monkeypatch,
+    ):
+        """I2: A UNIFIED-RESET EPOCH IS A CLOCK BOUNDARY, NOT AN IDENTITY.
+        This round's own wall was `1788925200` = 03:40:00Z exactly, so two
+        accounts hitting their window at the same boundary carry the SAME
+        reset. Keyed on the epoch alone, the first client's settled TRUE
+        answers 401 for the second account's wall with no bearer test and no
+        headroom test -- an account that never earned it.
+
+        The exposure is this branch's own doing: a settled negative used to
+        close the key forever, and now expires every TTL, so `switch()` gets
+        an attempt per TTL across the whole window to mint that permanent
+        TRUE. The key is `(reset, slot)`; the slot does not rotate per retry,
+        so a same-account token rotation still debounces."""
+        slots = iter(["1", "2"])   # one slot read per relay
+        calls = self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                           usage=self.HEADROOM,
+                           live_num=lambda: next(slots, "2"))
+        first = self._relay(auth="Bearer " + self.LIVE)
+        assert first.startswith(b"HTTP/1.1 401"), first[:40]
+        # Slot 2's own wall, same epoch, and it has never been switched off.
+        second = self._relay(auth="Bearer " + self.LIVE)
+        assert second.startswith(b"HTTP/1.1 401"), second[:40]
+        assert len(calls) == 2, (
+            "the second account's wall must be decided on its own evidence, "
+            f"not inherited from a conversion the first account earned: {calls}")
+
+    # --- the model sweep -------------------------------------------------
+    # tests/models/at_limit_conversion.pict enumerates the decision's inputs;
+    # `pict` expands it to the pairwise set beside it. The cases above each
+    # carry a NAMED rationale for one combination; this one walks every row of
+    # the model so a combination nobody imagined cannot go missing quietly.
+
+    HEADROOM_USAGE = {
+        "Ample": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}},
+        "Hairline": {"five_hour": {"pct": 99.9}, "seven_day": {"pct": 20.0}},
+        "Exhausted": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}},
+        "OverLimit": {"five_hour": {"pct": 120.0}, "seven_day": {"pct": 20.0}},
+        "NoReading": None,
+        "Sentinel": "rate_limited",
+        "MissingBaseWindow": {"five_hour": {"pct": 10.0}},
+        "ScopedOnly": {"scoped": [{"name": "Fable", "pct": 10.0}]},
+    }
+    SWITCH_WIRING = {
+        "LandedValidated": dict(switched=True, validated=True),
+        "LandedUnvalidated": dict(switched=True, validated=None),
+        "NoCandidate": dict(switched=False),
+        "NeedsLogin": dict(switched=True, needs_login=True),
+        "Raised": dict(switched=True),
+    }
+
+    @classmethod
+    def _model_rows(cls):
+        """Rows of the committed expansion, checked against the model itself.
+
+        A PARAMETER ADDED WITHOUT RE-RUNNING `pict` leaves the sweep passing on
+        the stale set while it reports full model coverage -- the model's own
+        "an unrun gate reads like a passed one", one level up. The header row
+        is the cheap witness: it is exactly the model's parameter names, in
+        order."""
+        from pathlib import Path
+        models = Path(__file__).parent / "models"
+        tsv = (models / "at_limit_conversion.tsv").read_text().splitlines()
+        head = tsv[0].split("\t")
+        declared = [
+            ln.split(":", 1)[0].strip()
+            for ln in (models / "at_limit_conversion.pict").read_text().splitlines()
+            if ln and not ln.lstrip().startswith(("#", "IF")) and ":" in ln
+        ]
+        assert declared == head, (
+            "at_limit_conversion.tsv is not the expansion of the current "
+            f"model -- re-run `pict`. model={declared} tsv={head}")
+        return [dict(zip(head, line.split("\t"))) for line in tsv[1:] if line]
+
+    @staticmethod
+    def _model_expects(row):
+        """The SPEC, read off the model -- never a second copy of the code.
+
+        A wall 429 becomes a 401 when, and only when, one of two things is
+        true: an earlier call for this same (wall, account) already converted
+        it, or the client's bearer is no longer the live account AND that
+        account has measured headroom to serve the retry. Everything else
+        relays, including every reading that is merely UNKNOWN.
+        """
+        if row["ResetHeader"] == "Absent":
+            return False, 0
+        if row["MemoEntry"] == "SettledConversion":
+            return True, 0
+        if row["MemoEntry"] == "LiveNegative":
+            return False, 0
+        stale_bearer = (row["Authorization"] == "BearerStale"
+                        and row["LiveToken"] == "Readable"
+                        and row["LiveSlot"] == "Managed")
+        if stale_bearer and row["Headroom"] in ("Ample", "Hairline"):
+            return True, 0
+        return row["Switch"] == "LandedValidated", 1
+
+    def case_every_row_of_the_pict_model(self, monkeypatch):
+        """One row per pairwise combination, expected outcome derived from the
+        model's rules rather than from the implementation."""
+        from cswap_pin import proxy as pp
+
+        rows = self._model_rows()
+        assert len(rows) > 40, f"the expanded model looks truncated: {len(rows)}"
+        failures = []
+        for i, row in enumerate(rows):
+            def _raise():
+                raise OSError("locked")
+
+            slot = "1" if row["LiveSlot"] == "Managed" else None
+            calls = self._wire(
+                monkeypatch,
+                live_token=self.LIVE if row["LiveToken"] == "Readable" else None,
+                usage=self.HEADROOM_USAGE[row["Headroom"]],
+                live_num=slot,
+                before=_raise if row["Switch"] == "Raised" else None,
+                **self.SWITCH_WIRING[row["Switch"]])
+            key = (b"9999999999", slot)
+            if row["MemoEntry"] == "SettledConversion":
+                pp._walled_switch_seen[key] = (True, None)
+            elif row["MemoEntry"] == "LiveNegative":
+                pp._walled_switch_seen[key] = (False, time.monotonic() + 1e6)
+            elif row["MemoEntry"] == "ExpiredNegative":
+                pp._walled_switch_seen[key] = (False, time.monotonic() - 1.0)
+            auth = {"BearerStale": "Bearer stale-account-token",
+                    "BearerIsLive": "Bearer " + self.LIVE,
+                    "NonBearerScheme": "Basic dXNlcjpwYXNz",
+                    "NoHeader": ""}[row["Authorization"]]
+            got = self._relay(
+                reset=False if row["ResetHeader"] == "Absent" else None,
+                auth=auth)
+            want_401, want_calls = self._model_expects(row)
+            saw_401 = got.startswith(b"HTTP/1.1 401")
+            if saw_401 != want_401 or len(calls) != want_calls:
+                failures.append(
+                    f"row {i + 1} {row} -> 401={saw_401} calls={len(calls)}, "
+                    f"model says 401={want_401} calls={want_calls}")
+                continue
+            # Every wall this decision reaches (ResetHeader=Present, 401 or
+            # relayed) must lose its rate-limit family either way; an
+            # edge/gateway 429 (ResetHeader=Absent) is outside this decision
+            # and must pass every header through unchanged.
+            if row["ResetHeader"] == "Present":
+                if (self.RESET_HEADER in got or self.RETRY_AFTER in got
+                        or self.UNIFIED_STATUS in got
+                        or self.SHOULD_RETRY in got):
+                    failures.append(
+                        f"row {i + 1} {row} -> rate-limit headers survived "
+                        f"(401={saw_401})")
+            elif self.RETRY_AFTER not in got or self.SHOULD_RETRY not in got:
+                failures.append(
+                    f"row {i + 1} {row} -> an edge/gateway 429 lost a header "
+                    "this decision never touches")
+        assert not failures, (
+            f"{len(failures)} of {len(rows)} model rows disagree with the "
+            "implementation:\n" + "\n".join(failures[:6]))
+
+    def case_the_live_slot_is_read_outside_the_wall_lock(self, monkeypatch):
+        """`_live_login_identity`'s own docstring: "`ask_server=False` for a
+        caller inside the locks". `current_account_number()` takes the DEFAULT
+        `ask_server=True`, so reading it under `_walled_switch_lock` puts a
+        server round trip inside the one lock every waiter in a wall storm
+        blocks on -- ten concurrent 429s on one wall is measured, and the
+        debounced repeats (28 in the 2026-09-09 event) would each pay it in
+        series. The key needs the slot; nothing needs it read under the lock."""
+        from cswap_pin import proxy as pp
+        under_lock = []
+
+        def _slot():
+            free = pp._walled_switch_lock.acquire(blocking=False)
+            if free:
+                pp._walled_switch_lock.release()
+            under_lock.append(not free)
+            return "1"
+
+        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                   usage=self.HEADROOM, live_num=_slot)
+        self._relay(auth="Bearer stale-account-token")
+        assert under_lock and not any(under_lock), (
+            "the live slot was resolved while `_walled_switch_lock` was held: "
+            f"{under_lock}")
+
+    def case_the_bearer_conversion_is_logged(self, monkeypatch):
+        """`_TRACE` is off on a serving daemon, so daemon.log is the only
+        record — and every count in the 2026-09-09 analysis came from
+        `/usr/bin/grep -aFc` over these lines. A branch with no line of its
+        own is unmeasurable after the fact."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        self._relay(auth="Bearer stale-account-token")
+        assert sum("no longer the live account" in m for m in logged) == 1, logged
+
+    def case_a_switch_without_a_validated_landing_relays_the_429_with_headers_stripped(
         self, monkeypatch,
     ):
         """`switch()` landed a credential but never probed it live (an older
@@ -13216,18 +14613,18 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         calls = self._wire(monkeypatch, switched=True, validated=None)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER in got, got[:80]
-        assert self.RETRY_AFTER in got, got[:80]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert self.RETRY_AFTER not in got, got[:80]
         assert sum(
             "did not validate the landing credential (validated absent), "
-            "relaying the 429 unchanged" in m for m in logged
+            "relaying the 429 with headers stripped" in m for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
-        assert self.RESET_HEADER in second, second[:80]
+        assert self.RESET_HEADER not in second, second[:80]
         assert len(calls) == 1, len(calls)
 
-    def case_a_switch_with_validated_false_relays_the_429_unchanged(
+    def case_a_switch_with_validated_false_relays_the_429_with_headers_stripped(
         self, monkeypatch,
     ):
         """Same as the missing-key case, spelled the other way: `switch()`
@@ -13238,11 +14635,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         calls = self._wire(monkeypatch, switched=True, validated=False)
         got = self._relay()
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert self.RESET_HEADER in got, got[:80]
-        assert self.RETRY_AFTER in got, got[:80]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert self.RETRY_AFTER not in got, got[:80]
         assert sum(
             "did not validate the landing credential (validated False), "
-            "relaying the 429 unchanged" in m for m in logged
+            "relaying the 429 with headers stripped" in m for m in logged
         ) == 1, logged
         second = self._relay()
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
@@ -13362,6 +14759,45 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             "so a target full on the model this request needs is invisible to "
             f"it and the wall becomes a 401 with nowhere to land: {calls}")
         assert status == 429, status
+
+    def case_the_bearer_reaches_the_relay_through_the_real_mitm(
+        self, monkeypatch, certdir,
+    ):
+        """THE WIRING, end to end. The request and the response are handled in
+        different methods, so the bearer has to be carried from `_forward` to
+        `_relay_response` — and a conversion that works when the unit case
+        hands `auth=` in directly, while the daemon passes nothing, is a fleet
+        that never converts and a unit suite that never says so.
+
+        `disk-token` is the client's bearer; the store answers with a
+        different live account that has headroom, and `switched=False` means
+        the 401 cannot have come from a switch."""
+        from cswap_pin.proxy import PinProxy
+
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 429 Too Many Requests\r\n" + self.RESET_HEADER
+            + b"\r\n" + self.RETRY_AFTER + b"\r\nContent-Length: 0\r\n"
+            b"Connection: close\r\n\r\n"))
+        proxy = PinProxy(certdir=certdir,
+                         pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages",
+                bearer="disk-token",
+                body=json.dumps({"model": "claude-fable-5-1", "max_tokens": 4}),
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert not calls, (
+            f"no switch was needed; the host had already moved: {calls}")
+        assert status == 401, (
+            "the client's bearer never reached the relay, so the daemon "
+            f"relayed the wall the host had already left: {status}")
 
 
 class TestTheEvidenceSurvivesAHandover:
