@@ -4558,6 +4558,120 @@ def _dead_creator_bridge_ids(stamp: bool = True) -> set[str]:
     return out
 
 
+def _transcript_bridge_history(session_id: str) -> set[str]:
+    """Every bridge id a ``bridge-session`` record in ``session_id``'s own
+    transcript has EVER named, from the tail :data:`_POINTER_TAIL_BYTES`
+    reads -- not just the newest, which is the CURRENT bridge and by
+    definition never the twin `_replaced_twin_bridge_ids` is looking for.
+
+    Same one-file rule as `_last_pointer`, but STRICTER: this declines
+    whenever a SECOND transcript file for the session id exists at all,
+    whether or not it carries a pointer -- `_last_pointer` declines only
+    when two files EACH carry one.
+    """
+    found = list((require("paths").get_claude_config_home() / "projects")
+                 .glob(f"*/{session_id}.jsonl"))
+    if len(found) != 1:
+        return set()
+    try:
+        with found[0].open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - _POINTER_TAIL_BYTES))
+            lines = fh.read().split(b"\n")
+    except OSError:
+        return set()
+    out: set[str] = set()
+    for raw in lines:
+        if b"bridge-session" not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue  # also swallows the leading partial line
+        if not isinstance(rec, dict) or rec.get("type") != "bridge-session" \
+                or not rec.get("bridgeSessionId"):
+            continue
+        # SAME FILTER AS `_last_pointer` (4174): a proof used to CLOSE a
+        # bridge must decline at least as strictly as the one used to
+        # CARRY one.
+        if rec.get("sessionId") not in (None, session_id):
+            continue
+        out.update(_both_spellings(str(rec["bridgeSessionId"])))
+    return out
+
+
+def _replaced_twin_bridge_ids() -> set[str]:
+    """Bridge ids a job THIS HOST is currently running once held itself,
+    before minting the newer bridge it holds now -- the twin a reconnect
+    leaves behind, never a dead creator's.
+
+    `_dead_creator_bridge_ids` only ever speaks for a job whose CREATOR is
+    gone; a job still running, simply holding a newer bridge, never shows up
+    there, and its own earlier bridge sits ``active``+``disconnected`` with
+    every existing guard skipping it (measured on lmd42: 8 of 17 live
+    sessions, each older than a live newer bridge of the same title). Same
+    discipline as that function: POSITIVE evidence only -- never "no
+    process holds it" (this host cannot see another machine's pids), always
+    a record THIS HOST itself wrote.
+
+    TWO STORES, because a job can be resumed either through
+    ``CLAUDE_JOB_DIR`` or interactively -- see `_carry_pointer`'s note on
+    why both exist:
+
+    1. A ``~/.claude/sessions/*.json`` record whose process is DEAD, whose
+       ``jobId`` names a job THIS HOST has LIVE right now, and whose own
+       ``bridgeSessionId`` is the twin -- an earlier resume's own record,
+       left behind when the live one took over.
+    2. A ``bridge-session`` record naming the twin ANYWHERE in the tail of
+       the live job's OWN transcript -- this same conversation held that
+       bridge before Claude Code minted the one it holds now. Read the
+       same two candidate ids `_carry_candidates` reads for "the live
+       transcript" -- ``resumeSessionId`` when a resume set it, else
+       ``sessionId``.
+    """
+    try:
+        home = require("paths").get_claude_config_home()
+    except Exception:  # noqa: BLE001 — no host, nothing to enumerate
+        return set()
+    live_jobs = _live_job_pids()
+    if not live_jobs:
+        return set()
+
+    out: set[str] = set()
+    for path in (home / "sessions").glob("*.json"):
+        rec = _read_json(path)
+        if not isinstance(rec, dict):
+            continue
+        bridge, job, pid = (rec.get("bridgeSessionId"), rec.get("jobId"),
+                            rec.get("pid"))
+        if not bridge or not job or str(job) not in live_jobs:
+            continue
+        # POSITIVE EVIDENCE ONLY, same as `_dead_creator_bridge_ids` (see
+        # its own note above): a missing/non-int/<=0 pid, or an `os.kill`
+        # that answers anything but `ProcessLookupError` (most of all
+        # `PermissionError` -- a reused pid now owned by someone else),
+        # proves nothing dead and must KEEP the bridge, not condemn it.
+        if not (isinstance(pid, int) and pid > 0):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            out.update(_both_spellings(str(bridge)))
+        except Exception:  # noqa: BLE001 — unknown errno: KEEP
+            pass
+        # alive (no exception): the live job's OWN current record -- KEEP
+
+    for job in live_jobs:
+        st = _read_json(home / "jobs" / str(job) / "state.json")
+        if not isinstance(st, dict):
+            continue
+        for sid in (st.get("resumeSessionId"), st.get("sessionId")):
+            if not sid:
+                continue
+            out.update(_transcript_bridge_history(str(sid)))
+    return out
+
+
 def observed_bridge_owners() -> dict[str, str | None]:
     """``bridge id -> the organizationUuid its record says it belongs to``.
 
@@ -4932,7 +5046,7 @@ def _host_slug() -> str:
 # `is_pinned_route` already treats identically (its own `/v1/sessions/`
 # prefix row): `POST /v1/sessions/<sid>/bridge` is the same permanent
 # give-away under the sibling spelling, not a different route.
-_BRIDGE_ATTACH = re.compile(r"^/v1/(?:code/)?sessions/[^/]+/bridge$")
+_BRIDGE_ATTACH = re.compile(r"^/v1/(?:code/)?sessions/([^/]+)/bridge$")
 
 
 def should_wait_for_pin(method: str, path: str) -> bool:
@@ -4990,6 +5104,54 @@ def should_wait_for_pin(method: str, path: str) -> bool:
     if bare in ("/v1/code/sessions", "/v1/environments/bridge"):
         return True
     return bool(_BRIDGE_ATTACH.match(bare))
+
+
+# HOW LONG A LATER /bridge POST FOR THE SAME cse WAITS on an earlier one's
+# upstream exchange to settle (T0955): Claude Code POSTs .../bridge with a
+# 10s timeout, ABORTS the socket on timeout and retries -- but the pin kept
+# relaying the aborted request upstream regardless, so during a hop stall
+# the aborted request could reach the server AFTER the retry's and become
+# the newest worker registration, 409ing the retry off its own session.
+# Measured stalls ran 14-27s; 60s clears them with room, and past it both
+# racers relay -- which only risks the fault this exists to close, never a
+# hang, the same reason `_PIN_WAIT_S * _PIN_WAIT_TRIES` is bounded: a
+# launch must never hang.
+_BRIDGE_ATTACH_HOLD_S = 60.0
+
+
+def _bridge_attach_cse(method: str, path: str) -> "str | None":
+    """The `<cse>` a POST `.../bridge` names, or None for anything else."""
+    if method != "POST":
+        return None
+    m = _BRIDGE_ATTACH.match(path.split("?", 1)[0].rstrip("/"))
+    return m.group(1) if m else None
+
+
+def _client_hung_up(sock) -> bool:
+    """Best-effort: has SOCK's peer already closed.
+
+    ponytail: a non-blocking `select` readable check is the whole signal --
+    a client that pipelines a byte before its first reply would misread as
+    hung up here, but nothing on the bridge-attach route does that (it
+    blocks for the reply). Consuming the byte to disambiguate would need
+    `_Prefixed`-style push-back on an SSL socket (`MSG_PEEK` is refused --
+    see `_tunnel_is_open`'s own note); not worth it for a route this narrow.
+
+    `select.poll()`, not `select.select()`: `select.select` raises
+    ValueError for any fd >= FD_SETSIZE (1024), and the pin caps no
+    RLIMIT_NOFILE, so a fd past that point (what a hop stall's fd pile-up
+    produces) failed here on every live client past 1024 open fds. On any
+    error this fails OPEN (relay it) rather than closed (drop it): the
+    hold this feeds already orders a relayed dead request ahead of the
+    retry waiting on it.
+    """
+    try:
+        poller = select.poll()
+        poller.register(sock, select.POLLIN)
+        ready = poller.poll(0)
+    except (OSError, ValueError):
+        return False  # cannot even ask -- fail open, the hold covers it
+    return bool(ready)
 
 
 #: Titles this pin has PUT, keyed by bridge id. The one thing that separates
@@ -12089,6 +12251,11 @@ class PinProxy:
         self._bridge_sweeping = False
         self._last_bridge_sweep: float | None = None
         self._sweep_lock = threading.Lock()
+        # EARLIER /bridge POSTS FOR THE SAME cse, in flight (T0955) --
+        # `_hold_bridge_attach`/`_release_bridge_attach`. Keyed per cse, so
+        # two different sessions' attaches never wait on each other.
+        self._bridge_attach_lock = threading.Lock()
+        self._bridge_attach_holds: dict = {}
         # The connections themselves, not just a count. `stop()` has to CLOSE
         # them before the process exits — see the note there on why a drained
         # request still ends in RST without this.
@@ -15285,6 +15452,13 @@ class PinProxy:
         # sleeping bridge answers that identically, and the pin exists
         # precisely so this host cannot see that machine's pids.
         dead_creator = _dead_creator_bridge_ids()
+        # A THIRD PATH, alongside the dead-creator one: a twin the SAME job
+        # held before it minted the newer bridge it holds now. The job's
+        # creator is not dead here -- it is the live process holding the
+        # newer bridge -- so `_dead_creator_bridge_ids` never names this
+        # twin; only a host-local record proving THIS host's own job once
+        # held it does. See `_replaced_twin_bridge_ids`.
+        replaced_twin = _replaced_twin_bridge_ids()
         newest: dict[str, str] = {}
         for item in sessions:
             title = (item.get("title") or "").strip()
@@ -15317,13 +15491,14 @@ class PinProxy:
                     continue
             elif (item.get("status") == "active"
                     and item.get("connection_status") == "disconnected"
-                    and sid in dead_creator):
-                # THE DEAD-CREATOR PATH. Archived is deliberately excluded --
-                # that is the owner's claude.ai history, kept on purpose,
-                # whatever a local record says -- and `worker_status` is
-                # ignored: a disconnected bridge whose creator is dead here
-                # carries a stale flag, and only the dead-creator record may
-                # speak for it.
+                    and (sid in dead_creator or sid in replaced_twin)):
+                # THE DEAD-CREATOR PATH, OR THE REPLACED-TWIN ONE. Archived
+                # is deliberately excluded -- that is the owner's claude.ai
+                # history, kept on purpose, whatever a local record says --
+                # and `worker_status` is ignored: a disconnected bridge
+                # whose creator is dead, or whose own job has since moved to
+                # a newer bridge, carries a stale flag here, and only the
+                # local record may speak for it.
                 pass
             else:
                 continue
@@ -15535,6 +15710,36 @@ class PinProxy:
             "permanently and cannot be transferred"
         )
         return None
+
+    def _hold_bridge_attach(self, cse: str) -> "tuple[threading.Event, bool]":
+        """Block until any earlier `/bridge` POST for this cse has settled.
+
+        Registers THIS request's own event before returning (still under the
+        lock, so nothing can slip between "read the previous holder" and
+        "become the new one") — a still-later request then waits on us
+        rather than on whichever attempt was first. Returns whether there
+        was anything to wait on -- but order at the hold is the order
+        requests REACH it, not the order they arrived: a request that
+        never waited here (`prev is None`) can still have been overtaken
+        earlier, in `_wait_for_pin_token`, so the hung-up check below runs
+        every time, not only when this returns True.
+        """
+        mine = threading.Event()
+        with self._bridge_attach_lock:
+            prev = self._bridge_attach_holds.get(cse)
+            self._bridge_attach_holds[cse] = mine
+        if prev is None:
+            return mine, False
+        prev.wait(_BRIDGE_ATTACH_HOLD_S)
+        return mine, True
+
+    def _release_bridge_attach(self, cse: str, mine: "threading.Event") -> None:
+        """Settle THIS request's hold: wake anything waiting on it, and drop
+        the registration if nothing newer has already replaced it."""
+        mine.set()
+        with self._bridge_attach_lock:
+            if self._bridge_attach_holds.get(cse) is mine:
+                del self._bridge_attach_holds[cse]
 
     def _refuse_stalled_mint(self, tls, method: str, path: str,
                               reason: str | None = None,
@@ -15995,57 +16200,98 @@ class PinProxy:
             return sock, (f"{method} {rel_path} HTTP/1.1\r\n"
                           + "\r\n".join(hdrs) + "\r\n\r\n")
 
-        # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path already
-        # does. An environment registered before the pin knew this route
-        # belongs to whoever registered it, so asking as the pin gets 401 and a
-        # live Remote Control dies. Nothing has reached the client yet, so the
-        # request can still go again with the bearer it arrived with.
-        for hdrs, retry in ((headers, unswapped is not None),
-                            (unswapped, False)):
-            if hdrs is None:
-                break
-            try:
-                up, head = dial(hdrs)
-            except NoChainHopError:
-                # Nothing has reached the client yet on this path — the
-                # request line and headers were only ever read, never
-                # answered. A retryable 503, not a dropped connection and
-                # never the inspector's 403.
+        # T0955: THE SAME HOLD THE MITM PATH TAKES for a POST .../bridge —
+        # `is_pinned_route`/`should_wait_for_pin` above already treat this
+        # absolute-form path as carrying the identical route, so a stalled
+        # hop here can overtake its own retry exactly the way it does there.
+        _bridge_cse = (_bridge_attach_cse(method, rel)
+                       if host == UPSTREAM_HOST and secure else None)
+        _bridge_event = None
+        if _bridge_cse:
+            _bridge_event, _ = self._hold_bridge_attach(_bridge_cse)
+            if _client_hung_up(conn):
+                self._release_bridge_attach(_bridge_cse, _bridge_event)
+                conn.close()
+                return
+        _bridge_released = False
+
+        def _release_bridge_hold() -> None:
+            nonlocal _bridge_released
+            if _bridge_event is not None and not _bridge_released:
+                self._release_bridge_attach(_bridge_cse, _bridge_event)
+                _bridge_released = True
+
+        try:
+            # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path
+            # already does. An environment registered before the pin knew
+            # this route belongs to whoever registered it, so asking as the
+            # pin gets 401 and a live Remote Control dies. Nothing has
+            # reached the client yet, so the request can still go again with
+            # the bearer it arrived with.
+            for hdrs, retry in ((headers, unswapped is not None),
+                                (unswapped, False)):
+                if hdrs is None:
+                    break
                 try:
-                    conn.sendall(
-                        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
-                        b"Content-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
-                except OSError:
-                    pass
-                conn.close()
-                return
-            if up is None:
-                conn.close()
-                return
-            try:
-                # Connect budget only, same as the tunnel: _pump streams, and
-                # a read timeout left on the socket tears down a response that
-                # is merely quiet — an SSE gap or a slow origin — rather than
-                # dead.
-                up.settimeout(None)
-                up.sendall(head.encode("latin1") + body)
-                if retry:
-                    code, seen = _peek_status(up)
-                    if code in (401, 403, 404):
-                        self._tunnel_trace(
-                            f"{method} {rel} swap refused ({code}) — "
-                            "retrying as it arrived (absolute-form)")
-                        continue
+                    up, head = dial(hdrs)
+                except NoChainHopError:
+                    # Nothing has reached the client yet on this path — the
+                    # request line and headers were only ever read, never
+                    # answered. A retryable 503, not a dropped connection and
+                    # never the inspector's 403.
+                    try:
+                        conn.sendall(
+                            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    except OSError:
+                        pass
+                    conn.close()
+                    return
+                if up is None:
+                    conn.close()
+                    return
+                try:
+                    # Connect budget only, same as the tunnel: _pump streams, and
+                    # a read timeout left on the socket tears down a response that
+                    # is merely quiet — an SSE gap or a slow origin — rather than
+                    # dead.
+                    up.settimeout(None)
+                    up.sendall(head.encode("latin1") + body)
+                    seen = b""
+                    if retry or _bridge_cse:
+                        code, seen = _peek_status(up)
+                        if retry and code in (401, 403, 404):
+                            self._tunnel_trace(
+                                f"{method} {rel} swap refused ({code}) — "
+                                "retrying as it arrived (absolute-form)")
+                            continue
+                    # RELEASED HERE, THE MOMENT THE STATUS LINE IS IN HAND —
+                    # same discipline as the MITM path's `on_status` (see
+                    # `_forward`): the outer `finally` below is only the
+                    # backstop for a dial failure or an exception before this
+                    # point. Waiting for `_pump` to return instead held this
+                    # past a whole keep-alive connection's lifetime, or
+                    # released it EARLY on the client's own abort while the
+                    # request was still live in a stalled hop — either way
+                    # not "the exchange settled". (`_release_bridge_hold`
+                    # is already a no-op with no `_bridge_cse`.)
+                    _release_bridge_hold()
                     if seen:
                         conn.sendall(seen)
-                _pump(conn, up)
-                return
-            finally:
-                try:
-                    up.close()
-                except OSError:
-                    pass
+                    _pump(conn, up)
+                    return
+                finally:
+                    try:
+                        up.close()
+                    except OSError:
+                        pass
+        finally:
+            # THE EXCHANGE HAS SETTLED ONE WAY OR ANOTHER by the time this
+            # runs — sent and handed to `_pump`, refused with a 503, or
+            # every hop failed — so a later request for this cse may
+            # proceed.
+            _release_bridge_hold()
 
     def _mitm(self, conn: socket.socket) -> bool:
         """Serve requests on this connection. True when it was HANDED OVER.
@@ -16333,8 +16579,28 @@ class PinProxy:
             except Exception:
                 pass
 
+        # T0955: HOLD A LATER /bridge POST FOR THE SAME cse until any
+        # earlier one's upstream exchange has settled — see
+        # `_BRIDGE_ATTACH_HOLD_S`. After ALL the checks above (pinned,
+        # stalled-mint 503, the token wait) and just before the request
+        # reaches `_forward`, so nothing here changes what gets sent, only
+        # when a second attempt is allowed to send it.
+        _bridge_cse = _bridge_attach_cse(method, path)
+        _bridge_hold = None
+        if _bridge_cse:
+            _bridge_event, _ = self._hold_bridge_attach(_bridge_cse)
+            if _client_hung_up(tls):
+                # The client that sent THIS request is already gone — relay
+                # it anyway and it becomes the stray newest registration the
+                # hold exists to prevent, with nobody left to hear the
+                # answer. Drop it instead.
+                self._release_bridge_attach(_bridge_cse, _bridge_event)
+                return False
+            _bridge_hold = (_bridge_cse, _bridge_event)
+
         try:
-            keep = self._forward(method, path, headers, body, tls, swapped=swapped)
+            keep = self._forward(method, path, headers, body, tls,
+                                 swapped=swapped, bridge_hold=_bridge_hold)
             if keep is _AUTH_REJECTED:
                 # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
                 # 401/403/404 is terminal to the client — SSETransport treats
@@ -16370,7 +16636,9 @@ class PinProxy:
         return keep
 
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
-                 swapped: bool = False) -> bool:
+                 swapped: bool = False,
+                 bridge_hold: "tuple[str, threading.Event] | None" = None
+                 ) -> bool:
         """Relay one request upstream and stream the response back.
 
         Returns whether the MITM connection may carry another request. The RC
@@ -16382,8 +16650,39 @@ class PinProxy:
         The upstream socket is kept open across requests (one upstream
         connection per MITM connection) — reconnecting per request would make
         an SSE stream impossible to hold.
+
+        ``bridge_hold`` is T0955's `(cse, event)` from
+        `_hold_bridge_attach`, released the moment this exchange SETTLES —
+        the status line arrives (`on_status`, below) — or, failing that: a
+        dial failure out of `_upstream_conn` (its own `except` below, since
+        that call stays OUTSIDE the relay's `try` — see
+        `TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt`), or an
+        `OSError`/`ssl.SSLError`/anything else once connected, in the
+        relay's own `finally`. Idempotent, so whichever fires first wins
+        and the other is a no-op.
         """
-        up = self._upstream_conn()
+        _bridge_cse, _bridge_event = bridge_hold or (None, None)
+        _bridge_released = False
+
+        def _release_bridge_hold() -> None:
+            nonlocal _bridge_released
+            if _bridge_event is not None and not _bridge_released:
+                self._release_bridge_attach(_bridge_cse, _bridge_event)
+                _bridge_released = True
+
+        try:
+            up = self._upstream_conn()
+        except Exception:
+            # A DIAL FAILURE PROPAGATES PAST THIS FRAME ON PURPOSE -- see
+            # `TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt`:
+            # `_upstream_conn` is called OUTSIDE the `except (OSError,
+            # ssl.SSLError)` below so a dial failure reaches `_mitm`'s own
+            # `finally` unswallowed, not this frame's `return False`. A
+            # later request for this cse still must not wait on an
+            # exchange that is never going to happen.
+            _release_bridge_hold()
+            raise
+
         try:
             # A WebSocket handshake must keep Connection/Upgrade even though
             # they are hop-by-hop: strip them and the server sees a plain GET
@@ -16533,6 +16832,11 @@ class PinProxy:
                 # only place it can be timed. Time to the first byte is the
                 # number that means the same thing for both.
                 on_status=lambda st: (
+                    # RELEASED HERE FIRST: the status line is the earliest
+                    # sign the upstream exchange has settled, and a later
+                    # request for the same cse must not wait a byte longer
+                    # than that.
+                    _release_bridge_hold(),
                     self._note_attachment(path, st),
                     self._note_rename(method, path, st),
                     self._note_bridge_superseded(method, path, st),
@@ -16557,6 +16861,13 @@ class PinProxy:
         except (OSError, ssl.SSLError):
             self._drop_upstream()
             return False
+        finally:
+            # THE STATUS LINE NEVER ARRIVED: a NoChainHopError out of
+            # `_upstream_conn`, the OSError/SSLError just above, or an
+            # upgrade that failed and dropped the upstream. Whatever the
+            # cause, a later request for this cse must not wait for an
+            # exchange that is never going to settle on its own.
+            _release_bridge_hold()
 
     def _upstream_conn(self) -> ssl.SSLSocket:
         """The live upstream TLS socket for this MITM connection, dialing on
