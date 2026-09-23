@@ -4178,6 +4178,14 @@ class TestIsPinnedRoute:
              "the machine never appears on the pinned account's claude.ai"),
             ("/v1/environments/bridge/env_01", True,
              "deregister must reach the account that owns the environment"),
+            # markEnvironmentOffline (CC 2.1.280) carries the ENVIRONMENT
+            # SECRET as bearer, exactly like the /work/* routes below --
+            # swapped, it answers 401 before the take-back ever runs. It
+            # shares the `bridge/<env>` prefix with deregister above, so the
+            # boundary has to stop one segment deeper than deregister's own.
+            ("/v1/environments/bridge/env_01/offline", False,
+             "carries the environment secret, not the OAuth bearer -- same "
+             "credential shape as /work/*, not the register/deregister pair"),
             ("/v1/environments/env_01/bridge/reconnect", True,
              "reconnect re-mints a session token for the environment, the "
              "same bargain as /v1/sessions/<id>/unarchive"),

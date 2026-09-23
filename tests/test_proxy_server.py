@@ -1034,7 +1034,15 @@ class TestPinProxyServer:
                         + body_b)
                     c.settimeout(10)
                     got = b""
-                    while True:
+                    # READ THE FULL CHUNKED RESPONSE, not until EOF: T0986
+                    # CHANGE 1 gives every request the same HTTP-aware relay
+                    # (`_relay_response`) the connection's first always got,
+                    # so a keep-alive-eligible response (no `Connection:
+                    # close`, chunked framing intact) leaves the socket OPEN
+                    # for a next request instead of hanging up -- waiting
+                    # for a close here would wait past this test's own
+                    # timeout for a request that never comes.
+                    while not got.endswith(b"0\r\n\r\n"):
                         d = c.recv(4096)
                         if not d:
                             break
@@ -4541,6 +4549,427 @@ class TestChainRediscovery:
                 proxy.stop()
             chain.stop()
 
+    def case_a_second_pinned_request_on_the_same_socket_is_also_swapped_and_traced(
+        self, certdir
+    ):
+        """T0986 CHANGE 1: `_plain_relay` used to route-decide only the
+        FIRST request on a keep-alive absolute-form connection and hand
+        every later one to a raw `_pump` -- unswapped and untraced.
+        `claude remote-control` sends register, session create and the
+        first work poll on ONE socket, so the register swapped while
+        session create went out unswapped and 404'd. Both requests here
+        must swap and both must trace."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        traced = []
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+            proxy._tunnel_trace = traced.append
+
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\nContent-Length: 0\r\n\r\n")
+                got = b""
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                assert got.startswith(b"HTTP/1.1 200"), got[:60]
+
+                # SAME SOCKET, second request: the session create.
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/code/sessions"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\nContent-Length: 0\r\n\r\n")
+                got2 = b""
+                while b"\r\n\r\n" not in got2:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got2 += d
+                assert got2.startswith(b"HTTP/1.1 200"), got2[:60]
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while len(seen) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 2, f"the chain saw {len(seen)} request(s), not 2"
+            assert b"Bearer PINTOKEN" in seen[0], "the register was not swapped"
+            assert b"Bearer PINTOKEN" in seen[1], (
+                "the SECOND request on the socket went out unswapped -- "
+                "the keep-alive gap this round closes")
+            swapped_traces = sum("swapped=True" in t for t in traced)
+            assert swapped_traces == 2, (
+                f"only {swapped_traces} of 2 requests were traced as "
+                f"swapped: {traced!r}")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
+    def case_a_foreign_host_then_the_api_host_on_one_socket_only_the_second_swaps(
+        self, certdir
+    ):
+        """A foreign-host request first, then a pinned API-host request on
+        the SAME socket: only the second may swap -- a bearer belongs to
+        the host it was minted for (:16093, 6257f67), and that guard must
+        hold on every request, not only the connection's first."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"POST https://example.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: example.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\nContent-Length: 0\r\n\r\n")
+                got = b""
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                assert got.startswith(b"HTTP/1.1 200"), got[:60]
+
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\nContent-Length: 0\r\n\r\n")
+                got2 = b""
+                while b"\r\n\r\n" not in got2:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got2 += d
+                assert got2.startswith(b"HTTP/1.1 200"), got2[:60]
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while len(seen) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 2, f"the chain saw {len(seen)} request(s), not 2"
+            assert b"Bearer ACTIVE" in seen[0] and b"Bearer PINTOKEN" not in seen[0], (
+                "a foreign host's bearer was swapped -- the pinned token "
+                "was sent to a host that did not mint it")
+            assert b"Bearer PINTOKEN" in seen[1], (
+                "the API-host request on the same socket was not swapped")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
+    def case_a_chunked_second_request_on_the_socket_is_relayed_whole(
+        self, certdir
+    ):
+        """The body-read/re-framing defence (568d8f8) must hold for a
+        LATER request too, not only the connection's first: a chunked
+        second request must reach the chain fully re-framed as
+        Content-Length."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                             rediscover_chain=True)
+            proxy.start()
+
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"GET https://example.com/first HTTP/1.1\r\n"
+                    b"Host: example.com\r\nContent-Length: 0\r\n\r\n")
+                got = b""
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                assert got.startswith(b"HTTP/1.1 200"), got[:60]
+
+                body = b'{"session_id":"cse_X"}'
+                chunked = (f"{len(body):x}\r\n".encode() + body
+                          + b"\r\n0\r\n\r\n")
+                c.sendall(
+                    b"POST https://example.com/second HTTP/1.1\r\n"
+                    b"Host: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + chunked)
+                got2 = b""
+                while b"\r\n\r\n" not in got2:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got2 += d
+                assert got2.startswith(b"HTTP/1.1 200"), got2[:60]
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while len(seen) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 2, f"the chain saw {len(seen)} request(s), not 2"
+            assert body in seen[1], (
+                "the chunked second request's body did not reach the chain")
+            assert b"transfer-encoding" not in seen[1].lower(), (
+                "the chunked framing was relayed verbatim instead of being "
+                "re-declared as Content-Length")
+            assert f"Content-Length: {len(body)}".encode() in seen[1], (
+                "the decoded body was not re-framed with its own "
+                "Content-Length")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
+    def case_a_client_connection_close_on_a_later_request_ends_the_loop(
+        self, certdir
+    ):
+        """A LATER request's `Connection: close` must end the per-request
+        loop, not only the connection's first: the socket must not
+        silently accept a third request nor hang waiting for one."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                             rediscover_chain=True)
+            proxy.start()
+
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"GET https://example.com/first HTTP/1.1\r\n"
+                    b"Host: example.com\r\nContent-Length: 0\r\n\r\n")
+                got = b""
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                assert got.startswith(b"HTTP/1.1 200"), got[:60]
+
+                c.sendall(
+                    b"GET https://example.com/second HTTP/1.1\r\n"
+                    b"Host: example.com\r\nConnection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n")
+                got2 = b""
+                while b"\r\n\r\n" not in got2:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got2 += d
+                assert got2.startswith(b"HTTP/1.1 200"), got2[:60]
+
+                # THE PROXY MUST CLOSE ITS END. A `recv` on a still-open
+                # socket blocks; on a closed one it returns b"" promptly.
+                c.settimeout(5)
+                assert c.recv(1024) == b"", (
+                    "the socket stayed open past a client Connection: "
+                    "close on the SECOND request")
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while len(seen) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 2, f"the chain saw {len(seen)} request(s), not 2"
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
+    def case_a_websocket_upgrade_on_a_later_request_stays_opaque(
+        self, certdir
+    ):
+        """T0986 CHANGE 1's per-request loop must still hand an Upgrade
+        request off to the opaque `_pump` tail, not `_relay_response` --
+        `_is_interim` counts a 101 as interim (100 <= code < 200), so
+        routing it through the response parser would try to read a "real"
+        status line out of the first WebSocket frame instead. Proven on
+        the SECOND request of a connection, which only the per-request
+        loop reaches -- the first request's own opaque handling was never
+        in doubt."""
+        from cswap_pin.proxy import PinProxy
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0)); srv.listen(2)
+        oport = srv.getsockname()[1]
+        got_after_101 = {}
+
+        def origin():
+            try:
+                # First (plain) request, on its own fresh dial.
+                c1, _ = srv.accept()
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += c1.recv(4096)
+                c1.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                c1.close()
+
+                # Second (upgrade) request -- CHANGE 1 dials fresh per
+                # request, so this is a NEW connection to the origin.
+                c2, _ = srv.accept()
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += c2.recv(4096)
+                c2.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                frame = c2.recv(4096)
+                got_after_101["upstream_saw"] = frame
+                c2.sendall(b"PONG-FRAME")
+                time.sleep(0.3)
+                c2.close()
+            except Exception:
+                pass
+        threading.Thread(target=origin, daemon=True).start()
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(
+                f"GET http://127.0.0.1:{oport}/first HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{oport}\r\n"
+                f"Content-Length: 0\r\n\r\n".encode())
+            got = b""
+            raw.settimeout(10)
+            while b"\r\n\r\n" not in got:
+                d = raw.recv(4096)
+                if not d:
+                    break
+                got += d
+            assert got.startswith(b"HTTP/1.1 200"), got[:60]
+
+            raw.sendall(
+                f"GET http://127.0.0.1:{oport}/ws HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{oport}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n\r\n".encode())
+            got2 = b""
+            while b"\r\n\r\n" not in got2:
+                d = raw.recv(4096)
+                if not d:
+                    break
+                got2 += d
+            assert got2.startswith(b"HTTP/1.1 101"), (
+                f"the upgrade handshake was not relayed intact: {got2[:80]!r}")
+
+            raw.sendall(b"CLIENT-FRAME")
+            raw.settimeout(5)
+            tail = raw.recv(4096)
+            assert tail == b"PONG-FRAME", (
+                f"post-101 bytes were not pumped opaquely: {tail!r}")
+            raw.close()
+        finally:
+            proxy.stop()
+            srv.close()
+
+        deadline = time.time() + 5
+        while "upstream_saw" not in got_after_101 and time.time() < deadline:
+            time.sleep(0.05)
+        assert got_after_101.get("upstream_saw") == b"CLIENT-FRAME", (
+            "the client's post-101 bytes were not pumped to the origin: "
+            f"{got_after_101!r}")
+
+    def case_a_cleartext_second_request_to_the_api_host_is_never_swapped(
+        self, certdir
+    ):
+        """`and secure` (568d8f8/6257f67) is the half that keeps the
+        pinned token off a bare TCP wire: a host guard alone says WHO, not
+        HOW, so a cleartext http:// request to the API host must never
+        swap even though the host matches -- proven on request #2, which
+        only the per-request loop reaches."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"POST https://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\nContent-Length: 0\r\n\r\n")
+                got = b""
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                assert got.startswith(b"HTTP/1.1 200"), got[:60]
+
+                c.sendall(
+                    b"POST http://api.anthropic.com/v1/environments/bridge"
+                    b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    b"Authorization: Bearer ACTIVE\r\nContent-Length: 0\r\n\r\n")
+                got2 = b""
+                while b"\r\n\r\n" not in got2:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got2 += d
+                assert got2.startswith(b"HTTP/1.1 200"), got2[:60]
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while len(seen) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 2, f"the chain saw {len(seen)} request(s), not 2"
+            assert b"Bearer PINTOKEN" in seen[0], "the https register was not swapped"
+            assert b"Bearer ACTIVE" in seen[1] and b"Bearer PINTOKEN" not in seen[1], (
+                "a cleartext http:// request to the API host was swapped "
+                "-- the pinned bearer just went out on a bare TCP wire")
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
     def case_the_environment_create_waits_for_the_pin_on_this_path(
         self, certdir
     ):
@@ -4994,7 +5423,11 @@ class TestChainRediscovery:
         import inspect
         import cswap_pin.proxy as pp
 
-        relay = inspect.getsource(pp.PinProxy._plain_relay)
+        # T0986 CHANGE 1 split the per-connection loop from the per-request
+        # parse/route/swap/trace/relay -- both lines below live in the
+        # latter now, so both sources are read together.
+        relay = (inspect.getsource(pp.PinProxy._plain_relay)
+                 + inspect.getsource(pp.PinProxy._plain_relay_request))
         assert "(absolute-form)" in relay, (
             "the swap on this path is silent again — a request travelling "
             "here leaves the same evidence as one that never ran")
