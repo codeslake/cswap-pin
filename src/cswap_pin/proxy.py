@@ -12141,7 +12141,11 @@ def _stamp_evidence(existing):
     identity = existing.get("identity")
     kind = existing.get("kind")
     sha = existing.get("sha")
-    hipaa_seen = existing.get("hipaa_seen")
+    # `.default([])` in CC's own schema: a stamp missing this key is `ok`
+    # to CC, not unparseable, so a missing key reads the same as an empty
+    # list here -- only a PRESENT, wrong-shaped value fails the check
+    # below.
+    hipaa_seen = existing.get("hipaa_seen", [])
     confirmed_at = existing.get("confirmed_at")
     incomplete = existing.get("hipaa_seen_incomplete", False)
     ruled_out = existing.get("hipaa_ruled_out", [])
@@ -12184,7 +12188,8 @@ def _trusted_stamp_identity(existing, expected_sha):
     actually validated it against, before this sweep does anything to
     either file -- and the whole record still matches the shape CC's own
     schema requires (`v`, `identity`, `kind`, `sha`, `confirmed_at`,
-    `hipaa_seen`, each element of the latter a 64-hex-char string);
+    `hipaa_seen`, each element of the latter a 64-hex-char string, plus
+    the two OPTIONAL keys `hipaa_seen_incomplete`/`hipaa_ruled_out`);
     anything else carries no assurance CC computed it at all.
     `expected_sha` itself being unknown (the body was unreadable, or this
     is the very first sweep) also trusts nothing: there is no claim to
@@ -12200,7 +12205,7 @@ def _trusted_stamp_identity(existing, expected_sha):
 
     A WRONG identity would only buy "foreign", which refuses exactly like
     "unstamped" does (see `sweep_policy_once`), so an indeterminate case
-    falls back to the plain unlink instead of guessing.
+    falls back to `_fall_back_to_unlink` instead of guessing.
     """
     if (expected_sha is None or not isinstance(existing, dict)
             or existing.get("sha") != expected_sha):
@@ -13009,10 +13014,11 @@ class PinProxy:
         # WITH NO TRUSTED IDENTITY (no prior stamp, or one that does not
         # vouch for the body that was actually on disk) -- OR ONE THIS
         # SWEEP CANNOT VOUCH IS STILL FOR THE SAME ACCOUNT (the witness
-        # gate below, T0681 round 4) -- this still falls back to the plain
-        # unlink: a WRONG identity would only buy "foreign", which refuses
-        # exactly like "unstamped" does, so guessing is never better than
-        # not guessing.
+        # gate below, T0681 round 4) -- this still falls back to
+        # `_fall_back_to_unlink`, which unlinks or tombstones depending on
+        # whether the prior stamp carries HIPAA evidence (T1004): a WRONG
+        # identity would only buy "foreign", which refuses exactly like
+        # "unstamped" does, so guessing is never better than not guessing.
         #
         # THE BODY THIS MINT VOUCHES FOR is whatever is ACTUALLY on disk
         # once the write step above is done: `doc` only if the write just
@@ -13091,10 +13097,19 @@ class PinProxy:
             # and fails `allow_web_fetch`/`allow_design_sync` OPEN for an
             # identity that was actually seen, where the old unconditional
             # unlink read every case below as "nothing to lose". Decided
-            # from `pre_sweep_stamp` -- the SAME record read above, before
-            # this sweep touched anything, never a fresh re-read here.
+            # from a FRESH read of the stamp file, not `pre_sweep_stamp` --
+            # every caller but the mint's own OSError branch below reaches
+            # here before anything has written to `stamp`, so the two
+            # reads see the same bytes there. That branch is the
+            # exception: `tmp.replace(stamp)` can already have landed
+            # THIS sweep's own new evidence (a fresh taint or an overflow
+            # marker) before the witness write that follows it fails, and
+            # falling back on `pre_sweep_stamp` there would overwrite that
+            # fresh evidence with the stale record this sweep was about
+            # to replace.
             nonlocal tombstoned
-            evidence = _stamp_evidence(pre_sweep_stamp)
+            current_stamp = _read_json(stamp)
+            evidence = _stamp_evidence(current_stamp)
             if evidence is None:
                 # UNPARSEABLE (missing/wrong-shaped fields, not just a sha
                 # mismatch): CC's own deleteCacheFile leaves this exactly
@@ -13126,7 +13141,7 @@ class PinProxy:
                     if incomplete:
                         tombstone["hipaa_seen_incomplete"] = True
                         tombstone["hipaa_ruled_out"] = ruled_out[-8:]
-                    if pre_sweep_stamp != tombstone:
+                    if current_stamp != tombstone:
                         try:
                             tmp = stamp.with_name(
                                 f"{stamp.name}.{os.getpid()}.tmp")
