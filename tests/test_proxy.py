@@ -4731,9 +4731,11 @@ class TestIsPinnedRoute:
              "deregister must reach the account that owns the environment"),
             # markEnvironmentOffline (CC 2.1.280) carries the ENVIRONMENT
             # SECRET as bearer, exactly like the /work/* routes below --
-            # swapped, it answers 401 before the take-back ever runs. It
-            # shares the `bridge/<env>` prefix with deregister above, so the
-            # boundary has to stop one segment deeper than deregister's own.
+            # swapped, the take-back ran and the unswapped re-send was
+            # refused too ("Bridge environments are not available for this
+            # organization"). It shares the `bridge/<env>` prefix with
+            # deregister above, so the boundary has to stop one segment
+            # deeper than deregister's own.
             ("/v1/environments/bridge/env_01/offline", False,
              "carries the environment secret, not the OAuth bearer -- same "
              "credential shape as /work/*, not the register/deregister pair"),

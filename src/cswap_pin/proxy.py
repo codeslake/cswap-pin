@@ -2877,7 +2877,8 @@ _ENV_BRIDGE = re.compile(
     # right there. `bridge/<env>/offline` (markEnvironmentOffline, CC
     # 2.1.280) carries the ENVIRONMENT SECRET as bearer, exactly like the
     # /work/* routes below, so it must not fall through this same prefix --
-    # swapped, it answers 401 before the take-back ever runs.
+    # swapped, the take-back ran and the unswapped re-send was refused too
+    # ("Bridge environments are not available for this organization").
     r"|/(?:bridge(?:$|\?|/[^/?]*(?:$|\?))"
     r"|[^/?]+/bridge/reconnect(?:/|$|\?)))"
 )
@@ -16185,13 +16186,13 @@ class PinProxy:
         direct if no chain is set).
 
         PER REQUEST, NOT ONLY THE CONNECTION'S FIRST (T0986 CHANGE 1).
-        `claude remote-control` pipelines register, session create and its
-        first work poll on ONE socket, so route-deciding only the first
-        request left every later one unswapped and untraced — raw `_pump`
-        has no idea what a request even is. `_plain_relay_request` repeats
-        the connection's first request's own parse/route/swap/trace/relay
-        for every request; this loops while it says the connection may
-        carry another.
+        `claude remote-control` sends its requests one after another on one
+        keep-alive socket — register, session create and its first work
+        poll — so route-deciding only the first request left every later
+        one unswapped and untraced — raw `_pump` has no idea what a request
+        even is. `_plain_relay_request` repeats the connection's first
+        request's own parse/route/swap/trace/relay for every request; this
+        loops while it says the connection may carry another.
         """
         # NO BLANKET try/finally HERE. `_wait_for_pin_token` can raise
         # `_BlindMintRefusal` out of `_plain_relay_request`, uncaught on
@@ -16206,8 +16207,45 @@ class PinProxy:
                 except OSError:
                     pass
                 return
+            # THE DEBT BOUNDARY, mirroring `_mitm`'s own (see the comment
+            # at the top of its loop): the reply just relayed has settled,
+            # so clear it before blocking on the next request line, not
+            # after — otherwise every absolute-form keep-alive connection
+            # reads as permanently owed between requests, the same bug
+            # `_mitm` fixed at its own loop.
+            self._note_reply_finished(conn)
+            self._owe_answer(conn, False)
             request_line = _read_line(conn)
-            if request_line in ("", None):
+            while request_line == "":
+                # RFC 9112 2.2: a server SHOULD ignore at least one empty
+                # line received prior to a request-line — some clients
+                # pipeline one as a buggy workaround. Treating it as the
+                # end closed a socket that had a request right behind it.
+                request_line = _read_line(conn)
+            if request_line is None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return
+            # A REQUEST LINE ARRIVED, so somebody is waiting again — same
+            # moment `_handle_one_request` re-arms the debt on the MITM
+            # path.
+            self._owe_answer(conn, True)
+            # A LATER REQUEST ON THIS SOCKET MUST STILL BE ABSOLUTE-FORM:
+            # this loop only knows how to relay the form `_handle_client`
+            # already checked for the connection's first (its own "://"
+            # gate). A CONNECT or an origin-form line here used to run into
+            # `urlsplit` misparsing "host:port" as a scheme and dialling
+            # nowhere; close it instead — draining the headers first, same
+            # discipline as the CONNECT path's own unreadable-authority
+            # close, so closing on top of unread bytes does not send RST.
+            _rl = request_line.split(" ")
+            if len(_rl) < 2 or "://" not in _rl[1]:
+                while True:
+                    h = _read_line(conn)
+                    if h in ("", None):
+                        break
                 try:
                     conn.close()
                 except OSError:
@@ -16416,9 +16454,14 @@ class PinProxy:
         # THE CLIENT'S OWN INTENT, read once from the arrival headers —
         # `headers` may be rewritten below (Authorization/Host) but
         # Connection is never one of the rewritten names.
-        client_wants_close = any(
-            k.lower() == "connection" and "close" in v.lower()
-            for k, v in parsed)
+        _conn_header = next(
+            (v for k, v in parsed if k.lower() == "connection"), "")
+        client_wants_close = "close" in _conn_header.lower() or (
+            # RFC 9112 9.3: HTTP/1.0 defaults to close, unlike 1.1 — only an
+            # explicit `Connection: keep-alive` persists it.
+            len(rl) > 2 and rl[2] == "HTTP/1.0"
+            and "keep-alive" not in _conn_header.lower()
+        )
 
         try:
             # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path
@@ -16488,11 +16531,12 @@ class PinProxy:
                         reject_on_auth_error=retry,
                         method=method,
                         on_status=lambda st: _release_bridge_hold(),
+                        note_hop=host == UPSTREAM_HOST and secure,
                     )
-                    if result is _AUTH_REJECTED:
+                    if isinstance(result, _AuthRejected):
                         self._tunnel_trace(
-                            f"{method} {rel} swap refused — retrying as it "
-                            "arrived (absolute-form)")
+                            f"{method} {rel} swap refused ({result.code}) — "
+                            "retrying as it arrived (absolute-form)")
                         continue
                     _release_bridge_hold()
                     return bool(result) and not client_wants_close
@@ -16817,7 +16861,7 @@ class PinProxy:
         try:
             keep = self._forward(method, path, headers, body, tls,
                                  swapped=swapped, bridge_hold=_bridge_hold)
-            if keep is _AUTH_REJECTED:
+            if isinstance(keep, _AuthRejected):
                 # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
                 # 401/403/404 is terminal to the client — SSETransport treats
                 # those as permanent (M7y = new Set([401,403,404])), sets
@@ -17734,16 +17778,19 @@ class _AuthRejected:
 
     Distinct from True/False, which both mean "the client already has its
     response". This says the opposite — the client has received NOTHING and
-    the caller must retry.
+    the caller must retry. Carries the STATUS CODE the upstream refused
+    with, so a caller can trace which of 401/403/404 fired instead of a
+    bare "swap refused".
     """
 
-    __slots__ = ()
+    __slots__ = ("code",)
+
+    def __init__(self, code: int) -> None:
+        self.code = code
 
     def __bool__(self) -> bool:  # never mistaken for "keep the connection"
         return False
 
-
-_AUTH_REJECTED = _AuthRejected()
 
 _HOP_BY_HOP = {
     "connection",
@@ -18507,6 +18554,7 @@ def _relay_response(
     path: str | None = None,
     certdir=None,
     auth: str = "",
+    note_hop: bool = True,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
@@ -18521,6 +18569,11 @@ def _relay_response(
 
     Bytes are forwarded as they arrive, so an SSE stream reaches the client
     event-by-event instead of being buffered whole.
+
+    `note_hop` gates `_note_hop_trouble`: True (the default, what `_forward`
+    relies on) for the pin's own upstream, False for a foreign host relayed
+    on the plain path — a foreign host's own 5xx is not evidence about the
+    hop `_hop_recently_failed` guards.
     """
     # EVERY WRITE, NOT JUST THE FIRST. `on_headers` began as "the reply has
     # started", which the drain needed to tell a retryable cut from a lost one.
@@ -18569,9 +18622,13 @@ def _relay_response(
                 " (swap refused — retrying unswapped)\n"
             )
             _TRACE.flush()
-        return _AUTH_REJECTED
+        # ONE OF THE THREE `c` VALUES JUST MATCHED, so `status_line` is
+        # guaranteed to start with "HTTP/1.1 " + a 3-digit code at this
+        # exact offset.
+        return _AuthRejected(int(status_line.split(b" ", 2)[1]))
     _note_worker_status(path, status_line, certdir)
-    _note_hop_trouble(status_line)
+    if note_hop:
+        _note_hop_trouble(status_line)
     # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
     # above cannot see it; 401 is a rebuild trigger, 429 is not.
     _walled_401 = False
@@ -18719,13 +18776,13 @@ def _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
                 on_headers=None, on_status=on_status, path=path,
-                certdir=certdir, auth=auth,
+                certdir=certdir, auth=auth, note_hop=note_hop,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
             on_headers=None, on_status=on_status, path=path,
-            certdir=certdir, auth=auth,
+            certdir=certdir, auth=auth, note_hop=note_hop,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
