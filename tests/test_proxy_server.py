@@ -2657,8 +2657,9 @@ class TestChainRediscovery:
 
         # timeout=10: `learn_next_hop` calls `_probe_next_hop` with its 1.0s
         # default, tight enough that a loaded runner's own thread scheduling
-        # (not the network) can miss it — see `_probe_next_hop`'s call site
-        # in `learn_next_hop` for why the default stays 1.0s in production.
+        # (not the network) can miss it — see `learn_next_hop`'s own
+        # docstring (src/cswap_pin/proxy.py:17756-17758) for why the default
+        # stays 1.0s in production.
         real_probe = pp._probe_next_hop
         pp._probe_next_hop = functools.partial(real_probe, timeout=10)
         try:
@@ -6226,7 +6227,7 @@ class TestChainRediscovery:
 
         threading.Thread(target=serve, daemon=True).start()
         try:
-            nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}")
+            nxt = pp._probe_next_hop(f"http://127.0.0.1:{dead}", timeout=10)
             assert nxt == "http://127.0.0.1:8118", (
                 "the earlier failure to answer at all must not have "
                 "excluded this address")
@@ -6302,7 +6303,7 @@ class TestChainRediscovery:
             # asked, exactly once, and its answer still comes back. No sleep
             # needed here: `_probe_next_hop` only returns after the response
             # has already been read, so the accept is already recorded.
-            nxt = pp._probe_next_hop(other_url, own_proxy=ambient_url)
+            nxt = pp._probe_next_hop(other_url, timeout=10, own_proxy=ambient_url)
             assert nxt == "http://127.0.0.1:2"
             assert other_accepted == [1], other_accepted
         finally:
@@ -6513,6 +6514,15 @@ class TestChainRediscovery:
             monkeypatch.setattr(pp, "publish_ca", lambda _p: None)
             monkeypatch.setattr(pp, "wire_global_config", lambda *_a: None)
             monkeypatch.setattr(pp, "_read_alive_port", lambda *_a, **_k: 41000)
+            import functools
+
+            # timeout=10: `served` (6526) needs the server thread's own
+            # reply, not the network — see the analogous swap in
+            # `case_the_record_grows_and_refuses_a_hop_that_names_the_pin`.
+            monkeypatch.setattr(
+                pp, "_probe_next_hop",
+                functools.partial(pp._probe_next_hop, timeout=10),
+            )
 
             class _SW:
                 backup_dir = tmp_path
