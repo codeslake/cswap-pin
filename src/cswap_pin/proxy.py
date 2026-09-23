@@ -18528,7 +18528,7 @@ def _remember_walled_switch(key: tuple[bytes, str | None], ok: bool) -> None:
     (cswap moved back onto it), and a later request whose own slot read
     happened after this verdict is the signal that re-decides, in
     `_switch_off_walled_account`; "nothing to re-decide" was the false
-    premise a 1055-line 23-minute debounce storm measured on 2026-09-11.
+    premise a 1055-line 23-minute debounce storm measured on 2026-09-23.
     Every negative EXPIRES — a raise and a `switched=False` both mean "not
     now", not "not ever", and `retry_at=None` on a `switched=False` is what
     relayed 28 raw 429s across 101 seconds on 2026-09-09 while a healthy

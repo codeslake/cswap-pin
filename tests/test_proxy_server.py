@@ -16176,6 +16176,49 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert results["b"].startswith(b"HTTP/1.1 401"), results["b"][:40]
         assert len(calls) == 1, len(calls)
 
+    def case_two_concurrent_429s_on_the_same_wall_wait_for_the_switch_with_the_gate_open(
+        self, monkeypatch,
+    ):
+        """THE STORM BOUND WITH THE RE-DECIDE GATE ABLE TO OPEN. The case
+        above runs on `_wire`, where `_switch_takes_exclude()` reads False,
+        so it never exercises the `redecide` branch at all — nothing there
+        proves the storm still collapses into one `switch()` call once a
+        host CAN take `exclude`. Thread b reads its own slot (`seen_at`)
+        while thread a's `switch()` is still blocked, so that read predates
+        `decided_at` by construction: `seen_at >= decided_at` must read
+        False for it, same as the case above, one `switch()` call for both
+        429s."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _block():
+            entered.set()
+            assert release.wait(timeout=5), "release never set — test bug"
+
+        calls = self._wire_exclude_capable(monkeypatch, switched=True,
+                                            before=_block)
+
+        results = {}
+
+        def _run(key):
+            results[key] = self._relay()
+
+        t1 = threading.Thread(target=_run, args=("a",))
+        t1.start()
+        assert entered.wait(timeout=5), "switch() never started"
+
+        t2 = threading.Thread(target=_run, args=("b",))
+        t2.start()
+        time.sleep(0.2)
+        assert "b" not in results, results
+        release.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert results["a"].startswith(b"HTTP/1.1 401"), results["a"][:40]
+        assert results["b"].startswith(b"HTTP/1.1 401"), results["b"][:40]
+        assert len(calls) == 1, len(calls)
+
     def case_a_different_wall_switches_again(self, monkeypatch):
         """The debounce keys on the WALL's own reset value, not on a time
         window or the account identity: a different wall must switch again
@@ -16291,7 +16334,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     @staticmethod
     def _wire_exclude_capable(monkeypatch, switched, exclude_param=True,
-                               validated=True, live_token=None, live_num="1"):
+                               validated=True, live_token=None, live_num="1",
+                               before=None):
         """`ClaudeAccountSwitcher` as a real CLASS carrying `switch` as an
         ordinary method, so `_switch_takes_exclude`'s
         `inspect.signature(...ClaudeAccountSwitcher.switch)` can actually see
@@ -16300,7 +16344,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         all and `_switch_takes_exclude` reads False on the AttributeError —
         which is what keeps every case above this one immune to the
         re-decide gate regardless of timing. This wiring is what exercises
-        it."""
+        it. ``before``, as in `_wire`, runs at the top of `switch()`, for a
+        case that needs to block inside it."""
         from cswap_pin import proxy as pp
         calls = []
 
@@ -16316,6 +16361,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             def _switch(self, strategy=None, json_output=False, models=None,
                         current_at_limit=False, exclude=None):
                 calls.append(exclude)
+                if before is not None:
+                    before()
                 return {"switched": switched, "needsLogin": False,
                         "validated": validated,
                         "reason": None if switched else "candidates-exhausted"}
@@ -16323,6 +16370,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             def _switch(self, strategy=None, json_output=False, models=None,
                         current_at_limit=False):
                 calls.append(None)
+                if before is not None:
+                    before()
                 return {"switched": switched, "needsLogin": False,
                         "validated": validated,
                         "reason": None if switched else "candidates-exhausted"}
@@ -16344,7 +16393,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         """THE DEFECT: a settled TRUE was permanent, so once cswap moved BACK
         onto the walled slot inside its own wall the pin kept relaying a
         debounced 401 forever — measured 1055 times across 23 minutes on
-        2026-09-11 (wall reset unexpired, slot live again). A request whose
+        2026-09-23 (wall reset unexpired, slot live again). A request whose
         own slot read happened AFTER the verdict, and still names the walled
         slot, is what tells this apart from a storm waiter (whose read
         predates the verdict by construction): only that request re-decides,
