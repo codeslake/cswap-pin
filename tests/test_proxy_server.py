@@ -4866,12 +4866,14 @@ class TestChainRediscovery:
                 proxy.stop()
             chain.stop()
 
-    def case_an_http_1_0_request_with_keep_alive_stays_open_for_a_second_request(
+    def case_an_http_1_0_request_with_keep_alive_is_closed_after_its_reply(
         self, certdir
     ):
-        """The other half of finding 2: RFC 9112 9.3 only defaults HTTP/1.0
-        to close -- an explicit `Connection: keep-alive` overrides that
-        default, and the socket must serve a second request on it."""
+        """T1041 finding 4: RFC 9112 9.3 persists an HTTP/1.0 `keep-alive`
+        only when the recipient is not a proxy, or the message is a
+        response -- this pin is a proxy receiving a REQUEST, so neither
+        holds and the connection closes regardless of the client's own
+        `Connection: keep-alive`."""
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         chain = _RecordingChain(
@@ -4899,24 +4901,20 @@ class TestChainRediscovery:
                     got += d
                 assert got.startswith(b"HTTP/1.1 200"), got[:60]
 
-                c.sendall(
-                    b"GET https://example.com/second HTTP/1.0\r\n"
-                    b"Host: example.com\r\nConnection: keep-alive\r\n"
-                    b"Content-Length: 0\r\n\r\n")
-                got2 = b""
-                while b"\r\n\r\n" not in got2:
-                    d = c.recv(4096)
-                    if not d:
-                        break
-                    got2 += d
-                assert got2.startswith(b"HTTP/1.1 200"), got2[:60]
+                # THE PROXY MUST CLOSE ITS END, same discipline as an
+                # explicit `Connection: close` -- an HTTP/1.0 client's own
+                # `keep-alive` does not persist a connection to a proxy.
+                c.settimeout(5)
+                assert c.recv(1024) == b"", (
+                    "the socket stayed open after an HTTP/1.0 reply with "
+                    "Connection: keep-alive")
             finally:
                 c.close()
 
-            deadline = time.time() + 10
-            while len(seen) < 2 and time.time() < deadline:
+            deadline = time.time() + 5
+            while len(seen) < 1 and time.time() < deadline:
                 time.sleep(0.05)
-            assert len(seen) == 2, f"the chain saw {len(seen)} request(s), not 2"
+            assert len(seen) == 1, f"the chain saw {len(seen)} request(s), not 1"
         finally:
             if proxy:
                 proxy.stop()
@@ -5127,6 +5125,79 @@ class TestChainRediscovery:
         assert got_after_101.get("upstream_saw") == b"CLIENT-FRAME", (
             "the client's post-101 bytes were not pumped to the origin: "
             f"{got_after_101!r}")
+
+    def case_a_held_upgrade_response_reads_as_owed_through_the_hold(
+        self, certdir
+    ):
+        """T1041 finding 3: on the unpeeked path (`not (retry or
+        _bridge_cse)`), `_plain_relay_request`'s Upgrade tail cleared the
+        owed-answer debt the instant it decided not to peek -- before any
+        upstream byte had reached the client, unlike `_mitm`'s own Upgrade
+        tail (`_relay_upgrade`), which only clears it once the handshake
+        response has actually been relayed. While the origin holds its 101,
+        a drain reading `inflight_requests()` must still see this
+        connection as owed."""
+        from cswap_pin.proxy import PinProxy
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        oport = srv.getsockname()[1]
+        reached_hold = threading.Event()
+        release = threading.Event()
+
+        def origin():
+            try:
+                c, _ = srv.accept()
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += c.recv(4096)
+                reached_hold.set()
+                release.wait(10)
+                c.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                time.sleep(0.3)
+                c.close()
+            except Exception:
+                pass
+        threading.Thread(target=origin, daemon=True).start()
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(
+                f"GET http://127.0.0.1:{oport}/ws HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{oport}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n\r\n".encode())
+
+            assert reached_hold.wait(5), "the origin never saw the request"
+            time.sleep(0.1)  # let the debt-clear decision, if any, happen
+            assert proxy.inflight_requests() >= 1, (
+                "the connection read as not owed while the 101 was still "
+                "held upstream")
+
+            release.set()
+            got = b""
+            raw.settimeout(10)
+            while b"\r\n\r\n" not in got:
+                d = raw.recv(4096)
+                if not d:
+                    break
+                got += d
+            assert got.startswith(b"HTTP/1.1 101"), (
+                f"the upgrade handshake was not relayed: {got[:80]!r}")
+
+            deadline = time.time() + 5
+            while proxy.inflight_requests() and time.time() < deadline:
+                time.sleep(0.02)
+            assert proxy.inflight_requests() == 0, (
+                "the debt never cleared once the 101 reached the client")
+            raw.close()
+        finally:
+            proxy.stop()
+            srv.close()
 
     def case_a_cleartext_second_request_to_the_api_host_is_never_swapped(
         self, certdir
@@ -12539,12 +12610,15 @@ class TestDrainReportsWhatItCut:
             # AND THE MARK IS FORGOTTEN WHEN THE REPLY THAT SET IT ENDS,
             # or the set grows for the life of the daemon and fills with
             # sockets whose descriptors have been reused. SCOPED TO `_mitm`
-            # ITSELF (T1025): `_plain_relay` now clears the same debt at its
-            # own loop boundary (finding 5) with the identical call, and
-            # `_stream_conns` is only ever populated by `_mitm`'s own
-            # `_handle_one_request` -- a whole-module search would read
-            # whichever call comes first in the file, not the one this
-            # check is about.
+            # ITSELF (T1025): `_stream_conns` is only ever populated behind
+            # `_mitm`'s own loop boundary (`_handle_one_request`), so this
+            # check is about THAT boundary specifically -- a whole-module
+            # search would read whichever call comes first in the file, not
+            # the one this check is about. `_plain_relay` clears its own
+            # owed-answer debt at its own loop boundary (finding 5) with a
+            # different call, `_owe_answer(conn, False)` and never
+            # `_note_reply_finished` (see proxy.py ~16213), a deliberate
+            # difference this check does not cover.
             mitm_src = inspect.getsource(pp.PinProxy._mitm)
             paid = mitm_src.find("self._note_reply_finished(conn)")
             assert paid != -1, "the debt boundary moved; this guard is blind"
@@ -15040,9 +15114,10 @@ class TestASpuriousStream404DoesNotEndTheSession:
         touched.
 
         END TO END, through the real plain-relay call site
-        (`note_hop=host == UPSTREAM_HOST and secure`, :16534) -- a direct
-        `_relay_response(note_hop=False)` call stays green even with that
-        argument reverted to unconditional `True`, and caught nothing."""
+        (`note_hop=host == UPSTREAM_HOST and secure` in
+        `_plain_relay_request`) -- a direct `_relay_response(note_hop=False)`
+        call stays green even with that argument reverted to unconditional
+        `True`, and caught nothing."""
         from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 

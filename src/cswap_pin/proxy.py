@@ -16468,10 +16468,12 @@ class PinProxy:
         _conn_header = ", ".join(
             v for k, v in parsed if k.lower() == "connection")
         client_wants_close = "close" in _conn_header.lower() or (
-            # RFC 9112 9.3: HTTP/1.0 defaults to close, unlike 1.1 — only an
-            # explicit `Connection: keep-alive` persists it.
+            # RFC 9112 9.3: an HTTP/1.0 `keep-alive` persists a connection
+            # only when the recipient is not a proxy, or the message is a
+            # response. This pin is a proxy receiving a REQUEST, so neither
+            # holds and every HTTP/1.0 request closes, its own `Connection`
+            # header notwithstanding.
             len(rl) > 2 and rl[2] == "HTTP/1.0"
-            and "keep-alive" not in _conn_header.lower()
         )
 
         try:
@@ -16510,18 +16512,20 @@ class PinProxy:
                     up.settimeout(None)
                     up.sendall(head.encode("latin1") + body)
                     if upgrading:
-                        # THE OPAQUE TAIL. `retry`/`_bridge_cse` still decide
-                        # whether to peek the status first, exactly as
-                        # before this round: a refused swap is taken back
-                        # here too.
-                        seen = b""
-                        if retry or _bridge_cse:
-                            code, seen = _peek_status(up)
-                            if retry and code in (401, 403, 404):
-                                self._tunnel_trace(
-                                    f"{method} {rel} swap refused ({code}) — "
-                                    "retrying as it arrived (absolute-form)")
-                                continue
+                        # THE OPAQUE TAIL. Always peek the status first — a
+                        # drain reading `inflight_requests()` between the
+                        # dial and the handshake must still see this
+                        # connection as owed, the same order `_mitm`'s own
+                        # Upgrade tail keeps (`_relay_upgrade` relays before
+                        # `_owe_answer(_c, False)` runs). The take-back
+                        # stays gated on `retry` alone: a `_bridge_cse` hold
+                        # with no swap never asked for one.
+                        code, seen = _peek_status(up)
+                        if retry and code in (401, 403, 404):
+                            self._tunnel_trace(
+                                f"{method} {rel} swap refused ({code}) — "
+                                "retrying as it arrived (absolute-form)")
+                            continue
                         # RELEASED HERE, THE MOMENT THE STATUS LINE IS IN
                         # HAND — same discipline as the MITM path's
                         # `on_status` (see `_forward`): the outer `finally`
@@ -16530,11 +16534,13 @@ class PinProxy:
                         _release_bridge_hold()
                         if seen:
                             conn.sendall(seen)
-                        # AN OPAQUE TAIL OWES NOTHING, same as `_mitm`'s own
-                        # 101 handover and `_blind_tunnel`'s CONNECT one:
-                        # from here two sockets are pumped into each other
-                        # for the life of the connection, and nobody is
-                        # waiting on a reply.
+                        # THE DEBT CLEARS ONLY NOW, AFTER THE HANDSHAKE
+                        # REACHED THE CLIENT — not at the dial, or a drain
+                        # racing the peek above would read this connection
+                        # as answered while the client is still waiting on
+                        # a 101 the upstream has not sent yet. From here two
+                        # sockets are pumped into each other for the life of
+                        # the connection, and nobody is waiting on a reply.
                         self._owe_answer(conn, False)
                         _pump(conn, up)
                         return False
@@ -16543,6 +16549,10 @@ class PinProxy:
                     # carries — chunked re-framing, the swap take-back, the
                     # bridge-hold release at the status line — applies to
                     # every request here, not only a connection's first.
+                    #
+                    # NO `path=`/`certdir=`/`auth=` (T1041 finding 5): none of
+                    # what they enable is owed here — the standalone RC
+                    # client's absolute-form routes gate on none of them.
                     result = _relay_response(
                         up, conn, getattr(self._local, "cid", 0),
                         reject_on_auth_error=retry,
