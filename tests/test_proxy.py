@@ -20977,6 +20977,183 @@ class TestTheSweepClosesAReplacedTwin:
         assert closed == 0
 
 
+class TestTheSweepArchivesATranscriptProvenTwin:
+    """The FOURTH proof `sweep_superseded_bridges` accepts before disposing
+    of an active+disconnected twin that neither the dead-creator nor the
+    replaced-twin proof names: a `bridge-session` record in an ENDED
+    transcript sitting in the SAME project directory as a LIVE session's own
+    transcript, naming the twin. Disposed of by ARCHIVE, never DELETE --
+    this proof alone does not rule out the twin being exactly what someone
+    meant to keep.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _home(self, tmp_path, monkeypatch):
+        home = tmp_path / "cfg"
+        (home / "sessions").mkdir(parents=True)
+        (home / "jobs").mkdir(parents=True)
+        (home / "projects" / "proj").mkdir(parents=True)
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home",
+                            lambda: home)
+        return home
+
+    def _live_session(self, home, title, session_id="s-live",
+                       bridge="cse_local_new"):
+        """A live session on this host named `title`, holding `bridge`, with
+        its own (empty) transcript in `projects/proj` -- the file
+        `_archived_twin_proof` uses to find that directory."""
+        (home / "sessions" / f"{session_id}.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": session_id, "name": title,
+            "bridgeSessionId": bridge}))
+        (home / "projects" / "proj" / f"{session_id}.jsonl").write_text("")
+
+    def _daemon(self, sessions, deleted, archived):
+        from cswap_pin import proxy as pin_proxy
+
+        d = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        d._list_bridges = lambda tok: sessions
+        d._listing_complete = True
+        d._restore_bridge_titles = lambda s, tok: None
+
+        def _api(m, path, tok, **kw):
+            if m == "DELETE":
+                deleted.append(path.rsplit("/", 1)[-1])
+            elif path.endswith("/archive"):
+                archived.append(path.rsplit("/", 2)[-2])
+            return {"ok": True}
+
+        d._bridge_api = _api
+        return d
+
+    def _roster(self, twin_status="active", twin_connection="disconnected"):
+        """A live bridge and an older, offline twin -- both titled `work`,
+        a generic title with nothing to identify."""
+        return [
+            {"id": "cse_local_new", "title": "work", "status": "active",
+             "connection_status": "connected", "worker_status": "idle",
+             "last_event_at": "2026-01-02T00:00:00Z",
+             "created_at": "2020-01-01T00:00:00Z"},
+            {"id": "cse_twin", "title": "work",
+             "status": twin_status, "connection_status": twin_connection,
+             "worker_status": "idle",
+             "last_event_at": "2026-01-01T00:00:00Z",
+             "created_at": "2020-01-01T00:00:00Z"},
+        ]
+
+    def _stub_other_proofs(self, monkeypatch, live=("cse_local_new",)):
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_live_bridge_ids", lambda: set(live))
+        monkeypatch.setattr(pin_proxy, "_dead_creator_bridge_ids", lambda: set())
+        monkeypatch.setattr(pin_proxy, "_replaced_twin_bridge_ids", lambda: set())
+
+    def case_a_the_pair_archives_the_twin_never_deletes(
+            self, tmp_path, monkeypatch):
+        home = self._home(tmp_path, monkeypatch)
+        self._live_session(home, "work")
+        (home / "projects" / "proj" / "ended123.jsonl").write_text(
+            json.dumps({"type": "bridge-session", "sessionId": "ended123",
+                        "bridgeSessionId": "cse_twin"}) + "\n")
+        self._stub_other_proofs(monkeypatch)
+        deleted, archived = [], []
+        result = self._daemon(
+            self._roster(), deleted, archived
+        ).sweep_superseded_bridges("tok")
+        assert archived == ["cse_twin"], archived
+        assert deleted == [], deleted
+        assert result == 1
+
+    def case_b_control_an_offline_only_title_is_kept(
+            self, tmp_path, monkeypatch):
+        """CONTROL: the only `work` is this offline session -- no live
+        session shares its title, though a transcript still names it."""
+        home = self._home(tmp_path, monkeypatch)
+        (home / "projects" / "proj" / "ended123.jsonl").write_text(
+            json.dumps({"type": "bridge-session", "sessionId": "ended123",
+                        "bridgeSessionId": "cse_twin"}) + "\n")
+        self._stub_other_proofs(monkeypatch, live=())
+        deleted, archived = [], []
+        roster = [{"id": "cse_twin", "title": "work", "status": "active",
+                   "connection_status": "disconnected", "worker_status": "idle",
+                   "last_event_at": "2026-01-01T00:00:00Z",
+                   "created_at": "2020-01-01T00:00:00Z"}]
+        result = self._daemon(roster, deleted, archived) \
+            .sweep_superseded_bridges("tok")
+        assert archived == [], archived
+        assert deleted == [], deleted
+        assert result == 0
+
+    def case_c_no_proof_another_machines_twin_is_kept(
+            self, tmp_path, monkeypatch):
+        """As (a), but nothing in the live session's project directory
+        names THIS twin -- the one record there names a different bridge,
+        the shape another machine's sleeping twin of the same title takes."""
+        home = self._home(tmp_path, monkeypatch)
+        self._live_session(home, "work")
+        (home / "projects" / "proj" / "ended123.jsonl").write_text(
+            json.dumps({"type": "bridge-session", "sessionId": "ended123",
+                        "bridgeSessionId": "cse_some_other_machine"}) + "\n")
+        self._stub_other_proofs(monkeypatch)
+        deleted, archived = [], []
+        result = self._daemon(
+            self._roster(), deleted, archived
+        ).sweep_superseded_bridges("tok")
+        assert archived == [], archived
+        assert deleted == [], deleted
+        assert result == 0
+
+    def case_d_a_twin_a_live_session_still_holds_is_kept(
+            self, tmp_path, monkeypatch):
+        """As (a), but the twin's id is ALSO a live session's OWN held
+        bridge (`live_bridge_names()`) -- `_live_bridge_ids()` is stubbed to
+        leave it out, so only the explicit guard can be what keeps it.
+        Archiving it would just have `revive_archived_bridges` unarchive it
+        back."""
+        home = self._home(tmp_path, monkeypatch)
+        self._live_session(home, "work")
+        (home / "projects" / "proj" / "ended123.jsonl").write_text(
+            json.dumps({"type": "bridge-session", "sessionId": "ended123",
+                        "bridgeSessionId": "cse_twin"}) + "\n")
+        (home / "sessions" / "s-other.json").write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": "s-other", "name": "elsewhere",
+            "bridgeSessionId": "cse_twin"}))
+        self._stub_other_proofs(monkeypatch)
+        deleted, archived = [], []
+        result = self._daemon(
+            self._roster(), deleted, archived
+        ).sweep_superseded_bridges("tok")
+        assert archived == [], archived
+        assert deleted == [], deleted
+        assert result == 0
+
+    def case_e_a_record_past_the_64kb_tail_is_still_archived(
+            self, tmp_path, monkeypatch):
+        """As (a), but the naming record sits in the LIVE session's OWN
+        transcript, more than `_POINTER_TAIL_BYTES` before the end --
+        outside `_transcript_bridge_history`'s bounded tail. The new proof
+        reads the whole file and still finds it."""
+        from cswap_pin import proxy as pin_proxy
+
+        home = self._home(tmp_path, monkeypatch)
+        self._live_session(home, "work")  # writes an EMPTY s-live.jsonl
+        naming = json.dumps({"type": "bridge-session", "sessionId": "s-live",
+                              "bridgeSessionId": "cse_twin"}) + "\n"
+        filler = ("x" * 200 + "\n") * 400  # comfortably over 64 KiB
+        tx = home / "projects" / "proj" / "s-live.jsonl"
+        tx.write_text(naming + filler)
+        assert len(tx.read_bytes()) - len(naming) > pin_proxy._POINTER_TAIL_BYTES
+        self._stub_other_proofs(monkeypatch)
+        deleted, archived = [], []
+        result = self._daemon(
+            self._roster(), deleted, archived
+        ).sweep_superseded_bridges("tok")
+        assert archived == ["cse_twin"], archived
+        assert deleted == [], deleted
+        assert result == 1
+
+
 #: THE LONGEST BYTE-FREE WAIT IN THE FLEET WATCHER'S CORPUS -- not the longest
 #: ever seen. A 140s sample was reported before the corpus file existed, which
 #: is why the watcher banks them: the daemon log rotates and loses them. Only
