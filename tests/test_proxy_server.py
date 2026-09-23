@@ -15367,6 +15367,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         })()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
+        pp._walled_slots.clear()
         return calls
 
     @classmethod
@@ -16002,12 +16003,20 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 before=_raise if row["Switch"] == "Raised" else None,
                 **self.SWITCH_WIRING[row["Switch"]])
             key = (b"9999999999", slot)
+            # `decided_at` in the past: this fixture's `ClaudeAccountSwitcher`
+            # has no `.switch` class attribute (`_wire`'s lambda returns an
+            # instance, not a class), so `_switch_takes_exclude` always reads
+            # False here and the re-decide gate this fix adds never opens —
+            # the model's own rows carry no case for it.
+            decided_at = time.monotonic() - 1.0
             if row["MemoEntry"] == "SettledConversion":
-                pp._walled_switch_seen[key] = (True, None)
+                pp._walled_switch_seen[key] = (True, None, decided_at)
             elif row["MemoEntry"] == "LiveNegative":
-                pp._walled_switch_seen[key] = (False, time.monotonic() + 1e6)
+                pp._walled_switch_seen[key] = (
+                    False, time.monotonic() + 1e6, decided_at)
             elif row["MemoEntry"] == "ExpiredNegative":
-                pp._walled_switch_seen[key] = (False, time.monotonic() - 1.0)
+                pp._walled_switch_seen[key] = (
+                    False, time.monotonic() - 1.0, decided_at)
             auth = {"BearerStale": "Bearer stale-account-token",
                     "BearerIsLive": "Bearer " + self.LIVE,
                     "NonBearerScheme": "Basic dXNlcjpwYXNz",
@@ -16277,6 +16286,169 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert status == 401, (
             "the client's bearer never reached the relay, so the daemon "
             f"relayed the wall the host had already left: {status}")
+
+    # --- a walled slot going live again inside its own wall (T1111) -------
+
+    @staticmethod
+    def _wire_exclude_capable(monkeypatch, switched, exclude_param=True,
+                               validated=True, live_token=None, live_num="1"):
+        """`ClaudeAccountSwitcher` as a real CLASS carrying `switch` as an
+        ordinary method, so `_switch_takes_exclude`'s
+        `inspect.signature(...ClaudeAccountSwitcher.switch)` can actually see
+        whether `exclude` is in it. `_wire`'s lambda returns an INSTANCE, so
+        `ClaudeAccountSwitcher.switch` there has no `.switch` attribute at
+        all and `_switch_takes_exclude` reads False on the AttributeError —
+        which is what keeps every case above this one immune to the
+        re-decide gate regardless of timing. This wiring is what exercises
+        it."""
+        from cswap_pin import proxy as pp
+        calls = []
+
+        def _read_credentials(self):
+            if live_token is None:
+                raise OSError("credential store unreadable")
+            return json.dumps({"claudeAiOauth": {"accessToken": live_token}})
+
+        def _current_account_number(self):
+            return live_num() if callable(live_num) else live_num
+
+        if exclude_param:
+            def _switch(self, strategy=None, json_output=False, models=None,
+                        current_at_limit=False, exclude=None):
+                calls.append(exclude)
+                return {"switched": switched, "needsLogin": False,
+                        "validated": validated,
+                        "reason": None if switched else "candidates-exhausted"}
+        else:
+            def _switch(self, strategy=None, json_output=False, models=None,
+                        current_at_limit=False):
+                calls.append(None)
+                return {"switched": switched, "needsLogin": False,
+                        "validated": validated,
+                        "reason": None if switched else "candidates-exhausted"}
+
+        fake_switcher = type("FakeSwitcher", (), {
+            "_read_credentials": _read_credentials,
+            "current_account_number": _current_account_number,
+            "switch": _switch,
+        })
+        fake_module = type("M", (), {"ClaudeAccountSwitcher": fake_switcher})()
+        monkeypatch.setattr(pp, "require", lambda n: fake_module)
+        pp._walled_switch_seen.clear()
+        pp._walled_slots.clear()
+        return calls
+
+    def case_a_walled_slot_live_again_re_decides_when_the_host_can_exclude_it(
+        self, monkeypatch,
+    ):
+        """THE DEFECT: a settled TRUE was permanent, so once cswap moved BACK
+        onto the walled slot inside its own wall the pin kept relaying a
+        debounced 401 forever — measured 1055 times across 23 minutes on
+        2026-09-11 (wall reset unexpired, slot live again). A request whose
+        own slot read happened AFTER the verdict, and still names the walled
+        slot, is what tells this apart from a storm waiter (whose read
+        predates the verdict by construction): only that request re-decides,
+        and only when the host can be told to skip the slot it would
+        otherwise land right back on."""
+        from cswap_pin import proxy as pp
+        calls = self._wire_exclude_capable(monkeypatch, switched=True,
+                                            live_num="6")
+        pp._walled_switch_seen[(b"9999999999", "6")] = (
+            True, None, time.monotonic() - 1.0)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert len(calls) == 1, (
+            "the walled slot is live again; a fresh switch() attempt was "
+            f"owed, not a bare debounce: {calls}")
+
+    def case_a_storm_waiter_reading_before_the_verdict_still_just_debounces(
+        self, monkeypatch,
+    ):
+        """THE CONTROL for the case above. Without the `seen_at < decided_at`
+        gate every debounced repeat would re-attempt `switch()` — exactly
+        the ten-at-once storm `case_two_concurrent_429s_on_the_same_wall_
+        wait_for_the_switch` exists to collapse into one call. Seeding
+        `decided_at` far in the future stands in for a read that truly
+        predates the verdict, deterministically and without a sleep."""
+        from cswap_pin import proxy as pp
+        calls = self._wire_exclude_capable(monkeypatch, switched=True,
+                                            live_num="6")
+        pp._walled_switch_seen[(b"9999999999", "6")] = (
+            True, None, time.monotonic() + 1e6)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert not calls, (
+            f"a storm waiter must not re-attempt the switch: {calls}")
+
+    def case_a_host_that_cannot_exclude_keeps_the_bare_debounce(
+        self, monkeypatch,
+    ):
+        """THE OTHER CONTROL. Without `exclude` a re-decide could ping-pong
+        between two walled slots, one consume per client retry — so on a
+        host whose `switch()` predates the kwarg (every host until a
+        separate cswap task ships it) the pin must keep debouncing exactly
+        as it did before this fix, even though the slot read postdates the
+        verdict."""
+        from cswap_pin import proxy as pp
+        calls = self._wire_exclude_capable(monkeypatch, switched=True,
+                                            exclude_param=False, live_num="6")
+        pp._walled_switch_seen[(b"9999999999", "6")] = (
+            True, None, time.monotonic() - 1.0)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert not calls, (
+            "a host without `exclude` must not re-attempt the switch: "
+            f"{calls}")
+
+    def case_switch_excludes_a_slot_still_inside_its_own_wall(
+        self, monkeypatch,
+    ):
+        """THE SECOND CAUSE: the pin's own switch-off can land right back on
+        a slot it already knows is walled, because cswap's `switch()`
+        cannot be told to skip one — until a separate cswap task adds
+        `exclude`. `_walled_slots` is what feeds it: a fresh 429 on a
+        different slot, with no memo entry of its own, still must not switch
+        onto a slot this daemon already recorded a live, unexpired wall
+        for."""
+        from cswap_pin import proxy as pp
+        calls = self._wire_exclude_capable(
+            monkeypatch, switched=False, live_token=self.LIVE, live_num="4")
+        pp._walled_slots["6"] = time.time() + 3600
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert len(calls) == 1, calls
+        assert "6" in calls[0], (
+            f"the still-walled slot must be excluded from the switch: {calls}")
+
+    def case_an_expired_walled_slot_is_not_excluded(self, monkeypatch):
+        """THE CONTROL. `_walled_slots` is a decaying set, not a log: once
+        the slot's own wall has passed, keeping it excluded forever would
+        refuse a perfectly healthy account for no reason."""
+        from cswap_pin import proxy as pp
+        calls = self._wire_exclude_capable(
+            monkeypatch, switched=False, live_token=self.LIVE, live_num="4")
+        pp._walled_slots["6"] = time.time() - 10
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert len(calls) == 1, calls
+        assert "6" not in calls[0], (
+            f"an expired wall must not exclude its slot forever: {calls}")
+
+    def case_a_bearer_branch_conversion_records_no_walled_slot(
+        self, monkeypatch,
+    ):
+        """The bearer branch answers for a credential nobody has confirmed
+        is still walled — its reset belongs to whichever account the
+        client's frozen bearer names, not to the slot cswap has live now.
+        Recording it into `_walled_slots` would make a future switch avoid a
+        slot on no evidence at all."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert not pp._walled_slots, pp._walled_slots
 
 
 class TestTheEvidenceSurvivesAHandover:

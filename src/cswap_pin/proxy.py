@@ -20,6 +20,7 @@ import base64
 import contextlib
 import datetime as _dt
 import glob
+import inspect
 import itertools
 import json
 import os
@@ -18484,15 +18485,31 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
 
 
 _walled_switch_lock = threading.Lock()
-# reset -> (ok, retry_at). Insertion-ordered, capped at 8 — a bounded memo,
-# not a bound on how many walls can be in flight: once the cap is hit the
-# OLDEST entry is dropped, so a straggler request from a wall we already
-# left (A -> switched to B -> B also walled -> switched to C) can re-run the
-# switch once, the pre-existing behaviour. `retry_at` is None for a settled
-# CONVERSION and a monotonic deadline for every negative; see
-# `_remember_walled_switch` for why the asymmetry runs that way.
+# (reset, slot) -> (ok, retry_at, decided_at). Insertion-ordered, capped at
+# 8 — a bounded memo, not a bound on how many walls can be in flight: once
+# the cap is hit the OLDEST entry is dropped, so a straggler request from a
+# wall we already left (A -> switched to B -> B also walled -> switched to
+# C) can re-run the switch once, the pre-existing behaviour. `retry_at` is
+# None for a settled CONVERSION and a monotonic deadline for every negative;
+# see `_remember_walled_switch` for why the asymmetry runs that way.
+# `decided_at` is the monotonic time the verdict was written, so a later
+# request whose own slot read (`seen_at`, in `_switch_off_walled_account`)
+# happened AFTER it can tell "I am a storm waiter that read the slot before
+# the switch landed" from "the walled slot is live again, on a later look" —
+# the settled TRUE alone cannot, once a switch-off is permanent history
+# rather than a decision nobody has revisited.
 _walled_switch_seen: dict[tuple[bytes, str | None],
-                          tuple[bool, float | None]] = {}
+                          tuple[bool, float | None, float]] = {}
+
+# slot -> the reset epoch (seconds, from the wall's own header) that walled
+# it, recorded only for a 429 whose bearer is the live slot's own token —
+# see `_switch_off_walled_account`. Read as the set of slots still inside
+# their own wall (epoch > time.time()); expired entries are pruned on read,
+# so this is a decaying set, not a log. Feeds `exclude=` on `switch()` when
+# the host supports it (`_switch_takes_exclude`), so a switch-off does not
+# hand the account straight back onto a slot this daemon already knows is
+# still walled.
+_walled_slots: dict[str, float] = {}
 
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
 # enough that a storm on one wall does not re-attempt for every repeat,
@@ -18506,15 +18523,21 @@ def _remember_walled_switch(key: tuple[bytes, str | None], ok: bool) -> None:
 
     ONE WRITER, because the asymmetry is the whole point and it was wrong in
     two of the three places that wrote it. A validated conversion is
-    permanent: the account really is off, so a later repeat has nothing to
-    re-decide. Every negative EXPIRES — a raise and a `switched=False` both
-    mean "not now", not "not ever", and `retry_at=None` on a `switched=False`
-    is what relayed 28 raw 429s across 101 seconds on 2026-09-09 while a
-    healthy account sat live and unreachable.
+    permanent AS A RECORD — the switch really landed — but not as a licence
+    to stop looking: the walled slot can go live again inside its own wall
+    (cswap moved back onto it), and a later request whose own slot read
+    happened after this verdict is the signal that re-decides, in
+    `_switch_off_walled_account`; "nothing to re-decide" was the false
+    premise a 1055-line 23-minute debounce storm measured on 2026-09-11.
+    Every negative EXPIRES — a raise and a `switched=False` both mean "not
+    now", not "not ever", and `retry_at=None` on a `switched=False` is what
+    relayed 28 raw 429s across 101 seconds on 2026-09-09 while a healthy
+    account sat live and unreachable.
     """
+    now = time.monotonic()
     _walled_switch_seen[key] = (
-        (True, None) if ok
-        else (False, time.monotonic() + _WALLED_SWITCH_RAISE_TTL)
+        (True, None, now) if ok
+        else (False, now + _WALLED_SWITCH_RAISE_TTL, now)
     )
     if len(_walled_switch_seen) > 8:
         del _walled_switch_seen[next(iter(_walled_switch_seen))]
@@ -18575,6 +18598,20 @@ def _live_account_headroom(num: str) -> float | None:
         return None
 
 
+def _switch_takes_exclude() -> bool:
+    """Whether this host's `switch()` accepts `exclude`, the slot-skip kwarg
+    a separate cswap task adds so a switch-off need not hand the account
+    straight back onto a slot this daemon already knows is still walled. Not
+    every host has it yet, so the pin must work against both: False on any
+    exception (an older `switch()`, or the symbol missing outright) leaves
+    the call exactly as it was before this kwarg existed."""
+    try:
+        return "exclude" in inspect.signature(
+            require("switcher").ClaudeAccountSwitcher.switch).parameters
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return False
+
+
 def _switch_off_walled_account(
     reset: bytes, retry_after: bytes, auth: str = "",
 ) -> bool:
@@ -18602,12 +18639,16 @@ def _switch_off_walled_account(
 
     True means "turn the 429 the client will see into a 401" — because this
     call switched the account off onto a credential the host confirmed is
-    LIVE, or an earlier call for this same wall already did, or the host had
-    ALREADY moved and the client's frozen bearer is the only thing still on
-    the walled account (`_live_account_headroom`: a 401 alone fixes that, and
-    no switch can). False (no headroom anywhere, `switch()` raised, `switch()`
-    landed a credential it never validated, or a repeat of a wall that never
-    earned a 401 and whose expiry has not passed) means
+    LIVE, or an earlier call for this same wall already did AND THAT VERDICT
+    STILL HOLDS (a request whose own slot read happened before the switch is
+    a storm waiter and gets the debounce as-is; one whose slot read happened
+    after, and still names the walled slot, means the wall let the account
+    back onto it and RE-DECIDES instead — see `seen_at`/`decided_at` below),
+    or the host had ALREADY moved and the client's frozen bearer is the only
+    thing still on the walled account (`_live_account_headroom`: a 401 alone
+    fixes that, and no switch can). False (no headroom anywhere, `switch()`
+    raised, `switch()` landed a credential it never validated, or a repeat of
+    a wall that never earned a 401 and whose expiry has not passed) means
     relay the 429 with its rate-limit headers stripped, so the client backs
     off and retries instead of sleeping the wall's own reset window; a 401
     onto a credential nobody confirmed is alive is worse than the wall
@@ -18655,6 +18696,12 @@ def _switch_off_walled_account(
     # That is the exhaustion `headroom > 0` exists to prevent, so the pair is
     # read adjacently here and the debounce pays one extra store read rather
     # than deciding on two different accounts.
+    #
+    # `seen_at` IS READ HERE TOO, immediately before the slot, for the same
+    # reason: it dates this request's own look at the slot, which is what
+    # tells a storm waiter (its look predates the verdict) from a later
+    # request finding the walled slot live again (its look postdates it).
+    seen_at = time.monotonic()
     slot = _live_account_slot()
     live = _active_oauth_token()
     with _walled_switch_lock:
@@ -18669,14 +18716,32 @@ def _switch_off_walled_account(
         # number does not rotate.
         key = (reset, slot)
         if key in _walled_switch_seen:
-            ok, retry_at = _walled_switch_seen[key]
+            ok, retry_at, decided_at = _walled_switch_seen[key]
             if retry_at is None or time.monotonic() < retry_at:
+                # A settled TRUE is not re-decided on every hit: only when
+                # THIS request's own slot read happened after the verdict
+                # (so it is not one of the storm's own waiters, whose read
+                # predates the switch by construction) AND the host can be
+                # told to skip the slot it would otherwise land right back
+                # on. Without `exclude` a re-decide could ping-pong between
+                # two walled slots, one consume per client retry — worse
+                # than the standing debounce it would replace.
+                redecide = (ok and seen_at >= decided_at
+                            and _switch_takes_exclude())
+                if not redecide:
+                    _log_lifecycle(
+                        "429 on /v1/messages — debounced repeat of wall reset="
+                        f"{reset.decode('latin1', 'replace')}, relaying "
+                        f"{'a 401' if ok else 'the 429 with headers stripped'}"
+                    )
+                    return ok
                 _log_lifecycle(
-                    "429 on /v1/messages — debounced repeat of wall reset="
-                    f"{reset.decode('latin1', 'replace')}, relaying "
-                    f"{'a 401' if ok else 'the 429 with headers stripped'}"
+                    "429 on /v1/messages — wall reset="
+                    f"{reset.decode('latin1', 'replace')} is on slot "
+                    f"{slot} again after the pin switched off it; "
+                    "re-deciding"
                 )
-                return ok
+                # Falls through to the ordinary decision path below.
             # The negative's short expiry passed: treat this wall as unseen.
         # NO SWITCH IS NEEDED WHEN THE HOST HAS ALREADY MOVED. `switch()`
         # answers "did I just switch?"; what decides whether a 401 helps is
@@ -18727,6 +18792,16 @@ def _switch_off_walled_account(
                 # until the retry loop exhausts into `authentication_failed`.
                 _remember_walled_switch(key, False)
                 return True
+        # THE WALL ITSELF, RECORDED — only for a 429 whose bearer is the
+        # live slot's OWN token: a bearer-branch 429 (handled above) is
+        # someone else's frozen credential and its reset belongs to another
+        # account, not to the slot cswap has active now. An unparseable
+        # reset records nothing rather than a slot excluded forever.
+        if slot is not None and token and live and token == live:
+            try:
+                _walled_slots[slot] = float(reset)
+            except ValueError:
+                pass
         try:
             switcher = require("switcher")
             # NOT `switch_off_at_limit_account`, which passes no `models` and
@@ -18756,10 +18831,17 @@ def _switch_off_walled_account(
             # claude-swap — survives unchanged: an older `switch()` has no
             # `models` parameter, so the TypeError lands in the except below
             # and relays the 429, exactly as a missing symbol did.
-            result = switcher.ClaudeAccountSwitcher().switch(
+            switch_kwargs = dict(
                 strategy="best", json_output=True,
                 current_at_limit=True, models=("all",),
             )
+            if _switch_takes_exclude():
+                now = time.time()
+                for expired in [s for s, exp in _walled_slots.items()
+                                 if exp <= now]:
+                    del _walled_slots[expired]
+                switch_kwargs["exclude"] = frozenset(_walled_slots)
+            result = switcher.ClaudeAccountSwitcher().switch(**switch_kwargs)
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
                 f"429 on /v1/messages — the at-limit switch raised "
