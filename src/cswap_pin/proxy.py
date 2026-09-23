@@ -2873,7 +2873,12 @@ _ENV_BRIDGE = re.compile(
     # rest on it either way: listing creates nothing and mints nothing, so
     # there is no ownership to get wrong by including it.
     r"(?:$|\?"
-    r"|/(?:bridge(?:/|$|\?)"
+    # `bridge` alone is register; `bridge/<env>` is deregister -- both stop
+    # right there. `bridge/<env>/offline` (markEnvironmentOffline, CC
+    # 2.1.280) carries the ENVIRONMENT SECRET as bearer, exactly like the
+    # /work/* routes below, so it must not fall through this same prefix --
+    # swapped, it answers 401 before the take-back ever runs.
+    r"|/(?:bridge(?:$|\?|/[^/?]*(?:$|\?))"
     r"|[^/?]+/bridge/reconnect(?:/|$|\?)))"
 )
 
@@ -12108,8 +12113,9 @@ _STAMP_KINDS = ("org", "key", "wif", "token")
 
 
 def _trusted_stamp_identity(existing, expected_sha):
-    """`(identity, kind, hipaa_seen)` from an EXISTING stamp CC itself can be
-    trusted to have written, or None.
+    """`(identity, kind, hipaa_seen, hipaa_seen_incomplete, hipaa_ruled_out)`
+    from an EXISTING stamp CC itself can be trusted to have written, or
+    None.
 
     GROUND TRUTH, not a guess. An earlier draft of this fix
     (`_local_stamp_identity`) tried to re-derive `lve()`'s precedence -- an
@@ -12128,9 +12134,14 @@ def _trusted_stamp_identity(existing, expected_sha):
     Trusted only when the stamp's `sha` names `expected_sha` -- the body CC
     actually validated it against, before this sweep does anything to
     either file -- and the whole record still matches the shape CC's own
-    schema requires (`v`, `identity`, `kind`, `sha`, `confirmed_at`,
-    `hipaa_seen`, each element of the latter a 64-hex-char string);
-    anything else carries no assurance CC computed it at all.
+    2.1.275 schema requires (`v`, `identity`, `kind`, `sha`, `confirmed_at`,
+    `hipaa_seen`, each element of the latter a 64-hex-char string, plus the
+    two keys CC's own writer (`mZn`) emits only once a record is
+    incomplete: `hipaa_seen_incomplete` a bool, `hipaa_ruled_out` the same
+    hex64-max-8 shape as `hipaa_seen`); anything else carries no assurance
+    CC computed it at all. Both are OPTIONAL -- a COMPLETE stamp carries
+    neither -- so their absence defaults to `False`/`[]` rather than
+    failing trust.
     `expected_sha` itself being unknown (the body was unreadable, or this
     is the very first sweep) also trusts nothing: there is no claim to
     check the stamp against.
@@ -12154,6 +12165,8 @@ def _trusted_stamp_identity(existing, expected_sha):
     kind = existing.get("kind")
     hipaa_seen = existing.get("hipaa_seen")
     confirmed_at = existing.get("confirmed_at")
+    incomplete = existing.get("hipaa_seen_incomplete", False)
+    ruled_out = existing.get("hipaa_ruled_out", [])
     if (existing.get("v") != 1
             or not isinstance(identity, str)
             or not re.fullmatch(r"[0-9a-f]{64}", identity)
@@ -12166,9 +12179,39 @@ def _trusted_stamp_identity(existing, expected_sha):
             or not isinstance(hipaa_seen, list)
             or len(hipaa_seen) > 8
             or not all(isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
-                       for h in hipaa_seen)):
+                       for h in hipaa_seen)
+            or not isinstance(incomplete, bool)
+            or not isinstance(ruled_out, list)
+            or len(ruled_out) > 8
+            or not all(isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
+                       for h in ruled_out)):
         return None
-    return identity, kind, hipaa_seen
+    return identity, kind, hipaa_seen, incomplete, ruled_out
+
+
+def _stamp_carries_evidence(existing: "dict | None") -> bool:
+    """Whether an on-disk `.stamp.json` carries HIPAA evidence a plain
+    unlink would erase: a `hipaa_seen` with at least one well-formed
+    identity, `hipaa_seen_incomplete` true, or CC's own 2.1.275 tombstone
+    (`sha:"none"`, written by `deleteCacheFile` in place of an unlink
+    whenever ITS evidence is non-empty or incomplete). See
+    `sweep_policy_once`'s own T1004 note.
+
+    A `hipaa_seen`/`hipaa_ruled_out` entry that is NOT a well-formed
+    identity is not evidence, only noise `_trusted_stamp_identity` already
+    refuses to trust for other reasons -- checked here so a malformed
+    fixture that exercises THAT refusal (see
+    `case_a_malformed_hipaa_seen_entry_falls_back_to_the_unlink` and its
+    `hipaa_ruled_out` sibling) does not also trip this guard.
+    """
+    if not isinstance(existing, dict):
+        return False
+    if existing.get("sha") == "none" or existing.get("hipaa_seen_incomplete") is True:
+        return True
+    seen = existing.get("hipaa_seen")
+    return isinstance(seen, list) and any(
+        isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h) for h in seen
+    )
 
 
 class PinProxy:
@@ -12936,6 +12979,32 @@ class PinProxy:
         except Exception:  # noqa: BLE001 — unreadable: no reference sha
             pass
         wrote = old_doc != doc
+        # T1004 (T0986 CHANGE 4, "path B"): EVIDENCE WINS, read BEFORE
+        # either file is touched. `_fall_back_to_unlink` below would
+        # otherwise trade CC's own HIPAA evidence -- or its 2.1.275
+        # tombstone, `sha:"none"` -- for a blind guess the moment this
+        # sweep cannot vouch for an identity to mint instead. That unlink
+        # was CC's own 2.1.274 delete behaviour and is not its 2.1.275 one:
+        # `deleteCacheFile` there refuses exactly this unlink when the
+        # evidence is non-empty or incomplete. Writing the body anyway and
+        # leaving the stale stamp is not the safe alternative either -- a
+        # stamp whose sha no longer names the fresh body reads "unstamped"
+        # (refused), which is the very refusal this sweep exists to
+        # prevent. So when there is evidence and nothing here can vouch
+        # for an identity to mint, NEITHER file is touched: CC's own next
+        # swapped fetch rewrites both and carries the evidence forward,
+        # which only costs this sweep cycle, never the evidence itself.
+        stamp = path.with_name(path.name + ".stamp.json")
+        witness_path = path.with_name(path.name + ".pin-witness.json")
+        existing_stamp = _read_json(stamp)
+        trusted = _trusted_stamp_identity(existing_stamp, old_body_sha)
+        if _stamp_carries_evidence(existing_stamp):
+            if trusted is None:
+                return False
+            if wrote:
+                current = _sweep_witness()
+                if current is None or _read_json(witness_path) != current:
+                    return False
         write_failed = False
         if wrote:
             try:
@@ -12987,16 +13056,16 @@ class PinProxy:
         # not before: mid-write the state is "new stamp, old body" -> torn
         # -> refused, the safe direction. Any OSError here is silently
         # fine; this runs off the sweep's own timer and must never fail it.
-        stamp = path.with_name(path.name + ".stamp.json")
-        # T0681 ROUND 4: our OWN fingerprint of the account active when we
-        # last minted `stamp`, kept beside it -- see `_sweep_witness`. Never
-        # read by CC; consulted only below, at the one moment an identity
-        # is about to be carried onto a body it was never confirmed
-        # against (the skip path further down, where `target_sha` already
-        # equals `old_body_sha`, leaves an already-correct stamp untouched
-        # regardless of this file, exactly as before this round).
-        witness_path = path.with_name(path.name + ".pin-witness.json")
-        trusted = _trusted_stamp_identity(_read_json(stamp), old_body_sha)
+        # `stamp`, `witness_path` and `trusted` were already read above --
+        # T1004's evidence guard needs them before either file is touched.
+        # (T0681 ROUND 4: `witness_path` is our OWN fingerprint of the
+        # account active when we last minted `stamp`, kept beside it -- see
+        # `_sweep_witness`. Never read by CC; consulted below, at the one
+        # moment an identity is about to be carried onto a body it was
+        # never confirmed against -- the skip path further down, where
+        # `target_sha` already equals `old_body_sha`, leaves an
+        # already-correct stamp untouched regardless of this file, exactly
+        # as before that round.)
         target_sha = (_canonical_body_sha(doc)
                       if wrote and not write_failed else old_body_sha)
         healed = False
@@ -13061,20 +13130,38 @@ class PinProxy:
             if current is None or recorded != current:
                 _fall_back_to_unlink(current)
             else:
-                identity_hex, kind, prev_seen = trusted
-                # hipaa_seen mirrors CC's own `bzn`: drop any earlier record
-                # of THIS identity, then re-add it only if the fresh body
-                # carries a "hipaa" taint, capped to the last 8 (CC's `ce`).
-                # `prev_seen` is already list-shaped --
+                identity_hex, kind, prev_seen, prev_incomplete, prev_ruled_out = trusted
+                # MIRRORS CC's OWN `mZn` (2.1.275) line for line, replacing
+                # the retired `bzn` this used to mirror (T1004): drop any
+                # earlier record of THIS identity from both `seen` and
+                # `ruled_out`, then re-add it to `seen` on a fresh "hipaa"
+                # taint, else to `ruled_out` when the PRIOR stamp was
+                # already incomplete -- an untainted identity against a
+                # COMPLETE prior stamp is left unrecorded, same as before
+                # this round. `prev_seen`/`prev_ruled_out` are already
+                # list-shaped and `prev_incomplete` already bool --
                 # `_trusted_stamp_identity` checked -- so no further
                 # validation is owed here.
                 seen = [h for h in prev_seen if h != identity_hex]
+                ruled_out = [h for h in prev_ruled_out if h != identity_hex]
                 if "hipaa" in (doc.get("compliance_taints") or []):
                     seen.append(identity_hex)
+                elif prev_incomplete:
+                    ruled_out.append(identity_hex)
+                # OVERFLOW, READ AFTER THE PUSH -- same order `mZn` computes
+                # `h`: `len(seen) > 8` here, `d.length>P` there, both AFTER
+                # `d.push(c)`. Once incomplete, it stays incomplete: `mZn`
+                # never clears it either (`s.incomplete||h`).
+                incomplete = prev_incomplete or len(seen) > 8
                 new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
                              "sha": target_sha,
                              "confirmed_at": int(time.time() * 1000),
                              "hipaa_seen": seen[-8:]}
+                # `ye(e)`: both keys ONLY when incomplete -- a complete
+                # stamp keeps exactly CC's original six keys.
+                if incomplete:
+                    new_stamp["hipaa_seen_incomplete"] = True
+                    new_stamp["hipaa_ruled_out"] = ruled_out[-8:]
                 try:
                     # PID-SUFFIXED, matching `write_daemon_state`'s convention:
                     # CC mints this same sidecar, and a draining daemon plus
@@ -16028,7 +16115,42 @@ class PinProxy:
                 pass
 
     def _plain_relay(self, request_line: str, conn: socket.socket) -> None:
-        """Forward an absolute-form proxy request through the chain (or direct).
+        """Forward every request on an absolute-form proxy connection (or
+        direct if no chain is set).
+
+        PER REQUEST, NOT ONLY THE CONNECTION'S FIRST (T0986 CHANGE 1).
+        `claude remote-control` pipelines register, session create and its
+        first work poll on ONE socket, so route-deciding only the first
+        request left every later one unswapped and untraced — raw `_pump`
+        has no idea what a request even is. `_plain_relay_request` repeats
+        the connection's first request's own parse/route/swap/trace/relay
+        for every request; this loops while it says the connection may
+        carry another.
+        """
+        # NO BLANKET try/finally HERE. `_wait_for_pin_token` can raise
+        # `_BlindMintRefusal` out of `_plain_relay_request`, uncaught on
+        # purpose — `_handle_client`'s own handler answers it and closes
+        # `conn` itself (matching every other refusal on that path); closing
+        # here first would race it and leave the 503 written to a socket
+        # already shut.
+        while True:
+            if not self._plain_relay_request(request_line, conn):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return
+            request_line = _read_line(conn)
+            if request_line in ("", None):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return
+
+    def _plain_relay_request(self, request_line: str, conn: socket.socket) -> bool:
+        """One request on an absolute-form proxy connection. Returns whether
+        the connection may carry another.
 
         Rewrites the request line to origin-form and dials the target host —
         via the chain proxy if one is set (still absolute-form to it, as a
@@ -16108,8 +16230,7 @@ class PinProxy:
                         self._pin_token_provider, "mint_stalled", None
                 ) and self._pin_token_provider.mint_stalled():
                     self._refuse_stalled_mint(conn, method, rel, close=True)
-                    conn.close()
-                    return
+                    return False
                 token = self._wait_for_pin_token(method, rel, token)
                 if token and any(h.split(":", 1)[0].strip().lower()
                                  == "authorization" for h in headers):
@@ -16211,8 +16332,7 @@ class PinProxy:
             _bridge_event, _ = self._hold_bridge_attach(_bridge_cse)
             if _client_hung_up(conn):
                 self._release_bridge_attach(_bridge_cse, _bridge_event)
-                conn.close()
-                return
+                return False
         _bridge_released = False
 
         def _release_bridge_hold() -> None:
@@ -16220,6 +16340,19 @@ class PinProxy:
             if _bridge_event is not None and not _bridge_released:
                 self._release_bridge_attach(_bridge_cse, _bridge_event)
                 _bridge_released = True
+
+        # AN UPGRADE (101) STAYS OPAQUE, exactly like the connection's first
+        # request always did: `_relay_response` treats a 1xx as interim and
+        # reads PAST it for the "real" status, and `_is_interim` counts a
+        # 101 in that range — routed there, a WebSocket handshake would have
+        # it read the first frame as a status line instead.
+        upgrading = any(k.lower() == "upgrade" and v.strip() for k, v in parsed)
+        # THE CLIENT'S OWN INTENT, read once from the arrival headers —
+        # `headers` may be rewritten below (Authorization/Host) but
+        # Connection is never one of the rewritten names.
+        client_wants_close = any(
+            k.lower() == "connection" and "close" in v.lower()
+            for k, v in parsed)
 
         try:
             # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path
@@ -16246,41 +16379,57 @@ class PinProxy:
                         )
                     except OSError:
                         pass
-                    conn.close()
-                    return
+                    return False
                 if up is None:
-                    conn.close()
-                    return
+                    return False
                 try:
-                    # Connect budget only, same as the tunnel: _pump streams, and
-                    # a read timeout left on the socket tears down a response that
-                    # is merely quiet — an SSE gap or a slow origin — rather than
-                    # dead.
+                    # Connect budget only, same as the tunnel: the relay
+                    # streams, and a read timeout left on the socket tears
+                    # down a response that is merely quiet — an SSE gap or a
+                    # slow origin — rather than dead.
                     up.settimeout(None)
                     up.sendall(head.encode("latin1") + body)
-                    seen = b""
-                    if retry or _bridge_cse:
-                        code, seen = _peek_status(up)
-                        if retry and code in (401, 403, 404):
-                            self._tunnel_trace(
-                                f"{method} {rel} swap refused ({code}) — "
-                                "retrying as it arrived (absolute-form)")
-                            continue
-                    # RELEASED HERE, THE MOMENT THE STATUS LINE IS IN HAND —
-                    # same discipline as the MITM path's `on_status` (see
-                    # `_forward`): the outer `finally` below is only the
-                    # backstop for a dial failure or an exception before this
-                    # point. Waiting for `_pump` to return instead held this
-                    # past a whole keep-alive connection's lifetime, or
-                    # released it EARLY on the client's own abort while the
-                    # request was still live in a stalled hop — either way
-                    # not "the exchange settled". (`_release_bridge_hold`
-                    # is already a no-op with no `_bridge_cse`.)
+                    if upgrading:
+                        # THE OPAQUE TAIL. `retry`/`_bridge_cse` still decide
+                        # whether to peek the status first, exactly as
+                        # before this round: a refused swap is taken back
+                        # here too.
+                        seen = b""
+                        if retry or _bridge_cse:
+                            code, seen = _peek_status(up)
+                            if retry and code in (401, 403, 404):
+                                self._tunnel_trace(
+                                    f"{method} {rel} swap refused ({code}) — "
+                                    "retrying as it arrived (absolute-form)")
+                                continue
+                        # RELEASED HERE, THE MOMENT THE STATUS LINE IS IN
+                        # HAND — same discipline as the MITM path's
+                        # `on_status` (see `_forward`): the outer `finally`
+                        # below is only the backstop for a dial failure or
+                        # an exception before this point.
+                        _release_bridge_hold()
+                        if seen:
+                            conn.sendall(seen)
+                        _pump(conn, up)
+                        return False
+                    # NOT UPGRADING: THE SAME RELAY THE MITM PATH USES
+                    # (`_forward`/`_relay_response`), so every defence it
+                    # carries — chunked re-framing, the swap take-back, the
+                    # bridge-hold release at the status line — applies to
+                    # every request here, not only a connection's first.
+                    result = _relay_response(
+                        up, conn, getattr(self._local, "cid", 0),
+                        reject_on_auth_error=retry,
+                        method=method,
+                        on_status=lambda st: _release_bridge_hold(),
+                    )
+                    if result is _AUTH_REJECTED:
+                        self._tunnel_trace(
+                            f"{method} {rel} swap refused — retrying as it "
+                            "arrived (absolute-form)")
+                        continue
                     _release_bridge_hold()
-                    if seen:
-                        conn.sendall(seen)
-                    _pump(conn, up)
-                    return
+                    return bool(result) and not client_wants_close
                 finally:
                     try:
                         up.close()
@@ -16288,10 +16437,11 @@ class PinProxy:
                         pass
         finally:
             # THE EXCHANGE HAS SETTLED ONE WAY OR ANOTHER by the time this
-            # runs — sent and handed to `_pump`, refused with a 503, or
-            # every hop failed — so a later request for this cse may
+            # runs — sent and handed to `_pump`, relayed, refused with a
+            # 503, or every hop failed — so a later request for this cse may
             # proceed.
             _release_bridge_hold()
+        return False
 
     def _mitm(self, conn: socket.socket) -> bool:
         """Serve requests on this connection. True when it was HANDED OVER.
