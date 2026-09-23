@@ -663,7 +663,8 @@ def _canon_sha(doc):
 
 
 def _seed_trusted_stamp(cfg, old_doc, *, identity=_TEST_IDENTITY, kind="org",
-                        hipaa_seen=None, confirmed_at=1, witness=True):
+                        hipaa_seen=None, confirmed_at=1, witness=True,
+                        incomplete=False, ruled_out=None):
     """Leave `old_doc` on disk with a stamp CC itself could have minted for
     it -- the ground truth `_trusted_stamp_identity` reuses (T0681
     correctness review: no env var or credential-precedence guess is
@@ -684,20 +685,45 @@ def _seed_trusted_stamp(cfg, old_doc, *, identity=_TEST_IDENTITY, kind="org",
     consulted only where an identity is about to be carried onto a body it
     was never confirmed against.
 
+    `incomplete`/`ruled_out` seed CC's two 2.1.275+ optional keys
+    (`hipaa_seen_incomplete`, `hipaa_ruled_out`), written only when
+    `incomplete` is true -- CC's own writer never emits one without the
+    other either.
+
     Returns `old_doc`'s canonical sha.
     """
     (cfg / "policy-limits.json").write_text(json.dumps(old_doc))
     sha = _canon_sha(old_doc)
-    (cfg / "policy-limits.json.stamp.json").write_text(json.dumps({
+    stamp = {
         "v": 1, "identity": identity, "kind": kind, "sha": sha,
         "confirmed_at": confirmed_at, "hipaa_seen": hipaa_seen or [],
-    }))
+    }
+    if incomplete:
+        stamp["hipaa_seen_incomplete"] = True
+        stamp["hipaa_ruled_out"] = ruled_out or []
+    (cfg / "policy-limits.json.stamp.json").write_text(json.dumps(stamp))
     if witness:
         (cfg / "policy-limits.json.pin-witness.json").write_text(json.dumps({
             "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
             "account": _TEST_ACCOUNT_LABEL,
         }))
     return sha
+
+
+def _stale_stamp_dict(*, hipaa_seen=None, incomplete=False, ruled_out=None):
+    """A stamp that fully parses per CC's own `.stamp.json` schema but
+    names a `sha` that will not match whatever body is really on disk --
+    the shape of a genuinely TORN CC stamp (the T0656/f465796 scenario, CC
+    wrote it correctly for a body since replaced), never the schema-invalid
+    content CC's own `deleteCacheFile` calls unparseable and leaves alone.
+    """
+    stamp = {"v": 1, "identity": "a" * 64, "kind": "org",
+             "sha": "sha256:" + "9" * 64, "confirmed_at": 1,
+             "hipaa_seen": hipaa_seen or []}
+    if incomplete:
+        stamp["hipaa_seen_incomplete"] = True
+        stamp["hipaa_ruled_out"] = ruled_out or []
+    return stamp
 
 
 class TestLiveRemoteControlSessions:
@@ -1611,7 +1637,7 @@ class TestLiveRemoteControlSessions:
         cfg = tmp_path / "config"
         cfg.mkdir()
         stamp = cfg / "policy-limits.json.stamp.json"
-        stamp.write_text(json.dumps({"sha": "stale"}))
+        stamp.write_text(json.dumps(_stale_stamp_dict()))
         doc = {"restrictions": {}, "compliance_taints": []}
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
@@ -1640,12 +1666,13 @@ class TestLiveRemoteControlSessions:
         the on-disk stamp is CC's own rather than a leftover: only the
         unlink heals it without waiting for the policy value itself to
         change. NOT unconditional since T0681 round 2: the stamp seeded here
-        is `{"sha": "stale"}`, which `_trusted_stamp_identity` refuses on
-        shape alone -- a genuinely trusted stamp on this same skip path
+        is `_stale_stamp_dict()`, well-formed but naming a sha that will
+        never match this body, which `_trusted_stamp_identity` refuses on
+        the sha check -- a genuinely trusted stamp on this same skip path
         survives untouched instead (`case_a_matching_stamp_is_left_alone`).
-        Per CC's own gate, unlinking an untrusted one costs nothing: an
-        absent stamp reads "legacy" and serves the body verbatim, exactly
-        like "match" does.
+        Per CC's own gate, unlinking an untrusted one with no HIPAA
+        evidence on it costs nothing (T1004): an absent stamp reads
+        "legacy" and serves the body verbatim, exactly like "match" does.
 
         ALSO THE POSITIVE CONTROL for `case_a_failed_heal_unlink_does_not_
         log_a_removal`'s negative (round 5 correctness review): that case
@@ -1664,7 +1691,7 @@ class TestLiveRemoteControlSessions:
         body_path.write_text(json.dumps(doc))
         before = body_path.stat().st_mtime_ns
         stamp = cfg / "policy-limits.json.stamp.json"
-        stamp.write_text(json.dumps({"sha": "stale"}))
+        stamp.write_text(json.dumps(_stale_stamp_dict()))
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
         monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
@@ -1707,7 +1734,7 @@ class TestLiveRemoteControlSessions:
         doc = {"restrictions": {}, "compliance_taints": []}
         (cfg / "policy-limits.json").write_text(json.dumps(doc))
         stamp = cfg / "policy-limits.json.stamp.json"
-        stamp.write_text(json.dumps({"sha": "stale"}))
+        stamp.write_text(json.dumps(_stale_stamp_dict()))
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
         monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
@@ -1762,12 +1789,23 @@ class TestLiveRemoteControlSessions:
     ):
         """THE SWEEP IS A TIMER CALLBACK and must stay non-fatal. An OSError
         out of the unlink (e.g. a permissions race) must not propagate and
-        must not change the sweep's own return value."""
+        must not change the sweep's own return value.
+
+        T1004: SEEDS A REAL (empty-evidence) STALE STAMP. `_fall_back_to_
+        unlink` no longer unlinks unconditionally -- "absent -> nothing"
+        never even calls `unlink` (nothing there to remove), so a run with
+        no stamp file at all no longer reaches the monkeypatched raise and
+        proves nothing about the OSError being swallowed. A stamp that
+        parses but carries no HIPAA evidence still takes the unlink branch
+        exactly as before, which is what this case is about.
+        """
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
         cfg.mkdir()
         doc = {"restrictions": {}, "compliance_taints": []}
+        (cfg / "policy-limits.json.stamp.json").write_text(
+            json.dumps(_stale_stamp_dict()))
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
         monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
@@ -1801,8 +1839,9 @@ class TestLiveRemoteControlSessions:
         every other path — old body, no stamp, reads "legacy" — and this is
         the one occasion the heal is needed most: skipping it would leave an
         unstamped body for as long as the write keeps failing. NOT true of
-        every stamp: the one seeded here is `{"sha": "stale"}`, which
-        `_trusted_stamp_identity` refuses on shape alone --
+        every stamp: the one seeded here is `_stale_stamp_dict()`, which
+        `_trusted_stamp_identity` refuses on the sha check and carries no
+        HIPAA evidence to lose (T1004) --
         `case_a_failed_write_leaves_a_trusted_prior_stamp_untouched` is the
         control where a genuinely trusted stamp survives this same failure
         untouched.
@@ -1814,7 +1853,7 @@ class TestLiveRemoteControlSessions:
         different = {"restrictions": {"allow_remote_control": {"allowed": False}}}
         (cfg / "policy-limits.json").write_text(json.dumps(different))
         stamp = cfg / "policy-limits.json.stamp.json"
-        stamp.write_text(json.dumps({"sha": "stale"}))
+        stamp.write_text(json.dumps(_stale_stamp_dict()))
 
         doc = {"restrictions": {}, "compliance_taints": []}
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
@@ -2069,7 +2108,15 @@ class TestLiveRemoteControlSessions:
         """THE CAP (T0681 round 3 review named this untested too): CC's `ce`
         keeps only the last 8. Seed 8 OTHER identities already at the cap,
         taint the fresh body, and the 9th (this identity) must push out the
-        OLDEST (index 0), not truncate from the end or grow past 8."""
+        OLDEST (index 0), not truncate from the end or grow past 8.
+
+        T1004: THE CAP ALSO MARKS THE EVIDENCE INCOMPLETE. Once the 9th
+        entry drops the oldest, `hipaa_seen` no longer names everyone this
+        identity was ever seen alongside -- CC's own `mZn` sets
+        `hipaa_seen_incomplete` the same instant it computes `h = d.length >
+        8`, so this asserts the marker lands beside the capped list, not
+        only the list itself.
+        """
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
@@ -2095,8 +2142,84 @@ class TestLiveRemoteControlSessions:
             (cfg / "policy-limits.json.stamp.json").read_text())
         assert stamp["hipaa_seen"] == others[1:] + [_TEST_IDENTITY], (
             "the cap did not drop the oldest entry when the 9th was added")
+        assert stamp.get("hipaa_seen_incomplete") is True, (
+            "dropping the oldest entry off the cap must mark the evidence "
+            "incomplete")
+        assert "hipaa_ruled_out" in stamp, (
+            "the incomplete marker must carry its ruled-out list beside it")
 
-    def case_a_malformed_hipaa_seen_entry_falls_back_to_the_unlink(
+    def case_an_already_incomplete_stamp_appends_to_ruled_out(
+        self, tmp_path, monkeypatch
+    ):
+        """T1004, A2: a trusted stamp already marked incomplete, with its
+        own `hipaa_ruled_out` history, sweeping an UNTAINTED fresh body --
+        CC's own `mZn` appends this identity to `ruled_out` in that branch
+        (`else if(prev.incomplete) f.push(c)`), because the evidence was
+        never complete enough to say this identity was truly never seen;
+        the marker itself stays set."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        other = "b" * 64
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, incomplete=True,
+                            ruled_out=[other])
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {"allow_web_fetch": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp.get("hipaa_seen_incomplete") is True, (
+            "an already-incomplete stamp must keep the marker set")
+        assert stamp.get("hipaa_ruled_out") == [other, _TEST_IDENTITY], (
+            "an untainted sweep of an incomplete stamp must append this "
+            "identity to hipaa_ruled_out")
+
+    def case_a_padded_uppercase_hipaa_taint_still_counts(
+        self, tmp_path, monkeypatch
+    ):
+        """T1004, A3: CC normalises a taint (trim + lowercase) before
+        testing it against "hipaa" -- a body naming it " HIPAA " must be
+        read exactly like the bare lowercase string."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        fresh_doc = {"restrictions": {}, "compliance_taints": [" HIPAA "]}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp["hipaa_seen"] == [_TEST_IDENTITY], (
+            "a padded, differently-cased 'hipaa' taint must still count")
+
+    def case_a_malformed_hipaa_seen_entry_is_left_untouched(
         self, tmp_path, monkeypatch
     ):
         """THE PER-ELEMENT hipaa_seen REGEX HAS NO NEGATIVE CASE ABOVE
@@ -2105,20 +2228,25 @@ class TestLiveRemoteControlSessions:
         entries -- nothing exercises `re.fullmatch(...) for h in
         hipaa_seen` actually REJECTING a malformed one. A single non-hex
         entry must sink the whole stamp exactly like a bad `kind` or a
-        missing `v` already does: `_trusted_stamp_identity` returns None,
-        and the sweep falls back to the plain unlink instead of trusting a
-        record CC's own schema would never have produced.
+        missing `v` already does: `_trusted_stamp_identity` returns None.
+
+        T1004: THE OUTCOME THIS PROVES MOVED. A malformed `hipaa_seen`
+        entry is exactly what CC's own schema would reject too --
+        `_stamp_evidence` returns None for it, the same UNPARSEABLE bucket
+        CC's own `deleteCacheFile` leaves untouched rather than deletes (it
+        cannot read what evidence, if any, is on the record either). The
+        identity is still refused as untrusted; only the fallback's own
+        action changed, from unlink to leave-as-is.
 
         SEEDED THROUGH `_seed_trusted_stamp`, WITH ITS MATCHING WITNESS
         (round 5 correctness review): a hand-written stamp with no witness
-        of ours reaches the SAME plain-unlink outcome through the witness
-        gate's own mismatch fallback regardless of what `_trusted_stamp_
-        identity` decides, so deleting the hipaa_seen regex entirely left
-        this test green -- it was never exercising the regex at all. With
-        a matching witness AND matching active token/label, a stamp the
-        regex wrongly accepted would reach the mint branch and actually
-        write a new stamp, which is what the assertion below must be able
-        to catch.
+        of ours reaches the SAME fallback through the witness gate's own
+        mismatch path regardless of what `_trusted_stamp_identity` decides,
+        so deleting the hipaa_seen regex entirely left this test green -- it
+        was never exercising the regex at all. With a matching witness AND
+        matching active token/label, a stamp the regex wrongly accepted
+        would reach the mint branch and actually write a new stamp, which
+        is what the assertion below must be able to catch.
         """
         from cswap_pin import proxy as pin_proxy
 
@@ -2126,6 +2254,165 @@ class TestLiveRemoteControlSessions:
         cfg.mkdir()
         old_doc = {"restrictions": {}, "compliance_taints": []}
         _seed_trusted_stamp(cfg, old_doc, hipaa_seen=["not-a-64-hex-hash"])
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: _TEST_ACCOUNT_LABEL)
+
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        before = stamp_path.read_bytes()
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert stamp_path.read_bytes() == before, (
+            "a hipaa_seen entry that is not a 64-hex hash is unparseable "
+            "per CC's own schema; CC's deleteCacheFile leaves an "
+            "unparseable stamp exactly as it found it"
+        )
+
+    def case_a_stale_stamp_carrying_evidence_becomes_a_tombstone(
+        self, tmp_path, monkeypatch
+    ):
+        """T1004, B1: a torn stamp (CC's own sha check already refuses it)
+        that still carries HIPAA evidence must not be thrown away with a
+        plain unlink -- CC's own `deleteCacheFile` writes a tombstone that
+        carries the evidence forward instead, and this sweep's own body
+        write still lands exactly as it does today."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        (cfg / "policy-limits.json").write_text(json.dumps(old_doc))
+        evidence = "c" * 64
+        (cfg / "policy-limits.json.stamp.json").write_text(
+            json.dumps(_stale_stamp_dict(hipaa_seen=[evidence])))
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert json.loads(
+            (cfg / "policy-limits.json").read_text()) == fresh_doc, (
+            "the body write itself must still land")
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp == {
+            "v": 1, "identity": "0" * 64, "kind": "token", "sha": "none",
+            "confirmed_at": 0, "hipaa_seen": [evidence],
+        }, "a stale stamp with evidence on it must become CC's own tombstone"
+
+    def case_ccs_own_tombstone_with_no_body_survives_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        """T1004, B2: CC's own `deleteCacheFile` may already have left
+        exactly this tombstone beside an absent body -- its own cache-miss
+        state, the body it once guarded already gone. Re-sweeping it must
+        not unlink the evidence it carries, and must not even rewrite it,
+        since it already IS the tombstone this sweep would otherwise mint."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        evidence = "d" * 64
+        tombstone = {"v": 1, "identity": "0" * 64, "kind": "token",
+                     "sha": "none", "confirmed_at": 0,
+                     "hipaa_seen": [evidence]}
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        stamp_path.write_text(json.dumps(tombstone))
+        before = stamp_path.stat().st_mtime_ns
+
+        doc = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for", lambda _t: doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True  # no prior body: wrote=True
+        assert json.loads(stamp_path.read_text()) == tombstone
+        assert stamp_path.stat().st_mtime_ns == before, (
+            "a stamp already equal to the tombstone this sweep would "
+            "write must not be rewritten"
+        )
+
+    def case_a_witness_mismatch_with_evidence_becomes_a_tombstone(
+        self, tmp_path, monkeypatch
+    ):
+        """T1004, B3: the witness gate's own mismatch fallback (T0681
+        round 4) must ALSO keep evidence instead of discarding it -- a
+        trusted stamp with real hipaa_seen history, whose witness no
+        longer matches the active account, still has to land as CC's
+        tombstone rather than an unlink; and the witness itself is still
+        recorded on this fallback, exactly as the empty-evidence case
+        already does (`case_a_changed_account_label_does_not_inherit`)."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        evidence = "e" * 64
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc, hipaa_seen=[evidence])
+        monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                            lambda: _TEST_TOKEN)
+        monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
+                            lambda: "a-different-account")
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+
+        stamp = json.loads(
+            (cfg / "policy-limits.json.stamp.json").read_text())
+        assert stamp == {
+            "v": 1, "identity": "0" * 64, "kind": "token", "sha": "none",
+            "confirmed_at": 0, "hipaa_seen": [evidence],
+        }, ("a witness mismatch on an evidence-carrying stamp must "
+            "tombstone, not unlink")
+        witness = json.loads(
+            (cfg / "policy-limits.json.pin-witness.json").read_text())
+        assert witness == {
+            "token_sha": hashlib.sha256(_TEST_TOKEN.encode()).hexdigest(),
+            "account": "a-different-account",
+        }, "the fallback must still record the freshly-read witness"
+
+    def case_a_bad_optional_key_is_left_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        """T1004, B4: `hipaa_seen_incomplete` must be a bool per CC's own
+        schema (2.1.275+) -- a string there is exactly as unparseable to
+        `_stamp_evidence` as a missing `v` or a malformed `hipaa_seen`
+        entry is, and CC's own `deleteCacheFile` leaves an unparseable
+        stamp exactly as it found it."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        _seed_trusted_stamp(cfg, old_doc)
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        bad = json.loads(stamp_path.read_text())
+        bad["hipaa_seen_incomplete"] = "true"  # schema wants a bool
+        stamp_path.write_text(json.dumps(bad))
+        before = stamp_path.read_bytes()
         monkeypatch.setattr(pin_proxy, "_active_oauth_token",
                             lambda: _TEST_TOKEN)
         monkeypatch.setattr(pin_proxy, "_active_pin_account_label",
@@ -2140,9 +2427,40 @@ class TestLiveRemoteControlSessions:
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
         daemon._pin_token_provider = lambda: "tok"
         assert daemon.sweep_policy_once() is True
-        assert not (cfg / "policy-limits.json.stamp.json").exists(), (
-            "a hipaa_seen entry that is not a 64-hex hash still let the "
-            "stamp's identity through as trusted"
+        assert stamp_path.read_bytes() == before, (
+            "a bad optional key makes the stamp unparseable, and an "
+            "unparseable stamp must be left exactly as it was found"
+        )
+
+    def case_a_stale_stamp_with_empty_evidence_is_still_unlinked(
+        self, tmp_path, monkeypatch
+    ):
+        """T1004, CONTROL: the negative space for B1 -- a torn stamp that
+        parses fine but carries NO evidence (every host today, since no
+        HIPAA taint has ever landed) must still be unlinked exactly as
+        before this round; nothing here should ever reach for a
+        tombstone."""
+        from cswap_pin import proxy as pin_proxy
+
+        cfg = tmp_path / "config"
+        cfg.mkdir()
+        old_doc = {"restrictions": {}, "compliance_taints": []}
+        (cfg / "policy-limits.json").write_text(json.dumps(old_doc))
+        stamp_path = cfg / "policy-limits.json.stamp.json"
+        stamp_path.write_text(json.dumps(_stale_stamp_dict()))
+
+        fresh_doc = {"restrictions": {"allow_remote_control": {"allowed": True}},
+                     "compliance_taints": []}
+        monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
+        monkeypatch.setattr(pin_proxy, "policy_limits_for",
+                            lambda _t: fresh_doc)
+
+        daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+        daemon._pin_token_provider = lambda: "tok"
+        assert daemon.sweep_policy_once() is True
+        assert not stamp_path.exists(), (
+            "a stale stamp with no HIPAA evidence must still be unlinked, "
+            "exactly as before this round"
         )
 
     def case_a_failed_mint_falls_through_to_the_unlink(
@@ -2233,7 +2551,7 @@ class TestLiveRemoteControlSessions:
         cfg = tmp_path / "config"
         cfg.mkdir()
         stamp = cfg / "policy-limits.json.stamp.json"
-        stamp.write_text(json.dumps({"sha": "stale"}))
+        stamp.write_text(json.dumps(_stale_stamp_dict()))
         doc = {"restrictions": {}, "compliance_taints": []}
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)

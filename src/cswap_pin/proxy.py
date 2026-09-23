@@ -12107,9 +12107,64 @@ def _canonical_body_sha(doc: dict) -> str:
 _STAMP_KINDS = ("org", "key", "wif", "token")
 
 
+def _is_hex64_list(v):
+    """CC's own shape for `hipaa_seen`/`hipaa_ruled_out`: at most 8
+    64-hex-char strings."""
+    return (isinstance(v, list) and len(v) <= 8
+            and all(isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
+                    for h in v))
+
+
+def _stamp_evidence(existing):
+    """`(hipaa_seen, hipaa_seen_incomplete, hipaa_ruled_out)` from an
+    existing stamp record whose SHAPE is exactly what CC's own
+    `.stamp.json` schema admits, or None.
+
+    THE SHAPE CHECK `_trusted_stamp_identity` used to run inline, split out
+    here because Path B (a stamp CC's gate would call "unstamped" or
+    "foreign" -- `expected_sha` unknown to it) still needs to know whether
+    that record's evidence is worth carrying forward, never just whether
+    its identity is trustworthy.
+
+    CC's schema (2.1.275+ `mZn` and its reader): `v`, `identity` (64-hex),
+    `kind` (one of `_STAMP_KINDS`), `sha` (1-128 chars), `confirmed_at` (a
+    non-negative int), `hipaa_seen` (at most 8 64-hex strings), and two
+    OPTIONAL keys admitted independently of each other -- `hipaa_seen_
+    incomplete` (bool) and `hipaa_ruled_out` (at most 8 64-hex strings),
+    even though CC's own writer only ever emits them together. Anything
+    outside this shape is UNPARSEABLE, the same bucket CC's own read gives
+    an unreadable or oversize file, and this returns None for it -- exactly
+    what the old inline check did before the split.
+    """
+    if not isinstance(existing, dict):
+        return None
+    identity = existing.get("identity")
+    kind = existing.get("kind")
+    sha = existing.get("sha")
+    hipaa_seen = existing.get("hipaa_seen")
+    confirmed_at = existing.get("confirmed_at")
+    incomplete = existing.get("hipaa_seen_incomplete", False)
+    ruled_out = existing.get("hipaa_ruled_out", [])
+    if (existing.get("v") != 1
+            or not isinstance(identity, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", identity)
+            or kind not in _STAMP_KINDS
+            or not isinstance(sha, str)
+            or not (1 <= len(sha) <= 128)
+            or not isinstance(confirmed_at, int)
+            or isinstance(confirmed_at, bool)
+            or confirmed_at < 0
+            or not _is_hex64_list(hipaa_seen)
+            or not isinstance(incomplete, bool)
+            or not _is_hex64_list(ruled_out)):
+        return None
+    return hipaa_seen, incomplete, ruled_out
+
+
 def _trusted_stamp_identity(existing, expected_sha):
-    """`(identity, kind, hipaa_seen)` from an EXISTING stamp CC itself can be
-    trusted to have written, or None.
+    """`(identity, kind, evidence)` from an EXISTING stamp CC itself can be
+    trusted to have written, or None -- `evidence` is `_stamp_evidence`'s
+    `(hipaa_seen, hipaa_seen_incomplete, hipaa_ruled_out)`.
 
     GROUND TRUTH, not a guess. An earlier draft of this fix
     (`_local_stamp_identity`) tried to re-derive `lve()`'s precedence -- an
@@ -12150,25 +12205,10 @@ def _trusted_stamp_identity(existing, expected_sha):
     if (expected_sha is None or not isinstance(existing, dict)
             or existing.get("sha") != expected_sha):
         return None
-    identity = existing.get("identity")
-    kind = existing.get("kind")
-    hipaa_seen = existing.get("hipaa_seen")
-    confirmed_at = existing.get("confirmed_at")
-    if (existing.get("v") != 1
-            or not isinstance(identity, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", identity)
-            or kind not in _STAMP_KINDS
-            or not isinstance(existing["sha"], str)
-            or not (1 <= len(existing["sha"]) <= 128)
-            or not isinstance(confirmed_at, int)
-            or isinstance(confirmed_at, bool)
-            or confirmed_at < 0
-            or not isinstance(hipaa_seen, list)
-            or len(hipaa_seen) > 8
-            or not all(isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
-                       for h in hipaa_seen)):
+    evidence = _stamp_evidence(existing)
+    if evidence is None:
         return None
-    return identity, kind, hipaa_seen
+    return existing["identity"], existing["kind"], evidence
 
 
 class PinProxy:
@@ -12996,10 +13036,21 @@ class PinProxy:
         # equals `old_body_sha`, leaves an already-correct stamp untouched
         # regardless of this file, exactly as before this round).
         witness_path = path.with_name(path.name + ".pin-witness.json")
-        trusted = _trusted_stamp_identity(_read_json(stamp), old_body_sha)
+        # THE PRE-SWEEP STAMP, read once: `_trusted_stamp_identity` below
+        # is only the IDENTITY question (does this vouch for `old_body_sha`
+        # too); `_fall_back_to_unlink` needs the same record for the
+        # EVIDENCE question (does it carry HIPAA history worth keeping)
+        # even when the identity itself is not trusted -- Path B, sha
+        # mismatch included. Reading it twice would still see the same
+        # bytes (nothing above this line touches the stamp file), but
+        # passing the one read through is cheaper and keeps both questions
+        # answered from the same observation.
+        pre_sweep_stamp = _read_json(stamp)
+        trusted = _trusted_stamp_identity(pre_sweep_stamp, old_body_sha)
         target_sha = (_canonical_body_sha(doc)
                       if wrote and not write_failed else old_body_sha)
         healed = False
+        tombstoned = False
 
         def _fall_back_to_unlink(witness: "dict | None" = None) -> None:
             # THE SAME DIRECTION EVERY OTHER INDETERMINATE CASE ON THIS PATH
@@ -13032,10 +13083,62 @@ class PinProxy:
             # either still matches the live account (in which case
             # inheriting is exactly correct) or it does not (falls back,
             # same as if it had been deleted).
-            try:
-                stamp.unlink(missing_ok=True)
-            except OSError:
+            #
+            # THE STAMP ITSELF: 2.1.275+ CC has its own rule for exactly
+            # this moment (`deleteCacheFile`), read off the shipped binary,
+            # and this now mirrors it instead of always unlinking --
+            # losing a policy-limits stamp's HIPAA evidence is permanent
+            # and fails `allow_web_fetch`/`allow_design_sync` OPEN for an
+            # identity that was actually seen, where the old unconditional
+            # unlink read every case below as "nothing to lose". Decided
+            # from `pre_sweep_stamp` -- the SAME record read above, before
+            # this sweep touched anything, never a fresh re-read here.
+            nonlocal tombstoned
+            evidence = _stamp_evidence(pre_sweep_stamp)
+            if evidence is None:
+                # UNPARSEABLE (missing/wrong-shaped fields, not just a sha
+                # mismatch): CC's own deleteCacheFile leaves this exactly
+                # as it found it -- it could not read what, if anything,
+                # is worth keeping either. Nothing to touch.
                 pass
+            else:
+                seen, incomplete, ruled_out = evidence
+                if not seen and not incomplete:
+                    # EMPTY, COMPLETE EVIDENCE: nothing to lose, so this is
+                    # every host today (no HIPAA taint has ever landed) --
+                    # unlink exactly as before this round.
+                    try:
+                        stamp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                else:
+                    # EVIDENCE ON RECORD: an unlink here is what loses it
+                    # for good. CC's own tombstone -- an identity no real
+                    # credential produces, so CC's gate reads it
+                    # "unstamped" and refetches, the same cache-miss state
+                    # its own deleteCacheFile leaves when it unlinks a
+                    # body-less stamp -- carries the evidence forward for
+                    # CC's next save to inherit, instead of an unlink
+                    # discarding it.
+                    tombstone = {"v": 1, "identity": "0" * 64,
+                                 "kind": "token", "sha": "none",
+                                 "confirmed_at": 0, "hipaa_seen": seen[-8:]}
+                    if incomplete:
+                        tombstone["hipaa_seen_incomplete"] = True
+                        tombstone["hipaa_ruled_out"] = ruled_out[-8:]
+                    if pre_sweep_stamp != tombstone:
+                        try:
+                            tmp = stamp.with_name(
+                                f"{stamp.name}.{os.getpid()}.tmp")
+                            tmp.write_text(json.dumps(tombstone),
+                                            encoding="utf-8")
+                            tmp.replace(stamp)
+                            tombstoned = True
+                        except OSError:
+                            # LEAVE THE STAMP AS IS, never unlink: an
+                            # unlink here is exactly the evidence loss this
+                            # branch exists to avoid.
+                            pass
             if witness is not None:
                 try:
                     wtmp = witness_path.with_name(
@@ -13061,20 +13164,41 @@ class PinProxy:
             if current is None or recorded != current:
                 _fall_back_to_unlink(current)
             else:
-                identity_hex, kind, prev_seen = trusted
-                # hipaa_seen mirrors CC's own `bzn`: drop any earlier record
-                # of THIS identity, then re-add it only if the fresh body
-                # carries a "hipaa" taint, capped to the last 8 (CC's `ce`).
-                # `prev_seen` is already list-shaped --
+                identity_hex, kind, (prev_seen, prev_incomplete,
+                                      prev_ruled_out) = trusted
+                # MIRRORS CC's OWN `mZn` (2.1.275+), line for line: drop any
+                # earlier record of THIS identity from both lists; a fresh
+                # "hipaa" taint re-adds it to `seen`, otherwise an already-
+                # incomplete history re-adds it to `ruled_out` (this sweep
+                # itself did not see it tainted, but it cannot vouch the
+                # identity was truly never seen either, since the evidence
+                # it inherited already wasn't complete). `prev_seen`/
+                # `prev_ruled_out` are already list-shaped --
                 # `_trusted_stamp_identity` checked -- so no further
-                # validation is owed here.
+                # validation is owed here. CC normalises a taint (trim +
+                # lowercase) before this comparison; matched here too.
+                taints = doc.get("compliance_taints") or []
+                tainted = any(isinstance(t, str) and t.strip().lower() == "hipaa"
+                               for t in taints)
                 seen = [h for h in prev_seen if h != identity_hex]
-                if "hipaa" in (doc.get("compliance_taints") or []):
+                ruled_out = [h for h in prev_ruled_out if h != identity_hex]
+                if tainted:
                     seen.append(identity_hex)
+                elif prev_incomplete:
+                    ruled_out.append(identity_hex)
+                overflowed = len(seen) > 8
                 new_stamp = {"v": 1, "identity": identity_hex, "kind": kind,
                              "sha": target_sha,
                              "confirmed_at": int(time.time() * 1000),
                              "hipaa_seen": seen[-8:]}
+                if prev_incomplete or overflowed:
+                    # CC's own `mZn` carries `hipaa_seen_incomplete` forward
+                    # once it is ever true, and sets it fresh the moment the
+                    # cap (8) drops an entry -- a `hipaa_seen` list that no
+                    # longer names everyone this identity has been dropped
+                    # for is no longer COMPLETE evidence either way.
+                    new_stamp["hipaa_seen_incomplete"] = True
+                    new_stamp["hipaa_ruled_out"] = ruled_out[-8:]
                 try:
                     # PID-SUFFIXED, matching `write_daemon_state`'s convention:
                     # CC mints this same sidecar, and a draining daemon plus
@@ -13133,6 +13257,15 @@ class PinProxy:
             # OSError logs nothing.
             _log_lifecycle("removed a stale policy-cache stamp left by an "
                            "earlier write")
+        elif tombstoned:
+            # THE EVIDENCE-PRESERVING TWIN of the unlink log above: fires
+            # only where `_fall_back_to_unlink` actually wrote a NEW
+            # tombstone (never on the skip-because-already-equal path, and
+            # never merely because a stamp was left untouched as
+            # unparseable) -- same truthfulness the unlink log already
+            # holds itself to.
+            _log_lifecycle("kept the stamp's HIPAA evidence in a tombstone "
+                           "instead of removing it")
         return wrote
 
     def revive_archived_bridges(self, sessions: list[dict], token: str) -> int:
