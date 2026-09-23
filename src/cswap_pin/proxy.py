@@ -16213,7 +16213,12 @@ class PinProxy:
             # after — otherwise every absolute-form keep-alive connection
             # reads as permanently owed between requests, the same bug
             # `_mitm` fixed at its own loop.
-            self._note_reply_finished(conn)
+            #
+            # NOT `_note_reply_finished`: this path passes no `on_headers` to
+            # `_relay_response`, so `_content_at[conn]` never moves off its
+            # `_owe_answer` seed here — calling it would bank the WHOLE
+            # reply as content-free silence, the wrong-instrument shape its
+            # own docstring warns about.
             self._owe_answer(conn, False)
             request_line = _read_line(conn)
             while request_line == "":
@@ -16239,7 +16244,9 @@ class PinProxy:
             # `urlsplit` misparsing "host:port" as a scheme and dialling
             # nowhere; close it instead — draining the headers first, same
             # discipline as the CONNECT path's own unreadable-authority
-            # close, so closing on top of unread bytes does not send RST.
+            # close, so closing on top of unread bytes does not send RST --
+            # for a BODYLESS line only: a body past the headers is not
+            # drained here and stays unread on the socket.
             _rl = request_line.split(" ")
             if len(_rl) < 2 or "://" not in _rl[1]:
                 while True:
@@ -16454,8 +16461,12 @@ class PinProxy:
         # THE CLIENT'S OWN INTENT, read once from the arrival headers —
         # `headers` may be rewritten below (Authorization/Host) but
         # Connection is never one of the rewritten names.
-        _conn_header = next(
-            (v for k, v in parsed if k.lower() == "connection"), "")
+        # JOINED, NOT JUST THE FIRST: RFC 9110 5.3 lets a sender split one
+        # field across repeated header lines, and an earlier version here
+        # took only the first match, losing a later `close` the old `any()`
+        # over every parsed header used to see.
+        _conn_header = ", ".join(
+            v for k, v in parsed if k.lower() == "connection")
         client_wants_close = "close" in _conn_header.lower() or (
             # RFC 9112 9.3: HTTP/1.0 defaults to close, unlike 1.1 — only an
             # explicit `Connection: keep-alive` persists it.
@@ -16519,6 +16530,12 @@ class PinProxy:
                         _release_bridge_hold()
                         if seen:
                             conn.sendall(seen)
+                        # AN OPAQUE TAIL OWES NOTHING, same as `_mitm`'s own
+                        # 101 handover and `_blind_tunnel`'s CONNECT one:
+                        # from here two sockets are pumped into each other
+                        # for the life of the connection, and nobody is
+                        # waiting on a reply.
+                        self._owe_answer(conn, False)
                         _pump(conn, up)
                         return False
                     # NOT UPGRADING: THE SAME RELAY THE MITM PATH USES
@@ -18622,10 +18639,13 @@ def _relay_response(
                 " (swap refused — retrying unswapped)\n"
             )
             _TRACE.flush()
-        # ONE OF THE THREE `c` VALUES JUST MATCHED, so `status_line` is
-        # guaranteed to start with "HTTP/1.1 " + a 3-digit code at this
-        # exact offset.
-        return _AuthRejected(int(status_line.split(b" ", 2)[1]))
+        # ONLY BYTES [9:12] ARE GUARANTEED: the `startswith` above matched
+        # "HTTP/1.1 " + one of the three `c` values at that exact offset,
+        # and nothing else -- what follows could be a space, a reason
+        # phrase, or (a malformed "HTTP/1.1 401x") more digits, which
+        # `status_line.split(b" ", 2)[1]` picked up and `int()` then raised
+        # on.
+        return _AuthRejected(int(status_line[9:12]))
     _note_worker_status(path, status_line, certdir)
     if note_hop:
         _note_hop_trouble(status_line)

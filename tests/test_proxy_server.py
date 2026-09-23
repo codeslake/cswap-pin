@@ -4866,6 +4866,62 @@ class TestChainRediscovery:
                 proxy.stop()
             chain.stop()
 
+    def case_an_http_1_0_request_with_keep_alive_stays_open_for_a_second_request(
+        self, certdir
+    ):
+        """The other half of finding 2: RFC 9112 9.3 only defaults HTTP/1.0
+        to close -- an explicit `Connection: keep-alive` overrides that
+        default, and the socket must serve a second request on it."""
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen = chain.seen
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                             rediscover_chain=True)
+            proxy.start()
+
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    b"GET https://example.com/first HTTP/1.0\r\n"
+                    b"Host: example.com\r\nConnection: keep-alive\r\n"
+                    b"Content-Length: 0\r\n\r\n")
+                got = b""
+                c.settimeout(10)
+                while b"\r\n\r\n" not in got:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got += d
+                assert got.startswith(b"HTTP/1.1 200"), got[:60]
+
+                c.sendall(
+                    b"GET https://example.com/second HTTP/1.0\r\n"
+                    b"Host: example.com\r\nConnection: keep-alive\r\n"
+                    b"Content-Length: 0\r\n\r\n")
+                got2 = b""
+                while b"\r\n\r\n" not in got2:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    got2 += d
+                assert got2.startswith(b"HTTP/1.1 200"), got2[:60]
+            finally:
+                c.close()
+
+            deadline = time.time() + 10
+            while len(seen) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert len(seen) == 2, f"the chain saw {len(seen)} request(s), not 2"
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+
     def case_a_connect_as_a_later_request_gets_a_prompt_close(self, certdir):
         """T1025 finding 3: the per-request loop only knows how to relay
         ABSOLUTE-FORM -- a CONNECT line arriving as a LATER request on a
@@ -5667,8 +5723,9 @@ class TestChainRediscovery:
         `_AUTH_REJECTED` sentinel with no status code, so the absolute-form
         trace line read "swap refused -- retrying" with nothing to say
         WHICH code the swap was refused with. Each of 401/403/404 must
-        appear by number, the way the same trace already does on the
-        Upgrade tail (:16467-16469)."""
+        appear by number, the way the same trace already does on
+        `_plain_relay_request`'s own Upgrade tail (its `if upgrading:`
+        branch's retry)."""
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
         def ask(code):
@@ -14916,15 +14973,12 @@ class TestASpuriousStream404DoesNotEndTheSession:
         run_cases(self, request, tmp_path_factory)
 
     @staticmethod
-    def _relay(path, status, prime=None, age=0.0, note_hop=True):
+    def _relay(path, status, prime=None, age=0.0):
         """Drive the REAL relay and return what the client actually received.
 
         `prime` is a route to answer 200 on first, which is the only way the
         pin learns a session is alive -- there is no probe and no extra
-        request, just traffic already crossing this hop. `note_hop` mirrors
-        what the plain path passes `_relay_response` (T1025 finding 4):
-        False for a foreign host, True (the default) for the pin's own
-        upstream.
+        request, just traffic already crossing this hop.
         """
         import socket as _s
         from cswap_pin import proxy as pp
@@ -14944,8 +14998,7 @@ class TestASpuriousStream404DoesNotEndTheSession:
             up_b.sendall(b"HTTP/1.1 " + status +
                          b"\r\nContent-Length: 2\r\n\r\nno")
             up_b.shutdown(_s.SHUT_WR)
-            pp._relay_response(up_a, cl_a, 0, method="GET", path=path,
-                               note_hop=note_hop)
+            pp._relay_response(up_a, cl_a, 0, method="GET", path=path)
             cl_a.shutdown(_s.SHUT_WR)
             return cl_b.recv(4096)
         finally:
@@ -14978,28 +15031,60 @@ class TestASpuriousStream404DoesNotEndTheSession:
             "this hop had just returned a 502, so the 404 is not a verdict — "
             f"relaying it ends the session permanently. got {got[:40]!r}")
 
-    def case_a_foreign_hosts_502_does_not_arm_hop_trouble(self):
+    def case_a_foreign_hosts_502_does_not_arm_hop_trouble(self, certdir):
         """T1025 finding 4: `_note_hop_trouble` ran on every
         `_relay_response` call, including the plain absolute-form path's
         foreign-host requests. A foreign host's own 502 then poisoned the
         NEXT stream 404 on api.anthropic.com, masking a real session loss
         as a transport hiccup on a hop the pin's own upstream never
-        touched."""
+        touched.
+
+        END TO END, through the real plain-relay call site
+        (`note_hop=host == UPSTREAM_HOST and secure`, :16534) -- a direct
+        `_relay_response(note_hop=False)` call stays green even with that
+        argument reverted to unconditional `True`, and caught nothing."""
         from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        proxy = None
         pp._hop_trouble_at = 0.0
         try:
-            # The plain path's own scoping: `host == UPSTREAM_HOST and
-            # secure` is False for a foreign host.
-            self._relay("/", b"502 Bad Gateway", prime=None, note_hop=False)
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                             rediscover_chain=True)
+            proxy.start()
+
+            def ask(url, host):
+                c = socket.create_connection(("127.0.0.1", proxy.port),
+                                             timeout=10)
+                try:
+                    c.sendall(
+                        f"GET {url} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+                    c.settimeout(10)
+                    try:
+                        c.recv(256)
+                    except OSError:
+                        pass
+                finally:
+                    c.close()
+
+            ask("https://example.com/", "example.com")
             assert pp._hop_trouble_at == 0.0, (
                 "a foreign host's 502 armed hop trouble for the pin's own "
                 "upstream")
-            got = self._relay(self.STREAM, b"404 Not Found", prime=None)
-            assert got.startswith(b"HTTP/1.1 404"), (
-                "a later stream 404 was masked as a 503 by a foreign "
-                f"host's unrelated 502. got {got[:40]!r}")
+
+            # THE CONTROL, through the same end-to-end path: the pin's own
+            # upstream's 502 must still arm it.
+            ask("https://api.anthropic.com/", "api.anthropic.com")
+            assert pp._hop_trouble_at != 0.0, (
+                "the pin's own upstream's 502 did not arm hop trouble")
         finally:
             pp._hop_trouble_at = 0.0
+            if proxy:
+                proxy.stop()
+            chain.stop()
 
     def case_the_pins_own_upstreams_502_still_arms_hop_trouble(self):
         """THE CONTROL: narrowing `_note_hop_trouble` to the pin's own
