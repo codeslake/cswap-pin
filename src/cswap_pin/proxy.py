@@ -4678,6 +4678,168 @@ def _replaced_twin_bridge_ids() -> set[str]:
     return out
 
 
+def _transcript_names_bridge(path: Path, ids: set[str]) -> bool:
+    """Whether a ``bridge-session`` record ANYWHERE in ``path`` names one of
+    ``ids``, with its own ``sessionId`` absent or equal to the file's stem.
+
+    STREAMED LINE BY LINE, unlike `_transcript_bridge_history`'s bounded
+    tail read: the record this looks for is not the file's own newest
+    pointer and can sit anywhere in an ended transcript up to 19 MB past
+    that window (measured), so there is no tail to bound it to.
+    """
+    stem = path.stem
+    try:
+        with path.open("rb") as fh:
+            for raw in fh:
+                if b"bridge-session" not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "bridge-session":
+                    continue
+                bridge = rec.get("bridgeSessionId")
+                if not bridge or str(bridge) not in ids:
+                    continue
+                # SAME FILTER AS `_transcript_bridge_history`: a proof used
+                # to dispose of a bridge must decline at least as strictly
+                # as the one used to carry one.
+                if rec.get("sessionId") not in (None, stem):
+                    continue
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _live_transcript_bridges() -> dict[str, str | None]:
+    """Every live session's own transcript id -> the bridge the same
+    two-file join `_live_bridge_records` uses (registry `bridgeSessionId`,
+    else the job record's), or ``None`` when neither can say.
+
+    UNLIKE THAT JOIN, an unresolved bridge is KEPT here rather than dropped:
+    `_archived_twin_proof` needs "this transcript is live and its bridge is
+    unknown" to WITHHOLD proof, not to lose the row -- see its own note on
+    the fault this closes.
+    """
+    try:
+        home = require("paths").get_claude_config_home()
+        entries = list((home / "sessions").glob("*.json"))
+    except Exception:  # noqa: BLE001 — no host, nothing to enumerate
+        return {}
+    out: dict[str, str | None] = {}
+    for path in entries:
+        rec = _read_json(path)
+        if not isinstance(rec, dict):
+            continue
+        pid = rec.get("pid")
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        job = rec.get("jobId")
+        tx_id, bridge = rec.get("sessionId"), rec.get("bridgeSessionId")
+        if job:
+            st = _read_json(home / "jobs" / str(job) / "state.json")
+            if isinstance(st, dict):
+                if st.get("resumeSessionId"):
+                    tx_id = st.get("resumeSessionId")
+                bridge = bridge or st.get("bridgeSessionId")
+        if not tx_id:
+            continue
+        out[str(tx_id)] = str(bridge) if bridge else None
+    return out
+
+
+def _archived_twin_proof(twin_id: str, title: str, created_at) -> bool:
+    """Whether an ENDED transcript in a LIVE session's own project directory
+    names ``twin_id`` -- the fourth proof `sweep_superseded_bridges` accepts
+    before ARCHIVING an active+disconnected twin that neither
+    `_dead_creator_bridge_ids` nor `_replaced_twin_bridge_ids` names.
+
+    THE LIVE SESSION IS FOUND THE WAY THE REST OF THIS FILE ALREADY DOES: a
+    ``sessions/<pid>.json`` record with a live pid and the twin's own title
+    as its ``name``, resolved to its transcript through ``resumeSessionId``
+    (set by a resume) or its own ``sessionId`` otherwise -- the same two
+    candidate ids `_replaced_twin_bridge_ids` reads for "the live
+    transcript". No parallel liveness reader: `_pid_alive` and `_read_json`
+    are the same ones every other proof in this file uses.
+
+    A CANDIDATE FILE THAT IS ITSELF A LIVE TRANSCRIPT is skipped UNLESS
+    `_live_transcript_bridges` can name that session's own bridge AND it is
+    not the twin (either spelling). Without this, a session whose registry
+    pointer a rotation teardown nulled and never rewrote -- so it holds the
+    twin right now, but `_live_bridge_records` cannot see that and neither
+    can ``live`` -- has its own CURRENT ``bridge-session`` record read as
+    history and the twin it is still holding gets archived out from under
+    it. An unknown bridge cannot be told apart from that shape, so it is
+    withheld rather than trusted.
+
+    CALLED ONLY FOR A CANDIDATE THAT ALREADY PASSED EVERY OTHER CONDITION of
+    its branch -- not live, older than the newest of its title, a same-title
+    superseder in ``live``, and not in dead_creator / replaced_twin -- so a
+    sweep with nothing left to explain reads no transcript.
+
+    ponytail: no cross-sweep memo of (path, size) already scanned, so a
+    candidate with no proof -- another machine's sleeping bridge sharing a
+    title -- is rescanned on every sweep. Measured 0 such rows on two hosts;
+    upgrade path is a process-local memo keyed on (path, size).
+    """
+    ids = set(_both_spellings(twin_id))
+    floor = None
+    if created_at:
+        try:
+            floor = _dt.datetime.fromisoformat(
+                str(created_at).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            floor = None
+    try:
+        home = require("paths").get_claude_config_home()
+        entries = list((home / "sessions").glob("*.json"))
+    except Exception:  # noqa: BLE001 — no host, nothing to enumerate
+        return False
+    live_map = _live_transcript_bridges()
+    seen_dirs: set[Path] = set()
+    for path in entries:
+        rec = _read_json(path)
+        if not isinstance(rec, dict):
+            continue
+        pid = rec.get("pid")
+        if (not isinstance(pid, int) or not _pid_alive(pid)
+                or rec.get("name") != title):
+            continue
+        job = rec.get("jobId")
+        tx_id = rec.get("sessionId")
+        if job:
+            st = _read_json(home / "jobs" / str(job) / "state.json")
+            if isinstance(st, dict) and st.get("resumeSessionId"):
+                tx_id = st.get("resumeSessionId")
+        if not tx_id:
+            continue
+        for tx in (home / "projects").glob(f"*/{tx_id}.jsonl"):
+            project_dir = tx.parent
+            if project_dir in seen_dirs:
+                continue
+            seen_dirs.add(project_dir)
+            try:
+                candidates = list(project_dir.glob("*.jsonl"))
+            except OSError:
+                continue
+            for tf in candidates:
+                if tf.stem in live_map:
+                    known = live_map[tf.stem]
+                    if known is None or set(_both_spellings(known)) & ids:
+                        continue  # a live pointer this cannot rule out
+                try:
+                    mtime = tf.stat().st_mtime
+                except OSError:
+                    continue
+                if floor is not None and mtime < floor:
+                    continue  # T did not exist yet when this file last wrote
+                if _transcript_names_bridge(tf, ids):
+                    return True
+    return False
+
+
 def observed_bridge_owners() -> dict[str, str | None]:
     """``bridge id -> the organizationUuid its record says it belongs to``.
 
@@ -15573,6 +15735,17 @@ class PinProxy:
         Nor is a title shared between two LIVE bridges a reason to close
         either: two windows both named ``cswap`` that each opened RC are two
         sessions in use, and that is for the human to fix with `/rename`.
+
+        A FOURTH PATH, disposed of by ARCHIVE rather than DELETE: an
+        active+disconnected twin neither the dead-creator nor the
+        replaced-twin proof names, but that a `bridge-session` record in an
+        ENDED transcript sitting in the SAME project directory as a LIVE
+        session's own transcript still names -- see `_archived_twin_proof`.
+        ARCHIVE, not DELETE, because that proof alone does not rule out the
+        twin being exactly what someone meant to keep: archiving still drops
+        it from ListAgents and the `@` picker, still leaves it in the
+        owner's claude.ai history, and is reversible from there, where a
+        DELETE is not.
         """
         sessions = self._list_bridges(token)
         # SET EVEN WHEN THE LISTING FAILED, and that is the whole point of the
@@ -15613,6 +15786,14 @@ class PinProxy:
         # twin; only a host-local record proving THIS host's own job once
         # held it does. See `_replaced_twin_bridge_ids`.
         replaced_twin = _replaced_twin_bridge_ids()
+        # NO SEPARATE OWNERSHIP CHECK IS NEEDED for the fourth path below,
+        # unlike a first draft that kept one (`held = live_bridge_names()`,
+        # removed): `revive_archived_bridges` only unarchives an id in
+        # `live_bridge_names()`, and that set is built from the exact same
+        # `_live_bridge_records()` join as `live` -- so anything this sweep
+        # reaches to archive has already failed `sid in live` below and can
+        # therefore never be in `live_bridge_names()` either. No revive loop
+        # is possible without a check that duplicates one already run.
         newest: dict[str, str] = {}
         for item in sessions:
             title = (item.get("title") or "").strip()
@@ -15622,10 +15803,13 @@ class PinProxy:
                     newest[title] = stamp
 
         closed = 0
+        archived = 0
+        archive_refused = 0
         for item in sessions:
             sid, title = item.get("id"), (item.get("title") or "").strip()
             if not sid or not title or sid in live:
                 continue
+            archive_only = False
             if (item.get("connection_status") == "connected"
                     and item.get("status") == "archived"):
                 # A RUNNING WORKER IS A SESSION AT WORK, and the listing says
@@ -15644,8 +15828,7 @@ class PinProxy:
                 if str(item.get("worker_status") or "").lower() == "running":
                     continue
             elif (item.get("status") == "active"
-                    and item.get("connection_status") == "disconnected"
-                    and (sid in dead_creator or sid in replaced_twin)):
+                    and item.get("connection_status") == "disconnected"):
                 # THE DEAD-CREATOR PATH, OR THE REPLACED-TWIN ONE. Archived
                 # is deliberately excluded -- that is the owner's claude.ai
                 # history, kept on purpose, whatever a local record says --
@@ -15653,7 +15836,21 @@ class PinProxy:
                 # whose creator is dead, or whose own job has since moved to
                 # a newer bridge, carries a stale flag here, and only the
                 # local record may speak for it.
-                pass
+                #
+                # NEITHER PROVES IT: the fourth path, `_archived_twin_proof`,
+                # gets its chance below, once every cheap condition already
+                # holds -- and its finding is disposed of by ARCHIVE, never
+                # DELETE, since it alone does not rule out this being exactly
+                # what someone meant to keep.
+                if sid not in dead_creator and sid not in replaced_twin:
+                    # RULE 4 APPLIES HERE TOO, unlike the dead-creator/
+                    # replaced-twin proofs above: those carry their own pid
+                    # evidence of death, this one does not, so a `running`
+                    # worker still only SAVES a bridge, never condemns one.
+                    if str(item.get("worker_status") or "").lower() \
+                            == "running":
+                        continue
+                    archive_only = True
             else:
                 continue
             if (item.get("last_event_at") or "") >= newest[title]:
@@ -15670,13 +15867,40 @@ class PinProxy:
                        if (other.get("title") or "").strip() == title
                        and other.get("id") != sid):
                 continue
+            if archive_only:
+                if not _archived_twin_proof(
+                        sid, title, item.get("created_at")):
+                    continue
+                # ROUTE READ FROM THE BINARY, the same discipline
+                # `revive_archived_bridges` used for `/unarchive`: Claude
+                # Code's own `archiveRemoteSession` posts an empty body to
+                # exactly this path and accepts 200 or 409, and its
+                # `bridge:api.archiveSession` names the identical path under
+                # `useCcrV2SessionCrud` (`/v1/sessions/{id}/archive` is the
+                # legacy fallback when that flag is off) -- the same CCR v2
+                # namespace this sweep's own DELETE call already uses.
+                if self._bridge_api(
+                    "POST", f"/v1/code/sessions/{sid}/archive", token
+                ) is not None:
+                    archived += 1
+                else:
+                    archive_refused += 1
+                continue
             if self._bridge_api(
                 "DELETE", f"/v1/code/sessions/{sid}", token
             ) is not None:
                 closed += 1
         if closed:
             _log_lifecycle(f"closed {closed} superseded remote-control bridges")
-        return closed
+        if archived:
+            _log_lifecycle(
+                f"archived {archived} superseded remote-control bridge(s) an "
+                f"ended transcript in a live session's own project proved")
+        if archive_refused:
+            _log_lifecycle(
+                f"refused to archive {archive_refused} superseded "
+                f"remote-control bridge(s) an ended transcript proved")
+        return closed + archived
 
     def _handle_client(self, conn: socket.socket) -> None:
         # A per-CONNECTION id, not a thread id: threads are pooled and reused,
