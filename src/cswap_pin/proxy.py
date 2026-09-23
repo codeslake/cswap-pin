@@ -18725,8 +18725,14 @@ def _switch_off_walled_account(
                 # told to skip the slot it would otherwise land right back
                 # on. Without `exclude` a re-decide could ping-pong between
                 # two walled slots, one consume per client retry — worse
-                # than the standing debounce it would replace.
-                redecide = (ok and seen_at >= decided_at
+                # than the standing debounce it would replace. `slot is not
+                # None`, because an unmanaged/failed slot read keys on
+                # `(reset, None)` for EVERY request while it lasts, not just
+                # the one that decided it — without this term a settled TRUE
+                # on that key re-decides on every later look. `>`, not
+                # `>=`: a tie is this same request's own read, not a later
+                # one, and must debounce like any other.
+                redecide = (ok and slot is not None and seen_at > decided_at
                             and _switch_takes_exclude())
                 if not redecide:
                     _log_lifecycle(

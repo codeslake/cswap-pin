@@ -16499,6 +16499,100 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert not pp._walled_slots, pp._walled_slots
 
+    def case_an_unmanaged_slot_never_redecides_on_a_settled_true(
+        self, monkeypatch,
+    ):
+        """THE OTHER GAP `redecide` left open: `_live_account_slot` answers
+        `None` on an unmanaged or failed read, so every 429 seen while the
+        host is unmanaged keys on `(reset, None)` — not just the one
+        request that first decided it. Without `slot is not None` in
+        `redecide`, a settled TRUE on that key re-decides on every later
+        look (`seen_at >= decided_at` is true for all of them, not just a
+        storm waiter's), calling `switch()` again on every repeat instead
+        of holding the debounce."""
+        from cswap_pin import proxy as pp
+        calls = self._wire_exclude_capable(monkeypatch, switched=True,
+                                            live_num=None)
+        pp._walled_switch_seen[(b"9999999999", None)] = (
+            True, None, time.monotonic() - 1.0)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert not calls, (
+            f"an unmanaged slot read must not re-attempt the switch: {calls}")
+
+    def case_switch_off_records_the_walled_slot_from_a_real_relay(
+        self, monkeypatch,
+    ):
+        """THE RECORDING, COVERED. Every case above this one SEEDS
+        `_walled_slots` by hand, so deleting the two lines that write it
+        (`_walled_slots[slot] = float(reset)`, in
+        `_switch_off_walled_account`) leaves the whole suite green. Drive
+        it from two real relays instead: a 429 on slot "6" carrying slot
+        6's own live bearer must record the wall against "6" — then cswap
+        moves the live slot to "4" and a DIFFERENT wall's 429, carrying
+        slot 4's own bearer, must exclude "6" from that switch() call."""
+        from cswap_pin import proxy as pp
+        state = {"live_num": "6", "live_token": "token-6"}
+        calls = []
+
+        def _read_credentials(self):
+            return json.dumps(
+                {"claudeAiOauth": {"accessToken": state["live_token"]}})
+
+        def _current_account_number(self):
+            return state["live_num"]
+
+        def _switch(self, strategy=None, json_output=False, models=None,
+                    current_at_limit=False, exclude=None):
+            calls.append(exclude)
+            return {"switched": False, "needsLogin": False,
+                    "validated": True, "reason": "candidates-exhausted"}
+
+        fake_switcher = type("FakeSwitcher", (), {
+            "_read_credentials": _read_credentials,
+            "current_account_number": _current_account_number,
+            "switch": _switch,
+        })
+        fake_module = type("M", (), {"ClaudeAccountSwitcher": fake_switcher})()
+        monkeypatch.setattr(pp, "require", lambda n: fake_module)
+        pp._walled_switch_seen.clear()
+        pp._walled_slots.clear()
+
+        first = self._relay(reset=self.RESET_HEADER, auth="Bearer token-6")
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+
+        state["live_num"] = "4"
+        state["live_token"] = "token-4"
+        second = self._relay(reset=self.RESET_HEADER_2, auth="Bearer token-4")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 2, calls
+        assert "6" in calls[1], (
+            f"slot 6's wall was recorded but not excluded: {calls}")
+
+    def case_a_redecide_that_finds_no_candidate_relays_the_429_and_expires(
+        self, monkeypatch,
+    ):
+        """THE RE-DECIDE'S OWN FAILURE PATH. The walled slot is live again,
+        so a fresh `switch()` is owed — but this time nothing else is
+        switchable. That answers exactly as a first-time miss would: the
+        429 relays with its headers stripped, not the settled 401, and the
+        verdict OVERWRITES the settled TRUE with an EXPIRING negative on
+        the same key, not a permanent one."""
+        from cswap_pin import proxy as pp
+        calls = self._wire_exclude_capable(monkeypatch, switched=False,
+                                            live_num="6")
+        pp._walled_switch_seen[(b"9999999999", "6")] = (
+            True, None, time.monotonic() - 1.0)
+        got = self._relay()
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert self.RESET_HEADER not in got, got[:80]
+        assert len(calls) == 1, calls
+        ok, retry_at, decided_at = pp._walled_switch_seen[(b"9999999999", "6")]
+        assert ok is False, pp._walled_switch_seen
+        assert retry_at is not None, (
+            "a redecide miss must expire, not go permanent: "
+            f"{pp._walled_switch_seen}")
+
 
 class TestTheEvidenceSurvivesAHandover:
     """THE DEFECT THE IN-MEMORY MAP HAD, and it is not a tuning problem.
