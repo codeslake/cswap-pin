@@ -2612,9 +2612,11 @@ class TestChainRediscovery:
         passes for code that learns nothing), and dropping the loop must not
         drop the real hop with it.
         """
+        import functools
         import http.server
         import threading
 
+        import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy, _read_upstream, write_upstream_hint
 
         class _Health(http.server.BaseHTTPRequestHandler):
@@ -2653,25 +2655,39 @@ class TestChainRediscovery:
             finally:
                 srv.shutdown()
 
-        # CONTROL: a hop that names no upstream must leave the record alone.
-        assert not _learned({"status": "ok"}), (
-            "CONTROL FAILED: a hop reporting no upstream still got recorded"
-        )
-        # ...and a real one must be learned, unprompted.
-        assert _learned({"https_proxy": "http://127.0.0.1:8118"}, 36301) == (
-            "http://127.0.0.1:8118"
-        ), (
-            "a healthy hop was never asked what is behind it, so the chain "
-            "stays single-hop and falls to DIRECT when that hop dies"
-        )
-        # A REFUSAL WRITES NOTHING, so a re-read returns whatever the line
-        # above recorded. Assert on what is NOT written, not on an empty read.
-        assert _learned(
-            {"https_proxy": "http://127.0.0.1:36301"}, 36301
-        ) != "http://127.0.0.1:36301", (
-            "the pin recorded ITSELF as its own next hop — every request "
-            "would dial back into this daemon (9901 -> 36301 -> 9901)"
-        )
+        # timeout=10: `learn_next_hop` calls `_probe_next_hop` with its 1.0s
+        # default, tight enough that a loaded runner's own thread scheduling
+        # (not the network) can miss it — see `_probe_next_hop`'s call site
+        # in `learn_next_hop` for why the default stays 1.0s in production.
+        real_probe = pp._probe_next_hop
+        pp._probe_next_hop = functools.partial(real_probe, timeout=10)
+        try:
+            # CONTROL: a hop that names no upstream must leave the record
+            # alone.
+            assert not _learned({"status": "ok"}), (
+                "CONTROL FAILED: a hop reporting no upstream still got "
+                "recorded"
+            )
+            # ...and a real one must be learned, unprompted.
+            assert _learned({"https_proxy": "http://127.0.0.1:8118"}, 36301) == (
+                "http://127.0.0.1:8118"
+            ), (
+                "a healthy hop was never asked what is behind it, so the "
+                "chain stays single-hop and falls to DIRECT when that hop "
+                "dies"
+            )
+            # A REFUSAL WRITES NOTHING, so a re-read returns whatever the
+            # line above recorded. Assert on what is NOT written, not on an
+            # empty read.
+            assert _learned(
+                {"https_proxy": "http://127.0.0.1:36301"}, 36301
+            ) != "http://127.0.0.1:36301", (
+                "the pin recorded ITSELF as its own next hop — every "
+                "request would dial back into this daemon "
+                "(9901 -> 36301 -> 9901)"
+            )
+        finally:
+            pp._probe_next_hop = real_probe
 
         # AND THE WALK REFUSES ONE ALREADY ON DISK, written by an older
         # version or during the polluted window.
@@ -5990,7 +6006,9 @@ class TestChainRediscovery:
 
         threading.Thread(target=serve, daemon=True).start()
         try:
-            nxt = pp._probe_next_hop(f"http://127.0.0.1:{port}")
+            # timeout=10: a generous probe budget, the server thread's own
+            # reply is what the assertion waits on, not the network.
+            nxt = pp._probe_next_hop(f"http://127.0.0.1:{port}", timeout=10)
             assert nxt == "http://127.0.0.1:8118"
             pp.write_upstream_hint(
                 certdir, f"http://127.0.0.1:{port}", next_hop=nxt
@@ -6074,13 +6092,15 @@ class TestChainRediscovery:
             # read below sees only what the probes themselves did to it —
             # not what a later re-stamp would carry regardless of the probe.
             pp.write_upstream_hint(certdir, "http://127.0.0.1:1")
-            nxt = pp._probe_next_hop(url)
+            # timeout=10: the assertion below waits on the server thread's
+            # own reply, not the network.
+            nxt = pp._probe_next_hop(url, timeout=10)
             assert nxt is None
             assert handled == [1], handled
 
             # A second probe of the same address: the process-local memo
             # must return None without opening a socket at all.
-            nxt2 = pp._probe_next_hop(url)
+            nxt2 = pp._probe_next_hop(url, timeout=10)
             assert nxt2 is None
             assert handled == [1], (
                 "a hop already known to answer 4xx was asked again")
@@ -6143,7 +6163,9 @@ class TestChainRediscovery:
         address = f"127.0.0.1:{srv.getsockname()[1]}"
         try:
             url = f"http://{address}"
-            nxt = pp._probe_next_hop(url)
+            # timeout=10: the assertion below waits on the server thread's
+            # own reply, not the network.
+            nxt = pp._probe_next_hop(url, timeout=10)
             assert nxt is None
             assert handled == [1], handled
             assert address not in pp._ASKED_NOHEALTH, (
@@ -6151,7 +6173,7 @@ class TestChainRediscovery:
                 "having a bad moment")
 
             # a second probe, same address: still asked, unlike the 4xx case.
-            nxt2 = pp._probe_next_hop(url)
+            nxt2 = pp._probe_next_hop(url, timeout=10)
             assert nxt2 is None
             assert handled == [1, 1], (
                 "a 5xx hop was not reprobed on the second call")
@@ -6406,6 +6428,15 @@ class TestChainRediscovery:
                 rediscover_chain=True,
             )
             proxy.port = 36301
+            import functools
+
+            # timeout=10: the assertion below waits on the server thread's
+            # own reply, not the network — see the analogous swap in
+            # `case_the_record_grows_and_refuses_a_hop_that_names_the_pin`.
+            monkeypatch.setattr(
+                pp, "_probe_next_hop",
+                functools.partial(pp._probe_next_hop, timeout=10),
+            )
             proxy.learn_next_hop()
             assert pp._read_upstream(certdir, "next") == (
                 "http://127.0.0.1:8118"
