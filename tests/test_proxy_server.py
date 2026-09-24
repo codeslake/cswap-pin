@@ -229,12 +229,14 @@ class _RecordingChain:
 
 def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
                            bearer: "str | None" = None,
-                           ua: str | None = None, body: str = "{}"):
+                           ua: str | None = None, body: str = "{}",
+                           extra_headers: "dict[str, str] | None" = None):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
     trusting the proxy's CA. Returns the response status.
 
     `bearer=None` sends no `Authorization` header at all -- a client that
-    never had one, not one that was cleared."""
+    never had one, not one that was cleared. `extra_headers` merges in
+    anything else the case needs on the wire, e.g. `x-claude-code-session-id`."""
     ctx = ssl.create_default_context(cafile=str(ca_path))
     conn = http.client.HTTPSConnection(
         "api.anthropic.com", context=ctx, timeout=10
@@ -247,6 +249,8 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
     headers = {} if bearer is None else {"Authorization": f"Bearer {bearer}"}
     if ua is not None:
         headers["User-Agent"] = ua
+    if extra_headers:
+        headers.update(extra_headers)
     conn.request("POST", path, body=body, headers=headers)
     resp = conn.getresponse()
     resp.read()
@@ -15710,7 +15714,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         ``live_token`` is the access token the credential store hands back for
         the account cswap has ACTIVE; ``None`` (the default every case that
         predates the bearer test gets) makes the store unreadable, which is
-        also what a real host with a broken store gives. ``usage`` is the
+        also what a real host with a broken store gives, or a CALLABLE when a
+        case needs it to change between relays (a same-account token
+        rotation, unlike `live_num`'s account switch). ``usage`` is the
         live slot's decision-grade usage value — ``None`` for "no reading",
         a sentinel string, or a window dict. ``snap`` collects each
         ``usage_entries_by_account`` ``fetch=`` argument. ``live_num`` is what
@@ -15752,9 +15758,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             return result
 
         def _read_credentials():
-            if live_token is None:
+            lt = live_token() if callable(live_token) else live_token
+            if lt is None:
                 raise OSError("credential store unreadable")
-            return json.dumps({"claudeAiOauth": {"accessToken": live_token}})
+            return json.dumps({"claudeAiOauth": {"accessToken": lt}})
 
         def _usage_entries_by_account(fetch=None):
             if snap is not None:
@@ -15794,6 +15801,13 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
+        # THE `_note_usage_headers` THROTTLE, KEYED ON THE BEARER, is a memo
+        # of the SAME shape and outlives this case exactly like the three
+        # above: cases run alphabetically (`run_cases`'s `sorted(dir(cls))`),
+        # so a case that stamps `self.LIVE` leaves a live token in here for
+        # whichever case with that same bearer sorts next, throttling it
+        # before it ever reaches the code it means to exercise.
+        pp._usage_header_seen.clear()
         return calls
 
     @classmethod
@@ -15968,11 +15982,40 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             f"a reply inside the throttle window must not record again: "
             f"{recorded}")
         # Age the one entry past the throttle instead of sleeping for it.
-        pp._usage_header_seen[self.LIVE] -= pp._USAGE_HEADER_THROTTLE_S + 1
+        # Keyed on the live SLOT ("1", `_wire`'s default), not the bearer.
+        pp._usage_header_seen["1"] -= pp._USAGE_HEADER_THROTTLE_S + 1
         self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
                     extra_headers=self._5H_HEADER)
         assert len(recorded) == 2, (
             f"a reply after the throttle expires must record: {recorded}")
+
+    def case_two_tokens_of_the_same_slot_inside_30s_is_one_record(
+        self, monkeypatch,
+    ):
+        """THE DEFECT: keyed on the bearer, a token ROTATION on the same
+        account — the ordinary shape of a refreshed access token — was a
+        fresh key, so two different tokens of ONE slot each earned their own
+        record inside the window `record_usage_headers` means to collapse to
+        one. Keyed on the slot instead, a second reply from a rotated token
+        on the SAME live slot inside the TTL is the debounced repeat."""
+        from cswap_pin import proxy as pp
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        # A real client always presents whatever is currently live, so the
+        # rotation moves BOTH the store's own answer and the request's own
+        # bearer together — only the slot ("1", `_wire`'s default) stays put.
+        tokens = iter([self.LIVE, self.LIVE + "-rotated"])
+        self._wire(monkeypatch, switched=True, live_token=lambda: next(tokens),
+                   record_usage_headers=lambda *a: recorded.append(a))
+        pp._usage_header_seen.clear()
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=self._5H_HEADER)
+        self._relay(status=b"200 OK", reset=False,
+                    auth="Bearer " + self.LIVE + "-rotated",
+                    extra_headers=self._5H_HEADER)
+        assert len(recorded) == 1, (
+            f"two tokens of the same slot inside the TTL must be one "
+            f"record, not one per token: {recorded}")
 
     def case_a_stale_token_never_calls_record(self, monkeypatch):
         """The request's own token must equal the LIVE one, or a stale
@@ -15989,13 +16032,46 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     def case_a_switcher_without_the_method_raises_nothing(self, monkeypatch):
         """`_wire`'s default fake switcher has no `record_usage_headers` —
-        an older cswap, still installable as a peer."""
+        an older cswap, still installable as a peer.
+
+        THE HTTP STATUS ALONE CANNOT SEE THIS: `_run`'s own `except`
+        swallows an `AttributeError` from calling a method that is not
+        there and only logs it, so a reply that never even reaches `_run`
+        (the response head is already sent) reads 200 either way. The
+        assertion that actually exercises the `hasattr` guard is that
+        nothing was logged as a raise."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
         self._run_usage_thread_synchronously(monkeypatch)
         self._wire(monkeypatch, switched=True, live_token=self.LIVE)
         got = self._relay(status=b"200 OK", reset=False,
                           auth="Bearer " + self.LIVE,
                           extra_headers=self._5H_HEADER)
         assert got.startswith(b"HTTP/1.1 200"), got[:40]
+        assert not any("usage-header record raised" in m for m in logged), (
+            f"the missing method must be a no-op, not a caught exception: "
+            f"{logged}")
+
+    def case_a_thread_spawn_failure_does_not_abort_the_reply(self, monkeypatch):
+        """`_spawn_usage_header_recorder` is a bare `Thread.start()`, which
+        can raise `RuntimeError` under thread exhaustion — a statistic that
+        must never cost the reply it is riding on, exactly like `on_status`
+        just above it in `_relay_response`. Unguarded, this raise would
+        propagate out of `_note_usage_headers` and abort the response BEFORE
+        its head is sent."""
+        from cswap_pin import proxy as pp
+
+        def _raise(fn):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", _raise)
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE)
+        got = self._relay(status=b"200 OK", reset=False,
+                          auth="Bearer " + self.LIVE,
+                          extra_headers=self._5H_HEADER)
+        assert got.startswith(b"HTTP/1.1 200"), (
+            f"a thread-spawn failure must not cost the reply: {got[:40]!r}")
 
     def case_the_switch_outcome_is_logged_both_ways(self, monkeypatch):
         """`_TRACE` is off on a daemon that is already serving, which is
@@ -16347,6 +16423,30 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert not calls, (
             f"no repeat from this session may reach switch(): {calls}")
 
+    def case_a_sessions_expired_memo_converts_again(self, monkeypatch):
+        """THE OTHER HALF OF THE TTL: the case above is the control that the
+        debounce holds INSIDE the window; nothing covered the per-session
+        memo actually EXPIRING, the way `_walled_switch_seen`'s own negative
+        does (`case_a_settled_negative_expires_so_the_next_429_re_attempts`).
+        Without the prune in `_switch_off_walled_account`'s bearer branch,
+        this session's one 401 would be its last forever, on a wall whose
+        window can run for hours."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
+        calls = self._wire(monkeypatch, switched=False,
+                           live_token=self.LIVE, usage=self.HEADROOM)
+        first = self._relay(auth="Bearer stale-account-token",
+                            session="cse_expiring")
+        assert first.startswith(b"HTTP/1.1 401"), first[:40]
+        second = self._relay(auth="Bearer stale-account-token",
+                             session="cse_expiring")
+        assert second.startswith(b"HTTP/1.1 401"), (
+            "a session's own stale-bearer memo must expire like any other "
+            f"negative, or one 401 is this session's last on the whole "
+            f"wall: {second[:40]!r}")
+        assert not calls, (
+            f"no repeat from this session may reach switch(): {calls}")
+
     def case_a_reading_missing_a_base_window_converts(self, monkeypatch):
         """INVERTED (T1178): `oauth.relevant_windows` appends 5h and 7d only
         when each is present, so this reading is UNKNOWN (not "90% full") —
@@ -16561,7 +16661,6 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         parameter of this model; the two known-walled controls live as their
         own named cases instead of a ninth `Headroom` value). Only a
         MEASURED non-positive headroom (Exhausted, OverLimit) still relays.
-        Everything else relays.
         """
         if row["ResetHeader"] == "Absent":
             return False, 0
@@ -16923,6 +17022,54 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert status == 401, (
             "the client's bearer never reached the relay, so the daemon "
             f"relayed the wall the host had already left: {status}")
+
+    def case_the_session_id_reaches_the_relay_through_the_real_mitm(
+        self, monkeypatch, certdir,
+    ):
+        """THE OTHER HALF OF THE SAME WIRING: `x-claude-code-session-id`
+        travels `_forward` -> `_relay_response` exactly like the bearer
+        above, and nothing covered it. If the header is not threaded, both
+        sessions fall back to the shared `(reset, slot)` memo: the first
+        stale-bearer 429 converts and records a negative under that shared
+        key, and the second session's 429 on the same wall is then a
+        DEBOUNCED REPEAT of that negative — a raw 429, not its own 401. With
+        the header threaded each session gets its own per-session memo, so
+        both convert."""
+        from cswap_pin.proxy import PinProxy
+
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        upstream = _FakeUpstream(certdir, reply=(
+            b"HTTP/1.1 429 Too Many Requests\r\n" + self.RESET_HEADER
+            + b"\r\n" + self.RETRY_AFTER + b"\r\nContent-Length: 0\r\n"
+            b"Connection: close\r\n\r\n"))
+        proxy = PinProxy(certdir=certdir,
+                         pin_token_provider=lambda: "PIN-TOKEN",
+                         upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            body = json.dumps({"model": "claude-fable-5-1", "max_tokens": 4})
+            first = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages",
+                bearer="disk-token", body=body,
+                extra_headers={"x-claude-code-session-id": "session-a"},
+            )
+            second = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages",
+                bearer="disk-token", body=body,
+                extra_headers={"x-claude-code-session-id": "session-b"},
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+        assert first == 401, (
+            "the first session's stale bearer never reached the relay: "
+            f"{first}")
+        assert second == 401, (
+            "the session id never reached the relay, so the second "
+            "session's own stale-bearer 429 was debounced against the "
+            f"first session's shared-key negative instead of its own "
+            f"per-session memo: {second}")
 
     # --- a walled slot going live again inside its own wall (T1111) -------
 

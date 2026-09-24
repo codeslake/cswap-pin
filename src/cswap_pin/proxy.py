@@ -19357,8 +19357,10 @@ _walled_slots: dict[str, float] = {}
 # Sharing the key made N stale sessions take N * 30s to all recover (one
 # converts, the other N-1 read its memo and relay raw 429s until it
 # expires); keying on the session too gives each its own one-401-per-TTL
-# instead. Pruned on write, like `_walled_slots` — no cap needed, since it
-# self-limits to sessions that hit a stale bearer within the last TTL.
+# instead. Pruned in `_switch_off_walled_account`'s bearer branch, every
+# time a session key is checked there — before the membership test, not
+# tied to a write — so no cap is needed: it self-limits to sessions that
+# hit a stale bearer within the last TTL.
 _walled_switch_seen_by_session: dict[tuple[bytes, str | None, str], float] = {}
 
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
@@ -19479,8 +19481,12 @@ def _switch_off_walled_account(
     """Switch cswap off the account that just 429'd, at most once per wall.
 
     ``session`` is the request's ``x-claude-code-session-id`` — stable per
-    session and never rotated on retry, unlike the bearer. Empty for a
-    caller that owes it nothing (the standalone RC client, absolute-form
+    session and never rotated on retry, unlike the bearer. The absolute-form
+    relay (`_plain_relay_request`) never reaches this function at all — it
+    calls `_relay_response` with no `path=`, so the `/v1/messages` gate above
+    never matches. The only session-less caller is a request that DID reach
+    `_forward`'s MITM path with no `x-claude-code-session-id` header (an
+    older Claude Code client, or cswap's own urllib fetch of the same
     routes): the bearer branch below then falls back to today's shared
     per-(reset, slot) memo, exactly as before this parameter existed.
 
@@ -19519,7 +19525,7 @@ def _switch_off_walled_account(
     cannot yet measure is not the same claim as a retry the pin has measured
     and found nowhere to land, and unknown-fails-closed here was itself
     forging the "nowhere to land" 429 whenever the cache was merely cold
-    (five fable subagents' `authentication_failed` was the OTHER direction of
+    (three fable subagents' `authentication_failed` was the OTHER direction of
     this same mistake; a cold cache stalling a good retry is the direction
     this reverses). False (a KNOWN wall on the live account, `switch()`
     raised, `switch()` landed a credential it never validated, this session
@@ -19648,10 +19654,11 @@ def _switch_off_walled_account(
             # shared `key`: a stale bearer is a fact about ONE client, and
             # sharing the memo made every OTHER stale session wait out the
             # first one's TTL instead of getting its own 401 — N sessions
-            # took N * 30s. No `session` (a caller that owes it none, e.g.
-            # the standalone RC client) falls through unchanged and is
-            # recorded into the shared `key` below instead, exactly as
-            # before this parameter existed.
+            # took N * 30s. No `session` (a caller that reached this branch
+            # with no `x-claude-code-session-id` header — the absolute-form
+            # relay never reaches this function at all, see the docstring
+            # above) falls through unchanged and is recorded into the shared
+            # `key` below instead, exactly as before this parameter existed.
             session_key = (reset, slot, session) if session else None
             now2 = time.monotonic()
             if session_key is not None:
@@ -19805,12 +19812,19 @@ def _switch_off_walled_account(
 
 _USAGE_HEADER_THROTTLE_S = 30.0
 _usage_header_lock = threading.Lock()
-# bearer token -> monotonic time of the last thread this spawned. Bounded the
-# same way as `_walled_switch_seen`: the true key is the live SLOT, and
-# resolving that is exactly the cost this throttle exists to avoid paying on
-# the relay's own thread — see `_note_usage_headers`. The token is free
-# (the caller already has it for `auth`) and is what the spawned thread will
-# match against the live one anyway, so it stands in.
+# live SLOT -> monotonic time of the last thread that recorded for it. Keyed
+# on the slot, not the bearer: cswap's own `record_usage_headers` throttles
+# per SLOT at most once per 30s, and a token ROTATION on the same account is
+# still the same slot, so keying on the token let two different tokens of
+# one slot each pay their own record inside the window `record_usage_headers`
+# means to collapse to one — and let a burst of OTHER accounts' bearers
+# evict the live slot's own entry first, since eviction below takes
+# whichever key was inserted longest ago. Resolving the slot needs
+# `current_account_number()`, which can ask the server — see
+# `_note_usage_headers` for why that read, and so this whole memo, lives in
+# the spawned thread rather than on the relay's own. LRU: a hit moves the
+# key to the newest end (pop, then reinsert), so eviction takes the LEAST
+# recently touched slot rather than merely the oldest inserted one.
 _usage_header_seen: dict[str, float] = {}
 
 
@@ -19826,14 +19840,14 @@ def _note_usage_headers(
     slot goes through `current_account_number()`, whose docstring already
     warns it can ask the server — fine once per 429 under
     `_switch_off_walled_account`'s lock, not on every 200 this fires for.
-    So the slot read, the token match, and the write all happen in a
-    throwaway thread; this function only decides whether to start one, in
-    O(1) — a dict lookup and a header scan already sized by the caller.
-
-    Throttled per BEARER (see `_usage_header_seen` for why that stands in
-    for the slot), once per `_USAGE_HEADER_THROTTLE_S`: `record_usage_headers`
-    itself already asks for at most once per 30s per slot, so calling it
-    more often would trade store-write cost for nothing.
+    So the slot read, the throttle check against `_usage_header_seen`, the
+    token match, and the write all happen in a throwaway thread; this
+    function only decides whether to start one at all, in O(1) — a header
+    scan and a bearer strip already sized by the caller. The cost this
+    pays that the old per-bearer throttle did not is a thread spawn on
+    every 200/429 carrying the 5h header, in exchange for a throttle that
+    actually means what `record_usage_headers` promises: once per
+    `_USAGE_HEADER_THROTTLE_S` per SLOT, not per bearer.
     """
     if (path or "").split("?", 1)[0].rstrip("/") != "/v1/messages":
         return
@@ -19853,14 +19867,6 @@ def _note_usage_headers(
     token = token[7:].strip() if token[:7].lower() == "bearer " else ""
     if not token:
         return
-    now = time.monotonic()
-    with _usage_header_lock:
-        last = _usage_header_seen.get(token)
-        if last is not None and now - last < _USAGE_HEADER_THROTTLE_S:
-            return
-        _usage_header_seen[token] = now
-        if len(_usage_header_seen) > 8:
-            del _usage_header_seen[next(iter(_usage_header_seen))]
 
     def _run() -> None:
         try:
@@ -19872,6 +19878,15 @@ def _note_usage_headers(
             # actually has live now.
             if slot is None or live is None or token != live:
                 return
+            now = time.monotonic()
+            with _usage_header_lock:
+                last = _usage_header_seen.get(slot)
+                if last is not None and now - last < _USAGE_HEADER_THROTTLE_S:
+                    return
+                _usage_header_seen.pop(slot, None)
+                _usage_header_seen[slot] = now
+                if len(_usage_header_seen) > 8:
+                    del _usage_header_seen[next(iter(_usage_header_seen))]
             sw = require("switcher").ClaudeAccountSwitcher()
             if not hasattr(sw, "record_usage_headers"):
                 return
@@ -20054,7 +20069,10 @@ def _relay_response(
             on_status(status_line)
         except Exception:  # noqa: BLE001 — never let a statistic break a reply
             pass
-    _note_usage_headers(_upstream_status_line, lines, path, auth)
+    try:
+        _note_usage_headers(_upstream_status_line, lines, path, auth)
+    except Exception:  # noqa: BLE001 — never let a statistic break a reply
+        pass
     out = [status_line]
     length: int | None = None
     chunked = False
