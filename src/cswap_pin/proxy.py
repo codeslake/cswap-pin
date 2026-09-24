@@ -8510,7 +8510,17 @@ def _is_claimed(certdir: Path, live_clients=None, republish=None) -> bool:
         # socket at all (`_PUMP` runs it instead) — measured, the incident
         # this whole function exists to close had 22 of them open when the
         # daemon was torn down and none of them counted here.
-        if _PUMP.live_pairs() > 0:
+        #
+        # THE SAME SILENCE BOUND `await_inflight` USES, or this and that
+        # function disagree about what a pair means. `await_inflight` treats
+        # a pair quiet past `_DRAINING_MARKER_TTL` as WEDGED, not live, and
+        # releases it (c5aa0ad, d4167e0 — a wall clock could not tell a
+        # talking peer from a wedged one, so silence became the discriminator).
+        # Without the same bound here, `live_pairs() > 0` alone claims the
+        # daemon forever on exactly one wedged pair — the teardown that would
+        # have reached `await_inflight` and released it never fires, because
+        # `watch_refcount` never gets past this check.
+        if _PUMP.live_pairs() > 0 and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL:
             return True
         live = clients_that_arming_would_cut_off(port)
         if live is None:
@@ -8521,6 +8531,58 @@ def _is_claimed(certdir: Path, live_clients=None, republish=None) -> bool:
         return bool(live)
     except Exception:
         return False
+
+
+def _republish_own_record(
+    certdir: Path, port: int, pid: int, fingerprint: str,
+    still_accepting: bool, live_clients=None,
+) -> None:
+    """Re-assert this daemon's own ``proxy.json`` — ONLY when every signal
+    says this process is still the one actually serving ``port``.
+
+    `_is_claimed` calls whatever ``republish`` it is handed from a process
+    whose record has gone missing, which is also exactly what a DRAINING
+    PREDECESSOR looks like right after a handover: `_spawn_daemon` marked it,
+    spawned a successor, and the predecessor's own ``watch_refcount`` thread
+    is still ticking in the background with nothing new on disk. An
+    unconditional write there is a real incident, not a hypothetical one: if
+    that predecessor rewrites ``proxy.json`` naming itself, `_spawn_daemon`'s
+    wait (run by whatever is trying to replace a successor that died) reads a
+    record and calls the spawn done, `_sweep_orphan_daemons(keep_pid=
+    <predecessor>)` TERMs the real, freshly spawned successor as an orphan,
+    and the standby reads the predecessor's record and believes a live daemon
+    already holds the port — when the predecessor gave up its listener the
+    moment the handover began.
+
+    THREE GATES, all independent evidence, all required:
+
+    - ``not this_process_is_draining()``: the process has announced no
+      handover. `release_listener` runs very shortly after
+      `announce_draining` on every handover path in this module, but not
+      atomically with it, so this is not redundant with the gate below — it
+      closes the announcement-to-release window too.
+    - ``still_accepting``: THIS process's own listener is still open. The
+      caller passes ``proxy._srv is not None`` — `release_listener` (called
+      at the start of every handover, before the drain) nils it, so a
+      process past that point can never get here again regardless of what
+      the draining marker says yet.
+    - A claim already holds: a live client, a live Remote Control tunnel, or
+      the global wiring already naming this port. Without one of these there
+      is nothing established to protect, and republishing would manufacture
+      a claim rather than preserve one.
+    """
+    if this_process_is_draining():
+        return
+    if not still_accepting:
+        return
+    claimed = (
+        (live_clients is not None and live_clients() > 0)
+        or _PUMP.live_pairs() > 0
+        or _wired_port() == port
+    )
+    if not claimed:
+        return
+    write_daemon_state(certdir, port, pid, fingerprint, ungated=True)
 
 
 def watch_refcount(
@@ -9700,6 +9762,12 @@ class PortHolder:
         # a refused client fails at once and a queued one waits out its own
         # timeout.
         env[_STANDBY_FROM_ENV] = str(os.getpid())
+        # THE DAEMON THIS STANDBY IS ARMED FOR, so its own promote/release
+        # decision has a pid to check that is not read from `proxy.json` —
+        # see `_STANDBY_DAEMON_FROM_ENV`. Set here, once, at spawn time: the
+        # daemon this holder is CURRENTLY running (`self._spawn()` already
+        # ran by the time `start()` reaches this call).
+        env[_STANDBY_DAEMON_FROM_ENV] = str(self.daemon_pid or 0)
         log = _open_daemon_log(self._certdir)
         try:
             proc = subprocess.Popen(
@@ -10102,6 +10170,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         _log_lifecycle("standby got no listening descriptor — exiting")
         return
     born_of = int(os.environ.get(_STANDBY_FROM_ENV) or 0)
+    armed_for = int(os.environ.get(_STANDBY_DAEMON_FROM_ENV) or 0) or None
     port = srv.getsockname()[1]
 
     # THE SIGNAL TABLE IS THE CONTRACT — see `PortHolder.stop`. Only being ASKED
@@ -10138,7 +10207,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         # recorded daemon settles it with a signal-0 and no probe at all.
         silent, arm, wait = _standby_tick(
             born_of, silent,
-            lambda: (_recorded_daemon_alive(certdir)
+            lambda: (_recorded_daemon_alive(certdir, armed_for)
                      or _port_returns_bytes(port)),
         )
         if arm:
@@ -10493,6 +10562,25 @@ def _clear_handover_mark(certdir: Path) -> bool:
     # answers its port would be its own outage — every reader would believe
     # a pin is up when nothing is behind it.
     if pid and port and _pid_alive(pid) and _port_answers(port):
+        # RE-READ, IMMEDIATELY BEFORE THE WRITE. `_pid_alive` and
+        # `_port_answers` cost real wall time (a signal-0, a 0.5s connect
+        # budget), and a successor can publish its own record in exactly
+        # that window — `_spawn_daemon`'s own wait is racing this function.
+        # Writing the snapshot read at the TOP of this call would overwrite
+        # that fresh, correct record with a stale one, so the write only
+        # goes ahead if the mark on disk is still the SAME one: same pid,
+        # still a handover. Anything else means somebody already handled
+        # it — a successor published, or another caller already cleared or
+        # restored it — and there is nothing left for us to do here.
+        current = read_daemon_state(certdir)
+        if not (current and current.get("handover")
+                and int(current.get("pid") or 0) == pid):
+            _log_lifecycle(
+                f"{pid}'s handover mark changed while checking it was "
+                f"still serving {port} — leaving whatever is there now "
+                f"alone"
+            )
+            return True
         try:
             write_daemon_state(
                 certdir, port, pid, st.get("fingerprint") or "",
@@ -11199,6 +11287,13 @@ _HOLDER_SHA_ENV = "CSWAP_PIN_HOLDER_SHA"
 # reparents orphans to itself, so 1 is never reached and the standby would hold
 # the descriptor forever without ever arming.
 _STANDBY_FROM_ENV = "CSWAP_PIN_STANDBY_FROM"
+# WHICH DAEMON PID THE STANDBY WAS ARMED FOR — see `_recorded_daemon_alive`.
+# `proxy.json` is read fresh on every tick and can go missing out from under
+# a daemon that never stopped (the same class of race `_clear_handover_mark`
+# has its own fix for); this pid, captured at spawn time and never read from
+# a file another path can delete, is the fallback evidence for exactly that
+# window.
+_STANDBY_DAEMON_FROM_ENV = "CSWAP_PIN_STANDBY_DAEMON"
 _STANDBY_MODULE_ARG = "--standby"
 # ONE ARMING STANDBY PER CERTDIR. Held for the life of the winner, so every
 # later standby that reaches the same decision finds it taken and stands down.
@@ -11287,7 +11382,7 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
     return retired
 
 
-def _recorded_daemon_alive(certdir) -> bool:
+def _recorded_daemon_alive(certdir, armed_for: "int | None" = None) -> bool:
     """Is the daemon `proxy.json` names still running? Microseconds, no socket.
 
     DIRECT EVIDENCE INSTEAD OF INFERRED. Silence on the port is a PROXY for
@@ -11296,20 +11391,36 @@ def _recorded_daemon_alive(certdir) -> bool:
     one here and had to be three without it: the corroboration moved from
     repetition to a different KIND of evidence.
 
-    Absent or unreadable means "cannot tell", and the safe answer is TRUE —
-    assume something serves and do not arm. Arming wrongly is not cheap for us:
-    this standby does not carry traffic, it puts a DAEMON on the socket, and
-    two daemons accepting the same listener lose requests outright (19 of 60 in
-    steady state, measured). A peer can arm on a hunch because their relay
-    forwards to the same hop either way; ours cannot.
+    ``armed_for`` IS THE FALLBACK, NOT THE RECORD'S PRESENCE. The record can
+    go missing while the daemon it named keeps running — a race, or
+    `_clear_handover_mark` clearing a mark out from under a daemon that
+    turned out to still be serving — and reading that as "cannot tell,
+    assume alive" is only safe if the standby has no better evidence. It
+    does: the daemon pid it was armed for, passed down at spawn time
+    (`PortHolder._spawn_standby`) rather than read from a file another path
+    can delete. When the record itself cannot answer, THIS pid's liveness
+    decides instead of a blanket "assume alive" — a daemon whose only record
+    vanished must still be arm-able if it is genuinely gone, or the standby
+    holds the port answering nothing forever (the same outage the missing
+    record was already causing, from a different angle).
+
+    Absent or unreadable, AND no ``armed_for`` either, means "cannot tell",
+    and the safe answer is TRUE — assume something serves and do not arm.
+    Arming wrongly is not cheap for us: this standby does not carry traffic,
+    it puts a DAEMON on the socket, and two daemons accepting the same
+    listener lose requests outright (19 of 60 in steady state, measured). A
+    peer can arm on a hunch because their relay forwards to the same hop
+    either way; ours cannot.
     """
     try:
         rec = json.loads((Path(certdir) / _STATE_FILE).read_text())
     except (OSError, ValueError):
-        return True
+        rec = None
     pid = rec.get("pid") if isinstance(rec, dict) else None
     if not isinstance(pid, int) or pid <= 0:
-        return True
+        pid = armed_for  # the record proves nothing — fall back to what we know
+    if not isinstance(pid, int) or pid <= 0:
+        return True  # nothing at all to check — the safe default stands
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -12016,10 +12127,14 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             # ever goes missing while we are still serving — a stray delete,
             # `_clear_handover_mark` racing this daemon's own restore — this
             # is what `_is_claimed` calls to put it back before deciding we
-            # are unclaimed.
-            "republish": lambda: write_daemon_state(
+            # are unclaimed. GATED, not unconditional — see
+            # `_republish_own_record`: this same thread keeps ticking in a
+            # DRAINING predecessor after a handover, and writing there names
+            # a process that no longer accepts as the daemon.
+            "republish": lambda: _republish_own_record(
                 certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT,
-                ungated=True,
+                still_accepting=proxy._srv is not None,
+                live_clients=proxy.live_client_count,
             ),
         },
         daemon=True,
