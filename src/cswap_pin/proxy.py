@@ -10651,34 +10651,73 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         return
     _log_lifecycle(
         f"holder {born_of} is gone and port {port} answered nothing "
-        f"{_STANDBY_SILENT_STREAK}x — releasing it and healing rather than "
-        f"holding it under whatever this standby was born with"
+        f"{_STANDBY_SILENT_STREAK}x — reviving it fresh if the pin still "
+        f"names an account, or promoting in place if it does not"
     )
-    _standby_revive(certdir, srv)
+    _standby_revive(certdir, srv, account_num, email)
 
 
-def _standby_revive(certdir: Path, srv: socket.socket) -> None:
-    """Give the port back and heal, rather than holding it under a stale
-    identity. Split out of `standby_main` so a test can drive it without a
-    live loop -- same reason `_standby_tick` exists.
+def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
+                    email: str) -> None:
+    """Hand the still-open port to a freshly-resolved holder, or promote in
+    place on the identity this standby was BORN with. Split out of
+    `standby_main` so a test can drive it without a live loop -- same reason
+    `_standby_tick` exists.
 
-    RELEASED FIRST: `heal`'s spawn path binds the port itself (`holder_main`
-    over `subprocess.Popen`, socket-activation style, not a handed-down fd),
-    so this process's own hold has to be gone before that bind can succeed.
+    THE SIGNAL TABLE IS RESET BEFORE EITHER PATH BELOW, spawn or promotion.
+    `standby_main` set SIGTERM/SIGINT to SIG_IGN while idle (see there) --
+    SIG_IGN survives `exec`, so a child spawned before this reset inherits
+    it and starts life ignoring the signal meant to stop it.
 
-    `load_pin` GATES IT, not the ``account_num``/``email`` this standby was
-    BORN with. Those name whatever was pinned when its holder started, and a
-    `cswap pin --clear` (or a re-pin to a different account) since then must
-    not be resurrected by an orphan that never heard about it. `heal`
-    re-resolves the account itself, fresh, the same way `cswap pin --heal`
-    does — so this asks it rather than repeating the stale identity here.
+    THE SOCKET IS NEVER CLOSED HERE. 0.1.279 closed it and let `heal`'s
+    spawn path (`_spawn_daemon` with no fd) rebind the port from scratch --
+    which races a draining PREDECESSOR from an EARLIER handover, still
+    holding an open (if detached, see `release_listener` ~14248) copy of
+    the same port for as long as its own uncapped drain runs. That bind
+    then fails EADDRINUSE, and the port is left listening with nobody
+    accepting: the very incident this exists to end. The fix is the same
+    socket-activation handoff `release_listener(hand_down=True)` already
+    uses for a code handover: hand the SAME open, listening fd straight to
+    a fresh holder through `_spawn_daemon(listen_fd=...)`. Nothing here
+    calls `.close()` on it; the process that ends up not using it (this one,
+    once a successor is up) drops its own reference and the OS reclaims
+    that copy on its own, the same way a handed-down fd is never explicitly
+    closed anywhere else in this module.
+
+    `load_pin` GATES THE FRESH RESOLVE, not the ``account_num``/``email``
+    this standby was BORN with. Those name whatever was pinned when its
+    holder started, and a `cswap pin --clear` (or a re-pin to a different
+    account) since then must not be resurrected by an orphan that never
+    heard about it. Any failure resolving it -- no pin, a dangling slot,
+    `load_pin` itself raising, or the spawn failing outright -- falls to the
+    OLD IN-PLACE PROMOTION: this process becomes the holder on the socket
+    it is already holding, under the identity it was born with. That is
+    exactly what ran here before 3c5ab00, and it kept serving live sessions
+    (whose HTTPS_PROXY is fixed at exec) -- releasing the port with nothing
+    proven to hand it to only strands them.
     """
+    import signal
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
     try:
-        srv.close()
-    except OSError:
-        pass
-    if load_pin(certdir.parent):
-        heal(certdir.parent)
+        pin = load_pin(certdir.parent)
+        resolved = _resolve_pinned_slot(certdir.parent, pin[0]) if pin else None
+    except Exception:  # noqa: BLE001 — a daemon thread must never raise
+        pin, resolved = None, None
+    if resolved:
+        port = _spawn_daemon(resolved, pin[0], certdir, listen_fd=srv.fileno())
+        if port is not None:
+            return
+        # Spawn failed -- fall through to the old promotion below, still on
+        # the same open, listening socket.
+
+    holder = PortHolder(certdir, account_num, email, sock=srv)
+    holder.start()
+    if holder._thread is not None:
+        holder._thread.join()
 
 
 def holder_main(account_num: str, email: str, certdir: Path,
@@ -11948,12 +11987,19 @@ def _successor_is_serving(own_port: int) -> bool:
     holder, unwired the shared `.claude.json` away from a live pin on a
     different port four times in one day because this used to read the
     holder state alone and never asked whether the wired port was even ours.
+
+    A DIFFERENT PORT STILL HAS TO ANSWER TO COUNT. It is not automatically
+    a live pin just for being somebody else's -- a previous lineage's daemon
+    that has since died leaves the config naming its corpse exactly as
+    readily as ours does, and the owner's rule counts a DEAD port as safe to
+    rewire whoever it belonged to. Trusting a different port unconditionally
+    left that corpse wired forever, past the unwire that exists to clear it.
     """
     live = _wired_port()
     if live is None:
         return False
     if live != own_port:
-        return True
+        return _port_answers(live)
     if not _port_answers(live):
         return False
     return not held_by_a_holder()
