@@ -10893,7 +10893,15 @@ print("OK", port)
             def fileno(self):
                 return 4242
 
-        prev = signal.signal(signal.SIGHUP, signal.SIG_IGN)  # standby_main's idle disposition
+        # `_standby_revive` resets SIGTERM/SIGINT unconditionally -- save and
+        # restore all three (SIGHUP included) so this case does not leave
+        # the rest of the suite deaf to TERM/INT (T1168), the same as its
+        # siblings above.
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)  # standby_main's idle disposition
         try:
             pin_proxy._standby_revive(certdir, _Srv(), "1", "born@with.it")
             assert seen_during_spawn == [signal.SIG_IGN], (
@@ -10903,7 +10911,8 @@ print("OK", port)
                 "SIGHUP was reset even though the spawn succeeded and no "
                 "promotion ran")
         finally:
-            signal.signal(signal.SIGHUP, prev)
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
 
     def case_standby_main_arms_into_the_revive_path(self, tmp_path, monkeypatch):
         """T1168 (I) end to end: `standby_main`'s own arm branch is what
@@ -12158,8 +12167,17 @@ print("OK", port)
 
         monkeypatch.setattr(sys, "platform", "darwin")
         # Must return cleanly. A `pytest.skip` here would raise `Skipped`
-        # right through this call, uncaught by anything below.
-        self.case_a_term_is_never_dropped_by_a_parked_main_thread(tmp_path)
+        # right through this call -- caught here, or it escapes uncaught
+        # same as it would from `run_cases` itself, and this case reports
+        # SKIPPED instead of the FAILED a regression must produce.
+        try:
+            self.case_a_term_is_never_dropped_by_a_parked_main_thread(tmp_path)
+        except BaseException as exc:
+            raise AssertionError(
+                f"the non-Linux branch raised {type(exc).__name__} instead "
+                f"of returning cleanly -- a pytest.skip regression here "
+                f"escapes run_cases entirely: {exc}"
+            ) from exc
 
     def case_a_connection_is_counted_before_its_thread_runs(self, tmp_path):
         """An ACCEPTED connection must be drainable, not just a served one.
@@ -17513,7 +17531,14 @@ class TestArmingReportsWhoItCutsOff:
         try:
             n_idle = pin_proxy.clients_that_arming_would_cut_off(port)
             if n_idle is None:
-                pytest.skip("no /proc/net/tcp on this platform")
+                # AN EARLY RETURN, NEVER `pytest.skip` -- `run_cases` invokes
+                # every `case_*` by hand and its `except Exception` does not
+                # catch `Skipped` (it is a `BaseException`), so a skip here
+                # ESCAPES the loop and ends every case sorted after this one
+                # for the whole class, silently, on a host with no
+                # /proc/net/tcp (both Macs). See
+                # `case_the_unmeasurable_branch_never_raises_skipped` below.
+                return
             assert n_idle == 0, "counted a client before anyone connected"
             c = socket.create_connection(("127.0.0.1", port), timeout=5)
             conn, _ = srv.accept()
@@ -17527,6 +17552,30 @@ class TestArmingReportsWhoItCutsOff:
                 c.close()
         finally:
             srv.close()
+
+    def case_the_unmeasurable_branch_never_raises_skipped(
+            self, tmp_path, monkeypatch):
+        """`pytest.skip` inside a `case_*` raises `Skipped`, a
+        `BaseException` -- `run_cases`'s own `except Exception` does not
+        catch it, so it ESCAPES the loop and ends every case sorted after
+        this one for the whole class, silently, on a host with no
+        /proc/net/tcp (both Macs). Forces that branch and asserts the sibling
+        case returns cleanly, not about which host happens to run the
+        suite."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(
+            pin_proxy, "clients_that_arming_would_cut_off", lambda _p: None)
+        try:
+            self.case_the_count_is_sockets_not_environments(
+                monkeypatch, tmp_path)
+        except BaseException as exc:
+            raise AssertionError(
+                f"the unmeasurable-platform branch raised "
+                f"{type(exc).__name__} instead of returning cleanly -- a "
+                f"pytest.skip regression here escapes run_cases entirely: "
+                f"{exc}"
+            ) from exc
 
 
 class TestClearingThePinDoesNotStrandLiveSessions:
@@ -17566,7 +17615,14 @@ class TestClearingThePinDoesNotStrandLiveSessions:
         monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
         try:
             if pin_proxy.clients_that_arming_would_cut_off(port) is None:
-                pytest.skip("no /proc/net/tcp on this platform")
+                # AN EARLY RETURN, NEVER `pytest.skip` -- `run_cases` invokes
+                # every `case_*` by hand and its `except Exception` does not
+                # catch `Skipped` (it is a `BaseException`), so a skip here
+                # ESCAPES the loop and ends every case sorted after this one
+                # for the whole class, silently, on a host with no
+                # /proc/net/tcp (both Macs). See
+                # `case_the_unmeasurable_branch_never_raises_skipped` below.
+                return
             assert pin_proxy._is_claimed(certdir) is False, (
                 "an idle unwired daemon should still time out"
             )
@@ -17620,6 +17676,30 @@ class TestClearingThePinDoesNotStrandLiveSessions:
         assert pin_proxy._is_claimed(certdir, lambda: 1) is True, (
             "a live client was ignored because the platform cannot be probed"
         )
+
+    def case_the_unmeasurable_branch_never_raises_skipped(
+            self, tmp_path, monkeypatch):
+        """`pytest.skip` inside a `case_*` raises `Skipped`, a
+        `BaseException` -- `run_cases`'s own `except Exception` does not
+        catch it, so it ESCAPES the loop and ends every case sorted after
+        this one for the whole class, silently, on a host with no
+        /proc/net/tcp (both Macs). Forces that branch and asserts the sibling
+        case returns cleanly, not about which host happens to run the
+        suite."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(
+            pin_proxy, "clients_that_arming_would_cut_off", lambda _p: None)
+        try:
+            self.case_a_live_connection_claims_the_daemon(
+                tmp_path, monkeypatch)
+        except BaseException as exc:
+            raise AssertionError(
+                f"the unmeasurable-platform branch raised "
+                f"{type(exc).__name__} instead of returning cleanly -- a "
+                f"pytest.skip regression here escapes run_cases entirely: "
+                f"{exc}"
+            ) from exc
 
     def case_a_missing_record_with_an_open_channel_is_republished(
         self, tmp_path, monkeypatch
@@ -18448,7 +18528,7 @@ class TestAWedgeIsNotTrustedForever:
             proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
         monkeypatch.setattr(
             proxy, "_kill_daemon",
-            lambda pid, certdir=None, **k: kills.append(pid))
+            lambda pid, certdir=None, **k: kills.append(pid) or True)
         monkeypatch.setattr(
             proxy, "_spawn_daemon", lambda n, e, c, **k: port + 1)
         try:
@@ -18587,6 +18667,8 @@ class TestAWedgeIsNotTrustedForever:
         monkeypatch.setattr(
             proxy, "_kill_daemon",
             lambda pid, certdir=None, **k: kills.append(pid))
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda n, e, c, **k: port + 1)
         try:
             proxy.heal(tmp_path)
             assert kills == [os.getpid()], (
@@ -18650,6 +18732,8 @@ class TestAWedgeIsNotTrustedForever:
         monkeypatch.setattr(
             proxy, "_kill_daemon",
             lambda pid, certdir=None, **k: kills.append(pid))
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda n, e, c, **k: port + 1)
         try:
             proxy.heal(tmp_path)
             assert kills == [os.getpid()], (
@@ -18714,6 +18798,8 @@ class TestAWedgeIsNotTrustedForever:
         monkeypatch.setattr(
             proxy, "_kill_daemon",
             lambda pid, certdir=None, **k: kills.append((pid, k)))
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda n, e, c, **k: port + 1)
         try:
             proxy.heal(tmp_path)
             assert kills and kills[0][0] == os.getpid(), (
@@ -18755,7 +18841,7 @@ class TestAWedgeIsNotTrustedForever:
         monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
         monkeypatch.setattr(proxy, "_watchdog_had_its_turn", lambda *a: True)
-        monkeypatch.setattr(proxy, "_worker_alive_age", lambda cd: None)
+        monkeypatch.setattr(proxy, "_worker_alive_age", lambda cd, pid: None)
         monkeypatch.setattr(proxy, "_holder_owns", lambda cd: True)
         monkeypatch.setattr(
             proxy, "_wedged_parent_holder",
@@ -18868,6 +18954,60 @@ class TestAWedgeIsNotTrustedForever:
             "heal replaced the wedge through its holder but reported "
             "'Nothing to heal'")
 
+    def case_a_term_that_hits_esrch_does_not_report_healed(
+            self, tmp_path, monkeypatch):
+        """`_kill_daemon` hitting ESRCH means no signal was delivered -- the
+        pid was already gone, retired by someone else (another `heal` call,
+        the daemon's own self-replace) or never existed. `recycled` must not
+        say otherwise: finding a successor already up afterwards is that
+        OTHER caller's repair, not this call's, and reporting it as one lets
+        this call claim credit for a race it lost."""
+        from cswap_pin import proxy
+
+        root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        fp = proxy.daemon_fingerprint()
+        stale_pid, successor_pid = 70001, 70002
+        proxy.write_daemon_state(certdir, 4300, stale_pid, fp)  # WEDGE
+
+        def _fake_read_alive_port(cd, fingerprint=None):
+            st = proxy.read_daemon_state(cd)
+            if not st:
+                return None
+            if fingerprint is not None:
+                if st.get("fingerprint") != fingerprint:
+                    return None
+                # WEDGED: the fingerprint matches, but the probe still finds
+                # nothing, until a genuinely new pid takes over the record.
+                if int(st.get("pid") or 0) == stale_pid:
+                    return None
+            return st.get("port")
+
+        monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
+        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+
+        def _fake_kill_daemon(pid, cd=None, **k):
+            # ESRCH: no signal delivered -- but someone ELSE already
+            # replaced this daemon, which is exactly why the TERM found
+            # nothing there.
+            proxy.write_daemon_state(cd, 4300, successor_pid, fp)
+            return False
+        monkeypatch.setattr(proxy, "_kill_daemon", _fake_kill_daemon)
+
+        spawn_calls = []
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda *a, **k: spawn_calls.append(a) or 99999)
+
+        result = proxy.heal(root)
+        assert not spawn_calls, (
+            "heal spawned a second daemon over a successor that was already "
+            "serving")
+        assert result is False, (
+            "a TERM that hit ESRCH was reported as this call's own repair -- "
+            "the successor it found belongs to whoever actually retired the "
+            "stale pid")
+
     def case_heal_never_asks_a_holder_that_never_claimed_the_channel(
             self, tmp_path, monkeypatch):
         """T1168 (I): the guard, driven through `heal` itself.
@@ -18902,7 +19042,7 @@ class TestAWedgeIsNotTrustedForever:
         monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
         monkeypatch.setattr(proxy, "_watchdog_had_its_turn", lambda *a: True)
-        monkeypatch.setattr(proxy, "_worker_alive_age", lambda cd: None)
+        monkeypatch.setattr(proxy, "_worker_alive_age", lambda cd, pid: None)
         monkeypatch.setattr(proxy, "_holder_owns", lambda cd: True)
         monkeypatch.setattr(
             proxy, "_wedged_parent_holder",
@@ -18946,7 +19086,8 @@ class TestAWedgeIsNotTrustedForever:
             f"{spawn_calls}")
         assert result is True, "heal did not report the fallback as done"
 
-    def case_a_holder_lacking_the_flag_is_not_signalled(self, tmp_path):
+    def case_a_holder_lacking_the_flag_is_not_signalled(
+            self, tmp_path, monkeypatch):
         """T1168 (H): `_REPLACE_ME_SIGNAL` (SIGUSR1) TERMINATES a process
         with no handler for it -- the default disposition.
         `_wedged_parent_holder` only proves the parent's ARGV looks like a
@@ -18957,14 +19098,12 @@ class TestAWedgeIsNotTrustedForever:
         exec-time snapshot nothing in THIS process can fake by mutating its
         own `os.environ` afterwards.
 
-        T1168 (C): NO /proc ON macOS. `_wedged_daemon_can_be_asked` already
-        answers False there (the `read_bytes` in it raises `OSError`, caught),
-        so the CLAIMING row's own answer flips with the host -- everything
-        else stays False on both. Asserting `is True` unconditionally made
-        this case macOS-red, and a `pytest.skip` here would raise past
-        `run_cases`'s bare `except Exception` (`Skipped` is not one) and take
-        the whole class down with it -- so the row is read from the host
-        instead of skipped.
+        T1168 (C) IS SETTLED, NOT OPEN. `_wedged_daemon_can_be_asked` now
+        falls back to `ps eww` when `/proc` is unavailable (`_wedged_env_via_ps`),
+        and that fallback reads the same real exec-time environment `ps`
+        itself sees -- so the CLAIMING row must answer True on EITHER path,
+        macOS included. Simulated below (`_no_proc`) rather than skipped,
+        so this platform gap is caught here instead of only on a Mac runner.
         """
         import subprocess
         import sys
@@ -19001,12 +19140,21 @@ class TestAWedgeIsNotTrustedForever:
                     time.sleep(0.02)
 
             assert pin_proxy._wedged_daemon_can_be_asked(
-                claiming.pid, holder_pid) is has_proc, (
+                claiming.pid, holder_pid) is True, (
                 "a daemon whose own environment claims this exact holder "
                 "was not trusted — the legitimate row this guard must "
-                "still pass" if has_proc else
-                "no /proc on this host, but the guard did not fail closed"
+                "still pass, on /proc or on the ps fallback alike"
             )
+            # T1168 (C), simulated: /proc unavailable (macOS) must not
+            # regress this same row -- `ps eww` reads the real environment
+            # either way.
+            self._no_proc(monkeypatch)
+            assert pin_proxy._wedged_daemon_can_be_asked(
+                claiming.pid, holder_pid) is True, (
+                "with /proc unavailable, the ps fallback did not trust a "
+                "daemon whose own environment claims this exact holder"
+            )
+            monkeypatch.undo()
             assert pin_proxy._wedged_daemon_can_be_asked(
                 silent.pid, holder_pid) is False, (
                 "a daemon with NEITHER marker was signalled — SIGUSR1's "
@@ -19095,6 +19243,36 @@ class TestAWedgeIsNotTrustedForever:
             "the macOS ps fallback did not confirm the wedged daemon's own "
             "capability markers")
 
+    def case_a_holder_pid_that_is_a_prefix_of_another_is_not_matched(
+            self, monkeypatch):
+        """`ps eww`'s output is a bare command line, and a substring test
+        against it reads `CSWAP_PIN_HELD_BY=90` as present in
+        `CSWAP_PIN_HELD_BY=901` -- a real daemon held by 901 would then be
+        trusted for a candidate holder of 90. The token has to match
+        EXACTLY, the same as the `/proc/<pid>/environ` path's own dict
+        equality."""
+        import subprocess
+
+        from cswap_pin import proxy
+
+        wedged_pid, real_holder = 501, 901
+        candidate_holder = 90  # a PREFIX of real_holder, not equal to it
+
+        def _fake_run(argv, **k):
+            class _R:
+                stdout = (
+                    f"/usr/bin/python3 -m claude_swap.pin_proxy 1 a@b.c "
+                    f"/tmp/certdir CSWAP_PIN_HELD_BY={real_holder} "
+                    f"CSWAP_PIN_HOLDER_TAKES_REPLACE=1\n")
+            return _R()
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert proxy._wedged_env_via_ps(wedged_pid, candidate_holder) is False, (
+            f"holder {candidate_holder} was trusted on evidence naming "
+            f"{real_holder} -- a prefix match, not an exact one")
+        assert proxy._wedged_env_via_ps(wedged_pid, real_holder) is True, (
+            "the CONTROL: the real holder itself was not trusted")
+
     def case_a_standby_promoted_in_place_still_qualifies_as_the_holder(
             self, tmp_path):
         """`_standby_revive` promotes a standby to holder IN PLACE -- same
@@ -19133,6 +19311,123 @@ class TestAWedgeIsNotTrustedForever:
                 os.kill(child_pid, 9)
             except (OSError, NameError):
                 pass
+
+    def case_a_wedge_under_a_promoted_standby_is_asked_not_termed(
+            self, tmp_path, monkeypatch):
+        """T1186 (I): `asked_holder` required `_holder_owns(certdir)`, which
+        matches `--hold-port` ONLY. A standby promoted in place never
+        re-execs -- its argv still reads `--standby ...` -- so
+        `_holder_owns` answers False for it, and `and` short-circuited
+        before `_wedged_parent_holder` (which DOES recognise a promoted
+        standby, see the sibling case above) was ever reached: a wedge
+        under one fell straight to the ordinary TERM instead of being
+        asked first. Driven through `heal` itself, on a REAL promoted-standby
+        parent and a REAL wedged child -- `_holder_owns`,
+        `_wedged_parent_holder` and `_wedged_daemon_can_be_asked` are none of
+        them stubbed. Only `os.kill` is intercepted, so the SIGUSR1 this case
+        is asserting about is observed rather than actually delivered to a
+        process with no handler for it."""
+        import signal
+        import subprocess
+        import sys
+
+        from cswap_pin import proxy
+
+        root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        fp = proxy.daemon_fingerprint()
+
+        parent_script = (
+            # A REAPER THREAD, or `_kill_daemon`'s real SIGTERM to the real
+            # child below leaves a ZOMBIE (nobody ever calls `wait()` on it)
+            # and `_pid_alive`'s `kill(pid, 0)` reports a zombie as alive
+            # until reaped -- `heal` then burns its whole drain budget on a
+            # child that already died. Measured: 10s per run without this.
+            "import subprocess, sys, os, time, threading\n"
+            "myenv = dict(os.environ)\n"
+            f"myenv[{proxy._HELD_BY_ENV!r}] = str(os.getpid())\n"
+            f"myenv[{proxy._HOLDER_REPLACE_ENV!r}] = '1'\n"
+            "c = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(10)'], env=myenv)\n"
+            "threading.Thread(target=c.wait, daemon=True).start()\n"
+            "print(c.pid, flush=True)\n"
+            "time.sleep(10)\n"
+        )
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parent_script,
+             proxy._STANDBY_MODULE_ARG, "1", "a@b.c", str(certdir)],
+            stdout=subprocess.PIPE, text=True,
+        )
+        stale_pid = None
+        try:
+            stale_pid = int(parent.stdout.readline().strip())
+            # THE CONTROL this case depends on: a promoted standby's argv
+            # never satisfies `_holder_owns` -- proving the old gate really
+            # would have refused this row before ever asking
+            # `_wedged_parent_holder`.
+            assert proxy._holder_owns(certdir) is False, (
+                "the promoted standby's argv unexpectedly matched "
+                "_holder_owns -- this case is vacuous without that mismatch")
+            deadline = time.monotonic() + 5
+            while (time.monotonic() < deadline
+                   and not os.path.exists(f"/proc/{stale_pid}/environ")):
+                time.sleep(0.02)
+
+            proxy.write_daemon_state(certdir, 4200, stale_pid, fp)  # WEDGE
+
+            def _fake_read_alive_port(cd, fingerprint=None):
+                st = proxy.read_daemon_state(cd)
+                if not st:
+                    return None
+                if fingerprint is not None:
+                    if st.get("fingerprint") != fingerprint:
+                        return None
+                    # WEDGED: the fingerprint matches, but the probe still
+                    # finds nothing -- exactly what `_serving_can_pin`
+                    # answering False means in production -- until a
+                    # genuinely NEW pid takes over the record.
+                    if int(st.get("pid") or 0) == stale_pid:
+                        return None
+                return st.get("port")
+
+            monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
+            monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
+            monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+
+            asked = []
+            _real_kill = os.kill
+
+            def _fake_kill(pid, sig):
+                if pid == parent.pid and sig == proxy._REPLACE_ME_SIGNAL:
+                    asked.append(pid)
+                    proxy.write_daemon_state(certdir, 4200, 999999, fp)
+                    return
+                _real_kill(pid, sig)
+            monkeypatch.setattr(proxy.os, "kill", _fake_kill)
+
+            spawn_calls = []
+            monkeypatch.setattr(
+                proxy, "_spawn_daemon",
+                lambda *a, **k: spawn_calls.append(a) or 99999)
+
+            assert proxy._REPLACE_ME_SIGNAL == signal.SIGUSR1, (
+                "no 'replace me' channel on this platform -- the case below "
+                "is vacuous without it")
+            proxy.heal(root)
+            assert asked == [parent.pid], (
+                "the wedge under a promoted standby was TERMed directly "
+                "instead of being asked through its holder first")
+            assert not spawn_calls, (
+                "heal spawned a second daemon instead of trusting the "
+                "holder's successor")
+        finally:
+            parent.kill()
+            parent.wait(timeout=5)
+            if stale_pid is not None:
+                try:
+                    os.kill(stale_pid, 9)
+                except OSError:
+                    pass
 
     def case_CONTROL_an_ordinary_parent_is_not_a_holder(self, tmp_path):
         """The control for the row above: an OS parent that is neither a
@@ -19889,7 +20184,9 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         # reused freely, and killing on liveness alone aims TERM at whatever
         # unrelated process inherited the number.
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None, **k: killed.append(pid))
+        monkeypatch.setattr(
+            proxy, "_kill_daemon",
+            lambda pid, certdir=None, **k: killed.append(pid) or True)
 
         def _spawn(num, email, cd, **kw):
             spawned.append((num, email))
@@ -24570,8 +24867,14 @@ class TestAHolderDoesNotOutliveItsLauncher:
 
         from cswap_pin.proxy import ensure_ca
 
+        # AN EARLY RETURN, NEVER `pytest.skip` -- `run_cases` invokes every
+        # `case_*` by hand and its `except Exception` does not catch
+        # `Skipped` (it is a `BaseException`), so a skip here ESCAPES the
+        # loop and ends every case sorted after this one for the whole
+        # class, silently, on every macOS CI runner. See
+        # `case_the_non_linux_early_exit_never_raises_skipped` below.
         if sys.platform != "linux":
-            pytest.skip("PR_SET_PDEATHSIG is Linux-only")
+            return
 
         ensure_ca(tmp_path, "api.anthropic.com")
         launcher_src = (
@@ -24647,6 +24950,28 @@ class TestAHolderDoesNotOutliveItsLauncher:
                     pass
             if launcher.poll() is None:
                 launcher.kill()
+
+    def case_the_non_linux_early_exit_never_raises_skipped(
+            self, tmp_path, monkeypatch):
+        """`pytest.skip` inside a `case_*` raises `Skipped`, a
+        `BaseException` -- `run_cases`'s own `except Exception` does not
+        catch it (`Skipped` is not one), so it ESCAPES the loop and ends
+        every case sorted after this one for the whole class, silently, on
+        every macOS CI runner. Called directly here, platform forced
+        non-Linux, so the assertion is about this method's OWN control flow
+        -- an early `return` -- not about which host happens to run the
+        suite."""
+        import sys
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        try:
+            self.case_a_sigkilled_launcher_takes_the_holder_with_it(tmp_path)
+        except BaseException as exc:
+            raise AssertionError(
+                f"the non-Linux branch raised {type(exc).__name__} instead "
+                f"of returning cleanly -- a pytest.skip regression here "
+                f"escapes run_cases entirely: {exc}"
+            ) from exc
 
 
 class TestAnUpstreamFailureCLOSESTheClientRatherThanHangingIt:

@@ -17487,6 +17487,39 @@ class TestTheEvidenceSurvivesAHandover:
         pid = os.getpid()
         assert f"{other}@{pid}" in got and f"{self.SID}@{pid}" in got, sorted(got)
 
+    def case_an_old_shape_reader_sees_a_new_writers_fresh_stamp(self, certdir):
+        """During a rollout handover, a draining OLD daemon still running the
+        DEPLOYED release reads `_alive_load(certdir).get(sid)` -- a bare key,
+        never `sid@pid`. Writing ONLY the pid-suffixed key leaves that reader
+        blind to a successor's traffic for the whole drain, and after
+        `_STREAM_LIVE_SECONDS` a spurious 404 passes through and ends the
+        session. The bare key has to be there too."""
+        import time as _t
+        from cswap_pin import proxy as pp
+        self._cold()
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        bare = pp._alive_load(certdir).get(self.SID)
+        assert isinstance(bare, (int, float)), (
+            "no bare `sid` key -- an old-shape reader's `.get(sid)` sees "
+            f"nothing: {pp._alive_load(certdir)!r}")
+        assert abs(bare - _t.time()) < 60, f"stale bare stamp: {bare}"
+
+    def case_a_fresh_bare_key_from_an_older_writer_still_spares_the_404(
+            self, certdir):
+        """The `k == sid` branch in `_stream_404_is_spurious`, untested until
+        now: an OLDER release's daemon writes only the bare key, and a
+        session mid-handover depends on the NEW reader still counting it."""
+        import json
+        import time as _t
+        from cswap_pin import proxy as pp
+        with pp._worker_alive_lock:
+            pp._worker_alive.clear()
+        pp._alive_path(certdir).write_text(json.dumps({self.SID: _t.time()}))
+        got = self._relay(self.STREAM, b"404 Not Found", certdir)
+        assert got.startswith(b"HTTP/1.1 503"), (
+            "a bare `sid` key from an older-release writer did not spare "
+            f"the 404: got {got[:40]!r}")
+
 
 class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
     """THE DRAIN PROTECTED NOTHING AND COST EVERYTHING.
