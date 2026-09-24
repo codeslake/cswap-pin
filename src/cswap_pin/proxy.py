@@ -1954,12 +1954,22 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # A DAEMON CARRYING LIVE WORKER TRAFFIC IS NOT WEDGED,
                     # whatever `/health` just said -- `_worker_alive_age`
                     # reads evidence written from the REQUEST path, which a
-                    # deadlock confined to `/health` alone cannot fake.
+                    # deadlock confined to `/health` alone cannot fake --
+                    # SCOPED TO THIS PID, because the stamp file is per
+                    # CERTDIR, not per daemon: a draining predecessor still
+                    # ticking on its own worker route, or a daemon in another
+                    # pid namespace entirely, writes into the very same file.
                     # Killing it here would cut sessions still using it, so
                     # this pass leaves the record alone; the next heal call
-                    # (or the code watchdog) gets another look.
-                    age = _worker_alive_age(certdir)
-                    if age is not None and age < _STREAM_LIVE_SECONDS:
+                    # gets another look. WEDGE ONLY -- a stale-fingerprint
+                    # daemon is retired for running code we no longer ship,
+                    # not for a missed /health, and the CODE watchdog already
+                    # covers that case (it fires on a stale fingerprint). A
+                    # WEDGE on CURRENT code never trips that watchdog -- so
+                    # worker traffic must spare only THIS recycle, or a
+                    # spared wedge would have nothing left to catch it.
+                    age = _worker_alive_age(certdir, stale_pid) if wedged else None
+                    if wedged and age is not None and age < _STREAM_LIVE_SECONDS:
                         _log_lifecycle(
                             f"{stale_pid} missed /health but carried worker "
                             f"traffic {age:.0f}s ago — leaving it rather than "
@@ -1979,9 +1989,18 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # (not merely "a holder exists somewhere for this
                     # certdir") to replace it, and wait for a fresh record
                     # before touching the old pid at all.
+                    # NOT `_holder_owns(certdir) and` -- that matches
+                    # `--hold-port` only, and a standby PROMOTED IN PLACE
+                    # never re-execs (its argv still reads `--standby ...`),
+                    # so `and`-ing it in short-circuited before
+                    # `_wedged_parent_holder` (which DOES recognise a
+                    # promoted standby) was ever reached. `_wedged_parent_holder`
+                    # already proves the STRONGER claim -- that STALE_PID'S OWN
+                    # parent is a holder or a promoted standby for THIS
+                    # certdir -- so the looser "something holds it somewhere"
+                    # check added nothing but a way to refuse the standby row.
                     asked_holder = (
                         _REPLACE_ME_SIGNAL is not None
-                        and _holder_owns(certdir)
                         and _wedged_parent_holder(stale_pid, certdir)
                     )
                     # THE HOLDER HAS TO HAVE CLAIMED THE CHANNEL. Its argv
@@ -2012,19 +2031,30 @@ def heal(backup_root: Path, identity: dict | None = None,
                             time.sleep(0.1)
                     # ponytail: TERM through `_kill_daemon` still gives this
                     # predecessor its ordinary 30s signal drain, even though
-                    # both liveness signals (a missed /health, a stale or
-                    # absent worker-alive stamp) already said it was not
-                    # moving -- upgrade: announce_draining before this TERM,
-                    # the way the daemon's own self-replace path does.
-                    _kill_daemon(stale_pid, certdir, misses=_PIN_PROBE_ATTEMPTS,
-                                worker_alive_age=age)
-                    # ONLY AFTER A KILL. `recycled` decides whether the spawn
-                    # guard below is fingerprinted, and setting it merely for
-                    # ENTERING this branch made a no-op recycle look like a
-                    # real one: with no `ps` (the documented blind spot) the
-                    # identity gate kills nothing, and heal then spawned a
-                    # successor over a daemon that is still serving.
-                    recycled = True
+                    # a missed /health already said it was not moving -- on
+                    # the WEDGE branch the worker-alive stamp said the same
+                    # (checked above; a stale-fingerprint recycle never runs
+                    # that check and is killed on the mismatch alone) --
+                    # upgrade: announce_draining before this TERM, the way
+                    # the daemon's own self-replace path does.
+                    # `misses` NAMES A /health FAILURE COUNT -- only true for
+                    # the wedge branch. A stale-fingerprint recycle is killed
+                    # for the code it runs, not for missed probes, and
+                    # logging `misses=3` against it claimed evidence this
+                    # path never gathered.
+                    # ONLY WHEN A SIGNAL WAS ACTUALLY DELIVERED. Setting
+                    # `recycled` merely for ENTERING this branch made a
+                    # no-op recycle look like a real one: with no `ps` (the
+                    # documented blind spot) the identity gate kills nothing,
+                    # and heal then spawned a successor over a daemon that is
+                    # still serving. ESRCH is the same failure by another
+                    # route -- the pid was already gone -- so a successor
+                    # found afterwards belongs to whoever actually retired
+                    # it, not to this call.
+                    recycled = _kill_daemon(
+                        stale_pid, certdir,
+                        misses=_PIN_PROBE_ATTEMPTS if wedged else None,
+                        worker_alive_age=age)
         except SpawnLockBusy as exc:
             # NOT THE SAME FALSE AS "nothing to heal". Both reach the caller as
             # a bare False and it prints "Nothing to heal" — the opposite of
@@ -2100,7 +2130,13 @@ def heal(backup_root: Path, identity: dict | None = None,
                 else _read_alive_port(certdir)
             )
             if probe is not None:
-                return False
+                # RECYCLED MEANS THIS CALL ALREADY DID THE REPAIR -- it
+                # killed the stale/wedged daemon above, successor-first
+                # through its own holder when there was one. Finding that
+                # successor already serving here is the SAME repair
+                # finishing, not a bystander's; reporting False read as
+                # "nothing to heal" for a call that just retired a daemon.
+                return recycled
             port = _spawn_daemon(account_num, email, certdir)
         if port is None:
             # Could not start. Make sure a stale wiring is not left behind to
@@ -4006,9 +4042,9 @@ def _log_carry(certdir: Path, what: str, **evidence) -> None:
     written into Claude Code's own files has to outlive the launch that wrote
     it, or the comment justifying it is not true.
 
-    ``**evidence`` is optional keyword context (``_kill_daemon`` passes ``pid``,
-    ``ppid`` and, from `heal`, ``misses``/``worker_alive_age``) appended after
-    ``what``. A key whose value is None is dropped rather than printed, so a
+    ``**evidence`` is optional keyword context (``_kill_daemon`` passes
+    ``by_pid`` and, from `heal`, ``misses``/``worker_alive_age``) appended
+    after ``what``. A key whose value is None is dropped rather than printed, so a
     caller with nothing to say about it costs nothing on the line.
     """
     extra = "".join(f" {k}={v}" for k, v in evidence.items() if v is not None)
@@ -7149,10 +7185,16 @@ def _spawn_lock(certdir: Path, name: str = ".spawn.lock",
 
 def _kill_daemon(pid: int, certdir: "Path | None" = None,
                   misses: "int | None" = None,
-                  worker_alive_age: "float | None" = None) -> None:
+                  worker_alive_age: "float | None" = None) -> bool:
     """TERM a daemon, then escalate to KILL if it does not exit — so a daemon
     that ignores TERM (or hangs mid-teardown) never lingers as an orphan
     holding a port. Mirrors a supervisor recycle: bounded wait, then force.
+
+    RETURNS WHETHER A SIGNAL WAS ACTUALLY DELIVERED -- False on ESRCH (the
+    pid was already gone by the time this ran). `heal`'s recycle uses this to
+    set `recycled`, so a TERM that hits ESRCH does not get reported as a
+    repair this call made when the pid was in fact retired by someone else,
+    or never existed to begin with.
 
     THE TERM BUDGET IS DERIVED FROM THE DRAIN, NOT CHOSEN. A daemon answering
     TERM runs ``stop(drain=_DRAIN_SECONDS)``, so a fixed 2s wait here SIGKILLed
@@ -7183,19 +7225,25 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None,
     # SIGTERMs this daemon and whatever spawned it. A peer landed exactly here
     # with SIGKILL and took down its own test runner.
     if pid <= 0:
-        return
+        return False
     try:
         os.kill(pid, 15)  # SIGTERM
     except OSError:
-        return
+        return False
     if certdir is not None:
-        _log_carry(certdir, f"TERM {pid}", ppid=os.getppid(), misses=misses,
+        # THE KILLER'S OWN PID, not `os.getppid()` -- that names OUR
+        # parent, which is neither the killer (this process IS the killer)
+        # nor the killed daemon's own parent, and reads as either "the
+        # daemon's parent" or "who did this" depending on which the reader
+        # guesses. `by_pid` is unambiguous: it names the process that just
+        # called `os.kill`.
+        _log_carry(certdir, f"TERM {pid}", by_pid=os.getpid(), misses=misses,
                    worker_alive_age=worker_alive_age)
     # +2s of slack past the drain ceiling; the loop exits the moment it dies,
     # so a daemon with no live clients still returns in milliseconds.
     for _ in range(int(_DRAIN_SECONDS * 10) + 20):
         if not _pid_alive(pid):
-            return
+            return True
         # A DRAIN THAT ANNOUNCED ITSELF IS NOT AN ORPHAN. This escalation
         # exists so a daemon that IGNORES the signal never lingers holding a
         # port; a daemon that took it and is beating its marker is leaving on
@@ -7210,19 +7258,20 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None,
         # and the next sweep reaps it -- the leak stays bounded without this
         # loop having to be the thing that bounds it.
         if certdir is not None and is_draining(certdir, pid):
-            return
+            return True
         time.sleep(0.1)
     try:
         os.kill(pid, 9)  # SIGKILL escalation
     except OSError:
-        return
+        return True  # TERM was delivered; it vanished before the escalation
     if certdir is not None:
-        _log_carry(certdir, f"KILL {pid}", ppid=os.getppid(), misses=misses,
+        _log_carry(certdir, f"KILL {pid}", by_pid=os.getpid(), misses=misses,
                    worker_alive_age=worker_alive_age)
     for _ in range(10):  # up to ~1s for the port to actually free
         if not _pid_alive(pid):
-            return
+            return True
         time.sleep(0.1)
+    return True
 
 
 def _recycle_daemon(certdir: Path, pid: int) -> bool:
@@ -7299,16 +7348,61 @@ def _holder_owns(certdir: Path) -> bool:
     return False
 
 
+def _ps_out(argv: list[str]) -> "str | None":
+    """Run ``ps``, return its stripped stdout, or None on any failure or
+    empty answer -- the shared plumbing behind every macOS ``ps`` fallback
+    in this module (no ``/proc`` there)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            argv, capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.strip() or None
+
+
+def _ppid_via_ps(pid: int) -> "int | None":
+    """``pid``'s parent, via ``ps`` -- the macOS fallback for
+    `_wedged_parent_holder` where ``/proc/<pid>/status`` does not exist.
+    Cannot tell -> None, same failure mode as the /proc path."""
+    out = _ps_out(["ps", "-o", "ppid=", "-p", str(pid)])
+    try:
+        return int(out) if out is not None else None
+    except ValueError:
+        return None
+
+
+def _cmdline_via_ps(pid: int) -> "str | None":
+    """``pid``'s full command line, via ``ps`` -- the macOS fallback for
+    reading ``/proc/<pid>/cmdline``. ``-ww`` for the same reason
+    `_holder_owns` uses it: a truncated line can never match a long certdir
+    path. None when ``ps`` cannot answer, never a guess."""
+    return _ps_out(["ps", "-ww", "-o", "command=", "-p", str(pid)])
+
+
 def _wedged_parent_holder(pid: int, certdir: Path) -> "int | None":
     """``pid``'s own OS parent, when that parent is the ``--hold-port``
-    holder for ``certdir`` -- else None.
+    holder (or a ``--standby`` promoted in place, see below) for ``certdir``
+    -- else None.
 
     `_holder_owns` answers "IS a holder holding this certdir's port"; this
     answers "is THIS pid's OWN parent that holder" -- what makes a
     successor-first replace (see `heal`'s wedge branch) land the REPLACE_ME
     signal on the wedged daemon's own supervisor rather than some other
-    holder's. /proc only: on a platform without it (macOS) this returns
-    None and the caller falls back to today's direct kill.
+    holder's.
+
+    A STANDBY QUALIFIES TOO. `_standby_revive` promotes a standby to holder
+    IN PLACE -- same pid, same argv, never re-exec'd as ``--hold-port`` --
+    so its argv still reads ``--standby ...`` even though it now installs
+    the replace handler and spawns children exactly like an ordinary holder.
+    Requiring the holder flag alone made that promoted process invisible
+    here, and a wedge under it fell straight to the direct-kill fallback.
+
+    /proc FIRST, ``ps`` as the macOS fallback -- same order as
+    `_holder_owns`, for the same reason: `/proc/<pid>/cmdline` has no width
+    to truncate a long certdir path out of.
     """
     try:
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
@@ -7318,13 +7412,17 @@ def _wedged_parent_holder(pid: int, certdir: Path) -> "int | None":
         else:
             return None
     except (OSError, ValueError, IndexError):
-        return None
+        ppid = _ppid_via_ps(pid)
+        if ppid is None:
+            return None
     try:
-        argv = Path(f"/proc/{ppid}/cmdline").read_bytes().replace(b"\0", b" ")
+        cmd = Path(f"/proc/{ppid}/cmdline").read_bytes().replace(
+            b"\0", b" ").decode("utf-8", "replace").rstrip()
     except OSError:
-        return None
-    cmd = argv.decode("utf-8", "replace").rstrip()
-    if _HOLDER_MODULE_ARG not in cmd:
+        cmd = _cmdline_via_ps(ppid)
+        if cmd is None:
+            return None
+    if _HOLDER_MODULE_ARG not in cmd and _STANDBY_MODULE_ARG not in cmd:
         return None
     targets = {str(Path(certdir)), str(Path(certdir).resolve())}
     return ppid if any(cmd.endswith(" " + t) for t in targets) else None
@@ -7349,16 +7447,44 @@ def _wedged_daemon_can_be_asked(pid: int, holder_pid: int) -> bool:
     that same moment) succeeded. `/proc/<pid>/environ` is the exec-time
     snapshot of exactly that block, unaffected by anything either process
     does afterwards. Any read failure (no /proc, the pid already gone, no
-    permission) answers False: the caller's fallback is today's direct kill,
-    never a guess.
+    permission) falls to the macOS `ps` fallback below; that failing too
+    answers False, the caller's fallback is today's direct kill, never a
+    guess.
     """
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
-        return False
+        return _wedged_env_via_ps(pid, holder_pid)
     env = dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
     return (env.get(_HOLDER_REPLACE_ENV.encode()) == b"1"
             and env.get(_HELD_BY_ENV.encode()) == str(holder_pid).encode())
+
+
+def _wedged_env_via_ps(pid: int, holder_pid: int) -> bool:
+    """macOS fallback for `_wedged_daemon_can_be_asked`: there is no
+    ``/proc/<pid>/environ`` there, but ``ps eww`` appends a process's own
+    environment to its command line. Parses the same two markers a direct
+    ``/proc`` read would have given. UNRELIABLE -- ``ps`` failing outright,
+    or answering nothing for this pid -- falls back to False, same as the
+    /proc path's own read failures: the caller's fallback is the ordinary
+    TERM, never a signal sent on a guess.
+    """
+    out = _ps_out(["ps", "eww", "-o", "command=", "-p", str(pid)])
+    if out is None:
+        _log_lifecycle(
+            f"ps could not read {pid}'s environment -- falling back to the "
+            "ordinary TERM path")
+        return False
+    # ANCHORED, NOT A BARE SUBSTRING -- `ps eww`'s output is a command line,
+    # not a dict, and `f"{KEY}={v}" in out` reads `CSWAP_PIN_HELD_BY=90` as
+    # present inside `CSWAP_PIN_HELD_BY=901`. Matched as a whole token, the
+    # same exact equality the `/proc/<pid>/environ` dict path already gets.
+    def _token(key: str) -> "str | None":
+        m = re.search(rf"(?:^|\s){re.escape(key)}=(\S*)", out)
+        return m.group(1) if m else None
+
+    return (_token(_HELD_BY_ENV) == str(holder_pid)
+            and _token(_HOLDER_REPLACE_ENV) == "1")
 
 
 def _pin_daemon_pids(certdir: Path) -> list[int]:
@@ -8816,21 +8942,27 @@ def _teardown_vetoed_by_live_work(certdir: Path, live_clients=None) -> bool:
     """Whether `watch_refcount` must keep watching rather than tear down,
     even though `_is_claimed` just said no.
 
-    `_is_claimed` reads a record naming another LIVE pid as a real handover
-    and answers False on the spot (its own docstring) -- right for "who does
-    the WIRING point at now", wrong for "is THIS process still doing
-    anything": the record can move to a successor while THIS daemon still
-    has a live client or an open Remote Control pair it has not drained.
-    Torn down on the record's word alone, those get ConnectionRefused mid
-    conversation. So this asks the two things `_is_claimed` never reaches in
-    that branch, directly and with NO quiet bound -- a pair `_is_claimed`
+    THE EXITS THIS ACTUALLY VETOES are the ones `_is_claimed` takes for a
+    reason OTHER than a genuine handover: a MISSING record (none at all, or
+    one naming a dead pid), QUIET PAIRS (its own live-pair check reading
+    zero or too stale), a REFUSED REPUBLISH (asked to re-assert our record
+    and still came back without one), and a bare EXCEPTION anywhere inside
+    it. None of those prove this process let go of anything -- they are
+    "the record cannot confirm us", not "someone else has taken over" -- so
+    a live client or an open Remote Control pair this daemon still has must
+    still be asked directly, with NO quiet bound: a pair `_is_claimed`
     itself would call wedged past `_DRAINING_MARKER_TTL` still counts here,
     because the record moving is not proof this process let go of it.
+    Torn down on the record's word alone, those get ConnectionRefused mid
+    conversation.
 
-    `_superseded_on_the_port` is the one carve-out: a record naming another
-    pid that really IS alive on this port is a genuine supersession, and
-    that teardown already gets the uncapped handover drain elsewhere -- so
-    only there does this let `on_last_holder_gone` proceed.
+    IT DOES NOT VETO A RECORD NAMING ANOTHER LIVE PID -- that is
+    `_superseded_on_the_port`'s question, not this one, and it is the ONE
+    `_is_claimed` exit this function does not touch: a record naming
+    another pid that really IS alive on this port is a genuine
+    supersession, and that teardown already gets the uncapped handover
+    drain elsewhere -- so only `_superseded_on_the_port` lets
+    `on_last_holder_gone` proceed there.
     """
     if _superseded_on_the_port(certdir):
         return False
@@ -10674,10 +10806,12 @@ def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
     `standby_main` so a test can drive it without a live loop -- same reason
     `_standby_tick` exists.
 
-    THE SIGNAL TABLE IS RESET BEFORE EITHER PATH BELOW, spawn or promotion.
-    `standby_main` set SIGTERM/SIGINT to SIG_IGN while idle (see there) --
-    SIG_IGN survives `exec`, so a child spawned before this reset inherits
-    it and starts life ignoring the signal meant to stop it.
+    SIGTERM/SIGINT ARE RESET BEFORE EITHER PATH BELOW, spawn or promotion.
+    `standby_main` set both to SIG_IGN while idle (see there) -- SIG_IGN
+    survives `exec`, so a child spawned before this reset inherits it and
+    starts life ignoring the signal meant to stop it. SIGHUP is NOT reset
+    here -- it keeps `standby_main`'s own `_release` handler until the
+    PROMOTION path below; see the comment there for why.
 
     THE SOCKET IS NEVER CLOSED HERE. 0.1.279 closed it and let `heal`'s
     spawn path (`_spawn_daemon` with no fd) rebind the port from scratch --
@@ -10710,7 +10844,14 @@ def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
 
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    # SIGHUP IS RESET ONLY ON THE PROMOTION PATH BELOW, not here. A fresh
+    # holder's own `_spawn` starts a daemon whose `_retire_stale_standbys`
+    # SIGHUPs every OTHER standby it finds on this port -- including THIS
+    # one, still mid-wait inside `_spawn_daemon` below. Resetting here made
+    # that SIGHUP land on the default disposition (terminate) instead of
+    # `_release`, the handler `standby_main` armed while idle, killing the
+    # reviving standby in the middle of the very wait meant to give it a
+    # successor.
 
     try:
         pin = load_pin(certdir.parent)
@@ -10731,7 +10872,17 @@ def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
         # socket. Only promote when nothing else is already covering it.
         if _port_returns_bytes(srv.getsockname()[1]) or _holder_owns(certdir):
             return
+        # THE RESOLVED PIN, NOT THE BORN-WITH IDENTITY. A pin was JUST
+        # confirmed live moments ago -- only the fresh holder's spawn
+        # failed, not the resolve -- so promoting on the identity this
+        # standby happened to be born with would serve whatever account was
+        # pinned when its OWN holder started, which a `cswap pin --clear`
+        # or a re-pin since then has already moved past.
+        account_num, email = resolved, pin[0]
 
+    # PROMOTION ONLY, past this point: this process becomes the holder on
+    # the socket it is already holding.
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
     holder = PortHolder(certdir, account_num, email, sock=srv)
     holder.start()
     if holder._thread is not None:
@@ -19242,15 +19393,21 @@ def _alive_load(certdir) -> dict:
     return got if isinstance(got, dict) else {}
 
 
-def _worker_alive_age(certdir) -> "float | None":
-    """Seconds since the NEWEST `_alive_load` stamp, or None with no stamps.
+def _worker_alive_age(certdir, pid: int) -> "float | None":
+    """Seconds since ``pid``'s own newest `_alive_load` stamp, or None with
+    no stamp FROM THAT PID.
 
     Evidence a daemon `heal` is about to recycle is still carrying live
     worker traffic even though its own `/health` missed -- see the caller in
     `heal`'s wedge branch, which must not kill a daemon this reads as fresh.
+    SCOPED TO ``pid``, because the stamp file is per CERTDIR, not per daemon:
+    a draining predecessor's own traffic, or a daemon in another pid
+    namespace, would otherwise spare a wedged CURRENT daemon on evidence that
+    was never its own.
     """
-    stamps = [v for v in _alive_load(certdir).values()
-              if isinstance(v, (int, float))]
+    suffix = f"@{pid}"
+    stamps = [v for k, v in _alive_load(certdir).items()
+              if k.endswith(suffix) and isinstance(v, (int, float))]
     return (time.time() - max(stamps)) if stamps else None
 
 
@@ -19281,7 +19438,20 @@ def _note_worker_status(path: str | None, status_line: bytes,
     if p is None:
         return
     shared = _alive_load(certdir)
+    # THE WRITER'S OWN PID IS PART OF THE KEY, not the value -- a value has
+    # to stay a bare number or the filter two lines down (every OTHER
+    # writer's read-modify-write, not just this one) drops the entry on its
+    # very next pass. See `_worker_alive_age`, the reader this exists for.
+    #
+    # BOTH SHAPES, DURING THE ROLLOUT HANDOVER. A DEPLOYED release still
+    # reads the bare `shared.get(sid)` -- a draining OLD daemon running that
+    # code cannot see a successor's `sid@pid`-only stamp, and after
+    # `_STREAM_LIVE_SECONDS` a spurious stream 404 passes through and ends
+    # the session. `_stream_404_is_spurious` here already accepts either
+    # shape; the bare key is for the reader this process has not upgraded
+    # past yet.
     shared[sid] = now
+    shared[f"{sid}@{os.getpid()}"] = now
     # MERGED, NOT OVERWRITTEN: the departing daemon and its successor both
     # write here. A lost update costs one entry and fails toward "no
     # evidence", which is the direction that lets the 404 through.
@@ -19312,9 +19482,13 @@ def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:
     sid, now = m.group(1), time.time()
     with _worker_alive_lock:
         seen = _worker_alive.get(sid)
-    shared = _alive_load(certdir).get(sid)
-    if isinstance(shared, (int, float)):
-        seen = shared if seen is None else max(seen, shared)
+    # ANY WRITER COUNTS HERE, unlike `_worker_alive_age`: this question is
+    # "did ANY daemon just see this session move", so both the bare key an
+    # older release wrote and the `sid@pid` key this one does are evidence.
+    prefix = f"{sid}@"
+    for k, v in _alive_load(certdir).items():
+        if (k == sid or k.startswith(prefix)) and isinstance(v, (int, float)):
+            seen = v if seen is None else max(seen, v)
     if seen is None:
         return False
     # A future stamp is clock skew, not evidence of anything; bound it both
