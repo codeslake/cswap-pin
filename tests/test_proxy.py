@@ -4205,6 +4205,156 @@ class TestASuccessorThatCannotStart:
             holder.stop()
 
 
+class TestSuperviseCleanExitGuards:
+    """T1168 (R): `PortHolder._supervise`'s clean-exit (code 0) respawn used
+    to check only `load_pin`, so it respawned under `CSWAP_PIN_SELF_HEAL=off`
+    (the non-zero-exit branch a few lines down honours the switch, this one
+    did not), let `load_pin` raising escape the daemon THREAD (which ends
+    silently -- `_stop` never set, `self._srv` never closed, the standby
+    still reads the holder as alive), and never checked whether the pin had
+    already moved to a different held port.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    class _FakeProc:
+        def __init__(self, code):
+            self.returncode = code
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+    def _drive_clean_exit(self, tmp_path, monkeypatch):
+        """A holder whose FIRST spawn exits 0 at once, under a real socket.
+        Returns (holder, spawn_calls, stopped_event)."""
+        import threading
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        spawn_calls = []
+        stopped = threading.Event()
+
+        def _fake_spawn(self):
+            spawn_calls.append(1)
+            self._proc = TestSuperviseCleanExitGuards._FakeProc(0)
+            self.daemon_pid = 4242
+
+        real_stop = PortHolder.stop
+
+        def _stop(self):
+            stopped.set()
+            real_stop(self)
+
+        monkeypatch.setattr(PortHolder, "_spawn", _fake_spawn)
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "stop", _stop)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        return holder, spawn_calls, stopped
+
+    def case_self_heal_off_releases_instead_of_respawning(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setenv(pin_proxy._SELF_HEAL_ENV, "off")
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@b.c", "org-1"))
+        holder, spawn_calls, stopped = self._drive_clean_exit(
+            tmp_path, monkeypatch)
+        try:
+            holder.start()
+            assert stopped.wait(timeout=5), (
+                "a clean exit under CSWAP_PIN_SELF_HEAL=off did not release "
+                "the port"
+            )
+        finally:
+            if not stopped.is_set():
+                holder.stop()
+        assert len(spawn_calls) == 1, (
+            f"respawned under self-heal=off: {len(spawn_calls)} spawns"
+        )
+
+    def case_load_pin_raising_releases_instead_of_leaving_the_thread_dead(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        def _boom(root):
+            raise RuntimeError("host missing")
+
+        monkeypatch.setattr(pin_proxy, "load_pin", _boom)
+        holder, spawn_calls, stopped = self._drive_clean_exit(
+            tmp_path, monkeypatch)
+        try:
+            holder.start()
+            assert stopped.wait(timeout=5), (
+                "load_pin raising left the supervisor thread dead instead "
+                "of releasing the port — the standby still reads this "
+                "holder as alive forever"
+            )
+        finally:
+            if not stopped.is_set():
+                holder.stop()
+        assert len(spawn_calls) == 1, (
+            f"respawned after load_pin raised: {len(spawn_calls)} spawns"
+        )
+
+    def case_port_no_longer_wanted_releases_instead_of_respawning(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@b.c", "org-1"))
+        monkeypatch.setattr(pin_proxy, "_standby_port_still_wanted",
+                            lambda certdir, port: False)
+        holder, spawn_calls, stopped = self._drive_clean_exit(
+            tmp_path, monkeypatch)
+        try:
+            holder.start()
+            assert stopped.wait(timeout=5), (
+                "respawned on a port the pin no longer wants — two "
+                "lineages on two ports now supersede each other forever"
+            )
+        finally:
+            if not stopped.is_set():
+                holder.stop()
+        assert len(spawn_calls) == 1, (
+            f"respawned on an unwanted port: {len(spawn_calls)} spawns"
+        )
+
+    def case_CONTROL_still_pinned_and_wanted_respawns(
+            self, tmp_path, monkeypatch):
+        """CONTROL: with every guard passing, the existing auto-heal still
+        respawns on the held port rather than releasing it."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "load_pin",
+                            lambda root: ("a@b.c", "org-1"))
+        monkeypatch.setattr(pin_proxy, "_standby_port_still_wanted",
+                            lambda certdir, port: True)
+        holder, spawn_calls, stopped = self._drive_clean_exit(
+            tmp_path, monkeypatch)
+        try:
+            deadline = time.time() + 5
+            holder.start()
+            while len(spawn_calls) < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            assert len(spawn_calls) >= 2, (
+                "CONTROL FAILED: a still-pinned, still-wanted clean exit "
+                "did not respawn — the case above proves nothing without it"
+            )
+        finally:
+            holder.stop()
+
+
 class TestHolderCrashIsSurvivable:
     """A crash of the process HOLDING the socket — the case one level up
     from its sibling in :class:`TestDaemonPortStability`, which kills the
@@ -8272,6 +8422,82 @@ class TestEnsureProxy:
                 raise AccountNotFoundError(identifier)
         assert pin_proxy.ensure_proxy(Sw(tmp_path)) is None
 
+    def case_a_live_daemon_in_another_pid_namespace_is_not_recycled_or_spawned(
+            self, tmp_path, monkeypatch):
+        """T1168 (S): the recorded pid invisible to THIS pid namespace is not
+        proof of death. `_pin_daemon_pids` gives the same empty answer for a
+        genuinely dead pid and for a live one a daemon in another pid
+        namespace -- sharing $HOME, not the pid namespace -- answers from.
+        Marking the record or spawning here overwrites a live daemon's own
+        state and puts a second daemon on the port from a namespace that can
+        never supervise it. A REAL daemon (`PinProxy`), not a stub, because
+        the point is what its own `/health` answers with `pid`."""
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+        try:
+            # A DIFFERENT fingerprint, so the fast path's fingerprinted read
+            # already misses it -- the only way this reaches the stale
+            # branch the case is about.
+            pin_proxy.write_daemon_state(
+                certdir, live.port, os.getpid(), "OTHER-FINGERPRINT")
+            # INVISIBLE HERE. The recorded pid is real (this test process),
+            # but production visibility is decided by `_pin_daemon_pids`
+            # alone -- stub it empty to stand in for a container's `ps`
+            # missing the host's pid, or the reverse.
+            monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [])
+            monkeypatch.setattr(
+                pin_proxy, "_recycle_daemon",
+                lambda *a, **k: (_ for _ in ()).throw(
+                    AssertionError("recycled a live cross-namespace daemon")))
+            monkeypatch.setattr(
+                pin_proxy, "_spawn_daemon",
+                lambda *a, **k: (_ for _ in ()).throw(
+                    AssertionError("spawned over a live cross-namespace daemon")))
+            before = (certdir / "proxy.json").read_bytes()
+            got_port, _ = pin_proxy.ensure_proxy(self._Sw(tmp_path))
+            after = (certdir / "proxy.json").read_bytes()
+        finally:
+            live.stop(drain=0)
+        assert got_port == live.port, (
+            f"did not return the live cross-namespace daemon's own port: "
+            f"{got_port}"
+        )
+        assert after == before, (
+            "the live daemon's own record was rewritten from a namespace "
+            "that cannot supervise it"
+        )
+
+    def case_CONTROL_a_genuinely_dead_record_is_still_recycled_the_old_way(
+            self, tmp_path, monkeypatch):
+        """CONTROL for the case above: invisible AND unreachable (no
+        /health answer either) is still today's path -- straight through to
+        an ordinary spawn."""
+        from cswap_pin import proxy as pin_proxy
+
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.write_daemon_state(certdir, 1, 999999, "OTHER-FINGERPRINT")
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [])
+        spawned = []
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon",
+            lambda a, e, c, **kw: spawned.append(a) or 9955)
+        port, _ = pin_proxy.ensure_proxy(self._Sw(tmp_path))
+        assert port == 9955 and spawned == ["2"], (
+            f"a genuinely dead cross-namespace record blocked the ordinary "
+            f"spawn path: port={port} spawned={spawned}"
+        )
+
 
 
 
@@ -10191,6 +10417,63 @@ print("OK", port)
             "INT on purpose, so anything else escalates to SIGKILL"
         )
 
+    def case_orphaned_standby_with_a_recorded_pin_releases_and_heals(
+            self, tmp_path, monkeypatch):
+        """T1168 (A): `_standby_revive` -- what an orphaned, silent standby
+        falls into once it is the one arming. 0.1.279 reused whatever
+        account/email THIS standby was born with, which resurrects a pin a
+        `cswap pin --clear` (or a re-pin) already moved on from. `heal`
+        re-resolves the account fresh, the same way `cswap pin --heal`
+        does, so this releases the port and asks it instead.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org-1")
+
+        closed = []
+
+        class _Srv:
+            def close(self):
+                closed.append(True)
+
+        healed = []
+        monkeypatch.setattr(pin_proxy, "heal",
+                            lambda root: healed.append(root) or True)
+
+        pin_proxy._standby_revive(certdir, _Srv())
+
+        assert closed == [True], (
+            "the port was not released before healing — heal's spawn path "
+            "binds the port itself and needs it free"
+        )
+        assert healed == [tmp_path], f"a recorded pin did not heal: {healed}"
+
+    def case_CONTROL_orphaned_standby_with_no_pin_only_releases(
+            self, tmp_path, monkeypatch):
+        """CONTROL: nothing pinned — releases the port and resurrects
+        nothing."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        closed = []
+
+        class _Srv:
+            def close(self):
+                closed.append(True)
+
+        healed = []
+        monkeypatch.setattr(pin_proxy, "heal",
+                            lambda root: healed.append(root) or True)
+
+        pin_proxy._standby_revive(certdir, _Srv())
+
+        assert closed == [True]
+        assert healed == [], f"healed with nothing pinned: {healed}"
+
     def case_only_one_standby_can_win_the_right_to_arm(self, tmp_path):
         """The exclusion I shipped and then admitted was unproven.
 
@@ -11094,7 +11377,7 @@ print("OK", port)
         os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
         try:
             assert pin_proxy.held_by_a_holder(), "premise: we are under a holder"
-            assert not pin_proxy._successor_is_serving(), (
+            assert not pin_proxy._successor_is_serving(pin_proxy._wired_port()), (
                 "a holder's own listening socket read as a successor — the "
                 "teardown skips the unwire and every later session dials a "
                 "port nothing answers"
@@ -11105,6 +11388,47 @@ print("OK", port)
             else:
                 os.environ[pin_proxy._HELD_BY_ENV] = prev
 
+    def case_a_wiring_naming_another_ports_live_pin_is_not_touched(
+            self, tmp_path, monkeypatch):
+        """T1168 (W): the holder-corpse reading above is right only for OUR
+        OWN port. `_successor_is_serving` used to trust `held_by_a_holder()`
+        alone, whatever port was wired -- so under a holder this teardown
+        read a DIFFERENT daemon's live port as "our own corpse" and unwired
+        past it. Measured 2026-09-24: exactly this, four times in one day,
+        against a live pin on another port.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: 41111)
+        monkeypatch.setattr(pin_proxy, "held_by_a_holder", lambda: True)
+        monkeypatch.setattr(pin_proxy, "_port_answers",
+                            lambda p, timeout=0.5: True)
+
+        assert pin_proxy._successor_is_serving(36301) is True, (
+            "a wiring naming a DIFFERENT port (41111) was read as our own "
+            "corpse just because we are under a holder -- that port is "
+            "somebody else's daemon, alive or dead, and not this "
+            "teardown's to unwire"
+        )
+
+    def case_CONTROL_our_own_ports_wiring_still_uses_the_holder_corpse_check(
+            self, tmp_path, monkeypatch):
+        """CONTROL for the case above: our OWN port, under a holder, must
+        still read as our corpse rather than a successor -- unchanged from
+        `case_an_idle_teardown_under_a_holder_still_unwires`, driven
+        directly instead of through the environment."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: 36301)
+        monkeypatch.setattr(pin_proxy, "held_by_a_holder", lambda: True)
+        monkeypatch.setattr(pin_proxy, "_port_answers",
+                            lambda p, timeout=0.5: True)
+
+        assert pin_proxy._successor_is_serving(36301) is False, (
+            "our own port's listen-only corpse under a holder read as a "
+            "successor — the unwire is skipped and every later session "
+            "dials a port nothing answers"
+        )
 
     def case_the_port_answers_across_a_SIGKILL_of_the_daemon(self, tmp_path):
         """A CRASH is the case a handover cannot cover.
@@ -17603,6 +17927,14 @@ class TestAWedgeIsNotTrustedForever:
         monkeypatch.setattr(
             proxy, "_wedged_parent_holder",
             lambda pid, cd: holder_pid if pid == stale_pid else None)
+        # THIS CASE IS ABOUT THE SUCCESSOR-FIRST PROTOCOL, NOT ABOUT WHETHER
+        # THE HOLDER CLAIMED THE CHANNEL -- see `TestAWedgeIsNotTrustedForever
+        # .case_a_holder_lacking_the_flag_is_not_signalled` for that guard on
+        # its own. `stale_pid`/`holder_pid` are synthetic here, so a real
+        # `/proc/<stale_pid>/environ` read would answer False for reasons
+        # that have nothing to do with what this case asserts.
+        monkeypatch.setattr(proxy, "_wedged_daemon_can_be_asked",
+                            lambda pid, hp: True)
         monkeypatch.setattr(proxy, "_pid_alive", lambda pid: pid != stale_pid)
 
         signalled, killed = [], []
@@ -17634,6 +17966,73 @@ class TestAWedgeIsNotTrustedForever:
             "heal spawned a second daemon instead of trusting the holder's "
             "successor -- exactly the double-bind `_recycle_daemon` exists "
             "to avoid")
+
+    def case_a_holder_lacking_the_flag_is_not_signalled(self, tmp_path):
+        """T1168 (H): `_REPLACE_ME_SIGNAL` (SIGUSR1) TERMINATES a process
+        with no handler for it -- the default disposition.
+        `_wedged_parent_holder` only proves the parent's ARGV looks like a
+        holder for this certdir; this is the check that proves the WEDGED
+        DAEMON ITSELF believes that holder installed the handler, read the
+        only way another process can -- its own exec-time environment. Real
+        subprocesses, not stubs: the point is `/proc/<pid>/environ`, an
+        exec-time snapshot nothing in THIS process can fake by mutating its
+        own `os.environ` afterwards.
+        """
+        import subprocess
+        import sys
+
+        from cswap_pin import proxy as pin_proxy
+
+        def _spawn(env_extra):
+            env = {**os.environ, **env_extra}
+            return subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                env=env)
+
+        holder_pid = 424242  # never has to be a real process for this check
+
+        claiming = _spawn({
+            pin_proxy._HELD_BY_ENV: str(holder_pid),
+            pin_proxy._HOLDER_REPLACE_ENV: "1",
+        })
+        silent = _spawn({})
+        wrong_holder = _spawn({
+            pin_proxy._HELD_BY_ENV: str(holder_pid + 1),
+            pin_proxy._HOLDER_REPLACE_ENV: "1",
+        })
+        try:
+            # /proc/<pid>/environ exists as soon as exec lands; poll rather
+            # than assume the first read wins that race.
+            deadline = time.monotonic() + 5
+            while (time.monotonic() < deadline
+                   and not os.path.exists(f"/proc/{claiming.pid}/environ")):
+                time.sleep(0.02)
+
+            assert pin_proxy._wedged_daemon_can_be_asked(
+                claiming.pid, holder_pid) is True, (
+                "a daemon whose own environment claims this exact holder "
+                "was not trusted — the legitimate row this guard must "
+                "still pass"
+            )
+            assert pin_proxy._wedged_daemon_can_be_asked(
+                silent.pid, holder_pid) is False, (
+                "a daemon with NEITHER marker was signalled — SIGUSR1's "
+                "default disposition is TERMINATE and this holder never "
+                "claimed the channel"
+            )
+            assert pin_proxy._wedged_daemon_can_be_asked(
+                wrong_holder.pid, holder_pid) is False, (
+                "a daemon that names a DIFFERENT holder was trusted for "
+                "this one"
+            )
+            assert pin_proxy._wedged_daemon_can_be_asked(
+                999_999_999, holder_pid) is False, (
+                "a pid with no /proc entry at all answered True"
+            )
+        finally:
+            for p in (claiming, silent, wrong_holder):
+                p.kill()
+                p.wait(timeout=5)
 
     def _root_for_heal(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
@@ -26223,6 +26622,36 @@ class TestTheServingDaemonOwnsTheWiring:
     def test_a_config_naming_ANOTHER_port_is_rewired(self, monkeypatch):
         rc, wrote = self._wire(monkeypatch, wired=41111)
         assert rc is True and wrote == [36301], (rc, wrote)
+
+    def test_a_config_naming_a_LIVE_PINS_port_is_left_alone(
+            self, tmp_path, monkeypatch):
+        """T1168 (W): the owner's wiring rule -- a daemon never rewires a
+        config whose wired port answers with a live pin's fingerprint.
+        Measured 2026-09-24: a throwaway daemon on a spare certdir under the
+        real $HOME rewired the shared .claude.json away from the live pin
+        four times in one day. A REAL daemon, not a stub, because the point
+        is what `/health` actually answers with."""
+        import cswap_pin.proxy as p
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        certdir = tmp_path / "other-pin"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+        wrote = []
+        monkeypatch.setattr(p, "_wired_port", lambda: live.port)
+        monkeypatch.setattr(p, "wire_global_config",
+                            lambda po, ca, **k: wrote.append(po) or True)
+        monkeypatch.setattr(p, "_log_lifecycle", lambda _m: None)
+        try:
+            rc = p.ensure_wired_to(36301, "/nonexistent")
+        finally:
+            live.stop(drain=0)
+        assert rc is False and wrote == [], (
+            f"a live pin's wiring on {live.port} was rewritten by a daemon "
+            f"that is not its own: rc={rc} wrote={wrote}"
+        )
 
     def test_CONTROL_a_correct_config_is_left_alone(self, monkeypatch):
         """`.claude.json` is watched live by Claude Code. Rewriting it on every
