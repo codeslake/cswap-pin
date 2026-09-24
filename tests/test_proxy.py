@@ -4533,6 +4533,12 @@ class TestIsPinnedRoute:
             # dynamically either (`deploy/$` is 0).
             ("/api/frame/deploy/direct", True,
              "artifact publishes are owned by the creating bearer too"),
+            ("/api/frame/read/frame_01ABC", True,
+             "reading a frame this pin owns — the 2.1.281 binary's own "
+             "route, same subtree as deploy/direct"),
+            ("/api/frame/comments/frame_01ABC", True,
+             "comments on a frame this pin owns — same subtree, same "
+             "binary"),
             # RC reconnect unarchives at /v1/sessions/{id}/unarchive — NOT
             # /v1/code/sessions — before re-bridging. Keeping the disk bearer
             # here SPLITS the session's ownership: unarchive lands it on the

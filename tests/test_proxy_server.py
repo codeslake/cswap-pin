@@ -53,15 +53,17 @@ class _FakeUpstream:
     and replies 200. Uses the same leaf cert the proxy MITMs with, so the
     proxy's own upstream TLS (servername api.anthropic.com) validates it."""
 
-    def __init__(self, certdir: Path, reject_bearer: str | None = None,
+    def __init__(self, certdir: Path,
+                 reject_bearer: "str | set[str] | None" = None,
                  reject_status: int = 403, reply: bytes | None = None):
-        # reject_bearer: answer `reject_status` to exactly this credential,
-        # 200 to any other. Models an endpoint the pinned account may not
-        # use — the shape that makes a misrouted swap terminal for the
-        # client.
+        # reject_bearer: answer `reject_status` to exactly this credential
+        # (or any credential in the set), 200 to any other. Models an
+        # endpoint the pinned account may not use — the shape that makes a
+        # misrouted swap terminal for the client.
         # reply: the whole response to send instead of the 200, for a case
         # that needs the origin to answer something the pin then rewrites.
-        self.reject_bearer = reject_bearer
+        self._reject = ({reject_bearer} if isinstance(reject_bearer, str)
+                         else set(reject_bearer or ()))
         self.reject_status = reject_status
         self.reply = reply
         self.seen_auth: str | None = None
@@ -116,10 +118,7 @@ class _FakeUpstream:
                     if line.lower().startswith("authorization:"):
                         self.seen_auth = line.split(":", 1)[1].strip()
                 self.auths_seen.append(self.seen_auth)
-                if (
-                    self.reject_bearer
-                    and self.seen_auth == f"Bearer {self.reject_bearer}"
-                ):
+                if self.seen_auth in {f"Bearer {b}" for b in self._reject}:
                     tls.sendall(
                         f"HTTP/1.1 {self.reject_status} Rejected\r\n"
                         "Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -14813,19 +14812,53 @@ class TestAMisroutedSwapCannotKillASession:
             proxy.stop()
             upstream.stop()
 
-    def case_a_stale_pinned_token_is_retried_with_a_fresh_one(self, certdir):
+    def case_a_stale_pinned_token_is_retried_with_a_fresh_one(
+            self, certdir, monkeypatch):
         """The cached credential went stale (rotated on the live account
         underneath it) and the upstream refuses it — a re-read finds the
         rotation and one extra swapped attempt with it succeeds, so the
-        client never sees the refusal at all."""
+        client never sees the refusal at all.
+
+        THROUGH THE REAL `make_pin_token_provider`, not a bare callable
+        (T1155 I2): a bare function that just counts its own calls goes
+        green even when the retry calls `provider()` AGAIN instead of
+        forcing a genuine store re-read — the real provider's FAST PATH
+        returns the SAME cached, UNEXPIRED token on every call
+        (`_live_token` only checks `expiresAt`), so a switcher whose
+        stored credential rotates underneath an unexpired cached token is
+        the only shape that can catch that regression.
+        """
+        import json as _json
+
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
 
-        calls = {"n": 0}
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
 
-        def provider():
-            calls["n"] += 1
-            return "stale-token" if calls["n"] == 1 else "fresh-token"
+        class _Switcher:
+            backup_dir = certdir
+
+            def __init__(self):
+                self.reads = 0
+
+            def current_account_number(self):
+                return "1"
+
+            def read_account_credentials(self, n, e):
+                self.reads += 1
+                token = "stale-token" if self.reads == 1 else "fresh-token"
+                return _json.dumps({"claudeAiOauth": {
+                    "accessToken": token, "expiresAt": 4102444800000,
+                    "refreshToken": "rt"}})
+
+            def resolve_account(self, i):
+                return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _Switcher()
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
 
         upstream = _FakeUpstream(
             certdir, reject_bearer="stale-token", reject_status=401)
@@ -14848,8 +14881,12 @@ class TestAMisroutedSwapCannotKillASession:
                 f"a refusal: got {status}"
             )
             assert upstream.auths_seen == ["Bearer stale-token", "Bearer fresh-token"], (
-                f"expected exactly one refused attempt and one fresh retry: "
-                f"{upstream.auths_seen}"
+                f"expected exactly one refused attempt and one fresh retry, "
+                f"through the REAL provider's own cache: {upstream.auths_seen}"
+            )
+            assert switcher.reads == 2, (
+                "the retry must force a genuine store read rather than "
+                f"reuse the provider's own cached fast path: {switcher.reads} reads"
             )
             # Filtered, not an exact-list compare: `proxy.start()` (patched
             # before it runs, same as `TestWebSocketUpgrade`) logs its own
@@ -14901,6 +14938,88 @@ class TestAMisroutedSwapCannotKillASession:
             ], (
                 f"expected exactly one refusal line naming the fell-back "
                 f"branch, no retried-fresh: {lines}"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+            pp._log_lifecycle = real_log
+
+    def case_a_fresh_retry_that_is_also_refused_falls_back_unswapped(
+            self, certdir, monkeypatch):
+        """The refetch finds a genuinely DIFFERENT token, but the upstream
+        refuses that one too — T1155 m3: this second-refusal branch had no
+        coverage, and losing it would let the retry's own falsy
+        `_AuthRejected` sentinel escape as `keep`, dropping the connection
+        instead of answering with the client's own bearer."""
+        import json as _json
+
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+
+        class _Switcher:
+            backup_dir = certdir
+
+            def __init__(self):
+                self.reads = 0
+
+            def current_account_number(self):
+                return "1"
+
+            def read_account_credentials(self, n, e):
+                self.reads += 1
+                token = "stale-token" if self.reads == 1 else "also-stale-token"
+                return _json.dumps({"claudeAiOauth": {
+                    "accessToken": token, "expiresAt": 4102444800000,
+                    "refreshToken": "rt"}})
+
+            def resolve_account(self, i):
+                return ("2", "pin@example.com", "org")
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _Switcher()
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+
+        upstream = _FakeUpstream(
+            certdir, reject_bearer={"stale-token", "also-stale-token"},
+            reject_status=401)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=provider,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/api/frame/deploy/direct", bearer="disk-token",
+            )
+            assert status == 200, (
+                "a swap refused twice must still fall back to the client's "
+                f"own bearer, not drop the connection: got {status}"
+            )
+            assert upstream.auths_seen == [
+                "Bearer stale-token", "Bearer also-stale-token",
+                "Bearer disk-token",
+            ], (
+                "expected the swap, the one fresh retry, and the unswapped "
+                f"fallback, in that order: {upstream.auths_seen}"
+            )
+            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
+            assert swap_lines == [
+                "swap refused (401) on POST /api/frame/deploy/direct: "
+                "retried-fresh",
+                "swap refused (401) on POST /api/frame/deploy/direct: "
+                "fell-back",
+            ], (
+                f"expected the retried-fresh line, then a fell-back line for "
+                f"the second refusal: {lines}"
             )
         finally:
             proxy.stop()
