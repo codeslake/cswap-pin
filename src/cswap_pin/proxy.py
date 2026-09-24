@@ -6727,7 +6727,17 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         the same one would just be refused again -- and None otherwise: a
         read that comes back empty, unchanged, or (via `provider`'s own
         propagation) raises.
+
+        NONE, NOT A COLD READ, when `refused_bearer` ITSELF is empty --
+        the shape a pinned request with no `Authorization` header at all
+        takes (T1182): nothing was swapped, so nothing was refused for
+        being stale, and any token this call finds would differ from ""
+        trivially and read as a genuine retry. The absolute-form take-back
+        already guards the same way, arming its own retry only when an
+        Authorization header was present to begin with.
         """
+        if not refused_bearer:
+            return None
         token = provider(refused=refused_bearer)
         if token and f"Bearer {token}" != refused_bearer:
             return token
@@ -12929,12 +12939,14 @@ class PinProxy:
         # The last hop fault reported, so a steadily-down hop costs one line
         # instead of one per connection — see _note_hop_unusable.
         self._hop_fault: "tuple[tuple[str, int], str] | None" = None
-        # outcome ("retried-fresh"/"fell-back") -> (last logged monotonic,
-        # suppressed count) -- see _note_swap_refused. A polled legitimate
-        # 404, or a store that has not rotated yet, refuses a swap the
-        # identical way on every request; rate-limited the same as
-        # _note_busy_slot's cooldown, instead of one daemon.log line per
-        # refusal.
+        # (outcome ("retried-fresh"/"fell-back"), path family) -> (last
+        # logged monotonic, suppressed count) -- see _note_swap_refused. A
+        # polled legitimate 404, or a store that has not rotated yet,
+        # refuses a swap the identical way on every request; rate-limited
+        # the same as _note_busy_slot's cooldown, instead of one
+        # daemon.log line per refusal. Keyed on the path family too
+        # (T1182), or a fall-back on one route hides inside another's
+        # cooldown window.
         self._swap_refused: dict = {}
         self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
         self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -17238,6 +17250,15 @@ class PinProxy:
                     self._tunnel_trace(
                         f"{method} {rel} swap refused ({pending_refusal}) — "
                         f"retrying {kind} (absolute-form)")
+                    # SAME daemon.log LINE THE MITM TAKE-BACK WRITES
+                    # (T1182): `_tunnel_trace` is opt-in (--debug only),
+                    # so a stale-token fall-back on this route (the
+                    # `claude remote-control` bridge client) wrote nothing
+                    # daemon.log's own readers -- rc_six_gate.py row 13
+                    # among them -- could see.
+                    self._note_swap_refused(
+                        pending_refusal, method, rel.split("?", 1)[0],
+                        "fell-back" if hdrs is unswapped else "retried-fresh")
                     pending_refusal = None
                 try:
                     up, head = dial(hdrs)
@@ -17725,17 +17746,31 @@ class PinProxy:
     def _note_swap_refused(self, code: int, method: str, clean_path: str,
                             outcome: str) -> None:
         """Log a refused swap, at most once per `_BUSY_REPORT_COOLDOWN_S`
-        per `outcome` ("retried-fresh"/"fell-back") -- see `_swap_refused`
-        on `__init__`. A polled legitimate 404, or a store that has not
-        rotated yet, refuses the identical way on every request, and this
-        used to write one `_log_lifecycle` line per refusal.
+        per (`outcome` ("retried-fresh"/"fell-back"), PATH FAMILY) -- see
+        `_swap_refused` on `__init__`. A polled legitimate 404, or a store
+        that has not rotated yet, refuses the identical way on every
+        request, and this used to write one `_log_lifecycle` line per
+        refusal.
+
+        KEYED ON THE FAMILY, NOT JUST THE OUTCOME (T1182): the MITM and
+        absolute-form take-backs share this one limiter, so without the
+        path a fell-back on `/api/frame/...` inside the same cooldown as
+        one on `/v1/environments/...` folded the second into the first's
+        "; N more" and the rc gate's row 13 (artifact fell-back) could
+        read PASS off a suppressed line naming a different route
+        entirely. The family is the first two path segments
+        (`/api/frame`, `/v1/environments`, `/v1/code`) -- coarse enough
+        that a route with an id in it (`/api/frame/read/frame_01ABC`)
+        still keys the same as its siblings.
         """
+        family = "/" + "/".join(clean_path.strip("/").split("/")[:2])
+        key = (outcome, family)
         now = time.monotonic()
-        last, suppressed = self._swap_refused.get(outcome, (None, 0))
+        last, suppressed = self._swap_refused.get(key, (None, 0))
         if last is not None and now - last < _BUSY_REPORT_COOLDOWN_S:
-            self._swap_refused[outcome] = (last, suppressed + 1)
+            self._swap_refused[key] = (last, suppressed + 1)
             return
-        self._swap_refused[outcome] = (now, 0)
+        self._swap_refused[key] = (now, 0)
         more = f"; {suppressed} more" if suppressed else ""
         _log_lifecycle(
             f"swap refused ({code}) on {method} {clean_path}: {outcome}{more}")
