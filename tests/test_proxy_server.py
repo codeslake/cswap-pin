@@ -17490,9 +17490,14 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         own header already lagged) must not zero out the negative's expiry
         -- that let every OTHER concurrent 429 on the same wall, queued
         behind `_walled_switch_lock`, find it already expired and re-run
-        `switch()` for itself. Two 429s decided at the SAME monotonic
-        instant -- the shape of two threads serialized on that lock -- must
-        call `switch()` once between them, not once each."""
+        `switch()` for itself. This is the LIVE token's own 429 (`auth` is
+        `self.LIVE`, not a stale bearer) -- a non-walled path -- so a 1 ms
+        floor on this cap would have expired long before a second, genuinely
+        concurrent 429 gets its turn on the lock: 0.5s later, well past a
+        1 ms floor but nowhere near main's 30s TTL, is what a queued waiter's
+        lock handoff actually costs. That later waiter must still find the
+        debounce standing and call `switch()` once between them, not once
+        each."""
         from cswap_pin import proxy as pp
         import time as _time
         BASE = 2_000_000_000.0
@@ -17509,7 +17514,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
         assert len(calls) == 1, calls
 
-        # Same monotonic instant: a floored cap must still debounce this.
+        # 0.5s later, not the same instant: long past any 1ms floor, the
+        # shape of a queued waiter's actual lock handoff.
+        clock["mono"] = 0.5
+        clock["wall"] = BASE + 0.5
         second = self._relay(reset=reset_header, auth=f"Bearer {self.LIVE}")
         assert second.startswith(b"HTTP/1.1 429"), second[:40]
         assert len(calls) == 1, (
