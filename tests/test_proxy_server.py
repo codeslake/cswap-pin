@@ -55,15 +55,20 @@ class _FakeUpstream:
 
     def __init__(self, certdir: Path,
                  reject_bearer: "str | set[str] | None" = None,
-                 reject_status: int = 403, reply: bytes | None = None):
+                 reject_status: int = 403, reply: bytes | None = None,
+                 reject_missing_auth: bool = False):
         # reject_bearer: answer `reject_status` to exactly this credential
         # (or any credential in the set), 200 to any other. Models an
         # endpoint the pinned account may not use — the shape that makes a
         # misrouted swap terminal for the client.
+        # reject_missing_auth: also answer `reject_status` to a request
+        # carrying NO Authorization header at all -- a pinned route the
+        # client reached with nothing to swap.
         # reply: the whole response to send instead of the 200, for a case
         # that needs the origin to answer something the pin then rewrites.
         self._reject = ({reject_bearer} if isinstance(reject_bearer, str)
                          else set(reject_bearer or ()))
+        self._reject_missing_auth = reject_missing_auth
         self.reject_status = reject_status
         self.reply = reply
         self.seen_auth: str | None = None
@@ -118,7 +123,9 @@ class _FakeUpstream:
                     if line.lower().startswith("authorization:"):
                         self.seen_auth = line.split(":", 1)[1].strip()
                 self.auths_seen.append(self.seen_auth)
-                if self.seen_auth in {f"Bearer {b}" for b in self._reject}:
+                if (self.seen_auth in {f"Bearer {b}" for b in self._reject}
+                        or (self.seen_auth is None
+                            and self._reject_missing_auth)):
                     tls.sendall(
                         f"HTTP/1.1 {self.reject_status} Rejected\r\n"
                         "Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -220,10 +227,14 @@ class _RecordingChain:
         self._thr.join(timeout=2.0)
 
 
-def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: str,
+def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
+                           bearer: "str | None" = None,
                            ua: str | None = None, body: str = "{}"):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
-    trusting the proxy's CA. Returns the response status."""
+    trusting the proxy's CA. Returns the response status.
+
+    `bearer=None` sends no `Authorization` header at all -- a client that
+    never had one, not one that was cleared."""
     ctx = ssl.create_default_context(cafile=str(ca_path))
     conn = http.client.HTTPSConnection(
         "api.anthropic.com", context=ctx, timeout=10
@@ -233,7 +244,7 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str, bearer: st
     conn._create_connection = lambda *a, **k: socket.create_connection(
         ("127.0.0.1", proxy_port), timeout=10
     )
-    headers = {"Authorization": f"Bearer {bearer}"}
+    headers = {} if bearer is None else {"Authorization": f"Bearer {bearer}"}
     if ua is not None:
         headers["User-Agent"] = ua
     conn.request("POST", path, body=body, headers=headers)
@@ -5907,6 +5918,12 @@ class TestChainRediscovery:
         fresh swap"), and when THAT one is also refused there is nothing
         left to retry with, so the second line must read "as it arrived",
         not repeat the first.
+
+        T1182: `_tunnel_trace` above is opt-in (--debug only) -- this
+        take-back reported to daemon.log's own readers (rc_six_gate.py
+        row 13) not at all. It must call the SAME `_note_swap_refused`
+        the MITM path does, in the SAME order: `retried-fresh` for the
+        first refusal's retry, `fell-back` for the second.
         """
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy, write_upstream_hint
@@ -5926,6 +5943,9 @@ class TestChainRediscovery:
                              or b"Bearer fresh-token" in req) else
                          b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
         traced = []
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
         proxy = None
         try:
             write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
@@ -5964,10 +5984,21 @@ class TestChainRediscovery:
                 "the second refusal has nothing left to retry with -- the "
                 "unswapped fallback is next, not another fresh swap: "
                 f"{refusal_lines[1]!r}")
+            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
+            assert swap_lines == [
+                "swap refused (401) on POST /v1/environments/bridge: "
+                "retried-fresh",
+                "swap refused (401) on POST /v1/environments/bridge: "
+                "fell-back",
+            ], (
+                "the absolute-form take-back must write the same "
+                f"daemon.log lines the MITM path does: {lines!r}"
+            )
         finally:
             if proxy:
                 proxy.stop()
             chain.stop()
+            pp._log_lifecycle = real_log
 
     def case_a_swapped_request_with_a_BODY_still_completes(self, certdir):
         """The registration this whole feature exists to pin carries a body.
@@ -14917,24 +14948,17 @@ class TestAMisroutedSwapCannotKillASession:
             proxy.stop()
             upstream.stop()
 
-    def case_a_stale_pinned_token_is_retried_with_a_fresh_one(
+    def case_a_missing_authorization_header_is_not_falsely_retried_fresh(
             self, certdir, monkeypatch):
-        """The cached credential went stale (rotated on the live account
-        underneath it) and the upstream refuses it — a re-read finds the
-        rotation and one extra swapped attempt with it succeeds, so the
-        client never sees the refusal at all.
-
-        THROUGH THE REAL `make_pin_token_provider`, not a bare callable
-        (T1155 I2): a bare function that just counts its own calls goes
-        green even when the retry calls `provider()` AGAIN instead of
-        forcing a genuine store re-read — the real provider's FAST PATH
-        returns the SAME cached, UNEXPIRED token on every call
-        (`_live_token` only checks `expiresAt`), so a switcher whose
-        stored credential rotates underneath an unexpired cached token is
-        the only shape that can catch that regression.
-        """
-        import json as _json
-
+        """T1182: a pinned request that arrives with NO `Authorization`
+        header sets `swapped=True` anyway (nothing there to substitute)
+        and, on refusal, `refused_auth=""`. `provider(refused="")` never
+        equals `f"Bearer {token}"`, so the untouched cached token used to
+        read as "fresh" and log a false `retried-fresh` while the request
+        went out a THIRD time. `refetch` must treat an empty
+        `refused_bearer` as nothing to compare against, the guard the
+        absolute-form path already applies before ever calling in
+        (`unswapped` is armed only when an Authorization header exists)."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
 
@@ -14942,31 +14966,12 @@ class TestAMisroutedSwapCannotKillASession:
             pp, "pin_profile_for",
             lambda token: {"emailAddress": "pin@example.com"})
 
-        class _Switcher:
-            backup_dir = certdir
-
-            def __init__(self):
-                self.reads = 0
-
-            def current_account_number(self):
-                return "1"
-
-            def read_account_credentials(self, n, e):
-                self.reads += 1
-                token = "stale-token" if self.reads == 1 else "fresh-token"
-                return _json.dumps({"claudeAiOauth": {
-                    "accessToken": token, "expiresAt": 4102444800000,
-                    "refreshToken": "rt"}})
-
-            def resolve_account(self, i):
-                return ("2", "pin@example.com", "org")
-
         pp.save_pin(certdir, "pin@example.com", "org")
-        switcher = _Switcher()
+        switcher = _refetch_switcher(certdir, lambda n: "pin-token")
         provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
 
         upstream = _FakeUpstream(
-            certdir, reject_bearer="stale-token", reject_status=401)
+            certdir, reject_missing_auth=True, reject_status=401)
         proxy = PinProxy(
             certdir=certdir,
             pin_token_provider=provider,
@@ -14977,324 +14982,179 @@ class TestAMisroutedSwapCannotKillASession:
         pp._log_lifecycle = lines.append
         proxy.start()
         try:
+            # NOT `/v1/code/sessions` -- every POST there unconditionally
+            # triggers `_should_sweep_bridges`' own upstream call, which
+            # would land on this SAME fake upstream and contaminate
+            # `auths_seen` on a timing that races this request. Every
+            # other case in this class uses this route for the same
+            # reason.
+            # A genuine 401 IS the right answer here: the fallback resends
+            # the SAME headers the client arrived with (no Authorization),
+            # so there is nothing better to offer it either. What this
+            # case is about is the COUNT: exactly one swapped attempt and
+            # one unswapped fallback, never a false "fresh" retry in
+            # between.
             status = _request_through_proxy(
-                proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
+                proxy.port, certdir / "ca.pem", "/api/frame/deploy/direct",
             )
-            assert status == 200, (
-                "a stale-then-fresh rotation must not reach the client as "
-                f"a refusal: got {status}"
+            assert status == 401, f"expected the upstream's own refusal: {status}"
+            assert len(upstream.auths_seen) == 2, (
+                "a request with no Authorization header must be sent "
+                f"exactly twice, not retried a third time on a false "
+                f"match: {upstream.auths_seen}"
             )
-            assert upstream.auths_seen == ["Bearer stale-token", "Bearer fresh-token"], (
-                f"expected exactly one refused attempt and one fresh retry, "
-                f"through the REAL provider's own cache: {upstream.auths_seen}"
-            )
-            assert switcher.reads == 2, (
-                "the retry must force a genuine store read rather than "
-                f"reuse the provider's own cached fast path: {switcher.reads} reads"
-            )
-            # Filtered, not an exact-list compare: `proxy.start()` (patched
-            # before it runs, same as `TestWebSocketUpgrade`) logs its own
-            # startup lines into the same list.
             swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
-            assert swap_lines == [
-                "swap refused (401) on POST /api/frame/deploy/direct: "
-                "retried-fresh"
-            ], (
-                f"expected exactly one refusal line naming the retried-fresh "
-                f"branch: {lines}"
+            assert not any("retried-fresh" in ln for ln in swap_lines), (
+                f"there was nothing to swap, so no genuinely fresh token "
+                f"exists to retry with: {lines}"
             )
         finally:
             proxy.stop()
             upstream.stop()
             pp._log_lifecycle = real_log
 
-    def case_CONTROL_the_same_dead_token_on_disk_still_falls_back(
+    def case_the_refetch_takes_every_shape_the_real_provider_can_answer(
             self, certdir, monkeypatch):
-        """The pinned slot's token never actually changed — eviction buys
-        nothing, and the existing unswapped take-back is still what saves
-        the client. No second swapped attempt is made.
+        """T1155 pass 3: the swap-refused retry, THROUGH THE REAL
+        `make_pin_token_provider` (T1155 I2) -- a bare callable's own
+        call counter goes green even when a retry calls `provider()`
+        AGAIN instead of forcing a genuine store re-read, because the
+        real provider's fast path returns the SAME cached, unexpired
+        token on every call (`_live_token` only checks `expiresAt`).
+        Only a switcher whose disk read genuinely runs proves any of
+        these branches rather than their absence.
 
-        THROUGH THE REAL `make_pin_token_provider` (T1155 pass 3): a bare
-        `lambda: "dead-token"` carries no `.refetch`, so
-        `_refetch_swap_token` returned None WITHOUT ever calling it -- the
-        SAME-TOKEN comparison this case is named for was never reached.
-        Only a switcher whose disk read genuinely runs, and genuinely
-        returns the same bytes, proves that branch rather than its
-        absence.
+        One table, one runner -- the six rows differed only in the
+        switcher's per-read tokens, the rejected bearer(s), and which
+        assertions apply:
+
+          a: a rotation refused once, then accepted on the fresh read
+             (`retried-fresh`).
+          CONTROL: the same dead token twice -- eviction buys nothing,
+             no second swapped attempt (`fell-back`, no retried-fresh).
+          b: the fresh retry is ALSO refused (T1155 m3) -- a missing
+             branch here let `_AuthRejected` escape as `keep` and drop
+             the connection instead of falling back unswapped.
+          c: an empty re-read (T1155 pass 3 (b)) must not blind
+             `provider` when a live credential is already cached.
+          d: a re-read landing on a FOREIGN account (T1155 pass 3 (d))
+             must not be spliced in -- the same `_identity_ok` gate
+             every other cold-path read runs.
+          e: a re-read that RAISES (a locked Keychain) must still fall
+             back rather than drop the connection.
         """
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
 
-        monkeypatch.setattr(
-            pp, "pin_profile_for",
-            lambda token: {"emailAddress": "pin@example.com"})
+        def _default_profile(token):
+            return {"emailAddress": "pin@example.com"}
 
-        pp.save_pin(certdir, "pin@example.com", "org")
-        switcher = _refetch_switcher(certdir, lambda n: "dead-token")
-        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
-
-        upstream = _FakeUpstream(certdir, reject_bearer="dead-token")
-        proxy = PinProxy(
-            certdir=certdir,
-            pin_token_provider=provider,
-            upstream=("127.0.0.1", upstream.port),
-        )
-        lines = []
-        real_log = pp._log_lifecycle
-        pp._log_lifecycle = lines.append
-        proxy.start()
-        try:
-            status = _request_through_proxy(
-                proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
-            )
-            assert status != 403
-            assert upstream.auths_seen == ["Bearer dead-token", "Bearer disk-token"], (
-                "a same-token re-read must not retry swapped a second time: "
-                f"{upstream.auths_seen}"
-            )
-            assert switcher.reads == 2, (
-                "the refusal must still force a genuine re-read, through "
-                f"the real provider: {switcher.reads} reads"
-            )
-            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
-            assert swap_lines == [
-                "swap refused (403) on POST /api/frame/deploy/direct: "
-                "fell-back"
-            ], (
-                f"expected exactly one refusal line naming the fell-back "
-                f"branch, no retried-fresh: {lines}"
-            )
-        finally:
-            proxy.stop()
-            upstream.stop()
-            pp._log_lifecycle = real_log
-
-    def case_a_fresh_retry_that_is_also_refused_falls_back_unswapped(
-            self, certdir, monkeypatch):
-        """The refetch finds a genuinely DIFFERENT token, but the upstream
-        refuses that one too — T1155 m3: this second-refusal branch had no
-        coverage, and losing it would let the retry's own falsy
-        `_AuthRejected` sentinel escape as `keep`, dropping the connection
-        instead of answering with the client's own bearer."""
-        import json as _json
-
-        import cswap_pin.proxy as pp
-        from cswap_pin.proxy import PinProxy
-
-        monkeypatch.setattr(
-            pp, "pin_profile_for",
-            lambda token: {"emailAddress": "pin@example.com"})
-
-        class _Switcher:
-            backup_dir = certdir
-
-            def __init__(self):
-                self.reads = 0
-
-            def current_account_number(self):
-                return "1"
-
-            def read_account_credentials(self, n, e):
-                self.reads += 1
-                token = "stale-token" if self.reads == 1 else "also-stale-token"
-                return _json.dumps({"claudeAiOauth": {
-                    "accessToken": token, "expiresAt": 4102444800000,
-                    "refreshToken": "rt"}})
-
-            def resolve_account(self, i):
-                return ("2", "pin@example.com", "org")
-
-        pp.save_pin(certdir, "pin@example.com", "org")
-        switcher = _Switcher()
-        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
-
-        upstream = _FakeUpstream(
-            certdir, reject_bearer={"stale-token", "also-stale-token"},
-            reject_status=401)
-        proxy = PinProxy(
-            certdir=certdir,
-            pin_token_provider=provider,
-            upstream=("127.0.0.1", upstream.port),
-        )
-        lines = []
-        real_log = pp._log_lifecycle
-        pp._log_lifecycle = lines.append
-        proxy.start()
-        try:
-            status = _request_through_proxy(
-                proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
-            )
-            assert status == 200, (
-                "a swap refused twice must still fall back to the client's "
-                f"own bearer, not drop the connection: got {status}"
-            )
-            assert upstream.auths_seen == [
-                "Bearer stale-token", "Bearer also-stale-token",
-                "Bearer disk-token",
-            ], (
-                "expected the swap, the one fresh retry, and the unswapped "
-                f"fallback, in that order: {upstream.auths_seen}"
-            )
-            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
-            assert swap_lines == [
-                "swap refused (401) on POST /api/frame/deploy/direct: "
-                "retried-fresh",
-                "swap refused (401) on POST /api/frame/deploy/direct: "
-                "fell-back",
-            ], (
-                f"expected the retried-fresh line, then a fell-back line for "
-                f"the second refusal: {lines}"
-            )
-        finally:
-            proxy.stop()
-            upstream.stop()
-            pp._log_lifecycle = real_log
-
-    def case_an_empty_reread_falls_back_without_emptying_the_cache(
-            self, certdir, monkeypatch):
-        """T1155 pass 3 (b): routed through `provider`'s own cold path, an
-        empty re-read (`read(...) or creds`) must keep the last-known-good
-        entry in `_cred_cache` rather than leave it empty -- an empty
-        cache reads as `can_pin: False` to `/health` and the self-heal
-        watchdog, which recycle a live daemon a fresh process would find
-        in exactly the same state (a locked Keychain, or a store that has
-        not rotated yet)."""
-        import cswap_pin.proxy as pp
-        from cswap_pin.proxy import PinProxy
-
-        monkeypatch.setattr(
-            pp, "pin_profile_for",
-            lambda token: {"emailAddress": "pin@example.com"})
-
-        pp.save_pin(certdir, "pin@example.com", "org")
-        # 1: the cold warm-up swap. 2+: the refusal's re-read -- empty, a
-        # locked Keychain or nothing rotated yet.
-        switcher = _refetch_switcher(
-            certdir, lambda n: "stale-token" if n == 1 else "")
-        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
-
-        upstream = _FakeUpstream(
-            certdir, reject_bearer="stale-token", reject_status=401)
-        proxy = PinProxy(
-            certdir=certdir,
-            pin_token_provider=provider,
-            upstream=("127.0.0.1", upstream.port),
-        )
-        proxy.start()
-        try:
-            status = _request_through_proxy(
-                proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
-            )
-            assert status == 200, (
-                f"an empty re-read must still fall back cleanly: got {status}")
-            assert upstream.auths_seen == ["Bearer stale-token", "Bearer disk-token"], (
-                "an empty re-read must not manufacture a second swapped "
-                f"attempt: {upstream.auths_seen}"
-            )
-            assert switcher.reads == 2
-            assert provider.can_pin_cached() is True, (
-                "an empty re-read must not empty `_cred_cache`")
-        finally:
-            proxy.stop()
-            upstream.stop()
-
-    def case_a_refetch_that_lands_on_a_foreign_token_does_not_splice_it(
-            self, certdir, monkeypatch):
-        """T1155 pass 3 (d): a refused-token retry that lands on a
-        cross-wired store must run the SAME `_identity_ok` gate every
-        other cold-path read does -- a side implementation that skipped
-        it would splice a foreign bearer into the client's request the
-        moment the disk happened to answer with one."""
-        import cswap_pin.proxy as pp
-        from cswap_pin.proxy import PinProxy
-
-        profiles = {
+        foreign_profiles = {
             "pin-token": {"emailAddress": "pin@example.com"},
             "foreign-token": {"accountUuid": "foreign-uuid",
                               "emailAddress": "someone-else@example.com"},
         }
-        monkeypatch.setattr(
-            pp, "pin_profile_for", lambda token: profiles[token])
 
-        pp.save_pin(certdir, "pin@example.com", "org")
-        switcher = _refetch_switcher(
-            certdir, lambda n: "pin-token" if n == 1 else "foreign-token")
-        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
-
-        upstream = _FakeUpstream(
-            certdir, reject_bearer="pin-token", reject_status=401)
-        proxy = PinProxy(
-            certdir=certdir,
-            pin_token_provider=provider,
-            upstream=("127.0.0.1", upstream.port),
-        )
-        proxy.start()
-        try:
-            status = _request_through_proxy(
-                proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
-            )
-            assert status == 200, (
-                f"a foreign retry must still fall back cleanly: got {status}")
-            assert upstream.auths_seen == ["Bearer pin-token", "Bearer disk-token"], (
-                "a foreign re-read must never be swapped in for a second "
-                f"attempt: {upstream.auths_seen}"
-            )
-        finally:
-            proxy.stop()
-            upstream.stop()
-
-    def case_a_refetch_that_raises_still_falls_back_unswapped(
-            self, certdir, monkeypatch):
-        """T1155 pass 3: routing `refetch` through `provider` means a
-        raising store read propagates out of `provider` too --
-        `_refetch_swap_token`'s own `except Exception` (kept from pass 1)
-        must still catch it and answer the client with its own bearer,
-        not drop the connection."""
-        import cswap_pin.proxy as pp
-        from cswap_pin.proxy import PinProxy
-
-        monkeypatch.setattr(
-            pp, "pin_profile_for",
-            lambda token: {"emailAddress": "pin@example.com"})
-
-        def _token_or_locked(n):
+        def _raises_on_second_read(n):
             if n == 1:
                 return "stale-token"
             raise OSError("Keychain locked")
 
-        pp.save_pin(certdir, "pin@example.com", "org")
-        switcher = _refetch_switcher(certdir, _token_or_locked)
-        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+        rows = [
+            dict(name="a: stale token retried with a fresh one",
+                 token_for_read=lambda n: "stale-token" if n == 1 else "fresh-token",
+                 reject_bearer="stale-token", reject_status=401,
+                 status_ok=lambda s: s == 200,
+                 expect_auths=["Bearer stale-token", "Bearer fresh-token"],
+                 expect_reads=2,
+                 expect_swap_lines=[
+                     "swap refused (401) on POST /api/frame/deploy/direct: "
+                     "retried-fresh"]),
+            dict(name="CONTROL: the same dead token still falls back",
+                 token_for_read=lambda n: "dead-token",
+                 reject_bearer="dead-token", reject_status=403,
+                 status_ok=lambda s: s != 403,
+                 expect_auths=["Bearer dead-token", "Bearer disk-token"],
+                 expect_reads=2,
+                 expect_swap_lines=[
+                     "swap refused (403) on POST /api/frame/deploy/direct: "
+                     "fell-back"]),
+            dict(name="b: a fresh retry that is also refused falls back unswapped",
+                 token_for_read=lambda n: "stale-token" if n == 1 else "also-stale-token",
+                 reject_bearer={"stale-token", "also-stale-token"}, reject_status=401,
+                 status_ok=lambda s: s == 200,
+                 expect_auths=["Bearer stale-token", "Bearer also-stale-token",
+                               "Bearer disk-token"],
+                 expect_swap_lines=[
+                     "swap refused (401) on POST /api/frame/deploy/direct: "
+                     "retried-fresh",
+                     "swap refused (401) on POST /api/frame/deploy/direct: "
+                     "fell-back"]),
+            dict(name="c: an empty re-read falls back without emptying the cache",
+                 token_for_read=lambda n: "stale-token" if n == 1 else "",
+                 reject_bearer="stale-token", reject_status=401,
+                 status_ok=lambda s: s == 200,
+                 expect_auths=["Bearer stale-token", "Bearer disk-token"],
+                 expect_reads=2, expect_can_pin_cached=True),
+            dict(name="d: a foreign re-read is not spliced in",
+                 token_for_read=lambda n: "pin-token" if n == 1 else "foreign-token",
+                 reject_bearer="pin-token", reject_status=401,
+                 status_ok=lambda s: s == 200,
+                 expect_auths=["Bearer pin-token", "Bearer disk-token"],
+                 expect_reads=2, profile_for=foreign_profiles.__getitem__),
+            dict(name="e: a raising re-read still falls back unswapped",
+                 token_for_read=_raises_on_second_read,
+                 reject_bearer="stale-token", reject_status=401,
+                 status_ok=lambda s: s == 200,
+                 expect_auths=["Bearer stale-token", "Bearer disk-token"],
+                 expect_reads=2),
+        ]
 
-        upstream = _FakeUpstream(
-            certdir, reject_bearer="stale-token", reject_status=401)
-        proxy = PinProxy(
-            certdir=certdir,
-            pin_token_provider=provider,
-            upstream=("127.0.0.1", upstream.port),
-        )
-        proxy.start()
-        try:
-            status = _request_through_proxy(
-                proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
+        for row in rows:
+            monkeypatch.setattr(
+                pp, "pin_profile_for", row.get("profile_for", _default_profile))
+            pp.save_pin(certdir, "pin@example.com", "org")
+            switcher = _refetch_switcher(certdir, row["token_for_read"])
+            provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+
+            upstream = _FakeUpstream(
+                certdir, reject_bearer=row["reject_bearer"],
+                reject_status=row["reject_status"])
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=provider,
+                upstream=("127.0.0.1", upstream.port),
             )
-            assert status == 200, (
-                "a raising refetch must still answer the client, not drop "
-                f"the connection: got {status}"
-            )
-            assert upstream.auths_seen == ["Bearer stale-token", "Bearer disk-token"], (
-                "a raising re-read must fall back to the client's own "
-                f"bearer without a second swapped attempt: {upstream.auths_seen}"
-            )
-        finally:
-            proxy.stop()
-            upstream.stop()
+            lines = []
+            real_log = pp._log_lifecycle
+            pp._log_lifecycle = lines.append
+            proxy.start()
+            try:
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem",
+                    "/api/frame/deploy/direct", bearer="disk-token",
+                )
+                assert row["status_ok"](status), f"{row['name']}: got {status}"
+                assert upstream.auths_seen == row["expect_auths"], (
+                    f"{row['name']}: {upstream.auths_seen}")
+                if row.get("expect_reads") is not None:
+                    assert switcher.reads == row["expect_reads"], (
+                        f"{row['name']}: {switcher.reads} reads")
+                if row.get("expect_swap_lines") is not None:
+                    # Filtered, not an exact-list compare of `lines`:
+                    # `proxy.start()` logs its own startup lines too.
+                    swap_lines = [ln for ln in lines
+                                 if ln.startswith("swap refused")]
+                    assert swap_lines == row["expect_swap_lines"], (
+                        f"{row['name']}: {lines}")
+                if row.get("expect_can_pin_cached") is not None:
+                    assert (provider.can_pin_cached()
+                           is row["expect_can_pin_cached"]), (
+                        f"{row['name']}: can_pin_cached mismatch")
+            finally:
+                proxy.stop()
+                upstream.stop()
+                pp._log_lifecycle = real_log
 
     def case_a_later_rotation_is_refetched_even_after_an_unchanged_read(
             self, certdir, monkeypatch):
