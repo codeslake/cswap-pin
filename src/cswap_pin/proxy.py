@@ -1984,6 +1984,15 @@ def heal(backup_root: Path, identity: dict | None = None,
                         and _holder_owns(certdir)
                         and _wedged_parent_holder(stale_pid, certdir)
                     )
+                    # THE HOLDER HAS TO HAVE CLAIMED THE CHANNEL. Its argv
+                    # alone (just proven above) says it is A holder for this
+                    # certdir, not that it ever installed the SIGUSR1
+                    # handler -- the default disposition is TERMINATE, so
+                    # asking one that cannot hear it kills it and the
+                    # listening socket with it. See `_wedged_daemon_can_be_asked`.
+                    if asked_holder and not _wedged_daemon_can_be_asked(
+                            stale_pid, asked_holder):
+                        asked_holder = None
                     if asked_holder:
                         try:
                             os.kill(asked_holder, _REPLACE_ME_SIGNAL)
@@ -7037,6 +7046,22 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                         wire_global_config(port, ca)
                         return port, ca
                     time.sleep(0.1)
+        elif (stale and isinstance(stale.get("port"), int)
+              and _health_pid(stale["port"]) == int(stale["pid"])):
+            # INVISIBLE HERE IS NOT DEAD. `_pin_daemon_pids` asked `ps` in
+            # THIS pid namespace, which gives the same ESRCH-shaped "no" for
+            # a genuinely dead pid and for a live one a daemon inside a
+            # container answers from — sharing $HOME, not the pid namespace.
+            # The daemon's own `/health` is the one witness that can still be
+            # asked "are you pid N" across that boundary (see `_health_pid`),
+            # and it just confirmed the record. Recycling or spawning from
+            # here would mark and overwrite a record a live daemon owns, in
+            # its own namespace, spawning a second daemon on the same port
+            # this namespace cannot see and cannot supervise. Its own code
+            # watchdog is what replaces it on a redeploy; return the port and
+            # leave the record exactly as read.
+            wire_global_config(stale["port"], ca)
+            return stale["port"], ca
         if _keychain_denied_here():
             _log_lifecycle(
                 "not spawning the pin daemon from here: this process cannot "
@@ -7303,6 +7328,37 @@ def _wedged_parent_holder(pid: int, certdir: Path) -> "int | None":
         return None
     targets = {str(Path(certdir)), str(Path(certdir).resolve())}
     return ppid if any(cmd.endswith(" " + t) for t in targets) else None
+
+
+def _wedged_daemon_can_be_asked(pid: int, holder_pid: int) -> bool:
+    """Would the wedged daemon ``pid`` itself trust ``holder_pid`` with
+    `_REPLACE_ME_SIGNAL`?
+
+    THE SAME QUESTION `_holder_pid` ANSWERS FROM INSIDE THE DAEMON, asked
+    from outside it. `_wedged_parent_holder` only proves ``holder_pid``'s
+    ARGV is a ``--hold-port`` holder for this certdir -- not that IT ever
+    installed the handler. `_REPLACE_ME_SIGNAL`'s default disposition is
+    TERMINATE (see `_HOLDER_REPLACE_ENV`), and a holder that never claimed
+    the channel -- an older release, still running above a daemon it never
+    respawned -- has no handler, so signalling it on the strength of its
+    argv alone kills it and takes the listening socket down with it.
+
+    The daemon's own exec-time environment already answers this: a holder's
+    `_spawn` sets `_HELD_BY_ENV`/`_HOLDER_REPLACE_ENV` in its CHILD's
+    environment, and only when `_install_replace_handler` (that same holder,
+    that same moment) succeeded. `/proc/<pid>/environ` is the exec-time
+    snapshot of exactly that block, unaffected by anything either process
+    does afterwards. Any read failure (no /proc, the pid already gone, no
+    permission) answers False: the caller's fallback is today's direct kill,
+    never a guess.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    env = dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
+    return (env.get(_HOLDER_REPLACE_ENV.encode()) == b"1"
+            and env.get(_HELD_BY_ENV.encode()) == str(holder_pid).encode())
 
 
 def _pin_daemon_pids(certdir: Path) -> list[int]:
@@ -8313,9 +8369,23 @@ def ensure_wired_to(port: int, certdir: Path) -> bool:
     NO-OP WHEN ALREADY CORRECT — one config read on a normal start, no write.
     Never raises: a wiring failure must not stop a daemon that is otherwise
     serving, and the next launch or heal still repairs it.
+
+    NEVER STEALS A LIVE PIN'S WIRING. A wired port that answers `/health` as
+    a pin daemon already (`pin_proxy: true`) is somebody else's live pin, and
+    only ITS OWN daemon may rewire it — this one owns port ``port``, not
+    that one. Measured 2026-09-24: a throwaway daemon on a spare certdir
+    under the same ``$HOME`` rewired the shared ``.claude.json`` away from
+    the live pin four times in one day. A wiring naming a DEAD port (or
+    nothing) is still corrected, exactly as before.
     """
     try:
-        if _wired_port() == port:
+        wired = _wired_port()
+        if wired == port:
+            return False
+        if wired is not None and _wired_names_a_live_pin(wired):
+            _log_lifecycle(
+                f"leaving .claude.json wired to {wired} — a live pin already "
+                f"answers there, and only its own daemon may rewire it")
             return False
         wire_global_config(port, Path(certdir) / "ca.pem")
         _log_lifecycle(
@@ -9476,6 +9546,27 @@ def _health_pid(port: int, timeout: float = 1.0) -> int | None:
     return pid if isinstance(pid, int) else None
 
 
+def _wired_names_a_live_pin(port: int, timeout: float = 1.0) -> bool:
+    """Does ``port``'s own ``/health`` answer as a live pin daemon?
+
+    A THIRD READER OF `_health_probe`'s ONE ROUND TRIP, same reason
+    `_health_pid` is: no second HTTP client. Checks ``pin_proxy`` where
+    `_health_pid` checks ``pid`` -- both fields the same body carries, see
+    `_serve_health`. A dead or non-pin port (nothing there, a stray
+    listener, a wedge with no full answer) reads False, which is what
+    leaves `ensure_wired_to` free to correct a wiring naming nothing that
+    mints.
+    """
+    buf = _health_probe(port, timeout)
+    if not buf or b"\r\n\r\n" not in buf:
+        return False
+    try:
+        body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
+    except ValueError:
+        return False
+    return body.get("pin_proxy") is True
+
+
 def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | None:
     """Port of a live recorded daemon whose pid is alive, its port answers, and
     (when ``fingerprint`` is given) its fingerprint matches. Else None."""
@@ -10164,8 +10255,39 @@ class PortHolder:
                 # ``getattr``: a test double built without ``__init__`` has
                 # no ``_certdir``; that is "cannot tell" and falls to the
                 # release path below, same as every real holder without one.
+                #
+                # THREE MORE GUARDS, ALL ON THE SAME RELEASE PATH.
+                # `self._self_heal_on()`: the switch means "do not act on
+                # your own", and this respawn is exactly that, same as the
+                # non-zero-exit branch below.
+                # `_standby_port_still_wanted`: a redeploy or a re-pin may
+                # already have moved the pin to a DIFFERENT held port, and
+                # respawning here too would leave two lineages superseding
+                # each other on two ports forever.
+                # `load_pin` CAN RAISE (a host gone missing, an ImportError a
+                # deploy left behind) -- and this loop runs in a daemon
+                # thread, so an escaping exception does not fail loudly, it
+                # ends the THREAD only: `_stop` is never set and `self._srv`
+                # is never closed, so `getppid() == born_of` still reads
+                # "holder alive" to the standby forever, port held, nothing
+                # supervising it. `stop()` is the same release a genuinely
+                # unpinned clean exit takes.
                 certdir = getattr(self, "_certdir", None)
-                if certdir is not None and load_pin(certdir.parent):
+                try:
+                    pinned = bool(
+                        certdir is not None
+                        and self._self_heal_on()
+                        and _standby_port_still_wanted(certdir, self.port)
+                        and load_pin(certdir.parent)
+                    )
+                except Exception as exc:  # noqa: BLE001 — see above
+                    _log_lifecycle(
+                        f"could not tell whether the pin is still set "
+                        f"({exc!r}) — releasing port {self.port} rather than "
+                        f"leaving the standby thinking a dead supervisor is "
+                        f"still watching it")
+                    pinned = False
+                if pinned:
                     _log_lifecycle(
                         f"daemon {self.daemon_pid} exited cleanly but the pin "
                         f"is still set — respawning on the held port "
@@ -10539,27 +10661,77 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         return
     _log_lifecycle(
         f"holder {born_of} is gone and port {port} answered nothing "
-        f"{_STANDBY_SILENT_STREAK}x — putting a daemon back on the descriptor "
-        f"this process has held all along"
+        f"{_STANDBY_SILENT_STREAK}x — reviving it fresh if the pin still "
+        f"names an account, or promoting in place if it does not"
     )
-    # GIVE THE SIGNALS BACK BEFORE BECOMING A HOLDER. The SIG_IGN above is
-    # right for a standby — TERM is when the sessions most need the address —
-    # and WRONG the moment this process starts serving, because a handler
-    # installed once outlives the reason for it. An armed standby kept ignoring
-    # TERM and INT, so it could not be stopped by any ordinary means: `cswap`
-    # could not retire it, a supervisor could not stop it, and only SIGKILL
-    # reached it.
-    #
-    # MEASURED ON THE LINUX HOST, and it is why that box needed a manual cleanup: three
-    # armed standbys had each become a holder on port 36301 — four acceptors on
-    # one socket, the single property this whole design exists to keep — and
-    # SIGTERM to all three did nothing at all.
+    _standby_revive(certdir, srv, account_num, email)
+
+
+def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
+                    email: str) -> None:
+    """Hand the still-open port to a freshly-resolved holder, or promote in
+    place on the identity this standby was BORN with. Split out of
+    `standby_main` so a test can drive it without a live loop -- same reason
+    `_standby_tick` exists.
+
+    THE SIGNAL TABLE IS RESET BEFORE EITHER PATH BELOW, spawn or promotion.
+    `standby_main` set SIGTERM/SIGINT to SIG_IGN while idle (see there) --
+    SIG_IGN survives `exec`, so a child spawned before this reset inherits
+    it and starts life ignoring the signal meant to stop it.
+
+    THE SOCKET IS NEVER CLOSED HERE. 0.1.279 closed it and let `heal`'s
+    spawn path (`_spawn_daemon` with no fd) rebind the port from scratch --
+    which races a draining PREDECESSOR from an EARLIER handover, still
+    holding an open (if detached, see `release_listener` ~14248) copy of
+    the same port for as long as its own uncapped drain runs. That bind
+    then fails EADDRINUSE, and the port is left listening with nobody
+    accepting: the very incident this exists to end. The fix is the same
+    socket-activation handoff `release_listener(hand_down=True)` already
+    uses for a code handover: hand the SAME open, listening fd straight to
+    a fresh holder through `_spawn_daemon(listen_fd=...)`. Nothing here
+    calls `.close()` on it; the process that ends up not using it (this one,
+    once a successor is up) drops its own reference and the OS reclaims
+    that copy on its own, the same way a handed-down fd is never explicitly
+    closed anywhere else in this module.
+
+    `load_pin` GATES THE FRESH RESOLVE, not the ``account_num``/``email``
+    this standby was BORN with. Those name whatever was pinned when its
+    holder started, and a `cswap pin --clear` (or a re-pin to a different
+    account) since then must not be resurrected by an orphan that never
+    heard about it. Any failure resolving it -- no pin, a dangling slot,
+    `load_pin` itself raising, or the spawn failing outright -- falls to the
+    OLD IN-PLACE PROMOTION: this process becomes the holder on the socket
+    it is already holding, under the identity it was born with. That is
+    exactly what ran here before 3c5ab00, and it kept serving live sessions
+    (whose HTTPS_PROXY is fixed at exec) -- releasing the port with nothing
+    proven to hand it to only strands them.
+    """
+    import signal
+
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGHUP, signal.SIG_DFL)
-    # BECOME THE HOLDER on the socket we are already holding. Everything below
-    # this line is the ordinary supervisor: respawn, backoff, self-heal — and
-    # it places a standby of its own, so the lineage stays covered.
+
+    try:
+        pin = load_pin(certdir.parent)
+        resolved = _resolve_pinned_slot(certdir.parent, pin[0]) if pin else None
+    except Exception:  # noqa: BLE001 — a daemon thread must never raise
+        pin, resolved = None, None
+    if resolved:
+        try:
+            port = _spawn_daemon(resolved, pin[0], certdir, listen_fd=srv.fileno())
+        except Exception:  # noqa: BLE001 -- a daemon thread must never raise
+            port = None
+        if port is not None:
+            return
+        # Spawn failed -- fall through to the old promotion below, still on
+        # the same open, listening socket. BUT the 10s wait can also just
+        # run out while the child came up anyway and already owns the fd --
+        # promoting here would put a SECOND PortHolder on the same listening
+        # socket. Only promote when nothing else is already covering it.
+        if _port_returns_bytes(srv.getsockname()[1]) or _holder_owns(certdir):
+            return
+
     holder = PortHolder(certdir, account_num, email, sock=srv)
     holder.start()
     if holder._thread is not None:
@@ -11804,7 +11976,7 @@ def _standby_tick(born_of: int, silent: int, answered, getppid=os.getppid):
     return silent, silent >= _STANDBY_SILENT_STREAK, _STANDBY_POLL_S
 
 
-def _successor_is_serving() -> bool:
+def _successor_is_serving(own_port: int) -> bool:
     """Is SOMEBODY ELSE serving the wired port?
 
     The teardown asks the port rather than a file, because a successor that
@@ -11823,10 +11995,30 @@ def _successor_is_serving() -> bool:
     reached through the guard itself.
 
     So a port that answers counts only when it is NOT the one our own holder
-    is holding for us.
+    is holding for us -- ``own_port``, this daemon's own, is the only one the
+    corpse-probe concern applies to.
+
+    A WIRING NAMING A DIFFERENT PORT IS NOT OUR CORPSE AND NOT OURS TO
+    UNWIRE. `held_by_a_holder()` says whether OUR socket might still answer
+    for us; it says nothing about some OTHER daemon's port, alive or dead.
+    Measured 2026-09-24: a throwaway daemon's teardown, running under a
+    holder, unwired the shared `.claude.json` away from a live pin on a
+    different port four times in one day because this used to read the
+    holder state alone and never asked whether the wired port was even ours.
+
+    A DIFFERENT PORT STILL HAS TO ANSWER TO COUNT. It is not automatically
+    a live pin just for being somebody else's -- a previous lineage's daemon
+    that has since died leaves the config naming its corpse exactly as
+    readily as ours does, and the owner's rule counts a DEAD port as safe to
+    rewire whoever it belonged to. Trusting a different port unconditionally
+    left that corpse wired forever, past the unwire that exists to clear it.
     """
     live = _wired_port()
-    if live is None or not _port_answers(live):
+    if live is None:
+        return False
+    if live != own_port:
+        return _port_answers(live)
+    if not _port_answers(live):
         return False
     return not held_by_a_holder()
 
@@ -12359,7 +12551,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
             # this: a successor publishes its record and rewires only once it
             # is serving, so between our decision and its publication the files
             # say we are alone while the port says otherwise.
-            if _successor_is_serving():
+            if _successor_is_serving(proxy.port):
                 _log_lifecycle(
                     f"port {_wired_port()} is still served — leaving the "
                     f"wiring alone"
