@@ -17451,11 +17451,13 @@ class TestTheEvidenceSurvivesAHandover:
         """monotonic is not comparable across processes, and two of them read
         this file. A monotonic stamp would read as ~55 years in the past on a
         freshly booted host and expire instantly."""
-        import json, time as _t
+        import json, os, time as _t
         from cswap_pin import proxy as pp
         self._cold()
         pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
-        v = json.loads(pp._alive_path(certdir).read_text())[self.SID]
+        # THE KEY CARRIES THE WRITER'S PID -- see `_worker_alive_age`.
+        v = json.loads(pp._alive_path(certdir).read_text())[
+            f"{self.SID}@{os.getpid()}"]
         assert abs(v - _t.time()) < 60, (
             f"stamp {v} is not wall clock; monotonic would be ~{_t.monotonic():.0f}")
 
@@ -17470,7 +17472,7 @@ class TestTheEvidenceSurvivesAHandover:
     def case_a_second_daemons_write_does_not_erase_the_first(self, certdir):
         """Both processes write this file. A plain overwrite would drop the
         other's sessions, which is a self-inflicted version of the bug."""
-        import json
+        import json, os
         from cswap_pin import proxy as pp
         other = "cse_theotherdaemons000000"
         self._cold()
@@ -17480,7 +17482,10 @@ class TestTheEvidenceSurvivesAHandover:
             pp._worker_alive.clear()
         pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
         got = json.loads(pp._alive_path(certdir).read_text())
-        assert other in got and self.SID in got, sorted(got)
+        # THE KEY CARRIES THE WRITER'S PID -- see `_worker_alive_age`. Both
+        # writes came from this same test process, so both carry it.
+        pid = os.getpid()
+        assert f"{other}@{pid}" in got and f"{self.SID}@{pid}" in got, sorted(got)
 
 
 class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
