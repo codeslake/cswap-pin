@@ -8577,7 +8577,12 @@ def _republish_own_record(
         return
     claimed = (
         (live_clients is not None and live_clients() > 0)
-        or _PUMP.live_pairs() > 0
+        # THE SAME SILENCE BOUND `_is_claimed` USES (~8523): a pair quiet
+        # past `_DRAINING_MARKER_TTL` is WEDGED, not live, per
+        # `await_inflight`. Unbounded here undoes that bound from the
+        # writing side — a wedged pair `_is_claimed` would refuse to count
+        # still gets a fresh record republished for it.
+        or (_PUMP.live_pairs() > 0 and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL)
         or _wired_port() == port
     )
     if not claimed:
@@ -9855,15 +9860,29 @@ class PortHolder:
 
     def _supervise(self) -> None:
         while not self._stop:
-            code = self._proc.wait()
+            # CAPTURED BEFORE THE WAIT, so it still names the PREDECESSOR
+            # after `wait()` returns, whatever `self._proc` has become by
+            # then. `_on_replace_request` reassigns `self._proc` to the
+            # successor as `_spawn()`'s very last line, and only THEN sets
+            # `self._replacing = True` — two statements, not one, and the
+            # predecessor's own exit is asked for across a process boundary
+            # (`os.kill`, a 0.25s settle, a drain that can be instant with
+            # nothing inflight). Nothing orders that exit after the SECOND
+            # statement, only after the first, so `self._replacing` alone
+            # can still read False here on a genuine handover — and reading
+            # it that way calls `stop()` on the successor's own socket.
+            proc = self._proc
+            code = proc.wait()
             if self._stop:
                 return
             # A HANDOVER, NOT A RELEASE. The predecessor asked us to replace it
             # while it was still serving, we did, and it then drained and left
             # with 0. That 0 means "released — do not restart" everywhere else,
             # and acting on it here would close the listening socket the
-            # successor is already accepting on.
-            if self._replacing:
+            # successor is already accepting on. `self._proc is not proc` is
+            # independent proof of the same thing, and closes the race above:
+            # `_spawn()` reassigns it before `self._replacing` is ever set.
+            if self._replacing or self._proc is not proc:
                 self._replacing = False
                 _log_lifecycle(
                     f"daemon {code} retired after handing over — successor "

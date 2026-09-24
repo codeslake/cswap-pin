@@ -8718,7 +8718,71 @@ class TestRefcount:
             "an unreferenced daemon lingered — the reaper stopped working"
         )
 
+    def case_the_last_holder_leaving_with_a_missing_record_still_republishes(
+        self, tmp_path, monkeypatch
+    ):
+        """`watch_refcount` reaches `_is_claimed` with `republish` through TWO
+        doors: the first-holder timeout (~8666, covered by the 00:41:13Z case
+        above, which never opens a FIFO writer at all) and this one — the EOF
+        re-check after the LAST holder closes (~8697). A record gone missing
+        when the last holder leaves is the same 2026-09-24 class of failure,
+        reached by the other door, and nothing proved `republish` actually
+        runs there: only that it runs on the first-holder path.
+        """
+        import json as _json, os, threading
 
+        import claude_swap.paths as paths
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import (
+            refcount_fifo_path,
+            watch_refcount,
+            write_daemon_state,
+            daemon_fingerprint,
+        )
+
+        certdir = tmp_path / "pin-proxy"; certdir.mkdir()
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        write_daemon_state(certdir, 40404, os.getpid(), daemon_fingerprint())
+        (certdir / "proxy.json").unlink()  # missing by the time the watcher checks
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "59999"}}))  # not us
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
+        # A live Remote Control tunnel is the claim carrying this — the same
+        # channel-only shape as the 00:41:13Z case, so `live_clients` alone
+        # cannot be what keeps `_is_claimed` from ending the claim here.
+        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 1)
+
+        republished = []
+
+        def _republish():
+            republished.append(1)
+            write_daemon_state(certdir, 40404, os.getpid(), daemon_fingerprint())
+
+        holder = os.open(fifo, os.O_RDWR)  # a wrapper-launched session attaches
+        reached = _watch_blocking_phase(monkeypatch)  # as above
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount,
+            args=(fifo, fired.set),
+            kwargs={"live_clients": lambda: 0, "republish": _republish},
+            daemon=True,
+        ).start()
+        assert reached.wait(timeout=5.0), "watcher never reached the blocking read"
+        os.close(holder)  # the last FIFO holder leaves, with the record missing
+        assert not fired.wait(timeout=0.3), (
+            "watch_refcount tore the daemon down on the EOF re-check even "
+            "though a channel was still live"
+        )
+        assert republished == [1], (
+            "the EOF-recheck door never called republish — only the "
+            "first-holder-timeout door (00:41:13Z case) is covered"
+        )
+        assert pin_proxy.read_daemon_state(certdir) == {
+            "port": 40404, "pid": os.getpid(),
+            "fingerprint": daemon_fingerprint(),
+        }, "republish ran but did not actually restore the record"
 
 
 # The badge is rendered by `claude_swap.tui.autoview`, and the version that
@@ -11790,6 +11854,86 @@ print("OK", port)
         assert closed == ["closed"], (
             "a plain exit 0 no longer releases the port — idle teardown would "
             "leave the address held forever"
+        )
+
+    def case_a_handover_wins_the_race_even_when_the_flag_is_not_set_yet(
+        self, tmp_path
+    ):
+        """`_replacing` alone is TIMING, not proof. `_on_replace_request` runs
+        `self._spawn()` — which reassigns `self._proc` to the successor as
+        its very last line — and only THEN sets `self._replacing = True`. The
+        predecessor's own exit is asked for by a signal sent across process
+        boundaries (`os.kill`, then a 0.25s settle and a possibly-instant
+        drain), so nothing orders it after the SECOND of those two lines —
+        only after the first. A `self._proc.wait()` that returns between them
+        must still be read as a handover, or `_supervise` closes the
+        successor's socket out from under it (`self.stop()`) on exactly the
+        exit the flag was supposed to catch.
+
+        Reproduced here without threads or signals: `self._proc` is swapped
+        to the successor from INSIDE the predecessor's own `wait()` — the
+        one place production genuinely cannot promise `_replacing` is set
+        yet — and `_replacing` is never set True at all.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        closed = []
+
+        class _Sock:
+            def close(self):
+                closed.append("closed")
+
+        class _Proc:
+            def __init__(self, code):
+                self._code = code
+
+            def wait(self):
+                return self._code
+
+        class _RacyHolder(pin_proxy.PortHolder):
+            def __init__(self):
+                self._stop = False
+                self._replacing = False  # never set True — see docstring
+                self._srv = _Sock()
+                self.port = 36301
+                self.daemon_pid = 4242
+                self._rounds = 0
+                self.successor = _Proc(0)
+                predecessor = _Proc(0)
+
+                def _predecessor_wait():
+                    # THE RACE: `self._proc` is reassigned before this
+                    # returns, exactly as `_spawn()`'s last line does — but
+                    # `self._replacing` is not set, exactly as the gap
+                    # before `_on_replace_request`'s own next line allows.
+                    self._proc = self.successor
+                    return 0
+
+                predecessor.wait = _predecessor_wait
+                self._proc = predecessor
+
+            def _reap_standby(self):
+                pass
+
+        # A round-2 wait, reached only if the branch under test correctly
+        # `continue`s on round 1 instead of falling through to `stop()`.
+        def _successor_wait():
+            h._rounds += 1
+            h._stop = True
+            return 0
+
+        h = _RacyHolder()
+        h.successor.wait = _successor_wait
+        h._supervise()
+        assert closed == [], (
+            "the holder closed its listening socket on a HANDOVER exit "
+            "whose `_replacing` flag lost the race — `self._proc` had "
+            "already been swapped to the successor and `_supervise` never "
+            "looked"
+        )
+        assert h._rounds == 1, (
+            "corollary: with the fix, round 2 (the successor's own wait()) "
+            "must be reached too"
         )
 
     def case_a_held_exit_does_not_drain_before_letting_the_holder_respawn(
@@ -16570,6 +16714,65 @@ class TestClearingThePinDoesNotStrandLiveSessions:
             "port": 45678, "pid": os.getpid(), "fingerprint": "fp",
             "plain_relay_ungated": True,
         }, "CONTROL FAILED: every gate satisfied must still republish"
+
+    def case_a_republish_wedged_past_the_drain_ttl_does_not_claim(
+        self, tmp_path, monkeypatch
+    ):
+        """`_is_claimed`'s own `_PUMP.live_pairs()` read is bounded by
+        `quiet_for() <= _DRAINING_MARKER_TTL`
+        (`case_a_wedged_tunnel_past_the_drain_ttl_no_longer_claims`), because
+        an unbounded read claims a daemon forever on one wedged pair and it
+        never reaches the teardown `await_inflight` would otherwise release
+        it from. `_republish_own_record` reads the exact same
+        `_PUMP.live_pairs()` to decide whether it has anything to protect —
+        with no bound there, a wedged pair `_is_claimed` would refuse to
+        count still gets a fresh `proxy.json` written for it here, undoing
+        the bound from the writing side."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
+        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 1)
+        monkeypatch.setattr(
+            pin_proxy._PUMP, "quiet_for",
+            lambda: pin_proxy._DRAINING_MARKER_TTL + 1,
+        )
+
+        pin_proxy._republish_own_record(
+            certdir, 45678, os.getpid(), "fp",
+            still_accepting=True, live_clients=lambda: 0,
+        )
+        assert pin_proxy.read_daemon_state(certdir) is None, (
+            "a tunnel wedged past the drain TTL still got a fresh record "
+            "republished for it"
+        )
+
+    def case_a_republish_wedged_tunnel_control_still_below_ttl(
+        self, tmp_path, monkeypatch
+    ):
+        """CONTROL for the case above: a pair quiet for LESS than the TTL —
+        the ordinary, still-live state — must still republish, or the case
+        above proves nothing."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
+        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 1)
+        monkeypatch.setattr(pin_proxy._PUMP, "quiet_for", lambda: 1.0)
+
+        pin_proxy._republish_own_record(
+            certdir, 45678, os.getpid(), "fp",
+            still_accepting=True, live_clients=lambda: 0,
+        )
+        assert pin_proxy.read_daemon_state(certdir) == {
+            "port": 45678, "pid": os.getpid(), "fingerprint": "fp",
+            "plain_relay_ungated": True,
+        }, (
+            "CONTROL FAILED: a tunnel still within the drain TTL must still "
+            "republish"
+        )
 
     def case_the_daemon_counts_its_own_live_clients(self, tmp_path):
         """The count must track real connections, not just exist."""
