@@ -6362,7 +6362,15 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         elif verdict == "ok":
             _set_identity(False)
 
-    def provider() -> str | None:
+    def provider(refused: "str | None" = None) -> str | None:
+        """`refused` is the `Authorization` value (``"Bearer <token>"``) a
+        swap carrying it was just REFUSED upstream -- `refetch` below passes
+        it through so a retry routes through this SAME cold path (the
+        store re-read, the racing-rotation re-check, `_identity_ok` on the
+        result) instead of a side implementation that has to remember to
+        keep re-deriving all of it. None (every other caller) never matches
+        a live token's `Bearer {token}` form, so the fast path below behaves
+        exactly as it does today."""
         _deferred.discard(1)
         _stalled.flag = False
         # PER-CALL, always reset here -- read by `_can_mint`,
@@ -6411,22 +6419,30 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # whether the disk changed. Evicting bounds the blind window to one
         # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
-        evict_foreign = False
+        bypass = False
         if cached is not None:
             provider.blind_reason = ""
             token = _live_token(cached)
             if token:
-                if _identity_ok(token, mail):
+                if f"Bearer {token}" == refused:
+                    # THE VERY TOKEN THAT WAS JUST REFUSED: comparing first
+                    # means never spending an `_identity_ok` probe on a
+                    # bearer this call already knows to discard. Bypass, the
+                    # same way a confirmed-foreign verdict does below, so
+                    # the re-read under `refresh_lock` runs.
+                    bypass = True
+                elif _identity_ok(token, mail):
                     return token
-                # CONFIRMED FOREIGN: fall through to a re-read under
-                # `refresh_lock` instead of returning here with the entry
-                # popped -- an empty `_cred_cache` reads as `can_pin: False`
-                # to both `_read_alive_port` and the self-heal watchdog,
-                # which recycle a live daemon that a fresh process would
-                # find just as cross-wired. `creds = cached` (not None)
-                # below so a re-read that comes back empty restores this
-                # SAME blob instead of leaving the cache empty.
-                evict_foreign = True
+                else:
+                    # CONFIRMED FOREIGN: fall through to a re-read under
+                    # `refresh_lock` instead of returning here with the entry
+                    # popped -- an empty `_cred_cache` reads as `can_pin: False`
+                    # to both `_read_alive_port` and the self-heal watchdog,
+                    # which recycle a live daemon that a fresh process would
+                    # find just as cross-wired. `creds = cached` (not None)
+                    # below so a re-read that comes back empty restores this
+                    # SAME blob instead of leaving the cache empty.
+                    bypass = True
             creds = cached
         else:
             # COLD -- the very first read for this key, which is EVERY key on
@@ -6474,7 +6490,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             # `can_pin: False`, and a read that RAISES would leave it that
             # way for good. `fresh is cached` is the same race guard the
             # branch below uses: a racer's replacement is not ours to discard.
-            if evict_foreign and fresh is cached:
+            if bypass and fresh is cached:
                 fresh = None
             token = _live_token(fresh) if fresh is not None else None
             if token:
@@ -6631,65 +6647,32 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         cached = _cred_cache.get(target)
         return bool(cached and _live_token(cached))
 
-    # {refused Authorization value: True} -- ONE entry, the most recent
-    # refusal `refetch` was asked about. A polled legitimate 404 (or a
-    # store that has not rotated yet) refuses the identical bearer on
-    # every request, and re-reading the store for it every time (a
-    # Keychain shell-out on macOS) buys nothing once the first re-read
-    # already came back with nothing newer. Keyed on the bearer, not
-    # time: a DIFFERENT refused bearer (the rotation this exists to
-    # catch, or a re-pin) always gets its own read.
-    _refetch_memo: dict = {}
-
     def refetch(refused_bearer: "str | None") -> "str | None":
-        """Force a fresh disk read for the CURRENTLY pinned slot because a
-        swap carrying `refused_bearer` was just REJECTED upstream RIGHT
-        NOW, whether or not the cached bytes' `expiresAt` says they still
-        have time left (the pinned account was live and rotated its token
-        underneath `_cred_cache`). Never called on the request's hot path
-        -- `provider()`'s own fast path still trusts expiry alone,
-        unchanged, so c4e6913's "expiry invalidates, not a disk read on
-        every request" stays true for every call that is not retrying a
-        refusal.
+        """A swap carrying `refused_bearer` was just REJECTED upstream RIGHT
+        NOW. Routes through `provider` itself -- the SAME cold path a cold
+        or foreign-evicted call takes, so a retry gets everything that path
+        already does (the store re-read, `read(...) or creds` on an empty
+        one, the racing-rotation re-check under `refresh_lock`,
+        `_lock_acquired_at` for the mint-stall watchdog, `_identity_ok` on
+        the result) instead of a side implementation that has to remember
+        to keep re-deriving all of it.
 
-        THE SAME NEVER-REMOVE DISCIPLINE `evict_foreign` above uses: this
-        never pops or blanks `_cred_cache` -- an empty read (Keychain
-        locked/timed out) or a raising one leaves the existing entry
-        exactly as it was, because an empty `_cred_cache` reads as
-        `can_pin: False` to `can_pin_cached()`/`/health` and the self-heal
-        watchdog recycles a daemon a fresh process would find just as
-        cross-wired.
+        NO MEMO: every call here is one failed upstream round trip already
+        -- refused requests, not the hot path -- so one store read apiece is
+        proportional, not a storm amplifier. The daemon.log line this can
+        drive is rate-limited separately, by `_note_swap_refused` at the
+        call site (the `_note_busy_slot` pattern), so a polled legitimate
+        404 still writes at most one line per cooldown window.
 
         Returns a token only when it is DIFFERENT from `refused_bearer` --
         the same one would just be refused again -- and None otherwise: a
-        read that comes back empty, unchanged, or raises.
+        read that comes back empty, unchanged, or (via `provider`'s own
+        propagation) raises.
         """
-        if _refetch_memo.get("bearer") == refused_bearer:
-            return None
-        target = _current_target()
-        if target is None:
-            return None
-        num, mail = target
-        ckey = (num, mail)
-        if not refresh_lock.acquire(timeout=_MINT_LOCK_BOUND_S):
-            return None
-        try:
-            try:
-                creds = switcher.read_account_credentials(num, mail)
-            except Exception:
-                creds = None
-            if not creds:
-                _refetch_memo["bearer"] = refused_bearer
-                return None
-            _cred_cache[ckey] = creds
-            token = _live_token(creds)
-            if token and f"Bearer {token}" != refused_bearer:
-                _refetch_memo.clear()
-                return token
-            _refetch_memo["bearer"] = refused_bearer
-            return None
-        finally:
-            refresh_lock.release()
+        token = provider(refused=refused_bearer)
+        if token and f"Bearer {token}" != refused_bearer:
+            return token
+        return None
 
     provider.refetch = refetch
     provider.pin_is_noop = pin_is_noop
@@ -17013,6 +16996,7 @@ class PinProxy:
                         else h for h in headers], True)
             yield unswapped, False
 
+        pending_refusal = None
         try:
             # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path
             # already does. An environment registered before the pin knew
@@ -17023,6 +17007,18 @@ class PinProxy:
             for hdrs, retry in _swap_attempts():
                 if hdrs is None:
                     break
+                if pending_refusal is not None:
+                    # NAMES THIS ATTEMPT -- the one actually about to be
+                    # retried -- not the one that was just refused: whether
+                    # a fresh swap exists at all is `_swap_attempts`' own
+                    # lazy decision, not known until the generator has
+                    # already advanced to it, which is only now.
+                    kind = ("as it arrived" if hdrs is unswapped
+                            else "with a fresh swap")
+                    self._tunnel_trace(
+                        f"{method} {rel} swap refused ({pending_refusal}) — "
+                        f"retrying {kind} (absolute-form)")
+                    pending_refusal = None
                 try:
                     up, head = dial(hdrs)
                 except NoChainHopError:
@@ -17047,12 +17043,6 @@ class PinProxy:
                     # slow origin — rather than dead.
                     up.settimeout(None)
                     up.sendall(head.encode("latin1") + body)
-                    # NAMES WHICH ATTEMPT THIS IS, for the two refusal traces
-                    # below -- the unswapped fallback goes out "as it
-                    # arrived", the refetch attempt in between "with a fresh
-                    # swap".
-                    kind = ("as it arrived" if hdrs is unswapped
-                            else "with a fresh swap")
                     if upgrading:
                         # THE OPAQUE TAIL. Always peek the status first — a
                         # drain reading `inflight_requests()` between the
@@ -17064,9 +17054,7 @@ class PinProxy:
                         # with no swap never asked for one.
                         code, seen = _peek_status(up)
                         if retry and code in (401, 403, 404):
-                            self._tunnel_trace(
-                                f"{method} {rel} swap refused ({code}) — "
-                                f"retrying {kind} (absolute-form)")
+                            pending_refusal = code
                             continue
                         # RELEASED HERE, THE MOMENT THE STATUS LINE IS IN
                         # HAND — same discipline as the MITM path's
@@ -17103,9 +17091,7 @@ class PinProxy:
                         note_hop=host == UPSTREAM_HOST and secure,
                     )
                     if isinstance(result, _AuthRejected):
-                        self._tunnel_trace(
-                            f"{method} {rel} swap refused ({result.code}) — "
-                            f"retrying {kind} (absolute-form)")
+                        pending_refusal = result.code
                         continue
                     _release_bridge_hold()
                     return bool(result) and not client_wants_close

@@ -6411,7 +6411,7 @@ class TestMakePinTokenProvider:
     # `case_an_unverifiable_identity_still_does_not_reread_the_store` and
     # `case_repeated_requests_do_not_reread_the_store` (below) -- an
     # unknown/timeout verdict and a same-identity verdict never set
-    # `evict_foreign`, so this PR's fix does not touch either path and the
+    # `bypass`, so this PR's fix does not touch either path and the
     # existing controls already prove a single store read across repeats.
 
 
