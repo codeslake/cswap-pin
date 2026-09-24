@@ -15801,13 +15801,16 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
-        # THE `_note_usage_headers` THROTTLE, KEYED ON THE BEARER, is a memo
-        # of the SAME shape and outlives this case exactly like the three
-        # above: cases run alphabetically (`run_cases`'s `sorted(dir(cls))`),
-        # so a case that stamps `self.LIVE` leaves a live token in here for
-        # whichever case with that same bearer sorts next, throttling it
-        # before it ever reaches the code it means to exercise.
+        # THE `_note_usage_headers` THROTTLES are memos of the SAME shape
+        # and outlive this case exactly like the three above: cases run
+        # alphabetically (`run_cases`'s `sorted(dir(cls))`), so a case that
+        # stamps `self.LIVE` leaves an entry in here for whichever case
+        # with that same bearer or slot sorts next, throttling it before it
+        # ever reaches the code it means to exercise. `_usage_header_seen`
+        # is keyed on the live SLOT; `_usage_header_spawn_seen` is the
+        # pre-spawn gate, keyed on the bearer.
         pp._usage_header_seen.clear()
+        pp._usage_header_spawn_seen.clear()
         return calls
 
     @classmethod
@@ -15965,6 +15968,26 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE)
         assert not recorded, recorded
 
+    def case_many_200s_inside_30s_spawn_one_thread(self, monkeypatch):
+        """T1178: moving the throttle inside `_run` left NOTHING in front
+        of `_spawn_usage_header_recorder` -- every 200 carrying the 5h
+        header spawned its own thread, each building two
+        `ClaudeAccountSwitcher()`s before the in-thread check ever ran.
+        Counting spawns through the seam itself, without ever running
+        `fn`, isolates the pre-spawn gate from the in-thread per-slot
+        throttle the case below covers."""
+        from cswap_pin import proxy as pp
+        spawns = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", spawns.append)
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE)
+        for _ in range(5):
+            self._relay(status=b"200 OK", reset=False,
+                        auth="Bearer " + self.LIVE,
+                        extra_headers=self._5H_HEADER)
+        assert len(spawns) == 1, (
+            f"many 200s inside the throttle window must spawn one thread, "
+            f"not one per reply: {len(spawns)}")
+
     def case_a_second_reply_inside_30s_is_throttled_a_later_one_is_not(
         self, monkeypatch,
     ):
@@ -15984,6 +16007,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         # Age the one entry past the throttle instead of sleeping for it.
         # Keyed on the live SLOT ("1", `_wire`'s default), not the bearer.
         pp._usage_header_seen["1"] -= pp._USAGE_HEADER_THROTTLE_S + 1
+        # ... and the PRE-SPAWN gate, keyed on the bearer every relay above
+        # used -- unaged, it would swallow the third call before `_run`
+        # ever saw the slot entry aged above.
+        pp._usage_header_spawn_seen[self.LIVE] -= (
+            pp._USAGE_HEADER_THROTTLE_S + 1)
         self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
                     extra_headers=self._5H_HEADER)
         assert len(recorded) == 2, (

@@ -19822,10 +19822,19 @@ _usage_header_lock = threading.Lock()
 # whichever key was inserted longest ago. Resolving the slot needs
 # `current_account_number()`, which can ask the server — see
 # `_note_usage_headers` for why that read, and so this whole memo, lives in
-# the spawned thread rather than on the relay's own. LRU: a hit moves the
-# key to the newest end (pop, then reinsert), so eviction takes the LEAST
-# recently touched slot rather than merely the oldest inserted one.
+# the spawned thread rather than on the relay's own. LRU: a RECORDED reply
+# moves the key to the newest end (pop, then reinsert) — a throttled hit
+# returns before that reinsert, so eviction takes the LEAST RECENTLY
+# RECORDED slot, not merely the least recently touched one.
 _usage_header_seen: dict[str, float] = {}
+# bearer token -> monotonic time of the last thread SPAWNED for it. Cheap
+# (the caller already has `token`, for the same match `_run` makes anyway):
+# a pre-spawn gate so a hot /v1/messages loop on ONE token pays for at most
+# one `ClaudeAccountSwitcher()` resolution per `_USAGE_HEADER_THROTTLE_S`,
+# not one thread PER REPLY. A token ROTATION still spawns its own thread
+# here — that thread's `_usage_header_seen` check above is what collapses
+# it with the slot's other token, same as before this gate existed.
+_usage_header_spawn_seen: dict[str, float] = {}
 
 
 def _note_usage_headers(
@@ -19840,14 +19849,17 @@ def _note_usage_headers(
     slot goes through `current_account_number()`, whose docstring already
     warns it can ask the server — fine once per 429 under
     `_switch_off_walled_account`'s lock, not on every 200 this fires for.
-    So the slot read, the throttle check against `_usage_header_seen`, the
-    token match, and the write all happen in a throwaway thread; this
-    function only decides whether to start one at all, in O(1) — a header
-    scan and a bearer strip already sized by the caller. The cost this
-    pays that the old per-bearer throttle did not is a thread spawn on
-    every 200/429 carrying the 5h header, in exchange for a throttle that
-    actually means what `record_usage_headers` promises: once per
-    `_USAGE_HEADER_THROTTLE_S` per SLOT, not per bearer.
+    So the slot read, the per-slot throttle check against
+    `_usage_header_seen`, the token match, and the write all happen in a
+    throwaway thread; this function itself only decides whether to START
+    one, behind the cheap pre-spawn gate against `_usage_header_spawn_seen`
+    — a header scan, a bearer strip, and one dict lookup, all already
+    sized by the caller. That gate is what keeps a hot loop on ONE token
+    from paying for a `ClaudeAccountSwitcher()` resolution on every
+    200/429 carrying the 5h header; the in-thread check behind it is what
+    still makes the throttle mean what `record_usage_headers` promises:
+    once per `_USAGE_HEADER_THROTTLE_S` per SLOT, not per bearer, when a
+    token rotates mid-window.
     """
     if (path or "").split("?", 1)[0].rstrip("/") != "/v1/messages":
         return
@@ -19867,6 +19879,15 @@ def _note_usage_headers(
     token = token[7:].strip() if token[:7].lower() == "bearer " else ""
     if not token:
         return
+    now = time.monotonic()
+    with _usage_header_lock:
+        last_spawn = _usage_header_spawn_seen.get(token)
+        if last_spawn is not None and now - last_spawn < _USAGE_HEADER_THROTTLE_S:
+            return
+        _usage_header_spawn_seen.pop(token, None)
+        _usage_header_spawn_seen[token] = now
+        if len(_usage_header_spawn_seen) > 8:
+            del _usage_header_spawn_seen[next(iter(_usage_header_spawn_seen))]
 
     def _run() -> None:
         try:
