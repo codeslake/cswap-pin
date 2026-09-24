@@ -18142,6 +18142,12 @@ class PinProxy:
                 # and `original_headers` keeps the arrival copy.
                 auth=next((v for k, v in headers
                            if k.lower() == "authorization"), ""),
+                # STABLE PER SESSION, UNLIKE THE BEARER: lets a stale-bearer
+                # 401 debounce per client instead of per (reset, slot) — see
+                # `_switch_off_walled_account`. Absent on a client that never
+                # sends it, which keeps today's shared-memo behaviour.
+                session=next((v for k, v in headers
+                              if k.lower() == "x-claude-code-session-id"), ""),
                 # THE MOMENT A CUT STOPS BEING RETRYABLE. Before this fires the
                 # client has received nothing and the SDK retries; after it,
                 # part of an answer is already delivered.
@@ -19343,6 +19349,18 @@ _walled_switch_seen: dict[tuple[bytes, str | None],
 # still walled.
 _walled_slots: dict[str, float] = {}
 
+# (reset, slot, session) -> the monotonic deadline the bearer branch's OWN
+# 401 is good until. Separate from `_walled_switch_seen`, on purpose: that
+# memo is a SHARED verdict (did `switch()` actually move the account, a fact
+# every session should see alike), while a stale bearer is a PER-CLIENT fact
+# — one session's frozen credential says nothing about another session's.
+# Sharing the key made N stale sessions take N * 30s to all recover (one
+# converts, the other N-1 read its memo and relay raw 429s until it
+# expires); keying on the session too gives each its own one-401-per-TTL
+# instead. Pruned on write, like `_walled_slots` — no cap needed, since it
+# self-limits to sessions that hit a stale bearer within the last TTL.
+_walled_switch_seen_by_session: dict[tuple[bytes, str | None, str], float] = {}
+
 # ~ the cross-process lock timeouts this daemon and cswap itself use: long
 # enough that a storm on one wall does not re-attempt for every repeat,
 # short enough that a genuinely transient failure (the config lock held by
@@ -19392,12 +19410,21 @@ def _live_account_slot() -> str | None:
 def _live_account_headroom(num: str) -> float | None:
     """Headroom, in percent, of slot ``num``, which is the live one.
 
-    ``None`` means UNKNOWN and every caller must fail CLOSED on it, because
-    the two answers are indistinguishable from the outside: `decision_value`
-    returns ``None`` for "no reading recent enough to act on" — a property of
-    the CACHE, not of the account — and an empty reading read as "no limit
-    anywhere" hands out a 401 onto an account nobody has measured. A sentinel
-    string (a rate-limited row) is not a dict and is not a number either.
+    ``None`` means UNKNOWN. Its caller in the bearer branch of
+    `_switch_off_walled_account` no longer fails closed on it (see that
+    function for why); every OTHER reading a live account can carry that is
+    not a number — `decision_value`'s "no reading recent enough to act on"
+    and a sentinel string (a rate-limited row) alike — still comes back
+    ``None`` here, because the caller's own `not walled` term is what makes
+    an unknown reading safe to convert on, not a guess buried in this
+    function about what the number would have been.
+
+    ``0.0``, NOT ``None``, when cswap's OWN usage entry already knows the
+    live slot is walled (`entry.walled`, set from a persisted
+    `walledUntil` in the future): that is not an unknown, it is the same
+    fact `_walled_slots` records for a wall this daemon itself saw, read
+    from the host's copy instead, and `> 0` fails it exactly like a
+    known-full reading rather than like an unmeasured one.
 
     ONE SLOT, NAMED, and that is a CORRECTNESS argument before it is a cost
     one. `fetch=None` reserves with `respect_plans=True` — the entry must be
@@ -19418,8 +19445,10 @@ def _live_account_headroom(num: str) -> float | None:
     """
     try:
         sw = require("switcher").ClaudeAccountSwitcher()
-        usage = sw.usage_entries_by_account(
-            fetch={num})[num].decision_value(("all",))
+        entry = sw.usage_entries_by_account(fetch={num})[num]
+        if getattr(entry, "walled", False):
+            return 0.0
+        usage = entry.decision_value(("all",))
         # `relevant_windows` answers [] for anything that is not a window dict,
         # so a sentinel string and a None reading fail this test too.
         if not {"5h", "7d"} <= {
@@ -19445,9 +19474,15 @@ def _switch_takes_exclude() -> bool:
 
 
 def _switch_off_walled_account(
-    reset: bytes, retry_after: bytes, auth: str = "",
+    reset: bytes, retry_after: bytes, auth: str = "", session: str = "",
 ) -> bool:
     """Switch cswap off the account that just 429'd, at most once per wall.
+
+    ``session`` is the request's ``x-claude-code-session-id`` — stable per
+    session and never rotated on retry, unlike the bearer. Empty for a
+    caller that owes it nothing (the standalone RC client, absolute-form
+    routes): the bearer branch below then falls back to today's shared
+    per-(reset, slot) memo, exactly as before this parameter existed.
 
     ``reset`` is the wall's own ``anthropic-ratelimit-unified-reset`` value —
     unique per (account, window) already, so it needs no identity lookup and
@@ -19477,14 +19512,23 @@ def _switch_off_walled_account(
     after, and still names the walled slot, means the wall let the account
     back onto it and RE-DECIDES instead — see `seen_at`/`decided_at` below),
     or the host had ALREADY moved and the client's frozen bearer is the only
-    thing still on the walled account (`_live_account_headroom`: a 401 alone
-    fixes that, and no switch can). False (no headroom anywhere, `switch()`
-    raised, `switch()` landed a credential it never validated, or a repeat of
-    a wall that never earned a 401 and whose expiry has not passed) means
-    relay the 429 with its rate-limit headers stripped, so the client backs
-    off and retries instead of sleeping the wall's own reset window; a 401
-    onto a credential nobody confirmed is alive is worse than the wall
-    itself, because CC rebuilds onto it.
+    thing still on the walled account. That last branch no longer needs
+    `_live_account_headroom` to be a KNOWN positive: it converts whenever the
+    live account is not KNOWN walled — this daemon's own `_walled_slots`, or
+    cswap's persisted wall via `entry.walled` — because a retry the pin
+    cannot yet measure is not the same claim as a retry the pin has measured
+    and found nowhere to land, and unknown-fails-closed here was itself
+    forging the "nowhere to land" 429 whenever the cache was merely cold
+    (five fable subagents' `authentication_failed` was the OTHER direction of
+    this same mistake; a cold cache stalling a good retry is the direction
+    this reverses). False (a KNOWN wall on the live account, `switch()`
+    raised, `switch()` landed a credential it never validated, this session
+    already spent its own bearer-branch 401 for this wall, or a repeat of a
+    wall that never earned a 401 and whose expiry has not passed) means relay
+    the 429 with its rate-limit headers stripped, so the client backs off and
+    retries instead of sleeping the wall's own reset window; a 401 onto a
+    credential nobody confirmed is alive is worse than the wall itself,
+    because CC rebuilds onto it.
 
     Storm control and per-wall debounce are the SAME guard, and the lock is
     held ACROSS `switch()`: the wall claims its slot and every waiter blocks
@@ -19599,14 +19643,52 @@ def _switch_off_walled_account(
         token = auth.strip()
         token = token[7:].strip() if token[:7].lower() == "bearer " else ""
         if token and live and token != live and slot is not None:
-            # AND ONLY WHEN THE RETRY CAN LAND. A stale bearer says the
-            # client would rebuild; it says nothing about whether what it
-            # rebuilds onto can serve, and a 401 with nowhere to land
-            # exhausts into `authentication_failed` — absent from Claude
-            # Code's partial-result set, so a subagent loses its context
-            # outright instead of sleeping (2026-09-07, three leads).
-            headroom = _live_account_headroom(slot)
-            if headroom is not None and headroom > 0:
+            # PER-SESSION DEBOUNCE FIRST, and cheaper than the headroom read
+            # it can skip. Keyed on (reset, slot, session) rather than the
+            # shared `key`: a stale bearer is a fact about ONE client, and
+            # sharing the memo made every OTHER stale session wait out the
+            # first one's TTL instead of getting its own 401 — N sessions
+            # took N * 30s. No `session` (a caller that owes it none, e.g.
+            # the standalone RC client) falls through unchanged and is
+            # recorded into the shared `key` below instead, exactly as
+            # before this parameter existed.
+            session_key = (reset, slot, session) if session else None
+            now2 = time.monotonic()
+            if session_key is not None:
+                for expired in [k for k, exp in
+                                 _walled_switch_seen_by_session.items()
+                                 if exp <= now2]:
+                    del _walled_switch_seen_by_session[expired]
+                if session_key in _walled_switch_seen_by_session:
+                    _log_lifecycle(
+                        "429 on /v1/messages — this session already had its "
+                        "bearer converted for wall reset="
+                        f"{reset.decode('latin1', 'replace')}, relaying the "
+                        "429 with headers stripped rather than repeat the "
+                        "401 with nothing changed"
+                    )
+                    return False
+            # NOT KNOWN WALLED, AND ONLY THEN. `_walled_slots` is this
+            # daemon's own record of a wall it saw directly; `headroom`
+            # below can now also read `0.0` from cswap's OWN persisted wall
+            # (`_live_account_headroom`'s `entry.walled`) rather than a
+            # missing reading. Checking the cheap, local record first skips
+            # a usage fetch entirely when the answer is already known.
+            walled = _walled_slots.get(slot, 0.0) > time.time()
+            # UNKNOWN HEADROOM NO LONGER FAILS CLOSED HERE. It used to: a
+            # cold cache (`decision_value` returns `None` for "no reading
+            # recent enough to act on", a property of the CACHE, not of the
+            # account) fell through to `switch(current_at_limit=True)`,
+            # which scores the LIVE account 0.0 and either relays a
+            # stripped 429 with a perfectly healthy account sitting live,
+            # or moves cswap off a healthy account it never needed to
+            # leave. `walled` is what makes that safe: an account this
+            # daemon does not know is walled converts on an unknown
+            # reading exactly as it would on a good one, and a KNOWN wall
+            # (this daemon's own, or cswap's persisted one) still fails
+            # closed via `headroom <= 0`.
+            headroom = None if walled else _live_account_headroom(slot)
+            if not walled and (headroom is None or headroom > 0):
                 # `:.3g`, NOT `:.0f`. The band this branch is least obvious in
                 # is the one just above zero, and `:.0f` printed "0% headroom;
                 # relaying a 401" there -- the only post-hoc evidence
@@ -19614,8 +19696,11 @@ def _switch_off_walled_account(
                 _log_lifecycle(
                     "429 on /v1/messages — the client's bearer is no longer "
                     "the live account, which has "
-                    f"{headroom:.3g}% headroom; relaying a 401 so the client "
-                    "rebuilds onto it, without switching"
+                    + (f"{headroom:.3g}% headroom"
+                       if headroom is not None else "no reading yet, but is "
+                       "not known walled")
+                    + "; relaying a 401 so the client rebuilds onto it, "
+                    "without switching"
                 )
                 # RECORD A NEGATIVE, RETURN TRUE: this request gets its 401
                 # and the next 429 on this wall does not, until the entry
@@ -19628,7 +19713,11 @@ def _switch_off_walled_account(
                 # token ROTATION reaches it (bearer != live, account unchanged
                 # and still walled), giving 401 -> 429 -> 401 with no sleep
                 # until the retry loop exhausts into `authentication_failed`.
-                _remember_walled_switch(key, False)
+                if session_key is not None:
+                    _walled_switch_seen_by_session[session_key] = (
+                        now2 + _WALLED_SWITCH_RAISE_TTL)
+                else:
+                    _remember_walled_switch(key, False)
                 return True
         # THE WALL ITSELF, RECORDED — only for a 429 whose bearer is the
         # live slot's OWN token: a bearer-branch 429 (handled above) is
@@ -19714,6 +19803,95 @@ def _switch_off_walled_account(
         return ok
 
 
+_USAGE_HEADER_THROTTLE_S = 30.0
+_usage_header_lock = threading.Lock()
+# bearer token -> monotonic time of the last thread this spawned. Bounded the
+# same way as `_walled_switch_seen`: the true key is the live SLOT, and
+# resolving that is exactly the cost this throttle exists to avoid paying on
+# the relay's own thread — see `_note_usage_headers`. The token is free
+# (the caller already has it for `auth`) and is what the spawned thread will
+# match against the live one anyway, so it stands in.
+_usage_header_seen: dict[str, float] = {}
+
+
+def _note_usage_headers(
+    status_line: bytes, lines: list[bytes], path: str | None, auth: str,
+) -> None:
+    """Feed a `/v1/messages` reply's own 5h/7d usage headers to cswap's
+    usage store — free evidence a fetch would otherwise pay for, and the
+    only fresh reading available while an account is walled. See
+    ``record_usage_headers`` (``claude_swap.switcher``).
+
+    NEVER ON THE RELAY'S OWN THREAD past this function. Resolving the live
+    slot goes through `current_account_number()`, whose docstring already
+    warns it can ask the server — fine once per 429 under
+    `_switch_off_walled_account`'s lock, not on every 200 this fires for.
+    So the slot read, the token match, and the write all happen in a
+    throwaway thread; this function only decides whether to start one, in
+    O(1) — a dict lookup and a header scan already sized by the caller.
+
+    Throttled per BEARER (see `_usage_header_seen` for why that stands in
+    for the slot), once per `_USAGE_HEADER_THROTTLE_S`: `record_usage_headers`
+    itself already asks for at most once per 30s per slot, so calling it
+    more often would trade store-write cost for nothing.
+    """
+    if (path or "").split("?", 1)[0].rstrip("/") != "/v1/messages":
+        return
+    if not (status_line.startswith(b"HTTP/1.1 200")
+            or status_line.startswith(b"HTTP/1.1 429")):
+        return
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if b":" not in line:
+            continue
+        k, v = line.split(b":", 1)
+        headers[k.strip().lower().decode("latin1", "replace")] = (
+            v.strip().decode("latin1", "replace"))
+    if "anthropic-ratelimit-unified-5h-utilization" not in headers:
+        return
+    token = auth.strip()
+    token = token[7:].strip() if token[:7].lower() == "bearer " else ""
+    if not token:
+        return
+    now = time.monotonic()
+    with _usage_header_lock:
+        last = _usage_header_seen.get(token)
+        if last is not None and now - last < _USAGE_HEADER_THROTTLE_S:
+            return
+        _usage_header_seen[token] = now
+        if len(_usage_header_seen) > 8:
+            del _usage_header_seen[next(iter(_usage_header_seen))]
+
+    def _run() -> None:
+        try:
+            slot = _live_account_slot()
+            live = _active_oauth_token()
+            # ONLY WHEN THE REQUEST'S OWN TOKEN IS STILL THE LIVE ONE —
+            # otherwise a stale session's headers, read off an account it
+            # is no longer even talking to, would land on the slot cswap
+            # actually has live now.
+            if slot is None or live is None or token != live:
+                return
+            sw = require("switcher").ClaudeAccountSwitcher()
+            if not hasattr(sw, "record_usage_headers"):
+                return
+            sw.record_usage_headers(slot, headers)
+        except Exception as exc:  # noqa: BLE001 — never let this break the relay
+            _log_lifecycle(
+                f"usage-header record raised {exc.__class__.__name__}, "
+                "dropped"
+            )
+
+    _spawn_usage_header_recorder(_run)
+
+
+def _spawn_usage_header_recorder(fn) -> None:
+    """Where `_note_usage_headers` starts its detached thread — a seam so a
+    test can run ``fn`` synchronously instead of racing a real one, same
+    idea as `_config_home_for_policy`."""
+    threading.Thread(target=fn, daemon=True).start()
+
+
 def _relay_response(
     up: ssl.SSLSocket,
     client: ssl.SSLSocket,
@@ -19725,10 +19903,16 @@ def _relay_response(
     path: str | None = None,
     certdir=None,
     auth: str = "",
+    session: str = "",
     note_hop: bool = True,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
+
+    ``session`` is the request's ``x-claude-code-session-id``, threaded
+    through to `_switch_off_walled_account` so a stale-bearer 401 debounces
+    per session rather than per (reset, slot) — see that function. Empty
+    for a caller that owes it nothing, same as `auth`/`path`/`certdir`.
 
     Response framing decides where this response ends, which is what makes
     keep-alive possible at all:
@@ -19781,6 +19965,10 @@ def _relay_response(
         return False
     lines = head.split(b"\r\n")
     status_line = lines[0] if lines and lines[0] else b"HTTP/1.1 502 Bad Gateway"
+    # THE UPSTREAM'S OWN ANSWER, before any of the rewrites below (a walled
+    # 429 becoming a 401, a spurious 404 becoming a 503) can touch it — see
+    # `_note_usage_headers`, which needs to know what actually came back.
+    _upstream_status_line = status_line
     # Nothing has reached the client yet, so a swap the upstream refused can
     # still be taken back. 401/403/404 are the three the client treats as
     # permanent; anything else is the origin's own answer and belongs to it.
@@ -19822,7 +20010,7 @@ def _relay_response(
              if l.lower().startswith(b"retry-after:")),
             b"",
         )
-        _walled_401 = _switch_off_walled_account(reset, retry_after, auth)
+        _walled_401 = _switch_off_walled_account(reset, retry_after, auth, session)
         _wall_relay = bool(reset) and not _walled_401
     if _walled_401:
         if _TRACE is not None:
@@ -19866,6 +20054,7 @@ def _relay_response(
             on_status(status_line)
         except Exception:  # noqa: BLE001 — never let a statistic break a reply
             pass
+    _note_usage_headers(_upstream_status_line, lines, path, auth)
     out = [status_line]
     length: int | None = None
     chunked = False
@@ -19950,13 +20139,13 @@ def _relay_response(
                 _Prefixed(up, rest), client, cid,
                 reject_on_auth_error=reject_on_auth_error, method=method,
                 on_headers=None, on_status=on_status, path=path,
-                certdir=certdir, auth=auth, note_hop=note_hop,
+                certdir=certdir, auth=auth, session=session, note_hop=note_hop,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
             on_headers=None, on_status=on_status, path=path,
-            certdir=certdir, auth=auth, note_hop=note_hop,
+            certdir=certdir, auth=auth, session=session, note_hop=note_hop,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
