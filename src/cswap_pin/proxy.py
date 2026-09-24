@@ -19545,7 +19545,7 @@ _WALLED_SWITCH_RAISE_TTL = 30.0
 
 
 def _remember_walled_switch(
-    key: tuple[bytes, str | None], ok: bool, reset: bytes = b"",
+    key: tuple[bytes, str | None], ok: bool, cap: float | None = None,
 ) -> None:
     """Record this wall's verdict. Call under `_walled_switch_lock`.
 
@@ -19562,24 +19562,39 @@ def _remember_walled_switch(
     relayed 28 raw 429s across 101 seconds on 2026-09-09 while a healthy
     account sat live and unreachable.
 
-    `reset` caps a negative's own expiry at the WALL'S clear time — its own
-    `anthropic-ratelimit-unified-reset` epoch, converted from Unix time to
-    this process's monotonic clock via the offset read NOW. Without it, a
-    negative written just before the wall clears (the stale-bearer branch's
-    fallthrough to `switch()` while the live slot is already known walled,
-    in `_switch_off_walled_account`) ran its own full
-    `_WALLED_SWITCH_RAISE_TTL` regardless, so the shared debounce could
-    outlive the wall by up to that whole window and relay a stripped 429
-    to every session on it while a perfectly good account sat live.
+    `cap` caps a negative's own expiry at the WALL'S clear time — a Unix
+    epoch, converted to this process's monotonic clock via the offset read
+    NOW. It must be the LIVE slot's own clear time, not whichever 429's
+    `reset` header happened to be on hand: the stale-bearer branch's
+    fallthrough to `switch()` (while the live slot is already known walled,
+    in `_switch_off_walled_account`) is handed a 429 whose `reset` belongs
+    to the STALE account, and capping on that let the shared debounce
+    outlive the LIVE wall by up to the whole `_WALLED_SWITCH_RAISE_TTL`
+    while a perfectly good account sat live (T1213). Every other caller
+    passes the live wall's own reset, which is the same fact by
+    construction.
+
+    A `cap` at or before "now" (a reset already past when this is written,
+    clock skew or a wall that cleared before the request finished) is
+    floored rather than honoured verbatim: zeroing the debounce out would
+    let every OTHER concurrent 429 on this same wall, still queued on
+    `_walled_switch_lock`, find it already expired and re-run `switch()`
+    for itself — the one-`switch()`-per-wall property this whole memo
+    exists for, broken by the cap meant to tighten it (T1213 pass 2, I2).
     """
     now = time.monotonic()
     if not ok:
         retry_at = now + _WALLED_SWITCH_RAISE_TTL
-        if reset:
-            try:
-                retry_at = min(retry_at, float(reset) + (now - time.time()))
-            except ValueError:
-                pass
+        if cap is not None:
+            capped_at = cap + (now - time.time())
+            if capped_at <= now:
+                # I2: a cap already at or before "now" is floored rather
+                # than honoured verbatim -- see above. Left alone otherwise,
+                # so an explicit zero TTL some cases use to test "expires by
+                # the very next look" still does: nothing here floors a
+                # `retry_at` no cap ever pushed down.
+                capped_at = now + 1e-3
+            retry_at = min(retry_at, capped_at)
         _walled_switch_seen[key] = (False, retry_at, now)
     else:
         _walled_switch_seen[key] = (True, None, now)
@@ -19818,6 +19833,13 @@ def _switch_off_walled_account(
         # a fresh key and the 401 -> 429 -> 401 loop below reopens; a slot
         # number does not rotate.
         key = (reset, slot)
+        # Set by the bearer branch below, ONLY when it finds the live slot
+        # already known walled (`walled=True`): that fallthrough's own
+        # `reset` belongs to the STALE account, not the live one, so the
+        # negative recorded further down must cap on the live slot's own
+        # clear time instead (see I1, T1213 pass 2). `None` elsewhere falls
+        # back to `reset` at the point it is used.
+        cap_epoch: float | None = None
         if key in _walled_switch_seen:
             ok, retry_at, decided_at = _walled_switch_seen[key]
             if retry_at is None or time.monotonic() < retry_at:
@@ -19903,6 +19925,8 @@ def _switch_off_walled_account(
             # missing reading. Checking the cheap, local record first skips
             # a usage fetch entirely when the answer is already known.
             walled = _walled_slots.get(slot, 0.0) > time.time()
+            if walled:
+                cap_epoch = _walled_slots.get(slot)
             # UNKNOWN HEADROOM NO LONGER FAILS CLOSED HERE. It used to: a
             # cold cache (`decision_value` returns `None` for "no reading
             # recent enough to act on", a property of the CACHE, not of the
@@ -19956,8 +19980,14 @@ def _switch_off_walled_account(
         if slot is not None and token and live and token == live:
             try:
                 _walled_slots[slot] = float(reset)
+                cap_epoch = _walled_slots[slot]
             except ValueError:
                 pass
+        if cap_epoch is None:
+            try:
+                cap_epoch = float(reset)
+            except ValueError:
+                cap_epoch = None
         try:
             switcher = require("switcher")
             # NOT `switch_off_at_limit_account`, which passes no `models` and
@@ -20004,7 +20034,7 @@ def _switch_off_walled_account(
                 f"{exc.__class__.__name__}, relaying the 429 with headers "
                 f"stripped"
             )
-            _remember_walled_switch(key, False, reset)
+            _remember_walled_switch(key, False, cap_epoch)
             return False
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
@@ -20028,7 +20058,7 @@ def _switch_off_walled_account(
                 f"{result.get('needsLogin') if result else None}, relaying "
                 f"the 429 with headers stripped"
             )
-        _remember_walled_switch(key, ok, reset)
+        _remember_walled_switch(key, ok, cap_epoch)
         return ok
 
 

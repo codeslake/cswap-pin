@@ -17428,46 +17428,93 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             "a redecide miss must expire, not go permanent: "
             f"{pp._walled_switch_seen}")
 
-    def case_a_shared_negative_expires_when_the_wall_clears_not_30s_later(
+    def case_a_shared_negative_caps_on_the_live_walls_clock_not_the_stale_bearers(
         self, monkeypatch,
     ):
-        """THE DEFECT (T1213): while the live slot is KNOWN walled
+        """THE DEFECT (T1213 pass 2, I1): while the live slot is KNOWN walled
         (`_walled_slots`), a stale-bearer 429 skips the per-session headroom
         branch (`not walled` is False) and falls through to the ordinary
         `switch()` attempt, which writes its failure into the SHARED
-        `(reset, slot)` memo -- and that memo's own negative used to expire
-        `_WALLED_SWITCH_RAISE_TTL` after it was WRITTEN, not after the wall
-        itself clears, so it could outlive the wall by up to 30s. Capping
-        the negative at the wall's own clear time (the same `reset` epoch)
-        instead makes the debounce end exactly when the wall does."""
+        `(reset, slot)` memo. That 429's own `reset` belongs to the STALE
+        account, not the live one -- its wall can clear long after the live
+        slot's own does, so capping the negative on it (instead of on
+        `_walled_slots[slot]`, the live slot's own clear time) lets the
+        debounce outlive the LIVE wall by up to the stale account's wait
+        instead of ending when the live wall does."""
         from cswap_pin import proxy as pp
         import time as _time
         BASE = 2_000_000_000.0
-        RESET_EPOCH = int(BASE) + 2
+        LIVE_CLEAR = BASE + 2.0
+        STALE_RESET = int(BASE) + 100  # the STALE account's own wall
         reset_header = (b"anthropic-ratelimit-unified-reset: "
-                         + str(RESET_EPOCH).encode())
+                         + str(STALE_RESET).encode())
         clock = {"mono": 0.0, "wall": BASE}
         monkeypatch.setattr(_time, "monotonic", lambda: clock["mono"])
         monkeypatch.setattr(_time, "time", lambda: clock["wall"])
-        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
-                   usage=self.HEADROOM)
-        pp._walled_slots["1"] = float(RESET_EPOCH)
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage=self.HEADROOM)
+        pp._walled_slots["1"] = LIVE_CLEAR
 
         first = self._relay(reset=reset_header,
                             auth="Bearer stale-account-token")
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert len(calls) == 1, calls
 
-        # 3s pass -- past the wall's own clear time, well inside the OLD
-        # 30s TTL a negative written here used to run for.
-        clock["mono"] = 3.0
-        clock["wall"] = BASE + 3.0
-
+        # Still inside the LIVE wall (it clears at +2s): the debounce must
+        # hold, and switch() must not run again for this same wall.
+        clock["mono"] = 1.0
+        clock["wall"] = BASE + 1.0
         second = self._relay(reset=reset_header,
                              auth="Bearer stale-account-token")
-        assert second.startswith(b"HTTP/1.1 401"), (
-            f"the wall cleared 1s ago; the next stale-bearer 429 must "
-            f"convert at once, not wait out a 30s window stamped before "
-            f"the wall cleared: {second[:40]!r}")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, (
+            f"the debounce must hold while the LIVE wall still stands: "
+            f"{calls}")
+
+        # The LIVE wall has now cleared (+2s); the stale account's own wall
+        # (STALE_RESET, +100s) has not -- and must not matter.
+        clock["mono"] = 2.5
+        clock["wall"] = BASE + 2.5
+        third = self._relay(reset=reset_header,
+                            auth="Bearer stale-account-token")
+        assert third.startswith(b"HTTP/1.1 401"), (
+            f"the live wall cleared 0.5s ago; the next stale-bearer 429 "
+            f"must convert at once, not wait out a debounce capped on the "
+            f"stale account's unrelated, later, wall: {third[:40]!r}")
+        assert len(calls) == 1, calls
+
+    def case_a_cap_already_past_does_not_reopen_switch_for_a_concurrent_429(
+        self, monkeypatch,
+    ):
+        """I2: a cap at or before `time.time()` (clock skew, or a wall whose
+        own header already lagged) must not zero out the negative's expiry
+        -- that let every OTHER concurrent 429 on the same wall, queued
+        behind `_walled_switch_lock`, find it already expired and re-run
+        `switch()` for itself. Two 429s decided at the SAME monotonic
+        instant -- the shape of two threads serialized on that lock -- must
+        call `switch()` once between them, not once each."""
+        from cswap_pin import proxy as pp
+        import time as _time
+        BASE = 2_000_000_000.0
+        PAST_RESET = int(BASE) - 5  # already expired when this 429 arrives
+        reset_header = (b"anthropic-ratelimit-unified-reset: "
+                         + str(PAST_RESET).encode())
+        clock = {"mono": 0.0, "wall": BASE}
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(_time, "time", lambda: clock["wall"])
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage=self.HEADROOM)
+
+        first = self._relay(reset=reset_header, auth=f"Bearer {self.LIVE}")
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert len(calls) == 1, calls
+
+        # Same monotonic instant: a floored cap must still debounce this.
+        second = self._relay(reset=reset_header, auth=f"Bearer {self.LIVE}")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, (
+            f"a reset already in the past zeroed the debounce and let a "
+            f"second concurrent 429 call switch() again: {calls}")
 
 
 class TestTheEvidenceSurvivesAHandover:
