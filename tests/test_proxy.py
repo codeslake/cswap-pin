@@ -12481,6 +12481,73 @@ print("OK", port)
             f"the report does not name how many attempts failed: {said[0]!r}"
         )
 
+    def case_a_clean_exit_releases_the_standby_too(self, tmp_path):
+        """`_supervise`'s own code==0 branch used to close only ITS OWN
+        listener, never `stop()` — so the standby's dup of the same
+        descriptor was never signalled. It stayed LISTENing, still completing
+        handshakes into a backlog nobody would ever drain.
+
+        MEASURED: 2026-09-24 00:41:13Z, an idle refcount teardown left port
+        36301 accepting connects and answering nothing for 13 minutes, until
+        a human ran `cswap pin --heal`. `stop()` is what `_supervise` must
+        call on a clean exit — same release path its OWN tests already cover
+        when something calls it directly (see the two cases above and
+        below); this is the one caller that never did.
+        """
+        import socket
+        import time
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+
+        def _fake_spawn():
+            holder._proc = _ExitedProc(0)  # a clean, voluntary exit
+            holder.daemon_pid = 4242
+
+        holder._spawn = _fake_spawn
+        holder.start()  # the fake daemon "exits" 0 at once; the standby is real
+        try:
+            deadline = time.monotonic() + 5
+            while holder._thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert not holder._thread.is_alive(), (
+                "_supervise never returned after the clean exit"
+            )
+
+            survivors = []
+            for entry in pathlib.Path("/proc").glob("[0-9]*"):
+                try:
+                    argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+                except OSError:
+                    continue
+                cmd = argv.decode(errors="replace")
+                if "cswap_pin.proxy" in cmd and str(tmp_path) in cmd:
+                    survivors.append(f"{entry.name} {cmd.strip()}")
+            assert not survivors, (
+                "a clean daemon exit left the standby running, still holding "
+                f"a dup of the listener: {survivors}"
+            )
+
+            # AND THE PORT ITSELF: with the standby released too, nothing
+            # anywhere still holds the descriptor, so a connect must be
+            # REFUSED at once rather than parked in a backlog nobody drains.
+            try:
+                socket.create_connection(
+                    ("127.0.0.1", holder.port), timeout=1
+                ).close()
+            except ConnectionRefusedError:
+                pass
+            else:
+                pytest.fail(
+                    "the port still accepted connects after a clean exit — "
+                    "the standby's dup of the listener was never closed"
+                )
+        finally:
+            from conftest import _reap_pin_processes
+            _reap_pin_processes(tmp_path)
+
     def case_the_teardown_does_not_leave_the_standby_running(self, tmp_path):
         """`stop()` returning must mean the whole lineage let go — standby
         included, not just the daemon it stubs out here.
@@ -12558,6 +12625,133 @@ print("OK", port)
             )
         finally:
             _reap_pin_processes(tmp_path)
+
+    def case_a_still_serving_displaced_pid_gets_its_record_restored(
+        self, tmp_path
+    ):
+        """`_clear_handover_mark` used to delete unconditionally. A holder
+        that finds the port already answering exits without ever spawning a
+        successor (736bb88) — correctly, since a healthy daemon already owns
+        it — so `_spawn_daemon`'s wait for a new record times out with the
+        OLD daemon still up. Deleting the mark then erased that live
+        daemon's only record. Measured 2026-09-24 00:39-00:41Z: daemon
+        2147854 stayed up the whole window and was torn down under 22 open
+        channels two minutes after its record vanished.
+        """
+        import socket
+
+        from cswap_pin.proxy import (
+            _clear_handover_mark, read_daemon_state, write_daemon_state,
+        )
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        port = srv.getsockname()[1]
+        try:
+            write_daemon_state(certdir, port, os.getpid(), "fp", handover=True)
+            assert _clear_handover_mark(certdir) is True
+            st = read_daemon_state(certdir)
+            assert st == {"port": port, "pid": os.getpid(), "fingerprint": "fp"}, (
+                "a still-serving displaced daemon's record was not restored: "
+                f"{st!r}"
+            )
+        finally:
+            srv.close()
+
+    def case_CONTROL_a_dead_displaced_pid_still_gets_the_delete(self, tmp_path):
+        """The restore above must not become "never delete a handover mark" —
+        a genuinely departed predecessor's record is exactly what this
+        function exists to clear, and the control that proves the case above
+        is not "the mark is never cleared any more"."""
+        import subprocess
+        import sys
+
+        from cswap_pin.proxy import (
+            _clear_handover_mark, read_daemon_state, write_daemon_state,
+        )
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()  # reaped: genuinely gone, not merely "probably"
+        write_daemon_state(certdir, 41234, dead.pid, "fp", handover=True)
+        assert _clear_handover_mark(certdir) is True
+        assert read_daemon_state(certdir) is None, (
+            "a mark left by a pid that had actually exited was not cleared"
+        )
+
+    def case_the_00_41_13Z_tick_never_stops_a_still_serving_daemon(
+        self, tmp_path
+    ):
+        """Full incident reproduction, 2026-09-24 00:39:13-00:41:13Z.
+
+        `_spawn_daemon` marks a live daemon's own record as a handover, no
+        successor ever publishes one (its holder found the port already
+        answering and exited without spawning anything, 736bb88 — correct by
+        design), and `_clear_handover_mark` used to unconditionally DELETE
+        that record. `watch_refcount`'s periodic `_is_claimed` then read a
+        state file naming nobody and tore the daemon down two minutes later,
+        with 22 channels and 16 requests still live. Items 1 and 2 close
+        this together: the mark is restored rather than deleted, and even
+        where it were not, `live_clients` keeps the claim open. Either way
+        the teardown callback must never fire.
+        """
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import (
+            _clear_handover_mark, read_daemon_state, refcount_fifo_path,
+            watch_refcount, write_daemon_state,
+        )
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        port = srv.getsockname()[1]
+        try:
+            write_daemon_state(certdir, port, os.getpid(), "fp")
+            # `_spawn_daemon` marks the departing record before forking a
+            # successor...
+            write_daemon_state(certdir, port, os.getpid(), "fp", handover=True)
+            # ...and here that successor's holder found the port already
+            # answering and exited (736bb88) — no successor ever published a
+            # record, so `_spawn_daemon`'s wait loop times out and clears the
+            # mark, exactly as it did at 00:39:23Z.
+            assert _clear_handover_mark(certdir) is True
+            st = read_daemon_state(certdir)
+            assert st and st["pid"] == os.getpid() and not st.get("handover"), (
+                f"the mark was cleared by deleting a still-serving daemon's "
+                f"own record instead of restoring it: {st!r}"
+            )
+
+            fifo = refcount_fifo_path(certdir)
+            os.mkfifo(fifo)
+            fired = threading.Event()
+            threading.Thread(
+                target=watch_refcount,
+                args=(fifo, fired.set),
+                kwargs={
+                    "first_holder_timeout": 0.15,
+                    # 16 requests were live at 00:41:13Z; one is enough to
+                    # prove the daemon is not idle.
+                    "live_clients": lambda: 1,
+                },
+                daemon=True,
+            ).start()
+            assert not fired.wait(timeout=1.0), (
+                "watch_refcount tore the daemon down — the 00:41:13Z "
+                "refcount stop, reproduced"
+            )
+        finally:
+            srv.close()
 
     def case_a_mark_that_cannot_be_cleared_is_not_reported_as_cleared(
         self, tmp_path
@@ -15880,6 +16074,98 @@ class TestClearingThePinDoesNotStrandLiveSessions:
         assert pin_proxy._is_claimed(certdir, lambda: 1) is True, (
             "a live client was ignored because the platform cannot be probed"
         )
+
+    def case_a_missing_record_with_an_open_channel_is_republished(
+        self, tmp_path, monkeypatch
+    ):
+        """A record can go missing while the daemon it names is still
+        serving — `_clear_handover_mark` deleting a live daemon's own mark
+        was one way (2026-09-24 00:39-00:41Z), a race or a corrupt read are
+        others. `_is_claimed` used to end the claim right there, on the
+        theory that "no record" and "someone else's record" prove the same
+        thing. They do not, so a caller that HAS a way to republish gets to
+        re-assert its own record — the way `ensure_wired_to` re-asserts the
+        global wiring — and the usual checks run on it. A live Remote
+        Control tunnel (`_PUMP`) is one of those checks: `live_client_count`
+        does not track it at all once the 101 upgrade detaches its socket, so
+        this is also the "any channel is open" clause on its own.
+        """
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
+        monkeypatch.setattr(
+            pin_proxy, "clients_that_arming_would_cut_off", lambda _p: 0
+        )
+        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 1)
+
+        republished = []
+
+        def _republish():
+            republished.append(1)
+            pin_proxy.write_daemon_state(certdir, 45678, os.getpid(), "fp")
+
+        assert pin_proxy._is_claimed(
+            certdir, live_clients=lambda: 0, republish=_republish
+        ) is True, "an open channel on a missing record did not keep the claim"
+        assert republished == [1], "the caller's republish was never invoked"
+        assert pin_proxy.read_daemon_state(certdir) == {
+            "port": 45678, "pid": os.getpid(), "fingerprint": "fp"
+        }
+
+    def case_CONTROL_a_missing_record_with_nothing_claiming_still_ends_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The republish above must not become "a missing record is always
+        claimed" — 7b4b77e's whole point is that a cleared pin with nothing
+        live still lets its daemon go."""
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
+        monkeypatch.setattr(
+            pin_proxy, "clients_that_arming_would_cut_off", lambda _p: 0
+        )
+        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 0)
+
+        assert pin_proxy._is_claimed(
+            certdir, live_clients=lambda: 0,
+            republish=lambda: pin_proxy.write_daemon_state(
+                certdir, 45678, os.getpid(), "fp"
+            ),
+        ) is False, "an idle, unclaimed daemon must still time out"
+
+    def case_CONTROL_a_record_naming_another_live_pid_still_ends_the_claim(
+        self, tmp_path
+    ):
+        """A real handover — another daemon's record, and it is actually
+        alive — must end the claim without ever calling `republish`:
+        overwriting a record that genuinely belongs to someone else would be
+        the hijack `_repair_wiring_if_ours` was written to refuse."""
+        import subprocess
+        import sys
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        other = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(5)"]
+        )
+        try:
+            pin_proxy.write_daemon_state(certdir, 45678, other.pid, "fp")
+
+            def _must_not_republish():
+                pytest.fail("republished over another live daemon's record")
+
+            assert pin_proxy._is_claimed(
+                certdir, live_clients=lambda: 1, republish=_must_not_republish
+            ) is False, "another live daemon's record was overridden"
+        finally:
+            other.kill()
+            other.wait()
 
     def case_the_daemon_counts_its_own_live_clients(self, tmp_path):
         """The count must track real connections, not just exist."""
