@@ -260,11 +260,7 @@ def _redirect_everything_to(tmp_path, monkeypatch):
                  # The standby's hand-down source. Same hazard as the two
                  # LISTEN vars above: a stale value from a shell makes a test
                  # adopt a descriptor that is not the one under test.
-                 "CSWAP_PIN_STANDBY_FROM",
-                 # The daemon pid the standby was armed for — same hazard: a
-                 # stale value would make a test's standby check the
-                 # liveness of a pid nothing in that test ever started.
-                 "CSWAP_PIN_STANDBY_DAEMON"):
+                 "CSWAP_PIN_STANDBY_FROM"):
         monkeypatch.delenv(name, raising=False)
 
     store = tmp_path / "data-home"

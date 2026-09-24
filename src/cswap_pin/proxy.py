@@ -9442,13 +9442,6 @@ class PortHolder:
         self._account = account_num
         self._email = email
         self._standby = None
-        # GUARDS `self._standby` against `stop()` and `_spawn_standby()`
-        # racing each other. `_spawn_standby` now runs on every respawn, not
-        # only from `start()` — so it can be mid-placement on the supervisor
-        # thread at the exact moment `stop()` runs on another one, and
-        # without this, whichever finishes last leaves the other's idea of
-        # `self._standby` behind, unreleased. See both methods.
-        self._standby_lock = threading.Lock()
         # Set by `_on_replace_request` so `_supervise` can tell a HANDOVER exit
         # (successor already serving on our socket) from a RELEASE exit
         # (nothing left to serve). Both are exit 0 from the daemon's side, and
@@ -9683,16 +9676,7 @@ class PortHolder:
         # THE PREDECESSOR PROTOCOL, not the systemd one.
         # `_handed_down_listener` was built for exactly this: the fd is named
         # by NUMBER and guarded by the PARENT's pid, which we do know.
-        #
-        # SCRUB THE STANDBY MARKERS TOO. This process can itself be a
-        # promoted standby (`standby_main`'s "become the holder" path
-        # constructs a `PortHolder` in the same process, which never re-execs
-        # and so still carries `CSWAP_PIN_STANDBY_FROM`/
-        # `CSWAP_PIN_STANDBY_DAEMON` from when it was spawned as one) — a
-        # daemon child must not inherit a standby's own identity markers.
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("LISTEN_PID", _STANDBY_FROM_ENV,
-                             _STANDBY_DAEMON_FROM_ENV)}
+        env = {k: v for k, v in os.environ.items() if k != "LISTEN_PID"}
         env["LISTEN_FDS"] = "0"
         env[_HANDDOWN_FD_ENV] = str(fd)
         env[_HANDDOWN_FROM_ENV] = str(os.getpid())
@@ -9759,78 +9743,51 @@ class PortHolder:
         import subprocess
         import sys
 
-        # SERIALIZED AGAINST `stop()` — see `self._standby_lock`. Whichever of
-        # the two gets here first decides: `stop()` first means the lock is
-        # held while it releases whatever exists, and the check below then
-        # sees `self._stop` and places nothing; this method first means it
-        # runs to completion (including retiring what it replaces) before
-        # `stop()` can even look at `self._standby`.
-        with self._standby_lock:
-            if self._stop:
-                return
-            # CAPTURED BEFORE WE OVERWRITE IT, so a re-arm (this holder
-            # placing a SECOND standby, armed for a new daemon pid) can
-            # release the one it is replacing with a CONFIRMED signal rather
-            # than the ps-scan's fire-and-forget one — see
-            # `_release_standby_confirmed`.
-            prev_standby = getattr(self, "_standby", None)
-            fd = self._srv.fileno()
-            env = {k: v for k, v in os.environ.items() if k != "LISTEN_PID"}
-            env["LISTEN_FDS"] = "0"
-            env[_HANDDOWN_FD_ENV] = str(fd)
-            env[_HANDDOWN_FROM_ENV] = str(os.getpid())
-            # NEVER INHERIT THE DIE-WITH-PARENT REQUEST. `_EXIT_WITH_PARENT_ENV`
-            # asks a child to arm PDEATHSIG, which is a test harness's way of not
-            # leaking holders. Passed through to a standby it is precisely
-            # backwards: the standby exists to outlive this process, and arming it
-            # would make the standby die in the one event it was placed for.
-            env.pop(_EXIT_WITH_PARENT_ENV, None)
-            # THE PID IT WAS BORN UNDER, not a sentinel to compare against. Arming
-            # on ``getppid() == 1`` is wrong wherever a subreaper collects orphans
-            # (systemd --user is one): the standby never reads 1, so it never arms
-            # — while still holding the descriptor. The address then ACCEPTS and
-            # HANGS, which is strictly worse than the refusal it replaced, because
-            # a refused client fails at once and a queued one waits out its own
-            # timeout.
-            env[_STANDBY_FROM_ENV] = str(os.getpid())
-            # THE DAEMON THIS STANDBY IS ARMED FOR, so its own promote/release
-            # decision has a pid to check that is not read from `proxy.json` —
-            # see `_STANDBY_DAEMON_FROM_ENV`. Set here, once, at spawn time: the
-            # daemon this holder is CURRENTLY running (`self._spawn()` already
-            # ran by the time `start()` reaches this call).
-            env[_STANDBY_DAEMON_FROM_ENV] = str(self.daemon_pid or 0)
-            log = _open_daemon_log(self._certdir)
-            try:
-                proc = subprocess.Popen(
-                    [sys.executable, "-m", _DAEMON_MODULE, _STANDBY_MODULE_ARG,
-                     self._account, self._email, str(self._certdir)],
-                    env=env,
-                    pass_fds=(fd,),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    # A FILE, never a pipe.
-                    stderr=log,
-                    start_new_session=True,
-                )
-            finally:
-                if hasattr(log, "close"):
-                    log.close()
-            self._standby = proc
-            # ONE IN, ONE OUT — see `_retire_stale_standbys`. AFTER ours exists, so
-            # the socket is never left without one; the strays cannot arm meanwhile
-            # because the port is answering (the daemon above started first).
-            gone = _retire_stale_standbys(self._certdir, keep_pid=proc.pid)
-            if gone:
-                _log_lifecycle(
-                    f"retired {gone} standby(s) left behind on port {self.port} by "
-                    f"holders that were killed rather than released"
-                )
-            # AND CONFIRM OUR OWN PREVIOUS ONE IS ACTUALLY GONE, not merely asked.
-            # The sweep above already sent it a SIGHUP, but that is a single,
-            # unconfirmed one — fine for a stray from some other, already-dead
-            # holder, not for the standby THIS holder placed moments ago and can
-            # replace again well inside `_HOLD_RESTART_BASE_S`.
-            self._release_standby_confirmed(prev_standby)
+        fd = self._srv.fileno()
+        env = {k: v for k, v in os.environ.items() if k != "LISTEN_PID"}
+        env["LISTEN_FDS"] = "0"
+        env[_HANDDOWN_FD_ENV] = str(fd)
+        env[_HANDDOWN_FROM_ENV] = str(os.getpid())
+        # NEVER INHERIT THE DIE-WITH-PARENT REQUEST. `_EXIT_WITH_PARENT_ENV`
+        # asks a child to arm PDEATHSIG, which is a test harness's way of not
+        # leaking holders. Passed through to a standby it is precisely
+        # backwards: the standby exists to outlive this process, and arming it
+        # would make the standby die in the one event it was placed for.
+        env.pop(_EXIT_WITH_PARENT_ENV, None)
+        # THE PID IT WAS BORN UNDER, not a sentinel to compare against. Arming
+        # on ``getppid() == 1`` is wrong wherever a subreaper collects orphans
+        # (systemd --user is one): the standby never reads 1, so it never arms
+        # — while still holding the descriptor. The address then ACCEPTS and
+        # HANGS, which is strictly worse than the refusal it replaced, because
+        # a refused client fails at once and a queued one waits out its own
+        # timeout.
+        env[_STANDBY_FROM_ENV] = str(os.getpid())
+        log = _open_daemon_log(self._certdir)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", _DAEMON_MODULE, _STANDBY_MODULE_ARG,
+                 self._account, self._email, str(self._certdir)],
+                env=env,
+                pass_fds=(fd,),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                # A FILE, never a pipe.
+                stderr=log,
+                start_new_session=True,
+            )
+        finally:
+            if hasattr(log, "close"):
+                log.close()
+        self._standby = proc
+        # ONE IN, ONE OUT — see `_retire_stale_standbys`. AFTER ours exists, so
+        # the socket is never left without one; the strays cannot arm meanwhile
+        # because the port is answering (the daemon above started first).
+        gone = _retire_stale_standbys(self._certdir, keep_pid=proc.pid)
+        if gone:
+            _log_lifecycle(
+                f"retired {gone} standby(s) left behind on port {self.port} by "
+                f"holders that were killed rather than released"
+            )
 
     def _reap_standby(self) -> None:
         """Notice a dead standby, say so, and stop it being a zombie.
@@ -9894,14 +9851,6 @@ class PortHolder:
         # failed spawn look like a completed handover, and the holder would
         # close the socket with nothing on it.
         self._spawn()
-        # RE-PLACE THE STANDBY, not just the daemon. `_STANDBY_DAEMON_FROM_ENV`
-        # is set once, at `_spawn_standby()` time, from `self.daemon_pid` — a
-        # respawn changes that pid and leaves the existing standby armed for
-        # one that no longer runs. Dead: one missed probe arms a second
-        # acceptor beside the live successor. Reused: the standby holds the
-        # port answering nothing. `_spawn_standby` already retires the old one
-        # via `_retire_stale_standbys(keep_pid=...)`.
-        self._spawn_standby()
         self._replacing = True
 
     def _supervise(self) -> None:
@@ -9964,10 +9913,6 @@ class PortHolder:
                 )
                 self._failures = 0
                 self._spawn()
-                # SAME REASON AS `_on_replace_request`: the pid this standby
-                # is armed for just changed, and `_spawn_standby` retires the
-                # stale one for us.
-                self._spawn_standby()
                 continue
             if not self._self_heal_on():
                 # SAY WHAT HAPPENS, which is not what this used to claim. The
@@ -10015,52 +9960,6 @@ class PortHolder:
             if self._stop:
                 return
             self._spawn()
-            # SAME REASON AS `_on_replace_request`: the pid this standby is
-            # armed for just changed, and `_spawn_standby` retires the stale
-            # one for us.
-            self._spawn_standby()
-
-    def _release_standby_confirmed(self, standby) -> None:
-        """SIGHUP ``standby`` and keep resending until it is confirmed dead,
-        or ``_STANDBY_RELEASE_BOUND_S`` runs out. Shared by ``stop()`` and by
-        ``_spawn_standby()``'s own replacement of the standby it just armed
-        for a new daemon pid.
-
-        A SINGLE `send_signal` IS NOT PROOF. The signal can arrive before
-        ``standby_main`` has installed its own SIGHUP handler — a real
-        window, not a hypothetical one: a child inherits this process's
-        signal disposition across `exec`, so a standby spawned while we hold
-        SIGHUP ignored starts in that same state and a HUP delivered in the
-        gap before it re-arms the handler is silently dropped. A release that
-        only fires once has no way to notice it did not land, and that
-        standby is left holding the descriptor.
-
-        `_retire_stale_standbys` (the ps-scan `_spawn_standby` also runs) is
-        a single, unconfirmed SIGHUP too — the right trade for a STRAY
-        standby from some other, already-dead holder, where "eventually" is
-        fine. It is the wrong one for the standby THIS holder just placed and
-        is about to replace: we hold a live reference to it, a respawn can
-        repeat in well under `_HOLD_RESTART_BASE_S`, and repeating the same
-        unconfirmed race on every one of those is how it stops being rare.
-        """
-        import signal
-        import subprocess
-
-        if standby is None or getattr(standby, "returncode", 0) is not None:
-            return
-        deadline = time.monotonic() + _STANDBY_RELEASE_BOUND_S
-        while True:
-            try:
-                standby.send_signal(signal.SIGHUP)
-            except (OSError, ValueError):
-                return
-            try:
-                standby.wait(timeout=0.2)
-                return  # confirmed gone
-            except subprocess.TimeoutExpired:
-                pass
-            if time.monotonic() >= deadline:
-                return
 
     def stop(self) -> None:
         """Let go of the port: the DAEMON dies first, then the socket closes.
@@ -10087,6 +9986,9 @@ class PortHolder:
         stopping its daemon re-opens that resurrection silently, and there is
         no guard here that would catch it.
         """
+        import signal
+        import subprocess
+
         self._stop = True
         # RELEASE THE STANDBY FIRST, and by SIGHUP. It is detached and outlives
         # us on purpose, so the ordering trick that saves us from the daemon's
@@ -10095,13 +9997,26 @@ class PortHolder:
         # `getppid()` moves. SIGHUP, never SIGTERM. Death must keep the
         # address. Only being asked releases it.
         #
-        # UNDER THE SAME LOCK `_spawn_standby` takes, and `self._stop` is
-        # already True above — so a `_spawn_standby` racing this on another
-        # thread either finishes first (and we release what it just placed)
-        # or sees the flag once it gets the lock and places nothing at all.
-        with self._standby_lock:
-            standby = getattr(self, "_standby", None)
-        self._release_standby_confirmed(standby)
+        # RE-SENT UNTIL CONFIRMED DEAD — see `_STANDBY_RELEASE_BOUND_S`. A
+        # single `send_signal` that `os.kill` accepts is not proof the
+        # standby is gone: the signal can arrive before `standby_main` has
+        # installed its own handler, and a stop that only fires once leaves
+        # exactly that standby behind, still holding the descriptor.
+        standby = getattr(self, "_standby", None)
+        if standby is not None and getattr(standby, "returncode", 0) is None:
+            deadline = time.monotonic() + _STANDBY_RELEASE_BOUND_S
+            while True:
+                try:
+                    standby.send_signal(signal.SIGHUP)
+                except (OSError, ValueError):
+                    break
+                try:
+                    standby.wait(timeout=0.2)
+                    break  # confirmed gone
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() >= deadline:
+                    break
         # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
         # is only meaningful while the Popen it came from is ours — and a pid
         # is reused freely, so signalling it after the child is gone aims at
@@ -10249,7 +10164,6 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         _log_lifecycle("standby got no listening descriptor — exiting")
         return
     born_of = int(os.environ.get(_STANDBY_FROM_ENV) or 0)
-    armed_for = int(os.environ.get(_STANDBY_DAEMON_FROM_ENV) or 0) or None
     port = srv.getsockname()[1]
 
     # THE SIGNAL TABLE IS THE CONTRACT — see `PortHolder.stop`. Only being ASKED
@@ -10286,7 +10200,7 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
         # recorded daemon settles it with a signal-0 and no probe at all.
         silent, arm, wait = _standby_tick(
             born_of, silent,
-            lambda: (_recorded_daemon_alive(certdir, armed_for)
+            lambda: (_recorded_daemon_alive(certdir)
                      or _port_returns_bytes(port)),
         )
         if arm:
@@ -10512,15 +10426,8 @@ def _spawn_daemon(
     # the child does not have. The ppid guard already refuses it, but an
     # environment that lies is one pid-reuse away from being believed, and
     # nothing needs it to survive the process it was addressed to.
-    #
-    # SAME REASONING FOR THE STANDBY MARKERS. A promoted standby's own
-    # process (`standby_main`'s "become the holder" path) never re-execs, so
-    # its environment still names the daemon it was armed for and the holder
-    # it was born under — a spawn from here is a fresh holder/daemon and must
-    # not hand either of those down as if it were still a standby.
     env = {k: v for k, v in os.environ.items()
-           if k not in (_HANDDOWN_FD_ENV, _HANDDOWN_FROM_ENV,
-                        _STANDBY_FROM_ENV, _STANDBY_DAEMON_FROM_ENV)}
+           if k not in (_HANDDOWN_FD_ENV, _HANDDOWN_FROM_ENV)}
     pass_fds: tuple[int, ...] = ()
     if listen_fd is not None:
         # NAME THE NUMBER. The origin pid is the guard: these variables reach
@@ -11389,13 +11296,6 @@ _HOLDER_SHA_ENV = "CSWAP_PIN_HOLDER_SHA"
 # reparents orphans to itself, so 1 is never reached and the standby would hold
 # the descriptor forever without ever arming.
 _STANDBY_FROM_ENV = "CSWAP_PIN_STANDBY_FROM"
-# WHICH DAEMON PID THE STANDBY WAS ARMED FOR — see `_recorded_daemon_alive`.
-# `proxy.json` is read fresh on every tick and can go missing out from under
-# a daemon that never stopped (the same class of race `_clear_handover_mark`
-# has its own fix for); this pid, captured at spawn time and never read from
-# a file another path can delete, is the fallback evidence for exactly that
-# window.
-_STANDBY_DAEMON_FROM_ENV = "CSWAP_PIN_STANDBY_DAEMON"
 _STANDBY_MODULE_ARG = "--standby"
 # ONE ARMING STANDBY PER CERTDIR. Held for the life of the winner, so every
 # later standby that reaches the same decision finds it taken and stands down.
@@ -11484,7 +11384,7 @@ def _retire_stale_standbys(certdir, keep_pid: int | None = None) -> int:
     return retired
 
 
-def _recorded_daemon_alive(certdir, armed_for: "int | None" = None) -> bool:
+def _recorded_daemon_alive(certdir) -> bool:
     """Is the daemon `proxy.json` names still running? Microseconds, no socket.
 
     DIRECT EVIDENCE INSTEAD OF INFERRED. Silence on the port is a PROXY for
@@ -11493,36 +11393,20 @@ def _recorded_daemon_alive(certdir, armed_for: "int | None" = None) -> bool:
     one here and had to be three without it: the corroboration moved from
     repetition to a different KIND of evidence.
 
-    ``armed_for`` IS THE FALLBACK, NOT THE RECORD'S PRESENCE. The record can
-    go missing while the daemon it named keeps running — a race, or
-    `_clear_handover_mark` clearing a mark out from under a daemon that
-    turned out to still be serving — and reading that as "cannot tell,
-    assume alive" is only safe if the standby has no better evidence. It
-    does: the daemon pid it was armed for, passed down at spawn time
-    (`PortHolder._spawn_standby`) rather than read from a file another path
-    can delete. When the record itself cannot answer, THIS pid's liveness
-    decides instead of a blanket "assume alive" — a daemon whose only record
-    vanished must still be arm-able if it is genuinely gone, or the standby
-    holds the port answering nothing forever (the same outage the missing
-    record was already causing, from a different angle).
-
-    Absent or unreadable, AND no ``armed_for`` either, means "cannot tell",
-    and the safe answer is TRUE — assume something serves and do not arm.
-    Arming wrongly is not cheap for us: this standby does not carry traffic,
-    it puts a DAEMON on the socket, and two daemons accepting the same
-    listener lose requests outright (19 of 60 in steady state, measured). A
-    peer can arm on a hunch because their relay forwards to the same hop
-    either way; ours cannot.
+    Absent or unreadable means "cannot tell", and the safe answer is TRUE —
+    assume something serves and do not arm. Arming wrongly is not cheap for us:
+    this standby does not carry traffic, it puts a DAEMON on the socket, and
+    two daemons accepting the same listener lose requests outright (19 of 60 in
+    steady state, measured). A peer can arm on a hunch because their relay
+    forwards to the same hop either way; ours cannot.
     """
     try:
         rec = json.loads((Path(certdir) / _STATE_FILE).read_text())
     except (OSError, ValueError):
-        rec = None
+        return True
     pid = rec.get("pid") if isinstance(rec, dict) else None
     if not isinstance(pid, int) or pid <= 0:
-        pid = armed_for  # the record proves nothing — fall back to what we know
-    if not isinstance(pid, int) or pid <= 0:
-        return True  # nothing at all to check — the safe default stands
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

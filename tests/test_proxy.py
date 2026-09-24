@@ -9693,12 +9693,6 @@ print("OK", port)
         number naming a descriptor it does not have. The parentage guard
         refuses it today, but an environment that lies is one pid reuse from
         being believed — and the fd it names is whatever that number became.
-
-        SAME REASONING FOR THE STANDBY MARKERS. `standby_main`'s "become the
-        holder" path never re-execs, so a promoted standby's own environment
-        still carries `CSWAP_PIN_STANDBY_FROM`/`CSWAP_PIN_STANDBY_DAEMON`
-        from when IT was spawned — a spawn from here is a fresh holder or
-        daemon and must not hand either down as if it were still a standby.
         """
         import os
 
@@ -9714,8 +9708,6 @@ print("OK", port)
                             __import__("subprocess"), "Popen", _P)
         monkeypatch.setenv(pin_proxy._HANDDOWN_FD_ENV, "7")
         monkeypatch.setenv(pin_proxy._HANDDOWN_FROM_ENV, "12345")
-        monkeypatch.setenv(pin_proxy._STANDBY_FROM_ENV, "23456")
-        monkeypatch.setenv(pin_proxy._STANDBY_DAEMON_FROM_ENV, "34567")
         # Popen is stubbed, so no successor ever publishes and the spawn waits
         # out its whole budget. This case asserts what the spawn PASSES, not
         # that a successor comes up — 10 s for that was a sixth of the suite.
@@ -9730,12 +9722,6 @@ print("OK", port)
             f"the child was told to adopt fd {env[pin_proxy._HANDDOWN_FD_ENV]} "
             f"which it was never given")
         assert pin_proxy._HANDDOWN_FROM_ENV not in env, env
-        assert pin_proxy._STANDBY_FROM_ENV not in env, (
-            f"a fresh holder/daemon was told it was born as a standby: {env}"
-        )
-        assert pin_proxy._STANDBY_DAEMON_FROM_ENV not in env, (
-            f"a fresh holder/daemon inherited a stale armed-for pid: {env}"
-        )
         assert not seen.get("pass_fds"), seen.get("pass_fds")
 
     def case_the_holder_tells_its_child_which_code_the_HOLDER_runs(
@@ -9843,56 +9829,6 @@ print("OK", port)
         assert (seen.get("env") or {}).get(pin_proxy._HOLDER_REPLACE_ENV) == "1", (
             "a holder that DID install the handler stayed silent about it, so "
             "every daemon it starts falls back to the old gap forever"
-        )
-
-    def case_a_promoted_standby_does_not_hand_its_own_markers_down(
-        self, tmp_path, monkeypatch
-    ):
-        """A PROMOTED STANDBY NEVER RE-EXECS. `standby_main`'s "become the
-        holder" path constructs a `PortHolder` in the SAME process, so its
-        own environment still carries `CSWAP_PIN_STANDBY_FROM`/
-        `CSWAP_PIN_STANDBY_DAEMON` from when it was spawned as a standby —
-        and `_spawn` copies `os.environ` wholesale into every daemon it
-        starts. The daemon this holder places is not a standby and must not
-        be told it was born as one.
-        """
-        import subprocess
-
-        from cswap_pin import proxy as pin_proxy
-        from cswap_pin.proxy import PortHolder, ensure_ca
-
-        seen = {}
-
-        class _P:
-            pid = 5252
-
-            def __init__(self, *a, **kw):
-                seen.update(kw)
-
-            def wait(self, timeout=None):
-                return 0
-
-        ensure_ca(tmp_path, "api.anthropic.com")
-        holder = PortHolder(tmp_path, "1", "a@b.c")
-        monkeypatch.setattr(subprocess, "Popen", _P)
-        monkeypatch.setenv(pin_proxy._STANDBY_FROM_ENV, "111")
-        monkeypatch.setenv(pin_proxy._STANDBY_DAEMON_FROM_ENV, "222")
-        try:
-            holder._spawn()
-        finally:
-            try:
-                holder._srv.close()
-            except OSError:
-                pass
-
-        env = seen.get("env") or {}
-        assert pin_proxy._STANDBY_FROM_ENV not in env, (
-            f"the daemon this holder placed was told it was born as a "
-            f"standby: {env.get(pin_proxy._STANDBY_FROM_ENV)!r}"
-        )
-        assert pin_proxy._STANDBY_DAEMON_FROM_ENV not in env, (
-            f"the daemon this holder placed inherited a stale armed-for "
-            f"pid: {env.get(pin_proxy._STANDBY_DAEMON_FROM_ENV)!r}"
         )
 
     def case_the_fingerprint_covers_every_file_the_daemon_runs(self, tmp_path):
@@ -10028,68 +9964,6 @@ print("OK", port)
         assert _recorded_daemon_alive(certdir) is True, (
             "a missing record was treated as proof of death; that is the "
             "normal mid-respawn state and arming there races the respawn"
-        )
-
-    def case_a_missing_record_falls_back_to_the_pid_it_was_armed_for(
-        self, tmp_path
-    ):
-        """The record's PRESENCE is not the question — the daemon pid the
-        standby was armed for is. A record that has gone missing (a race, or
-        `_clear_handover_mark` deleting it) must not read as "assume alive"
-        when the standby already knows which pid it is really asking about:
-        an armed-for pid that has actually exited must arm the standby, and
-        one that is actually alive must not, whatever `proxy.json` says."""
-        import subprocess
-        import sys
-
-        from cswap_pin.proxy import _recorded_daemon_alive
-
-        certdir = tmp_path / "pin-proxy"
-        certdir.mkdir()
-        # No proxy.json at all.
-
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
-        dead.wait()  # reaped: genuinely gone, not merely "probably"
-        assert _recorded_daemon_alive(certdir, dead.pid) is False, (
-            "a missing record with a dead armed-for pid was read as alive — "
-            "the standby never arms and the port answers nothing forever"
-        )
-        assert _recorded_daemon_alive(certdir, os.getpid()) is True, (
-            "a missing record with a LIVE armed-for pid must not arm a "
-            "second acceptor"
-        )
-
-    def case_standby_main_passes_armed_for_to_recorded_daemon_alive(self):
-        """`standby_main`'s tick must ask `_recorded_daemon_alive(certdir,
-        armed_for)`, not `_recorded_daemon_alive(certdir)` — `armed_for` is
-        the fallback for exactly the window the record cannot answer
-        (missing, unreadable, or naming a dead pid), and dropping it
-        silently reverts to "cannot tell, assume alive", which never arms
-        this standby again once the record it depended on is gone.
-
-        ASSERTED ON THE PARSE TREE: `standby_main` loops forever on real
-        signals, so calling it directly is not a viable case for this one
-        fact.
-        """
-        import ast
-        import inspect
-        import textwrap
-
-        from cswap_pin import proxy as pin_proxy
-
-        tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.standby_main)))
-        calls = [
-            n for n in ast.walk(tree)
-            if isinstance(n, ast.Call)
-            and getattr(n.func, "id", None) == "_recorded_daemon_alive"
-        ]
-        assert calls, "standby_main no longer calls _recorded_daemon_alive at all"
-        args = calls[0].args
-        assert len(args) == 2 and getattr(args[1], "id", None) == "armed_for", (
-            f"_recorded_daemon_alive is called with {[ast.dump(a) for a in args]}"
-            " — armed_for must be the second argument, or a standby whose "
-            "record has gone missing can never tell its armed-for daemon is "
-            "dead"
         )
 
     def case_a_standby_on_an_abandoned_port_does_not_rebuild_on_it(self, tmp_path):
@@ -10352,7 +10226,6 @@ print("OK", port)
 
         ensure_ca(tmp_path, "api.anthropic.com")
         holder = PortHolder(tmp_path, "1", "a@b.c")
-        holder.daemon_pid = 7777  # the daemon this standby is armed for
         monkeypatch.setattr(subprocess, "Popen", _P)
         # Not what this case is about, and it would shell out through the
         # stubbed Popen. Covered by its own case.
@@ -10389,85 +10262,6 @@ print("OK", port)
             "never reparents to 1): the standby would never arm, while still "
             "holding the descriptor — so the address ACCEPTS and HANGS, which "
             "is worse than the refusal it was meant to replace"
-        )
-        armed_for = (seen.get("env") or {}).get(pin_proxy._STANDBY_DAEMON_FROM_ENV)
-        assert armed_for == "7777", (
-            "the standby must also know the DAEMON pid it was armed for, not "
-            "merely the holder's — its promote/release decision is keyed on "
-            "that pid's liveness, not on whatever proxy.json happens to say "
-            f"by the time it looks: {armed_for!r}"
-        )
-
-    def case_a_respawned_daemon_gets_a_freshly_armed_standby(
-        self, tmp_path, monkeypatch
-    ):
-        """`_STANDBY_DAEMON_FROM_ENV` is set ONCE, at `_spawn_standby()` time,
-        from `self.daemon_pid` — but the holder respawns its daemon without
-        re-placing the standby (`_on_replace_request`'s SIGUSR1 handler, and
-        `_supervise`'s exit-75 and crash-retry paths all call `self._spawn()`
-        again), so that pid goes stale. Dead: one missed probe arms a second
-        acceptor beside the live successor, breaking 7f001f4's invariant.
-        Reused: the standby holds the port answering nothing.
-
-        `_spawn_standby` already retires the previous standby via
-        `_retire_stale_standbys(keep_pid=...)`, so re-calling it after every
-        respawn is the whole fix — exercised here through the simplest of
-        the three call sites, `_on_replace_request`.
-        """
-        import subprocess
-
-        from cswap_pin import proxy as pin_proxy
-        from cswap_pin.proxy import PortHolder, ensure_ca
-
-        seen = []      # each standby Popen call's (pid, armed_for env)
-        next_pid = [8001]
-
-        class _P:
-            def __init__(self, *a, **kw):
-                self.pid = next_pid[0]
-                next_pid[0] += 1
-                seen.append({
-                    "pid": self.pid,
-                    "armed_for": (kw.get("env") or {}).get(
-                        pin_proxy._STANDBY_DAEMON_FROM_ENV),
-                })
-
-        retired = []
-
-        def _fake_retire(certdir, keep_pid=None):
-            retired.append(keep_pid)
-            return 1
-
-        ensure_ca(tmp_path, "api.anthropic.com")
-        holder = PortHolder(tmp_path, "1", "a@b.c")
-        monkeypatch.setattr(subprocess, "Popen", _P)
-        monkeypatch.setattr(pin_proxy, "_retire_stale_standbys", _fake_retire)
-
-        holder.daemon_pid = 1111
-        holder._spawn_standby()  # the FIRST standby, armed for 1111
-
-        def _fake_spawn():
-            holder.daemon_pid = 2222
-
-        monkeypatch.setattr(holder, "_spawn", _fake_spawn)
-        try:
-            holder._on_replace_request(None, None)
-        finally:
-            try:
-                holder._srv.close()
-            except OSError:
-                pass
-
-        assert [s["armed_for"] for s in seen] == ["1111", "2222"], (
-            f"the standby placed after a respawn is still armed for the OLD "
-            f"daemon pid: {seen} — a dead pid arms a second acceptor beside "
-            f"the live daemon, a reused one holds the port answering nothing"
-        )
-        assert retired[-1] == seen[-1]["pid"], (
-            f"the respawn's new standby (pid {seen[-1]['pid']!r}) was not "
-            f"the one kept when retiring stale standbys (keep_pid="
-            f"{retired[-1]!r}) — the OLD standby, still armed for 1111, was "
-            f"left holding the descriptor instead of being retired"
         )
 
     def case_adopting_a_socket_does_not_drop_the_client_already_queued_on_it(
@@ -11875,13 +11669,6 @@ print("OK", port)
                 spawned.append("spawn")
                 self._replacing = True
 
-            # NOT WHAT THIS CASE OWNS — the standby re-arm has its own case
-            # (`case_a_respawned_daemon_gets_a_freshly_armed_standby`). This
-            # holder has no socket at all, so the real method would fail on
-            # `self._srv.fileno()`.
-            def _spawn_standby(self):
-                pass
-
         # CALL THE HANDLER, DO NOT RAISE THE SIGNAL. Sending SIGUSR1 to this
         # process killed the xdist worker outright: `_install_replace_handler`
         # returns quietly off the main thread (it must — a holder that cannot
@@ -11959,8 +11746,6 @@ print("OK", port)
                 self.port = 36301
                 self.daemon_pid = 4242
                 self._rounds = 0
-                self._standby = None
-                self._standby_lock = threading.Lock()
 
             def _reap_standby(self):
                 pass
@@ -13015,7 +12800,7 @@ print("OK", port)
         )
 
     def case_the_00_41_13Z_tick_never_stops_a_still_serving_daemon(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         """Full incident reproduction, 2026-09-24 00:39:13-00:41:13Z.
 
@@ -13029,6 +12814,15 @@ print("OK", port)
         this together: the mark is restored rather than deleted, and even
         where it were not, `live_clients` keeps the claim open. Either way
         the teardown callback must never fire.
+
+        THE 22 CHANNELS, not just the 16 requests. Those channels were Remote
+        Control tunnels — `_PUMP.live_pairs()`, which `live_clients` never
+        counts (a CONNECT that reached its 101 upgrade detaches its socket
+        from `live_client_count` entirely). `claim["live"]` starts at 0 here
+        so the channel count is what has to carry the claim alone; if the
+        `_PUMP.live_pairs()` gate in `_is_claimed` regressed, this fires on
+        the FIRST tick rather than being coincidentally saved by a live
+        request.
         """
         import socket
         import threading
@@ -13038,6 +12832,7 @@ print("OK", port)
             _clear_handover_mark, _republish_own_record, read_daemon_state,
             refcount_fifo_path, watch_refcount, write_daemon_state,
         )
+        from cswap_pin import proxy as pin_proxy
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True)
@@ -13080,14 +12875,18 @@ print("OK", port)
             # thread nothing is watching. Flipping this to 0 after the
             # assertion below lets the SAME loop tear itself down so the
             # thread can be joined before the test returns.
-            claim = {"live": 1}
+            claim = {"live": 0, "channel": 1}
+            monkeypatch.setattr(
+                pin_proxy._PUMP, "live_pairs", lambda *a, **k: claim["channel"]
+            )
             thread = threading.Thread(
                 target=watch_refcount,
                 args=(fifo, fired.set),
                 kwargs={
                     "first_holder_timeout": 0.15,
-                    # 16 requests were live at 00:41:13Z; one is enough to
-                    # prove the daemon is not idle.
+                    # `live` stays 0 — the 22 Remote Control TUNNELS carry
+                    # the claim here, not the 16 requests (covered by the
+                    # sibling `live_clients` cases elsewhere in this file).
                     "live_clients": lambda: claim["live"],
                     # THE GATED FUNCTION, exactly as `daemon_main` wires it —
                     # a raw `write_daemon_state` here would republish whether
@@ -13110,8 +12909,10 @@ print("OK", port)
                 )
             finally:
                 # STOP THE THREAD before the test returns — see the comment
-                # on `claim` above.
+                # on `claim` above. Both claims, or the channel alone keeps
+                # it alive forever.
                 claim["live"] = 0
+                claim["channel"] = 0
                 assert fired.wait(timeout=3.0), (
                     "watch_refcount thread never stopped during test cleanup"
                 )

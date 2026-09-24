@@ -486,13 +486,6 @@ its own daemon, and a silent port during an ordinary daemon crash is a gap the
 holder closes by itself (measured: 407 of 408 requests served across a daemon
 `SIGKILL`, max time-to-first-byte 6.3ms).
 
-`CSWAP_PIN_STANDBY_DAEMON` carries the pid of the daemon the holder was
-running when it spawned this standby. Internal, never a setting: `proxy.json`
-is read fresh on every tick and can go missing while the daemon it named is
-still running, so this pid — never read from a file another path can delete
-— is the fallback the "daemon `proxy.json` names is gone" check above falls
-back to when the record itself cannot answer.
-
 When it does act it does not serve traffic — it puts a holder back on the
 descriptor it was already holding, and requests that arrived meanwhile are
 waiting in the backlog of a socket that never stopped listening.
