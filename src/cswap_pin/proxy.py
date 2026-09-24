@@ -6631,6 +6631,23 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         cached = _cred_cache.get(target)
         return bool(cached and _live_token(cached))
 
+    def evict_cached() -> None:
+        """Drop the cached credential for the CURRENTLY pinned slot only.
+
+        For the one caller that must not trust `_live_token`'s expiry check
+        alone: an upstream refusal on a swapped call means the cached bytes
+        answered wrong RIGHT NOW, whether or not `expiresAt` says they still
+        have time left (the pinned account was live and rotated its token
+        underneath this cache). Never called on the request's hot path --
+        `provider()`'s own fast path still trusts expiry alone, unchanged,
+        so c4e6913's "expiry invalidates, not a disk read on every request"
+        stays true for every call that is not retrying a refusal.
+        """
+        target = _current_target()
+        if target is not None:
+            _cred_cache.pop(target, None)
+
+    provider.evict_cached = evict_cached
     provider.pin_is_noop = pin_is_noop
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
@@ -17348,8 +17365,44 @@ class PinProxy:
                 # chain that dies between the two calls is a NoChainHopError
                 # here too, and it must answer 503, not escape as a bare
                 # OSError to the connection's `finally`.
+                #
+                # BUT FIRST: the refusal may be a STALE CACHE, not a
+                # misrouted path — the pinned account was live and rotated
+                # its token underneath `_cred_cache` (measured:
+                # `pinned=True swapped=True` traces answering as the active
+                # account for the daemon's life). Evict and re-read once; a
+                # DIFFERENT token is worth one more swapped attempt before
+                # falling back to "this request went out unpinned". At most
+                # one extra swapped attempt per request either way.
+                clean_path = path.split("?", 1)[0]
+                refused_auth = next(
+                    (v for k, v in headers if k.lower() == "authorization"), "")
                 self._drop_upstream()
-                keep = self._forward(method, path, original_headers, body, tls)
+                evict = getattr(self._pin_token_provider, "evict_cached", None)
+                if evict is not None:
+                    evict()
+                fresh_token = self._pin_token_provider()
+                if fresh_token and f"Bearer {fresh_token}" != refused_auth:
+                    _log_lifecycle(
+                        f"swap refused ({keep.code}) on {method} {clean_path}: "
+                        "retried-fresh")
+                    retry_headers = [
+                        (k, f"Bearer {fresh_token}") if k.lower() == "authorization"
+                        else (k, v) for k, v in headers
+                    ]
+                    keep = self._forward(method, path, retry_headers, body, tls,
+                                         swapped=True)
+                    if isinstance(keep, _AuthRejected):
+                        _log_lifecycle(
+                            f"swap refused ({keep.code}) on {method} "
+                            f"{clean_path}: fell-back")
+                        self._drop_upstream()
+                        keep = self._forward(method, path, original_headers, body, tls)
+                else:
+                    _log_lifecycle(
+                        f"swap refused ({keep.code}) on {method} {clean_path}: "
+                        "fell-back")
+                    keep = self._forward(method, path, original_headers, body, tls)
         except NoChainHopError:
             # No hop and no direct: a retryable answer, not a dropped
             # connection and never the inspector's 403.

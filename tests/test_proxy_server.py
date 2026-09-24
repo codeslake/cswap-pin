@@ -54,15 +54,21 @@ class _FakeUpstream:
     proxy's own upstream TLS (servername api.anthropic.com) validates it."""
 
     def __init__(self, certdir: Path, reject_bearer: str | None = None,
-                 reply: bytes | None = None):
-        # reject_bearer: answer 403 to exactly this credential, 200 to any
-        # other. Models an endpoint the pinned account may not use — the shape
-        # that makes a misrouted swap terminal for the client.
+                 reject_status: int = 403, reply: bytes | None = None):
+        # reject_bearer: answer `reject_status` to exactly this credential,
+        # 200 to any other. Models an endpoint the pinned account may not
+        # use — the shape that makes a misrouted swap terminal for the
+        # client.
         # reply: the whole response to send instead of the 200, for a case
         # that needs the origin to answer something the pin then rewrites.
         self.reject_bearer = reject_bearer
+        self.reject_status = reject_status
         self.reply = reply
         self.seen_auth: str | None = None
+        # Every Authorization this server has seen, in order — a single
+        # request-response case reconnects per attempt (`Connection: close`
+        # below), so `seen_auth` alone loses everything but the last one.
+        self.auths_seen: list[str] = []
         self.seen_path: str | None = None
         self.seen_body: bytes = b""
         self.seen_head: str = ""
@@ -109,13 +115,15 @@ class _FakeUpstream:
                 for line in lines[1:]:
                     if line.lower().startswith("authorization:"):
                         self.seen_auth = line.split(":", 1)[1].strip()
+                self.auths_seen.append(self.seen_auth)
                 if (
                     self.reject_bearer
                     and self.seen_auth == f"Bearer {self.reject_bearer}"
                 ):
                     tls.sendall(
-                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
-                        b"Connection: close\r\n\r\n"
+                        f"HTTP/1.1 {self.reject_status} Rejected\r\n"
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .encode("latin1")
                     )
                     tls.close()
                     continue
@@ -14804,6 +14812,100 @@ class TestAMisroutedSwapCannotKillASession:
         finally:
             proxy.stop()
             upstream.stop()
+
+    def case_a_stale_pinned_token_is_retried_with_a_fresh_one(self, certdir):
+        """The cached credential went stale (rotated on the live account
+        underneath it) and the upstream refuses it — a re-read finds the
+        rotation and one extra swapped attempt with it succeeds, so the
+        client never sees the refusal at all."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        calls = {"n": 0}
+
+        def provider():
+            calls["n"] += 1
+            return "stale-token" if calls["n"] == 1 else "fresh-token"
+
+        upstream = _FakeUpstream(
+            certdir, reject_bearer="stale-token", reject_status=401)
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=provider,
+            upstream=("127.0.0.1", upstream.port),
+        )
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/api/frame/deploy/direct", bearer="disk-token",
+            )
+            assert status == 200, (
+                "a stale-then-fresh rotation must not reach the client as "
+                f"a refusal: got {status}"
+            )
+            assert upstream.auths_seen == ["Bearer stale-token", "Bearer fresh-token"], (
+                f"expected exactly one refused attempt and one fresh retry: "
+                f"{upstream.auths_seen}"
+            )
+            # Filtered, not an exact-list compare: `proxy.start()` (patched
+            # before it runs, same as `TestWebSocketUpgrade`) logs its own
+            # startup lines into the same list.
+            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
+            assert swap_lines == [
+                "swap refused (401) on POST /api/frame/deploy/direct: "
+                "retried-fresh"
+            ], (
+                f"expected exactly one refusal line naming the retried-fresh "
+                f"branch: {lines}"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+            pp._log_lifecycle = real_log
+
+    def case_CONTROL_the_same_dead_token_on_disk_still_falls_back(self, certdir):
+        """The pinned slot's token never actually changed — eviction buys
+        nothing, and the existing unswapped take-back is still what saves
+        the client. No second swapped attempt is made."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir, reject_bearer="dead-token")
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: "dead-token",
+            upstream=("127.0.0.1", upstream.port),
+        )
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/api/frame/deploy/direct", bearer="disk-token",
+            )
+            assert status != 403
+            assert upstream.auths_seen == ["Bearer dead-token", "Bearer disk-token"], (
+                "a same-token re-read must not retry swapped a second time: "
+                f"{upstream.auths_seen}"
+            )
+            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
+            assert swap_lines == [
+                "swap refused (403) on POST /api/frame/deploy/direct: "
+                "fell-back"
+            ], (
+                f"expected exactly one refusal line naming the fell-back "
+                f"branch, no retried-fresh: {lines}"
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+            pp._log_lifecycle = real_log
 
 
 class TestEverySmallCaseHolder:
