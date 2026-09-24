@@ -6362,7 +6362,15 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         elif verdict == "ok":
             _set_identity(False)
 
-    def provider() -> str | None:
+    def provider(refused: "str | None" = None) -> str | None:
+        """`refused` is the `Authorization` value (``"Bearer <token>"``) a
+        swap carrying it was just REFUSED upstream -- `refetch` below passes
+        it through so a retry routes through this SAME cold path (the
+        store re-read, the racing-rotation re-check, `_identity_ok` on the
+        result) instead of a side implementation that has to remember to
+        keep re-deriving all of it. None (every other caller) never matches
+        a live token's `Bearer {token}` form, so the fast path below behaves
+        exactly as it does today."""
         _deferred.discard(1)
         _stalled.flag = False
         # PER-CALL, always reset here -- read by `_can_mint`,
@@ -6411,22 +6419,30 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # whether the disk changed. Evicting bounds the blind window to one
         # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
-        evict_foreign = False
+        bypass = False
         if cached is not None:
             provider.blind_reason = ""
             token = _live_token(cached)
             if token:
-                if _identity_ok(token, mail):
+                if f"Bearer {token}" == refused:
+                    # THE VERY TOKEN THAT WAS JUST REFUSED: comparing first
+                    # means never spending an `_identity_ok` probe on a
+                    # bearer this call already knows to discard. Bypass, the
+                    # same way a confirmed-foreign verdict does below, so
+                    # the re-read under `refresh_lock` runs.
+                    bypass = True
+                elif _identity_ok(token, mail):
                     return token
-                # CONFIRMED FOREIGN: fall through to a re-read under
-                # `refresh_lock` instead of returning here with the entry
-                # popped -- an empty `_cred_cache` reads as `can_pin: False`
-                # to both `_read_alive_port` and the self-heal watchdog,
-                # which recycle a live daemon that a fresh process would
-                # find just as cross-wired. `creds = cached` (not None)
-                # below so a re-read that comes back empty restores this
-                # SAME blob instead of leaving the cache empty.
-                evict_foreign = True
+                else:
+                    # CONFIRMED FOREIGN: fall through to a re-read under
+                    # `refresh_lock` instead of returning here with the entry
+                    # popped -- an empty `_cred_cache` reads as `can_pin: False`
+                    # to both `_read_alive_port` and the self-heal watchdog,
+                    # which recycle a live daemon that a fresh process would
+                    # find just as cross-wired. `creds = cached` (not None)
+                    # below so a re-read that comes back empty restores this
+                    # SAME blob instead of leaving the cache empty.
+                    bypass = True
             creds = cached
         else:
             # COLD -- the very first read for this key, which is EVERY key on
@@ -6474,7 +6490,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             # `can_pin: False`, and a read that RAISES would leave it that
             # way for good. `fresh is cached` is the same race guard the
             # branch below uses: a racer's replacement is not ours to discard.
-            if evict_foreign and fresh is cached:
+            if bypass and fresh is cached:
                 fresh = None
             token = _live_token(fresh) if fresh is not None else None
             if token:
@@ -6631,6 +6647,34 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         cached = _cred_cache.get(target)
         return bool(cached and _live_token(cached))
 
+    def refetch(refused_bearer: "str | None") -> "str | None":
+        """A swap carrying `refused_bearer` was just REJECTED upstream RIGHT
+        NOW. Routes through `provider` itself -- the SAME cold path a cold
+        or foreign-evicted call takes, so a retry gets everything that path
+        already does (the store re-read, `read(...) or creds` on an empty
+        one, the racing-rotation re-check under `refresh_lock`,
+        `_lock_acquired_at` for the mint-stall watchdog, `_identity_ok` on
+        the result) instead of a side implementation that has to remember
+        to keep re-deriving all of it.
+
+        NO MEMO: every call here is one failed upstream round trip already
+        -- refused requests, not the hot path -- so one store read apiece is
+        proportional, not a storm amplifier. The daemon.log line this can
+        drive is rate-limited separately, by `_note_swap_refused` at the
+        call site (the `_note_busy_slot` pattern), so a polled legitimate
+        404 still writes at most one line per cooldown window.
+
+        Returns a token only when it is DIFFERENT from `refused_bearer` --
+        the same one would just be refused again -- and None otherwise: a
+        read that comes back empty, unchanged, or (via `provider`'s own
+        propagation) raises.
+        """
+        token = provider(refused=refused_bearer)
+        if token and f"Bearer {token}" != refused_bearer:
+            return token
+        return None
+
+    provider.refetch = refetch
     provider.pin_is_noop = pin_is_noop
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
@@ -12665,6 +12709,13 @@ class PinProxy:
         # The last hop fault reported, so a steadily-down hop costs one line
         # instead of one per connection — see _note_hop_unusable.
         self._hop_fault: "tuple[tuple[str, int], str] | None" = None
+        # outcome ("retried-fresh"/"fell-back") -> (last logged monotonic,
+        # suppressed count) -- see _note_swap_refused. A polled legitimate
+        # 404, or a store that has not rotated yet, refuses a swap the
+        # identical way on every request; rate-limited the same as
+        # _note_busy_slot's cooldown, instead of one daemon.log line per
+        # refusal.
+        self._swap_refused: dict = {}
         self._bundle = ensure_ca(self._certdir, UPSTREAM_HOST)
         self._server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._server_ctx.load_cert_chain(
@@ -16921,6 +16972,31 @@ class PinProxy:
             len(rl) > 2 and rl[2] == "HTTP/1.0"
         )
 
+        def _swap_attempts():
+            """Swapped once, refetched once on a refusal, then unswapped --
+            the same take-back order `_forward` uses, via the SAME shared
+            helper (`_refetch_swap_token`), so this absolute-form route
+            retries a stale cache instead of going straight to falling
+            back unswapped. LAZY: nothing past the first `yield` runs
+            unless the loop below actually asks for a second attempt,
+            which only happens on a refusal (see the `retry` checks
+            below).
+            """
+            if unswapped is None:
+                yield headers, False
+                return
+            yield headers, True
+            refused_auth = next(
+                (h.split(":", 1)[1].strip() for h in headers
+                 if h.split(":", 1)[0].strip().lower() == "authorization"), "")
+            fresh = self._refetch_swap_token(refused_auth)
+            if fresh:
+                yield ([f"Authorization: Bearer {fresh}"
+                        if h.split(":", 1)[0].strip().lower() == "authorization"
+                        else h for h in headers], True)
+            yield unswapped, False
+
+        pending_refusal = None
         try:
             # A SWAP THE UPSTREAM REFUSES IS TAKEN BACK, as the MITM path
             # already does. An environment registered before the pin knew
@@ -16928,10 +17004,21 @@ class PinProxy:
             # pin gets 401 and a live Remote Control dies. Nothing has
             # reached the client yet, so the request can still go again with
             # the bearer it arrived with.
-            for hdrs, retry in ((headers, unswapped is not None),
-                                (unswapped, False)):
+            for hdrs, retry in _swap_attempts():
                 if hdrs is None:
                     break
+                if pending_refusal is not None:
+                    # NAMES THIS ATTEMPT -- the one actually about to be
+                    # retried -- not the one that was just refused: whether
+                    # a fresh swap exists at all is `_swap_attempts`' own
+                    # lazy decision, not known until the generator has
+                    # already advanced to it, which is only now.
+                    kind = ("as it arrived" if hdrs is unswapped
+                            else "with a fresh swap")
+                    self._tunnel_trace(
+                        f"{method} {rel} swap refused ({pending_refusal}) — "
+                        f"retrying {kind} (absolute-form)")
+                    pending_refusal = None
                 try:
                     up, head = dial(hdrs)
                 except NoChainHopError:
@@ -16967,9 +17054,7 @@ class PinProxy:
                         # with no swap never asked for one.
                         code, seen = _peek_status(up)
                         if retry and code in (401, 403, 404):
-                            self._tunnel_trace(
-                                f"{method} {rel} swap refused ({code}) — "
-                                "retrying as it arrived (absolute-form)")
+                            pending_refusal = code
                             continue
                         # RELEASED HERE, THE MOMENT THE STATUS LINE IS IN
                         # HAND — same discipline as the MITM path's
@@ -17006,9 +17091,7 @@ class PinProxy:
                         note_hop=host == UPSTREAM_HOST and secure,
                     )
                     if isinstance(result, _AuthRejected):
-                        self._tunnel_trace(
-                            f"{method} {rel} swap refused ({result.code}) — "
-                            "retrying as it arrived (absolute-form)")
+                        pending_refusal = result.code
                         continue
                     _release_bridge_hold()
                     return bool(result) and not client_wants_close
@@ -17348,8 +17431,38 @@ class PinProxy:
                 # chain that dies between the two calls is a NoChainHopError
                 # here too, and it must answer 503, not escape as a bare
                 # OSError to the connection's `finally`.
+                #
+                # BUT FIRST: the refusal may be a STALE CACHE, not a
+                # misrouted path — the pinned account was live and rotated
+                # its token underneath `_cred_cache` (measured:
+                # `pinned=True swapped=True` traces answering as the active
+                # account for the daemon's life). Refetch once; a
+                # DIFFERENT token is worth one more swapped attempt before
+                # falling back to "this request went out unpinned". At most
+                # one extra swapped attempt per request either way.
+                clean_path = path.split("?", 1)[0]
+                refused_auth = next(
+                    (v for k, v in headers if k.lower() == "authorization"), "")
                 self._drop_upstream()
-                keep = self._forward(method, path, original_headers, body, tls)
+                fresh_token = self._refetch_swap_token(refused_auth)
+                if fresh_token:
+                    self._note_swap_refused(keep.code, method, clean_path,
+                                            "retried-fresh")
+                    retry_headers = [
+                        (k, f"Bearer {fresh_token}") if k.lower() == "authorization"
+                        else (k, v) for k, v in headers
+                    ]
+                    keep = self._forward(method, path, retry_headers, body, tls,
+                                         swapped=True)
+                    if isinstance(keep, _AuthRejected):
+                        self._note_swap_refused(keep.code, method, clean_path,
+                                                "fell-back")
+                        self._drop_upstream()
+                        keep = self._forward(method, path, original_headers, body, tls)
+                else:
+                    self._note_swap_refused(keep.code, method, clean_path,
+                                            "fell-back")
+                    keep = self._forward(method, path, original_headers, body, tls)
         except NoChainHopError:
             # No hop and no direct: a retryable answer, not a dropped
             # connection and never the inspector's 403.
@@ -17366,6 +17479,46 @@ class PinProxy:
             if k.lower() == "connection" and "close" in v.lower():
                 keep = False
         return keep
+
+    def _refetch_swap_token(self, refused_auth: str) -> "str | None":
+        """A swap carrying `refused_auth` was just refused upstream. Ask the
+        pin token provider for a token worth ONE more attempt -- shared by
+        the MITM (`_forward`) and absolute-form (`_plain_relay_request`)
+        take-back paths, so both retry a stale cache the same way before
+        falling back to the request as it arrived.
+
+        None when there is nothing better: a provider with no `refetch`
+        (a bare-callable test double, or one built before this existed),
+        or a fresh read that comes back empty, unchanged, or RAISES -- a
+        wedged Keychain read here must answer the same as "nothing newer"
+        rather than escape past this path's own `except NoChainHopError`
+        and drop a connection the unswapped fallback would have answered.
+        """
+        refetch = getattr(self._pin_token_provider, "refetch", None)
+        if refetch is None:
+            return None
+        try:
+            return refetch(refused_auth)
+        except Exception:
+            return None
+
+    def _note_swap_refused(self, code: int, method: str, clean_path: str,
+                            outcome: str) -> None:
+        """Log a refused swap, at most once per `_BUSY_REPORT_COOLDOWN_S`
+        per `outcome` ("retried-fresh"/"fell-back") -- see `_swap_refused`
+        on `__init__`. A polled legitimate 404, or a store that has not
+        rotated yet, refuses the identical way on every request, and this
+        used to write one `_log_lifecycle` line per refusal.
+        """
+        now = time.monotonic()
+        last, suppressed = self._swap_refused.get(outcome, (None, 0))
+        if last is not None and now - last < _BUSY_REPORT_COOLDOWN_S:
+            self._swap_refused[outcome] = (last, suppressed + 1)
+            return
+        self._swap_refused[outcome] = (now, 0)
+        more = f"; {suppressed} more" if suppressed else ""
+        _log_lifecycle(
+            f"swap refused ({code}) on {method} {clean_path}: {outcome}{more}")
 
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
                  swapped: bool = False,

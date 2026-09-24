@@ -4533,6 +4533,12 @@ class TestIsPinnedRoute:
             # dynamically either (`deploy/$` is 0).
             ("/api/frame/deploy/direct", True,
              "artifact publishes are owned by the creating bearer too"),
+            ("/api/frame/read/frame_01ABC", True,
+             "reading a frame this pin owns — the 2.1.281 binary's own "
+             "route, same subtree as deploy/direct"),
+            ("/api/frame/comments/frame_01ABC", True,
+             "comments on a frame this pin owns — same subtree, same "
+             "binary"),
             # RC reconnect unarchives at /v1/sessions/{id}/unarchive — NOT
             # /v1/code/sessions — before re-bridging. Keeping the disk bearer
             # here SPLITS the session's ownership: unarchive lands it on the
@@ -6405,7 +6411,7 @@ class TestMakePinTokenProvider:
     # `case_an_unverifiable_identity_still_does_not_reread_the_store` and
     # `case_repeated_requests_do_not_reread_the_store` (below) -- an
     # unknown/timeout verdict and a same-identity verdict never set
-    # `evict_foreign`, so this PR's fix does not touch either path and the
+    # `bypass`, so this PR's fix does not touch either path and the
     # existing controls already prove a single store read across repeats.
 
 
