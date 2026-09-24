@@ -10471,7 +10471,20 @@ print("OK", port)
                 "fresh fd handoff should have handled it")
         monkeypatch.setattr(pin_proxy, "PortHolder", _no_promotion)
 
-        pin_proxy._standby_revive(certdir, _Srv(), "1", "born@with.it")
+        # `_standby_revive` resets SIGTERM/SIGINT/SIGHUP to SIG_DFL
+        # unconditionally -- save and restore them so this case does not
+        # leave the rest of the suite deaf to TERM/INT (T1168).
+        import signal
+
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        try:
+            pin_proxy._standby_revive(certdir, _Srv(), "1", "born@with.it")
+        finally:
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
 
         assert not closed, (
             "the standby closed its own listening socket before handing it "
@@ -10526,7 +10539,20 @@ print("OK", port)
         monkeypatch.setattr(pin_proxy, "PortHolder", _FakeHolder)
 
         srv = object()
-        pin_proxy._standby_revive(certdir, srv, "9", "born@with.it")
+        # `_standby_revive` resets SIGTERM/SIGINT/SIGHUP to SIG_DFL
+        # unconditionally -- save and restore them so this case does not
+        # leave the rest of the suite deaf to TERM/INT (T1168).
+        import signal
+
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        try:
+            pin_proxy._standby_revive(certdir, srv, "9", "born@with.it")
+        finally:
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
 
         assert not spawned, f"spawned a fresh holder with nothing pinned: {spawned}"
         assert not healed, f"healed with nothing pinned: {healed}"
@@ -10571,7 +10597,20 @@ print("OK", port)
         monkeypatch.setattr(pin_proxy, "PortHolder", _FakeHolder)
 
         srv = object()
-        pin_proxy._standby_revive(certdir, srv, "9", "born@with.it")
+        # `_standby_revive` resets SIGTERM/SIGINT/SIGHUP to SIG_DFL
+        # unconditionally -- save and restore them so this case does not
+        # leave the rest of the suite deaf to TERM/INT (T1168).
+        import signal
+
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        try:
+            pin_proxy._standby_revive(certdir, srv, "9", "born@with.it")
+        finally:
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
 
         assert not spawned, f"spawned with a raising load_pin: {spawned}"
         assert not healed, f"healed with a raising load_pin: {healed}"
@@ -10579,6 +10618,178 @@ print("OK", port)
             f"a raising load_pin did not fall back to the old in-place "
             f"promotion: {promoted}"
         )
+
+    def case_spawn_daemon_raising_falls_back_to_promotion(
+            self, tmp_path, monkeypatch):
+        """T1168 (m): `_spawn_daemon` itself can RAISE -- a `Popen` error
+        re-raised after `_clear_handover_mark`, or `os.mkfifo` failing
+        before the fork -- and the docstring already promises any spawn
+        failure falls to the old in-place promotion. Nothing caught it: a
+        bare exception here would have propagated out of this daemon
+        thread and closed the last copy of the port."""
+        import json as _json
+        import signal
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org-1")
+        (tmp_path / "sequence.json").write_text(
+            _json.dumps({"accounts": {"7": {"email": "a@b.c"}}}))
+
+        def _raises(*a, **k):
+            raise OSError("fork: Resource temporarily unavailable")
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", _raises)
+        # Nobody else is on the port -- the promotion below is the only
+        # thing that can still cover it.
+        monkeypatch.setattr(pin_proxy, "_port_returns_bytes",
+                            lambda port, timeout=None: False)
+        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: False)
+
+        promoted = []
+
+        class _FakeHolder:
+            def __init__(self, cd, account_num, email, sock=None):
+                promoted.append((cd, account_num, email, sock))
+                self._thread = None
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(pin_proxy, "PortHolder", _FakeHolder)
+
+        class _Srv:
+            def fileno(self):
+                return 4242
+
+            def getsockname(self):
+                return ("127.0.0.1", 36301)
+
+        srv = _Srv()
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        try:
+            pin_proxy._standby_revive(certdir, srv, "1", "born@with.it")
+        finally:
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
+
+        assert promoted == [(certdir, "1", "born@with.it", srv)], (
+            f"a raising _spawn_daemon did not fall back to the old "
+            f"in-place promotion: {promoted}"
+        )
+
+    def case_spawn_daemon_timeout_with_nobody_covering_falls_back_to_promotion(
+            self, tmp_path, monkeypatch):
+        """T1168 (m): CONTROL for the case below -- `_spawn_daemon`'s 10s
+        wait can also just run out with no successor at all, returning
+        `None` rather than raising. With nobody answering the port and no
+        holder process owning it, the old in-place promotion must still
+        run, exactly as it does for a raise."""
+        import json as _json
+        import signal
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org-1")
+        (tmp_path / "sequence.json").write_text(
+            _json.dumps({"accounts": {"7": {"email": "a@b.c"}}}))
+
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "_port_returns_bytes",
+                            lambda port, timeout=None: False)
+        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: False)
+
+        promoted = []
+
+        class _FakeHolder:
+            def __init__(self, cd, account_num, email, sock=None):
+                promoted.append((cd, account_num, email, sock))
+                self._thread = None
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(pin_proxy, "PortHolder", _FakeHolder)
+
+        class _Srv:
+            def fileno(self):
+                return 4242
+
+            def getsockname(self):
+                return ("127.0.0.1", 36301)
+
+        srv = _Srv()
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        try:
+            pin_proxy._standby_revive(certdir, srv, "1", "born@with.it")
+        finally:
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
+
+        assert promoted == [(certdir, "1", "born@with.it", srv)], (
+            f"_spawn_daemon returning None with nobody covering the port "
+            f"did not fall back to the old in-place promotion: {promoted}"
+        )
+
+    def case_spawn_daemon_timeout_with_a_holder_already_up_skips_promotion(
+            self, tmp_path, monkeypatch):
+        """T1168 (m): `_spawn_daemon` can return `None` because its 10s
+        wait simply ran out, NOT because the child failed -- the new
+        holder is alive and already owns the fd. Promoting in place here
+        puts a SECOND `PortHolder` on the same listening socket: two
+        daemons on one listener. `_holder_owns` seeing the new holder must
+        skip the promotion and leave the port to it."""
+        import json as _json
+        import signal
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org-1")
+        (tmp_path / "sequence.json").write_text(
+            _json.dumps({"accounts": {"7": {"email": "a@b.c"}}}))
+
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "_port_returns_bytes",
+                            lambda port, timeout=None: False)
+        # THE HOLDER IS ALIVE -- the wait simply ran out before it saw it.
+        monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: True)
+
+        def _no_promotion(*a, **k):
+            raise AssertionError(
+                "the old in-place promotion ran while a holder already "
+                "owns the fd -- this puts two daemons on one listener")
+        monkeypatch.setattr(pin_proxy, "PortHolder", _no_promotion)
+
+        class _Srv:
+            def fileno(self):
+                return 4242
+
+            def getsockname(self):
+                return ("127.0.0.1", 36301)
+
+        srv = _Srv()
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        try:
+            pin_proxy._standby_revive(certdir, srv, "1", "born@with.it")
+        finally:
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
 
     def case_standby_main_arms_into_the_revive_path(self, tmp_path, monkeypatch):
         """T1168 (I) end to end: `standby_main`'s own arm branch is what
@@ -10617,10 +10828,43 @@ print("OK", port)
 
         monkeypatch.setattr(pin_proxy, "_standby_revive", _record)
 
+        # `_standby_revive` is stubbed above, so its own SIGTERM/SIGINT/
+        # SIGHUP reset never runs -- and `standby_main` itself sets
+        # SIGTERM/SIGINT to SIG_IGN and SIGHUP to `_release` before it gets
+        # there. Left in place, every later case (and every child this
+        # process spawns) runs deaf to TERM/INT (T1168). Save and restore.
+        import signal
+
+        prev_signals = {
+            sig: signal.getsignal(sig)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        }
+        # `_claim_arm`'s fd is deliberately never closed in production (the
+        # winner holds it for as long as it is the holder) -- but this test
+        # never becomes a holder, so the real call underneath the stubbed
+        # `_standby_revive` leaks it unless we capture and close it here.
+        real_claim_arm = pin_proxy._claim_arm
+        claimed_fds = []
+
+        def _claim_arm_capture(cd):
+            fd = real_claim_arm(cd)
+            if fd is not None:
+                claimed_fds.append(fd)
+            return fd
+
+        monkeypatch.setattr(pin_proxy, "_claim_arm", _claim_arm_capture)
+
         try:
             pin_proxy.standby_main("3", "a@b.c", certdir)
         finally:
             listener.close()
+            for sig, prev in prev_signals.items():
+                signal.signal(sig, prev)
+            for fd in claimed_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
         assert len(revived) == 1, (
             f"standby_main's own arm branch never reached _standby_revive: "

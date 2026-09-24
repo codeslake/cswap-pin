@@ -10708,11 +10708,19 @@ def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
     except Exception:  # noqa: BLE001 — a daemon thread must never raise
         pin, resolved = None, None
     if resolved:
-        port = _spawn_daemon(resolved, pin[0], certdir, listen_fd=srv.fileno())
+        try:
+            port = _spawn_daemon(resolved, pin[0], certdir, listen_fd=srv.fileno())
+        except Exception:  # noqa: BLE001 -- a daemon thread must never raise
+            port = None
         if port is not None:
             return
         # Spawn failed -- fall through to the old promotion below, still on
-        # the same open, listening socket.
+        # the same open, listening socket. BUT the 10s wait can also just
+        # run out while the child came up anyway and already owns the fd --
+        # promoting here would put a SECOND PortHolder on the same listening
+        # socket. Only promote when nothing else is already covering it.
+        if _port_returns_bytes(srv.getsockname()[1]) or _holder_owns(certdir):
+            return
 
     holder = PortHolder(certdir, account_num, email, sock=srv)
     holder.start()
