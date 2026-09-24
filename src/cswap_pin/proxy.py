@@ -1950,6 +1950,21 @@ def heal(backup_root: Path, identity: dict | None = None,
                 # established (no ``ps``) this kills nothing rather than
                 # killing on faith.
                 if stale and int(stale.get("pid") or 0) in _pin_daemon_pids(certdir):
+                    stale_pid = int(stale["pid"])
+                    # A DAEMON CARRYING LIVE WORKER TRAFFIC IS NOT WEDGED,
+                    # whatever `/health` just said -- `_worker_alive_age`
+                    # reads evidence written from the REQUEST path, which a
+                    # deadlock confined to `/health` alone cannot fake.
+                    # Killing it here would cut sessions still using it, so
+                    # this pass leaves the record alone; the next heal call
+                    # (or the code watchdog) gets another look.
+                    age = _worker_alive_age(certdir)
+                    if age is not None and age < _STREAM_LIVE_SECONDS:
+                        _log_lifecycle(
+                            f"{stale_pid} missed /health but carried worker "
+                            f"traffic {age:.0f}s ago — leaving it rather than "
+                            f"cutting sessions still using it")
+                        return False
                     # Save the port BEFORE the kill. The daemon unlinks its own
                     # state on TERM, so afterwards there is nothing to reclaim
                     # from and the successor would take a FRESH port — which
@@ -1957,7 +1972,43 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # exact damage this recycle exists to avoid.
                     if isinstance(stale.get("port"), int):
                         _write_port_hint(certdir, stale["port"])
-                    _kill_daemon(int(stale["pid"]), certdir)
+                    # SUCCESSOR FIRST, THROUGH THE HOLDER, WHEN THERE IS ONE.
+                    # A bare TERM-then-spawn races the holder for the port --
+                    # `_recycle_daemon`'s own docstring measures the double
+                    # bind this avoids. Ask the WEDGED DAEMON'S OWN parent
+                    # (not merely "a holder exists somewhere for this
+                    # certdir") to replace it, and wait for a fresh record
+                    # before touching the old pid at all.
+                    asked_holder = (
+                        _REPLACE_ME_SIGNAL is not None
+                        and _holder_owns(certdir)
+                        and _wedged_parent_holder(stale_pid, certdir)
+                    )
+                    if asked_holder:
+                        try:
+                            os.kill(asked_holder, _REPLACE_ME_SIGNAL)
+                        except OSError:
+                            asked_holder = None
+                    if asked_holder:
+                        for _ in range(int(_SPAWN_WAIT_S * 10)):
+                            successor = read_daemon_state(certdir)
+                            if (successor and successor.get("fingerprint") == fp
+                                    and int(successor.get("pid") or 0) != stale_pid):
+                                _log_carry(
+                                    certdir,
+                                    f"{stale_pid} was wedged under a holder — "
+                                    f"asked the holder for a successor before "
+                                    f"terminating it")
+                                break
+                            time.sleep(0.1)
+                    # ponytail: TERM through `_kill_daemon` still gives this
+                    # predecessor its ordinary 30s signal drain, even though
+                    # both liveness signals (a missed /health, a stale or
+                    # absent worker-alive stamp) already said it was not
+                    # moving -- upgrade: announce_draining before this TERM,
+                    # the way the daemon's own self-replace path does.
+                    _kill_daemon(stale_pid, certdir, misses=_PIN_PROBE_ATTEMPTS,
+                                worker_alive_age=age)
                     # ONLY AFTER A KILL. `recycled` decides whether the spawn
                     # guard below is fingerprinted, and setting it merely for
                     # ENTERING this branch made a no-op recycle look like a
@@ -3936,7 +3987,7 @@ def _carry_pointer(record: dict, login: tuple[str, str],
 _POINTER_TAIL_BYTES = 65536
 
 
-def _log_carry(certdir: Path, what: str) -> None:
+def _log_carry(certdir: Path, what: str, **evidence) -> None:
     """Append one carry event to the daemon log, with a timestamp.
 
     NOT ``_log_lifecycle``, which writes to stderr. That is right for the
@@ -3945,10 +3996,18 @@ def _log_carry(certdir: Path, what: str) -> None:
     terminal and Claude Code paints over it immediately. A record of what was
     written into Claude Code's own files has to outlive the launch that wrote
     it, or the comment justifying it is not true.
+
+    ``**evidence`` is optional keyword context (``_kill_daemon`` passes ``pid``,
+    ``ppid`` and, from `heal`, ``misses``/``worker_alive_age``) appended after
+    ``what``. A key whose value is None is dropped rather than printed, so a
+    caller with nothing to say about it costs nothing on the line.
     """
+    extra = "".join(f" {k}={v}" for k, v in evidence.items() if v is not None)
     try:
         with daemon_log_path(certdir).open("a", encoding="utf-8") as fh:
-            fh.write(f"[{_iso_utc(time.time())}] {_COMPONENT} carry: {what}\n")
+            fh.write(
+                f"[{_iso_utc(time.time())}] {_COMPONENT} carry: {what}{extra}\n"
+            )
     except OSError:
         pass
 
@@ -7009,7 +7068,9 @@ def _spawn_lock(certdir: Path, name: str = ".spawn.lock",
     return _locked()
 
 
-def _kill_daemon(pid: int, certdir: "Path | None" = None) -> None:
+def _kill_daemon(pid: int, certdir: "Path | None" = None,
+                  misses: "int | None" = None,
+                  worker_alive_age: "float | None" = None) -> None:
     """TERM a daemon, then escalate to KILL if it does not exit — so a daemon
     that ignores TERM (or hangs mid-teardown) never lingers as an orphan
     holding a port. Mirrors a supervisor recycle: bounded wait, then force.
@@ -7048,6 +7109,9 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None) -> None:
         os.kill(pid, 15)  # SIGTERM
     except OSError:
         return
+    if certdir is not None:
+        _log_carry(certdir, f"TERM {pid}", ppid=os.getppid(), misses=misses,
+                   worker_alive_age=worker_alive_age)
     # +2s of slack past the drain ceiling; the loop exits the moment it dies,
     # so a daemon with no live clients still returns in milliseconds.
     for _ in range(int(_DRAIN_SECONDS * 10) + 20):
@@ -7073,6 +7137,9 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None) -> None:
         os.kill(pid, 9)  # SIGKILL escalation
     except OSError:
         return
+    if certdir is not None:
+        _log_carry(certdir, f"KILL {pid}", ppid=os.getppid(), misses=misses,
+                   worker_alive_age=worker_alive_age)
     for _ in range(10):  # up to ~1s for the port to actually free
         if not _pid_alive(pid):
             return
@@ -7151,6 +7218,37 @@ def _holder_owns(certdir: Path) -> bool:
         if any(cmd.endswith(" " + t) for t in targets):
             return True
     return False
+
+
+def _wedged_parent_holder(pid: int, certdir: Path) -> "int | None":
+    """``pid``'s own OS parent, when that parent is the ``--hold-port``
+    holder for ``certdir`` -- else None.
+
+    `_holder_owns` answers "IS a holder holding this certdir's port"; this
+    answers "is THIS pid's OWN parent that holder" -- what makes a
+    successor-first replace (see `heal`'s wedge branch) land the REPLACE_ME
+    signal on the wedged daemon's own supervisor rather than some other
+    holder's. /proc only: on a platform without it (macOS) this returns
+    None and the caller falls back to today's direct kill.
+    """
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("PPid:"):
+                ppid = int(line.split()[1])
+                break
+        else:
+            return None
+    except (OSError, ValueError, IndexError):
+        return None
+    try:
+        argv = Path(f"/proc/{ppid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except OSError:
+        return None
+    cmd = argv.decode("utf-8", "replace").rstrip()
+    if _HOLDER_MODULE_ARG not in cmd:
+        return None
+    targets = {str(Path(certdir)), str(Path(certdir).resolve())}
+    return ppid if any(cmd.endswith(" " + t) for t in targets) else None
 
 
 def _pin_daemon_pids(certdir: Path) -> list[int]:
@@ -8590,6 +8688,37 @@ def _republish_own_record(
     write_daemon_state(certdir, port, pid, fingerprint, ungated=True)
 
 
+def _teardown_vetoed_by_live_work(certdir: Path, live_clients=None) -> bool:
+    """Whether `watch_refcount` must keep watching rather than tear down,
+    even though `_is_claimed` just said no.
+
+    `_is_claimed` reads a record naming another LIVE pid as a real handover
+    and answers False on the spot (its own docstring) -- right for "who does
+    the WIRING point at now", wrong for "is THIS process still doing
+    anything": the record can move to a successor while THIS daemon still
+    has a live client or an open Remote Control pair it has not drained.
+    Torn down on the record's word alone, those get ConnectionRefused mid
+    conversation. So this asks the two things `_is_claimed` never reaches in
+    that branch, directly and with NO quiet bound -- a pair `_is_claimed`
+    itself would call wedged past `_DRAINING_MARKER_TTL` still counts here,
+    because the record moving is not proof this process let go of it.
+
+    `_superseded_on_the_port` is the one carve-out: a record naming another
+    pid that really IS alive on this port is a genuine supersession, and
+    that teardown already gets the uncapped handover drain elsewhere -- so
+    only there does this let `on_last_holder_gone` proceed.
+    """
+    if _superseded_on_the_port(certdir):
+        return False
+    if live_clients is not None:
+        try:
+            if live_clients() > 0:
+                return True
+        except Exception:
+            pass
+    return _PUMP.live_pairs() > 0
+
+
 def watch_refcount(
     fifo: str | Path,
     on_last_holder_gone,
@@ -8668,8 +8797,12 @@ def watch_refcount(
                 # ...which is NOT the same as "nobody is using me". A globally
                 # wired session never opens the FIFO, so check the wiring
                 # before concluding we are an orphan (see ``_is_claimed``).
-                if _is_claimed(Path(fifo).parent, live_clients, republish):
+                certdir_ = Path(fifo).parent
+                if _is_claimed(certdir_, live_clients, republish):
                     deadline = _time.monotonic() + timeout  # re-arm and re-check
+                    continue
+                if _teardown_vetoed_by_live_work(certdir_, live_clients):
+                    deadline = _time.monotonic() + timeout
                     continue
                 on_last_holder_gone()  # nobody ever attached — do not linger
                 return
@@ -8699,9 +8832,13 @@ def watch_refcount(
                 # HTTPS_PROXY fixed at exec: the ConnectionRefused loop
                 # ``_is_claimed`` exists to prevent, arriving by the one door
                 # that never asked it.
-                if _is_claimed(Path(fifo).parent, live_clients, republish):
+                certdir_ = Path(fifo).parent
+                if _is_claimed(certdir_, live_clients, republish):
                     _time.sleep(_CLAIM_RECHECK_INTERVAL)
                     continue  # still referenced — keep serving, re-check
+                if _teardown_vetoed_by_live_work(certdir_, live_clients):
+                    _time.sleep(_CLAIM_RECHECK_INTERVAL)
+                    continue
                 on_last_holder_gone()
                 return
             # A holder wrote an attach ping; drain and keep waiting.
@@ -9190,6 +9327,35 @@ _PIN_PROBE_ATTEMPTS = 3
 _MINT_STALL_WEDGE_S = 60.0
 
 
+def _health_probe(port: int, timeout: float) -> bytes | None:
+    """One GET /health round trip's raw bytes: connect, send, read until the
+    peer closes or 65536 bytes arrive. None only when the CONNECT itself
+    failed -- "nobody there". A connect that succeeds and then never answers
+    still returns what came back (``b""`` at worst), which is the "accepted
+    but silent" case its callers tell apart from "refused".
+
+    Factored out of ``_serving_can_pin`` so a second caller (``_health_pid``)
+    shares the one HTTP client instead of opening its own.
+    """
+    try:
+        sk = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except OSError:
+        return None
+    buf = b""
+    try:
+        with sk:
+            sk.settimeout(timeout)
+            sk.sendall(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+            while len(buf) < 65536:
+                chunk = sk.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError:
+        pass  # a reset AFTER a full answer is still an answer -- see below
+    return buf
+
+
 def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
     """What the daemon on ``port`` says about minting, or None if it will not say.
 
@@ -9208,22 +9374,9 @@ def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
     returned None and every caller reads None as healthy by policy.
     """
     for attempt in range(_PIN_PROBE_ATTEMPTS):
-        try:
-            sk = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-        except OSError:
+        buf = _health_probe(port, timeout)
+        if buf is None:
             return None
-        buf = b""
-        try:
-            with sk:
-                sk.settimeout(timeout)
-                sk.sendall(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                while len(buf) < 65536:
-                    chunk = sk.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-        except OSError:
-            pass  # a reset AFTER a full answer is still an answer -- see below
         if b"\r\n\r\n" not in buf:
             continue  # connected, but no full answer either -- a wedge
         parts = buf.split(b"\r\n\r\n", 1)
@@ -9238,6 +9391,35 @@ def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
         return val if isinstance(val, bool) else None
     # Every attempt connected and none produced an answer.
     return False
+
+
+def _health_pid(port: int, timeout: float = 1.0) -> int | None:
+    """The pid ``/health`` on ``port`` says answered, or None if it did not say.
+
+    THE ONE THING `os.kill(pid, 0)` CANNOT SEE ACROSS A PID NAMESPACE. A
+    `claude` run on a host and a daemon started inside a container sharing
+    $HOME and the network namespace but not the pid one both look at the
+    same ``proxy.json`` -- `os.kill` on that record's pid gives ESRCH for a
+    dead pid and for a live one in another namespace alike. The daemon
+    itself, answering its own ``/health``, is the one witness that can still
+    be asked "are you pid N" from outside that namespace: the port answers
+    or it does not, and the pid in the body is filled in by ``os.getpid()``
+    at the moment of the answer -- see the ``pid`` field's own comment in
+    ``_serve_health``.
+
+    A single probe, not ``_PIN_PROBE_ATTEMPTS`` retries: this is a FALLBACK
+    when `_pid_alive` has already said no, so a miss here just leaves that
+    answer standing rather than mattering to a wedge verdict.
+    """
+    buf = _health_probe(port, timeout)
+    if not buf or b"\r\n\r\n" not in buf:
+        return None
+    try:
+        body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
+    except ValueError:
+        return None
+    pid = body.get("pid")
+    return pid if isinstance(pid, int) else None
 
 
 def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | None:
@@ -9263,12 +9445,22 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
     # only that caller recycles; a bare liveness probe still sees it.
     if fingerprint is not None and st.get("unpinnable"):
         return None
-    if not _pid_alive(int(st["pid"])):
-        return None
+    port = int(st["port"])
+    pid = int(st["pid"])
     try:
-        with socket.create_connection(("127.0.0.1", int(st["port"])), timeout=1):
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
             pass
     except OSError:
+        return None
+    # `_pid_alive` gives ESRCH for a dead pid and for a live pid in ANOTHER
+    # pid namespace alike -- a `claude` run on a host reading a record the
+    # daemon inside a container wrote, sharing $HOME and the network
+    # namespace but not the pid one. When it says dead, ask the one witness
+    # that can still see across that boundary: the daemon's own `/health`,
+    # which fills in `pid` from its own `os.getpid()`. Checked only as a
+    # fallback -- the port has already proven something accepts here, so
+    # this is "is IT the recorded daemon", not a second liveness probe.
+    if not _pid_alive(pid) and _health_pid(port) != pid:
         return None
     # AND ASK THE DAEMON, because the field above is erasable. It is written
     # once per process, and a successor publishes a fresh record without it —
@@ -9906,6 +10098,28 @@ class PortHolder:
             # daemon chose to go (teardown, SIGTERM handler), anything else
             # means it was killed or crashed.
             if code == 0:
+                # AUTO-HEAL WITH NO ONE AT A KEYBOARD. This holder is the
+                # LAST pin process alive when its daemon exits cleanly, and a
+                # clean exit is not always the owner clearing the pin -- an
+                # idle-teardown that should not have fired is also code 0.
+                # `load_pin`, read fresh immediately before the spawn (never
+                # cached: the owner may clear it in this same window), is the
+                # one witness a holder with no human nearby can still ask.
+                # Still pinned -> respawn on the held port ourselves, same as
+                # a redeploy; nothing pinned -> release, exactly as today.
+                # ``getattr``: a test double built without ``__init__`` has
+                # no ``_certdir``; that is "cannot tell" and falls to the
+                # release path below, same as every real holder without one.
+                certdir = getattr(self, "_certdir", None)
+                if certdir is not None and load_pin(certdir.parent):
+                    _log_lifecycle(
+                        f"daemon {self.daemon_pid} exited cleanly but the pin "
+                        f"is still set — respawning on the held port "
+                        f"{self.port}"
+                    )
+                    self._failures = 0
+                    self._spawn()
+                    continue
                 _log_lifecycle(
                     f"daemon {self.daemon_pid} exited cleanly — releasing port "
                     f"{self.port}"
@@ -10573,7 +10787,13 @@ def _clear_handover_mark(certdir: Path) -> bool:
     # the time we look), and restoring a record for a daemon that no longer
     # answers its port would be its own outage — every reader would believe
     # a pin is up when nothing is behind it.
-    if pid and port and _pid_alive(pid) and _port_answers(port):
+    #
+    # `_pid_alive` OR its own `/health` naming this same pid: a container's
+    # daemon read by a host sharing $HOME and the network namespace but not
+    # the pid one gives ESRCH on a pid that is very much still serving. See
+    # `_read_alive_port`'s identical fallback for the measured case.
+    if (pid and port and _port_answers(port)
+            and (_pid_alive(pid) or _health_pid(port) == pid)):
         # RE-READ, IMMEDIATELY BEFORE THE WRITE. `_pid_alive` and
         # `_port_answers` cost real wall time (a signal-0, a 0.5s connect
         # budget), and a successor can publish its own record in exactly
@@ -18634,6 +18854,18 @@ def _alive_load(certdir) -> dict:
     except (OSError, ValueError):
         return {}
     return got if isinstance(got, dict) else {}
+
+
+def _worker_alive_age(certdir) -> "float | None":
+    """Seconds since the NEWEST `_alive_load` stamp, or None with no stamps.
+
+    Evidence a daemon `heal` is about to recycle is still carrying live
+    worker traffic even though its own `/health` missed -- see the caller in
+    `heal`'s wedge branch, which must not kill a daemon this reads as fresh.
+    """
+    stamps = [v for v in _alive_load(certdir).values()
+              if isinstance(v, (int, float))]
+    return (time.time() - max(stamps)) if stamps else None
 
 
 def _note_worker_status(path: str | None, status_line: bytes,

@@ -8441,7 +8441,7 @@ class TestEnsureProxyLifecycle:
         # recycle refuses to signal a pid it cannot identify as one of ours,
         # and the pytest process is not (see test_a_reused_pid_is_not_killed).
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None, **k: killed.append(pid))
         monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 52000)
         got, ca = pin_proxy.ensure_proxy(self._Sw(tmp_path))
         srv.close()
@@ -8974,6 +8974,52 @@ class TestKillDaemon:
         pin_proxy._kill_daemon(4321)
         assert 15 in sent and 9 in sent  # TERM first, then KILL escalation
 
+    def case_logs_pid_ppid_and_the_callers_evidence(self, monkeypatch, tmp_path):
+        """Every kill must leave a record of WHY: the pid, who did it
+        (`os.getppid()`), and whatever evidence the caller had -- `heal`
+        passes `misses`/`worker_alive_age`, and a caller with neither must
+        not crash `_log_carry` (it accepts `**k` for exactly this)."""
+        import os
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        monkeypatch.setattr(pin_proxy.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        pin_proxy._kill_daemon(4321, certdir, misses=3, worker_alive_age=12.5)
+
+        log = pin_proxy.daemon_log_path(certdir).read_text()
+        assert "4321" in log, f"the killed pid is not in the log: {log!r}"
+        assert f"ppid={os.getppid()}" in log, (
+            f"the caller's own os.getppid() is not in the log: {log!r}")
+        assert "misses=3" in log and "worker_alive_age=12.5" in log, (
+            f"the caller's evidence never reached the log: {log!r}")
+
+    def case_a_caller_with_no_evidence_logs_nothing_extra(
+        self, monkeypatch, tmp_path
+    ):
+        """The control: a caller that passes neither kwarg (every non-heal
+        caller, today) must not print `misses=None` noise on every kill."""
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        monkeypatch.setattr(pin_proxy.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        pin_proxy._kill_daemon(4322, certdir)
+
+        log = pin_proxy.daemon_log_path(certdir).read_text()
+        assert "misses" not in log and "worker_alive_age" not in log, (
+            f"an absent evidence kwarg was printed as text anyway: {log!r}")
+
 
 class TestDaemonSignalTeardown:
     """The daemon installs a SIGTERM handler so a recycle (or cc-update) that
@@ -9013,7 +9059,7 @@ class TestOrphanSweep:
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids",
                             lambda cd: list(found))
         killed = []
-        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
+        monkeypatch.setattr(pin_proxy, "_kill_daemon", lambda pid, certdir=None, **k: killed.append(pid))
         pin_proxy._sweep_orphan_daemons(certdir, keep_pid=202)
         assert sorted(killed) == [101, 303]  # everything but the keeper
 
@@ -12692,6 +12738,84 @@ print("OK", port)
             from conftest import _reap_pin_processes
             _reap_pin_processes(tmp_path)
 
+    def case_a_clean_exit_respawns_while_the_pin_is_still_set(self, tmp_path):
+        """AUTO-HEAL WITH NO ONE AT A KEYBOARD. A clean exit is not always
+        the owner clearing the pin -- an idle-teardown that should not have
+        fired is also code 0. While `load_pin` still names a pin,
+        `_supervise`'s clean-exit branch must respawn on the held port
+        rather than releasing it, the same way a redeploy
+        (`_RESTART_ME_CODE`) does.
+        """
+        import time
+
+        from cswap_pin.proxy import PortHolder, ensure_ca, save_pin
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        save_pin(tmp_path, "a@example.com", "org-1")  # a pin IS set
+        holder = PortHolder(certdir, "1", "a@b.c")
+
+        spawns = []
+
+        def _fake_spawn():
+            spawns.append(1)
+            if len(spawns) >= 2:
+                holder._stop = True  # end the test here, not a real teardown
+            holder._proc = _ExitedProc(0)  # exits cleanly again next tick
+            holder.daemon_pid = 4242
+
+        holder._spawn = _fake_spawn
+        holder.start()
+        try:
+            deadline = time.monotonic() + 5
+            while len(spawns) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert len(spawns) >= 2, (
+                "a clean exit with the pin still set released the port "
+                f"instead of respawning: spawns={spawns!r}")
+        finally:
+            holder._stop = True
+            from conftest import _reap_pin_processes
+            _reap_pin_processes(certdir)
+
+    def case_CONTROL_a_clean_exit_with_no_pin_still_releases(self, tmp_path):
+        """The control for the case above: with nothing pinned, a clean
+        exit must still release exactly as it always has -- the respawn
+        must not become "never stop on a clean exit"."""
+        import time
+
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        # NO save_pin: nothing is pinned here.
+        holder = PortHolder(certdir, "1", "a@b.c")
+
+        spawns = []
+
+        def _fake_spawn():
+            spawns.append(1)
+            holder._proc = _ExitedProc(0)
+            holder.daemon_pid = 4242
+
+        holder._spawn = _fake_spawn
+        holder.start()
+        try:
+            deadline = time.monotonic() + 5
+            while holder._thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert not holder._thread.is_alive(), (
+                "_supervise never returned after the clean exit"
+            )
+            assert spawns == [1], (
+                "a clean exit with nothing pinned respawned instead of "
+                f"releasing: spawns={spawns!r}")
+        finally:
+            from conftest import _reap_pin_processes
+            _reap_pin_processes(certdir)
+
     def case_the_teardown_does_not_leave_the_standby_running(self, tmp_path):
         """`stop()` returning must mean the whole lineage let go — standby
         included, not just the daemon it stubs out here.
@@ -12801,6 +12925,45 @@ print("OK", port)
             st = read_daemon_state(certdir)
             assert st == {"port": port, "pid": os.getpid(), "fingerprint": "fp"}, (
                 "a still-serving displaced daemon's record was not restored: "
+                f"{st!r}"
+            )
+        finally:
+            srv.close()
+
+    def case_a_pid_namespace_invisible_but_healthy_displaced_pid_gets_its_record_restored(
+        self, tmp_path, monkeypatch
+    ):
+        """A daemon inside a container answers `os.kill` with ESRCH from a
+        host sharing $HOME and the network namespace but not the pid one --
+        exactly like a dead pid. `/health` on the recorded port, answering
+        with the recorded pid, is the same proof `_pid_alive` gives when it
+        CAN see the process."""
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        port = srv.getsockname()[1]
+        invisible_pid = 999999
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(
+            pin_proxy, "_health_pid",
+            lambda p, timeout=1.0: invisible_pid if p == port else None)
+        try:
+            pin_proxy.write_daemon_state(
+                certdir, port, invisible_pid, "fp", handover=True)
+            assert pin_proxy._clear_handover_mark(certdir) is True
+            st = pin_proxy.read_daemon_state(certdir)
+            assert st == {
+                "port": port, "pid": invisible_pid, "fingerprint": "fp"
+            }, (
+                "a displaced daemon whose pid this pid namespace cannot "
+                f"see, but whose own /health confirms it, was not restored: "
                 f"{st!r}"
             )
         finally:
@@ -16004,6 +16167,32 @@ class TestTheDaemonWatchesItsOwnCode:
             self._live_srv = None
 
 
+def _health_server(body: bytes | None):
+    """A loopback listener answering /health, or accepting and saying
+    nothing when ``body`` is None. Shared by every case that needs a real
+    daemon to probe rather than a stub."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            with c:
+                try:
+                    c.recv(4096)
+                    if body is not None:
+                        c.sendall(b"HTTP/1.0 200 OK\r\n\r\n" + body)
+                except OSError:
+                    pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
 class TestHealRestoresWithoutRestart:
     """A repaired pin must come back on the SAME port, with no session restart.
 
@@ -16270,6 +16459,64 @@ class TestHealRestoresWithoutRestart:
         assert pin_proxy.load_pin(root) is None, (
             "a stale receipt with none of its own keys in the config was "
             "mistaken for a live wiring")
+
+    def case_heal_neither_spawns_nor_kills_a_pid_namespace_invisible_but_healthy_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        """A record whose pid this pid namespace cannot see -- a container's
+        daemon, read by a host sharing $HOME and the network namespace but
+        not the pid one -- must not read as dead just because `os.kill`
+        cannot find it. Its own `/health`, answering with the recorded pid,
+        is the same proof `_pid_alive` gives when it CAN see the process.
+        `heal` must neither spawn a second daemon nor kill the live one over
+        such a record."""
+        from cswap_pin import proxy as pin_proxy
+
+        root, _cfg = self._root(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        fp = pin_proxy.daemon_fingerprint()
+        invisible_pid = 999999
+        srv, port = _health_server(
+            json.dumps({"can_pin": True, "pid": invisible_pid}).encode())
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: False)
+        spawn_calls, kill_calls = [], []
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a, **k: spawn_calls.append(a) or 1)
+        monkeypatch.setattr(pin_proxy, "_kill_daemon",
+                            lambda *a, **k: kill_calls.append(a))
+        try:
+            pin_proxy.write_daemon_state(certdir, port, invisible_pid, fp)
+            pin_proxy.heal(root)
+        finally:
+            srv.close()
+        assert not spawn_calls, (
+            "heal spawned a second daemon over one answering its own /health")
+        assert not kill_calls, (
+            "heal killed a daemon that is answering its own /health")
+
+    def case_CONTROL_a_pid_invisible_record_on_a_dead_port_is_not_reused(
+        self, tmp_path, monkeypatch
+    ):
+        """The control for the case above: `_pid_alive` returning False must
+        still mean dead when NOTHING answers the recorded port either -- the
+        `/health` fallback is not a blanket "trust the record"."""
+        from cswap_pin import proxy as pin_proxy
+
+        root, _cfg = self._root(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        fp = pin_proxy.daemon_fingerprint()
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+        probe.close()  # closed again: guaranteed nothing answers here
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: False)
+        spawn_calls = []
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                            lambda *a, **k: spawn_calls.append(a) or 45678)
+        pin_proxy.write_daemon_state(certdir, dead_port, 999999, fp)
+        pin_proxy.heal(root)
+        assert spawn_calls, (
+            "a dead pid on a dead port was still treated as reused")
 
 
 class TestTheGateDisarmsWhenThePinIsCleared:
@@ -16806,6 +17053,128 @@ class TestClearingThePinDoesNotStrandLiveSessions:
         finally:
             proxy.stop()
 
+    def case_a_live_client_is_not_torn_down_when_is_claimed_reads_false(
+        self, tmp_path, monkeypatch
+    ):
+        """`_is_claimed` reading False for a reason OTHER than "nothing is
+        using me" (its own docstring: a record naming another live pid ends
+        the claim on the spot) must not by itself tear down a daemon that
+        still has a live client. `watch_refcount` must ask directly, with
+        no real supersession in play here."""
+        import os
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import refcount_fifo_path, watch_refcount
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        monkeypatch.setattr(pin_proxy, "_is_claimed", lambda *a, **k: False)
+        monkeypatch.setattr(pin_proxy, "_superseded_on_the_port", lambda cd: False)
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set),
+            kwargs={"first_holder_timeout": 0.1, "live_clients": lambda: 1},
+            daemon=True,
+        ).start()
+        assert not fired.wait(timeout=0.3), (
+            "tore down a daemon with a live client because _is_claimed "
+            "alone said no")
+
+    def case_a_stale_live_pair_is_not_torn_down_through_the_eof_door(
+        self, tmp_path, monkeypatch
+    ):
+        """The EOF-recheck door, and NO quiet bound: a pair `_is_claimed`
+        would itself call wedged (quiet past `_DRAINING_MARKER_TTL`) still
+        counts here -- `watch_refcount`'s own veto is more conservative than
+        `_is_claimed`'s on purpose, because the record moving is not proof
+        THIS process let go of the pair. Guards the SECOND exit, not the
+        first-holder-timeout one above."""
+        import os
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import refcount_fifo_path, watch_refcount
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        monkeypatch.setattr(pin_proxy, "_is_claimed", lambda *a, **k: False)
+        monkeypatch.setattr(pin_proxy, "_superseded_on_the_port", lambda cd: False)
+        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 1)
+        monkeypatch.setattr(
+            pin_proxy._PUMP, "quiet_for",
+            lambda: pin_proxy._DRAINING_MARKER_TTL + 60.0)  # well past it
+        monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
+
+        holder = os.open(fifo, os.O_RDWR)  # a wrapper-launched session attaches
+        reached = _watch_blocking_phase(monkeypatch)
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set), daemon=True
+        ).start()
+        assert reached.wait(timeout=5.0), "watcher never reached the blocking read"
+        os.close(holder)  # the last FIFO holder leaves
+        assert not fired.wait(timeout=0.3), (
+            "tore down over a live pair quiet past the TTL — watch_refcount's "
+            "own veto must not inherit _is_claimed's quiet bound")
+
+    def case_CONTROL_nothing_live_still_tears_down(self, tmp_path, monkeypatch):
+        """0 clients, 0 pairs, not superseded: the veto above must not
+        become "never tear down"."""
+        import os
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import refcount_fifo_path, watch_refcount
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        monkeypatch.setattr(pin_proxy, "_is_claimed", lambda *a, **k: False)
+        monkeypatch.setattr(pin_proxy, "_superseded_on_the_port", lambda cd: False)
+        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 0)
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set),
+            kwargs={"first_holder_timeout": 0.1, "live_clients": lambda: 0},
+            daemon=True,
+        ).start()
+        assert fired.wait(timeout=5), (
+            "an idle, unclaimed, unsuperseded daemon lingered")
+
+    def case_CONTROL_a_real_supersession_still_tears_down(
+        self, tmp_path, monkeypatch
+    ):
+        """A real supersession must still let go, even with a live client --
+        that teardown already gets the uncapped handover drain elsewhere,
+        and this veto exists to protect a daemon nobody replaced, not to
+        keep a superseded one on life support."""
+        import os
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import refcount_fifo_path, watch_refcount
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        fifo = refcount_fifo_path(certdir)
+        os.mkfifo(fifo)
+        monkeypatch.setattr(pin_proxy, "_is_claimed", lambda *a, **k: False)
+        monkeypatch.setattr(pin_proxy, "_superseded_on_the_port", lambda cd: True)
+        fired = threading.Event()
+        threading.Thread(
+            target=watch_refcount, args=(fifo, fired.set),
+            kwargs={"first_holder_timeout": 0.1, "live_clients": lambda: 1},
+            daemon=True,
+        ).start()
+        assert fired.wait(timeout=5), (
+            "a real supersession did not tear down despite a live client")
+
 
 class TestABlindDaemonIsNotReusedForever:
     """A daemon that cannot read the pinned credential must be recycled.
@@ -17112,7 +17481,7 @@ class TestAWedgeIsNotTrustedForever:
             proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
         monkeypatch.setattr(
             proxy, "_kill_daemon",
-            lambda pid, certdir=None: kills.append(pid))
+            lambda pid, certdir=None, **k: kills.append(pid))
         monkeypatch.setattr(
             proxy, "_spawn_daemon", lambda n, e, c, **k: port + 1)
         try:
@@ -17125,6 +17494,155 @@ class TestAWedgeIsNotTrustedForever:
                 "it")
         finally:
             srv.close()
+
+    def case_heal_never_kills_a_wedge_still_carrying_live_worker_traffic(
+            self, tmp_path, monkeypatch):
+        """Same shape as the case above, and the control there (a STALE
+        worker-alive stamp) must still recycle -- this one differs only in
+        one fact: `worker-alive.json` carries a stamp from THIS SECOND.
+        `/health` missing is not proof of death when the request path is
+        demonstrably still moving traffic; killing here would cut sessions
+        `/health`'s own deadlock says nothing about."""
+        from cswap_pin import proxy
+
+        fp = proxy.daemon_fingerprint()
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+
+        def _accept_until_closed():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                conn.close()
+        threading.Thread(target=_accept_until_closed, daemon=True).start()
+
+        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        (certdir / "proxy.json").write_text(json.dumps(
+            {"pid": os.getpid(), "port": port, "fingerprint": fp}))
+        (certdir / "ca.pem").write_bytes(b"x")
+        # FRESH: written NOW, well inside `_STREAM_LIVE_SECONDS`.
+        (certdir / proxy._ALIVE_FILE).write_text(
+            json.dumps({"cse_x": time.time()}))
+        (tmp_path / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "c@e.com"}}))
+        (tmp_path / "sequence.json").write_text(json.dumps(
+            {"accounts": {"1": {"email": "c@e.com"}}}))
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"CSWAP_PIN_PORT": str(port),
+                    "HTTPS_PROXY": f"http://127.0.0.1:{port}"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }))
+        import claude_swap.paths as paths
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(
+            paths, "get_default_global_config_path", lambda: cfg)
+
+        kills = []
+        monkeypatch.setattr(
+            proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
+        monkeypatch.setattr(
+            proxy, "_kill_daemon",
+            lambda pid, certdir=None, **k: kills.append(pid))
+        try:
+            result = proxy.heal(tmp_path)
+            assert kills == [], (
+                "heal killed a daemon that just carried live worker "
+                f"traffic: kills={kills!r}")
+            assert result is False, (
+                "heal must report nothing done, not a recycle it never made")
+        finally:
+            srv.close()
+
+    def case_a_wedged_daemon_under_a_holder_is_replaced_through_the_holder(
+            self, tmp_path, monkeypatch):
+        """A truly wedged daemon (misses /health, stale worker-alive) that is
+        under a holder must be replaced SUCCESSOR FIRST through the holder:
+        SIGUSR1 to the holder, wait for a fresh record, THEN terminate the
+        old pid -- never SIGTERM followed by heal spawning a second daemon
+        of its own, which would race the holder for the port. Same pattern
+        as `_on_replace_request`'s own protocol cases: call the signal path
+        directly and assert what it did, not `os.kill` on a real process."""
+        import signal
+
+        from cswap_pin import proxy
+
+        root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        fp = proxy.daemon_fingerprint()
+        stale_pid, holder_pid, new_pid = 55501, 55502, 55503
+        proxy.write_daemon_state(certdir, 4100, stale_pid, "STALE-FP")
+
+        def _fake_read_alive_port(cd, fingerprint=None):
+            st = proxy.read_daemon_state(cd)
+            if not st:
+                return None
+            if fingerprint is not None and st.get("fingerprint") != fingerprint:
+                return None
+            return st.get("port")
+
+        monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
+        monkeypatch.setattr(proxy, "_watchdog_had_its_turn", lambda *a: True)
+        monkeypatch.setattr(proxy, "_worker_alive_age", lambda cd: None)
+        monkeypatch.setattr(proxy, "_holder_owns", lambda cd: True)
+        monkeypatch.setattr(
+            proxy, "_wedged_parent_holder",
+            lambda pid, cd: holder_pid if pid == stale_pid else None)
+        monkeypatch.setattr(proxy, "_pid_alive", lambda pid: pid != stale_pid)
+
+        signalled, killed = [], []
+
+        def _fake_kill(pid, sig):
+            if pid == holder_pid and sig == proxy._REPLACE_ME_SIGNAL:
+                signalled.append(pid)
+                proxy.write_daemon_state(certdir, 4100, new_pid, fp)
+                return
+            if pid == stale_pid and sig == 15:
+                killed.append(pid)
+                return
+            raise AssertionError(f"unexpected os.kill({pid}, {sig})")
+        monkeypatch.setattr(proxy.os, "kill", _fake_kill)
+
+        spawn_calls = []
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda *a, **k: spawn_calls.append(a) or 99999)
+
+        assert proxy._REPLACE_ME_SIGNAL == signal.SIGUSR1, (
+            "no 'replace me' channel on this platform -- the case below is "
+            "vacuous without it")
+        proxy.heal(root)
+        assert signalled == [holder_pid], (
+            "the wedged daemon's own holder never got asked for a successor")
+        assert killed == [stale_pid], (
+            "the old pid was never terminated after the successor appeared")
+        assert not spawn_calls, (
+            "heal spawned a second daemon instead of trusting the holder's "
+            "successor -- exactly the double-bind `_recycle_daemon` exists "
+            "to avoid")
+
+    def _root_for_heal(self, tmp_path, monkeypatch):
+        import claude_swap.paths as paths
+        from cswap_pin.proxy import save_pin
+
+        root = tmp_path / "backup"
+        root.mkdir()
+        (root / "pin-proxy").mkdir()
+        save_pin(root, "a@example.com", "org-1")
+        (root / "sequence.json").write_text(json.dumps(
+            {"accounts": {"1": {"email": "a@example.com"}}}))
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text("{}")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        return root, cfg
 
 
 class TestAnAnswerBeforeAResetIsStillAnAnswer:
@@ -17828,7 +18346,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         # reused freely, and killing on liveness alone aims TERM at whatever
         # unrelated process inherited the number.
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None, **k: killed.append(pid))
 
         def _spawn(num, email, cd, **kw):
             spawned.append((num, email))
@@ -17886,7 +18404,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         killed, spawned = [], []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
         monkeypatch.setattr(proxy, "_kill_daemon",
-                            lambda pid, certdir=None: killed.append(pid))
+                            lambda pid, certdir=None, **k: killed.append(pid))
         monkeypatch.setattr(proxy, "_spawn_daemon",
                             lambda n, e, c, **k: spawned.append(n))
         try:
@@ -17914,7 +18432,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         killed = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
         monkeypatch.setattr(proxy, "_kill_daemon",
-                            lambda pid, certdir=None: killed.append(pid))
+                            lambda pid, certdir=None, **k: killed.append(pid))
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: 1)
         try:
             proxy.heal(tmp_path)
@@ -17943,7 +18461,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         hint_at_kill = {}
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
 
-        def _kill(pid, certdir=None):
+        def _kill(pid, certdir=None, **k):
             # Whatever the successor can reclaim, it can only be what was on
             # disk at THIS moment.
             hint_at_kill["port"] = proxy.read_port_hint(certdir)
@@ -17974,7 +18492,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         monkeypatch.setattr(
             proxy,
             "_kill_daemon",
-            lambda pid, certdir=None: pytest.fail("recycled a daemon running CURRENT code"),
+            lambda pid, certdir=None, **k: pytest.fail("recycled a daemon running CURRENT code"),
         )
         try:
             assert proxy.heal(tmp_path) is False
@@ -18016,7 +18534,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         )
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda d: [os.getpid()])
         monkeypatch.setattr(proxy, "_kill_daemon",
-                            lambda pid, certdir=None: None)
+                            lambda pid, certdir=None, **k: None)
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: 1)
         try:
             proxy.heal(tmp_path)                  # defers, records the sighting
@@ -18039,7 +18557,7 @@ class TestAnUpgradeDoesNotWaitForALaunch:
         monkeypatch.setattr(
             proxy,
             "_kill_daemon",
-            lambda pid, certdir=None: pytest.fail("signalled a pid it could not identify"),
+            lambda pid, certdir=None, **k: pytest.fail("signalled a pid it could not identify"),
         )
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         try:
@@ -18500,7 +19018,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         )
         killed = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: killed.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None, **k: killed.append(pid))
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: None)
         try:
             proxy.heal(tmp_path)
@@ -18530,7 +19048,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         )
         kills = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: kills.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None, **k: kills.append(pid))
         monkeypatch.setattr(proxy, "_spawn_daemon", lambda n, e, c, **k: port)
         try:
             for _ in range(5):
@@ -18557,7 +19075,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         )
         spawns = []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [os.getpid()])
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: None)
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None, **k: None)
         monkeypatch.setattr(
             proxy, "_spawn_daemon", lambda n, e, c, **k: spawns.append(n) or port
         )
@@ -18584,7 +19102,7 @@ class TestTheRecycleCannotBecomeTheOutage:
         certdir, port, cfg, srv = self._fixture(tmp_path, monkeypatch)
         kills, spawns = [], []
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [])  # no ps
-        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None: kills.append(pid))
+        monkeypatch.setattr(proxy, "_kill_daemon", lambda pid, certdir=None, **k: kills.append(pid))
         monkeypatch.setattr(
             proxy, "_spawn_daemon", lambda n, e, c, **k: spawns.append(n) or port
         )
