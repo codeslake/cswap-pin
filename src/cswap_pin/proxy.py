@@ -8408,7 +8408,7 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
         return False
 
 
-def _is_claimed(certdir: Path, live_clients=None) -> bool:
+def _is_claimed(certdir: Path, live_clients=None, republish=None) -> bool:
     """True when the global wiring names THIS daemon, holder or no holder.
 
     A FIFO holder is not the only way to claim a daemon, and it is not even the
@@ -8444,11 +8444,36 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
     Linux-only: on macOS it returns None, and None was being read as "not
     claimed" — turning the one check that protects a live session into a
     guaranteed false on the platform where the pin is used most.
+
+    A MISSING RECORD IS NOT A HANDOVER EITHER. `not st` used to end the claim
+    on its own, on the premise that a record naming someone else and a record
+    naming no one prove the same thing. They do not: a live daemon's own
+    ``proxy.json`` can go missing out from under it (`_clear_handover_mark`
+    deleting a mark whose displaced pid turned out to still be serving —
+    measured 2026-09-24 00:39-00:41Z, 22 channels and 16 requests cut) without
+    that daemon having gone anywhere. Only a record that names ANOTHER pid
+    that is actually ALIVE is evidence someone else owns it; that is a real
+    handover and ends the claim at once, same as before. Anything else —
+    missing, unreadable, or naming a pid that is no longer running — proves
+    nothing, so ``republish`` (when the caller has one) re-asserts our own
+    record the way ``ensure_wired_to`` re-asserts the global wiring, and the
+    checks below get to run on it.
     """
     try:
         st = read_daemon_state(certdir)
+        if st and int(st["pid"]) != os.getpid():
+            other = int(st["pid"])
+            if _pid_alive(other):
+                return False  # another LIVE daemon's record — a real handover
+            st = None  # a dead pid's record proves nothing either way
+        if not st and republish is not None:
+            try:
+                republish()
+            except Exception:
+                pass
+            st = read_daemon_state(certdir)
         if not st or int(st["pid"]) != os.getpid():
-            return False  # not our record — say nothing about our own liveness
+            return False  # still nothing naming us — say nothing about our own liveness
         port = int(st["port"])
         if _wired_port() == port:
             # Remember it, because this is the ONLY moment that proves we are
@@ -8479,6 +8504,24 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
                     return True
             except Exception:
                 pass
+        # A CHANNEL IS A CLAIM TOO, AND `live_clients` CANNOT SEE ONE. Once a
+        # CONNECT reaches its 101 and becomes an opaque Remote Control tunnel,
+        # `_close_open_connections`/`live_client_count` no longer track its
+        # socket at all (`_PUMP` runs it instead) — measured, the incident
+        # this whole function exists to close had 22 of them open when the
+        # daemon was torn down and none of them counted here.
+        #
+        # THE SAME SILENCE BOUND `await_inflight` USES, or this and that
+        # function disagree about what a pair means. `await_inflight` treats
+        # a pair quiet past `_DRAINING_MARKER_TTL` as WEDGED, not live, and
+        # releases it (c5aa0ad, d4167e0 — a wall clock could not tell a
+        # talking peer from a wedged one, so silence became the discriminator).
+        # Without the same bound here, `live_pairs() > 0` alone claims the
+        # daemon forever on exactly one wedged pair — the teardown that would
+        # have reached `await_inflight` and released it never fires, because
+        # `watch_refcount` never gets past this check.
+        if _PUMP.live_pairs() > 0 and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL:
+            return True
         live = clients_that_arming_would_cut_off(port)
         if live is None:
             # Unmeasurable, and the daemon's own count said zero (or was not
@@ -8490,11 +8533,69 @@ def _is_claimed(certdir: Path, live_clients=None) -> bool:
         return False
 
 
+def _republish_own_record(
+    certdir: Path, port: int, pid: int, fingerprint: str,
+    still_accepting: bool, live_clients=None,
+) -> None:
+    """Re-assert this daemon's own ``proxy.json`` — ONLY when every signal
+    says this process is still the one actually serving ``port``.
+
+    `_is_claimed` calls whatever ``republish`` it is handed from a process
+    whose record has gone missing, which is also exactly what a DRAINING
+    PREDECESSOR looks like right after a handover: `_spawn_daemon` marked it,
+    spawned a successor, and the predecessor's own ``watch_refcount`` thread
+    is still ticking in the background with nothing new on disk. An
+    unconditional write there is a real incident, not a hypothetical one: if
+    that predecessor rewrites ``proxy.json`` naming itself, `_spawn_daemon`'s
+    wait (run by whatever is trying to replace a successor that died) reads a
+    record and calls the spawn done, `_sweep_orphan_daemons(keep_pid=
+    <predecessor>)` TERMs the real, freshly spawned successor as an orphan,
+    and the standby reads the predecessor's record and believes a live daemon
+    already holds the port — when the predecessor gave up its listener the
+    moment the handover began.
+
+    THREE GATES, all independent evidence, all required:
+
+    - ``not this_process_is_draining()``: the process has announced no
+      handover. `release_listener` runs very shortly after
+      `announce_draining` on every handover path in this module, but not
+      atomically with it, so this is not redundant with the gate below — it
+      closes the announcement-to-release window too.
+    - ``still_accepting``: THIS process's own listener is still open. The
+      caller passes ``proxy._srv is not None`` — `release_listener` (called
+      at the start of every handover, before the drain) nils it, so a
+      process past that point can never get here again regardless of what
+      the draining marker says yet.
+    - A claim already holds: a live client, a live Remote Control tunnel, or
+      the global wiring already naming this port. Without one of these there
+      is nothing established to protect, and republishing would manufacture
+      a claim rather than preserve one.
+    """
+    if this_process_is_draining():
+        return
+    if not still_accepting:
+        return
+    claimed = (
+        (live_clients is not None and live_clients() > 0)
+        # THE SAME SILENCE BOUND `_is_claimed` USES (~8523): a pair quiet
+        # past `_DRAINING_MARKER_TTL` is WEDGED, not live, per
+        # `await_inflight`. Unbounded here undoes that bound from the
+        # writing side — a wedged pair `_is_claimed` would refuse to count
+        # still gets a fresh record republished for it.
+        or (_PUMP.live_pairs() > 0 and _PUMP.quiet_for() <= _DRAINING_MARKER_TTL)
+        or _wired_port() == port
+    )
+    if not claimed:
+        return
+    write_daemon_state(certdir, port, pid, fingerprint, ungated=True)
+
+
 def watch_refcount(
     fifo: str | Path,
     on_last_holder_gone,
     first_holder_timeout: float | None = None,
     live_clients=None,
+    republish=None,
 ) -> None:
     """Block on ``fifo`` until every write-holder closes, then call
     ``on_last_holder_gone``. This is a supervisor holding `cat FIFO`:
@@ -8527,6 +8628,11 @@ def watch_refcount(
     (their ``HTTPS_PROXY`` is fixed at exec), so they got ConnectionRefused
     and retried forever. Teardown now means "no holder and nothing else
     claims us", whichever door it arrives by.
+
+    ``republish`` is handed straight to ``_is_claimed``: a zero-arg callable
+    that re-asserts THIS daemon's own ``proxy.json`` when the record has gone
+    missing or stale, so a claim this function would otherwise keep serving
+    is not lost to a state file another path deleted out from under it.
     """
     timeout = _FIRST_HOLDER_TIMEOUT if first_holder_timeout is None else first_holder_timeout
     # O_NONBLOCK on a read-only FIFO open never blocks (POSIX), so this cannot
@@ -8562,7 +8668,7 @@ def watch_refcount(
                 # ...which is NOT the same as "nobody is using me". A globally
                 # wired session never opens the FIFO, so check the wiring
                 # before concluding we are an orphan (see ``_is_claimed``).
-                if _is_claimed(Path(fifo).parent, live_clients):
+                if _is_claimed(Path(fifo).parent, live_clients, republish):
                     deadline = _time.monotonic() + timeout  # re-arm and re-check
                     continue
                 on_last_holder_gone()  # nobody ever attached — do not linger
@@ -8593,7 +8699,7 @@ def watch_refcount(
                 # HTTPS_PROXY fixed at exec: the ConnectionRefused loop
                 # ``_is_claimed`` exists to prevent, arriving by the one door
                 # that never asked it.
-                if _is_claimed(Path(fifo).parent, live_clients):
+                if _is_claimed(Path(fifo).parent, live_clients, republish):
                     _time.sleep(_CLAIM_RECHECK_INTERVAL)
                     continue  # still referenced — keep serving, re-check
                 on_last_holder_gone()
@@ -9754,15 +9860,29 @@ class PortHolder:
 
     def _supervise(self) -> None:
         while not self._stop:
-            code = self._proc.wait()
+            # CAPTURED BEFORE THE WAIT, so it still names the PREDECESSOR
+            # after `wait()` returns, whatever `self._proc` has become by
+            # then. `_on_replace_request` reassigns `self._proc` to the
+            # successor as `_spawn()`'s very last line, and only THEN sets
+            # `self._replacing = True` — two statements, not one, and the
+            # predecessor's own exit is asked for across a process boundary
+            # (`os.kill`, a 0.25s settle, a drain that can be instant with
+            # nothing inflight). Nothing orders that exit after the SECOND
+            # statement, only after the first, so `self._replacing` alone
+            # can still read False here on a genuine handover — and reading
+            # it that way calls `stop()` on the successor's own socket.
+            proc = self._proc
+            code = proc.wait()
             if self._stop:
                 return
             # A HANDOVER, NOT A RELEASE. The predecessor asked us to replace it
             # while it was still serving, we did, and it then drained and left
             # with 0. That 0 means "released — do not restart" everywhere else,
             # and acting on it here would close the listening socket the
-            # successor is already accepting on.
-            if self._replacing:
+            # successor is already accepting on. `self._proc is not proc` is
+            # independent proof of the same thing, and closes the race above:
+            # `_spawn()` reassigns it before `self._replacing` is ever set.
+            if self._replacing or self._proc is not proc:
                 self._replacing = False
                 _log_lifecycle(
                     f"daemon {code} retired after handing over — successor "
@@ -9790,10 +9910,17 @@ class PortHolder:
                     f"daemon {self.daemon_pid} exited cleanly — releasing port "
                     f"{self.port}"
                 )
-                try:
-                    self._srv.close()
-                except OSError:
-                    pass
+                # `stop()`, NOT A BARE CLOSE. Closing only our own listener
+                # left the standby holding its OWN dup of the same descriptor,
+                # un-signalled — still LISTENing, still completing handshakes
+                # into a backlog nobody ever drains. Measured: port 36301
+                # accepted connects and answered nothing for 13 minutes after
+                # exactly this exit, until a human ran `cswap pin --heal`.
+                # `stop()` SIGHUPs the standby and confirms it gone before
+                # closing our own socket (see its own docstring for why that
+                # order matters), so a session that dials afterwards gets
+                # ConnectionRefused at once instead of queueing forever.
+                self.stop()
                 return
             if code == _RESTART_ME_CODE:
                 # A REDEPLOY, not a teardown. Respawn at once and skip the
@@ -10405,9 +10532,22 @@ def _clear_handover_mark(certdir: Path) -> bool:
 
     The mark means "a successor is coming"; leaving it after nothing came would
     make the caller's own teardown read "superseded" and keep the wiring
-    pointing at a port nobody serves. The record described a daemon that has
-    already stopped, so there is nothing left to preserve — the port to reclaim
-    lives in the hint (see ``read_port_hint``).
+    pointing at a port nobody serves. USUALLY the record described a daemon
+    that has already stopped, so there is nothing left to preserve — the port
+    to reclaim lives in the hint (see ``read_port_hint``).
+
+    BUT "no successor published a record" IS NOT "the predecessor is gone".
+    A holder that finds the port already answering exits without ever
+    spawning one (736bb88) — correctly, because a healthy daemon is already
+    there — and the wait loop above still times out with nothing new on
+    disk. Deleting the mark then erases the record of a daemon that never
+    stopped: `_is_claimed` reads the missing file as unclaimed and
+    `watch_refcount` tears the live daemon down underneath its own open
+    connections. Measured 2026-09-24 00:39:13-00:41:13Z: daemon 2147854
+    stayed up through the whole window, was marked as departing, and was
+    torn down 2 minutes later with 22 channels and 16 requests still live.
+    So the displaced pid is checked before the record is discarded, and a
+    still-serving one gets its record RESTORED instead.
 
     RETURNS WHETHER THE MARK IS GONE. The unlink swallowed every OSError and
     returned nothing either way, so a record that could NOT be removed — a
@@ -10423,6 +10563,71 @@ def _clear_handover_mark(certdir: Path) -> bool:
     st = read_daemon_state(certdir)
     if not (st and st.get("handover")):
         return True
+    try:
+        pid = int(st.get("pid") or 0)
+        port = int(st.get("port") or 0)
+    except (TypeError, ValueError):
+        pid = port = 0
+    # STILL ALIVE AND STILL SERVING, not merely alive: a pid can survive a
+    # crash of the socket it held (or belong to something else entirely by
+    # the time we look), and restoring a record for a daemon that no longer
+    # answers its port would be its own outage — every reader would believe
+    # a pin is up when nothing is behind it.
+    if pid and port and _pid_alive(pid) and _port_answers(port):
+        # RE-READ, IMMEDIATELY BEFORE THE WRITE. `_pid_alive` and
+        # `_port_answers` cost real wall time (a signal-0, a 0.5s connect
+        # budget), and a successor can publish its own record in exactly
+        # that window — `_spawn_daemon`'s own wait is racing this function.
+        # Writing the snapshot read at the TOP of this call would overwrite
+        # that fresh, correct record with a stale one, so the write only
+        # goes ahead if the mark on disk is still the SAME one: same pid,
+        # still a handover. Anything else means somebody already handled
+        # it — a successor published, or another caller already cleared or
+        # restored it — and there is nothing left for us to do here.
+        current = read_daemon_state(certdir)
+        if not (current and current.get("handover")
+                and int(current.get("pid") or 0) == pid):
+            _log_lifecycle(
+                f"{pid}'s handover mark changed while checking it was "
+                f"still serving {port} — leaving whatever is there now "
+                f"alone"
+            )
+            return True
+        try:
+            write_daemon_state(
+                certdir, port, pid, st.get("fingerprint") or "",
+                # CARRIED THROUGH, NEVER INVENTED — same reasoning as the
+                # mark written in `_spawn_daemon`: this restores the
+                # DISPLACED daemon's own record, so its capability is
+                # whatever it already was.
+                ungated=bool(st.get(_PLAIN_RELAY_UNGATED_KEY)),
+            )
+            _log_lifecycle(
+                f"no successor came, and {pid} is still serving {port} — "
+                f"restoring its record instead of deleting it"
+            )
+            return True
+        except OSError as exc:
+            _log_lifecycle(
+                f"could not restore {pid}'s record ({exc}) — falling back "
+                f"to clearing the mark"
+            )
+    # RE-READ, IMMEDIATELY BEFORE THE UNLINK — same reasoning as the restore
+    # branch above. `_pid_alive`/`_port_answers` cost real wall time, and a
+    # successor can publish its own record in exactly that window; deleting
+    # the snapshot read at the TOP of this call would then delete the
+    # successor's fresh record, not the stale mark. Skipped when `pid` was
+    # never known (the unparseable-record fallback above) — there is no
+    # "same pid" to check for, and the original behaviour there is unchanged.
+    if pid:
+        current = read_daemon_state(certdir)
+        if not (current and current.get("handover")
+                and int(current.get("pid") or 0) == pid):
+            _log_lifecycle(
+                f"{pid}'s handover mark changed while deciding whether to "
+                f"clear it — leaving whatever is there now alone"
+            )
+            return True
     try:
         (Path(certdir) / _STATE_FILE).unlink()
         return True
@@ -11919,9 +12124,24 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     threading.Thread(
         target=watch_refcount,
         args=(fifo, _teardown),
-        # The daemon's own connection count, so "is anyone using me" has an
-        # answer on macOS too (/proc/net/tcp does not exist there).
-        kwargs={"live_clients": proxy.live_client_count},
+        kwargs={
+            # The daemon's own connection count, so "is anyone using me" has
+            # an answer on macOS too (/proc/net/tcp does not exist there).
+            "live_clients": proxy.live_client_count,
+            # SAME VALUES AS THE START-OF-DAY WRITE ABOVE. If our own record
+            # ever goes missing while we are still serving — a stray delete,
+            # `_clear_handover_mark` racing this daemon's own restore — this
+            # is what `_is_claimed` calls to put it back before deciding we
+            # are unclaimed. GATED, not unconditional — see
+            # `_republish_own_record`: this same thread keeps ticking in a
+            # DRAINING predecessor after a handover, and writing there names
+            # a process that no longer accepts as the daemon.
+            "republish": lambda: _republish_own_record(
+                certdir, proxy.port, os.getpid(), _OWN_FINGERPRINT,
+                still_accepting=proxy._srv is not None,
+                live_clients=proxy.live_client_count,
+            ),
+        },
         daemon=True,
     ).start()
     # BOUNDED, so a signal callback actually RUNS. CPython executes a signal
