@@ -11754,30 +11754,17 @@ def _connect_probe(sock: "socket.socket") -> int:
     queued request and sat on it for the client's full 60s, which is worse than
     the drop it replaced.
 
-    Dialling our own address separates the two states: a LISTENING socket
-    completes the handshake from the backlog, a bound-but-never-listened one
-    usually answers ECONNREFUSED and sometimes just never answers (see
-    below). Skipping the probe entirely was tried first and is wrong —
-    `case_a_listening_socket_is_adopted_where_SO_ACCEPTCONN_cannot_be_read`
-    exists because adopting a non-listening descriptor is a real failure,
-    and it caught this immediately.
+    Dialling our own address separates the two states on every platform: a
+    LISTENING socket completes the handshake from the backlog, a bound-but-
+    never-listened one answers ECONNREFUSED. Skipping the probe entirely was
+    tried first and is wrong — `case_a_listening_socket_is_adopted_where_
+    SO_ACCEPTCONN_cannot_be_read` exists because adopting a non-listening
+    descriptor is a real failure, and it caught this immediately.
 
     Costs one connection queued on our own backlog, which we close at once. The
     daemon that later drains it sees a client that hung up, which every proxy
-    already handles.
-
-    MEASURED ON MACOS: a bound-but-never-listened socket does not always
-    answer with an immediate `ConnectionRefusedError` there — the connect can
-    hang past a 1s budget instead, which an earlier version of this probe
-    read as "only a listening socket can make a connect hang, by having a
-    full queue" and returned 1. It does not: on macOS 76-case
-    `case_a_listening_socket_is_adopted_where_SO_ACCEPTCONN_cannot_be_read`
-    and `case_a_passed_fd_that_is_not_a_listener_is_refused` both adopted a
-    socket that was never listened on. A timeout or any other error is
-    therefore read as NOT listening, same as a refusal: this function's
-    caller already treats "not listening" as safe to refuse (it binds a
-    fresh port instead), while trusting an unproven fd adopts a descriptor
-    that silently answers nothing — the worse failure of the two.
+    already handles. A TIMEOUT counts as listening: only a listening socket can
+    make a connect hang, by having a full queue.
     """
     try:
         addr = sock.getsockname()
@@ -11786,8 +11773,14 @@ def _connect_probe(sock: "socket.socket") -> int:
     try:
         with socket.create_connection(addr[:2], timeout=1.0):
             return 1
-    except OSError:
+    except ConnectionRefusedError:
         return 0
+    except (TimeoutError, socket.timeout):
+        return 1
+    except OSError:
+        # Anything else is not evidence of "never listened"; refusing here
+        # would strand the sessions this handover exists to keep.
+        return 1
 
 
 def _accept_probe(sock: "socket.socket") -> int:

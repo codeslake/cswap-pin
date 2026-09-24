@@ -9551,6 +9551,27 @@ class TestDaemonPortStability:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    def _accept_conn_readable(self) -> bool:
+        """Whether THIS platform can read SO_ACCEPTCONN off a live socket.
+
+        Real Darwin cannot (measured, OSError 42). Where it cannot,
+        `_connect_probe`'s own fallback cannot tell a full backlog from a
+        never-listened fd (its own docstring), so a case built on "the
+        fallback refuses a never-listened fd reliably" does not hold there —
+        production never hands one down, so that gap is a ceiling, not a
+        defect, and the case must skip the assertion rather than make it.
+        """
+        import socket
+
+        probe = socket.socket()
+        try:
+            probe.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
     def case_a_real_spawned_successor_drops_no_connection(
         self, tmp_path, monkeypatch
     ):
@@ -10006,6 +10027,10 @@ print("OK", port)
                 raise OSError(42, "Protocol not available")
             return real_getsockopt(self, level, optname, *a)
 
+        # TAKEN BEFORE THE MONKEYPATCH below forces every caller into the
+        # fallback the mock exists to simulate — see `_accept_conn_readable`.
+        accept_conn_readable = self._accept_conn_readable()
+
         monkeypatch.setattr(socket.socket, "getsockopt", _darwin)
 
         lsn = socket.socket()
@@ -10023,6 +10048,9 @@ print("OK", port)
             )
             adopted.detach()  # the fixture owns this fd
 
+            if not accept_conn_readable:
+                return
+
             # AND THE GUARD STILL GUARDS. A socket that was never listened on
             # must still be refused, or the fix is just a removed check.
             s2 = socket.socket()
@@ -10033,6 +10061,82 @@ print("OK", port)
             )
             s2.close()
         finally:
+            lsn.close()
+
+    def case_a_full_backlog_where_SO_ACCEPTCONN_cannot_be_read_is_still_adopted(
+        self, tmp_path, monkeypatch
+    ):
+        """A real listener with a FULL queue must be adopted, not refused.
+
+        `_connect_probe` cannot tell "never listened" from "listening with no
+        room": both leave its own connect hanging until its 1.0s budget
+        expires. Reading a timeout as "not listening" (as this daemon did
+        between 496b9fd and this commit) is the worse of the two failures —
+        the loaded case is a holder mid-handover whose queue is full of
+        already-accepted clients, and refusing it there strands them for the
+        full 10s drain ceiling, then lets the holder SIGHUP every standby and
+        ends `standby_main` with no respawn. A never-listened fd being handed
+        down is not something production does.
+
+        Runs on Linux by stubbing SO_ACCEPTCONN to raise, the same way real
+        Darwin's own kernel refuses it, and by filling the backlog for REAL —
+        a mocked `socket.create_connection` would only prove this test's own
+        mock, not that a genuine timeout reads as listening.
+        """
+        import socket
+
+        from cswap_pin import proxy as pin_proxy
+
+        real_getsockopt = socket.socket.getsockopt
+
+        def _darwin(self, level, optname, *a):
+            if (level, optname) == (socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+                raise OSError(42, "Protocol not available")
+            return real_getsockopt(self, level, optname, *a)
+
+        monkeypatch.setattr(socket.socket, "getsockopt", _darwin)
+
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(0)
+        addr = lsn.getsockname()
+
+        # FILL IT FOR REAL. A client that completes the handshake and is
+        # never accept()ed occupies the queue; once it is full the next SYN
+        # is silently dropped (this box's default,
+        # tcp_abort_on_overflow=0) instead of refused, so the following
+        # connect times out rather than raising ECONNREFUSED straight away —
+        # `listen(0)`'s own admitted count is a kernel detail, so this probes
+        # for the fill point instead of assuming it.
+        clients = []
+        try:
+            for _ in range(200):
+                c = socket.socket()
+                c.settimeout(0.3)
+                try:
+                    c.connect(addr)
+                    clients.append(c)
+                except OSError:
+                    c.close()
+                    break
+            else:
+                raise AssertionError(
+                    "never filled the backlog — the queue kept accepting"
+                )
+
+            monkeypatch.setenv(pin_proxy._HANDDOWN_FD_ENV, str(lsn.fileno()))
+            monkeypatch.setenv(pin_proxy._HANDDOWN_FROM_ENV, str(os.getppid()))
+            adopted = pin_proxy._handed_down_listener()
+            assert adopted is not None, (
+                "a real listener with a full accept queue was refused — a "
+                "connect to it timed out for the same reason a connect to a "
+                "never-listened socket does, and refusing on that signal "
+                "strands a live handover to treat a dead one safely"
+            )
+            adopted.detach()  # the fixture owns this fd
+        finally:
+            for c in clients:
+                c.close()
             lsn.close()
 
     def case_a_spawn_without_a_handdown_does_not_pass_the_variables_on(
@@ -11672,6 +11776,10 @@ print("OK", port)
             "str(os.getpid())",
         ), "adopted a non-listener"
 
+        # See `_accept_conn_readable`: where it cannot, the never-listened
+        # check below is not reliable and must be skipped, not asserted.
+        accept_conn_readable = self._accept_conn_readable()
+
         # The hand-down variables, same guard. A grandchild inherits them but
         # NOT the fd (Popen closes what it does not pass), so without the
         # parentage check it adopts whatever that number now refers to.
@@ -11692,6 +11800,9 @@ print("OK", port)
             # The adopted object OWNS the fd; letting it be collected would
             # close lsn2's descriptor out from under the fixture.
             adopted.detach()
+
+            if not accept_conn_readable:
+                return
 
             s3 = socket.socket()
             s3.bind(("127.0.0.1", 0))
