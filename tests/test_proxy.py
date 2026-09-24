@@ -11787,28 +11787,30 @@ print("OK", port)
             # appears, which can precede the holder being visible in `ps`.
             deadline = time.time() + 10
             while time.time() < deadline:
-                # /proc, NOT ps. Inside pytest the `ps` output arrived with
-                # the command line truncated mid-argument ("--hold-port 0 1
-                # a@"), so a certdir match could never succeed — the same
-                # class of trap as `pgrep -f` reading argv while the value is
-                # in the environment.
-                found = False
-                for entry in pathlib.Path("/proc").glob("[0-9]*"):
-                    try:
-                        cl = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
-                    except OSError:
-                        continue
-                    line = cl.decode(errors="replace")
-                    if "--hold-port" in line and str(tmp_path) in line:
-                        found = True
-                        break
+                # `-ww`, NOT bare `ps`. Bare `ps -eo command=` truncated to
+                # COLUMNS (pytest sets 80), so a certdir match could never
+                # succeed — the same class of trap as `pgrep -f` reading argv
+                # while the value is in the environment. `/proc` was tried as
+                # a Linux-only replacement and does not exist on macOS;
+                # `-ww` (unbounded width, on both GNU and BSD ps — see
+                # `_reap_pin_processes` in conftest.py) reads the full line
+                # on either platform without it.
+                out = subprocess.run(
+                    ["ps", "-ww", "-eo", "pid=,command="],
+                    capture_output=True, text=True,
+                ).stdout
+                found = any(
+                    "--hold-port" in line and str(tmp_path) in line
+                    for line in out.splitlines()
+                )
                 if found:
                     break
                 time.sleep(0.2)
             else:
                 log = tmp_path / "daemon.log"
                 out = subprocess.run(
-                    ["ps", "-eo", "pid=,command="], capture_output=True, text=True
+                    ["ps", "-ww", "-eo", "pid=,command="],
+                    capture_output=True, text=True,
                 ).stdout
                 raise AssertionError(
                     f"no holder came up (spawn returned {port}).\n"
@@ -11838,17 +11840,17 @@ print("OK", port)
                 "caller spawns a second holder for a port the first still has"
             )
 
-            # /proc, for the same reason the premise check uses it: `ps`
-            # truncated the command line here and every certdir match failed.
-            mine = []
-            for entry in pathlib.Path("/proc").glob("[0-9]*"):
-                try:
-                    argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
-                except OSError:
-                    continue
-                cmd = argv.decode(errors="replace")
-                if " -m cswap_pin.proxy" in cmd and str(tmp_path) in cmd:
-                    mine.append(f"{entry.name} {cmd}")
+            # `-ww`, for the same reason the premise check uses it: bare `ps`
+            # truncated the command line here and every certdir match failed,
+            # and `/proc` does not exist on macOS.
+            out = subprocess.run(
+                ["ps", "-ww", "-eo", "pid=,command="],
+                capture_output=True, text=True,
+            ).stdout
+            mine = [
+                line for line in out.splitlines()
+                if " -m cswap_pin.proxy" in line and str(tmp_path) in line
+            ]
             holders = [line for line in mine if "--hold-port" in line]
 
             assert again == port, (
