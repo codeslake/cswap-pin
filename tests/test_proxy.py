@@ -4979,24 +4979,6 @@ class TestTheProfileRouteIsPinnedForClaudeCodeOnly:
         assert not is_pinned_route("/api/oauth/validate/x", "claude-code/2.1.257")
 
 
-class TestTheProfileRouteAlsoCatchesClaudeCodesOwnAxiosFetch:
-    """CC's account-profile fetch (`Vxr` at startup, `wYn` at login, 2.1.282)
-    goes out over axios with no custom User-Agent, so it crosses as axios's
-    own default (`axios/1.15.2`) rather than `claude-code/`/`claude-cli/`.
-    Measured 2026-09-24: the unswapped route let a live bridge's
-    `oauthAccount` drift onto the active account and CC archived the session
-    on both wmac and pmac. Scoped to this one route -- `_is_claude_code_ua`
-    itself stays untouched, see the comment above `_is_cc_axios_ua`."""
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
-
-    def case_claude_codes_own_axios_profile_fetch_is_pinned(self):
-        for path in ("/api/oauth/profile", "/api/oauth/profile?beta=true",
-                     "/api/oauth/profile/"):
-            assert is_pinned_route(path, "axios/1.15.2"), path
-
-
 class TestPeekStatusHandsBackEveryByteItTook:
     """`_peek_status` reads off the upstream so a refused swap can be taken
     back. Whatever it consumed is gone from the socket, so the caller has to

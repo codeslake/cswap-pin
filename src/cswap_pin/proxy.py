@@ -13078,10 +13078,11 @@ def pin_profile_for(token: "str | None") -> "dict | None":
     Asked with the PIN's bearer, so the stamp it carries is true and the
     fields are the pin's own -- not a copy of whatever account was live when
     the pinned slot was last the login. Same route Claude Code asks: since
-    #44 that route is pinned and swapped for Claude Code's own fetch
-    (`claude-cli/`/`claude-code/`, or its bundled axios), and unswapped only
-    for cswap's own `claude-swap/1.0` fetch -- this call sends the token we
-    were given either way.
+    #44 that route is pinned and swapped only for Claude Code's own fetch (a
+    `claude-code/` or `claude-cli/` UA, or its bundled `axios/`); every other
+    client is unswapped, cswap's own `claude-swap/1.0` among them (and this
+    function's own urllib fetch) -- this call sends the token we were given
+    either way.
     """
     if not token:
         return None
