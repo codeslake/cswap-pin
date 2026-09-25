@@ -4958,7 +4958,8 @@ class TestTheProfileRouteIsPinnedForClaudeCodeOnly:
     own fetch of the same route keeps seeing the live account."""
 
     def test_claude_code_clients_are_swapped(self):
-        for ua in ("claude-code/2.1.257", "claude-cli/2.1.257 (external, cli)"):
+        for ua in ("claude-code/2.1.257", "claude-cli/2.1.257 (external, cli)",
+                   "axios/1.15.2"):
             assert is_pinned_route("/api/oauth/profile", ua), ua
             assert is_pinned_route("/api/oauth/profile?beta=true", ua), ua
             assert is_pinned_route("/api/oauth/profile/", ua), ua
@@ -4976,36 +4977,6 @@ class TestTheProfileRouteIsPinnedForClaudeCodeOnly:
     def test_a_user_agent_never_pins_an_unrelated_route(self):
         assert not is_pinned_route("/v1/messages", "claude-code/2.1.257")
         assert not is_pinned_route("/api/oauth/validate/x", "claude-code/2.1.257")
-
-
-class TestTheProfileRouteAlsoCatchesClaudeCodesOwnAxiosFetch:
-    """CC's account-profile fetch (`Vxr` at startup, `wYn` at login, 2.1.282)
-    goes out over axios with no custom User-Agent, so it crosses as axios's
-    own default (`axios/1.15.2`) rather than `claude-code/`/`claude-cli/`.
-    Measured 2026-09-24: the unswapped route let a live bridge's
-    `oauthAccount` drift onto the active account and CC archived the session
-    on both wmac and pmac. Scoped to this one route -- `_is_claude_code_ua`
-    itself stays untouched, see its docstring."""
-
-    def test_all(self, request, tmp_path_factory):
-        run_cases(self, request, tmp_path_factory)
-
-    def case_claude_codes_own_axios_profile_fetch_is_pinned(self):
-        for path in ("/api/oauth/profile", "/api/oauth/profile?beta=true",
-                     "/api/oauth/profile/"):
-            assert is_pinned_route(path, "axios/1.15.2"), path
-
-    def case_cswaps_own_profile_fetch_stays_unswapped(self):
-        assert not is_pinned_route("/api/oauth/profile", "claude-swap/1.0")
-
-    def case_a_claude_cli_profile_fetch_is_still_pinned(self):
-        assert is_pinned_route(
-            "/api/oauth/profile", "claude-cli/2.1.257 (external, cli)"
-        )
-
-    def case_an_axios_request_to_another_route_is_untouched(self):
-        assert not is_pinned_route("/v1/messages", "axios/1.15.2")
-        assert not is_pinned_route("/api/oauth/validate/x", "axios/1.15.2")
 
 
 class TestPeekStatusHandsBackEveryByteItTook:
