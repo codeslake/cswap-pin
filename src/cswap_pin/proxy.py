@@ -10011,6 +10011,16 @@ class PortHolder:
         # Whether `_install_replace_handler` succeeded. Only then may `_spawn`
         # tell a child this holder can be asked — see `_HOLDER_REPLACE_ENV`.
         self._replace_channel = False
+        # WHETHER `start()` IS A STANDBY'S OWN IN-PLACE PROMOTION, an explicit
+        # `sock=` from `_standby_revive` — not merely whatever `__init__`
+        # below happens to adopt, since an ordinary predecessor handoff also
+        # adopts a socket but is not this. `start()` reads this to decide
+        # what a permanently failing first spawn means: a cold start has
+        # nothing else covering the port, so it raises and lets `holder_main`
+        # exit; a promotion IS the last thing covering the port, so it
+        # degrades on the socket it already holds instead of raising the
+        # standby process down with it.
+        self._is_promotion = sock is not None
 
         # ADOPT A HANDED-DOWN SOCKET RATHER THAN BINDING. A predecessor that is
         # recycling passes its still-LISTENING socket down, and it has not let
@@ -10114,7 +10124,13 @@ class PortHolder:
         # socket it is already holding — see that method's docstring — and a
         # `Popen` failure here used to escape uncaught, killing the standby
         # process that was the last thing covering the port.
-        self._spawn_retrying()
+        #
+        # COLD START RAISES AT THE CAP; A PROMOTION DEGRADES INSTEAD. Both
+        # climb the same ladder (`self._failures`, `_HOLD_DEGRADE_AT`) --
+        # only what happens when it caps out differs, because only a
+        # promotion IS the last thing covering the port. See `_is_promotion`.
+        if not self._spawn_retrying(raise_at_cap=not self._is_promotion):
+            return  # promotion capped out — already degraded, nothing to supervise
         # AFTER the daemon, so a machine that cannot start one at all does not
         # also leave a standby behind waiting for a holder that never worked.
         self._spawn_standby()
@@ -10277,40 +10293,69 @@ class PortHolder:
         self.daemon_pid = proc.pid
         self._proc = proc
 
-    def _spawn_retrying(self) -> None:
-        """`_spawn`, but a `Popen` failure retries on our own backoff instead
-        of climbing out of the caller uncaught.
-
-        UNCAUGHT, THIS COST THE SOCKET. `OSError` (fork EAGAIN/EMFILE, or the
-        interpreter itself unrunnable) and `ValueError` (`Popen(pass_fds=
-        (-1,))` on our own closed socket, see `_on_replace_request`) both come
-        out of `subprocess.Popen` inside `_spawn`. From `start()` — used both
-        for a cold start and, via `_standby_revive`'s promotion, to put a
-        holder back on a socket a dying standby is the last thing covering —
-        an uncaught raise there killed the caller before a supervisor thread
-        ever existed to try again. From `_supervise`'s own respawns, its
-        `while` loop only re-enters through `proc.wait()` on the SAME
-        already-dead `Popen`, which returns at once forever — a bare retry
-        loop there would spin, not recover. The backoff (a LOCAL count, not
-        `self._failures`, which paces the unrelated crash-loop degrade path)
-        is what stops both.
+    def _report_if_stuck(self) -> None:
+        """Say once, at `_HOLD_RESTART_REPORT_AT`, that the successor is not
+        merely crashing but cannot start at all. Shared between a daemon
+        that keeps exiting and a `Popen` that keeps raising — both climb the
+        same `self._failures` ladder, and only one of them reaches this
+        exact count first, so there is no double report to guard against.
         """
-        attempt = 0
+        if self._failures == _HOLD_RESTART_REPORT_AT:
+            _log_lifecycle(
+                f"the successor cannot start — {self._failures} spawns in "
+                f"a row died immediately. Still retrying, but the port is "
+                f"one holder death away from being unrecoverable. The "
+                f"daemon's own stderr is above in this file."
+            )
+
+    def _spawn_retrying(self, *, raise_at_cap: bool = False) -> bool:
+        """`_spawn`, but a `Popen` failure climbs the SAME ladder a
+        crash-looping daemon does (`self._failures`, `_backoff`,
+        `_HOLD_RESTART_REPORT_AT`, `_HOLD_DEGRADE_AT`) instead of retrying on
+        a private, unbounded local count.
+
+        UNCAUGHT OR RETRIED WITHOUT A CAP, THIS COST THE SOCKET EITHER WAY.
+        `OSError` (fork EAGAIN/EMFILE, or the interpreter itself unrunnable)
+        and `ValueError` (`Popen(pass_fds=(-1,))` on our own closed socket,
+        see `_on_replace_request`) both come out of `subprocess.Popen` inside
+        `_spawn`. Uncaught, it killed the caller before a supervisor thread
+        ever existed to try again — that was the bug this class of fix
+        closes. Retried on a LOCAL count with no cap closed that, but opened
+        the other side of the same failure: a permanently unrunnable
+        interpreter then span here forever, on `start()`'s own calling
+        thread, the socket bound and nothing accepting — exactly the outage
+        `_HOLD_DEGRADE_AT` exists to end, reached through a door that never
+        counted towards it. Sharing `self._failures` closes that door: to
+        the ladder, a spawn that never got a process running is the same
+        kind of failure as a daemon that started and immediately died.
+
+        Returns True once spawned. At the cap: `degrade_now()` and return
+        False, UNLESS ``raise_at_cap`` — the cold start, where this holder is
+        the only thing covering the port and `holder_main`'s `except OSError`
+        needs to see the exception to know it never came up. A promotion
+        passes ``raise_at_cap=False`` — see `start()` and `_is_promotion`.
+        """
         while True:
             try:
                 self._spawn()
-                return
+                return True
             except (OSError, ValueError) as exc:
+                if self._stop:
+                    return False
+                self._failures += 1
                 _log_lifecycle(
                     f"could not spawn a successor on port {self.port}: "
                     f"{exc!r} — retrying"
                 )
+                self._report_if_stuck()
+                if self._failures >= _HOLD_DEGRADE_AT:
+                    if raise_at_cap:
+                        raise
+                    self.degrade_now()
+                    return False
+                time.sleep(self._backoff(self._failures))
                 if self._stop:
-                    return
-                attempt += 1
-                time.sleep(self._backoff(attempt))
-                if self._stop:
-                    return
+                    return False
 
     def _spawn_standby(self) -> None:
         """Place a third process on this descriptor that does nothing with it.
@@ -10587,7 +10632,8 @@ class PortHolder:
                             f"{self.port}"
                         )
                         self._failures = 0
-                        self._spawn_retrying()
+                        if not self._spawn_retrying():
+                            return  # capped out — degrade_now() already ran
                         continue
                     _log_lifecycle(
                         f"daemon {self.daemon_pid} exited cleanly — releasing port "
@@ -10614,7 +10660,8 @@ class PortHolder:
                         f"restarting on the held port {self.port}"
                     )
                     self._failures = 0
-                    self._spawn_retrying()
+                    if not self._spawn_retrying():
+                        return  # capped out — degrade_now() already ran
                     continue
                 if not self._self_heal_on():
                     # SAY WHAT HAPPENS, which is not what this used to claim. The
@@ -10641,16 +10688,9 @@ class PortHolder:
                     f"under the held port {self.port}"
                 )
                 # SAY IT ONCE when the successor is not merely crashing but cannot
-                # start at all — see `_HOLD_RESTART_REPORT_AT`. Exactly at the
-                # threshold, so a machine that keeps failing does not turn the log
-                # into one warning per rung forever.
-                if self._failures == _HOLD_RESTART_REPORT_AT:
-                    _log_lifecycle(
-                        f"the successor cannot start — {self._failures} spawns in "
-                        f"a row died immediately. Still retrying, but the port is "
-                        f"one holder death away from being unrecoverable. The "
-                        f"daemon's own stderr is above in this file."
-                    )
+                # start at all — see `_report_if_stuck`, shared with a `Popen`
+                # that keeps raising instead of a daemon that keeps exiting.
+                self._report_if_stuck()
                 if self._failures >= _HOLD_DEGRADE_AT:
                     # STOP WAITING FOR A SUCCESSOR THAT IS NOT COMING. Retrying
                     # past here is not patience, it is an outage held open: the
@@ -10661,7 +10701,14 @@ class PortHolder:
                 time.sleep(self._backoff(self._failures))
                 if self._stop:
                     return
-                self._spawn_retrying()
+                # NOT A BARE `proc.wait()` RE-ENTRY. `_spawn_retrying` owns its
+                # own retry-and-degrade past this point, so a `Popen` failure
+                # here never loops back through the top of this `while` to
+                # wait on the SAME already-dead `self._proc` again — it climbs
+                # this exact ladder itself and either lands a new `self._proc`
+                # (True) or has already called `degrade_now()` (False).
+                if not self._spawn_retrying():
+                    return
 
     def stop(self) -> None:
         """Let go of the port: the DAEMON dies first, then the socket closes.

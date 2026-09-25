@@ -4361,12 +4361,13 @@ class TestASpawnFailureIsNotFatal:
     `_on_replace_request`) -- and neither `_supervise`'s respawns nor
     `_standby_revive`'s promotion (`holder.start()`) caught it. MEASURED
     (T1284's deployer, sandbox 2026-09-25): with a throwaway venv's
-    interpreter made unrunnable, `_supervise`'s own respawn after a crash
-    raised uncaught in `Thread-1 (_supervise)` -- the thread died, the
-    holder process exited with no `stop()` -- and the standby's takeover
-    (`standby_main` -> `_standby_revive` -> `holder.start()` -> `_spawn`)
-    hit the identical unwrapped call and its exception killed the standby
-    too. Net: every process that could serve the port was gone.
+    interpreter made unrunnable, `_supervise`'s own respawn after a
+    redeploy ask (exit 75) raised uncaught in `Thread-1 (_supervise)` --
+    the thread died, the holder process exited with no `stop()` -- and
+    the standby's takeover (`standby_main` -> `_standby_revive` ->
+    `holder.start()` -> `_spawn`) hit the identical unwrapped call and its
+    exception killed the standby too. Net: every process that could serve
+    the port was gone.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -4401,53 +4402,14 @@ class TestASpawnFailureIsNotFatal:
         """The cold start succeeds; the daemon it started then crashes
         (non-zero exit), and the RESPAWN `_supervise` makes for it is the
         one that raises `OSError` a few times before succeeding -- the
-        exact shape of the measured incident's first half."""
-        from cswap_pin.proxy import PortHolder, ensure_ca
-
-        ensure_ca(tmp_path, "api.anthropic.com")
-        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
-        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
-        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
-
-        procs = []
-        spawn_calls = []
-        RAISES = 3
-
-        def _flaky_spawn(self):
-            spawn_calls.append(1)
-            # THE COLD START (the first call) always succeeds -- this case
-            # is about the RESPAWN after a crash, not the first spawn.
-            if 1 < len(spawn_calls) <= 1 + RAISES:
-                raise OSError("fork: Resource temporarily unavailable")
-            proc = TestASpawnFailureIsNotFatal._BlockingProc()
-            procs.append(proc)
-            self._proc = proc
-            self.daemon_pid = 1000 + len(spawn_calls)
-
-        monkeypatch.setattr(PortHolder, "_spawn", _flaky_spawn)
-
-        holder = PortHolder(tmp_path, "1", "a@b.c")
+        ordinary-crash respawn site. `case_the_code_75_redeploy_respawn_
+        survives_a_raising_spawn` below is the one that models the measured
+        incident (a redeploy ask, exit 75)."""
+        holder, procs, spawn_calls = self._respawn_after_exit_survives_a_raising_spawn(
+            tmp_path, monkeypatch, 1, raises=3)
         try:
-            holder.start()
-            assert len(procs) == 1, "premise: the cold start did not spawn cleanly"
-            procs[0].exit(1)  # the daemon crashes
-
-            deadline = time.time() + 5
-            while len(spawn_calls) <= 1 + RAISES and time.time() < deadline:
-                time.sleep(0.02)
-            assert len(spawn_calls) > 1 + RAISES, (
-                f"only {len(spawn_calls)} spawn attempt(s) after the crash — "
-                f"a raising respawn ended the supervisor instead of retrying "
-                f"it"
-            )
-            assert holder._thread.is_alive(), (
-                "the supervisor THREAD died on a raising respawn instead of "
-                "retrying past it"
-            )
-            assert len(procs) == 2, (
-                f"did not end up with a live successor daemon: {len(procs)} "
-                f"real spawn(s) landed"
-            )
+            self._assert_the_respawn_survived(
+                holder, procs, spawn_calls, "ordinary crash")
         finally:
             holder.stop()
 
@@ -4469,7 +4431,6 @@ class TestASpawnFailureIsNotFatal:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
         srv.listen(8)
-        port = srv.getsockname()[1]
 
         monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
         monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
@@ -4497,11 +4458,262 @@ class TestASpawnFailureIsNotFatal:
                 "the promoted holder's supervisor thread died on the "
                 "raising spawn instead of retrying past it"
             )
-            # THE SOCKET SURVIVED. A killed standby process would have taken
-            # its own copy of the descriptor down with it -- accepting a
-            # connection proves it is still intact.
-            conn = socket.create_connection(("127.0.0.1", port), timeout=2)
-            conn.close()
+            # `start()` RETURNING NORMALLY IS THE DISCRIMINATOR. A killed
+            # standby process would have taken this same test process down
+            # with it -- there is nothing else to check in-process; a raw
+            # connect to `srv` would succeed even if `start()` never got a
+            # real daemon running, since nothing here ever closes it.
+        finally:
+            holder.stop()
+
+    def case_a_permanently_raising_respawn_reaches_degrade_now(
+            self, tmp_path, monkeypatch):
+        """The cold start succeeds; the daemon then crashes, and every
+        RESPAWN `_supervise` makes for it raises `OSError` forever -- a
+        spawn that can never succeed is a failure on the SAME ladder a
+        crash-looping daemon climbs, so it must reach `degrade_now()` too
+        (model: `case_the_ladder_degrades_instead_of_retrying_forever`),
+        not retry past `_HOLD_DEGRADE_AT` forever on a private count."""
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        seen = {"degraded": False}
+        monkeypatch.setattr(PortHolder, "degrade_now",
+                            lambda self: seen.__setitem__("degraded", True))
+
+        spawn_calls = []
+
+        def _flaky_spawn(self):
+            spawn_calls.append(1)
+            if len(spawn_calls) == 1:
+                self._proc = TestASpawnFailureIsNotFatal._BlockingProc()
+                self.daemon_pid = 1000
+                return
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _flaky_spawn)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        try:
+            holder.start()
+            assert len(spawn_calls) == 1, "premise: cold start did not spawn cleanly"
+            holder._proc.exit(1)  # the daemon crashes; every respawn after this raises
+
+            deadline = time.time() + 5
+            while not seen["degraded"] and time.time() < deadline:
+                time.sleep(0.02)
+            assert seen["degraded"], (
+                f"{_HOLD_DEGRADE_AT} failed respawns (all raising `Popen`) "
+                f"and the holder is still retrying into a port nobody "
+                f"answers"
+            )
+        finally:
+            holder.stop()
+
+    def _respawn_after_exit_survives_a_raising_spawn(
+            self, tmp_path, monkeypatch, exit_code, *, raises=2, pinned=False):
+        """Shared drive for all three `_supervise` respawn sites: the cold
+        start succeeds, the daemon then exits with `exit_code`, and the
+        RESPAWN that site makes raises `raises` times before succeeding.
+        Returns (holder, procs, spawn_calls)."""
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        if pinned:
+            monkeypatch.setattr(pin_proxy, "load_pin",
+                                lambda root: ("a@b.c", "org-1"))
+            monkeypatch.setattr(pin_proxy, "_standby_port_still_wanted",
+                                lambda certdir, port: True)
+
+        procs = []
+        spawn_calls = []
+
+        def _flaky_spawn(self):
+            spawn_calls.append(1)
+            # THE COLD START (the first call) always succeeds -- this drive
+            # is about the RESPAWN after an exit, not the first spawn.
+            if 1 < len(spawn_calls) <= 1 + raises:
+                raise OSError("fork: Resource temporarily unavailable")
+            proc = TestASpawnFailureIsNotFatal._BlockingProc()
+            procs.append(proc)
+            self._proc = proc
+            self.daemon_pid = 1000 + len(spawn_calls)
+
+        monkeypatch.setattr(PortHolder, "_spawn", _flaky_spawn)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        holder.start()
+        assert len(procs) == 1, "premise: the cold start did not spawn cleanly"
+        procs[0].exit(exit_code)
+        return holder, procs, spawn_calls
+
+    def _assert_the_respawn_survived(self, holder, procs, spawn_calls, label):
+        """Poll on `procs`, not `spawn_calls` -- `_flaky_spawn` appends to
+        the latter before the former, so polling on it can wake this thread
+        in the gap between a successful call's two appends."""
+        deadline = time.time() + 5
+        while len(procs) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(procs) == 2, (
+            f"did not end up with a live successor after {label}: "
+            f"{len(procs)} real spawn(s) landed"
+        )
+        assert len(spawn_calls) > 1, (
+            f"only {len(spawn_calls)} spawn attempt(s) — the {label} "
+            f"respawn's raising spawn was not retried"
+        )
+        assert holder._thread.is_alive(), (
+            f"the supervisor THREAD died on the {label} respawn's raising "
+            f"Popen instead of retrying past it"
+        )
+
+    def case_the_code_75_redeploy_respawn_survives_a_raising_spawn(
+            self, tmp_path, monkeypatch):
+        """A redeploy ask (exit 75) respawns at once, skipping the backoff
+        -- and that respawn's own `Popen` can raise too, which is the
+        measured incident. Reverting this call site (`_supervise`'s
+        `code == _RESTART_ME_CODE` branch) back to a bare `self._spawn()`
+        must turn this red."""
+        from cswap_pin.proxy import _RESTART_ME_CODE
+
+        holder, procs, spawn_calls = self._respawn_after_exit_survives_a_raising_spawn(
+            tmp_path, monkeypatch, _RESTART_ME_CODE)
+        try:
+            self._assert_the_respawn_survived(
+                holder, procs, spawn_calls, "redeploy ask")
+        finally:
+            holder.stop()
+
+    def case_the_clean_exit_still_pinned_respawn_survives_a_raising_spawn(
+            self, tmp_path, monkeypatch):
+        """A clean exit (code 0) while still pinned respawns on the held
+        port -- and that respawn's own `Popen` can raise too. Reverting
+        this call site (`_supervise`'s `code == 0`, still-pinned branch)
+        back to a bare `self._spawn()` must turn this red."""
+        holder, procs, spawn_calls = self._respawn_after_exit_survives_a_raising_spawn(
+            tmp_path, monkeypatch, 0, pinned=True)
+        try:
+            self._assert_the_respawn_survived(
+                holder, procs, spawn_calls, "still-pinned clean exit")
+        finally:
+            holder.stop()
+
+    def case_cold_start_with_an_always_raising_spawn_raises(
+            self, tmp_path, monkeypatch):
+        """A cold start's FIRST spawn is the ONLY thing covering the port --
+        nothing else exists yet. If it can never succeed, `start()` must
+        raise (bounded, on the same ladder as every other respawn) so
+        `holder_main`'s `except OSError` can end the process and free the
+        launcher, which is already waiting on a state file that will never
+        appear. Driven off-thread and joined with a timeout: an unbounded
+        retry would otherwise hang this test forever instead of failing it.
+        """
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        spawn_calls = []
+
+        def _always_raise(self):
+            spawn_calls.append(1)
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _always_raise)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        outcome = {}
+
+        def _run():
+            try:
+                holder.start()
+            except BaseException as exc:  # noqa: BLE001 — captured for the assertion
+                outcome["exc"] = exc
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        try:
+            assert not t.is_alive(), (
+                f"start() is still retrying after {len(spawn_calls)} spawn "
+                f"attempt(s) — a permanently failing cold-start spawn must "
+                f"raise, bounded, not hang"
+            )
+            assert isinstance(outcome.get("exc"), OSError), (
+                f"start() returned instead of raising on a cold-start spawn "
+                f"that always fails: {outcome!r}"
+            )
+            assert len(spawn_calls) == _HOLD_DEGRADE_AT, (
+                f"{len(spawn_calls)} spawn attempt(s) before raising — "
+                f"expected exactly the ladder's cap ({_HOLD_DEGRADE_AT})"
+            )
+        finally:
+            holder.stop()
+
+    def case_promotion_with_an_always_raising_spawn_degrades_in_place(
+            self, tmp_path, monkeypatch):
+        """The standby's own promotion is the LAST thing covering the port
+        -- raising out of `start()` here would kill this process and take
+        the socket down with it, so a permanently failing spawn must
+        degrade on the socket instead. Driven off-thread and joined with a
+        timeout for the same reason as the cold-start case above."""
+        from cswap_pin.proxy import PortHolder
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+
+        def _always_raise(self):
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _always_raise)
+
+        holder = PortHolder(certdir, "1", "a@b.c", sock=srv)
+        outcome = {}
+
+        def _run():
+            try:
+                holder.start()
+            except BaseException as exc:  # noqa: BLE001 — captured for the assertion
+                outcome["exc"] = exc
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        try:
+            assert not t.is_alive(), (
+                "the promotion's start() is still retrying instead of "
+                "ending degraded -- an unbounded retry leaves nothing "
+                "accepting on the port for as long as it spins"
+            )
+            assert "exc" not in outcome, (
+                f"start() raised out of the promotion instead of degrading "
+                f"in place, which would kill the standby -- the last thing "
+                f"covering this port: {outcome.get('exc')!r}"
+            )
+            assert holder._degraded, (
+                "a permanently failing promotion spawn neither raised nor "
+                "degraded -- the standby is not serving anything"
+            )
+            assert not holder._stop, (
+                "degrade_now stopped the holder instead of serving the "
+                "socket it still holds"
+            )
+            assert holder._srv.fileno() != -1, (
+                "the socket was closed instead of being served degraded"
+            )
         finally:
             holder.stop()
 
