@@ -9596,6 +9596,33 @@ class TestDaemonPortStability:
         finally:
             probe.close()
 
+    class _Ticks:
+        """A `done` that ends the loop after N ticks, instead of a bare
+        `threading.Event()` that is never set.
+
+        Every held-replace case below drives `_watch_own_code` directly on
+        the test thread and expects it to exit (`os._exit`, stubbed to raise
+        `SystemExit`) on its FIRST pass through the held branch. A never-set
+        Event is harmless while that holds, but a regression that falls
+        through to `continue` instead of exiting would spin the `while`
+        loop forever with nothing to end it -- this bounds that to a few
+        ticks so the regression fails the assertions below instead of
+        hanging the suite.
+        """
+
+        def __init__(self, n=3):
+            self.left = n
+
+        def wait(self, _timeout=None):
+            self.left -= 1
+            return self.left <= 0
+
+        def is_set(self):
+            return self.left <= 0
+
+        def set(self):
+            self.left = 0
+
     def case_a_real_spawned_successor_drops_no_connection(
         self, tmp_path, monkeypatch
     ):
@@ -12641,8 +12668,6 @@ print("OK", port)
         # the fix — the fix is that the code-change path takes the exit branch
         # instead of the hand-over branch. Drive it with a stub server and a
         # fingerprint that never matches, and assert it never spawns.
-        import threading
-
         spawned = []
         exited = []
 
@@ -12690,7 +12715,7 @@ print("OK", port)
         os.environ[pin_proxy._HOLDER_REPLACE_ENV] = "1"
         try:
             pin_proxy._watch_own_code(
-                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
                 lambda *a: None, interval=0.01,
                 _own_fingerprint="never-matches",
             )
@@ -12721,38 +12746,25 @@ print("OK", port)
             f"the holder to spawn AGAIN, on top of the successor it just made"
         )
 
-    def case_a_held_daemon_with_no_successor_yet_keeps_serving(
+    def case_a_held_daemon_with_no_successor_takes_the_exit_75_fallback(
         self, tmp_path, monkeypatch
     ):
-        """RULE 0: the holder surviving the ask is not a successor existing.
+        """(a): a wait that never finds a successor takes the SAME fallback a
+        holder-less ask already takes, not a retry.
 
-        Before this fix, the wait for a successor ended at `_pid_alive(holder)`
-        — proof only that the ASK landed, nothing about anything listening
-        behind it. `_on_replace_request` runs on the holder's MAIN thread,
-        parked in `self._thread.join()`, so an `os._exit(0)` that lands
-        before that handler even starts can reach `_supervise`'s post-wait
-        decision first: with the pin still set it respawns into the
-        handler's own, now-late, second spawn on the same socket; with the
-        pin cleared `stop()` closes the port under live sessions and the
-        late `_spawn()` raises out of `join()` trying to pass an
-        already-detached fd.
+        Pass 2 kept the daemon serving on a timed-out wait and rechecked on a
+        later tick -- a second recovery path duplicating what the exit-75
+        fallback (a few lines up in the source, for "no holder pid at all")
+        already does: release, drain `_HELD_DRAIN_SECONDS`, then
+        `os._exit(_RESTART_ME_CODE)`, and let the supervisor respawn.
+        `_supervise` already handles that exit correctly whether or not the
+        replace handler ever ran, so a second, home-grown recovery bought
+        nothing the fallback did not already have.
 
-        Reproduced by never publishing a successor record at all: a holder
-        that took the ask and stayed alive (`os.kill` here does not raise)
-        with nothing behind it must keep serving, not exit.
-
-        A TIMED-OUT WAIT IS ALSO NOT A VERDICT (the second half of RULE 0):
-        giving up on this one tick must not end the watchdog for the rest of
-        the process's life -- that is the 22-hour outage this file measures
-        elsewhere. So this drives `_watch_own_code` in a background thread,
-        past its first wait's timeout, and checks it is STILL running (would
-        pick up a late successor), never asked the holder a second time (a
-        second SIGUSR1 would spawn a second successor), kept the listener
-        bound, and handed the draining announcement back since it is plainly
-        serving again, not draining.
+        Reproduced by never publishing a successor record at all: the ask
+        lands, the holder survives it, and `_SPAWN_WAIT_S` elapses with
+        nothing on disk.
         """
-        import threading
-
         from cswap_pin import proxy as pin_proxy
 
         released = []
@@ -12776,78 +12788,51 @@ print("OK", port)
         monkeypatch.setattr(
             os, "kill", lambda pid, sig: signalled.append((pid, sig)))
         monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
-        # SHORT, so a case that is RIGHT to keep waiting does not cost this
+        # SHORT, so a case that is RIGHT to give up does not cost this
         # suite ten seconds -- the budget itself is covered separately.
         monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.1)
         monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
         monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
 
-        asked_done_calls = []
-        real_announce = pin_proxy.announce_draining
-
-        def _tracking_announce(certdir, pid=None, server=None):
-            inner = real_announce(certdir, pid=pid, server=server)
-
-            def _wrapped():
-                asked_done_calls.append(1)
-                inner()
-            return _wrapped
-
-        monkeypatch.setattr(pin_proxy, "announce_draining", _tracking_announce)
-
-        done = threading.Event()
-        t = threading.Thread(
-            target=pin_proxy._watch_own_code,
-            args=(_Srv(), "1", "a@b.c", tmp_path, done, lambda *a: None),
-            kwargs={"interval": 0.05, "_own_fingerprint": "never-matches"},
-            daemon=True,
-        )
-        t.start()
         try:
-            # LONGER THAN ONE FULL ASK-AND-WAIT CYCLE (_SPAWN_WAIT_S=0.1s),
-            # so the first wait has definitely timed out at least once.
-            t.join(timeout=1.0)
-            assert t.is_alive(), (
-                "the watcher thread ended on its own after a timed-out "
-                "wait -- a successor that publishes later now has nobody "
-                "left watching for it"
+            pin_proxy._watch_own_code(
+                _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
+                lambda *a: None, interval=0.05,
+                _own_fingerprint="never-matches",
             )
-        finally:
-            done.set()
-            t.join(timeout=5)
+        except SystemExit:
+            pass
 
-        assert not t.is_alive(), "the watcher never stopped on `done`"
         assert pin_proxy.read_daemon_state(tmp_path) is None, (
             "premise: this case never publishes a successor record"
         )
-        assert exited == [], (
-            f"exited {exited} with no successor ever published — the holder "
+        assert exited == [pin_proxy._RESTART_ME_CODE], (
+            f"a wait that found no successor exited {exited} -- the holder "
             f"surviving the ask proves only that IT is alive, nothing about "
-            f"a successor"
+            f"a successor, and the fallback is exit "
+            f"{pin_proxy._RESTART_ME_CODE}, the same one a holder-less ask "
+            f"already takes"
         )
-        assert released == [], (
-            "released the listener with no successor confirmed -- the port "
-            "must stay bound while still checking for one"
+        assert released == [False], (
+            f"released {released} -- the fallback releases the plain way "
+            f"(`release_listener()`, no hand-down) exactly once, at the "
+            f"point it gives up, never before"
         )
         # `_pid_alive`'s own liveness probe is ALSO `os.kill(pid, 0)`, so this
         # filters to the REPLACE signal specifically -- counting every call
         # would count that probe as a second ask.
         asks = [s for s in signalled if s[1] == pin_proxy._REPLACE_ME_SIGNAL]
         assert len(asks) == 1, (
-            f"asked the holder {len(asks)} time(s) across the retries: "
-            f"{signalled} -- a second SIGUSR1 spawns a second successor"
-        )
-        assert asked_done_calls, (
-            "gave up on a tick without handing the draining announcement "
-            "back -- the orphan sweep would then see a predecessor still "
-            "marked draining forever"
+            f"asked the holder {len(asks)} time(s): {signalled} -- the ask "
+            f"happens once per process, because every path out of the held "
+            f"branch exits"
         )
 
     def case_a_held_daemon_waits_for_its_successors_own_publish(
         self, tmp_path, monkeypatch
     ):
-        """The other half: a successor that publishes LATE is still waited
-        for, not raced past the instant the holder answers alive."""
+        """(b): a successor that publishes LATE is still waited for, not
+        raced past the instant the holder answers alive."""
         import threading
         import time as _time
 
@@ -12884,7 +12869,7 @@ print("OK", port)
         threading.Thread(target=_publish_late, daemon=True).start()
         try:
             pin_proxy._watch_own_code(
-                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
                 lambda *a: None, interval=0.01,
                 _own_fingerprint="never-matches",
             )
@@ -12900,27 +12885,20 @@ print("OK", port)
             f"{delay}s -- the ask alone was treated as enough"
         )
 
-    def case_a_held_daemon_finds_its_successor_after_a_timed_out_wait(
+    def case_a_pre_existing_record_is_not_mistaken_for_the_successor(
         self, tmp_path, monkeypatch
     ):
-        """I1(b): a first wait that timed out is not the end of the watch.
+        """(d): `pre_ask_pid` excludes whatever `proxy.json` already named.
 
-        The publish here lands AFTER `_SPAWN_WAIT_S` has already elapsed once
-        -- unlike the sibling above, where it lands inside that first wait --
-        so this only passes if a timed-out wait is followed by a RETRY on a
-        later tick rather than the `return` that used to end the watchdog for
-        the process's life (the 22-hour outage this file measures elsewhere).
-
-        Also covers I1(a): the published record's fingerprint deliberately
-        does NOT match what `daemon_fingerprint()` reads from disk right now
-        -- a successor computes `_OWN_FINGERPRINT` at its OWN import, and a
-        deploy landing in between makes a fresh read here disagree with a
-        successor that already exists. The match must still succeed: pid
-        identity, not fingerprint, is what proves the record is a successor.
+        A record already sitting on disk before the ask -- a foreign
+        daemon's own publish, or simply this daemon's LAST successor from a
+        previous recycle -- must never be read as the successor THIS ask is
+        about to produce. Reproduced by writing one before the ask and never
+        publishing anything new: with the exclusion working, the wait times
+        out and takes the exit-75 fallback; broken, it would read the
+        foreign pid as a successor and exit 0 with nobody actually serving
+        behind the released port.
         """
-        import threading
-        import time as _time
-
         from cswap_pin import proxy as pin_proxy
 
         class _Srv:
@@ -12930,55 +12908,34 @@ print("OK", port)
             def await_inflight(self, budget):
                 pass
 
+        foreign_pid = os.getpid() + 999
+        pin_proxy.write_daemon_state(
+            tmp_path, 36301, foreign_pid, "some-other-fingerprint")
+
         exited = []
         monkeypatch.setattr(
             os, "_exit",
             lambda code: exited.append(code) or (_ for _ in ()).throw(
                 SystemExit(code)))
-        signalled = []
-        monkeypatch.setattr(
-            os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+        # NEVER PUBLISHES: the only record on disk stays the foreign one.
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
         monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
         monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.1)
         monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
         monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
 
-        # LONGER THAN THE FIRST WAIT'S OWN BUDGET (0.1s), so that wait has
-        # already timed out once before this publish ever lands.
-        delay = 0.3
-
-        def _publish_late():
-            _time.sleep(delay)
-            pin_proxy.write_daemon_state(
-                tmp_path, 36301, os.getpid() + 1, "stale-fingerprint")
-
-        started = _time.monotonic()
-        threading.Thread(target=_publish_late, daemon=True).start()
         try:
             pin_proxy._watch_own_code(
-                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
-                lambda *a: None, interval=0.02,
+                _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
+                lambda *a: None, interval=0.05,
                 _own_fingerprint="never-matches",
             )
         except SystemExit:
             pass
-        elapsed = _time.monotonic() - started
 
-        assert exited == [0], (
-            f"a successor published after the first wait timed out was "
-            f"never picked up on a later tick: {exited}"
-        )
-        assert elapsed >= delay, (
-            f"exited after {elapsed:.2f}s, before the late publish at "
-            f"{delay}s"
-        )
-        # `_pid_alive`'s own liveness probe is ALSO `os.kill(pid, 0)`, so this
-        # filters to the REPLACE signal specifically -- counting every call
-        # would count that probe as a second ask.
-        asks = [s for s in signalled if s[1] == pin_proxy._REPLACE_ME_SIGNAL]
-        assert len(asks) == 1, (
-            f"asked the holder {len(asks)} time(s) across the retries: "
-            f"{signalled} -- a second SIGUSR1 spawns a second successor"
+        assert exited == [pin_proxy._RESTART_ME_CODE], (
+            f"a foreign pid already in proxy.json before the ask was read "
+            f"as the successor: {exited}"
         )
 
     def case_a_held_daemon_cannot_hand_the_socket_down_at_all(self, tmp_path):
@@ -13286,12 +13243,13 @@ print("OK", port)
         `_on_replace_request` reassigns `self._proc` to the successor as the
         LAST line of `_spawn()` — an "unbounded" `Popen` that can still be
         running when the predecessor's own exit (asked for separately, across
-        a process boundary: the daemon's OWN self-replace path, ~11587-11717,
+        a process boundary: the daemon's OWN self-replace path, ~11584-11685,
         asks the holder, confirms it survived, and only then exits 0 -- once
         a successor's OWN record has published, whether or not `Popen` has
-        returned yet; a timed-out wait keeps serving and rechecks on a later
-        tick rather than exiting at all, see `_await_successor_state` — a
-        held daemon TERM'd instead exits 75, see `_install_signal_teardown`
+        returned yet; a wait that times out with no record exits 75 via the
+        same fallback a holder-less ask already takes, rather than retrying
+        on a later tick, see `_await_successor_state` — a held daemon TERM'd
+        instead exits 75 too, see `_install_signal_teardown`
         ~7688-7692) is observed by `_supervise`. Without a lock shared
         between the two, `_supervise` reads a `self._proc` that has not
         moved yet, treats the exit as an ordinary release, and calls
@@ -13387,7 +13345,16 @@ print("OK", port)
         successor_wait_calls = []
 
         def _successor_wait(timeout=None):
-            successor_wait_calls.append(1)
+            # ONLY THE SUPERVISOR'S OWN `proc.wait()` — called with no
+            # timeout — counts as round 2. `stop()` also calls
+            # `proc.wait(timeout=_DRAIN_SECONDS + 2)` on whatever
+            # `self._proc` names, so on a regression that wrongly takes the
+            # release branch (and therefore also terminates the successor,
+            # caught separately by the `terminated` assertion below) that
+            # call would land here too and fill this list for the wrong
+            # reason.
+            if timeout is None:
+                successor_wait_calls.append(1)
             h._stop = True
             return 0
         successor.wait = _successor_wait
@@ -27898,6 +27865,66 @@ class TestABlindDaemonRepairsItself:
         assert exited == [0], (
             "the successor is already on the socket, so this one must exit 0 "
             "-- 75 would make the holder spawn a SECOND daemon")
+
+    def test_a_blind_daemon_waits_for_a_successor_that_publishes_late(
+            self, monkeypatch, tmp_path):
+        """(c): the held-replace wait is the SAME code for every trigger.
+
+        The case above publishes the successor's record synchronously, as a
+        side effect of the `os.kill` stub itself, so it cannot tell "waited
+        for the publish" from "raced past it". This delays the publish past
+        the ask instead, the way
+        `TestDaemonPortStability.case_a_held_daemon_waits_for_its_successors_own_publish`
+        does for the code-changed trigger, and asserts the blind-mint
+        trigger is waited for identically -- nothing gates the outcome on
+        why the daemon decided to replace itself.
+        """
+        import threading
+        import time as _time
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 2.0)
+        monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+
+        delay = 0.3
+        fp = pin_proxy.daemon_fingerprint()
+
+        def _publish_late():
+            _time.sleep(delay)
+            pin_proxy.write_daemon_state(tmp_path, 36301, os.getpid() + 1, fp)
+
+        exited = []
+        monkeypatch.setattr(
+            os, "_exit",
+            lambda code: exited.append(code) or (_ for _ in ()).throw(
+                SystemExit(code)))
+
+        started = _time.monotonic()
+        threading.Thread(target=_publish_late, daemon=True).start()
+        try:
+            pin_proxy._watch_own_code(
+                self._Srv(lambda: None), "1", "a@b.c", tmp_path,
+                self._Ticks(), lambda *a: None, interval=0.01,
+                # CURRENT, so the blind mint is the only reason to act.
+                _own_fingerprint=fp,
+            )
+        except SystemExit:
+            pass
+        elapsed = _time.monotonic() - started
+
+        assert exited == [0], (
+            f"a blind-mint replace did not wait for its successor's "
+            f"publish: {exited}"
+        )
+        assert elapsed >= delay, (
+            f"exited after {elapsed:.2f}s, before the late publish at "
+            f"{delay}s -- the ask alone was treated as enough"
+        )
 
     def test_a_daemon_that_can_mint_is_left_alone(self, monkeypatch, tmp_path):
         """THE CONTROL. Without it the test above passes on any recycle at all,

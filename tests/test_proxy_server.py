@@ -12997,7 +12997,7 @@ class TestDrainReportsWhatItCut:
         )
 
     def case_each_exit_path_drains_on_the_ceiling_that_fits_it(self, certdir):
-        """THREE DRAINS, TWO SITUATIONS — and they were collapsed into one number.
+        """FOUR DRAINS, TWO SITUATIONS — and they were collapsed into one number.
 
         Measured 2026-08-18, all three hosts, with the phase split live:
 
@@ -13021,7 +13021,12 @@ class TestDrainReportsWhatItCut:
                                      until we are gone, so every second here is
                                      a second with nothing serving the port.
                                      Cutting is the lesser evil
-                                     -> `_HELD_DRAIN_SECONDS`.
+                                     -> `_HELD_DRAIN_SECONDS`. TWO call sites
+                                     share it: no holder pid to ask at all,
+                                     and a holder that survived the ask but
+                                     whose successor never published within
+                                     the wait -- both leave the supervisor to
+                                     start the next one the slow way.
 
         AND `_DRAIN_SECONDS` COULD NOT SIMPLY BE RAISED, which is why this is a
         third constant rather than a bigger one: it is also the supervisor's
@@ -13056,12 +13061,12 @@ class TestDrainReportsWhatItCut:
             "broken, and a broken scan passes every assertion below it")
         assert sorted(named) == [
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
-            "_HELD_DRAIN_SECONDS",
+            "_HELD_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
         ], (
             "the exit paths no longer drain on the ceilings that fit them. Two "
             "hand over to a successor that is already serving (free to wait) "
-            "and one exits so a holder can start the successor (every second "
-            "is an unserved port). Got: " + ", ".join(sorted(named))
+            "and two exit so a holder can start the successor the slow way "
+            "(every second is an unserved port). Got: " + ", ".join(sorted(named))
         )
 
         # AND THE NUMBERS THEMSELVES, or the names above are decoration.
