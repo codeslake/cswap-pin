@@ -10383,11 +10383,22 @@ class PortHolder:
             # but a late handler racing that wait is still possible, and
             # `stop()` has already closed `self._srv` — `_spawn()`'s
             # `self._srv.fileno()` on a closed socket returns -1, and
-            # `Popen(pass_fds=(-1,))` is what raises out of this signal
-            # handler, on the MAIN thread, into `self._thread.join()`.
+            # `Popen(pass_fds=(-1,))` raises `ValueError` for exactly that
+            # reason. Caught below, along with a live `Popen`'s own `OSError`
+            # (fork EAGAIN, EMFILE): either one used to escape this SIGNAL
+            # HANDLER into the holder's main thread at `self._thread.join()`,
+            # ending the holder process with no `stop()` — the predecessor
+            # then exits 75 to a dead holder and only the standby can recover
+            # the port.
             if self._stop:
                 return
-            self._spawn()
+            try:
+                self._spawn()
+            except (OSError, ValueError) as exc:
+                _log_lifecycle(
+                    f"could not spawn a successor on replace request: {exc!r} "
+                    f"— staying up on the current daemon"
+                )
 
     def _supervise(self) -> None:
         while not self._stop:
@@ -11439,11 +11450,13 @@ def _watch_own_code(
     # which is the safer of the two ways to be wrong.
     stand_down_asked = False
     # THE ASK HAPPENS ONCE PER PROCESS, WITH NO LOOP-CARRIED STATE NEEDED.
-    # Every path out of the held-replace branch below is an `os._exit` — the
-    # successor's own publish found (exit 0) or not found within
-    # `_SPAWN_WAIT_S` (exit 75, the fallback the supervisor already knows how
-    # to recover from). A second SIGUSR1 is therefore never reachable: the
-    # process asking is gone before a second tick could ask again.
+    # Every path out of the held-replace branch below exits the process or
+    # ends the watcher — the successor's own publish found (exit 0) or not
+    # found within `_SPAWN_WAIT_S` (exit 75, the fallback the supervisor
+    # already knows how to recover from), or the ask not surviving, which
+    # returns from this function instead of exiting. A second SIGUSR1 is
+    # therefore never reachable: the process asking is gone, or this watcher
+    # is, before a second tick could ask again.
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
     while not done.wait(interval):
