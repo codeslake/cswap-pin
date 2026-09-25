@@ -3129,6 +3129,16 @@ def _is_claude_code_ua(ua: str) -> bool:
     return bool(ua) and ua.lstrip().lower().startswith(_CLAUDE_CODE_UA)
 
 
+# CC's own account-profile fetch (`Vxr`/`wYn`, 2.1.282) goes out over axios
+# with no custom User-Agent, so it crosses as axios's own default rather than
+# `claude-code/`/`claude-cli/`. Scoped to the one route that needs it below --
+# widening `_is_claude_code_ua` itself would also start pinning every OTHER
+# route CC's axios-based internals happen to call, which nothing here has
+# looked at (see `_PRESENCE`'s own axios traffic, excluded by route instead).
+def _is_cc_axios_ua(ua: str) -> bool:
+    return bool(ua) and ua.lstrip().lower().startswith("axios/")
+
+
 def is_pinned_route(path: str, ua: str = "") -> bool:
     """Whether a request path's bearer must be swapped to the pinned account.
 
@@ -3215,8 +3225,10 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     # ``fetch_oauth_profile`` asks the same route over urllib, through the same
     # proxy vars, and must keep seeing the live account: it is the oracle that
     # decides which slot a credential belongs to. The User-Agent is the only
-    # thing that tells the two callers apart.
-    if _is_claude_code_ua(ua) and (
+    # thing that tells the two callers apart -- including CC's OWN axios
+    # fetch of this same route (`_is_cc_axios_ua`, measured 2026-09-24: an
+    # unswapped one drifted `oauthAccount` and archived two live bridges).
+    if (_is_claude_code_ua(ua) or _is_cc_axios_ua(ua)) and (
         path.split("?", 1)[0].rstrip("/") == "/api/oauth/profile"
     ):
         return True
