@@ -7535,6 +7535,109 @@ class _WebSocketUpstream:
         self._thr.join(timeout=2.0)
 
 
+class _WebSocketAuthUpstream:
+    """A TLS upstream for a pinned WebSocket route: answers `reject_status`
+    (`Connection: close`, no upgrade) to a bearer in `reject_bearer`, a 101
+    handshake to any other. Records every Authorization it saw, in order --
+    like `_FakeUpstream`, a swap-refused case reconnects per attempt."""
+
+    def __init__(self, certdir: Path,
+                 reject_bearer: "str | set[str] | None" = None,
+                 reject_status: int = 401):
+        self._reject = ({reject_bearer} if isinstance(reject_bearer, str)
+                         else set(reject_bearer or ()))
+        self.reject_status = reject_status
+        self.auths_seen: "list[str | None]" = []
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._stop = False
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            head = buf.split(b"\r\n\r\n")[0].decode("latin1")
+            auth = next((ln.split(":", 1)[1].strip()
+                         for ln in head.split("\r\n")
+                         if ln.lower().startswith("authorization:")), None)
+            self.auths_seen.append(auth)
+            if auth in {f"Bearer {b}" for b in self._reject}:
+                tls.sendall(
+                    f"HTTP/1.1 {self.reject_status} Rejected\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    .encode("latin1"))
+                tls.close()
+                return
+            tls.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            data = tls.recv(4096)
+            tls.sendall(b"PONG")
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
+        self._srv.close()
+        self._thr.join(timeout=2.0)
+
+
+def _upgrade_via_proxy(proxy_port: int, ca_path: Path, path: str,
+                       bearer: "str | None" = None):
+    """CONNECT-tunnel through the proxy, TLS to api.anthropic.com, then send
+    a WebSocket upgrade GET on `path`. Returns `(status_line, tls_socket)` so
+    a 101 caller can keep pumping frames on the returned socket."""
+    ctx = ssl.create_default_context(cafile=str(ca_path))
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+               b"Host: api.anthropic.com:443\r\n\r\n")
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        resp += raw.recv(4096)
+    assert b"200" in resp.split(b"\r\n")[0]
+    tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+    auth = f"Authorization: Bearer {bearer}\r\n" if bearer is not None else ""
+    tls.sendall(
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: api.anthropic.com\r\n{auth}"
+        f"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    return head.split(b"\r\n")[0], tls
+
+
 class TestWebSocketUpgrade:
     """RC's transport is a WebSocket. Stripping Connection/Upgrade as
     hop-by-hop made the server answer 403 — the whole reason /remote-control
@@ -15221,6 +15324,119 @@ class TestAMisroutedSwapCannotKillASession:
         finally:
             proxy.stop()
             upstream.stop()
+
+    def case_a_swapped_upgrade_refused_401_is_retried_fresh_and_still_gets_101(
+            self, certdir, monkeypatch):
+        """T1155: the gap. `/api/frame/sync` (artifact sync, the RC comment
+        watch/wake route) is a pinned route reached as a WebSocket upgrade.
+        `_relay_upgrade` used to relay a 401/403/404 straight to the client
+        -- terminal in SSETransport, same as the HTTP path above -- with no
+        refetch and no retry. A stale cached pinned token refused must get
+        the SAME treatment as the HTTP path: refetch once
+        (`_refetch_swap_token`), retry swapped, and the client sees only
+        the eventual 101."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _refetch_switcher(
+            certdir, lambda n: "stale-token" if n == 1 else "fresh-token")
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+
+        up = _WebSocketAuthUpstream(certdir, reject_bearer="stale-token",
+                                    reject_status=401)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem", "/api/frame/sync",
+                bearer="disk-token")
+            assert b"101" in status, (
+                "a refused swap on an upgrade must be retried fresh, not "
+                f"handed to the client as-is: {status!r}")
+            tls.sendall(b"PING")
+            assert tls.recv(4096) == b"PONG"
+            tls.close()
+        finally:
+            proxy.stop()
+            up.stop()
+        assert up.auths_seen == ["Bearer stale-token", "Bearer fresh-token"], (
+            up.auths_seen)
+
+    def case_a_dead_pinned_token_on_an_upgrade_falls_back_unswapped(
+            self, certdir, monkeypatch):
+        """Control: the pinned account is really dead (every read answers
+        the same refused token), not a stale cache. One retry, then the
+        same disk-bearer fallback the HTTP path takes, and one `swap
+        refused ... fell-back` log line -- never a client-visible
+        401/403/404."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _refetch_switcher(certdir, lambda n: "dead-token")
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+
+        up = _WebSocketAuthUpstream(certdir, reject_bearer="dead-token",
+                                    reject_status=403)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", up.port))
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        proxy.start()
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem", "/api/frame/sync",
+                bearer="disk-token")
+            assert b"101" in status, (
+                f"the unswapped fallback must still complete the upgrade: "
+                f"{status!r}")
+            tls.close()
+            assert up.auths_seen == ["Bearer dead-token", "Bearer disk-token"], (
+                up.auths_seen)
+            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
+            assert swap_lines == [
+                "swap refused (403) on GET /api/frame/sync: fell-back"
+            ], lines
+        finally:
+            proxy.stop()
+            up.stop()
+            pp._log_lifecycle = real_log
+
+    def case_a_non_swapped_upgrade_refused_is_relayed_untouched(self, certdir):
+        """Control: a route `is_pinned_route` never swaps (the `/worker`
+        subtree keeps its own session JWT, per that function's docstring)
+        must see NO refetch and NO retry on refusal -- the refused response
+        is the client's, verbatim, after exactly one upstream attempt."""
+        from cswap_pin.proxy import PinProxy
+
+        up = _WebSocketAuthUpstream(certdir, reject_bearer="disk-token",
+                                    reject_status=403)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PINTOKEN",
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/cse_x/worker/events/stream",
+                bearer="disk-token")
+            assert b"403" in status, (
+                f"a non-swapped route's own refusal must reach the client "
+                f"untouched: {status!r}")
+            tls.close()
+        finally:
+            proxy.stop()
+            up.stop()
+        assert up.auths_seen == ["Bearer disk-token"], (
+            f"a non-pinned route must never retry on refusal: {up.auths_seen}")
 
 
 class TestEverySmallCaseHolder:

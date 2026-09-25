@@ -18220,7 +18220,16 @@ class PinProxy:
                 # WebSocket): relay the handshake response, then pump both
                 # directions until either side closes. Nothing further on this
                 # connection is HTTP, so the request loop must end.
-                if _relay_upgrade(up, client):
+                _upgrade_result = _relay_upgrade(
+                    up, client, reject_on_auth_error=swapped)
+                if isinstance(_upgrade_result, _AuthRejected):
+                    # SAME SHAPE AS THE HTTP PATH'S `_relay_response` return:
+                    # nothing was sent to the client, so `_forward`'s caller
+                    # (`_handle_one_request_inner`) can refetch and retry
+                    # this upgrade exactly the way it retries a rejected
+                    # HTTP request — no second mechanism.
+                    return _upgrade_result
+                if _upgrade_result:
                     # 101 = OPAQUE FROM HERE. Nothing further on this
                     # connection is HTTP, so the thread that carried the
                     # handshake has no work left: hand both sockets to the
@@ -19156,12 +19165,24 @@ def _peek_status(up) -> "tuple[int | None, bytes]":
     return int(line[1]), bytes(buf)
 
 
-def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
+def _relay_upgrade(
+    up: ssl.SSLSocket, client: ssl.SSLSocket,
+    reject_on_auth_error: bool = False,
+) -> "bool | _AuthRejected":
     """Relay an upgrade handshake response verbatim; True when it was a 101.
 
     Headers pass through untouched (Connection/Upgrade included — the client
     needs them to accept the switch), and any bytes already read past the
     header terminator are forwarded so no frame is lost.
+
+    ``reject_on_auth_error`` mirrors `_relay_response`'s own flag: nothing
+    has reached the client yet at this point, so a 401/403/404 on a SWAPPED
+    upgrade (a WebSocket route the pin classified as pinned, e.g.
+    `/api/frame/sync`) can still be taken back the same way the HTTP path
+    already is — see `_AuthRejected` and `_handle_one_request_inner`'s
+    retry. Without this, the handshake's own refusal went straight to the
+    client, which is terminal for an SSETransport exactly like the HTTP
+    case, and no refetch or retry ever ran for an upgrade.
     """
     buf = bytearray()
     while b"\r\n\r\n" not in buf:
@@ -19172,6 +19193,11 @@ def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
         if not chunk:
             return False
         buf += chunk
+    status_line = bytes(buf).split(b"\r\n", 1)[0]
+    if reject_on_auth_error and any(
+        status_line.startswith(b"HTTP/1.1 " + c) for c in (b"401", b"403", b"404")
+    ):
+        return _AuthRejected(int(status_line[9:12]))
     if _TRACE is not None:
         _TRACE.write(
             "    <-UPGRADE "
@@ -19180,7 +19206,7 @@ def _relay_upgrade(up: ssl.SSLSocket, client: ssl.SSLSocket) -> bool:
         )
         _TRACE.flush()
     client.sendall(bytes(buf))
-    return buf.split(b"\r\n", 1)[0].split(b" ")[1:2] == [b"101"]
+    return status_line.split(b" ")[1:2] == [b"101"]
 
 
 def _status_has_no_body(status_line: bytes, method: str | None) -> bool:
