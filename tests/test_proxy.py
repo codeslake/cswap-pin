@@ -9563,6 +9563,37 @@ class TestThePortIsConfigurable:
         assert pin_proxy.configured_port(certdir) == 43333
 
 
+class _Ticks:
+    """A `done` that ends the loop after N ticks, instead of a bare
+    `threading.Event()` that is never set.
+
+    Every held-replace case below drives `_watch_own_code` directly on
+    the test thread and expects it to exit (`os._exit`, stubbed to raise
+    `SystemExit`) on its FIRST pass through the held branch. A never-set
+    Event is harmless while that holds, but a regression that falls
+    through to `continue` instead of exiting would spin the `while`
+    loop forever with nothing to end it -- this bounds that to a few
+    ticks so the regression fails the assertions below instead of
+    hanging the suite. Shared with the control cases in
+    `TestABlindDaemonRepairsItself`, which act on nothing by design and
+    need the same bound to make "nothing happened" assertable rather
+    than a hang.
+    """
+
+    def __init__(self, n=3):
+        self.left = n
+
+    def wait(self, _timeout=None):
+        self.left -= 1
+        return self.left <= 0
+
+    def is_set(self):
+        return self.left <= 0
+
+    def set(self):
+        self.left = 0
+
+
 class TestDaemonPortStability:
     """A live session's HTTPS_PROXY is fixed at exec time. If a recycled
     daemon comes back on a NEW port, every already-running session keeps
@@ -9571,6 +9602,8 @@ class TestDaemonPortStability:
     while the pin looked healthy). The daemon must therefore reclaim the port
     recorded in proxy.json whenever it is free.
     """
+
+    _Ticks = _Ticks
 
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
@@ -9595,33 +9628,6 @@ class TestDaemonPortStability:
             return False
         finally:
             probe.close()
-
-    class _Ticks:
-        """A `done` that ends the loop after N ticks, instead of a bare
-        `threading.Event()` that is never set.
-
-        Every held-replace case below drives `_watch_own_code` directly on
-        the test thread and expects it to exit (`os._exit`, stubbed to raise
-        `SystemExit`) on its FIRST pass through the held branch. A never-set
-        Event is harmless while that holds, but a regression that falls
-        through to `continue` instead of exiting would spin the `while`
-        loop forever with nothing to end it -- this bounds that to a few
-        ticks so the regression fails the assertions below instead of
-        hanging the suite.
-        """
-
-        def __init__(self, n=3):
-            self.left = n
-
-        def wait(self, _timeout=None):
-            self.left -= 1
-            return self.left <= 0
-
-        def is_set(self):
-            return self.left <= 0
-
-        def set(self):
-            self.left = 0
 
     def case_a_real_spawned_successor_drops_no_connection(
         self, tmp_path, monkeypatch
@@ -13123,10 +13129,17 @@ print("OK", port)
             subprocess, "Popen",
             lambda *a, **k: (_ for _ in ()).throw(OSError("no successor today")))
         f = _FailingHolder()
-        try:
-            f._on_replace_request(signal.SIGUSR1, None)
-        except OSError:
-            pass
+        lifecycle_lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lifecycle_lines.append)
+        # MUST NOT RAISE. An OSError here used to escape this SIGNAL HANDLER
+        # into the holder's main thread at `self._thread.join()`, ending the
+        # holder process with no `stop()` — the predecessor then exits 75 to
+        # a dead holder and only the standby can recover the port.
+        f._on_replace_request(signal.SIGUSR1, None)
+        assert any("no successor today" in line for line in lifecycle_lines), (
+            "a spawn that failed during a replace request left no trace — a "
+            "dead holder would give no clue why it never respawned"
+        )
         assert f._proc == "predecessor", (
             "a spawn that failed still reassigned `self._proc` — the next "
             "exit 0 would then be read as 'successor is serving' when "
@@ -13474,8 +13487,6 @@ print("OK", port)
 
         The budget here must be short enough that the gap is not felt.
         """
-        import threading
-
         from cswap_pin import proxy as pin_proxy
 
         budgets = []
@@ -13518,7 +13529,7 @@ print("OK", port)
         os.kill = _kill_and_publish
         try:
             pin_proxy._watch_own_code(
-                _Srv(), "1", "a@b.c", tmp_path, threading.Event(),
+                _Srv(), "1", "a@b.c", tmp_path, self._Ticks(),
                 lambda *a: None, interval=0.01,
                 _own_fingerprint="never-matches",
             )
@@ -27678,14 +27689,19 @@ class TestAHandoverIsNotAFailure:
         and an unconditional one would put `_SPAWN_WAIT_S` on every launch
         that legitimately needs a spawn.
 
-        ASSERTS THE OUTCOME, NOT A GLOBAL `time.sleep` COUNT. A macOS runner
-        reaches a real Keychain-probe subprocess before `_spawn_daemon` (see
-        `_keychain_denied_here`, stubbed below), and its post-EOF `wait()`
-        spins through CPython's own reap backoff -- ticks on the very same
-        `time.sleep` this test used to count, on Linux never appearing at
-        all. Counting `_read_alive_port` calls instead reads the same
-        decision (spawn without a wait loop) without being a census of every
-        `time.sleep` anywhere in the process.
+        A `_read_alive_port` CALL COUNT ALONE IS NOT ENOUGH: a wait loop
+        built on `read_daemon_state` or `_await_successor_state` instead of
+        `time.sleep` would still pass it. So this also censuses every sleep
+        `ensure_proxy` itself makes, through a stand-in on `pin_proxy.time`
+        -- never on the global `time` module, which is what makes the
+        census SPECIFIC. A macOS runner reaches a real Keychain-probe
+        subprocess before `_spawn_daemon` (see `_keychain_denied_here`), and
+        its post-EOF `wait()` spins through CPython's own reap backoff --
+        ticks on `subprocess`'s OWN `time` import, invisible to a stand-in
+        that only replaces `pin_proxy.time`. A census built on the global
+        `time.sleep` instead would count that backoff too, and that flake is
+        the reason the call-count version above was written in the first
+        place.
         """
         from cswap_pin import proxy as pin_proxy
 
@@ -27698,11 +27714,38 @@ class TestAHandoverIsNotAFailure:
             read_alive_calls.append(1)
             return None
 
+        class _TimeCensus:
+            """Records a `sleep` made through `pin_proxy.time`, and only
+            that -- every other attribute delegates to the real module, so
+            code that reads `time.monotonic()` elsewhere keeps working."""
+
+            def __init__(self):
+                self.sleeps = []
+
+            def sleep(self, seconds):
+                self.sleeps.append(seconds)
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+        census = _TimeCensus()
+        monkeypatch.setattr(pin_proxy, "time", census)
+
+        # THE DISCRIMINATING CONTROL: a sleep from OUTSIDE proxy.py, made
+        # through the global `time` module this test file imported (never
+        # `pin_proxy.time`), must not show up in the census -- proving it is
+        # scoped to proxy.py's own wait loops and cannot be tripped by the
+        # macOS reap-backoff flake the docstring above describes.
+        def _keychain_probe_that_sleeps():
+            time.sleep(0.001)
+            return False
+
         monkeypatch.setattr(pin_proxy, "_read_alive_port", _fake_read_alive_port)
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda _cd: set())
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
                             lambda *_a: spawned.append("spawn") or 41000)
-        self._drive(pin_proxy, monkeypatch, tmp_path)
+        self._drive(pin_proxy, monkeypatch, tmp_path,
+                   keychain_denied=_keychain_probe_that_sleeps)
         assert spawned == ["spawn"], "did not spawn when nothing was coming"
         assert len(read_alive_calls) == 2, (
             f"read the alive port {len(read_alive_calls)} time(s) -- the fast "
@@ -27710,14 +27753,20 @@ class TestAHandoverIsNotAFailure:
             f"wait loop with no handover in the record adds one per tick, "
             f"which is _SPAWN_WAIT_S added to every launch that needs a spawn"
         )
+        assert census.sleeps == [], (
+            f"proxy.py itself slept {census.sleeps} on a record with no "
+            f"handover -- a wait loop ran when nothing was coming"
+        )
 
     # -- harness -----------------------------------------------------------
 
-    def _drive(self, pin_proxy, monkeypatch, tmp_path):
+    def _drive(self, pin_proxy, monkeypatch, tmp_path, keychain_denied=None):
         """Call ensure_proxy with everything around the decision stubbed out.
 
         Only the reuse/wait/spawn decision is under test; the CA, the chain
-        probe and the wiring are other tests' subjects.
+        probe and the wiring are other tests' subjects. ``keychain_denied``
+        lets a caller drive `_keychain_denied_here` itself, rather than the
+        default stand-in that only ever returns False.
         """
         class _SW:
             backup_dir = tmp_path
@@ -27737,7 +27786,8 @@ class TestAHandoverIsNotAFailure:
         monkeypatch.setattr(pin_proxy, "publish_ca", lambda _p: None)
         monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *_a: None)
         monkeypatch.setattr(pin_proxy, "unwire_if_dead", lambda _cd: None)
-        monkeypatch.setattr(pin_proxy, "_keychain_denied_here", lambda: False)
+        monkeypatch.setattr(pin_proxy, "_keychain_denied_here",
+                            keychain_denied or (lambda: False))
         got = pin_proxy.ensure_proxy(_SW())
         return got if got is None else got[0]
 
@@ -27768,29 +27818,7 @@ class TestABlindDaemonRepairsItself:
         def learn_next_hop(self):
             pass
 
-    class _Ticks:
-        """A `done` that ends the loop after N ticks.
-
-        The existing watchdog harnesses pass a never-set Event and rely on the
-        branch under test calling `os._exit`. That works only for cases that
-        DO act -- the control cases here act by design on nothing, so with a
-        never-set Event the loop spins for ever and the test hangs instead of
-        failing. Ending the loop is what lets "nothing happened" be an
-        assertable outcome.
-        """
-
-        def __init__(self, n=3):
-            self.left = n
-
-        def wait(self, _timeout=None):
-            self.left -= 1
-            return self.left <= 0
-
-        def is_set(self):
-            return self.left <= 0
-
-        def set(self):
-            self.left = 0
+    _Ticks = _Ticks
 
     def _drive_with(self, monkeypatch, tmp_path, srv):
         """`_drive` for a server the caller already holds, so a test can read
