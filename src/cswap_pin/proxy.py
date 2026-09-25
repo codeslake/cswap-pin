@@ -1964,10 +1964,18 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # gets another look. WEDGE ONLY -- a stale-fingerprint
                     # daemon is retired for running code we no longer ship,
                     # not for a missed /health, and the CODE watchdog already
-                    # covers that case (it fires on a stale fingerprint). A
-                    # WEDGE on CURRENT code never trips that watchdog -- so
-                    # worker traffic must spare only THIS recycle, or a
-                    # spared wedge would have nothing left to catch it.
+                    # had its own separate turn at replacing it gaplessly
+                    # (`_watchdog_had_its_turn`, above) before this recycle
+                    # branch is ever reached for it -- so a STALE daemon
+                    # spared here by worker traffic would have nothing left
+                    # to retire it, and would keep running code we no longer
+                    # ship for as long as it stayed busy. A WEDGE on CURRENT
+                    # code never gets that earlier watchdog turn at all --
+                    # there is no newer fingerprint to trigger it -- so THIS
+                    # recycle is its only chance to be noticed, and sparing
+                    # it costs nothing: a wedge that is genuinely dead stays
+                    # dead, and the next heal call catches it once the
+                    # traffic itself goes stale.
                     age = _worker_alive_age(certdir, stale_pid) if wedged else None
                     if wedged and age is not None and age < _STREAM_LIVE_SECONDS:
                         _log_lifecycle(
@@ -2017,8 +2025,9 @@ def heal(backup_root: Path, identity: dict | None = None,
                             os.kill(asked_holder, _REPLACE_ME_SIGNAL)
                         except OSError:
                             asked_holder = None
-                    if asked_holder and _await_successor_state(
-                            certdir, fp, stale_pid):
+                    confirmed = bool(asked_holder) and _await_successor_state(
+                        certdir, fp, stale_pid)
+                    if confirmed:
                         _log_carry(
                             certdir,
                             f"{stale_pid} was wedged under a holder — "
@@ -2037,19 +2046,25 @@ def heal(backup_root: Path, identity: dict | None = None,
                     # for the code it runs, not for missed probes, and
                     # logging `misses=3` against it claimed evidence this
                     # path never gathered.
-                    # ONLY WHEN A SIGNAL WAS ACTUALLY DELIVERED. Setting
+                    # A SIGNAL DELIVERED OR A SUCCESSOR CONFIRMED. Setting
                     # `recycled` merely for ENTERING this branch made a
                     # no-op recycle look like a real one: with no `ps` (the
                     # documented blind spot) the identity gate kills nothing,
                     # and heal then spawned a successor over a daemon that is
-                    # still serving. ESRCH is the same failure by another
-                    # route -- the pid was already gone -- so a successor
-                    # found afterwards belongs to whoever actually retired
-                    # it, not to this call.
+                    # still serving. ESRCH ALONE is the same failure by
+                    # another route -- the pid was already gone -- so a
+                    # successor found afterwards belongs to whoever actually
+                    # retired it, not to this call -- UNLESS this same call
+                    # already asked the holder and watched that successor
+                    # publish (`confirmed`), in which case the ESRCH is the
+                    # holder's own replace beating this TERM there, not a
+                    # bystander's repair: reporting "Nothing to heal" for a
+                    # replace this call just confirmed sent someone chasing a
+                    # repair that had already happened.
                     recycled = _kill_daemon(
                         stale_pid, certdir,
                         misses=_PIN_PROBE_ATTEMPTS if wedged else None,
-                        worker_alive_age=age)
+                        worker_alive_age=age) or confirmed
         except SpawnLockBusy as exc:
             # NOT THE SAME FALSE AS "nothing to heal". Both reach the caller as
             # a bare False and it prints "Nothing to heal" — the opposite of
@@ -7245,8 +7260,13 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None,
         # nor the killed daemon's own parent, and reads as either "the
         # daemon's parent" or "who did this" depending on which the reader
         # guesses. `by_pid` is unambiguous: it names the process that just
-        # called `os.kill`.
-        _log_carry(certdir, f"TERM {pid}", by_pid=os.getpid(), misses=misses,
+        # called `os.kill`. `by_parent` is OUR OWN parent, named beside it
+        # under a key that does not contain the old ambiguous `ppid=` --
+        # a reader tracing this line back to a status line, a heal, or a
+        # deploy script needs the caller's own process tree, and `by_pid`
+        # alone leaves that one hop short.
+        _log_carry(certdir, f"TERM {pid}", by_pid=os.getpid(),
+                   by_parent=os.getppid(), misses=misses,
                    worker_alive_age=worker_alive_age)
     # +2s of slack past the drain ceiling; the loop exits the moment it dies,
     # so a daemon with no live clients still returns in milliseconds.
@@ -7274,7 +7294,8 @@ def _kill_daemon(pid: int, certdir: "Path | None" = None,
     except OSError:
         return True  # TERM was delivered; it vanished before the escalation
     if certdir is not None:
-        _log_carry(certdir, f"KILL {pid}", by_pid=os.getpid(), misses=misses,
+        _log_carry(certdir, f"KILL {pid}", by_pid=os.getpid(),
+                   by_parent=os.getppid(), misses=misses,
                    worker_alive_age=worker_alive_age)
     for _ in range(10):  # up to ~1s for the port to actually free
         if not _pid_alive(pid):
@@ -7303,8 +7324,18 @@ def _recycle_daemon(certdir: Path, pid: int) -> bool:
     successor retires it again if the file on disk has moved on. Without a
     holder this is the old behaviour, unchanged — kill, and let the caller
     spawn.
+
+    NOT `_holder_owns` ALONE. That matches `--hold-port` argv only, and a
+    standby PROMOTED IN PLACE (`_standby_revive`) never re-execs — its argv
+    still reads `--standby ...` — so a wedge under one fell through to
+    False here, `ensure_proxy` spawned a SECOND holder for a port the
+    promoted standby's own exit-75 respawn was about to refill, and the
+    caller was left with two holders on one certdir. `_wedged_parent_holder`
+    already proves the stronger claim (``pid``'s OWN parent is a holder OR a
+    promoted standby for THIS certdir) — the same reason `heal`'s own wedge
+    branch stopped `and`-ing `_holder_owns` in.
     """
-    held = _holder_owns(certdir)
+    held = _holder_owns(certdir) or _wedged_parent_holder(pid, certdir) is not None
     _kill_daemon(pid, certdir)
     return held
 
@@ -7488,9 +7519,17 @@ def _wedged_env_via_ps(pid: int, holder_pid: int) -> bool:
     # not a dict, and `f"{KEY}={v}" in out` reads `CSWAP_PIN_HELD_BY=90` as
     # present inside `CSWAP_PIN_HELD_BY=901`. Matched as a whole token, the
     # same exact equality the `/proc/<pid>/environ` dict path already gets.
+    #
+    # THE LAST MATCH, NOT THE FIRST -- `ps eww` appends the process's own
+    # ENVIRONMENT after its ARGV on the same line, and a token that merely
+    # looks like the marker can occur inside the command line itself before
+    # the real environment assignment that follows it. `re.search` returns
+    # whichever comes first, which is that argv token; the real value is
+    # the trailing one. Same reading `runtime_health.py` uses for this
+    # exact shape.
     def _token(key: str) -> "str | None":
-        m = re.search(rf"(?:^|\s){re.escape(key)}=(\S*)", out)
-        return m.group(1) if m else None
+        matches = re.findall(rf"(?:^|\s){re.escape(key)}=(\S*)", out)
+        return matches[-1] if matches else None
 
     return (_token(_HELD_BY_ENV) == str(holder_pid)
             and _token(_HOLDER_REPLACE_ENV) == "1")
@@ -10885,9 +10924,11 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
 def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
                     email: str) -> None:
     """Hand the still-open port to a freshly-resolved holder, or promote in
-    place on the identity this standby was BORN with. Split out of
-    `standby_main` so a test can drive it without a live loop -- same reason
-    `_standby_tick` exists.
+    place -- on that SAME fresh identity when the resolve succeeded and only
+    the spawn (or a race with what it started) did not, on the identity this
+    standby was BORN with only when nothing could be resolved at all. Split
+    out of `standby_main` so a test can drive it without a live loop -- same
+    reason `_standby_tick` exists.
 
     SIGTERM/SIGINT ARE RESET BEFORE EITHER PATH BELOW, spawn or promotion.
     `standby_main` set both to SIG_IGN while idle (see there) -- SIG_IGN
@@ -10915,13 +10956,17 @@ def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
     this standby was BORN with. Those name whatever was pinned when its
     holder started, and a `cswap pin --clear` (or a re-pin to a different
     account) since then must not be resurrected by an orphan that never
-    heard about it. Any failure resolving it -- no pin, a dangling slot,
-    `load_pin` itself raising, or the spawn failing outright -- falls to the
-    OLD IN-PLACE PROMOTION: this process becomes the holder on the socket
-    it is already holding, under the identity it was born with. That is
-    exactly what ran here before 3c5ab00, and it kept serving live sessions
+    heard about it. A failure to RESOLVE at all -- no pin, a dangling slot,
+    or `load_pin`/the resolve itself raising -- falls to the OLD IN-PLACE
+    PROMOTION on the BORN-WITH identity: this process becomes the holder on
+    the socket it is already holding, under the identity it was born with,
+    because nothing fresher was ever confirmed. That is exactly what ran
+    here before 3c5ab00, unconditionally, and it kept serving live sessions
     (whose HTTPS_PROXY is fixed at exec) -- releasing the port with nothing
-    proven to hand it to only strands them.
+    proven to hand it to only strands them. THE SPAWN FAILING OUTRIGHT is a
+    different case, handled at the promotion site itself (below): the
+    resolve DID succeed, so that fallback promotes on the RESOLVED identity
+    instead, never the possibly-stale born-with one.
     """
     import signal
 

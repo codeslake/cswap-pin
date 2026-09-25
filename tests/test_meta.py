@@ -48,6 +48,108 @@ def test_a_case_cannot_leave_the_process_marked_draining(request, tmp_path_facto
             pin_proxy._DRAINING_DEPTH.clear()
 
 
+def test_a_skip_in_one_case_does_not_swallow_a_later_failure(
+    request, tmp_path_factory
+):
+    """`pytest.skip()` raises `Skipped`, which derives from `BaseException`,
+    not `Exception` -- `run_cases`'s own `except Exception` never caught it.
+    A skip anywhere in a class's `case_*` methods ended the whole driver
+    loop on the spot: every later case never ran, and any failure the loop
+    had already collected was never raised.
+
+    NOT DRIVEN THROUGH `pytest.raises`: an escaping `Skipped` would just mark
+    THIS test skipped too, the same silent non-failure the bug itself
+    produces -- so this catches it by hand and turns it into a loud
+    `AssertionError` if it still escapes.
+    """
+    from conftest import run_cases as _run_cases
+
+    class Holder:
+        def case_a_skips(self, tmp_path):
+            pytest.skip("nothing to check on this platform")
+
+        def case_b_fails(self, tmp_path):
+            assert False, "this failure must reach the caller"
+
+    try:
+        _run_cases(Holder(), request, tmp_path_factory)
+    except AssertionError as exc:
+        assert "this failure must reach the caller" in str(exc), (
+            f"run_cases raised an AssertionError, but not one naming the "
+            f"failure from case_b_fails: {exc}")
+        return
+    except pytest.skip.Exception as exc:
+        raise AssertionError(
+            f"the skip in case_a_skips swallowed case_b_fails's failure "
+            f"entirely -- run_cases raised Skipped instead: {exc}"
+        ) from exc
+    raise AssertionError(
+        "run_cases returned normally instead of raising the failure from "
+        "case_b_fails")
+
+
+def test_a_class_whose_every_case_skips_is_reported_skipped(
+    request, tmp_path_factory
+):
+    """The all-skip class must not read as a silent pass: `run_cases` itself
+    skips, naming EVERY case that skipped -- not just the first one the old
+    code happened to bail out on, which a message with no case names cannot
+    tell apart from the bug this guards."""
+    from conftest import run_cases as _run_cases
+
+    class Holder:
+        def case_a_skips(self, tmp_path):
+            pytest.skip("reason-a")
+
+        def case_b_skips(self, tmp_path):
+            pytest.skip("reason-b")
+
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        _run_cases(Holder(), request, tmp_path_factory)
+    msg = str(exc_info.value)
+    assert "case_a_skips" in msg and "case_b_skips" in msg, (
+        f"the skip did not name every case that skipped -- indistinguishable "
+        f"from the old code bailing out on the first one alone: {msg!r}")
+
+
+def test_a_partial_skip_with_no_failure_still_passes_but_is_surfaced(
+    request, tmp_path_factory
+):
+    """Some cases skip, none fail: the driver must still PASS (a real skip
+    is not a failure) but the skip must be visible rather than vanishing --
+    a warning is enough for pytest to show it. Caught by hand, same reason
+    as the sibling case above: `pytest.warns` does not catch an escaping
+    `Skipped`, it just lets this test skip too."""
+    import warnings
+
+    from conftest import run_cases as _run_cases
+
+    ran = []
+
+    class Holder:
+        def case_a_skips(self, tmp_path):
+            pytest.skip("nothing to check on this platform")
+
+        def case_b_passes(self, tmp_path):
+            ran.append("b")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            _run_cases(Holder(), request, tmp_path_factory)
+        except pytest.skip.Exception as exc:
+            raise AssertionError(
+                f"a single skip ended the whole run instead of letting "
+                f"case_b_passes run: {exc}"
+            ) from exc
+
+    assert ran == ["b"], (
+        "case_b_passes never ran even though run_cases returned normally")
+    assert any("case_a_skips" in str(w.message) for w in caught), (
+        f"the skip in case_a_skips left no trace: "
+        f"{[str(w.message) for w in caught]!r}")
+
+
 def test_the_daemon_port_is_occupied_for_the_whole_run():
     """36301 must be unavailable while the suite runs, or a case can draw it.
 

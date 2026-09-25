@@ -9286,6 +9286,45 @@ class TestKillDaemon:
         assert "misses" not in log and "worker_alive_age" not in log, (
             f"an absent evidence kwarg was printed as text anyway: {log!r}")
 
+    def case_logs_the_killers_parent_too(self, monkeypatch, tmp_path):
+        """`by_pid` names the killer; nothing names the killer's OWN
+        parent, so a log naming only `by_pid=<this test runner's own pid>`
+        gives a reader no way to tell one caller's process tree from
+        another's without a second, out-of-band lookup. Named `by_parent`,
+        never `ppid` -- the sibling case's control still guards the
+        substring `ppid=` from reappearing."""
+        import os
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        monkeypatch.setattr(pin_proxy.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(pin_proxy, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        pin_proxy._kill_daemon(4323, certdir)
+
+        log = pin_proxy.daemon_log_path(certdir).read_text()
+        assert f"by_parent={os.getppid()}" in log, (
+            f"the killer's own parent is not in the log as `by_parent`: "
+            f"{log!r}")
+
+    def case_a_dead_pid_delivers_no_signal(self, monkeypatch):
+        """The pid was already gone -- `os.kill` raises ESRCH on the very
+        first TERM. No signal was delivered, so the caller (`heal`'s
+        `recycled`) must read False, not merely not-raise."""
+        from cswap_pin import proxy as pin_proxy
+
+        def _fake_kill(pid, sig):
+            raise OSError("No such process")
+        monkeypatch.setattr(pin_proxy.os, "kill", _fake_kill)
+
+        assert pin_proxy._kill_daemon(4324) is False, (
+            "a TERM that hit ESRCH on an already-dead pid was reported as "
+            "a signal delivered")
+
 
 class TestDaemonSignalTeardown:
     """The daemon installs a SIGTERM handler so a recycle (or cc-update) that
@@ -11028,10 +11067,11 @@ print("OK", port)
         `_spawn_daemon`, so a FRESH holder's own `_retire_stale_standbys`
         -- which SIGHUPs every OTHER standby it finds on this port,
         including this reviving one -- landed on the default disposition
-        (terminate) instead of the SIG_IGN `standby_main` arms while idle,
-        killing the reviving standby in the middle of the very wait meant
-        to give it a successor. SIGHUP must stay untouched unless and until
-        this call falls through to the old in-place promotion."""
+        (terminate) instead of the `_release` handler `standby_main` arms
+        for SIGHUP while idle, killing the reviving standby in the middle
+        of the very wait meant to give it a successor. SIGHUP must stay
+        untouched unless and until this call falls through to the old
+        in-place promotion."""
         import json as _json
         import signal
 
@@ -11062,7 +11102,13 @@ print("OK", port)
             sig: signal.getsignal(sig)
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
         }
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)  # standby_main's idle disposition
+        # A DISTINGUISHABLE SENTINEL, not literally what `standby_main` arms
+        # (that is `_release`, a closure local to that function and not
+        # importable here) -- what this case tests is only that
+        # `_standby_revive` leaves whatever was armed alone, so any
+        # disposition other than SIG_DFL proves the same thing `_release`
+        # would.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         try:
             pin_proxy._standby_revive(certdir, _Srv(), "1", "born@with.it")
             assert seen_during_spawn == [signal.SIG_IGN], (
@@ -12050,6 +12096,54 @@ print("OK", port)
             from conftest import _reap_pin_processes
 
             _reap_pin_processes(tmp_path)
+
+    def case_recycle_recognises_a_promoted_standby_as_the_holder(
+        self, tmp_path, monkeypatch
+    ):
+        """`_recycle_daemon`'s own gate asked only `_holder_owns`, which
+        matches `--hold-port` argv alone. A standby PROMOTED IN PLACE
+        (`_standby_revive`) never re-execs -- its argv still reads
+        `--standby ...` -- so `_holder_owns` answered False for it and
+        `ensure_proxy` spawned a SECOND holder for a port the promoted
+        standby's own exit-75 respawn was about to refill: the double bind
+        `_recycle_daemon`'s own docstring measures. `_wedged_parent_holder`
+        already proves the STRONGER claim -- this pid's OWN parent is a
+        holder OR a promoted standby for THIS certdir -- the same reason
+        `heal`'s own wedge branch stopped `and`-ing `_holder_owns` in.
+        """
+        from cswap_pin import proxy
+
+        stale_pid = 60001
+        killed = []
+        monkeypatch.setattr(
+            proxy, "_kill_daemon", lambda pid, cd=None, **k: killed.append(pid))
+
+        # THE ROW UNDER TEST: no `--hold-port` holder, but the pid's own
+        # parent is a promoted `--standby`.
+        monkeypatch.setattr(proxy, "_holder_owns", lambda cd: False)
+        monkeypatch.setattr(
+            proxy, "_wedged_parent_holder",
+            lambda pid, cd: 424242 if pid == stale_pid else None)
+        assert proxy._recycle_daemon(tmp_path, stale_pid) is True, (
+            "a promoted standby holding the port was not recognised as the "
+            "holder -- ensure_proxy starts a second one over it"
+        )
+        assert killed == [stale_pid]
+
+        # CONTROL: an ordinary --hold-port holder, `_holder_owns` alone,
+        # must still read True.
+        killed.clear()
+        monkeypatch.setattr(proxy, "_holder_owns", lambda cd: True)
+        monkeypatch.setattr(proxy, "_wedged_parent_holder", lambda pid, cd: None)
+        assert proxy._recycle_daemon(tmp_path, stale_pid) is True
+
+        # CONTROL: a plain parent, neither a holder nor a promoted standby,
+        # must still read False -- guessing True would skip a recycle that
+        # was asked for.
+        killed.clear()
+        monkeypatch.setattr(proxy, "_holder_owns", lambda cd: False)
+        monkeypatch.setattr(proxy, "_wedged_parent_holder", lambda pid, cd: None)
+        assert proxy._recycle_daemon(tmp_path, stale_pid) is False
 
     def case_an_idle_teardown_under_a_holder_still_unwires(self, tmp_path):
         """A holder's bare socket is not "somebody else is serving".
@@ -19216,8 +19310,15 @@ class TestAWedgeIsNotTrustedForever:
             {"pid": os.getpid(), "port": port, "fingerprint": fp}))
         (certdir / "ca.pem").write_bytes(b"x")
         # FRESH, but attributed to a DIFFERENT pid than the one being killed.
-        (certdir / proxy._ALIVE_FILE).write_text(
-            json.dumps({f"cse_x@{os.getpid() + 1}": time.time()}))
+        # BOTH SHAPES, the same as `_note_worker_status` actually writes: a
+        # bare key beside the per-pid one, in the same call. `_worker_alive_age`
+        # only ever matches the `@<pid>` suffix, so the bare key changes
+        # nothing this case asserts -- it is here so the fixture is the real
+        # production shape, not a hand-picked slice of it.
+        (certdir / proxy._ALIVE_FILE).write_text(json.dumps({
+            "cse_x": time.time(),
+            f"cse_x@{os.getpid() + 1}": time.time(),
+        }))
         (tmp_path / "settings.json").write_text(json.dumps(
             {"remoteControl": {"pinnedEmail": "c@e.com"}}))
         (tmp_path / "sequence.json").write_text(json.dumps(
@@ -19526,6 +19627,78 @@ class TestAWedgeIsNotTrustedForever:
             "heal replaced the wedge through its holder but reported "
             "'Nothing to heal'")
 
+    def case_a_confirmed_successor_survives_a_term_that_hits_esrch(
+            self, tmp_path, monkeypatch):
+        """The sibling above proves the ordinary path (`_kill_daemon`'s own
+        TERM succeeds) already reports True. This is the race the predecessor
+        can still lose: the holder's successor is CONFIRMED via
+        `_await_successor_state` (the SIGUSR1 branch below publishes it), but
+        the wedged predecessor had ALREADY exited by the time `heal` got
+        around to its own TERM -- ESRCH, no signal delivered, `_kill_daemon`
+        returns False on its own reasoning. `recycled` must still read True:
+        this call is the one that asked the holder and watched the successor
+        appear, and reporting 'Nothing to heal' for a repair just confirmed
+        sends someone chasing a repair that already happened."""
+        import signal
+
+        from cswap_pin import proxy
+
+        root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
+        certdir = root / "pin-proxy"
+        fp = proxy.daemon_fingerprint()
+        stale_pid, holder_pid, new_pid = 55531, 55532, 55533
+        proxy.write_daemon_state(certdir, 4100, stale_pid, fp)  # MATCHING fp
+
+        def _fake_read_alive_port(cd, fingerprint=None):
+            st = proxy.read_daemon_state(cd)
+            if not st:
+                return None
+            if fingerprint is not None:
+                if st.get("fingerprint") != fingerprint:
+                    return None
+                if int(st.get("pid") or 0) == stale_pid:
+                    return None
+            return st.get("port")
+
+        monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
+        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
+        monkeypatch.setattr(proxy, "_worker_alive_age", lambda cd, pid: None)
+        monkeypatch.setattr(proxy, "_holder_owns", lambda cd: True)
+        monkeypatch.setattr(
+            proxy, "_wedged_parent_holder",
+            lambda pid, cd: holder_pid if pid == stale_pid else None)
+        monkeypatch.setattr(proxy, "_wedged_daemon_can_be_asked",
+                            lambda pid, hp: True)
+        monkeypatch.setattr(proxy, "_pid_alive", lambda pid: pid != stale_pid)
+
+        def _fake_kill(pid, sig):
+            if pid == holder_pid and sig == proxy._REPLACE_ME_SIGNAL:
+                proxy.write_daemon_state(certdir, 4100, new_pid, fp)
+                return
+            if pid == stale_pid and sig == 15:
+                # ESRCH: the predecessor was already gone by the time this
+                # call got around to its own TERM -- the holder's successor
+                # (just confirmed above) beat it there.
+                raise OSError("No such process")
+            raise AssertionError(f"unexpected os.kill({pid}, {sig})")
+        monkeypatch.setattr(proxy.os, "kill", _fake_kill)
+
+        spawn_calls = []
+        monkeypatch.setattr(
+            proxy, "_spawn_daemon", lambda *a, **k: spawn_calls.append(a) or 99999)
+
+        assert proxy._REPLACE_ME_SIGNAL == signal.SIGUSR1, (
+            "no 'replace me' channel on this platform -- the case below is "
+            "vacuous without it")
+        result = proxy.heal(root)
+        assert not spawn_calls, (
+            "heal spawned a second daemon instead of trusting the holder's "
+            "successor")
+        assert result is True, (
+            "a confirmed successor was reported as 'Nothing to heal' "
+            "because the TERM to the already-gone predecessor hit ESRCH"
+        )
+
     def case_a_term_that_hits_esrch_does_not_report_healed(
             self, tmp_path, monkeypatch):
         """`_kill_daemon` hitting ESRCH means no signal was delivered -- the
@@ -19719,14 +19892,18 @@ class TestAWedgeIsNotTrustedForever:
             )
             # T1168 (C), simulated: /proc unavailable (macOS) must not
             # regress this same row -- `ps eww` reads the real environment
-            # either way.
-            self._no_proc(monkeypatch)
-            assert pin_proxy._wedged_daemon_can_be_asked(
-                claiming.pid, holder_pid) is True, (
-                "with /proc unavailable, the ps fallback did not trust a "
-                "daemon whose own environment claims this exact holder"
-            )
-            monkeypatch.undo()
+            # either way. SCOPED TO A `monkeypatch.context()`, not the
+            # shared fixture's own `undo()` -- calling `undo()` mid-case
+            # reverts EVERY patch this case has made so far, not just the
+            # `_no_proc` ones, and silently keeps doing that for whatever a
+            # later edit adds before this line.
+            with monkeypatch.context() as no_proc_mp:
+                self._no_proc(no_proc_mp)
+                assert pin_proxy._wedged_daemon_can_be_asked(
+                    claiming.pid, holder_pid) is True, (
+                    "with /proc unavailable, the ps fallback did not trust a "
+                    "daemon whose own environment claims this exact holder"
+                )
             assert pin_proxy._wedged_daemon_can_be_asked(
                 silent.pid, holder_pid) is False, (
                 "a daemon with NEITHER marker was signalled — SIGUSR1's "
@@ -19845,6 +20022,42 @@ class TestAWedgeIsNotTrustedForever:
         assert proxy._wedged_env_via_ps(wedged_pid, real_holder) is True, (
             "the CONTROL: the real holder itself was not trusted")
 
+    def case_the_env_token_is_the_last_one_on_the_line_not_the_first(
+            self, monkeypatch):
+        """`ps eww` appends a process's own ENVIRONMENT after its ARGV on
+        the same line -- env follows argv -- and argv is not evidence this
+        guard should trust: a token that merely LOOKS like the marker can
+        appear inside the command line itself, before the real environment
+        assignment that follows it. `re.search` returns the FIRST match on
+        the line, which is that argv token, not the real trailing value.
+        The token has to be the LAST match, the same as
+        `runtime_health.py`'s own reader of this shape."""
+        import subprocess
+
+        from cswap_pin import proxy
+
+        wedged_pid, real_holder = 501, 901
+        decoy_holder = 1  # what an earlier ARGV token names, not the real env
+
+        def _fake_run(argv, **k):
+            class _R:
+                stdout = (
+                    f"/usr/bin/python3 -m claude_swap.pin_proxy 1 a@b.c "
+                    f"CSWAP_PIN_HELD_BY={decoy_holder} /tmp/certdir "
+                    f"CSWAP_PIN_HELD_BY={real_holder} "
+                    f"CSWAP_PIN_HOLDER_TAKES_REPLACE=1\n")
+            return _R()
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert proxy._wedged_env_via_ps(wedged_pid, real_holder) is True, (
+            "the real holder, the LAST CSWAP_PIN_HELD_BY token on the "
+            "line, was not trusted -- the first (argv) token won instead"
+        )
+        assert proxy._wedged_env_via_ps(wedged_pid, decoy_holder) is False, (
+            "CONTROL: an earlier argv token naming a decoy pid was trusted "
+            "over the real trailing environment value"
+        )
+
     def case_a_standby_promoted_in_place_still_qualifies_as_the_holder(
             self, tmp_path):
         """`_standby_revive` promotes a standby to holder IN PLACE -- same
@@ -19905,6 +20118,8 @@ class TestAWedgeIsNotTrustedForever:
 
         from cswap_pin import proxy
 
+        has_proc = os.path.isdir("/proc")
+
         root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
         certdir = root / "pin-proxy"
         fp = proxy.daemon_fingerprint()
@@ -19940,10 +20155,16 @@ class TestAWedgeIsNotTrustedForever:
             assert proxy._holder_owns(certdir) is False, (
                 "the promoted standby's argv unexpectedly matched "
                 "_holder_owns -- this case is vacuous without that mismatch")
-            deadline = time.monotonic() + 5
-            while (time.monotonic() < deadline
-                   and not os.path.exists(f"/proc/{stale_pid}/environ")):
-                time.sleep(0.02)
+            # /proc/<pid>/environ exists as soon as exec lands; poll rather
+            # than assume the first read wins that race. Nothing to wait FOR
+            # without /proc -- the same guard the sibling case above uses,
+            # or this spins the full 5s ceiling on every run on a host with
+            # no /proc at all.
+            if has_proc:
+                deadline = time.monotonic() + 5
+                while (time.monotonic() < deadline
+                       and not os.path.exists(f"/proc/{stale_pid}/environ")):
+                    time.sleep(0.02)
 
             proxy.write_daemon_state(certdir, 4200, stale_pid, fp)  # WEDGE
 
