@@ -27488,6 +27488,7 @@ class TestAHandoverIsNotAFailure:
         monkeypatch.setattr(pin_proxy, "publish_ca", lambda _p: None)
         monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *_a: None)
         monkeypatch.setattr(pin_proxy, "unwire_if_dead", lambda _cd: None)
+        monkeypatch.setattr(pin_proxy, "_keychain_denied_here", lambda: False)
         got = pin_proxy.ensure_proxy(_SW())
         return got if got is None else got[0]
 
