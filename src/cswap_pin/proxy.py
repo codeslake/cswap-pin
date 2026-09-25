@@ -2017,18 +2017,13 @@ def heal(backup_root: Path, identity: dict | None = None,
                             os.kill(asked_holder, _REPLACE_ME_SIGNAL)
                         except OSError:
                             asked_holder = None
-                    if asked_holder:
-                        for _ in range(int(_SPAWN_WAIT_S * 10)):
-                            successor = read_daemon_state(certdir)
-                            if (successor and successor.get("fingerprint") == fp
-                                    and int(successor.get("pid") or 0) != stale_pid):
-                                _log_carry(
-                                    certdir,
-                                    f"{stale_pid} was wedged under a holder — "
-                                    f"asked the holder for a successor before "
-                                    f"terminating it")
-                                break
-                            time.sleep(0.1)
+                    if asked_holder and _await_successor_state(
+                            certdir, fp, stale_pid):
+                        _log_carry(
+                            certdir,
+                            f"{stale_pid} was wedged under a holder — "
+                            f"asked the holder for a successor before "
+                            f"terminating it")
                     # ponytail: TERM through `_kill_daemon` still gives this
                     # predecessor its ordinary 30s signal drain, even though
                     # a missed /health already said it was not moving -- on
@@ -9376,6 +9371,44 @@ def read_daemon_state(certdir: Path) -> dict | None:
     return data
 
 
+def _await_successor_state(
+    certdir: Path, fingerprint: "str | None", replaced_pid: int,
+    pre_ask_pid: "int | None" = None,
+) -> bool:
+    """Poll :func:`read_daemon_state` for the SUCCESSOR's own record — true
+    the instant one appears, false once ``_SPAWN_WAIT_S`` elapses with none.
+
+    A record counts as the successor when its pid differs from both
+    ``replaced_pid`` (the process being replaced) and ``pre_ask_pid`` (the
+    pid the record itself named the INSTANT BEFORE the ask, read by the
+    caller — so a record that already existed is never mistaken for the one
+    this ask is about to produce). ``fingerprint``, when given, must also
+    match; pass None to skip that test and match on pid identity alone — a
+    caller whose OWN fresh `daemon_fingerprint()` read can disagree with what
+    a successor computed at ITS OWN import (a deploy landing in between) has
+    no fingerprint left worth checking.
+
+    THE SAME TICK heal's wedge repair already used (0.1s), so this is that
+    loop factored out rather than a second one: an `os.kill` that returned
+    without OSError only proves the pid existed, never that anything is
+    listening behind it yet.
+
+    ``_SPAWN_WAIT_S`` IS READ HERE, AT CALL TIME — a default argument binds
+    when this function is DEFINED, so a test (or any caller) patching the
+    module attribute afterwards would have no effect.
+    """
+    for _ in range(int(_SPAWN_WAIT_S * 10)):
+        successor = read_daemon_state(certdir)
+        if successor:
+            pid = int(successor.get("pid") or 0)
+            if (pid != replaced_pid and pid != pre_ask_pid
+                    and (fingerprint is None
+                         or successor.get("fingerprint") == fingerprint)):
+                return True
+        time.sleep(0.1)
+    return False
+
+
 def _serving_daemon_ungated(certdir: Path | None) -> bool:
     """Whether ``proxy.json`` says the daemon serving ``certdir`` has retired
     its plain-relay credential gate — see ``_PLAIN_RELAY_UNGATED_KEY``.
@@ -10345,6 +10378,15 @@ class PortHolder:
         # already the correct "not a handover" answer — no separate flag
         # needed.
         with self._replace_lock:
+            # A HANDLER ARRIVING AFTER `stop()` HAS NOTHING TO SPAWN ONTO. The
+            # daemon side now waits for a published successor before it exits,
+            # but a late handler racing that wait is still possible, and
+            # `stop()` has already closed `self._srv` — `_spawn()`'s
+            # `self._srv.fileno()` on a closed socket returns -1, and
+            # `Popen(pass_fds=(-1,))` is what raises out of this signal
+            # handler, on the MAIN thread, into `self._thread.join()`.
+            if self._stop:
+                return
             self._spawn()
 
     def _supervise(self) -> None:
@@ -10383,8 +10425,9 @@ class PortHolder:
                 # iteration captured.
                 if self._proc is not proc:
                     _log_lifecycle(
-                        f"daemon {code} retired after handing over — successor "
-                        f"already serving on port {self.port}"
+                        f"daemon {proc.pid} retired (exit {code}) after "
+                        f"handing over — successor already serving on port "
+                        f"{self.port}"
                     )
                     continue
                 # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
@@ -11395,6 +11438,12 @@ def _watch_own_code(
     # for each one. One shot leaves the machine exactly as it was if it fails,
     # which is the safer of the two ways to be wrong.
     stand_down_asked = False
+    # THE ASK HAPPENS ONCE PER PROCESS, WITH NO LOOP-CARRIED STATE NEEDED.
+    # Every path out of the held-replace branch below is an `os._exit` — the
+    # successor's own publish found (exit 0) or not found within
+    # `_SPAWN_WAIT_S` (exit 75, the fallback the supervisor already knows how
+    # to recover from). A second SIGUSR1 is therefore never reachable: the
+    # process asking is gone before a second tick could ask again.
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
     while not done.wait(interval):
@@ -11564,56 +11613,116 @@ def _watch_own_code(
                 # uncapped ceiling on every later teardown and put `Connection:
                 # close` on every response it ever writes again.
                 _asked_done = announce_draining(certdir, server=server)
+                # THE RECORD THE INSTANT BEFORE THE ASK — so a record that
+                # was already sitting in `proxy.json` is never mistaken
+                # for the successor this ask is about to produce. See
+                # `_await_successor_state`. A LOCAL, not loop-carried: this
+                # whole branch exits before a second pass could need it.
+                _pre_ask = read_daemon_state(certdir)
+                pre_ask_pid = (
+                    int(_pre_ask.get("pid") or 0) if _pre_ask else None
+                )
                 holder = _holder_pid()
                 if holder:
                     try:
                         os.kill(holder, _REPLACE_ME_SIGNAL)
                     except OSError:
                         holder = None
-                if holder:
-                    # THE ASK IS NOT THE OUTCOME. `os.kill` returning says only
-                    # that the pid existed when we called it — nothing about a
-                    # successor. So verify the holder SURVIVED being asked: an
-                    # advertisement is written once at spawn and can be stale
-                    # by now, but whether that process is still there cannot
-                    # be. Serving stale code beats serving nothing, so we keep
-                    # the port and say so.
-                    time.sleep(_ASK_SETTLE_SECONDS)
-                    if not _pid_alive(holder):
-                        _log_lifecycle(
-                            "asked the holder to replace us and it did not "
-                            "survive the ask — keeping the port rather than "
-                            "releasing it to nobody"
-                        )
-                        # WE ARE NOT DRAINING AFTER ALL. This is the one exit
-                        # from this branch that keeps serving, so it is the one
-                        # that has to hand the announcement back.
-                        _asked_done()
-                        return
+                if not holder:
+                    # FALL BACK TO THE OLD SHAPE, never to nothing. No
+                    # holder pid, or a holder that will not take the
+                    # signal, means nobody has started a successor — so
+                    # we must still exit 75 and let the supervisor do it
+                    # the slow way. A gap is worse than the old behaviour
+                    # only if it is longer; no daemon at all is worse
+                    # than either.
                     _log_lifecycle(
-                        "code on disk changed — asked the holder to replace "
-                        "us while we keep serving"
+                        "code on disk changed — exiting for the holder "
+                        "to replace"
                     )
                     server.release_listener()
-                    # THE SUCCESSOR IS ALREADY SERVING, so this wait is free —
-                    # see `_HANDOVER_DRAIN_SECONDS`. Thirty seconds here cut 16
-                    # mid-response replies on this box.
-                    server.await_inflight(_HANDOVER_DRAIN_SECONDS)
-                    # 0, NOT 75: the successor is already serving on this
-                    # socket. 75 would make the holder spawn a SECOND one.
-                    os._exit(0)
-                # FALL BACK TO THE OLD SHAPE, never to nothing. No holder pid,
-                # or a holder that will not take the signal, means nobody has
-                # started a successor — so we must still exit 75 and let the
-                # supervisor do it the slow way. A gap is worse than the old
-                # behaviour only if it is longer; no daemon at all is worse
-                # than either.
+                    server.await_inflight(_HELD_DRAIN_SECONDS)
+                    os._exit(_RESTART_ME_CODE)
+                # THE ASK IS NOT THE OUTCOME. `os.kill` returning says only
+                # that the pid existed when we called it — nothing about a
+                # successor. So verify the holder SURVIVED being asked: an
+                # advertisement is written once at spawn and can be stale
+                # by now, but whether that process is still there cannot
+                # be. Serving stale code beats serving nothing, so we keep
+                # the port and say so.
+                time.sleep(_ASK_SETTLE_SECONDS)
+                if not _pid_alive(holder):
+                    _log_lifecycle(
+                        "asked the holder to replace us and it did not "
+                        "survive the ask — keeping the port rather than "
+                        "releasing it to nobody"
+                    )
+                    # WE ARE NOT DRAINING AFTER ALL. This is the one exit
+                    # from this branch that keeps serving, so it is the one
+                    # that has to hand the announcement back.
+                    _asked_done()
+                    return
+                # THE HOLDER SURVIVING IS NOT THE SUCCESSOR EXISTING. Only
+                # `_on_replace_request` can put one on the socket, and it
+                # holds `_replace_lock` from before its own `Popen` until
+                # `self._proc = proc` — so a published record proves the
+                # handler already won that lock, and `_supervise`'s later
+                # `self._proc is not proc` will read this exit as a
+                # handover. Exiting on the ask alone let this `os._exit(0)`
+                # land BEFORE the handler even started (it runs on the
+                # holder's main thread, parked in `self._thread.join()`):
+                # `_supervise` then read the exit as a release, and either
+                # respawned into the late handler's own second spawn on the
+                # same socket, or (pin cleared) closed the port under live
+                # sessions while the late `_spawn()` raised out of `join()`
+                # trying to pass an already-detached fd.
+                #
+                # MATCHED ON PID IDENTITY, NOT FINGERPRINT: a successor
+                # publishes `_OWN_FINGERPRINT`, taken at ITS OWN import, and a
+                # deploy landing between that import and a fresh
+                # `daemon_fingerprint()` read here would make the two
+                # disagree — timing out this wait on a successor that already
+                # exists. `os.getpid()` (this process) and `pre_ask_pid`
+                # (whatever was on disk before the ask) are what a genuinely
+                # new record cannot be.
+                #
+                # WAITED FOR ONCE, NEVER RETRIED ON A LATER TICK: a retry
+                # needs the ask itself to be idempotent state carried across
+                # ticks, and every path out of this branch already exits —
+                # found means exit 0 below, not found means the exit-75
+                # fallback right here, the same one a holder-less daemon
+                # already takes. A holder whose signal handler runs later
+                # than `_SPAWN_WAIT_S` still spawns a successor after this
+                # process is gone; the supervisor then has two, invisible to
+                # this wait either way.
+                # ponytail: the fallback below assumes the handler runs
+                # within _SPAWN_WAIT_S of the ask; a handler delayed past it
+                # would leave a second successor once the exit-75 respawn
+                # also spawns one (not observed -- every measured successor
+                # published within the same second as the ask).
+                if not _await_successor_state(
+                        certdir, None, os.getpid(),
+                        pre_ask_pid=pre_ask_pid):
+                    _log_lifecycle(
+                        "asked the holder to replace us and no successor "
+                        "published within the wait — exiting for the "
+                        "holder to replace us the slow way"
+                    )
+                    server.release_listener()
+                    server.await_inflight(_HELD_DRAIN_SECONDS)
+                    os._exit(_RESTART_ME_CODE)
                 _log_lifecycle(
-                    "code on disk changed — exiting for the holder to replace"
+                    "code on disk changed — asked the holder to replace "
+                    "us while we keep serving"
                 )
                 server.release_listener()
-                server.await_inflight(_HELD_DRAIN_SECONDS)
-                os._exit(_RESTART_ME_CODE)
+                # THE SUCCESSOR IS ALREADY SERVING, so this wait is free —
+                # see `_HANDOVER_DRAIN_SECONDS`. Thirty seconds here cut 16
+                # mid-response replies on this box.
+                server.await_inflight(_HANDOVER_DRAIN_SECONDS)
+                # 0, NOT 75: the successor is already serving on this
+                # socket. 75 would make the holder spawn a SECOND one.
+                os._exit(0)
             # NAME THE REASON THAT APPLIES.
             if not orphaned:
                 _log_lifecycle(
