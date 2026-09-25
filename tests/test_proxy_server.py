@@ -17492,9 +17492,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         header already lagged) must not zero out the negative's expiry --
         that let every OTHER concurrent 429 on the same wall, queued behind
         `_walled_switch_lock`, find it already expired and re-run
-        `switch()` for itself. A 1 ms floor on this cap would have expired
+        `switch()` for itself. A cap taken from this reset would have expired
         long before a second, genuinely concurrent 429 gets its turn on the
-        lock: 0.5s later, well past a 1 ms floor but nowhere near main's 30s
+        lock: 0.5s later, far longer than a cap already past allows but nowhere near main's 30s
         TTL, is what a queued waiter's lock handoff actually costs. That
         later waiter must still find the debounce standing and call
         `switch()` once between them, not once each."""

@@ -19968,16 +19968,14 @@ def _switch_off_walled_account(
         # account, not to the slot cswap has active now. An unparseable
         # reset records nothing rather than a slot excluded forever.
         #
-        # `cap_epoch` is NOT set from this 429's own `reset` here (T1213
-        # pass 3, I1): a reset that passes while `switch()` runs now expires
-        # the negative at once (the 1ms floor in `_remember_walled_switch`
-        # was removed in 4f63e998), so the next queued waiter on
-        # `_walled_switch_lock` reads this wall as walled=False and takes
-        # the bearer branch instead of debouncing — main's one `switch()`
-        # per 30s per key, broken. `cap_epoch` is set ONLY by the walled
-        # branch above (`_walled_slots[slot]`, the LIVE slot's own
-        # already-known clear time); every other path keeps main's full
-        # `_WALLED_SWITCH_RAISE_TTL` negative.
+        # `cap_epoch` is NOT set from this 429's own `reset` here (T1213 pass
+        # 3, I1): were it, a reset that passes while `switch()` runs would
+        # expire the negative at once, and the next live-token 429 queued on
+        # `_walled_switch_lock` would find it expired and call `switch()`
+        # again, breaking main's one `switch()` per 30s per key. `cap_epoch`
+        # is set ONLY by the walled branch above (`_walled_slots[slot]`, the
+        # LIVE slot's own already-known clear time); every other path keeps
+        # main's full `_WALLED_SWITCH_RAISE_TTL` negative.
         if slot is not None and token and live and token == live:
             try:
                 _walled_slots[slot] = float(reset)
