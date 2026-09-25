@@ -2017,18 +2017,13 @@ def heal(backup_root: Path, identity: dict | None = None,
                             os.kill(asked_holder, _REPLACE_ME_SIGNAL)
                         except OSError:
                             asked_holder = None
-                    if asked_holder:
-                        for _ in range(int(_SPAWN_WAIT_S * 10)):
-                            successor = read_daemon_state(certdir)
-                            if (successor and successor.get("fingerprint") == fp
-                                    and int(successor.get("pid") or 0) != stale_pid):
-                                _log_carry(
-                                    certdir,
-                                    f"{stale_pid} was wedged under a holder — "
-                                    f"asked the holder for a successor before "
-                                    f"terminating it")
-                                break
-                            time.sleep(0.1)
+                    if asked_holder and _await_successor_state(
+                            certdir, fp, stale_pid):
+                        _log_carry(
+                            certdir,
+                            f"{stale_pid} was wedged under a holder — "
+                            f"asked the holder for a successor before "
+                            f"terminating it")
                     # ponytail: TERM through `_kill_daemon` still gives this
                     # predecessor its ordinary 30s signal drain, even though
                     # a missed /health already said it was not moving -- on
@@ -9376,6 +9371,27 @@ def read_daemon_state(certdir: Path) -> dict | None:
     return data
 
 
+def _await_successor_state(
+    certdir: Path, fingerprint: str, replaced_pid: int, budget: float = _SPAWN_WAIT_S
+) -> bool:
+    """Poll :func:`read_daemon_state` for a record that carries ``fingerprint``
+    and a pid other than ``replaced_pid`` — true the instant one appears,
+    false once ``budget`` elapses with none.
+
+    THE SAME TICK heal's wedge repair already used (0.1s), so this is that
+    loop factored out rather than a second one: an `os.kill` that returned
+    without OSError only proves the pid existed, never that anything is
+    listening behind it yet.
+    """
+    for _ in range(int(budget * 10)):
+        successor = read_daemon_state(certdir)
+        if (successor and successor.get("fingerprint") == fingerprint
+                and int(successor.get("pid") or 0) != replaced_pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def _serving_daemon_ungated(certdir: Path | None) -> bool:
     """Whether ``proxy.json`` says the daemon serving ``certdir`` has retired
     its plain-relay credential gate — see ``_PLAIN_RELAY_UNGATED_KEY``.
@@ -10345,6 +10361,14 @@ class PortHolder:
         # already the correct "not a handover" answer — no separate flag
         # needed.
         with self._replace_lock:
+            # A HANDLER ARRIVING AFTER `stop()` HAS NOTHING TO SPAWN ONTO. The
+            # daemon side now waits for a published successor before it exits,
+            # but a late handler racing that wait is still possible, and
+            # `stop()` has already closed `self._srv` — `_spawn()`'s
+            # `self._srv.fileno()` on a closed socket raises out of this
+            # signal handler, on the MAIN thread, into `self._thread.join()`.
+            if self._stop:
+                return
             self._spawn()
 
     def _supervise(self) -> None:
@@ -10383,8 +10407,9 @@ class PortHolder:
                 # iteration captured.
                 if self._proc is not proc:
                     _log_lifecycle(
-                        f"daemon {code} retired after handing over — successor "
-                        f"already serving on port {self.port}"
+                        f"daemon {proc.pid} retired (exit {code}) after "
+                        f"handing over — successor already serving on port "
+                        f"{self.port}"
                     )
                     continue
                 # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
@@ -11588,6 +11613,29 @@ def _watch_own_code(
                         # WE ARE NOT DRAINING AFTER ALL. This is the one exit
                         # from this branch that keeps serving, so it is the one
                         # that has to hand the announcement back.
+                        _asked_done()
+                        return
+                    # THE HOLDER SURVIVING IS NOT THE SUCCESSOR EXISTING. Only
+                    # `_on_replace_request` can put one on the socket, and it
+                    # holds `_replace_lock` from before its own `Popen` until
+                    # `self._proc = proc` — so a published record proves the
+                    # handler already won that lock, and `_supervise`'s later
+                    # `self._proc is not proc` will read this exit as a
+                    # handover. Exiting on the ask alone let this `os._exit(0)`
+                    # land BEFORE the handler even started (it runs on the
+                    # holder's main thread, parked in `self._thread.join()`):
+                    # `_supervise` then read the exit as a release, and either
+                    # respawned into the late handler's own second spawn on the
+                    # same socket, or (pin cleared) closed the port under live
+                    # sessions while the late `_spawn()` raised out of `join()`
+                    # trying to pass an already-detached fd.
+                    if not _await_successor_state(
+                            certdir, daemon_fingerprint(), os.getpid()):
+                        _log_lifecycle(
+                            "asked the holder to replace us and no successor "
+                            "published in time — keeping the port rather "
+                            "than releasing it to nobody"
+                        )
                         _asked_done()
                         return
                     _log_lifecycle(
