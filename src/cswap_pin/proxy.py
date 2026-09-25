@@ -10016,10 +10016,17 @@ class PortHolder:
         # below happens to adopt, since an ordinary predecessor handoff also
         # adopts a socket but is not this. `start()` reads this to decide
         # what a permanently failing first spawn means: a cold start has
-        # nothing else covering the port, so it raises and lets `holder_main`
-        # exit; a promotion IS the last thing covering the port, so it
-        # degrades on the socket it already holds instead of raising the
-        # standby process down with it.
+        # nothing else covering the port, so it calls bare `_spawn()` and
+        # raises immediately, exactly as the base did, and `holder_main`'s
+        # `except OSError` ends the process. A promotion climbs the retry
+        # ladder (`_spawn_retrying`) instead, because raising here would take
+        # the standby PROCESS down mid-call rather than through its own
+        # control flow — but a PERMANENT failure still ends the process, only
+        # later: `_spawn_retrying` returns False, `_standby_revive` sees no
+        # `holder._thread` and skips its join, `standby_main` returns, and
+        # the interpreter exits, taking `degrade_now()`'s acceptor thread
+        # down with it. That is not "serving unpinned" — it is the same
+        # outcome the base's raise reached, a little later.
         self._is_promotion = sock is not None
 
         # ADOPT A HANDED-DOWN SOCKET RATHER THAN BINDING. A predecessor that is
@@ -10108,7 +10115,7 @@ class PortHolder:
         self._failures = 0
         self._thread: threading.Thread | None = None
 
-    def start(self) -> None:
+    def start(self) -> bool | None:
         # BEFORE THE FIRST SPAWN, not merely before the supervisor thread. A
         # child learns whether this holder can be asked from its ENVIRONMENT,
         # written once at spawn time, so a handler installed afterwards is one
@@ -10119,18 +10126,28 @@ class PortHolder:
         # The FIRST spawn happens here, not in the thread: `start()` returning
         # has to mean a daemon exists, or a caller that immediately reads
         # `daemon_pid` (or asks the port for a health probe) races the
-        # supervisor's first loop iteration. `_spawn_retrying`, not `_spawn`,
-        # because `_standby_revive`'s promotion calls THIS method on the
-        # socket it is already holding — see that method's docstring — and a
-        # `Popen` failure here used to escape uncaught, killing the standby
-        # process that was the last thing covering the port.
+        # supervisor's first loop iteration.
         #
-        # COLD START RAISES AT THE CAP; A PROMOTION DEGRADES INSTEAD. Both
-        # climb the same ladder (`self._failures`, `_HOLD_DEGRADE_AT`) --
-        # only what happens when it caps out differs, because only a
-        # promotion IS the last thing covering the port. See `_is_promotion`.
-        if not self._spawn_retrying(raise_at_cap=not self._is_promotion):
-            return  # promotion capped out — already degraded, nothing to supervise
+        # A COLD START (this holder is the ONLY thing covering the port)
+        # calls bare `_spawn()`, exactly as the base did: a permanent
+        # failure must raise immediately so `holder_main`'s `except OSError`
+        # can end the process and free the launcher, already waiting on a
+        # state file that will never appear. MEASURED: a retry ladder here
+        # cost up to 22.5s, longer than the launcher's own `_SPAWN_WAIT_S`,
+        # during which `unwire_if_dead` kept wiring live sessions to a port
+        # about to be refused anyway.
+        #
+        # A STANDBY'S OWN PROMOTION (`_is_promotion`, see `__init__`) climbs
+        # the retry ladder (`_spawn_retrying`) instead: raising here would
+        # take the standby process down mid-call rather than through its own
+        # control flow. A permanent failure still ends the process — see
+        # `_spawn_retrying`'s docstring and `_is_promotion`'s comment for
+        # what that really means.
+        if self._is_promotion:
+            if not self._spawn_retrying():
+                return False  # capped out — see `_spawn_retrying`'s docstring
+        else:
+            self._spawn()
         # AFTER the daemon, so a machine that cannot start one at all does not
         # also leave a standby behind waiting for a holder that never worked.
         self._spawn_standby()
@@ -10308,32 +10325,36 @@ class PortHolder:
                 f"daemon's own stderr is above in this file."
             )
 
-    def _spawn_retrying(self, *, raise_at_cap: bool = False) -> bool:
+    def _spawn_retrying(self) -> bool:
         """`_spawn`, but a `Popen` failure climbs the SAME ladder a
         crash-looping daemon does (`self._failures`, `_backoff`,
         `_HOLD_RESTART_REPORT_AT`, `_HOLD_DEGRADE_AT`) instead of retrying on
         a private, unbounded local count.
 
-        UNCAUGHT OR RETRIED WITHOUT A CAP, THIS COST THE SOCKET EITHER WAY.
+        ONLY WHERE THIS HOLDER IS NOT THE ONLY THING COVERING THE PORT:
+        `_supervise`'s three respawn sites, and a standby's own PROMOTION in
+        `start()` (see `_is_promotion`) — there, unlike a cold start, raising
+        out of `start()` would take the standby PROCESS down mid-call rather
+        than through its own control flow. A COLD START calls bare `_spawn()`
+        instead and lets a permanent failure raise immediately, exactly as
+        the base did — see `start()`.
+
         `OSError` (fork EAGAIN/EMFILE, or the interpreter itself unrunnable)
         and `ValueError` (`Popen(pass_fds=(-1,))` on our own closed socket,
         see `_on_replace_request`) both come out of `subprocess.Popen` inside
-        `_spawn`. Uncaught, it killed the caller before a supervisor thread
-        ever existed to try again — that was the bug this class of fix
-        closes. Retried on a LOCAL count with no cap closed that, but opened
-        the other side of the same failure: a permanently unrunnable
-        interpreter then span here forever, on `start()`'s own calling
-        thread, the socket bound and nothing accepting — exactly the outage
-        `_HOLD_DEGRADE_AT` exists to end, reached through a door that never
-        counted towards it. Sharing `self._failures` closes that door: to
-        the ladder, a spawn that never got a process running is the same
-        kind of failure as a daemon that started and immediately died.
+        `_spawn`. Retried on a LOCAL count with no cap, a permanently
+        unrunnable interpreter would spin here forever, the socket bound and
+        nothing accepting — exactly the outage `_HOLD_DEGRADE_AT` exists to
+        end. Sharing `self._failures` closes that: to the ladder, a spawn
+        that never got a process running is the same kind of failure as a
+        daemon that started and immediately died.
 
         Returns True once spawned. At the cap: `degrade_now()` and return
-        False, UNLESS ``raise_at_cap`` — the cold start, where this holder is
-        the only thing covering the port and `holder_main`'s `except OSError`
-        needs to see the exception to know it never came up. A promotion
-        passes ``raise_at_cap=False`` — see `start()` and `_is_promotion`.
+        False — a permanently failing promotion ends there rather than
+        raising, but it ends all the same: nobody past this method's own
+        caller joins on it, so the process exits a little later than the
+        base's immediate raise would have. See `_is_promotion`'s comment in
+        `__init__` for the full chain.
         """
         while True:
             try:
@@ -10343,14 +10364,14 @@ class PortHolder:
                 if self._stop:
                     return False
                 self._failures += 1
+                capped = self._failures >= _HOLD_DEGRADE_AT
+                verb = "giving up" if capped else "retrying"
                 _log_lifecycle(
                     f"could not spawn a successor on port {self.port}: "
-                    f"{exc!r} — retrying"
+                    f"{exc!r} — {verb}"
                 )
                 self._report_if_stuck()
-                if self._failures >= _HOLD_DEGRADE_AT:
-                    if raise_at_cap:
-                        raise
+                if capped:
                     self.degrade_now()
                     return False
                 time.sleep(self._backoff(self._failures))

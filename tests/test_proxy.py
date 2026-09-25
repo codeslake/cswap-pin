@@ -4513,6 +4513,45 @@ class TestASpawnFailureIsNotFatal:
         finally:
             holder.stop()
 
+    def case_the_capping_attempt_does_not_say_retrying(
+            self, tmp_path, monkeypatch):
+        """`_spawn_retrying`'s own log line said "retrying" on EVERY failed
+        attempt, including the one that hits `_HOLD_DEGRADE_AT` and gives
+        up instead -- the one moment the word is false."""
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+        from cswap_pin import proxy as pin_proxy
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "degrade_now", lambda self: None)
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+
+        def _always_raise(self):
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _always_raise)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        try:
+            assert holder._spawn_retrying() is False
+            spawn_lines = [l for l in lines if "could not spawn a successor" in l]
+            assert len(spawn_lines) == _HOLD_DEGRADE_AT, (
+                f"{len(spawn_lines)} logged attempt(s), expected exactly "
+                f"the ladder's cap ({_HOLD_DEGRADE_AT})"
+            )
+            assert "retrying" not in spawn_lines[-1], (
+                f"the attempt that hit the cap still said retrying: "
+                f"{spawn_lines[-1]!r}"
+            )
+            for line in spawn_lines[:-1]:
+                assert "retrying" in line, (
+                    f"a non-capping attempt should still say retrying: "
+                    f"{line!r}"
+                )
+        finally:
+            holder.stop()
+
     def _respawn_after_exit_survives_a_raising_spawn(
             self, tmp_path, monkeypatch, exit_code, *, raises=2, pinned=False):
         """Shared drive for all three `_supervise` respawn sites: the cold
@@ -4608,17 +4647,19 @@ class TestASpawnFailureIsNotFatal:
     def case_cold_start_with_an_always_raising_spawn_raises(
             self, tmp_path, monkeypatch):
         """A cold start's FIRST spawn is the ONLY thing covering the port --
-        nothing else exists yet. If it can never succeed, `start()` must
-        raise (bounded, on the same ladder as every other respawn) so
-        `holder_main`'s `except OSError` can end the process and free the
-        launcher, which is already waiting on a state file that will never
-        appear. Driven off-thread and joined with a timeout: an unbounded
-        retry would otherwise hang this test forever instead of failing it.
+        nothing else exists yet. `start()` calls bare `_spawn()` there,
+        exactly as the base did: a failure raises immediately, on the FIRST
+        attempt, with no retry ladder in between, so `holder_main`'s `except
+        OSError` can end the process and free the launcher, which is
+        already waiting on a state file that will never appear. A ladder
+        here would cost up to `_HOLD_DEGRADE_AT` backoffs (measured: up to
+        22.5s), longer than the launcher's own `_SPAWN_WAIT_S`, during which
+        `unwire_if_dead` keeps wiring live sessions to a port about to be
+        refused anyway.
         """
-        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+        from cswap_pin.proxy import PortHolder, ensure_ca
 
         ensure_ca(tmp_path, "api.anthropic.com")
-        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
         spawn_calls = []
 
         def _always_raise(self):
@@ -4628,41 +4669,29 @@ class TestASpawnFailureIsNotFatal:
         monkeypatch.setattr(PortHolder, "_spawn", _always_raise)
 
         holder = PortHolder(tmp_path, "1", "a@b.c")
-        outcome = {}
-
-        def _run():
-            try:
-                holder.start()
-            except BaseException as exc:  # noqa: BLE001 — captured for the assertion
-                outcome["exc"] = exc
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        t.join(timeout=5)
         try:
-            assert not t.is_alive(), (
-                f"start() is still retrying after {len(spawn_calls)} spawn "
-                f"attempt(s) — a permanently failing cold-start spawn must "
-                f"raise, bounded, not hang"
-            )
-            assert isinstance(outcome.get("exc"), OSError), (
-                f"start() returned instead of raising on a cold-start spawn "
-                f"that always fails: {outcome!r}"
-            )
-            assert len(spawn_calls) == _HOLD_DEGRADE_AT, (
-                f"{len(spawn_calls)} spawn attempt(s) before raising — "
-                f"expected exactly the ladder's cap ({_HOLD_DEGRADE_AT})"
+            with pytest.raises(OSError):
+                holder.start()
+            assert len(spawn_calls) == 1, (
+                f"{len(spawn_calls)} spawn attempt(s) before raising — a "
+                f"cold start must fail on the first attempt, not retry"
             )
         finally:
             holder.stop()
 
-    def case_promotion_with_an_always_raising_spawn_degrades_in_place(
+    def case_promotion_with_an_always_raising_spawn_reports_failure(
             self, tmp_path, monkeypatch):
         """The standby's own promotion is the LAST thing covering the port
-        -- raising out of `start()` here would kill this process and take
-        the socket down with it, so a permanently failing spawn must
-        degrade on the socket instead. Driven off-thread and joined with a
-        timeout for the same reason as the cold-start case above."""
+        -- raising out of `start()` here would kill this process mid-call
+        rather than through its own control flow, so a permanently failing
+        spawn climbs the retry ladder and reports failure instead of
+        raising. It does NOT end up serving the port unpinned: nobody past
+        `start()` joins on a `None` `holder._thread`, so `_standby_revive`
+        returns, `standby_main` returns, and the interpreter exits right
+        behind it, taking `degrade_now()`'s acceptor thread down with it --
+        the port ends refused, same as a cold start's raise, just a little
+        later. Driven off-thread and joined with a timeout for the same
+        reason as the cold-start case above."""
         from cswap_pin.proxy import PortHolder
 
         certdir = tmp_path / "pin-proxy"
@@ -4685,7 +4714,7 @@ class TestASpawnFailureIsNotFatal:
 
         def _run():
             try:
-                holder.start()
+                outcome["result"] = holder.start()
             except BaseException as exc:  # noqa: BLE001 — captured for the assertion
                 outcome["exc"] = exc
 
@@ -4695,24 +4724,25 @@ class TestASpawnFailureIsNotFatal:
         try:
             assert not t.is_alive(), (
                 "the promotion's start() is still retrying instead of "
-                "ending degraded -- an unbounded retry leaves nothing "
+                "capping out -- an unbounded retry leaves nothing "
                 "accepting on the port for as long as it spins"
             )
             assert "exc" not in outcome, (
-                f"start() raised out of the promotion instead of degrading "
-                f"in place, which would kill the standby -- the last thing "
-                f"covering this port: {outcome.get('exc')!r}"
+                f"start() raised out of the promotion instead of reporting "
+                f"failure, which would kill the standby process mid-call "
+                f"-- the last thing covering this port: "
+                f"{outcome.get('exc')!r}"
             )
-            assert holder._degraded, (
-                "a permanently failing promotion spawn neither raised nor "
-                "degraded -- the standby is not serving anything"
+            assert outcome.get("result") is False, (
+                "a permanently failing promotion spawn must report failure "
+                "(start() -> False) so _standby_revive skips its join and "
+                "lets the process end, rather than looking like a holder "
+                "that came up fine"
             )
-            assert not holder._stop, (
-                "degrade_now stopped the holder instead of serving the "
-                "socket it still holds"
-            )
-            assert holder._srv.fileno() != -1, (
-                "the socket was closed instead of being served degraded"
+            assert holder._thread is None, (
+                "a supervisor thread started over a promotion that never "
+                "got a daemon running -- there is nothing for it to "
+                "supervise, and _standby_revive would wrongly join on it"
             )
         finally:
             holder.stop()
