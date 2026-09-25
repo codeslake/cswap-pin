@@ -452,7 +452,16 @@ def _short_hop_budgets(monkeypatch):
     """
     from cswap_pin import proxy as _p
 
-    monkeypatch.setattr(_p, "_HOP_CONNECT_BUDGET_S", 0.3, raising=False)
+    # THE CONNECT BUDGET IS NOT SHRUNK. Every dial here is to 127.0.0.1,
+    # which is refused or connected at once (a census of all 180
+    # `_dial_chain` calls in this file and test_proxy.py found none that
+    # waits on its connect timeout), so only a stalled handshake ever
+    # reads this budget -- and 0.3s turned exactly that stall, on a loaded
+    # runner, into a false `egress REFUSED` in
+    # case_the_absolute_form_hold_releases_at_the_status_line. 10s matches
+    # what T1076/PR #31 gave `_probe_next_hop` for the same class of
+    # macOS-runner stall.
+    monkeypatch.setattr(_p, "_HOP_CONNECT_BUDGET_S", 10, raising=False)
     monkeypatch.setattr(_p, "_HOP_REPLY_BUDGET_S", 0.3, raising=False)
     # AND THE HEAL GRACE. The production value waits out a hop that is
     # restarting (~1s, measured); a test whose hop is deliberately dead pays it
