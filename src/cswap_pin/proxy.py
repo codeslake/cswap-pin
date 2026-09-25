@@ -3131,10 +3131,12 @@ def _is_claude_code_ua(ua: str) -> bool:
 
 # CC's own account-profile fetch (`Vxr`/`wYn`, 2.1.282) goes out over axios
 # with no custom User-Agent, so it crosses as axios's own default rather than
-# `claude-code/`/`claude-cli/`. Scoped to the one route that needs it below --
-# widening `_is_claude_code_ua` itself would also start pinning every OTHER
-# route CC's axios-based internals happen to call, which nothing here has
-# looked at (see `_PRESENCE`'s own axios traffic, excluded by route instead).
+# `claude-code/`/`claude-cli/`. Its own helper, not a widening of
+# `_is_claude_code_ua`, because the two name different things: that one
+# matches CC's declared client identity, this one infers CC from its bundled
+# axios instead -- a much weaker signal (any axios caller matches; `_PRESENCE`
+# has its own axios traffic, excluded by route instead) that a reader of
+# `_is_claude_code_ua` should not have to discount.
 def _is_cc_axios_ua(ua: str) -> bool:
     return bool(ua) and ua.lstrip().lower().startswith("axios/")
 
@@ -13075,9 +13077,11 @@ def pin_profile_for(token: "str | None") -> "dict | None":
 
     Asked with the PIN's bearer, so the stamp it carries is true and the
     fields are the pin's own -- not a copy of whatever account was live when
-    the pinned slot was last the login. Same route Claude Code asks, which is
-    deliberately unswapped by this proxy, so the bearer we send is the one the
-    server answers for.
+    the pinned slot was last the login. Same route Claude Code asks: since
+    #44 that route is pinned and swapped for Claude Code's own fetch
+    (`claude-cli/`/`claude-code/`, or its bundled axios), and unswapped only
+    for cswap's own `claude-swap/1.0` fetch -- this call sends the token we
+    were given either way.
     """
     if not token:
         return None
