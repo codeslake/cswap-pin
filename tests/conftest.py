@@ -443,7 +443,8 @@ def _session_ca(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def _short_hop_budgets(monkeypatch):
-    """Shrink the egress-hop budgets for tests.
+    """Adjust the egress-hop budgets for tests: shrink three, raise the
+    connect budget.
 
     A hop that accepts and never answers costs `_HOP_REPLY_BUDGET_S` (6 s) per
     dial, and several tests point the walk at exactly that shape on purpose.
@@ -453,12 +454,14 @@ def _short_hop_budgets(monkeypatch):
     """
     from cswap_pin import proxy as _p
 
-    # THE CONNECT BUDGET IS NOT SHRUNK. Every dial here is to 127.0.0.1,
-    # which is refused or connected at once (a census of all 180
-    # `_dial_chain` calls in this file and test_proxy.py found none that
-    # waits on its connect timeout), so only a stalled handshake ever
-    # reads this budget -- and 0.3s turned exactly that stall, on a loaded
-    # runner, into a false `egress REFUSED` in
+    # THE CONNECT BUDGET IS RAISED ABOVE PRODUCTION, NOT SHRUNK, and
+    # deliberately: 10s here vs. 2.0s (`_HOP_CONNECT_BUDGET_S` in proxy.py),
+    # five times over. Every dial here is to 127.0.0.1, which is refused or
+    # connected at once (a census found 180 runtime `_dial_chain` calls
+    # across test_proxy.py and test_proxy_server.py, none of which waits on
+    # its connect timeout), so only a stalled handshake ever reads this
+    # budget -- and 0.3s turned exactly that stall, on a loaded runner, into
+    # a false `egress REFUSED` in
     # case_the_absolute_form_hold_releases_at_the_status_line. 10s matches
     # what T1076/PR #31 gave `_probe_next_hop` for the same class of
     # macOS-runner stall.
