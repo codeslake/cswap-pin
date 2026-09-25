@@ -15801,6 +15801,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
+        pp._walled_headroom_seen.clear()
         # THE `_note_usage_headers` THROTTLES are memos of the SAME shape
         # and outlive this case exactly like the three above: cases run
         # alphabetically (`run_cases`'s `sorted(dir(cls))`), so a case that
@@ -16016,6 +16017,48 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     extra_headers=self._5H_HEADER)
         assert len(recorded) == 2, (
             f"a reply after the throttle expires must record: {recorded}")
+
+    def case_a_delayed_thread_still_dates_its_slot_memo_from_its_spawn(
+        self, monkeypatch,
+    ):
+        """THE DEFECT (T1213): `_run` used to stamp `_usage_header_seen`
+        with its OWN, later `time.monotonic()` read instead of the spawn
+        gate's `now` -- so a thread that resolves after a scheduling delay
+        lands inside the OLD slot window. A second reply spawned exactly
+        30s after the FIRST one (which the pre-spawn gate must allow) then
+        found the slot memo still fresh and recorded nothing, stretching
+        two records that should be 30s apart to ~60s on a busy
+        single-token loop. Dating both memos from the SAME spawn-time
+        `now` fixes it."""
+        import time as _time
+        from cswap_pin import proxy as pp
+        captured = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", captured.append)
+        recorded = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   record_usage_headers=lambda *a: recorded.append(a))
+        clock = {"t": 0.0}
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["t"])
+
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=self._5H_HEADER)
+        assert len(captured) == 1, captured
+        # This thread does not get scheduled until 5s later.
+        clock["t"] = 5.0
+        captured.pop(0)()
+        assert len(recorded) == 1, recorded
+
+        # A second reply, 30s after the FIRST SPAWN -- the pre-spawn gate
+        # (keyed on spawn time) must allow it.
+        clock["t"] = 30.0
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=self._5H_HEADER)
+        assert len(captured) == 1, captured
+        captured.pop(0)()
+        assert len(recorded) == 2, (
+            f"two replies 30s apart on one slot must each record, not be "
+            f"throttled by a slot memo dated from the first thread's late "
+            f"run time: {recorded}")
 
     def case_two_tokens_of_the_same_slot_inside_30s_is_one_record(
         self, monkeypatch,
@@ -16428,6 +16471,25 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             assert got.startswith(b"HTTP/1.1 401"), (sid, got[:40])
         assert not calls, (
             f"no session's bearer conversion may reach switch(): {calls}")
+
+    def case_n_sessions_on_the_same_wall_share_one_headroom_read(
+        self, monkeypatch,
+    ):
+        """THE DEFECT (T1213): keying the 401 per session (above) is right,
+        but each of the N sessions then also asked `_live_account_headroom`
+        on its own -- N usage fetches under `_walled_switch_lock` where the
+        old SHARED memo used to pay for one. A short (reset, slot) verdict
+        cache lets the N sessions still each get their own 401 while the
+        underlying reading is asked for once."""
+        snap = []
+        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                   usage=self.HEADROOM, snap=snap)
+        for sid in ("cse_a", "cse_b", "cse_c"):
+            got = self._relay(auth="Bearer stale-account-token", session=sid)
+            assert got.startswith(b"HTTP/1.1 401"), (sid, got[:40])
+        assert len(snap) == 1, (
+            f"N stale sessions on one wall must share one headroom read, "
+            f"not pay their own: {snap}")
 
     def case_one_session_gets_one_401_per_ttl_even_as_its_token_rotates(
         self, monkeypatch,
@@ -17155,6 +17217,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
+        pp._walled_headroom_seen.clear()
         return calls
 
     def case_a_walled_slot_live_again_re_decides_when_the_host_can_exclude_it(
@@ -17328,6 +17391,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
+        pp._walled_headroom_seen.clear()
 
         first = self._relay(reset=self.RESET_HEADER, auth="Bearer token-6")
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
@@ -17363,6 +17427,102 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert retry_at is not None, (
             "a redecide miss must expire, not go permanent: "
             f"{pp._walled_switch_seen}")
+
+    def case_a_shared_negative_caps_on_the_live_walls_clock_not_the_stale_bearers(
+        self, monkeypatch,
+    ):
+        """THE DEFECT (T1213 pass 2, I1): while the live slot is KNOWN walled
+        (`_walled_slots`), a stale-bearer 429 skips the per-session headroom
+        branch (`not walled` is False) and falls through to the ordinary
+        `switch()` attempt, which writes its failure into the SHARED
+        `(reset, slot)` memo. That 429's own `reset` belongs to the STALE
+        account, not the live one -- its wall can clear long after the live
+        slot's own does, so capping the negative on it (instead of on
+        `_walled_slots[slot]`, the live slot's own clear time) lets the
+        debounce outlive the LIVE wall by up to the stale account's wait
+        instead of ending when the live wall does."""
+        from cswap_pin import proxy as pp
+        import time as _time
+        BASE = 2_000_000_000.0
+        LIVE_CLEAR = BASE + 2.0
+        STALE_RESET = int(BASE) + 100  # the STALE account's own wall
+        reset_header = (b"anthropic-ratelimit-unified-reset: "
+                         + str(STALE_RESET).encode())
+        clock = {"mono": 0.0, "wall": BASE}
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(_time, "time", lambda: clock["wall"])
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage=self.HEADROOM)
+        pp._walled_slots["1"] = LIVE_CLEAR
+
+        first = self._relay(reset=reset_header,
+                            auth="Bearer stale-account-token")
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert len(calls) == 1, calls
+
+        # Still inside the LIVE wall (it clears at +2s): the debounce must
+        # hold, and switch() must not run again for this same wall.
+        clock["mono"] = 1.0
+        clock["wall"] = BASE + 1.0
+        second = self._relay(reset=reset_header,
+                             auth="Bearer stale-account-token")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, (
+            f"the debounce must hold while the LIVE wall still stands: "
+            f"{calls}")
+
+        # The LIVE wall has now cleared (+2s); the stale account's own wall
+        # (STALE_RESET, +100s) has not -- and must not matter.
+        clock["mono"] = 2.5
+        clock["wall"] = BASE + 2.5
+        third = self._relay(reset=reset_header,
+                            auth="Bearer stale-account-token")
+        assert third.startswith(b"HTTP/1.1 401"), (
+            f"the live wall cleared 0.5s ago; the next stale-bearer 429 "
+            f"must convert at once, not wait out a debounce capped on the "
+            f"stale account's unrelated, later, wall: {third[:40]!r}")
+        assert len(calls) == 1, calls
+
+    def case_a_cap_already_past_does_not_reopen_switch_for_a_concurrent_429(
+        self, monkeypatch,
+    ):
+        """I2: a cap at or before `time.time()` (clock skew, or a wall whose
+        own header already lagged) must not zero out the negative's expiry
+        -- that let every OTHER concurrent 429 on the same wall, queued
+        behind `_walled_switch_lock`, find it already expired and re-run
+        `switch()` for itself. This is the LIVE token's own 429 (`auth` is
+        `self.LIVE`, not a stale bearer) -- a non-walled path -- so a 1 ms
+        floor on this cap would have expired long before a second, genuinely
+        concurrent 429 gets its turn on the lock: 0.5s later, well past a
+        1 ms floor but nowhere near main's 30s TTL, is what a queued waiter's
+        lock handoff actually costs. That later waiter must still find the
+        debounce standing and call `switch()` once between them, not once
+        each."""
+        from cswap_pin import proxy as pp
+        import time as _time
+        BASE = 2_000_000_000.0
+        PAST_RESET = int(BASE) - 5  # already expired when this 429 arrives
+        reset_header = (b"anthropic-ratelimit-unified-reset: "
+                         + str(PAST_RESET).encode())
+        clock = {"mono": 0.0, "wall": BASE}
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(_time, "time", lambda: clock["wall"])
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage=self.HEADROOM)
+
+        first = self._relay(reset=reset_header, auth=f"Bearer {self.LIVE}")
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert len(calls) == 1, calls
+
+        # 0.5s later, not the same instant: long past any 1ms floor, the
+        # shape of a queued waiter's actual lock handoff.
+        clock["mono"] = 0.5
+        clock["wall"] = BASE + 0.5
+        second = self._relay(reset=reset_header, auth=f"Bearer {self.LIVE}")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, (
+            f"a reset already in the past zeroed the debounce and let a "
+            f"second concurrent 429 call switch() again: {calls}")
 
 
 class TestTheEvidenceSurvivesAHandover:

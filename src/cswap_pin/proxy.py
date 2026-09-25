@@ -19544,7 +19544,9 @@ _walled_switch_seen_by_session: dict[tuple[bytes, str | None, str], float] = {}
 _WALLED_SWITCH_RAISE_TTL = 30.0
 
 
-def _remember_walled_switch(key: tuple[bytes, str | None], ok: bool) -> None:
+def _remember_walled_switch(
+    key: tuple[bytes, str | None], ok: bool, cap: float | None = None,
+) -> None:
     """Record this wall's verdict. Call under `_walled_switch_lock`.
 
     ONE WRITER, because the asymmetry is the whole point and it was wrong in
@@ -19559,12 +19561,28 @@ def _remember_walled_switch(key: tuple[bytes, str | None], ok: bool) -> None:
     now", not "not ever", and `retry_at=None` on a `switched=False` is what
     relayed 28 raw 429s across 101 seconds on 2026-09-09 while a healthy
     account sat live and unreachable.
+
+    `cap` caps a negative's own expiry at the WALL'S clear time — a Unix
+    epoch, converted to this process's monotonic clock via the offset read
+    NOW. It must be the LIVE slot's own clear time, not whichever 429's
+    `reset` header happened to be on hand: the stale-bearer branch's
+    fallthrough to `switch()` (while the live slot is already known walled,
+    in `_switch_off_walled_account`) is handed a 429 whose `reset` belongs
+    to the STALE account, and capping on that let the shared debounce
+    outlive the LIVE wall by up to the whole `_WALLED_SWITCH_RAISE_TTL`
+    while a perfectly good account sat live (T1213). A cap is passed only
+    on that stale-bearer-already-walled branch; every other path keeps the
+    full `_WALLED_SWITCH_RAISE_TTL` negative.
     """
     now = time.monotonic()
-    _walled_switch_seen[key] = (
-        (True, None, now) if ok
-        else (False, now + _WALLED_SWITCH_RAISE_TTL, now)
-    )
+    if not ok:
+        retry_at = now + _WALLED_SWITCH_RAISE_TTL
+        if cap is not None:
+            capped_at = cap + (now - time.time())
+            retry_at = min(retry_at, capped_at)
+        _walled_switch_seen[key] = (False, retry_at, now)
+    else:
+        _walled_switch_seen[key] = (True, None, now)
     if len(_walled_switch_seen) > 8:
         del _walled_switch_seen[next(iter(_walled_switch_seen))]
 
@@ -19633,6 +19651,35 @@ def _live_account_headroom(num: str) -> float | None:
         return oauth.account_headroom(usage, ("all",))
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None
+
+
+_WALLED_HEADROOM_CACHE_S = 5.0
+# (reset, slot) -> (headroom, monotonic time recorded). `_walled_switch_seen_
+# by_session` keys the bearer branch's 401 per SESSION on purpose, so N
+# stale sessions on one wall each get their own conversion instead of N *
+# 30s to all recover — but that also means each of the N asked
+# `_live_account_headroom` on its own, paying N usage fetches under
+# `_walled_switch_lock` where the old shared memo paid one. This cache
+# keeps the READING shared for a few seconds while the VERDICT stays
+# per-session.
+_walled_headroom_seen: dict[tuple[bytes, str], tuple[float | None, float]] = {}
+
+
+def _cached_live_account_headroom(reset: bytes, slot: str) -> float | None:
+    """`_live_account_headroom(slot)`, shared across every stale-bearer
+    session on this SAME wall for `_WALLED_HEADROOM_CACHE_S` seconds. Call
+    under `_walled_switch_lock`, exactly like `_live_account_headroom`
+    itself."""
+    now = time.monotonic()
+    key = (reset, slot)
+    cached = _walled_headroom_seen.get(key)
+    if cached is not None and now - cached[1] < _WALLED_HEADROOM_CACHE_S:
+        return cached[0]
+    headroom = _live_account_headroom(slot)
+    _walled_headroom_seen[key] = (headroom, now)
+    if len(_walled_headroom_seen) > 8:
+        del _walled_headroom_seen[next(iter(_walled_headroom_seen))]
+    return headroom
 
 
 def _switch_takes_exclude() -> bool:
@@ -19771,6 +19818,14 @@ def _switch_off_walled_account(
         # a fresh key and the 401 -> 429 -> 401 loop below reopens; a slot
         # number does not rotate.
         key = (reset, slot)
+        # Set by the bearer branch below, ONLY when it finds the live slot
+        # already known walled (`walled=True`): that fallthrough's own
+        # `reset` belongs to the STALE account, not the live one, so the
+        # negative recorded further down must cap on the live slot's own
+        # clear time instead (see I1, T1213 pass 2). Every other path keeps
+        # `cap_epoch` `None` and so keeps the full `_WALLED_SWITCH_RAISE_TTL`
+        # negative -- there is no fallback to this 429's own `reset`.
+        cap_epoch: float | None = None
         if key in _walled_switch_seen:
             ok, retry_at, decided_at = _walled_switch_seen[key]
             if retry_at is None or time.monotonic() < retry_at:
@@ -19855,7 +19910,13 @@ def _switch_off_walled_account(
             # (`_live_account_headroom`'s `entry.walled`) rather than a
             # missing reading. Checking the cheap, local record first skips
             # a usage fetch entirely when the answer is already known.
+            # cswap's own `mark_at_limit` can keep its persisted `walledUntil`
+            # later than this record's clear time, so one extra switch() can
+            # still run across a pin-recorded clear -- at most 2 per key per
+            # `_WALLED_SWITCH_RAISE_TTL`.
             walled = _walled_slots.get(slot, 0.0) > time.time()
+            if walled:
+                cap_epoch = _walled_slots.get(slot)
             # UNKNOWN HEADROOM NO LONGER FAILS CLOSED HERE. It used to: a
             # cold cache (`decision_value` returns `None` for "no reading
             # recent enough to act on", a property of the CACHE, not of the
@@ -19868,7 +19929,8 @@ def _switch_off_walled_account(
             # reading exactly as it would on a good one, and a KNOWN wall
             # (this daemon's own, or cswap's persisted one) still fails
             # closed via `headroom <= 0`.
-            headroom = None if walled else _live_account_headroom(slot)
+            headroom = (None if walled else
+                        _cached_live_account_headroom(reset, slot))
             if not walled and (headroom is None or headroom > 0):
                 # `:.3g`, NOT `:.0f`. The band this branch is least obvious in
                 # is the one just above zero, and `:.0f` printed "0% headroom;
@@ -19905,6 +19967,17 @@ def _switch_off_walled_account(
         # someone else's frozen credential and its reset belongs to another
         # account, not to the slot cswap has active now. An unparseable
         # reset records nothing rather than a slot excluded forever.
+        #
+        # `cap_epoch` is NOT set from this 429's own `reset` here (T1213
+        # pass 3, I1): a reset that passes while `switch()` runs floors to
+        # 1ms (see `_remember_walled_switch`), and that floor has expired
+        # by the time a queued waiter on `_walled_switch_lock` gets its
+        # turn (lock handoff, a flushed `_log_lifecycle`, the GIL), so most
+        # queued 429s on this wall called `switch()` again — main's one
+        # `switch()` per 30s per key, broken. `cap_epoch` is set ONLY by
+        # the walled branch above (`_walled_slots[slot]`, the LIVE slot's
+        # own already-known clear time); every other path keeps main's
+        # full `_WALLED_SWITCH_RAISE_TTL` negative.
         if slot is not None and token and live and token == live:
             try:
                 _walled_slots[slot] = float(reset)
@@ -19956,7 +20029,7 @@ def _switch_off_walled_account(
                 f"{exc.__class__.__name__}, relaying the 429 with headers "
                 f"stripped"
             )
-            _remember_walled_switch(key, False)
+            _remember_walled_switch(key, False, cap_epoch)
             return False
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
@@ -19980,7 +20053,7 @@ def _switch_off_walled_account(
                 f"{result.get('needsLogin') if result else None}, relaying "
                 f"the 429 with headers stripped"
             )
-        _remember_walled_switch(key, ok)
+        _remember_walled_switch(key, ok, cap_epoch)
         return ok
 
 
@@ -20073,7 +20146,13 @@ def _note_usage_headers(
             # actually has live now.
             if slot is None or live is None or token != live:
                 return
-            now = time.monotonic()
+            # THE SAME `now` THE SPAWN GATE ABOVE STAMPED — not a fresh
+            # `time.monotonic()` read here, which dated the slot memo from
+            # whenever the thread got SCHEDULED rather than from when the
+            # throttle actually allowed the spawn: a faster-resolving
+            # thread landed inside the slower one's old slot window and
+            # recorded nothing, stretching two records that should be 30s
+            # apart to ~60s on a busy single-token loop.
             with _usage_header_lock:
                 last = _usage_header_seen.get(slot)
                 if last is not None and now - last < _USAGE_HEADER_THROTTLE_S:
