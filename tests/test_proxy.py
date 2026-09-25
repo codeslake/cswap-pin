@@ -4958,7 +4958,8 @@ class TestTheProfileRouteIsPinnedForClaudeCodeOnly:
     own fetch of the same route keeps seeing the live account."""
 
     def test_claude_code_clients_are_swapped(self):
-        for ua in ("claude-code/2.1.257", "claude-cli/2.1.257 (external, cli)"):
+        for ua in ("claude-code/2.1.257", "claude-cli/2.1.257 (external, cli)",
+                   "axios/1.15.2"):
             assert is_pinned_route("/api/oauth/profile", ua), ua
             assert is_pinned_route("/api/oauth/profile?beta=true", ua), ua
             assert is_pinned_route("/api/oauth/profile/", ua), ua

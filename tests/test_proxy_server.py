@@ -7535,6 +7535,109 @@ class _WebSocketUpstream:
         self._thr.join(timeout=2.0)
 
 
+class _WebSocketAuthUpstream:
+    """A TLS upstream for a pinned WebSocket route: answers `reject_status`
+    (`Connection: close`, no upgrade) to a bearer in `reject_bearer`, a 101
+    handshake to any other. Records every Authorization it saw, in order --
+    like `_FakeUpstream`, a swap-refused case reconnects per attempt."""
+
+    def __init__(self, certdir: Path,
+                 reject_bearer: "str | set[str] | None" = None,
+                 reject_status: int = 401):
+        self._reject = ({reject_bearer} if isinstance(reject_bearer, str)
+                         else set(reject_bearer or ()))
+        self.reject_status = reject_status
+        self.auths_seen: "list[str | None]" = []
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"), str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._stop = False
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            head = buf.split(b"\r\n\r\n")[0].decode("latin1")
+            auth = next((ln.split(":", 1)[1].strip()
+                         for ln in head.split("\r\n")
+                         if ln.lower().startswith("authorization:")), None)
+            self.auths_seen.append(auth)
+            if auth in {f"Bearer {b}" for b in self._reject}:
+                tls.sendall(
+                    f"HTTP/1.1 {self.reject_status} Rejected\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    .encode("latin1"))
+                tls.close()
+                return
+            tls.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            data = tls.recv(4096)
+            tls.sendall(b"PONG")
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            with socket.create_connection(self._srv.getsockname(),
+                                          timeout=0.2):
+                pass
+        except OSError:
+            pass
+        self._srv.close()
+        self._thr.join(timeout=2.0)
+
+
+def _upgrade_via_proxy(proxy_port: int, ca_path: Path, path: str,
+                       bearer: "str | None" = None):
+    """CONNECT-tunnel through the proxy, TLS to api.anthropic.com, then send
+    a WebSocket upgrade GET on `path`. Returns `(status_line, tls_socket)` so
+    a 101 caller can keep pumping frames on the returned socket."""
+    ctx = ssl.create_default_context(cafile=str(ca_path))
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+               b"Host: api.anthropic.com:443\r\n\r\n")
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        resp += raw.recv(4096)
+    assert b"200" in resp.split(b"\r\n")[0]
+    tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+    auth = f"Authorization: Bearer {bearer}\r\n" if bearer is not None else ""
+    tls.sendall(
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: api.anthropic.com\r\n{auth}"
+        f"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    return head.split(b"\r\n")[0], tls
+
+
 class TestWebSocketUpgrade:
     """RC's transport is a WebSocket. Stripping Connection/Upgrade as
     hop-by-hop made the server answer 403 — the whole reason /remote-control
@@ -15222,6 +15325,119 @@ class TestAMisroutedSwapCannotKillASession:
             proxy.stop()
             upstream.stop()
 
+    def case_a_swapped_upgrade_refused_401_is_retried_fresh_and_still_gets_101(
+            self, certdir, monkeypatch):
+        """T1155: the gap. `/api/frame/sync` (artifact sync, the RC comment
+        watch/wake route) is a pinned route reached as a WebSocket upgrade.
+        `_relay_upgrade` used to relay a 401/403/404 straight to the client
+        -- terminal in SSETransport, same as the HTTP path above -- with no
+        refetch and no retry. A stale cached pinned token refused must get
+        the SAME treatment as the HTTP path: refetch once
+        (`_refetch_swap_token`), retry swapped, and the client sees only
+        the eventual 101."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _refetch_switcher(
+            certdir, lambda n: "stale-token" if n == 1 else "fresh-token")
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+
+        up = _WebSocketAuthUpstream(certdir, reject_bearer="stale-token",
+                                    reject_status=401)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem", "/api/frame/sync",
+                bearer="disk-token")
+            assert b"101" in status, (
+                "a refused swap on an upgrade must be retried fresh, not "
+                f"handed to the client as-is: {status!r}")
+            tls.sendall(b"PING")
+            assert tls.recv(4096) == b"PONG"
+            tls.close()
+        finally:
+            proxy.stop()
+            up.stop()
+        assert up.auths_seen == ["Bearer stale-token", "Bearer fresh-token"], (
+            up.auths_seen)
+
+    def case_a_dead_pinned_token_on_an_upgrade_falls_back_unswapped(
+            self, certdir, monkeypatch):
+        """Control: the pinned account is really dead (every read answers
+        the same refused token), not a stale cache. One retry, then the
+        same disk-bearer fallback the HTTP path takes, and one `swap
+        refused ... fell-back` log line -- never a client-visible
+        401/403/404."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _refetch_switcher(certdir, lambda n: "dead-token")
+        provider = pp.make_pin_token_provider(switcher, "2", "pin@example.com")
+
+        up = _WebSocketAuthUpstream(certdir, reject_bearer="dead-token",
+                                    reject_status=403)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", up.port))
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        proxy.start()
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem", "/api/frame/sync",
+                bearer="disk-token")
+            assert b"101" in status, (
+                f"the unswapped fallback must still complete the upgrade: "
+                f"{status!r}")
+            tls.close()
+            assert up.auths_seen == ["Bearer dead-token", "Bearer disk-token"], (
+                up.auths_seen)
+            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
+            assert swap_lines == [
+                "swap refused (403) on GET /api/frame/sync: fell-back"
+            ], lines
+        finally:
+            proxy.stop()
+            up.stop()
+            pp._log_lifecycle = real_log
+
+    def case_a_non_swapped_upgrade_refused_is_relayed_untouched(self, certdir):
+        """Control: a route `is_pinned_route` never swaps (the `/worker`
+        subtree keeps its own session JWT, per that function's docstring)
+        must see NO refetch and NO retry on refusal -- the refused response
+        is the client's, verbatim, after exactly one upstream attempt."""
+        from cswap_pin.proxy import PinProxy
+
+        up = _WebSocketAuthUpstream(certdir, reject_bearer="disk-token",
+                                    reject_status=403)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PINTOKEN",
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/cse_x/worker/events/stream",
+                bearer="disk-token")
+            assert b"403" in status, (
+                f"a non-swapped route's own refusal must reach the client "
+                f"untouched: {status!r}")
+            tls.close()
+        finally:
+            proxy.stop()
+            up.stop()
+        assert up.auths_seen == ["Bearer disk-token"], (
+            f"a non-pinned route must never retry on refusal: {up.auths_seen}")
+
 
 class TestEverySmallCaseHolder:
     """Every small case-holder in this file, as ONE pytest test.
@@ -15801,6 +16017,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
+        pp._walled_headroom_seen.clear()
         # THE `_note_usage_headers` THROTTLES are memos of the SAME shape
         # and outlive this case exactly like the three above: cases run
         # alphabetically (`run_cases`'s `sorted(dir(cls))`), so a case that
@@ -16016,6 +16233,48 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     extra_headers=self._5H_HEADER)
         assert len(recorded) == 2, (
             f"a reply after the throttle expires must record: {recorded}")
+
+    def case_a_delayed_thread_still_dates_its_slot_memo_from_its_spawn(
+        self, monkeypatch,
+    ):
+        """THE DEFECT (T1213): `_run` used to stamp `_usage_header_seen`
+        with its OWN, later `time.monotonic()` read instead of the spawn
+        gate's `now` -- so a thread that resolves after a scheduling delay
+        lands inside the OLD slot window. A second reply spawned exactly
+        30s after the FIRST one (which the pre-spawn gate must allow) then
+        found the slot memo still fresh and recorded nothing, stretching
+        two records that should be 30s apart to ~60s on a busy
+        single-token loop. Dating both memos from the SAME spawn-time
+        `now` fixes it."""
+        import time as _time
+        from cswap_pin import proxy as pp
+        captured = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", captured.append)
+        recorded = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   record_usage_headers=lambda *a: recorded.append(a))
+        clock = {"t": 0.0}
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["t"])
+
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=self._5H_HEADER)
+        assert len(captured) == 1, captured
+        # This thread does not get scheduled until 5s later.
+        clock["t"] = 5.0
+        captured.pop(0)()
+        assert len(recorded) == 1, recorded
+
+        # A second reply, 30s after the FIRST SPAWN -- the pre-spawn gate
+        # (keyed on spawn time) must allow it.
+        clock["t"] = 30.0
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=self._5H_HEADER)
+        assert len(captured) == 1, captured
+        captured.pop(0)()
+        assert len(recorded) == 2, (
+            f"two replies 30s apart on one slot must each record, not be "
+            f"throttled by a slot memo dated from the first thread's late "
+            f"run time: {recorded}")
 
     def case_two_tokens_of_the_same_slot_inside_30s_is_one_record(
         self, monkeypatch,
@@ -16428,6 +16687,25 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             assert got.startswith(b"HTTP/1.1 401"), (sid, got[:40])
         assert not calls, (
             f"no session's bearer conversion may reach switch(): {calls}")
+
+    def case_n_sessions_on_the_same_wall_share_one_headroom_read(
+        self, monkeypatch,
+    ):
+        """THE DEFECT (T1213): keying the 401 per session (above) is right,
+        but each of the N sessions then also asked `_live_account_headroom`
+        on its own -- N usage fetches under `_walled_switch_lock` where the
+        old SHARED memo used to pay for one. A short (reset, slot) verdict
+        cache lets the N sessions still each get their own 401 while the
+        underlying reading is asked for once."""
+        snap = []
+        self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                   usage=self.HEADROOM, snap=snap)
+        for sid in ("cse_a", "cse_b", "cse_c"):
+            got = self._relay(auth="Bearer stale-account-token", session=sid)
+            assert got.startswith(b"HTTP/1.1 401"), (sid, got[:40])
+        assert len(snap) == 1, (
+            f"N stale sessions on one wall must share one headroom read, "
+            f"not pay their own: {snap}")
 
     def case_one_session_gets_one_401_per_ttl_even_as_its_token_rotates(
         self, monkeypatch,
@@ -17155,6 +17433,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
+        pp._walled_headroom_seen.clear()
         return calls
 
     def case_a_walled_slot_live_again_re_decides_when_the_host_can_exclude_it(
@@ -17328,6 +17607,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
         pp._walled_switch_seen_by_session.clear()
+        pp._walled_headroom_seen.clear()
 
         first = self._relay(reset=self.RESET_HEADER, auth="Bearer token-6")
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
@@ -17363,6 +17643,102 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert retry_at is not None, (
             "a redecide miss must expire, not go permanent: "
             f"{pp._walled_switch_seen}")
+
+    def case_a_shared_negative_caps_on_the_live_walls_clock_not_the_stale_bearers(
+        self, monkeypatch,
+    ):
+        """THE DEFECT (T1213 pass 2, I1): while the live slot is KNOWN walled
+        (`_walled_slots`), a stale-bearer 429 skips the per-session headroom
+        branch (`not walled` is False) and falls through to the ordinary
+        `switch()` attempt, which writes its failure into the SHARED
+        `(reset, slot)` memo. That 429's own `reset` belongs to the STALE
+        account, not the live one -- its wall can clear long after the live
+        slot's own does, so capping the negative on it (instead of on
+        `_walled_slots[slot]`, the live slot's own clear time) lets the
+        debounce outlive the LIVE wall by up to the stale account's wait
+        instead of ending when the live wall does."""
+        from cswap_pin import proxy as pp
+        import time as _time
+        BASE = 2_000_000_000.0
+        LIVE_CLEAR = BASE + 2.0
+        STALE_RESET = int(BASE) + 100  # the STALE account's own wall
+        reset_header = (b"anthropic-ratelimit-unified-reset: "
+                         + str(STALE_RESET).encode())
+        clock = {"mono": 0.0, "wall": BASE}
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(_time, "time", lambda: clock["wall"])
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage=self.HEADROOM)
+        pp._walled_slots["1"] = LIVE_CLEAR
+
+        first = self._relay(reset=reset_header,
+                            auth="Bearer stale-account-token")
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert len(calls) == 1, calls
+
+        # Still inside the LIVE wall (it clears at +2s): the debounce must
+        # hold, and switch() must not run again for this same wall.
+        clock["mono"] = 1.0
+        clock["wall"] = BASE + 1.0
+        second = self._relay(reset=reset_header,
+                             auth="Bearer stale-account-token")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, (
+            f"the debounce must hold while the LIVE wall still stands: "
+            f"{calls}")
+
+        # The LIVE wall has now cleared (+2s); the stale account's own wall
+        # (STALE_RESET, +100s) has not -- and must not matter.
+        clock["mono"] = 2.5
+        clock["wall"] = BASE + 2.5
+        third = self._relay(reset=reset_header,
+                            auth="Bearer stale-account-token")
+        assert third.startswith(b"HTTP/1.1 401"), (
+            f"the live wall cleared 0.5s ago; the next stale-bearer 429 "
+            f"must convert at once, not wait out a debounce capped on the "
+            f"stale account's unrelated, later, wall: {third[:40]!r}")
+        assert len(calls) == 1, calls
+
+    def case_a_cap_already_past_does_not_reopen_switch_for_a_concurrent_429(
+        self, monkeypatch,
+    ):
+        """I2: on the live token's own 429 (`auth` is `self.LIVE`, not a
+        stale bearer) -- a non-walled path that never receives a cap -- a
+        reset at or before `time.time()` (clock skew, or a wall whose own
+        header already lagged) must not zero out the negative's expiry --
+        that let every OTHER concurrent 429 on the same wall, queued behind
+        `_walled_switch_lock`, find it already expired and re-run
+        `switch()` for itself. A cap taken from this reset would have expired
+        long before a second, genuinely concurrent 429 gets its turn on the
+        lock: 0.5s later, far longer than a cap already past allows but nowhere near main's 30s
+        TTL, is what a queued waiter's lock handoff actually costs. That
+        later waiter must still find the debounce standing and call
+        `switch()` once between them, not once each."""
+        from cswap_pin import proxy as pp
+        import time as _time
+        BASE = 2_000_000_000.0
+        PAST_RESET = int(BASE) - 5  # already expired when this 429 arrives
+        reset_header = (b"anthropic-ratelimit-unified-reset: "
+                         + str(PAST_RESET).encode())
+        clock = {"mono": 0.0, "wall": BASE}
+        monkeypatch.setattr(_time, "monotonic", lambda: clock["mono"])
+        monkeypatch.setattr(_time, "time", lambda: clock["wall"])
+        calls = self._wire(monkeypatch, switched=False, live_token=self.LIVE,
+                           usage=self.HEADROOM)
+
+        first = self._relay(reset=reset_header, auth=f"Bearer {self.LIVE}")
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert len(calls) == 1, calls
+
+        # 0.5s later, not the same instant: long past any 1ms floor, the
+        # shape of a queued waiter's actual lock handoff.
+        clock["mono"] = 0.5
+        clock["wall"] = BASE + 0.5
+        second = self._relay(reset=reset_header, auth=f"Bearer {self.LIVE}")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, (
+            f"a reset already in the past zeroed the debounce and let a "
+            f"second concurrent 429 call switch() again: {calls}")
 
 
 class TestTheEvidenceSurvivesAHandover:
