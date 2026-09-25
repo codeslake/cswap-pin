@@ -31,6 +31,7 @@ import json
 import re
 import pathlib
 import sys
+import warnings
 
 import pytest
 
@@ -804,6 +805,12 @@ PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
 #    separate tests reported.
 #  - THE FAILING CASE'S NAME AND TRACEBACK. Both are in the message, so a
 #    failure still points at one method in one file.
+#  - A SKIP IS NOT AN EARLY EXIT. `pytest.skip()` raises `Skipped`, which
+#    derives from `BaseException`, not `Exception` -- so it is caught on its
+#    own, separately, and the loop CONTINUES: every later case still runs,
+#    and a failure among them still gets raised. Only when every case in the
+#    run skipped does this itself skip, naming each one; a mix of skips and a
+#    clean pass surfaces the skips as a warning rather than going quiet.
 def run_cases(instance, request, tmp_path_factory, extra=None):
     """Run every `case_*` method of `instance`, isolated, reporting all failures.
 
@@ -832,6 +839,7 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
         sys.modules[type(holders[0]).__module__], "case_fixtures", {}
     )
     failures = []
+    skipped = []
     for i, (instance, name, method) in enumerate(work):
         wants = [
             a
@@ -860,6 +868,15 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
                 pool[a] if a in pool else request.getfixturevalue(a) for a in wants
             ]
             method(*args)
+        except pytest.skip.Exception as exc:
+            # `Skipped` DERIVES FROM `BaseException`, NOT `Exception` -- the
+            # `except Exception` below never caught it, so a `pytest.skip()`
+            # inside any case ended this loop right here: every later case
+            # never ran, and any failure already in `failures` was never
+            # raised, because the raw `Skipped` propagated out of this
+            # function on the spot instead. Recorded and CONTINUED instead,
+            # the same as a real failure two lines down.
+            skipped.append(f"{name}: {exc}")
         except Exception:  # noqa: BLE001 — collect, do not stop the run
             failures.append(f"--- {name} ---\n{traceback.format_exc()}")
         finally:
@@ -885,4 +902,18 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
     if failures:
         raise AssertionError(
             f"{len(failures)} of {len(work)} cases failed:\n\n" + "\n".join(failures)
+        )
+    if skipped and len(skipped) == len(work):
+        # EVERY CASE SKIPPED. A pass here would read as "nothing to check",
+        # which is not what happened -- pytest's own `skip` is the honest
+        # report, naming every case so this reads nothing like the old bug's
+        # single, unlabelled `Skipped` escaping on the first case alone.
+        pytest.skip(f"all {len(work)} cases skipped:\n" + "\n".join(skipped))
+    if skipped:
+        # SOME SKIPPED, NONE FAILED: a real pass, not a failure -- but a
+        # skip silent enough to need no trace is exactly how this bug went
+        # unnoticed. `warnings.warn` is what pytest surfaces without turning
+        # a legitimate pass into one.
+        warnings.warn(
+            f"{len(skipped)} of {len(work)} cases skipped:\n" + "\n".join(skipped)
         )
