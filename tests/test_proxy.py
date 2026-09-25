@@ -12361,13 +12361,13 @@ print("OK", port)
 
         from cswap_pin.proxy import PortHolder, ensure_ca, read_daemon_state
 
-        # AN EARLY RETURN, NEVER `pytest.skip` -- `run_cases` invokes every
-        # `case_*` by hand and its `except Exception` does not catch
-        # `Skipped` (it is a `BaseException`), so a skip here ESCAPES the
-        # loop and ends every case sorted after this one for the whole
-        # class, silently, on whatever host lacks tgkill (every macOS CI
-        # runner). A plain return makes this case inapplicable there
-        # without taking its siblings down with it.
+        # AN EARLY RETURN, NOT `pytest.skip` -- `run_cases` now catches
+        # `Skipped` (a `BaseException`, so `except Exception` alone still
+        # would not) and records it per case instead of ending the loop, so
+        # a skip here would no longer take its siblings down either. Kept as
+        # a plain return anyway: it reads PASSED on whatever host lacks
+        # tgkill (every macOS CI runner), instead of the SKIPPED a
+        # `pytest.skip` there would report.
         if sys.platform != "linux":
             return
 
@@ -12425,27 +12425,29 @@ print("OK", port)
     def case_the_non_linux_early_exit_never_raises_skipped(
             self, tmp_path, monkeypatch):
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
-        `BaseException` -- `run_cases`'s own `except Exception` does not
-        catch it (`Skipped` is not one), so it ESCAPES the loop and ends
-        every case sorted after this one for the whole class, silently, on
-        whatever host takes the non-Linux branch above (every macOS CI
-        runner). Called directly here, platform forced non-Linux, so the
+        `BaseException` -- `run_cases` now catches it and records it per
+        case instead of letting it escape, so this no longer costs the whole
+        class its later cases either. Still asserted here as
+        belt-and-braces: called directly, platform forced non-Linux, so the
         assertion is about this method's OWN control flow -- an early
-        `return` -- not about which host happens to run the suite."""
+        `return`, never a skip -- not about which host happens to run the
+        suite."""
         import sys
 
         monkeypatch.setattr(sys, "platform", "darwin")
         # Must return cleanly. A `pytest.skip` here would raise `Skipped`
-        # right through this call -- caught here, or it escapes uncaught
-        # same as it would from `run_cases` itself, and this case reports
-        # SKIPPED instead of the FAILED a regression must produce.
+        # right through this call, caught below. Since #49 `run_cases`
+        # itself no longer lets a `Skipped` escape -- it records it per case
+        # and moves on -- so without this direct call and catch, a
+        # regression that turned this branch's `return` into a
+        # `pytest.skip` would just have that case read SKIPPED, not FAILED.
         try:
             self.case_a_term_is_never_dropped_by_a_parked_main_thread(tmp_path)
         except BaseException as exc:
             raise AssertionError(
                 f"the non-Linux branch raised {type(exc).__name__} instead "
                 f"of returning cleanly -- a pytest.skip regression here "
-                f"escapes run_cases entirely: {exc}"
+                f"would read SKIPPED instead of FAILED via run_cases: {exc}"
             ) from exc
 
     def case_a_connection_is_counted_before_its_thread_runs(self, tmp_path):
@@ -18197,13 +18199,15 @@ class TestArmingReportsWhoItCutsOff:
         try:
             n_idle = pin_proxy.clients_that_arming_would_cut_off(port)
             if n_idle is None:
-                # AN EARLY RETURN, NEVER `pytest.skip` -- `run_cases` invokes
-                # every `case_*` by hand and its `except Exception` does not
-                # catch `Skipped` (it is a `BaseException`), so a skip here
-                # ESCAPES the loop and ends every case sorted after this one
-                # for the whole class, silently, on a host with no
-                # /proc/net/tcp (both Macs). See
-                # `case_the_unmeasurable_branch_never_raises_skipped` below.
+                # AN EARLY RETURN, NOT `pytest.skip` -- `run_cases` now
+                # catches `Skipped` (a `BaseException`, so `except Exception`
+                # alone still would not) and records it per case instead of
+                # ending the loop, so a skip here would no longer take its
+                # siblings down either. Kept as a plain return anyway: it
+                # reads PASSED on a host with no /proc/net/tcp (both Macs),
+                # instead of the SKIPPED a `pytest.skip` there would report.
+                # See `case_the_unmeasurable_branch_never_raises_skipped`
+                # below.
                 return
             assert n_idle == 0, "counted a client before anyone connected"
             c = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -18222,12 +18226,11 @@ class TestArmingReportsWhoItCutsOff:
     def case_the_unmeasurable_branch_never_raises_skipped(
             self, tmp_path, monkeypatch):
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
-        `BaseException` -- `run_cases`'s own `except Exception` does not
-        catch it, so it ESCAPES the loop and ends every case sorted after
-        this one for the whole class, silently, on a host with no
-        /proc/net/tcp (both Macs). Forces that branch and asserts the sibling
-        case returns cleanly, not about which host happens to run the
-        suite."""
+        `BaseException` -- `run_cases` now catches it and records it per
+        case instead of letting it escape, so this no longer costs the whole
+        class its later cases either. Still asserted here as
+        belt-and-braces: forces that branch and asserts the sibling case
+        returns cleanly, not about which host happens to run the suite."""
         from cswap_pin import proxy as pin_proxy
 
         monkeypatch.setattr(
@@ -18239,8 +18242,8 @@ class TestArmingReportsWhoItCutsOff:
             raise AssertionError(
                 f"the unmeasurable-platform branch raised "
                 f"{type(exc).__name__} instead of returning cleanly -- a "
-                f"pytest.skip regression here escapes run_cases entirely: "
-                f"{exc}"
+                f"pytest.skip regression here would read SKIPPED instead of "
+                f"FAILED via run_cases: {exc}"
             ) from exc
 
 
@@ -18281,13 +18284,15 @@ class TestClearingThePinDoesNotStrandLiveSessions:
         monkeypatch.setattr(pin_proxy, "_wired_port", lambda: None)
         try:
             if pin_proxy.clients_that_arming_would_cut_off(port) is None:
-                # AN EARLY RETURN, NEVER `pytest.skip` -- `run_cases` invokes
-                # every `case_*` by hand and its `except Exception` does not
-                # catch `Skipped` (it is a `BaseException`), so a skip here
-                # ESCAPES the loop and ends every case sorted after this one
-                # for the whole class, silently, on a host with no
-                # /proc/net/tcp (both Macs). See
-                # `case_the_unmeasurable_branch_never_raises_skipped` below.
+                # AN EARLY RETURN, NOT `pytest.skip` -- `run_cases` now
+                # catches `Skipped` (a `BaseException`, so `except Exception`
+                # alone still would not) and records it per case instead of
+                # ending the loop, so a skip here would no longer take its
+                # siblings down either. Kept as a plain return anyway: it
+                # reads PASSED on a host with no /proc/net/tcp (both Macs),
+                # instead of the SKIPPED a `pytest.skip` there would report.
+                # See `case_the_unmeasurable_branch_never_raises_skipped`
+                # below.
                 return
             assert pin_proxy._is_claimed(certdir) is False, (
                 "an idle unwired daemon should still time out"
@@ -18346,12 +18351,11 @@ class TestClearingThePinDoesNotStrandLiveSessions:
     def case_the_unmeasurable_branch_never_raises_skipped(
             self, tmp_path, monkeypatch):
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
-        `BaseException` -- `run_cases`'s own `except Exception` does not
-        catch it, so it ESCAPES the loop and ends every case sorted after
-        this one for the whole class, silently, on a host with no
-        /proc/net/tcp (both Macs). Forces that branch and asserts the sibling
-        case returns cleanly, not about which host happens to run the
-        suite."""
+        `BaseException` -- `run_cases` now catches it and records it per
+        case instead of letting it escape, so this no longer costs the whole
+        class its later cases either. Still asserted here as
+        belt-and-braces: forces that branch and asserts the sibling case
+        returns cleanly, not about which host happens to run the suite."""
         from cswap_pin import proxy as pin_proxy
 
         monkeypatch.setattr(
@@ -18363,8 +18367,8 @@ class TestClearingThePinDoesNotStrandLiveSessions:
             raise AssertionError(
                 f"the unmeasurable-platform branch raised "
                 f"{type(exc).__name__} instead of returning cleanly -- a "
-                f"pytest.skip regression here escapes run_cases entirely: "
-                f"{exc}"
+                f"pytest.skip regression here would read SKIPPED instead of "
+                f"FAILED via run_cases: {exc}"
             ) from exc
 
     def case_a_missing_record_with_an_open_channel_is_republished(
@@ -19313,8 +19317,12 @@ class TestAWedgeIsNotTrustedForever:
         # BOTH SHAPES, the same as `_note_worker_status` actually writes: a
         # bare key beside the per-pid one, in the same call. `_worker_alive_age`
         # only ever matches the `@<pid>` suffix, so the bare key changes
-        # nothing this case asserts -- it is here so the fixture is the real
-        # production shape, not a hand-picked slice of it.
+        # nothing THIS case asserts TODAY -- but it is the FRESH stamp that a
+        # regression back to a bare `shared.get(sid)` read (the older shape
+        # `_note_worker_status` still writes for a not-yet-upgraded reader)
+        # would wrongly spare: that read would see this timestamp, decide the
+        # daemon is alive, and pass where it should kill. This case is what
+        # would catch that regression.
         (certdir / proxy._ALIVE_FILE).write_text(json.dumps({
             "cse_x": time.time(),
             f"cse_x@{os.getpid() + 1}": time.time(),
@@ -19559,14 +19567,15 @@ class TestAWedgeIsNotTrustedForever:
             "successor -- exactly the double-bind `_recycle_daemon` exists "
             "to avoid")
 
-    def case_a_wedge_replaced_through_the_holder_reports_healed(
-            self, tmp_path, monkeypatch):
-        """Same successor-first protocol as the case above, but on the WEDGE
-        path -- a MATCHING fingerprint, not a stale one -- which is where
-        `heal` used to return False ("Nothing to heal") after successfully
-        replacing the wedged daemon through its holder. It must return True:
-        this call killed the wedge and confirmed the holder's successor,
-        which IS the repair, not a bystander's."""
+    def _wedge_replaced_through_the_holder(
+            self, tmp_path, monkeypatch, *, term_raises_esrch):
+        """Shared setup for a wedge on a MATCHING fingerprint, replaced
+        through its holder: the holder always confirms the successor
+        (`_wedged_daemon_can_be_asked` stubbed True), and
+        ``term_raises_esrch`` picks the `(stale_pid, 15)` arm of `_fake_kill`
+        -- a delivered TERM or one that hits ESRCH because the predecessor
+        was already gone. Returns `heal`'s own result; the caller keeps its
+        own docstring and final assertion."""
         import signal
 
         from cswap_pin import proxy
@@ -19608,6 +19617,11 @@ class TestAWedgeIsNotTrustedForever:
                 proxy.write_daemon_state(certdir, 4100, new_pid, fp)
                 return
             if pid == stale_pid and sig == 15:
+                if term_raises_esrch:
+                    # ESRCH: the predecessor was already gone by the time
+                    # this call got around to its own TERM -- the holder's
+                    # successor (just confirmed above) beat it there.
+                    raise OSError("No such process")
                 return
             raise AssertionError(f"unexpected os.kill({pid}, {sig})")
         monkeypatch.setattr(proxy.os, "kill", _fake_kill)
@@ -19623,6 +19637,18 @@ class TestAWedgeIsNotTrustedForever:
         assert not spawn_calls, (
             "heal spawned a second daemon instead of trusting the holder's "
             "successor")
+        return result
+
+    def case_a_wedge_replaced_through_the_holder_reports_healed(
+            self, tmp_path, monkeypatch):
+        """Same successor-first protocol as the case above, but on the WEDGE
+        path -- a MATCHING fingerprint, not a stale one -- which is where
+        `heal` used to return False ("Nothing to heal") after successfully
+        replacing the wedged daemon through its holder. It must return True:
+        this call killed the wedge and confirmed the holder's successor,
+        which IS the repair, not a bystander's."""
+        result = self._wedge_replaced_through_the_holder(
+            tmp_path, monkeypatch, term_raises_esrch=False)
         assert result is True, (
             "heal replaced the wedge through its holder but reported "
             "'Nothing to heal'")
@@ -19639,61 +19665,8 @@ class TestAWedgeIsNotTrustedForever:
         this call is the one that asked the holder and watched the successor
         appear, and reporting 'Nothing to heal' for a repair just confirmed
         sends someone chasing a repair that already happened."""
-        import signal
-
-        from cswap_pin import proxy
-
-        root, _cfg = self._root_for_heal(tmp_path, monkeypatch)
-        certdir = root / "pin-proxy"
-        fp = proxy.daemon_fingerprint()
-        stale_pid, holder_pid, new_pid = 55531, 55532, 55533
-        proxy.write_daemon_state(certdir, 4100, stale_pid, fp)  # MATCHING fp
-
-        def _fake_read_alive_port(cd, fingerprint=None):
-            st = proxy.read_daemon_state(cd)
-            if not st:
-                return None
-            if fingerprint is not None:
-                if st.get("fingerprint") != fingerprint:
-                    return None
-                if int(st.get("pid") or 0) == stale_pid:
-                    return None
-            return st.get("port")
-
-        monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
-        monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
-        monkeypatch.setattr(proxy, "_worker_alive_age", lambda cd, pid: None)
-        monkeypatch.setattr(proxy, "_holder_owns", lambda cd: True)
-        monkeypatch.setattr(
-            proxy, "_wedged_parent_holder",
-            lambda pid, cd: holder_pid if pid == stale_pid else None)
-        monkeypatch.setattr(proxy, "_wedged_daemon_can_be_asked",
-                            lambda pid, hp: True)
-        monkeypatch.setattr(proxy, "_pid_alive", lambda pid: pid != stale_pid)
-
-        def _fake_kill(pid, sig):
-            if pid == holder_pid and sig == proxy._REPLACE_ME_SIGNAL:
-                proxy.write_daemon_state(certdir, 4100, new_pid, fp)
-                return
-            if pid == stale_pid and sig == 15:
-                # ESRCH: the predecessor was already gone by the time this
-                # call got around to its own TERM -- the holder's successor
-                # (just confirmed above) beat it there.
-                raise OSError("No such process")
-            raise AssertionError(f"unexpected os.kill({pid}, {sig})")
-        monkeypatch.setattr(proxy.os, "kill", _fake_kill)
-
-        spawn_calls = []
-        monkeypatch.setattr(
-            proxy, "_spawn_daemon", lambda *a, **k: spawn_calls.append(a) or 99999)
-
-        assert proxy._REPLACE_ME_SIGNAL == signal.SIGUSR1, (
-            "no 'replace me' channel on this platform -- the case below is "
-            "vacuous without it")
-        result = proxy.heal(root)
-        assert not spawn_calls, (
-            "heal spawned a second daemon instead of trusting the holder's "
-            "successor")
+        result = self._wedge_replaced_through_the_holder(
+            tmp_path, monkeypatch, term_raises_esrch=True)
         assert result is True, (
             "a confirmed successor was reported as 'Nothing to heal' "
             "because the TERM to the already-gone predecessor hit ESRCH"
@@ -25660,12 +25633,13 @@ class TestAHolderDoesNotOutliveItsLauncher:
 
         from cswap_pin.proxy import ensure_ca
 
-        # AN EARLY RETURN, NEVER `pytest.skip` -- `run_cases` invokes every
-        # `case_*` by hand and its `except Exception` does not catch
-        # `Skipped` (it is a `BaseException`), so a skip here ESCAPES the
-        # loop and ends every case sorted after this one for the whole
-        # class, silently, on every macOS CI runner. See
-        # `case_the_non_linux_early_exit_never_raises_skipped` below.
+        # AN EARLY RETURN, NOT `pytest.skip` -- `run_cases` now catches
+        # `Skipped` (a `BaseException`, so `except Exception` alone still
+        # would not) and records it per case instead of ending the loop, so
+        # a skip here would no longer take its siblings down either. Kept as
+        # a plain return anyway: it reads PASSED on every macOS CI runner,
+        # instead of the SKIPPED a `pytest.skip` there would report.
+        # See `case_the_non_linux_early_exit_never_raises_skipped` below.
         if sys.platform != "linux":
             return
 
@@ -25747,12 +25721,12 @@ class TestAHolderDoesNotOutliveItsLauncher:
     def case_the_non_linux_early_exit_never_raises_skipped(
             self, tmp_path, monkeypatch):
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
-        `BaseException` -- `run_cases`'s own `except Exception` does not
-        catch it (`Skipped` is not one), so it ESCAPES the loop and ends
-        every case sorted after this one for the whole class, silently, on
-        every macOS CI runner. Called directly here, platform forced
-        non-Linux, so the assertion is about this method's OWN control flow
-        -- an early `return` -- not about which host happens to run the
+        `BaseException` -- `run_cases` now catches it and records it per
+        case instead of letting it escape, so this no longer costs the whole
+        class its later cases either. Still asserted here as
+        belt-and-braces: called directly, platform forced non-Linux, so the
+        assertion is about this method's OWN control flow -- an early
+        `return`, never a skip -- not about which host happens to run the
         suite."""
         import sys
 
@@ -25763,7 +25737,7 @@ class TestAHolderDoesNotOutliveItsLauncher:
             raise AssertionError(
                 f"the non-Linux branch raised {type(exc).__name__} instead "
                 f"of returning cleanly -- a pytest.skip regression here "
-                f"escapes run_cases entirely: {exc}"
+                f"would read SKIPPED instead of FAILED via run_cases: {exc}"
             ) from exc
 
 
