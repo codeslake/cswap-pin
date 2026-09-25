@@ -4355,6 +4355,399 @@ class TestSuperviseCleanExitGuards:
             holder.stop()
 
 
+class TestASpawnFailureIsNotFatal:
+    """T1274: `_spawn`'s own `Popen` can raise `OSError` (fork EAGAIN/EMFILE,
+    or the interpreter itself unrunnable) or `ValueError` (a closed fd, see
+    `_on_replace_request`) -- and neither `_supervise`'s respawns nor
+    `_standby_revive`'s promotion (`holder.start()`) caught it. MEASURED
+    (T1284's deployer, sandbox 2026-09-25): with a throwaway venv's
+    interpreter made unrunnable, `_supervise`'s own respawn after a
+    redeploy ask (exit 75) raised uncaught in `Thread-1 (_supervise)` --
+    the thread died, the holder process exited with no `stop()` -- and
+    the standby's takeover (`standby_main` -> `_standby_revive` ->
+    `holder.start()` -> `_spawn`) hit the identical unwrapped call and its
+    exception killed the standby too. Net: every process that could serve
+    the port was gone.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    class _BlockingProc:
+        """A `Popen` double whose `wait()` blocks until told to exit, so
+        `_supervise`'s own blocking `proc.wait()` cannot return early and
+        race the assertions below -- the thread must still be parked in it,
+        not merely not-yet-scheduled."""
+
+        def __init__(self):
+            self._ev = threading.Event()
+            self.returncode = None
+
+        def exit(self, code):
+            self.returncode = code
+            self._ev.set()
+
+        def wait(self, timeout=None):
+            self._ev.wait(timeout)
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.exit(0)
+
+    def case_supervise_retries_a_raising_respawn_and_stays_alive(
+            self, tmp_path, monkeypatch):
+        """The cold start succeeds; the daemon it started then crashes
+        (non-zero exit), and the RESPAWN `_supervise` makes for it is the
+        one that raises `OSError` a few times before succeeding -- the
+        ordinary-crash respawn site. `case_the_code_75_redeploy_respawn_
+        survives_a_raising_spawn` below is the one that models the measured
+        incident (a redeploy ask, exit 75)."""
+        holder, procs, spawn_calls = self._respawn_after_exit_survives_a_raising_spawn(
+            tmp_path, monkeypatch, 1, raises=3)
+        try:
+            self._assert_the_respawn_survived(
+                holder, procs, spawn_calls, "ordinary crash")
+        finally:
+            holder.stop()
+
+    def case_promotion_survives_a_raising_spawn_and_keeps_the_socket(
+            self, tmp_path, monkeypatch):
+        """The standby's takeover promotes in place with exactly this
+        construction -- `PortHolder(certdir, account_num, email, sock=srv)`
+        then `.start()`, see `_standby_revive`. A raising `Popen` there used
+        to escape `start()` uncaught: nothing but this call was left to put
+        a holder back on the socket, so the exception killed the STANDBY
+        PROCESS itself, taking its own copy of the descriptor down with it.
+        """
+        from cswap_pin.proxy import PortHolder
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+
+        spawn_calls = []
+        RAISES = 2
+
+        def _flaky_spawn(self):
+            spawn_calls.append(1)
+            if len(spawn_calls) <= RAISES:
+                raise OSError("fork: Resource temporarily unavailable")
+            self._proc = TestASpawnFailureIsNotFatal._BlockingProc()
+            self.daemon_pid = 4242
+
+        monkeypatch.setattr(PortHolder, "_spawn", _flaky_spawn)
+
+        holder = PortHolder(certdir, "1", "a@b.c", sock=srv)
+        try:
+            holder.start()  # this IS `_standby_revive`'s own promotion call
+            assert len(spawn_calls) > RAISES, (
+                f"only {len(spawn_calls)} spawn attempt(s) — the promotion's "
+                f"raising spawn was not retried"
+            )
+            assert holder._thread.is_alive(), (
+                "the promoted holder's supervisor thread died on the "
+                "raising spawn instead of retrying past it"
+            )
+            # `start()` RETURNING NORMALLY IS THE DISCRIMINATOR. A killed
+            # standby process would have taken this same test process down
+            # with it -- there is nothing else to check in-process; a raw
+            # connect to `srv` would succeed even if `start()` never got a
+            # real daemon running, since nothing here ever closes it.
+        finally:
+            holder.stop()
+
+    def case_a_permanently_raising_respawn_reaches_degrade_now(
+            self, tmp_path, monkeypatch):
+        """The cold start succeeds; the daemon then crashes, and every
+        RESPAWN `_supervise` makes for it raises `OSError` forever -- a
+        spawn that can never succeed is a failure on the SAME ladder a
+        crash-looping daemon climbs, so it must reach `degrade_now()` too
+        (model: `case_the_ladder_degrades_instead_of_retrying_forever`),
+        not retry past `_HOLD_DEGRADE_AT` forever on a private count."""
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        seen = {"degraded": False}
+        monkeypatch.setattr(PortHolder, "degrade_now",
+                            lambda self: seen.__setitem__("degraded", True))
+
+        spawn_calls = []
+
+        def _flaky_spawn(self):
+            spawn_calls.append(1)
+            if len(spawn_calls) == 1:
+                self._proc = TestASpawnFailureIsNotFatal._BlockingProc()
+                self.daemon_pid = 1000
+                return
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _flaky_spawn)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        try:
+            holder.start()
+            assert len(spawn_calls) == 1, "premise: cold start did not spawn cleanly"
+            holder._proc.exit(1)  # the daemon crashes; every respawn after this raises
+
+            deadline = time.time() + 5
+            while not seen["degraded"] and time.time() < deadline:
+                time.sleep(0.02)
+            assert seen["degraded"], (
+                f"{_HOLD_DEGRADE_AT} failed respawns (all raising `Popen`) "
+                f"and the holder is still retrying into a port nobody "
+                f"answers"
+            )
+        finally:
+            holder.stop()
+
+    def case_the_capping_attempt_does_not_say_retrying(
+            self, tmp_path, monkeypatch):
+        """`_spawn_retrying`'s own log line said "retrying" on EVERY failed
+        attempt, including the one that hits `_HOLD_DEGRADE_AT` and gives
+        up instead -- the one moment the word is false."""
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+        from cswap_pin import proxy as pin_proxy
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "degrade_now", lambda self: None)
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+
+        def _always_raise(self):
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _always_raise)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        try:
+            assert holder._spawn_retrying() is False
+            spawn_lines = [l for l in lines if "could not spawn a successor" in l]
+            assert len(spawn_lines) == _HOLD_DEGRADE_AT, (
+                f"{len(spawn_lines)} logged attempt(s), expected exactly "
+                f"the ladder's cap ({_HOLD_DEGRADE_AT})"
+            )
+            assert "retrying" not in spawn_lines[-1], (
+                f"the attempt that hit the cap still said retrying: "
+                f"{spawn_lines[-1]!r}"
+            )
+            for line in spawn_lines[:-1]:
+                assert "retrying" in line, (
+                    f"a non-capping attempt should still say retrying: "
+                    f"{line!r}"
+                )
+        finally:
+            holder.stop()
+
+    def _respawn_after_exit_survives_a_raising_spawn(
+            self, tmp_path, monkeypatch, exit_code, *, raises=2, pinned=False):
+        """Shared drive for all three `_supervise` respawn sites: the cold
+        start succeeds, the daemon then exits with `exit_code`, and the
+        RESPAWN that site makes raises `raises` times before succeeding.
+        Returns (holder, procs, spawn_calls)."""
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        if pinned:
+            monkeypatch.setattr(pin_proxy, "load_pin",
+                                lambda root: ("a@b.c", "org-1"))
+            monkeypatch.setattr(pin_proxy, "_standby_port_still_wanted",
+                                lambda certdir, port: True)
+
+        procs = []
+        spawn_calls = []
+
+        def _flaky_spawn(self):
+            spawn_calls.append(1)
+            # THE COLD START (the first call) always succeeds -- this drive
+            # is about the RESPAWN after an exit, not the first spawn.
+            if 1 < len(spawn_calls) <= 1 + raises:
+                raise OSError("fork: Resource temporarily unavailable")
+            proc = TestASpawnFailureIsNotFatal._BlockingProc()
+            procs.append(proc)
+            self._proc = proc
+            self.daemon_pid = 1000 + len(spawn_calls)
+
+        monkeypatch.setattr(PortHolder, "_spawn", _flaky_spawn)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        holder.start()
+        assert len(procs) == 1, "premise: the cold start did not spawn cleanly"
+        procs[0].exit(exit_code)
+        return holder, procs, spawn_calls
+
+    def _assert_the_respawn_survived(self, holder, procs, spawn_calls, label):
+        """Poll on `procs`, not `spawn_calls` -- `_flaky_spawn` appends to
+        the latter before the former, so polling on it can wake this thread
+        in the gap between a successful call's two appends."""
+        deadline = time.time() + 5
+        while len(procs) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(procs) == 2, (
+            f"did not end up with a live successor after {label}: "
+            f"{len(procs)} real spawn(s) landed"
+        )
+        assert len(spawn_calls) > 1, (
+            f"only {len(spawn_calls)} spawn attempt(s) — the {label} "
+            f"respawn's raising spawn was not retried"
+        )
+        assert holder._thread.is_alive(), (
+            f"the supervisor THREAD died on the {label} respawn's raising "
+            f"Popen instead of retrying past it"
+        )
+
+    def case_the_code_75_redeploy_respawn_survives_a_raising_spawn(
+            self, tmp_path, monkeypatch):
+        """A redeploy ask (exit 75) respawns at once, skipping the backoff
+        -- and that respawn's own `Popen` can raise too, which is the
+        measured incident. Reverting this call site (`_supervise`'s
+        `code == _RESTART_ME_CODE` branch) back to a bare `self._spawn()`
+        must turn this red."""
+        from cswap_pin.proxy import _RESTART_ME_CODE
+
+        holder, procs, spawn_calls = self._respawn_after_exit_survives_a_raising_spawn(
+            tmp_path, monkeypatch, _RESTART_ME_CODE)
+        try:
+            self._assert_the_respawn_survived(
+                holder, procs, spawn_calls, "redeploy ask")
+        finally:
+            holder.stop()
+
+    def case_the_clean_exit_still_pinned_respawn_survives_a_raising_spawn(
+            self, tmp_path, monkeypatch):
+        """A clean exit (code 0) while still pinned respawns on the held
+        port -- and that respawn's own `Popen` can raise too. Reverting
+        this call site (`_supervise`'s `code == 0`, still-pinned branch)
+        back to a bare `self._spawn()` must turn this red."""
+        holder, procs, spawn_calls = self._respawn_after_exit_survives_a_raising_spawn(
+            tmp_path, monkeypatch, 0, pinned=True)
+        try:
+            self._assert_the_respawn_survived(
+                holder, procs, spawn_calls, "still-pinned clean exit")
+        finally:
+            holder.stop()
+
+    def case_cold_start_with_an_always_raising_spawn_raises(
+            self, tmp_path, monkeypatch):
+        """A cold start's FIRST spawn is the ONLY thing covering the port --
+        nothing else exists yet. `start()` calls bare `_spawn()` there,
+        exactly as the base did: a failure raises immediately, on the FIRST
+        attempt, with no retry ladder in between, so `holder_main`'s `except
+        OSError` can end the process and free the launcher, which is
+        already waiting on a state file that will never appear. A ladder
+        here would cost up to `_HOLD_DEGRADE_AT` backoffs (measured: up to
+        22.5s), longer than the launcher's own `_SPAWN_WAIT_S`, during which
+        `unwire_if_dead` keeps wiring live sessions to a port about to be
+        refused anyway.
+        """
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        spawn_calls = []
+
+        def _always_raise(self):
+            spawn_calls.append(1)
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _always_raise)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        try:
+            with pytest.raises(OSError):
+                holder.start()
+            assert len(spawn_calls) == 1, (
+                f"{len(spawn_calls)} spawn attempt(s) before raising — a "
+                f"cold start must fail on the first attempt, not retry"
+            )
+        finally:
+            holder.stop()
+
+    def case_promotion_with_an_always_raising_spawn_reports_failure(
+            self, tmp_path, monkeypatch):
+        """The standby's own promotion is the LAST thing covering the port
+        -- raising out of `start()` here would kill this process mid-call
+        rather than through its own control flow, so a permanently failing
+        spawn climbs the retry ladder and reports failure instead of
+        raising. It does NOT end up serving the port unpinned: nobody past
+        `start()` joins on a `None` `holder._thread`, so `_standby_revive`
+        returns, `standby_main` returns, and the interpreter exits right
+        behind it, taking `degrade_now()`'s acceptor thread down with it --
+        the port ends refused, same as a cold start's raise, just a little
+        later. Driven off-thread and joined with a timeout for the same
+        reason as the cold-start case above."""
+        from cswap_pin.proxy import PortHolder
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+
+        def _always_raise(self):
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _always_raise)
+
+        holder = PortHolder(certdir, "1", "a@b.c", sock=srv)
+        outcome = {}
+
+        def _run():
+            try:
+                outcome["result"] = holder.start()
+            except BaseException as exc:  # noqa: BLE001 — captured for the assertion
+                outcome["exc"] = exc
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        try:
+            assert not t.is_alive(), (
+                "the promotion's start() is still retrying instead of "
+                "capping out -- an unbounded retry leaves nothing "
+                "accepting on the port for as long as it spins"
+            )
+            assert "exc" not in outcome, (
+                f"start() raised out of the promotion instead of reporting "
+                f"failure, which would kill the standby process mid-call "
+                f"-- the last thing covering this port: "
+                f"{outcome.get('exc')!r}"
+            )
+            assert outcome.get("result") is False, (
+                "a permanently failing promotion spawn must report failure "
+                "(start() -> False) so _standby_revive skips its join and "
+                "lets the process end, rather than looking like a holder "
+                "that came up fine"
+            )
+            assert holder._thread is None, (
+                "a supervisor thread started over a promotion that never "
+                "got a daemon running -- there is nothing for it to "
+                "supervise, and _standby_revive would wrongly join on it"
+            )
+        finally:
+            holder.stop()
+
+
 class TestHolderCrashIsSurvivable:
     """A crash of the process HOLDING the socket — the case one level up
     from its sibling in :class:`TestDaemonPortStability`, which kills the
@@ -12427,11 +12820,12 @@ print("OK", port)
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
         `BaseException` -- `run_cases` now catches it and records it per
         case instead of letting it escape, so this no longer costs the whole
-        class its later cases either. Still asserted here as
-        belt-and-braces: called directly, platform forced non-Linux, so the
-        assertion is about this method's OWN control flow -- an early
-        `return`, never a skip -- not about which host happens to run the
-        suite."""
+        class its later cases either. Still called and caught directly here,
+        platform forced non-Linux: the assertion is about this method's OWN
+        control flow -- an early `return`, never a skip -- and that direct
+        call-and-catch is what makes a `pytest.skip` regression here read
+        FAILED via run_cases instead of SKIPPED, not about which host
+        happens to run the suite."""
         import sys
 
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -18228,9 +18622,11 @@ class TestArmingReportsWhoItCutsOff:
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
         `BaseException` -- `run_cases` now catches it and records it per
         case instead of letting it escape, so this no longer costs the whole
-        class its later cases either. Still asserted here as
-        belt-and-braces: forces that branch and asserts the sibling case
-        returns cleanly, not about which host happens to run the suite."""
+        class its later cases either. Still called and caught directly here:
+        forcing that branch and asserting the sibling case returns cleanly
+        is what makes a `pytest.skip` regression here read FAILED via
+        run_cases instead of SKIPPED, not about which host happens to run
+        the suite."""
         from cswap_pin import proxy as pin_proxy
 
         monkeypatch.setattr(
@@ -18353,9 +18749,11 @@ class TestClearingThePinDoesNotStrandLiveSessions:
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
         `BaseException` -- `run_cases` now catches it and records it per
         case instead of letting it escape, so this no longer costs the whole
-        class its later cases either. Still asserted here as
-        belt-and-braces: forces that branch and asserts the sibling case
-        returns cleanly, not about which host happens to run the suite."""
+        class its later cases either. Still called and caught directly here:
+        forcing that branch and asserting the sibling case returns cleanly
+        is what makes a `pytest.skip` regression here read FAILED via
+        run_cases instead of SKIPPED, not about which host happens to run
+        the suite."""
         from cswap_pin import proxy as pin_proxy
 
         monkeypatch.setattr(
@@ -25723,11 +26121,12 @@ class TestAHolderDoesNotOutliveItsLauncher:
         """`pytest.skip` inside a `case_*` raises `Skipped`, a
         `BaseException` -- `run_cases` now catches it and records it per
         case instead of letting it escape, so this no longer costs the whole
-        class its later cases either. Still asserted here as
-        belt-and-braces: called directly, platform forced non-Linux, so the
-        assertion is about this method's OWN control flow -- an early
-        `return`, never a skip -- not about which host happens to run the
-        suite."""
+        class its later cases either. Still called and caught directly here,
+        platform forced non-Linux: the assertion is about this method's OWN
+        control flow -- an early `return`, never a skip -- and that direct
+        call-and-catch is what makes a `pytest.skip` regression here read
+        FAILED via run_cases instead of SKIPPED, not about which host
+        happens to run the suite."""
         import sys
 
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -27855,6 +28254,20 @@ class TestAHandoverIsNotAFailure:
         (cd / pin_proxy._STATE_FILE).write_text(json.dumps(rec))
         return cd
 
+    class _TimeCensus:
+        """Records a `sleep` made through `pin_proxy.time`, and only
+        that -- every other attribute delegates to the real module, so
+        code that reads `time.monotonic()` elsewhere keeps working."""
+
+        def __init__(self):
+            self.sleeps = []
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
     def test_the_successor_is_waited_for_not_spawned_over(self, tmp_path,
                                                           monkeypatch):
         """The successor publishes while we wait; nothing is spawned."""
@@ -27870,6 +28283,14 @@ class TestAHandoverIsNotAFailure:
             # the handover settles on the third look
             return 41000 if seen["reads"] >= 3 else None
 
+        # A POSITIVE CONTROL for the sibling test's `census.sleeps == []`:
+        # this case DOES reach the `time.sleep(0.1)` in ensure_proxy's
+        # handover wait, so the same `pin_proxy.time` census must record it
+        # -- otherwise an empty census over there would be equally true of a
+        # census that never worked at all.
+        census = self._TimeCensus()
+        monkeypatch.setattr(pin_proxy, "time", census)
+
         monkeypatch.setattr(pin_proxy, "_read_alive_port", fake_read)
         monkeypatch.setattr(pin_proxy, "_spawn_daemon",
                             lambda *_a: spawned.append("spawn") or None)
@@ -27878,6 +28299,12 @@ class TestAHandoverIsNotAFailure:
             "a handover in flight was reported as nothing serving -- the "
             "caller prints 'no proxy is running' over a pin that is fine")
         assert spawned == [], "spawned over a successor that was already coming"
+        assert census.sleeps, (
+            "the sleep census recorded nothing while a handover was waited "
+            "for -- either the wait loop stopped sleeping through "
+            "`pin_proxy.time`, or the census mechanism itself is broken, "
+            "which would make the sibling test's empty census meaningless"
+        )
 
     def test_a_record_with_no_handover_does_not_wait(self, tmp_path, monkeypatch):
         """THE CONTROL. Without it the test above passes on any wait at all,
@@ -27909,29 +28336,20 @@ class TestAHandoverIsNotAFailure:
             read_alive_calls.append(1)
             return None
 
-        class _TimeCensus:
-            """Records a `sleep` made through `pin_proxy.time`, and only
-            that -- every other attribute delegates to the real module, so
-            code that reads `time.monotonic()` elsewhere keeps working."""
-
-            def __init__(self):
-                self.sleeps = []
-
-            def sleep(self, seconds):
-                self.sleeps.append(seconds)
-
-            def __getattr__(self, name):
-                return getattr(time, name)
-
-        census = _TimeCensus()
+        census = self._TimeCensus()
         monkeypatch.setattr(pin_proxy, "time", census)
 
         # THE DISCRIMINATING CONTROL: a sleep from OUTSIDE proxy.py, made
         # through the global `time` module this test file imported (never
         # `pin_proxy.time`), must not show up in the census -- proving it is
         # scoped to proxy.py's own wait loops and cannot be tripped by the
-        # macOS reap-backoff flake the docstring above describes.
+        # macOS reap-backoff flake the docstring above describes. Its own
+        # marker is asserted below -- a probe that never ran would make
+        # `census.sleeps == []` prove nothing about scoping either.
+        keychain_probe_ran = []
+
         def _keychain_probe_that_sleeps():
+            keychain_probe_ran.append(1)
             time.sleep(0.001)
             return False
 
@@ -27951,6 +28369,11 @@ class TestAHandoverIsNotAFailure:
         assert census.sleeps == [], (
             f"proxy.py itself slept {census.sleeps} on a record with no "
             f"handover -- a wait loop ran when nothing was coming"
+        )
+        assert keychain_probe_ran, (
+            "the discriminating control never ran -- `census.sleeps == []` "
+            "then proves nothing about scoping, only that this probe was "
+            "skipped"
         )
 
     # -- harness -----------------------------------------------------------
