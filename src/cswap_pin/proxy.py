@@ -10109,8 +10109,12 @@ class PortHolder:
         # The FIRST spawn happens here, not in the thread: `start()` returning
         # has to mean a daemon exists, or a caller that immediately reads
         # `daemon_pid` (or asks the port for a health probe) races the
-        # supervisor's first loop iteration.
-        self._spawn()
+        # supervisor's first loop iteration. `_spawn_retrying`, not `_spawn`,
+        # because `_standby_revive`'s promotion calls THIS method on the
+        # socket it is already holding — see that method's docstring — and a
+        # `Popen` failure here used to escape uncaught, killing the standby
+        # process that was the last thing covering the port.
+        self._spawn_retrying()
         # AFTER the daemon, so a machine that cannot start one at all does not
         # also leave a standby behind waiting for a holder that never worked.
         self._spawn_standby()
@@ -10272,6 +10276,41 @@ class PortHolder:
                 log.close()
         self.daemon_pid = proc.pid
         self._proc = proc
+
+    def _spawn_retrying(self) -> None:
+        """`_spawn`, but a `Popen` failure retries on our own backoff instead
+        of climbing out of the caller uncaught.
+
+        UNCAUGHT, THIS COST THE SOCKET. `OSError` (fork EAGAIN/EMFILE, or the
+        interpreter itself unrunnable) and `ValueError` (`Popen(pass_fds=
+        (-1,))` on our own closed socket, see `_on_replace_request`) both come
+        out of `subprocess.Popen` inside `_spawn`. From `start()` — used both
+        for a cold start and, via `_standby_revive`'s promotion, to put a
+        holder back on a socket a dying standby is the last thing covering —
+        an uncaught raise there killed the caller before a supervisor thread
+        ever existed to try again. From `_supervise`'s own respawns, its
+        `while` loop only re-enters through `proc.wait()` on the SAME
+        already-dead `Popen`, which returns at once forever — a bare retry
+        loop there would spin, not recover. The backoff (a LOCAL count, not
+        `self._failures`, which paces the unrelated crash-loop degrade path)
+        is what stops both.
+        """
+        attempt = 0
+        while True:
+            try:
+                self._spawn()
+                return
+            except (OSError, ValueError) as exc:
+                _log_lifecycle(
+                    f"could not spawn a successor on port {self.port}: "
+                    f"{exc!r} — retrying"
+                )
+                if self._stop:
+                    return
+                attempt += 1
+                time.sleep(self._backoff(attempt))
+                if self._stop:
+                    return
 
     def _spawn_standby(self) -> None:
         """Place a third process on this descriptor that does nothing with it.
@@ -10548,7 +10587,7 @@ class PortHolder:
                             f"{self.port}"
                         )
                         self._failures = 0
-                        self._spawn()
+                        self._spawn_retrying()
                         continue
                     _log_lifecycle(
                         f"daemon {self.daemon_pid} exited cleanly — releasing port "
@@ -10575,7 +10614,7 @@ class PortHolder:
                         f"restarting on the held port {self.port}"
                     )
                     self._failures = 0
-                    self._spawn()
+                    self._spawn_retrying()
                     continue
                 if not self._self_heal_on():
                     # SAY WHAT HAPPENS, which is not what this used to claim. The
@@ -10622,7 +10661,7 @@ class PortHolder:
                 time.sleep(self._backoff(self._failures))
                 if self._stop:
                     return
-                self._spawn()
+                self._spawn_retrying()
 
     def stop(self) -> None:
         """Let go of the port: the DAEMON dies first, then the socket closes.
