@@ -9916,11 +9916,12 @@ class PortHolder:
         self._account = account_num
         self._email = email
         self._standby = None
-        # Set by `_on_replace_request` so `_supervise` can tell a HANDOVER exit
-        # (successor already serving on our socket) from a RELEASE exit
-        # (nothing left to serve). Both are exit 0 from the daemon's side, and
-        # acting on the wrong one closes the port under a live successor.
-        self._replacing = False
+        # SHARED WITH `_on_replace_request`. Its own spawn of a successor and
+        # `_supervise`'s post-wait decision (does this exit mean HANDOVER or
+        # RELEASE?) both read/write `self._proc`, and an in-flight spawn can
+        # still be running its `Popen` when the predecessor's own exit is
+        # observed — see both methods' docstrings for the race this closes.
+        self._replace_lock = threading.RLock()
         # Whether `_install_replace_handler` succeeded. Only then may `_spawn`
         # tell a child this holder can be asked — see `_HOLDER_REPLACE_ENV`.
         self._replace_channel = False
@@ -10318,189 +10319,203 @@ class PortHolder:
             pass
 
     def _on_replace_request(self, signum, frame) -> None:
-        # SPAWN FIRST, FLAG SECOND is not optional. `_supervise` is blocked in
-        # `wait()` on the predecessor; the moment that returns it reads
-        # `_replacing` to decide whether an exit 0 means "handover" or "release
-        # the port". Setting the flag before the successor exists would make a
-        # failed spawn look like a completed handover, and the holder would
-        # close the socket with nothing on it.
-        self._spawn()
-        self._replacing = True
+        # THE SAME LOCK `_supervise` TAKES BEFORE ITS OWN DECISION. `_spawn()`
+        # reassigns `self._proc` to the successor as its very last line — an
+        # "unbounded" `Popen` that can still be running when the predecessor
+        # (asked to exit separately, across a process boundary) has already
+        # returned from `wait()`. Holding this lock for the whole call means
+        # `_supervise`'s post-wait read of `self._proc` runs only before this
+        # spawn starts or after it has fully landed, never astride it — see
+        # `_supervise`'s own comment for the outage that gap used to allow.
+        # A spawn that raises leaves `self._proc` exactly as it was, which is
+        # already the correct "not a handover" answer — no separate flag
+        # needed.
+        with self._replace_lock:
+            self._spawn()
 
     def _supervise(self) -> None:
         while not self._stop:
             # CAPTURED BEFORE THE WAIT, so it still names the PREDECESSOR
             # after `wait()` returns, whatever `self._proc` has become by
-            # then. `_on_replace_request` reassigns `self._proc` to the
-            # successor as `_spawn()`'s very last line, and only THEN sets
-            # `self._replacing = True` — two statements, not one, and the
-            # predecessor's own exit is asked for across a process boundary
-            # (`os.kill`, a 0.25s settle, a drain that can be instant with
-            # nothing inflight). Nothing orders that exit after the SECOND
-            # statement, only after the first, so `self._replacing` alone
-            # can still read False here on a genuine handover — and reading
-            # it that way calls `stop()` on the successor's own socket.
+            # then.
             proc = self._proc
             code = proc.wait()
             if self._stop:
                 return
-            # A HANDOVER, NOT A RELEASE. The predecessor asked us to replace it
-            # while it was still serving, we did, and it then drained and left
-            # with 0. That 0 means "released — do not restart" everywhere else,
-            # and acting on it here would close the listening socket the
-            # successor is already accepting on. `self._proc is not proc` is
-            # independent proof of the same thing, and closes the race above:
-            # `_spawn()` reassigns it before `self._replacing` is ever set.
-            if self._replacing or self._proc is not proc:
-                self._replacing = False
-                _log_lifecycle(
-                    f"daemon {code} retired after handing over — successor "
-                    f"already serving on port {self.port}"
-                )
-                continue
-            # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
-            # this loop already wakes on every daemon exit, so it costs a
-            # `poll()` and no timer. Reaping is the load-bearing half: an
-            # unreaped child stays `<defunct>` in the process table forever,
-            # and `ps`, `kill -0` and every check that asks the TABLE rather
-            # than the STATE then report a standby that is not there.
-            self._reap_standby()
-            # A CLEAN EXIT IS A DECISION, NOT A FAILURE. The pin tears itself
-            # down when the last refcount holder closes the FIFO — that is the
-            # whole idle-teardown design. Restarting it would make the port
-            # this class holds immortal too, and the daemon would respawn
-            # forever with nobody to serve.
-            #
-            # Exit status is the only thing that separates them: 0 means the
-            # daemon chose to go (teardown, SIGTERM handler), anything else
-            # means it was killed or crashed.
-            if code == 0:
-                # AUTO-HEAL WITH NO ONE AT A KEYBOARD. This holder is the
-                # LAST pin process alive when its daemon exits cleanly, and a
-                # clean exit is not always the owner clearing the pin -- an
-                # idle-teardown that should not have fired is also code 0.
-                # `load_pin`, read fresh immediately before the spawn (never
-                # cached: the owner may clear it in this same window), is the
-                # one witness a holder with no human nearby can still ask.
-                # Still pinned -> respawn on the held port ourselves, same as
-                # a redeploy; nothing pinned -> release, exactly as today.
-                # ``getattr``: a test double built without ``__init__`` has
-                # no ``_certdir``; that is "cannot tell" and falls to the
-                # release path below, same as every real holder without one.
-                #
-                # THREE MORE GUARDS, ALL ON THE SAME RELEASE PATH.
-                # `self._self_heal_on()`: the switch means "do not act on
-                # your own", and this respawn is exactly that, same as the
-                # non-zero-exit branch below.
-                # `_standby_port_still_wanted`: a redeploy or a re-pin may
-                # already have moved the pin to a DIFFERENT held port, and
-                # respawning here too would leave two lineages superseding
-                # each other on two ports forever.
-                # `load_pin` CAN RAISE (a host gone missing, an ImportError a
-                # deploy left behind) -- and this loop runs in a daemon
-                # thread, so an escaping exception does not fail loudly, it
-                # ends the THREAD only: `_stop` is never set and `self._srv`
-                # is never closed, so `getppid() == born_of` still reads
-                # "holder alive" to the standby forever, port held, nothing
-                # supervising it. `stop()` is the same release a genuinely
-                # unpinned clean exit takes.
-                certdir = getattr(self, "_certdir", None)
-                try:
-                    pinned = bool(
-                        certdir is not None
-                        and self._self_heal_on()
-                        and _standby_port_still_wanted(certdir, self.port)
-                        and load_pin(certdir.parent)
+            # THE SAME LOCK `_on_replace_request` HOLDS ACROSS ITS OWN SPAWN.
+            # That method reassigns `self._proc` to the successor as
+            # `_spawn()`'s very last line, and the predecessor's own exit is
+            # asked for across a process boundary (an external `os.kill`, a
+            # 0.25s settle, a drain that can be instant with nothing
+            # inflight) — nothing orders that exit after `_spawn()` returns,
+            # so `wait()` above can return while a replace is still inside an
+            # "unbounded" `Popen`. Taking the same lock here means this
+            # WHOLE decision — the identity check AND whichever of
+            # stop()/respawn it leads to — runs only before that spawn
+            # starts or after it has fully landed, never astride it. Astride
+            # it is exactly what let a still-assigning `_spawn()` be read as
+            # a plain release, and then let `stop()` — which reads
+            # `self._proc` a SECOND time, later — terminate the successor
+            # that had finished being assigned by then.
+            with self._replace_lock:
+                # A HANDOVER, NOT A RELEASE. The predecessor asked us to
+                # replace it while it was still serving, we did, and it then
+                # drained and left with 0. That 0 means "released — do not
+                # restart" everywhere else, and acting on it here would close
+                # the listening socket the successor is already accepting
+                # on. `self._proc is not proc` is the only proof needed: only
+                # a successor's own `_spawn()` call — never a bare wait()
+                # return — can move `self._proc` away from what this
+                # iteration captured.
+                if self._proc is not proc:
+                    _log_lifecycle(
+                        f"daemon {code} retired after handing over — successor "
+                        f"already serving on port {self.port}"
                     )
-                except Exception as exc:  # noqa: BLE001 — see above
+                    continue
+                # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
+                # this loop already wakes on every daemon exit, so it costs a
+                # `poll()` and no timer. Reaping is the load-bearing half: an
+                # unreaped child stays `<defunct>` in the process table forever,
+                # and `ps`, `kill -0` and every check that asks the TABLE rather
+                # than the STATE then report a standby that is not there.
+                self._reap_standby()
+                # A CLEAN EXIT IS A DECISION, NOT A FAILURE. The pin tears itself
+                # down when the last refcount holder closes the FIFO — that is the
+                # whole idle-teardown design. Restarting it would make the port
+                # this class holds immortal too, and the daemon would respawn
+                # forever with nobody to serve.
+                #
+                # Exit status is the only thing that separates them: 0 means the
+                # daemon chose to go (teardown, SIGTERM handler), anything else
+                # means it was killed or crashed.
+                if code == 0:
+                    # AUTO-HEAL WITH NO ONE AT A KEYBOARD. This holder is the
+                    # LAST pin process alive when its daemon exits cleanly, and a
+                    # clean exit is not always the owner clearing the pin -- an
+                    # idle-teardown that should not have fired is also code 0.
+                    # `load_pin`, read fresh immediately before the spawn (never
+                    # cached: the owner may clear it in this same window), is the
+                    # one witness a holder with no human nearby can still ask.
+                    # Still pinned -> respawn on the held port ourselves, same as
+                    # a redeploy; nothing pinned -> release, exactly as today.
+                    # ``getattr``: a test double built without ``__init__`` has
+                    # no ``_certdir``; that is "cannot tell" and falls to the
+                    # release path below, same as every real holder without one.
+                    #
+                    # THREE MORE GUARDS, ALL ON THE SAME RELEASE PATH.
+                    # `self._self_heal_on()`: the switch means "do not act on
+                    # your own", and this respawn is exactly that, same as the
+                    # non-zero-exit branch below.
+                    # `_standby_port_still_wanted`: a redeploy or a re-pin may
+                    # already have moved the pin to a DIFFERENT held port, and
+                    # respawning here too would leave two lineages superseding
+                    # each other on two ports forever.
+                    # `load_pin` CAN RAISE (a host gone missing, an ImportError a
+                    # deploy left behind) -- and this loop runs in a daemon
+                    # thread, so an escaping exception does not fail loudly, it
+                    # ends the THREAD only: `_stop` is never set and `self._srv`
+                    # is never closed, so `getppid() == born_of` still reads
+                    # "holder alive" to the standby forever, port held, nothing
+                    # supervising it. `stop()` is the same release a genuinely
+                    # unpinned clean exit takes.
+                    certdir = getattr(self, "_certdir", None)
+                    try:
+                        pinned = bool(
+                            certdir is not None
+                            and self._self_heal_on()
+                            and _standby_port_still_wanted(certdir, self.port)
+                            and load_pin(certdir.parent)
+                        )
+                    except Exception as exc:  # noqa: BLE001 — see above
+                        _log_lifecycle(
+                            f"could not tell whether the pin is still set "
+                            f"({exc!r}) — releasing port {self.port} rather than "
+                            f"leaving the standby thinking a dead supervisor is "
+                            f"still watching it")
+                        pinned = False
+                    if pinned:
+                        _log_lifecycle(
+                            f"daemon {self.daemon_pid} exited cleanly but the pin "
+                            f"is still set — respawning on the held port "
+                            f"{self.port}"
+                        )
+                        self._failures = 0
+                        self._spawn()
+                        continue
                     _log_lifecycle(
-                        f"could not tell whether the pin is still set "
-                        f"({exc!r}) — releasing port {self.port} rather than "
-                        f"leaving the standby thinking a dead supervisor is "
-                        f"still watching it")
-                    pinned = False
-                if pinned:
-                    _log_lifecycle(
-                        f"daemon {self.daemon_pid} exited cleanly but the pin "
-                        f"is still set — respawning on the held port "
+                        f"daemon {self.daemon_pid} exited cleanly — releasing port "
                         f"{self.port}"
+                    )
+                    # `stop()`, NOT A BARE CLOSE. Closing only our own listener
+                    # left the standby holding its OWN dup of the same descriptor,
+                    # un-signalled — still LISTENing, still completing handshakes
+                    # into a backlog nobody ever drains. Measured: port 36301
+                    # accepted connects and answered nothing for 13 minutes after
+                    # exactly this exit, until a human ran `cswap pin --heal`.
+                    # `stop()` SIGHUPs the standby and confirms it gone before
+                    # closing our own socket (see its own docstring for why that
+                    # order matters), so a session that dials afterwards gets
+                    # ConnectionRefused at once instead of queueing forever.
+                    self.stop()
+                    return
+                if code == _RESTART_ME_CODE:
+                    # A REDEPLOY, not a teardown. Respawn at once and skip the
+                    # backoff: this exit was asked for, so treating it as a failure
+                    # would make every update wait out a ladder rung.
+                    _log_lifecycle(
+                        f"daemon {self.daemon_pid} asked for a successor — "
+                        f"restarting on the held port {self.port}"
                     )
                     self._failures = 0
                     self._spawn()
                     continue
+                if not self._self_heal_on():
+                    # SAY WHAT HAPPENS, which is not what this used to claim. The
+                    # old line promised "the port stays bound but nothing is
+                    # serving it". A human who set this switch to debug a daemon
+                    # read "stays bound" and would expect their live sessions to
+                    # hang rather than be refused; they are refused, immediately,
+                    # all of them. The switch is still doing what it was built for
+                    # — its own rationale is that a respawner fighting a human is
+                    # "worse than a dead port", which accepts this cost out loud.
+                    # Only the line describing it was wrong, and a wrong line in
+                    # the one place a debugging session looks is worse than no
+                    # line.
+                    _log_lifecycle(
+                        f"daemon {self.daemon_pid} exited and {_SELF_HEAL_ENV}=off — "
+                        f"NOT respawning, and this holder is exiting with it, so "
+                        f"port {self.port} stops answering. Every session wired to "
+                        f"it gets ConnectionRefused until a pin is started again."
+                    )
+                    return
+                self._failures += 1
                 _log_lifecycle(
-                    f"daemon {self.daemon_pid} exited cleanly — releasing port "
-                    f"{self.port}"
+                    f"daemon {self.daemon_pid} exited (code {code}); restarting "
+                    f"under the held port {self.port}"
                 )
-                # `stop()`, NOT A BARE CLOSE. Closing only our own listener
-                # left the standby holding its OWN dup of the same descriptor,
-                # un-signalled — still LISTENing, still completing handshakes
-                # into a backlog nobody ever drains. Measured: port 36301
-                # accepted connects and answered nothing for 13 minutes after
-                # exactly this exit, until a human ran `cswap pin --heal`.
-                # `stop()` SIGHUPs the standby and confirms it gone before
-                # closing our own socket (see its own docstring for why that
-                # order matters), so a session that dials afterwards gets
-                # ConnectionRefused at once instead of queueing forever.
-                self.stop()
-                return
-            if code == _RESTART_ME_CODE:
-                # A REDEPLOY, not a teardown. Respawn at once and skip the
-                # backoff: this exit was asked for, so treating it as a failure
-                # would make every update wait out a ladder rung.
-                _log_lifecycle(
-                    f"daemon {self.daemon_pid} asked for a successor — "
-                    f"restarting on the held port {self.port}"
-                )
-                self._failures = 0
+                # SAY IT ONCE when the successor is not merely crashing but cannot
+                # start at all — see `_HOLD_RESTART_REPORT_AT`. Exactly at the
+                # threshold, so a machine that keeps failing does not turn the log
+                # into one warning per rung forever.
+                if self._failures == _HOLD_RESTART_REPORT_AT:
+                    _log_lifecycle(
+                        f"the successor cannot start — {self._failures} spawns in "
+                        f"a row died immediately. Still retrying, but the port is "
+                        f"one holder death away from being unrecoverable. The "
+                        f"daemon's own stderr is above in this file."
+                    )
+                if self._failures >= _HOLD_DEGRADE_AT:
+                    # STOP WAITING FOR A SUCCESSOR THAT IS NOT COMING. Retrying
+                    # past here is not patience, it is an outage held open: the
+                    # socket stays bound and unaccepted, so every wired session
+                    # hangs rather than failing over. See `degrade_now`.
+                    self.degrade_now()
+                    return
+                time.sleep(self._backoff(self._failures))
+                if self._stop:
+                    return
                 self._spawn()
-                continue
-            if not self._self_heal_on():
-                # SAY WHAT HAPPENS, which is not what this used to claim. The
-                # old line promised "the port stays bound but nothing is
-                # serving it". A human who set this switch to debug a daemon
-                # read "stays bound" and would expect their live sessions to
-                # hang rather than be refused; they are refused, immediately,
-                # all of them. The switch is still doing what it was built for
-                # — its own rationale is that a respawner fighting a human is
-                # "worse than a dead port", which accepts this cost out loud.
-                # Only the line describing it was wrong, and a wrong line in
-                # the one place a debugging session looks is worse than no
-                # line.
-                _log_lifecycle(
-                    f"daemon {self.daemon_pid} exited and {_SELF_HEAL_ENV}=off — "
-                    f"NOT respawning, and this holder is exiting with it, so "
-                    f"port {self.port} stops answering. Every session wired to "
-                    f"it gets ConnectionRefused until a pin is started again."
-                )
-                return
-            self._failures += 1
-            _log_lifecycle(
-                f"daemon {self.daemon_pid} exited (code {code}); restarting "
-                f"under the held port {self.port}"
-            )
-            # SAY IT ONCE when the successor is not merely crashing but cannot
-            # start at all — see `_HOLD_RESTART_REPORT_AT`. Exactly at the
-            # threshold, so a machine that keeps failing does not turn the log
-            # into one warning per rung forever.
-            if self._failures == _HOLD_RESTART_REPORT_AT:
-                _log_lifecycle(
-                    f"the successor cannot start — {self._failures} spawns in "
-                    f"a row died immediately. Still retrying, but the port is "
-                    f"one holder death away from being unrecoverable. The "
-                    f"daemon's own stderr is above in this file."
-                )
-            if self._failures >= _HOLD_DEGRADE_AT:
-                # STOP WAITING FOR A SUCCESSOR THAT IS NOT COMING. Retrying
-                # past here is not patience, it is an outage held open: the
-                # socket stays bound and unaccepted, so every wired session
-                # hangs rather than failing over. See `degrade_now`.
-                self.degrade_now()
-                return
-            time.sleep(self._backoff(self._failures))
-            if self._stop:
-                return
-            self._spawn()
 
     def stop(self) -> None:
         """Let go of the port: the DAEMON dies first, then the socket closes.
