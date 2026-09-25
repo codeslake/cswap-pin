@@ -12365,9 +12365,9 @@ print("OK", port)
         # `Skipped` (a `BaseException`, so `except Exception` alone still
         # would not) and records it per case instead of ending the loop, so
         # a skip here would no longer take its siblings down either. Kept as
-        # a plain return anyway, belt-and-braces, so this case reads neither
-        # SKIPPED nor FAILED on whatever host lacks tgkill (every macOS CI
-        # runner).
+        # a plain return anyway: it reads PASSED on whatever host lacks
+        # tgkill (every macOS CI runner), instead of the SKIPPED a
+        # `pytest.skip` there would report.
         if sys.platform != "linux":
             return
 
@@ -12436,16 +12436,18 @@ print("OK", port)
 
         monkeypatch.setattr(sys, "platform", "darwin")
         # Must return cleanly. A `pytest.skip` here would raise `Skipped`
-        # right through this call -- caught here, or it escapes uncaught
-        # same as it would from `run_cases` itself, and this case reports
-        # SKIPPED instead of the FAILED a regression must produce.
+        # right through this call, caught below. Since #49 `run_cases`
+        # itself no longer lets a `Skipped` escape -- it records it per case
+        # and moves on -- so without this direct call and catch, a
+        # regression that turned this branch's `return` into a
+        # `pytest.skip` would just have that case read SKIPPED, not FAILED.
         try:
             self.case_a_term_is_never_dropped_by_a_parked_main_thread(tmp_path)
         except BaseException as exc:
             raise AssertionError(
                 f"the non-Linux branch raised {type(exc).__name__} instead "
                 f"of returning cleanly -- a pytest.skip regression here "
-                f"escapes run_cases entirely: {exc}"
+                f"would read SKIPPED instead of FAILED via run_cases: {exc}"
             ) from exc
 
     def case_a_connection_is_counted_before_its_thread_runs(self, tmp_path):
@@ -18201,10 +18203,11 @@ class TestArmingReportsWhoItCutsOff:
                 # catches `Skipped` (a `BaseException`, so `except Exception`
                 # alone still would not) and records it per case instead of
                 # ending the loop, so a skip here would no longer take its
-                # siblings down either. Kept as a plain return anyway,
-                # belt-and-braces, on a host with no /proc/net/tcp (both
-                # Macs). See
-                # `case_the_unmeasurable_branch_never_raises_skipped` below.
+                # siblings down either. Kept as a plain return anyway: it
+                # reads PASSED on a host with no /proc/net/tcp (both Macs),
+                # instead of the SKIPPED a `pytest.skip` there would report.
+                # See `case_the_unmeasurable_branch_never_raises_skipped`
+                # below.
                 return
             assert n_idle == 0, "counted a client before anyone connected"
             c = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -18239,8 +18242,8 @@ class TestArmingReportsWhoItCutsOff:
             raise AssertionError(
                 f"the unmeasurable-platform branch raised "
                 f"{type(exc).__name__} instead of returning cleanly -- a "
-                f"pytest.skip regression here escapes run_cases entirely: "
-                f"{exc}"
+                f"pytest.skip regression here would read SKIPPED instead of "
+                f"FAILED via run_cases: {exc}"
             ) from exc
 
 
@@ -18285,10 +18288,11 @@ class TestClearingThePinDoesNotStrandLiveSessions:
                 # catches `Skipped` (a `BaseException`, so `except Exception`
                 # alone still would not) and records it per case instead of
                 # ending the loop, so a skip here would no longer take its
-                # siblings down either. Kept as a plain return anyway,
-                # belt-and-braces, on a host with no /proc/net/tcp (both
-                # Macs). See
-                # `case_the_unmeasurable_branch_never_raises_skipped` below.
+                # siblings down either. Kept as a plain return anyway: it
+                # reads PASSED on a host with no /proc/net/tcp (both Macs),
+                # instead of the SKIPPED a `pytest.skip` there would report.
+                # See `case_the_unmeasurable_branch_never_raises_skipped`
+                # below.
                 return
             assert pin_proxy._is_claimed(certdir) is False, (
                 "an idle unwired daemon should still time out"
@@ -18363,8 +18367,8 @@ class TestClearingThePinDoesNotStrandLiveSessions:
             raise AssertionError(
                 f"the unmeasurable-platform branch raised "
                 f"{type(exc).__name__} instead of returning cleanly -- a "
-                f"pytest.skip regression here escapes run_cases entirely: "
-                f"{exc}"
+                f"pytest.skip regression here would read SKIPPED instead of "
+                f"FAILED via run_cases: {exc}"
             ) from exc
 
     def case_a_missing_record_with_an_open_channel_is_republished(
@@ -19564,15 +19568,14 @@ class TestAWedgeIsNotTrustedForever:
             "to avoid")
 
     def _wedge_replaced_through_the_holder(
-            self, tmp_path, monkeypatch, *,
-            holder_ask_confirmed, term_raises_esrch):
+            self, tmp_path, monkeypatch, *, term_raises_esrch):
         """Shared setup for a wedge on a MATCHING fingerprint, replaced
-        through its holder: ``holder_ask_confirmed`` gates
-        `_wedged_daemon_can_be_asked`, and ``term_raises_esrch`` picks the
-        `(stale_pid, 15)` arm of `_fake_kill` -- a delivered TERM or one that
-        hits ESRCH because the predecessor was already gone. Returns
-        `heal`'s own result; the caller keeps its own docstring and final
-        assertion."""
+        through its holder: the holder always confirms the successor
+        (`_wedged_daemon_can_be_asked` stubbed True), and
+        ``term_raises_esrch`` picks the `(stale_pid, 15)` arm of `_fake_kill`
+        -- a delivered TERM or one that hits ESRCH because the predecessor
+        was already gone. Returns `heal`'s own result; the caller keeps its
+        own docstring and final assertion."""
         import signal
 
         from cswap_pin import proxy
@@ -19606,7 +19609,7 @@ class TestAWedgeIsNotTrustedForever:
             proxy, "_wedged_parent_holder",
             lambda pid, cd: holder_pid if pid == stale_pid else None)
         monkeypatch.setattr(proxy, "_wedged_daemon_can_be_asked",
-                            lambda pid, hp: holder_ask_confirmed)
+                            lambda pid, hp: True)
         monkeypatch.setattr(proxy, "_pid_alive", lambda pid: pid != stale_pid)
 
         def _fake_kill(pid, sig):
@@ -19645,8 +19648,7 @@ class TestAWedgeIsNotTrustedForever:
         this call killed the wedge and confirmed the holder's successor,
         which IS the repair, not a bystander's."""
         result = self._wedge_replaced_through_the_holder(
-            tmp_path, monkeypatch,
-            holder_ask_confirmed=True, term_raises_esrch=False)
+            tmp_path, monkeypatch, term_raises_esrch=False)
         assert result is True, (
             "heal replaced the wedge through its holder but reported "
             "'Nothing to heal'")
@@ -19664,8 +19666,7 @@ class TestAWedgeIsNotTrustedForever:
         appear, and reporting 'Nothing to heal' for a repair just confirmed
         sends someone chasing a repair that already happened."""
         result = self._wedge_replaced_through_the_holder(
-            tmp_path, monkeypatch,
-            holder_ask_confirmed=True, term_raises_esrch=True)
+            tmp_path, monkeypatch, term_raises_esrch=True)
         assert result is True, (
             "a confirmed successor was reported as 'Nothing to heal' "
             "because the TERM to the already-gone predecessor hit ESRCH"
@@ -25636,7 +25637,8 @@ class TestAHolderDoesNotOutliveItsLauncher:
         # `Skipped` (a `BaseException`, so `except Exception` alone still
         # would not) and records it per case instead of ending the loop, so
         # a skip here would no longer take its siblings down either. Kept as
-        # a plain return anyway, belt-and-braces, on every macOS CI runner.
+        # a plain return anyway: it reads PASSED on every macOS CI runner,
+        # instead of the SKIPPED a `pytest.skip` there would report.
         # See `case_the_non_linux_early_exit_never_raises_skipped` below.
         if sys.platform != "linux":
             return
@@ -25735,7 +25737,7 @@ class TestAHolderDoesNotOutliveItsLauncher:
             raise AssertionError(
                 f"the non-Linux branch raised {type(exc).__name__} instead "
                 f"of returning cleanly -- a pytest.skip regression here "
-                f"escapes run_cases entirely: {exc}"
+                f"would read SKIPPED instead of FAILED via run_cases: {exc}"
             ) from exc
 
 

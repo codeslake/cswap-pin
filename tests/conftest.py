@@ -886,7 +886,10 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             # so a plain `except Exception` never caught it either: a case
             # that calls `pytest.fail()` directly ended the loop right here,
             # the same way a `pytest.skip()` used to. Named in the tuple
-            # explicitly and collected, do not stop the run.
+            # explicitly and collected, do not stop the run. `pytest.fail.
+            # Exception` (`Failed`) also catches `XFailed`, which subclasses
+            # it -- no case calls `pytest.xfail()` today, but one that did
+            # would be recorded here as a failure, not a skip.
             failures.append(f"--- {name} ---\n{traceback.format_exc()}")
         finally:
             mp.undo()
