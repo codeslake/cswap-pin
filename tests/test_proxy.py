@@ -8982,10 +8982,22 @@ class TestRefcount:
         cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "59999"}}))  # not us
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
+        # A MUTABLE CLAIM, not a fixed `lambda: 1` — see the 00:41:13Z case's
+        # own comment on this. The thread below is daemon=True and loops on
+        # its own past this assertion once claimed; with no claim left to
+        # drop it would keep ticking `_is_claimed` past THIS test's own
+        # monkeypatches (`paths.get_global_config_path` above), reading real
+        # host state — `~/.claude.json`, `/proc/net/tcp` — from a thread
+        # nothing is watching after `monkeypatch.undo()` restores them.
+        # Flipping this to 0 after the assertions lets the same loop tear
+        # itself down so the thread can be joined before the test returns.
         # A live Remote Control tunnel is the claim carrying this — the same
         # channel-only shape as the 00:41:13Z case, so `live_clients` alone
         # cannot be what keeps `_is_claimed` from ending the claim here.
-        monkeypatch.setattr(pin_proxy._PUMP, "live_pairs", lambda *a, **k: 1)
+        claim = {"channel": 1}
+        monkeypatch.setattr(
+            pin_proxy._PUMP, "live_pairs", lambda *a, **k: claim["channel"]
+        )
 
         republished = []
 
@@ -8996,26 +9008,37 @@ class TestRefcount:
         holder = os.open(fifo, os.O_RDWR)  # a wrapper-launched session attaches
         reached = _watch_blocking_phase(monkeypatch)  # as above
         fired = threading.Event()
-        threading.Thread(
+        thread = threading.Thread(
             target=watch_refcount,
             args=(fifo, fired.set),
             kwargs={"live_clients": lambda: 0, "republish": _republish},
             daemon=True,
-        ).start()
-        assert reached.wait(timeout=5.0), "watcher never reached the blocking read"
-        os.close(holder)  # the last FIFO holder leaves, with the record missing
-        assert not fired.wait(timeout=0.3), (
-            "watch_refcount tore the daemon down on the EOF re-check even "
-            "though a channel was still live"
         )
-        assert republished == [1], (
-            "the EOF-recheck door never called republish — only the "
-            "first-holder-timeout door (00:41:13Z case) is covered"
-        )
-        assert pin_proxy.read_daemon_state(certdir) == {
-            "port": 40404, "pid": os.getpid(),
-            "fingerprint": daemon_fingerprint(),
-        }, "republish ran but did not actually restore the record"
+        thread.start()
+        try:
+            assert reached.wait(timeout=5.0), (
+                "watcher never reached the blocking read"
+            )
+            os.close(holder)  # the last FIFO holder leaves, with the record missing
+            assert not fired.wait(timeout=0.3), (
+                "watch_refcount tore the daemon down on the EOF re-check even "
+                "though a channel was still live"
+            )
+            assert republished == [1], (
+                "the EOF-recheck door never called republish — only the "
+                "first-holder-timeout door (00:41:13Z case) is covered"
+            )
+            assert pin_proxy.read_daemon_state(certdir) == {
+                "port": 40404, "pid": os.getpid(),
+                "fingerprint": daemon_fingerprint(),
+            }, "republish ran but did not actually restore the record"
+        finally:
+            # STOP THE THREAD before the test returns — see `claim` above.
+            claim["channel"] = 0
+            assert fired.wait(timeout=3.0), (
+                "watch_refcount thread never stopped during test cleanup"
+            )
+            thread.join(timeout=3.0)
 
 
 # The badge is rendered by `claude_swap.tui.autoview`, and the version that
@@ -12790,6 +12813,7 @@ print("OK", port)
         main thread spawned successfully and the predecessor stayed alive.
         """
         import signal
+        import threading
 
         from cswap_pin import proxy as pin_proxy
 
@@ -12803,12 +12827,13 @@ print("OK", port)
 
         class _Holder(pin_proxy.PortHolder):
             def __init__(self):            # no socket, no child: only the protocol
-                self._replacing = False
+                self._proc = "predecessor"
+                self._replace_lock = threading.RLock()
                 self._spawn_calls = spawned
 
             def _spawn(self):
                 spawned.append("spawn")
-                self._replacing = True
+                self._proc = "successor"
 
         # CALL THE HANDLER, DO NOT RAISE THE SIGNAL. Sending SIGUSR1 to this
         # process killed the xdist worker outright: `_install_replace_handler`
@@ -12821,29 +12846,28 @@ print("OK", port)
         # here: with `_supervise` blocked in `Popen.wait()` on a worker thread,
         # a main-thread SIGUSR1 handler spawned successfully and the
         # predecessor stayed alive. What THIS case owns is the protocol —
-        # handler spawns, then records that the next exit 0 is a handover.
+        # handler spawns, and that reassigns `self._proc`.
         h = _Holder()
         h._on_replace_request(signal.SIGUSR1, None)
         assert spawned == ["spawn"], (
             "SIGUSR1 to the holder did not start a successor, so the daemon "
             "still has to exit before one can exist"
         )
-        assert h._replacing is True, (
-            "the holder spawned a successor without recording that the next "
-            "exit 0 is a HANDOVER — it will read it as 'release the port' and "
-            "close the socket out from under the successor"
+        assert h._proc == "successor", (
+            "the holder spawned a successor without reassigning `self._proc` "
+            "to it — `_supervise` reads that identity change to tell a "
+            "HANDOVER exit from a RELEASE, and will read this one as "
+            "'release the port' and close the socket out from under the "
+            "successor"
         )
 
-        # AND THE ORDER IS PART OF THE CONTRACT, not a stylistic preference.
-        # Written as a comment first and NOT guarded — mutation-checked by
-        # swapping the two lines, and every case still passed. A claim about
-        # ordering that nothing can falsify is the kind the next refactor
-        # deletes, so it gets its own failing input: a spawn that raises must
-        # leave the flag alone, because `_supervise` reads it to decide whether
-        # an exit 0 is a handover or a release.
+        # A SPAWN THAT RAISES MUST LEAVE `self._proc` ALONE, because
+        # `_supervise` reads its identity to decide whether an exit 0 is a
+        # handover or a release, and a failed spawn is neither.
         class _FailingHolder(pin_proxy.PortHolder):
             def __init__(self):
-                self._replacing = False
+                self._proc = "predecessor"
+                self._replace_lock = threading.RLock()
 
             def _spawn(self):
                 raise OSError("no successor today")
@@ -12853,10 +12877,11 @@ print("OK", port)
             f._on_replace_request(signal.SIGUSR1, None)
         except OSError:
             pass
-        assert f._replacing is False, (
-            "a spawn that failed still marked the handover done; the next "
-            "exit 0 would then be read as 'successor is serving' when nothing "
-            "is, and the supervisor skips the respawn that would have saved it"
+        assert f._proc == "predecessor", (
+            "a spawn that failed still reassigned `self._proc` — the next "
+            "exit 0 would then be read as 'successor is serving' when "
+            "nothing is, and the supervisor skips the respawn that would "
+            "have saved it"
         )
 
         # THE LOAD-BEARING HALF, and it was unguarded until a mutation said so.
@@ -12864,7 +12889,7 @@ print("OK", port)
         # green — so the one line that stops the holder closing its socket out
         # from under a live successor had no test at all. An exit 0 means
         # "released, do not restart" everywhere else in this class; only
-        # `_replacing` separates it from "I handed over and left".
+        # `self._proc is not proc` separates it from "I handed over and left".
         closed = []
 
         class _Sock:
@@ -12879,10 +12904,11 @@ print("OK", port)
                 return self._code
 
         class _Handover(pin_proxy.PortHolder):
-            def __init__(self, replacing):
+            def __init__(self, handed_over):
                 self._stop = False
-                self._replacing = replacing
+                self._replace_lock = threading.RLock()
                 self._proc = _Proc(0)
+                self._handed_over = handed_over
                 self._srv = _Sock()
                 self.port = 36301
                 self.daemon_pid = 4242
@@ -12903,18 +12929,26 @@ print("OK", port)
         # the case passed with the branch deleted. Caught by re-applying the
         # mutation and running SERIALLY: the parallel run had crashed a worker
         # for an unrelated reason, which reads exactly like a caught mutation.
+        #
+        # THE SWAP, not a flag. A real successor's own `_spawn()` reassigns
+        # `self._proc` as its last line — done here, on round 1, from INSIDE
+        # the predecessor's own `wait()`, the one place `_supervise` has to
+        # catch it.
         def _twice(holder):
             holder._rounds += 1
+            if holder._handed_over and holder._rounds == 1:
+                holder._proc = _Proc(0)
+                holder._proc.wait = lambda: _twice(holder)
             if holder._rounds > 1:
                 holder._stop = True
             return 0
 
-        h_over = _Handover(replacing=True)
+        h_over = _Handover(handed_over=True)
         h_over._proc.wait = lambda: _twice(h_over)
         h_over._supervise()
         assert h_over._rounds >= 2, (
             "premise: the loop must have gone round at least once WITH the "
-            "handover flag set, or this case tests nothing"
+            "successor already assigned, or this case tests nothing"
         )
         assert closed == [], (
             "the holder closed its listening socket on a HANDOVER exit — the "
@@ -12925,7 +12959,7 @@ print("OK", port)
         # CONTROL: the same exit 0 WITHOUT a handover must still release, or
         # the assertion above would pass on a holder that never closes at all.
         closed.clear()
-        h_rel = _Handover(replacing=False)
+        h_rel = _Handover(handed_over=False)
         h_rel._proc.wait = lambda: 0
         h_rel._supervise()
         assert closed == ["closed"], (
@@ -12933,25 +12967,26 @@ print("OK", port)
             "leave the address held forever"
         )
 
-    def case_a_handover_wins_the_race_even_when_the_flag_is_not_set_yet(
+    def case_a_handover_wins_the_race_even_without_the_lock_contending(
         self, tmp_path
     ):
-        """`_replacing` alone is TIMING, not proof. `_on_replace_request` runs
-        `self._spawn()` — which reassigns `self._proc` to the successor as
-        its very last line — and only THEN sets `self._replacing = True`. The
-        predecessor's own exit is asked for by a signal sent across process
-        boundaries (`os.kill`, then a 0.25s settle and a possibly-instant
-        drain), so nothing orders it after the SECOND of those two lines —
-        only after the first. A `self._proc.wait()` that returns between them
-        must still be read as a handover, or `_supervise` closes the
-        successor's socket out from under it (`self.stop()`) on exactly the
-        exit the flag was supposed to catch.
+        """Identity alone is the mechanism now — no flag to lose a race with.
+        `_on_replace_request` reassigns `self._proc` to the successor as
+        `_spawn()`'s very last line. A `self._proc.wait()` on the predecessor
+        that returns the instant that reassignment lands must still be read
+        as a handover, or `_supervise` closes the successor's socket out
+        from under it (`self.stop()`).
 
         Reproduced here without threads or signals: `self._proc` is swapped
         to the successor from INSIDE the predecessor's own `wait()` — the
-        one place production genuinely cannot promise `_replacing` is set
-        yet — and `_replacing` is never set True at all.
+        tightest gap production allows between the reassignment and
+        `_supervise`'s own read of it. (The separate, genuinely concurrent
+        version of this race — `_spawn()` itself still in flight inside
+        `_on_replace_request`, on another thread — is covered by
+        `case_a_replace_in_flight_survives_the_supervisors_exit0_decision`.)
         """
+        import threading
+
         from cswap_pin import proxy as pin_proxy
 
         closed = []
@@ -12970,7 +13005,7 @@ print("OK", port)
         class _RacyHolder(pin_proxy.PortHolder):
             def __init__(self):
                 self._stop = False
-                self._replacing = False  # never set True — see docstring
+                self._replace_lock = threading.RLock()
                 self._srv = _Sock()
                 self.port = 36301
                 self.daemon_pid = 4242
@@ -12980,9 +13015,7 @@ print("OK", port)
 
                 def _predecessor_wait():
                     # THE RACE: `self._proc` is reassigned before this
-                    # returns, exactly as `_spawn()`'s last line does — but
-                    # `self._replacing` is not set, exactly as the gap
-                    # before `_on_replace_request`'s own next line allows.
+                    # returns, exactly as `_spawn()`'s last line does.
                     self._proc = self.successor
                     return 0
 
@@ -13003,14 +13036,187 @@ print("OK", port)
         h.successor.wait = _successor_wait
         h._supervise()
         assert closed == [], (
-            "the holder closed its listening socket on a HANDOVER exit "
-            "whose `_replacing` flag lost the race — `self._proc` had "
-            "already been swapped to the successor and `_supervise` never "
-            "looked"
+            "the holder closed its listening socket on a HANDOVER exit — "
+            "`self._proc` had already been swapped to the successor and "
+            "`_supervise` never looked"
         )
         assert h._rounds == 1, (
             "corollary: with the fix, round 2 (the successor's own wait()) "
             "must be reached too"
+        )
+
+    def case_a_replace_in_flight_survives_the_supervisors_exit0_decision(
+        self, tmp_path
+    ):
+        """RULE 0: a replace still being ASSIGNED must never be read as a
+        plain release.
+
+        `_on_replace_request` reassigns `self._proc` to the successor as the
+        LAST line of `_spawn()` — an "unbounded" `Popen` that can still be
+        running when the predecessor's own exit (asked for separately,
+        across a process boundary: `heal`'s successor-first replace TERMs it
+        once its OWN confirmation loop gives up, whether or not `Popen` has
+        returned yet) is observed by `_supervise`. Without a lock shared
+        between the two, `_supervise` reads a `self._proc` that has not
+        moved yet, treats the exit as an ordinary release, and calls
+        `stop()` — which reads `self._proc` a SECOND time, by when `_spawn`
+        may have finished, and terminates the SUCCESSOR it just assigned.
+
+        Reproduced deterministically with real threads and TWO checkpoints.
+        `_on_replace_request` is started FIRST and confirmed blocked inside
+        `_spawn` (an Event standing in for the slow `Popen`) before the
+        supervisor thread is even created, so the reassignment cannot have
+        happened yet no matter how the OS schedules things. The supervisor
+        is then started and its OWN `proc.wait()` call — the first thing
+        `_supervise` does, on either the fixed or the unfixed code — sets a
+        second checkpoint the instant it is entered; only once THAT fires
+        does the test release the spawn, so the identity check (or the
+        shared-lock acquire, on the fixed code) is forced to run BEFORE the
+        reassignment lands. `_reap_standby()` — the first call after the
+        identity check falls through on the unfixed code — then blocks on
+        the spawn's completion, forcing the OPPOSITE ordering for `stop()`'s
+        own, later read of `self._proc`: by the time it runs, the
+        reassignment has already landed, so an unfixed `stop()` terminates
+        the successor rather than a no-op on an already-exited predecessor.
+        The fixed code never reaches `_reap_standby()` at all here, because
+        the shared lock makes it wait for the in-flight replace before
+        deciding anything.
+        """
+        import threading
+
+        from cswap_pin.proxy import PortHolder
+
+        class _Proc:
+            def __init__(self):
+                self.terminated = False
+                self.returncode = None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                self.terminated = True
+
+        predecessor = _Proc()
+        successor = _Proc()
+        spawn_started = threading.Event()
+        supervise_woke = threading.Event()
+        release_spawn = threading.Event()
+        spawn_done = threading.Event()
+
+        class _Holder(PortHolder):
+            def __init__(self):
+                self._stop = False
+                self._proc = predecessor
+                self._standby = None
+                self._srv = type("_Srv", (), {"close": lambda self: None})()
+                self._replace_lock = threading.RLock()
+                self.port = 36301
+                self.daemon_pid = 4242
+
+            def _reap_standby(self):
+                # THE PROOF POINT: reached only once `_supervise` has
+                # already decided (wrongly, on the unfixed code) that this
+                # exit is NOT a handover. Blocking here until the replace's
+                # `_spawn()` has actually finished forces the reassignment
+                # to land before `stop()`'s own, later read of `self._proc`
+                # — the fixed code never calls this at all for an in-flight
+                # replace, because it never gets past the shared lock.
+                assert spawn_done.wait(timeout=5), "the replace never finished"
+
+            def _spawn(self):
+                spawn_started.set()
+                assert release_spawn.wait(timeout=5), (
+                    "test never released the spawn"
+                )
+                self._proc = successor
+                spawn_done.set()
+
+        h = _Holder()
+
+        def _predecessor_wait(timeout=None):
+            # THE SECOND CHECKPOINT. `_supervise` calls this the moment it
+            # wakes from `proc.wait()` on ITS OWN predecessor — the very
+            # first line of its per-iteration body, before either the
+            # identity check (unfixed) or the shared-lock acquire (fixed).
+            # Setting it here, rather than waiting on `spawn_started`
+            # directly, keeps this thread running (still holding the GIL)
+            # right up to whichever of those two the code under test takes,
+            # instead of racing the main thread to get there first.
+            supervise_woke.set()
+            return 0
+        predecessor.wait = _predecessor_wait
+
+        def _successor_wait(timeout=None):
+            h._stop = True
+            return 0
+        successor.wait = _successor_wait
+
+        t_replace = threading.Thread(
+            target=lambda: h._on_replace_request(None, None)
+        )
+        t_replace.start()
+        assert spawn_started.wait(timeout=5), "the replace never reached _spawn"
+
+        t_supervise = threading.Thread(target=h._supervise)
+        t_supervise.start()
+        assert supervise_woke.wait(timeout=5), (
+            "the supervisor never reached its own wait() on the predecessor"
+        )
+        release_spawn.set()
+        assert spawn_done.wait(timeout=5), "the replace never finished"
+
+        t_replace.join(timeout=5)
+        t_supervise.join(timeout=5)
+        assert not t_replace.is_alive() and not t_supervise.is_alive(), (
+            "the supervisor or the replace handler never finished"
+        )
+        assert successor.terminated is False, (
+            "the supervisor's exit-0 decision terminated the SUCCESSOR "
+            "`_spawn` had just assigned"
+        )
+
+    def case_an_exit0_with_no_replace_in_flight_still_releases(
+        self, tmp_path
+    ):
+        """CONTROL for the case above. With no replace ever requested,
+        `_supervise` must still call `stop()` and terminate its own daemon
+        on a plain exit 0 — the shared lock must not swallow the ordinary
+        release path."""
+        import threading
+
+        from cswap_pin.proxy import PortHolder
+
+        class _Proc:
+            def __init__(self):
+                self.terminated = False
+                self.returncode = None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                self.terminated = True
+
+        proc = _Proc()
+
+        class _Holder(PortHolder):
+            def __init__(self):
+                self._stop = False
+                self._proc = proc
+                self._standby = None
+                self._srv = type("_Srv", (), {"close": lambda self: None})()
+                self._replace_lock = threading.RLock()
+                self.port = 36301
+                self.daemon_pid = 4242
+
+            def _reap_standby(self):
+                pass
+
+        h = _Holder()
+        h._supervise()
+        assert proc.terminated is True, (
+            "a plain, un-raced exit-0 no longer releases its own daemon"
         )
 
     def case_a_held_exit_does_not_drain_before_letting_the_holder_respawn(
