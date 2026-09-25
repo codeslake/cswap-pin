@@ -17486,18 +17486,18 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     def case_a_cap_already_past_does_not_reopen_switch_for_a_concurrent_429(
         self, monkeypatch,
     ):
-        """I2: a cap at or before `time.time()` (clock skew, or a wall whose
-        own header already lagged) must not zero out the negative's expiry
-        -- that let every OTHER concurrent 429 on the same wall, queued
-        behind `_walled_switch_lock`, find it already expired and re-run
-        `switch()` for itself. This is the LIVE token's own 429 (`auth` is
-        `self.LIVE`, not a stale bearer) -- a non-walled path -- so a 1 ms
-        floor on this cap would have expired long before a second, genuinely
-        concurrent 429 gets its turn on the lock: 0.5s later, well past a
-        1 ms floor but nowhere near main's 30s TTL, is what a queued waiter's
-        lock handoff actually costs. That later waiter must still find the
-        debounce standing and call `switch()` once between them, not once
-        each."""
+        """I2: on the live token's own 429 (`auth` is `self.LIVE`, not a
+        stale bearer) -- a non-walled path that never receives a cap -- a
+        reset at or before `time.time()` (clock skew, or a wall whose own
+        header already lagged) must not zero out the negative's expiry --
+        that let every OTHER concurrent 429 on the same wall, queued behind
+        `_walled_switch_lock`, find it already expired and re-run
+        `switch()` for itself. A 1 ms floor on this cap would have expired
+        long before a second, genuinely concurrent 429 gets its turn on the
+        lock: 0.5s later, well past a 1 ms floor but nowhere near main's 30s
+        TTL, is what a queued waiter's lock handoff actually costs. That
+        later waiter must still find the debounce standing and call
+        `switch()` once between them, not once each."""
         from cswap_pin import proxy as pp
         import time as _time
         BASE = 2_000_000_000.0
