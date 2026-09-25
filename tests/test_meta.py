@@ -88,6 +88,51 @@ def test_a_skip_in_one_case_does_not_swallow_a_later_failure(
         "case_b_fails")
 
 
+def test_a_fail_in_one_case_does_not_end_the_case_class(
+    request, tmp_path_factory
+):
+    """`pytest.fail()` raises `Failed`, which -- like `Skipped` above -- derives
+    from `BaseException`, not `Exception`, so `run_cases`'s own
+    `except Exception` never caught it either. A `pytest.fail()` anywhere in
+    a class's `case_*` methods ended the whole driver loop on the spot: the
+    failures already collected were lost, and every later case never ran.
+
+    NOT DRIVEN THROUGH `pytest.raises`: an escaping `Failed` would just mark
+    THIS test failed for the wrong reason instead of pointing at the bug --
+    caught by hand, same reason as the skip guard above.
+    """
+    from conftest import run_cases as _run_cases
+
+    class Holder:
+        def case_a_fails_via_pytest_fail(self, tmp_path):
+            pytest.fail("case_a called pytest.fail directly")
+
+        def case_b_fails_via_assert(self, tmp_path):
+            assert False, "case_b's ordinary failure must also be named"
+
+    try:
+        _run_cases(Holder(), request, tmp_path_factory)
+    except pytest.fail.Exception as exc:
+        raise AssertionError(
+            f"case_a's pytest.fail() escaped run_cases instead of being "
+            f"recorded and continuing past it -- case_b never ran: {exc}"
+        ) from exc
+    except AssertionError as exc:
+        msg = str(exc)
+        assert (
+            "case_a_fails_via_pytest_fail" in msg
+            and "case_a called pytest.fail directly" in msg
+        ), f"case_a's pytest.fail() was not named in the raised failure: {msg}"
+        assert (
+            "case_b_fails_via_assert" in msg
+            and "case_b's ordinary failure must also be named" in msg
+        ), f"case_b's failure did not reach the caller: {msg}"
+        return
+    raise AssertionError(
+        "run_cases returned normally instead of raising the failures from "
+        "case_a and case_b")
+
+
 def test_a_class_whose_every_case_skips_is_reported_skipped(
     request, tmp_path_factory
 ):

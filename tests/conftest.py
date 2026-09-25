@@ -880,7 +880,13 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             # function on the spot instead. Recorded and CONTINUED instead,
             # the same as a real failure two lines down.
             skipped.append(f"{name}: {exc}")
-        except Exception:  # noqa: BLE001 — collect, do not stop the run
+        except (pytest.fail.Exception, Exception):  # noqa: BLE001
+            # `Failed` -- what `pytest.fail()` raises -- derives from
+            # `BaseException`, not `Exception`, the same as `Skipped` above,
+            # so a plain `except Exception` never caught it either: a case
+            # that calls `pytest.fail()` directly ended the loop right here,
+            # the same way a `pytest.skip()` used to. Named in the tuple
+            # explicitly and collected, do not stop the run.
             failures.append(f"--- {name} ---\n{traceback.format_exc()}")
         finally:
             mp.undo()
