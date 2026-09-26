@@ -10685,7 +10685,7 @@ class PortHolder:
         places a standby if one is not already covering the port, then
         `continue`s straight back to ordinary supervision — never a nested
         `_supervise()` call, which used to leave one parked OS thread
-        behind per re-degrade, ~2,870/day, computed (86,400s /
+        behind per re-degrade, ~2,880/day, computed (86,400s /
         `_HOLD_DEGRADE_RETRY_S`'s 30s default), not measured against a real
         cascade. A
         retry that fails outright re-enters the degraded branch on the

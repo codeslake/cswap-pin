@@ -5008,7 +5008,9 @@ class TestASpawnFailureIsNotFatal:
         same two drives `TestASpawnFailureIsNotFatal` already uses),
         shorten the retry timer, then either let the NEXT `_spawn` succeed
         (`recovers=True`) or keep it raising (`recovers=False`). Returns
-        (holder, procs, spawn_calls); the caller owns `holder.stop()`.
+        (holder, procs, spawn_calls, n_before), where `n_before` is
+        `len(procs)` captured before the gate below opens; the caller
+        owns `holder.stop()`.
 
         `_spawn` DECIDES BY `self._degraded`, NEVER BY A FLAG THIS METHOD
         FLIPS FROM OUTSIDE. A flag set only after THIS thread observes
@@ -5080,28 +5082,46 @@ class TestASpawnFailureIsNotFatal:
         else:
             holder = PortHolder(tmp_path, "1", "a@b.c")
             holder.start()
-            assert len(procs) == 1, (
-                "premise: the cold start did not spawn cleanly"
-            )
 
-        deadline = time.time() + 10
-        while not getattr(holder, "_degraded", False) and time.time() < deadline:
+        # PREMISE FAILURES STOP THE HOLDER TOO: a `raise` out of this
+        # `try` runs before the caller's own `try/finally` ever starts
+        # (the helper has not returned yet), so an un-stopped holder here
+        # leaves its supervisor thread and bound socket alive for the
+        # rest of the in-process test session.
+        try:
             if not promotion:
-                procs[-1].exit(1)
-                n_before = len(procs)
-                inner_deadline = time.time() + 1
-                while (len(procs) <= n_before
-                       and not getattr(holder, "_degraded", False)
-                       and time.time() < inner_deadline):
-                    time.sleep(0.01)
-            else:
-                time.sleep(0.02)
-        assert getattr(holder, "_degraded", False), (
-            "premise: the drive never reached degrade_now()"
-        )
+                assert len(procs) == 1, (
+                    "premise: the cold start did not spawn cleanly"
+                )
+
+            deadline = time.time() + 10
+            while not getattr(holder, "_degraded", False) and time.time() < deadline:
+                if not promotion:
+                    procs[-1].exit(1)
+                    n_before = len(procs)
+                    inner_deadline = time.time() + 1
+                    while (len(procs) <= n_before
+                           and not getattr(holder, "_degraded", False)
+                           and time.time() < inner_deadline):
+                        time.sleep(0.01)
+                else:
+                    time.sleep(0.02)
+            assert getattr(holder, "_degraded", False), (
+                "premise: the drive never reached degrade_now()"
+            )
+        except Exception:
+            holder.stop()
+            raise
+
+        # CAPTURED BEFORE THE GATE OPENS: once `observed` is set, a
+        # `recovers=True` retry may land within the (patched-short) retry
+        # window, on the holder's own thread -- if the caller reads
+        # `len(procs)` only after this returns, that landing can race
+        # ahead of the read and get counted into the "before" baseline.
+        n_before = len(procs)
         observed.set()
 
-        return holder, procs, spawn_calls
+        return holder, procs, spawn_calls, n_before
 
     def case_a_ladder_cap_degrade_retries_and_recovers_once_pinned(
             self, tmp_path, monkeypatch):
@@ -5114,7 +5134,7 @@ class TestASpawnFailureIsNotFatal:
         left holding the process up -- and, once the fault clears and the
         (patched-short) retry timer fires, a fresh daemon must land and
         `_degraded` must clear."""
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, n_before = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=False, recovers=True)
         try:
             assert holder._thread.is_alive(), (
@@ -5122,7 +5142,6 @@ class TestASpawnFailureIsNotFatal:
                 "own degraded branch -- the process would exit behind "
                 "the still-serving degraded acceptor"
             )
-            n_before = len(procs)
             deadline = time.time() + 5
             while getattr(holder, "_degraded") and time.time() < deadline:
                 time.sleep(0.02)
@@ -5144,7 +5163,7 @@ class TestASpawnFailureIsNotFatal:
         re-degrades at once). Waits for TWO retry attempts, not one: a
         loop that quietly ends after the first failed attempt would still
         pass a test that only checked for one."""
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, _ = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=False, recovers=False)
         try:
             n_calls_before = len(spawn_calls)
@@ -5183,7 +5202,7 @@ class TestASpawnFailureIsNotFatal:
         of these threads were still alive at once -- a stray fd, reused by
         something else entirely, read as if it were still this socket.
         `stop()` must not return with this thread still alive."""
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, _ = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=False, recovers=False)
         thread = holder._thread
         holder.stop()
@@ -5203,7 +5222,7 @@ class TestASpawnFailureIsNotFatal:
         `code == 0` release path uncaught, skip `self._srv.close()`, and
         leave the port bound with a traceback printed instead of a clean
         release."""
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, _ = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=False, recovers=True)
         try:
             deadline = time.time() + 5
@@ -5235,10 +5254,9 @@ class TestASpawnFailureIsNotFatal:
         straight into `_supervise`'s degraded branch and returns without
         blocking, so THAT thread's retry loop is the only thing keeping
         the process up, and recovery must still land a real daemon."""
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, n_before = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=True, recovers=True)
         try:
-            n_before = len(procs)
             deadline = time.time() + 5
             while getattr(holder, "_degraded") and time.time() < deadline:
                 time.sleep(0.02)
@@ -5259,7 +5277,7 @@ class TestASpawnFailureIsNotFatal:
         capped-promotion site instead. Waits for TWO retry attempts, not
         one, and proves the acceptor RELAYS, not merely listens -- same
         reasoning as the ordinary-crash-loop sibling above."""
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, _ = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=True, recovers=False)
         try:
             n_calls_before = len(spawn_calls)
@@ -5440,7 +5458,7 @@ class TestASpawnFailureIsNotFatal:
 
         monkeypatch.setattr(PortHolder, "_supervise", _tracking_supervise)
 
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, _ = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=False, recovers=False)
         try:
             # A FRESH `_spawn`, gated the same way `_drive_degrade_and_
@@ -5460,8 +5478,8 @@ class TestASpawnFailureIsNotFatal:
             monkeypatch.setattr(PortHolder, "_spawn", _spawn)
 
             for i in range(3):
-                observed.set()
                 n_before = len(procs)
+                observed.set()
                 deadline = time.time() + 5
                 while len(procs) <= n_before and time.time() < deadline:
                     time.sleep(0.01)
@@ -5567,7 +5585,7 @@ class TestASpawnFailureIsNotFatal:
         this case instead of the whole suite."""
         from cswap_pin import proxy as pin_proxy
 
-        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+        holder, procs, spawn_calls, _ = self._drive_degrade_and_retry(
             tmp_path, monkeypatch, promotion=False, recovers=False)
         try:
             # DECLINED, NOT MERELY "no new spawn count" -- the background
