@@ -9960,7 +9960,7 @@ _HOLD_DEGRADE_AT = 8
 # ladder's own backoff: the fault that capped the ladder (a broken install, a
 # missing interpreter) does not clear itself in seconds, and retrying at the
 # ladder's own pace would just re-run the same failure dozens of times before
-# anyone could fix anything. See `_run_degraded`.
+# anyone could fix anything. See `_supervise`'s own degraded branch.
 _HOLD_DEGRADE_RETRY_S = 30.0
 
 # Consecutive failed respawns before the holder says the successor cannot
@@ -10046,11 +10046,11 @@ class PortHolder:
         # the standby PROCESS down mid-call rather than through its own
         # control flow. A PERMANENT failure still degrades the socket
         # rather than ending the process: `_spawn_retrying` returns False
-        # only after `degrade_now()` has already started the degraded
-        # acceptor, and `start()` blocks on it (`_wait_out_degraded`)
-        # before handing that False back, so `_standby_revive`'s skipped
-        # join costs it nothing — the process it would have joined is
-        # still up, still serving unpinned.
+        # only after `degrade_now()` has already flagged it, and `start()`
+        # then starts `self._thread` straight into `_supervise`'s own
+        # degraded branch and returns without blocking, so `_standby_
+        # revive`'s ordinary join of `holder._thread` covers it — the
+        # process it would have joined is still up, still serving unpinned.
         self._is_promotion = sock is not None
 
         # ADOPT A HANDED-DOWN SOCKET RATHER THAN BINDING. A predecessor that is
@@ -10171,17 +10171,22 @@ class PortHolder:
         # control flow. A permanent failure now DEGRADES and RETRIES a
         # successor of its own accord (T1193) rather than ending the process
         # -- see `_spawn_retrying`'s docstring, `_is_promotion`'s comment,
-        # and `_run_degraded` for what that really means.
+        # and `_supervise`'s own degraded branch for what that really means.
         if self._is_promotion:
             if not self._spawn_retrying():
-                # CAPPED OUT — `_spawn_retrying` already ran `degrade_now()`.
-                # Blocking here, not merely returning False, is what keeps
-                # this PROMOTION case (the socket's last cover) up serving:
-                # `_standby_revive`'s own `if holder._thread is not None`
-                # never runs, since no supervisor thread ever started, so
-                # nothing past this call would otherwise wait on the
-                # degraded acceptor before the process exits behind it.
-                self._wait_out_degraded()
+                # CAPPED OUT — `_spawn_retrying` already ran `degrade_now()`,
+                # which flagged `self._degraded` (unless a test stubbed it
+                # away, the only other way this returns False). ONE THREAD,
+                # straight into `_supervise`'s degraded branch rather than
+                # blocking here, is what keeps this PROMOTION case (the
+                # socket's last cover) up serving: `_standby_revive`'s
+                # ordinary `if holder._thread is not None:
+                # _join_for_signals(...)` then covers it exactly as it
+                # covers an ordinary supervisor.
+                if getattr(self, "_degraded", False):
+                    self._thread = threading.Thread(
+                        target=self._supervise, daemon=True)
+                    self._thread.start()
                 return False
         else:
             self._spawn()
@@ -10221,11 +10226,13 @@ class PortHolder:
         the code is already in this process's memory, so it keeps working when
         the package is gone from disk, which is what put a machine here.
 
-        Idempotent while still degraded: a retry that lands un-degrades in
-        place (`_run_degraded` clears the flag itself), and one that fails
+        Idempotent: a retry that lands un-degrades in place (`_supervise`'s
+        own degraded branch clears the flag itself), and one that fails
         re-degrades through the SAME cap rather than a second ladder — see
-        `_run_degraded`. This method itself only ever starts the retrying
-        acceptor once per degrade.
+        `_supervise`. ONE THREAD (T1193): this only ever flips the flag and
+        logs — the retrying acceptor is `_supervise`'s own degraded branch,
+        already running on `self._thread` (or, for a capped promotion,
+        started straight into it by `start()`), never a thread of its own.
         """
         if getattr(self, "_degraded", False):
             return
@@ -10237,88 +10244,13 @@ class PortHolder:
             f"holder retries one itself every {_HOLD_DEGRADE_RETRY_S:.0f}s, "
             f"or `cswap pin --heal` tries sooner."
         )
-        # KEPT, so `_wait_out_degraded` can join it. Every caller that
-        # reaches this holder's return joins `self._thread` (or, for a
-        # capped promotion, nothing at all) to learn when the process may
-        # exit — and this acceptor is the only thing still serving once
-        # that happens.
-        self._degraded_thread = threading.Thread(
-            target=self._run_degraded, daemon=True)
-        self._degraded_thread.start()
 
-    def _run_degraded(self) -> None:
-        """Own the socket while degraded: serve it ourselves, and retry a
-        successor every `_HOLD_DEGRADE_RETRY_S` until one sticks or
-        `stop()` ends the holder (T1193).
-
-        ONE ATTEMPT PER WAKE, NOT A FRESH LADDER. `self._failures` is set
-        to `_HOLD_DEGRADE_AT - 1` first, so a spawn that fails outright
-        reaches the SAME cap `_spawn_retrying` already knows on its very
-        first try and re-degrades at once: its own `degrade_now()` call
-        no-ops here (`self._degraded` is still True), so this loop just
-        resumes accepting where it left off.
-
-        A spawn that starts hands off to ordinary supervision
-        (`_supervise`), which re-enters this same method through
-        `degrade_now()` if THAT daemon fails too — a retry that dies
-        right away re-degrades through `_supervise`'s own cap check, one
-        crash away, exactly like a resumed-but-fragile holder should.
-
-        ponytail: each re-degrade nests one more `_supervise` call inside
-        this thread's own stack (the call below never returns until the
-        nested one does). A host that flaps between degraded and pinned
-        for as long as it keeps retrying grows that stack for as long —
-        bound it with a depth counter if one is ever seen doing that.
-        """
-        while not self._stop:
-            self._accept_degraded(retry_after=_HOLD_DEGRADE_RETRY_S)
-            if self._stop:
-                return
-            self._failures = _HOLD_DEGRADE_AT - 1
-            if not self._spawn_retrying():
-                continue
-            self._degraded = False
-            self._supervise()
-            return
-
-    def _wait_out_degraded(self) -> None:
-        """Block until a degraded holder's retrying is over for good.
-
-        `_supervise` returning ends only ITS OWN thread — but `holder_main`
-        and `_standby_revive` both join that thread (or, for a capped
-        promotion, `start()` itself) to learn when the PROCESS may exit,
-        and a process that exits takes every daemon thread down with it,
-        `_run_degraded`'s acceptor included, socket and all.
-
-        THIS CAN RESUME SUPERVISING BEFORE IT EVER RETURNS. A retry that
-        lands hands off to `_supervise` from inside the same thread this
-        joins, and a later re-degrade there starts a NEW thread and joins
-        THAT one before returning — so this call keeps blocking through
-        however many degrade/retry cycles follow, same as it always did
-        for the plain no-retry case, and only returns once the process may
-        actually exit. A no-op unless `degrade_now()` actually ran
-        (`self._stop` already true is the other way a caller gets here,
-        mid-teardown, with nothing to wait for).
-
-        WAKES WITHIN A POLL INTERVAL OF `stop()`, not by relying on the
-        socket closing: closing a listening socket from another thread
-        does NOT interrupt a thread already blocked in `accept()` on
-        Linux (see `_accept_degraded`'s own `select.poll()`, and
-        `tests/test_proxy_server.py`'s `_ProbeChain.stop` for the same
-        measurement) — `self._stop` is what actually ends this, checked
-        every poll, not the close. TIMED, in a loop (`_join_for_signals`):
-        the PROMOTION caller runs this on the process's own MAIN thread, and
-        an untimed join there drops a SIGTERM the kernel delivers to a
-        different thread — see that helper's own docstring.
-        """
-        thread = getattr(self, "_degraded_thread", None)
-        if thread is not None:
-            _join_for_signals(thread)
-
-    def _accept_degraded(self, retry_after: float | None = None) -> None:
-        """Serve the held socket ourselves until `stop()` ends the holder,
-        or, when `retry_after` is given, until that many seconds pass
-        first — so `_run_degraded` can pause us to try a successor.
+    def _accept_degraded(self, retry_after: float) -> None:
+        """Serve the held socket ourselves for up to `retry_after` seconds,
+        or until `stop()` ends the holder first — so `_supervise`'s
+        degraded branch can pause us to try a successor (T1193: ONE
+        THREAD, `_supervise`'s own, calls this; there is no acceptor
+        thread of its own any more).
 
         `select.poll()`, NEVER `settimeout()` or non-blocking mode on
         `self._srv` (T1193): O_NONBLOCK is a property of the OPEN FILE
@@ -10327,24 +10259,32 @@ class PortHolder:
         our own wait non-blocking would make theirs non-blocking too, the
         moment it inherits the fd. `poll()` over `select.select()` for the
         same reason `_client_hung_up` picks it: no FD_SETSIZE ceiling.
+
+        AN OSError WHILE NOT STOPPING IS EMFILE, NOT THE TIMER FIRING
+        (T1193): a transient `accept()` failure used to read as "the
+        deadline is up", ending this call early and sending `_supervise`
+        straight into another spawn attempt — a hot loop of spawns and log
+        lines under exactly the load (too many open files) that raised it.
+        A short sleep and another lap around the same deadline keeps
+        serving instead.
         """
-        deadline = None if retry_after is None else time.monotonic() + retry_after
+        deadline = time.monotonic() + retry_after
         poller = select.poll()
         poller.register(self._srv, select.POLLIN)
         while not self._stop:
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return
-                wait_ms = int(min(remaining, 1.0) * 1000)
-            else:
-                wait_ms = 1000
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            wait_ms = int(min(remaining, 1.0) * 1000)
             if not poller.poll(wait_ms):
                 continue
             try:
                 conn, _ = self._srv.accept()
             except OSError:
-                return
+                if self._stop:
+                    return
+                time.sleep(0.1)
+                continue
             threading.Thread(target=self._relay_one, args=(conn,),
                              daemon=True).start()
 
@@ -10496,11 +10436,11 @@ class PortHolder:
         `_supervise`'s three respawn sites, a standby's own PROMOTION in
         `start()` (see `_is_promotion`) — there, unlike a cold start, raising
         out of `start()` would take the standby PROCESS down mid-call rather
-        than through its own control flow — and, since T1193, `_run_degraded`'s
-        own one retry attempt per wake, which is already degraded and has
-        nothing to lose by trying. A COLD START calls bare `_spawn()` instead
-        and lets a permanent failure raise immediately, exactly as the base
-        did — see `start()`.
+        than through its own control flow — and, since T1193, `_supervise`'s
+        own degraded branch's one retry attempt per wake, which is already
+        degraded and has nothing to lose by trying. A COLD START calls bare
+        `_spawn()` instead and lets a permanent failure raise immediately,
+        exactly as the base did — see `start()`.
 
         `OSError` (fork EAGAIN/EMFILE, or the interpreter itself unrunnable)
         and `ValueError` (`Popen(pass_fds=(-1,))` on our own closed socket,
@@ -10516,8 +10456,8 @@ class PortHolder:
         False — a permanently failing promotion serves the socket itself
         rather than raising, and (T1193) keeps trying a successor of its
         own accord on `_HOLD_DEGRADE_RETRY_S` rather than ending there for
-        good — see `_run_degraded`. See `_is_promotion`'s comment in
-        `__init__` for the full chain.
+        good — see `_supervise`'s own degraded branch. See `_is_promotion`'s
+        comment in `__init__` for the full chain.
         """
         while True:
             try:
@@ -10528,7 +10468,17 @@ class PortHolder:
                     return False
                 self._failures += 1
                 capped = self._failures >= _HOLD_DEGRADE_AT
-                verb = "giving up" if capped else "retrying"
+                # A DEGRADED RETRY THAT CAPS IS NOT GIVING UP — the wake
+                # this call runs under (`self._degraded` already True)
+                # tries again every `_HOLD_DEGRADE_RETRY_S` regardless
+                # (T1193): only an ORDINARY ladder reaching the cap for
+                # the first time is actually giving up.
+                if capped and getattr(self, "_degraded", False):
+                    verb = f"will retry again in {_HOLD_DEGRADE_RETRY_S:.0f}s"
+                elif capped:
+                    verb = "giving up"
+                else:
+                    verb = "retrying"
                 _log_lifecycle(
                     f"could not spawn a successor on port {self.port}: "
                     f"{exc!r} — {verb}"
@@ -10702,9 +10652,9 @@ class PortHolder:
             # A DEGRADED ACCEPTOR IS STILL ON THIS SOCKET (T1193). Spawning
             # here would put a daemon's own accept() loop beside it — the
             # exact two-acceptors bug this class refuses to have
-            # (test_meta.py:388's ban). `_run_degraded` already retries a
-            # successor on its own timer; this request can only log and
-            # decline, never trigger a spawn that races it.
+            # (test_meta.py:388's ban). `_supervise`'s own degraded branch
+            # already retries a successor on its own timer; this request
+            # can only log and decline, never trigger a spawn that races it.
             if getattr(self, "_degraded", False):
                 _log_lifecycle(
                     f"replace request for port {self.port} ignored — this "
@@ -10721,7 +10671,61 @@ class PortHolder:
                 )
 
     def _supervise(self) -> None:
+        """ONE THREAD, ONE LOOP (T1193): ordinary supervision and the
+        degraded serve-and-retry cycle both run here, never a thread of
+        their own. `degrade_now()` only ever sets `self._degraded` — this
+        loop is what actually notices it, on its very next lap, whether
+        that lap follows an ordinary crash (`_supervise_locked` returning
+        "continue" after calling `degrade_now()` itself) or `start()`
+        started this thread straight into a capped promotion (`self._proc`
+        is never even set in that case, so the degraded branch below must
+        run BEFORE anything tries to `.wait()` on it).
+
+        A LANDED RETRY STAYS IN THIS SAME LAP: it clears `self._degraded`,
+        places a standby if one is not already covering the port, then
+        `continue`s straight back to ordinary supervision — never a nested
+        `_supervise()` call, which used to leave one parked OS thread
+        behind per re-degrade, ~2,870/day on the measured cascade. A
+        retry that fails outright re-enters the degraded branch on the
+        very same `continue`, one crash away, exactly like a
+        resumed-but-fragile holder should.
+        """
         while not self._stop:
+            if getattr(self, "_degraded", False):
+                self._accept_degraded(retry_after=_HOLD_DEGRADE_RETRY_S)
+                if self._stop:
+                    return
+                # ONE ATTEMPT PER WAKE, NOT A FRESH LADDER: preset one
+                # short of the cap so an outright failure re-degrades at
+                # once through `_spawn_retrying`'s own check, rather than
+                # climbing a second ladder before it does.
+                self._failures = _HOLD_DEGRADE_AT - 1
+                if not self._spawn_retrying():
+                    continue
+                # STOP RACED THE LANDED SPAWN (T1193): `stop()` may have
+                # already read `self._proc` as it was BEFORE this spawn
+                # set it, so its own terminate pass never saw this daemon
+                # — left holding the fd with nobody supervising it. Catch
+                # that here, before this thread's next lap just exits on
+                # `self._stop` and abandons it.
+                if self._stop:
+                    proc = self._proc
+                    if proc is not None and getattr(proc, "returncode", 0) is None:
+                        try:
+                            proc.terminate()
+                        except (OSError, ValueError):
+                            pass
+                    return
+                self._degraded = False
+                if self._standby is None:
+                    try:
+                        self._spawn_standby()
+                    except (OSError, ValueError) as exc:
+                        _log_lifecycle(
+                            f"could not spawn a standby for port "
+                            f"{self.port}: {exc!r} — continuing without one"
+                        )
+                continue
             # CAPTURED BEFORE THE WAIT, so it still names the PREDECESSOR
             # after `wait()` returns, whatever `self._proc` has become by
             # then.
@@ -10729,33 +10733,36 @@ class PortHolder:
             code = proc.wait()
             if self._stop:
                 return
-            # THE DECISION RUNS LOCKED; THE JOIN DOES NOT (T1193). A retry
-            # can now keep `_wait_out_degraded()` blocked for the rest of
-            # this process's life, and holding `self._replace_lock` across
-            # that would park this thread on the lock forever — `_on_replace_
-            # request`'s own degraded-refusal check (also new) could then
-            # never run again either, since it takes the same lock. The
-            # join itself touches nothing `_on_replace_request` needs
-            # (`self._proc`), so it alone moves outside the `with` below;
-            # see `_supervise_locked` for the decision itself, which still
-            # takes the backoff sleep and every respawn under the lock.
+            # THE DECISION RUNS LOCKED; THE DEGRADED WAIT DOES NOT (T1193).
+            # A retry can now serve degraded for the rest of this
+            # process's life, and holding `self._replace_lock` across that
+            # would park this thread on the lock forever — `_on_replace_
+            # request`'s own degraded-refusal check (also locked) could
+            # then never run again either. Nothing past the `with` below
+            # touches `self._proc` before the NEXT lap's own wait, so
+            # releasing the lock here and re-checking `self._degraded` at
+            # the top is exactly the same "outside the lock" this always
+            # needed; see `_supervise_locked` for the decision itself,
+            # which still takes the backoff sleep and every respawn under
+            # the lock.
             with self._replace_lock:
                 outcome = self._supervise_locked(proc, code)
-            if outcome == "continue":
-                continue
-            if outcome == "wait_out":
-                self._wait_out_degraded()
-            return
+            if outcome == "return":
+                return
+            # "continue" either goes on supervising normally, or — when
+            # `_supervise_locked` just called `degrade_now()` — the next
+            # lap's own top-of-loop check sends it into the degraded
+            # branch above instead.
 
     def _supervise_locked(self, proc, code: int) -> str:
         """One `_supervise` iteration's decision, taken under
         `self._replace_lock` — see that method for why the LOCK stops here
         and a caller-side sentinel carries the outcome out past it.
 
-        Returns "continue" (go on supervising), "return" (the loop is
-        over, nothing more to do), or "wait_out" (the loop is over, and
-        the caller must join the degraded acceptor OUTSIDE the lock before
-        it, too, returns).
+        Returns "continue" (go on supervising — the caller's own next lap
+        notices for itself whether that means ordinary supervision or,
+        after a `degrade_now()` call in here, the degraded branch instead)
+        or "return" (the loop is over, nothing more to do).
         """
         # A HANDOVER, NOT A RELEASE. The predecessor asked us to
         # replace it while it was still serving, we did, and it then
@@ -10841,9 +10848,11 @@ class PortHolder:
                     f"{self.port}"
                 )
                 self._failures = 0
-                if not self._spawn_retrying():
-                    # CAPPED OUT — degrade_now() already ran.
-                    return "wait_out"
+                # CAPPED OUT OR NOT, THE OUTCOME IS THE SAME (T1193): a cap
+                # only flags `self._degraded`, which the caller's next lap
+                # notices for itself — nothing here needs to distinguish
+                # the two any more.
+                self._spawn_retrying()
                 return "continue"
             _log_lifecycle(
                 f"daemon {self.daemon_pid} exited cleanly — releasing port "
@@ -10870,9 +10879,8 @@ class PortHolder:
                 f"restarting on the held port {self.port}"
             )
             self._failures = 0
-            if not self._spawn_retrying():
-                # CAPPED OUT — see the same-shaped comment above.
-                return "wait_out"
+            # CAPPED OR NOT — see the same-shaped comment above.
+            self._spawn_retrying()
             return "continue"
         if not self._self_heal_on():
             # SAY WHAT HAPPENS, which is not what this used to claim. The
@@ -10918,7 +10926,7 @@ class PortHolder:
             # socket stays bound and unaccepted, so every wired session
             # hangs rather than failing over. See `degrade_now`.
             self.degrade_now()
-            return "wait_out"
+            return "continue"
         # STILL LOCKED, deliberately: the backoff is bounded (at most
         # `_HOLD_RESTART_MAX_S`) and the retry it leads into writes
         # `self._proc`, which is exactly what this lock serializes against
@@ -10932,9 +10940,10 @@ class PortHolder:
         # here never loops back through the top of this `while` to
         # wait on the SAME already-dead `self._proc` again — it climbs
         # this exact ladder itself and either lands a new `self._proc`
-        # (True) or has already called `degrade_now()` (False).
-        if not self._spawn_retrying():
-            return "wait_out"
+        # or has already called `degrade_now()`; either way the caller's
+        # next lap notices for itself, so the two no longer need telling
+        # apart here.
+        self._spawn_retrying()
         return "continue"
 
     def stop(self) -> None:
@@ -11011,19 +11020,26 @@ class PortHolder:
                     proc.kill()
                 except (OSError, ValueError):
                     pass
-        # JOINED BEFORE THE CLOSE, not merely signalled (T1193). Unlike the
-        # ordinary supervisor thread, `_run_degraded` (when running) is
-        # ACTIVELY calling `poller.poll()`/`self._srv.accept()` on this same
-        # socket from another thread — closing it out from under a still-
-        # running syscall on the same fd is a use-after-close race, not
-        # merely the accept()-does-not-wake-on-close gap documented
-        # elsewhere in this file. `self._stop` (set above) is what it is
-        # actually waiting on, and it checks that at least once a second
-        # (`_accept_degraded`'s own poll granularity), so a bounded join
-        # here is a real wait, not a guess.
-        degraded_thread = getattr(self, "_degraded_thread", None)
-        if degraded_thread is not None:
-            degraded_thread.join(timeout=5.0)
+        # JOINED BEFORE THE CLOSE, not merely signalled (T1193). ONE THREAD
+        # now covers both ordinary supervision and the degraded branch, and
+        # while degraded it is ACTIVELY calling `poller.poll()`/
+        # `self._srv.accept()` on this same socket — closing it out from
+        # under a still-running syscall on the same fd is a use-after-close
+        # race, not merely the accept()-does-not-wake-on-close gap
+        # documented elsewhere in this file. `self._stop` (set above) is
+        # what it is actually waiting on, and it checks that at least once
+        # a second (`_accept_degraded`'s own poll granularity), so a
+        # bounded join here is a real wait, not a guess.
+        #
+        # ONLY FROM ANOTHER THREAD. The clean-exit release path calls
+        # `stop()` from INSIDE `_supervise` itself (`_supervise_locked`'s
+        # `code == 0`, not-pinned branch) — `Thread.join()` on the CURRENT
+        # thread raises `RuntimeError` rather than returning, which used to
+        # escape uncaught, skip `self._srv.close()` below, and print a
+        # traceback instead of releasing the port.
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
         try:
             self._srv.close()
         except OSError:
