@@ -5935,7 +5935,7 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
         )
 
     def case_the_degraded_early_stop_check_terminates_the_successor_once(
-            self, tmp_path):
+            self):
         """proxy.py:10728: the degraded loop's own early-stop check used
         to do a bare `proc.terminate()` with no reap, so `returncode`
         stayed `None`; a later `_terminate_proc` call on the same proc
@@ -5973,10 +5973,6 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
                 self._standby = None
                 self._srv = type("_Srv", (), {"close": lambda self: None})()
                 self._replace_lock = threading.RLock()
-                self.port = 36301
-                self.daemon_pid = None
-                self._failures = 0
-                self._certdir = tmp_path
                 self._thread = None
 
             def _accept_degraded(self, retry_after=None):
