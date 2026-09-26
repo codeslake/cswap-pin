@@ -15062,15 +15062,17 @@ class TestAMisroutedSwapCannotKillASession:
 
     def case_a_missing_authorization_header_is_not_falsely_retried_fresh(
             self, certdir, monkeypatch):
-        """T1182: a pinned request that arrives with NO `Authorization`
-        header sets `swapped=True` anyway (nothing there to substitute)
-        and, on refusal, `refused_auth=""`. `provider(refused="")` never
-        equals `f"Bearer {token}"`, so the untouched cached token used to
-        read as "fresh" and log a false `retried-fresh` while the request
-        went out a THIRD time. `refetch` must treat an empty
-        `refused_bearer` as nothing to compare against, the guard the
-        absolute-form path already applies before ever calling in
-        (`unswapped` is armed only when an Authorization header exists)."""
+        """T1193: a pinned request that arrives with NO `Authorization`
+        header has nothing to substitute, so it must never be armed for a
+        take-back in the first place -- the same guard the absolute-form
+        path already applies before ever calling in (`unswapped` is armed
+        only when an Authorization header exists). `swapped` used to be
+        set unconditionally once a token was minted, so a request with no
+        Authorization header was sent, refused, and RE-SENT byte-identical
+        by the take-back -- twice on the wire for one arrival, and a
+        `swap refused ... fell-back` line logged for a request that was
+        never actually swapped (rc-gate row 13 counts that line as an
+        artifact FAIL)."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
 
@@ -15100,29 +15102,117 @@ class TestAMisroutedSwapCannotKillASession:
             # `auths_seen` on a timing that races this request. Every
             # other case in this class uses this route for the same
             # reason.
-            # A genuine 401 IS the right answer here: the fallback resends
-            # the SAME headers the client arrived with (no Authorization),
-            # so there is nothing better to offer it either. What this
-            # case is about is the COUNT: exactly one swapped attempt and
-            # one unswapped fallback, never a false "fresh" retry in
-            # between.
+            # A genuine 401 IS the right answer here: there is nothing to
+            # swap, so the upstream's own refusal is the only honest
+            # answer -- and it must be reached with exactly ONE request,
+            # never a take-back re-sending the same bytes.
             status = _request_through_proxy(
                 proxy.port, certdir / "ca.pem", "/api/frame/deploy/direct",
             )
             assert status == 401, f"expected the upstream's own refusal: {status}"
-            assert len(upstream.auths_seen) == 2, (
-                "a request with no Authorization header must be sent "
-                f"exactly twice, not retried a third time on a false "
-                f"match: {upstream.auths_seen}"
+            assert len(upstream.auths_seen) == 1, (
+                "a request with no Authorization header was never actually "
+                f"swapped, so it must reach the upstream exactly once, not "
+                f"be re-sent by a take-back: {upstream.auths_seen}"
             )
             swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
-            assert not any("retried-fresh" in ln for ln in swap_lines), (
-                f"there was nothing to swap, so no genuinely fresh token "
-                f"exists to retry with: {lines}"
+            assert not swap_lines, (
+                f"nothing was swapped, so there is nothing to take back and "
+                f"no 'swap refused' line to log: {lines}"
             )
         finally:
             proxy.stop()
             upstream.stop()
+            pp._log_lifecycle = real_log
+
+    def case_a_swap_refused_line_is_keyed_on_three_segments_under_api_oauth(
+            self, certdir):
+        """T1193: `/api/oauth/files/<id>/content` (an rc-gate row 13
+        artifact route) used to share its two-segment family
+        (`/api/oauth`) with `/api/oauth/validate` and `/api/oauth/profile`
+        -- a files fall-back inside a validate fall-back's own cooldown
+        folded into the validate line's "; N more", and the gate could
+        read PASS off a suppressed line naming a different route than the
+        one it was counting. Three requests, one cooldown: files (its own
+        family), validate (its own family, absolute-form with a `?query`),
+        then validate again with a DIFFERENT query -- same family, so it
+        must fold rather than print its own line, which is only true if
+        the query is stripped BEFORE the family is computed, not carried
+        into it (the absolute-form `rel.split("?", 1)[0]` this exercises).
+        Red against all three reverts if any is undone: outcome-alone
+        (files and validate would share one line), two segments (both
+        collapse to `/api/oauth`, same result), or a dropped query strip
+        (the second validate would print its own line instead of
+        folding)."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        def _reject_pin_token(req_bytes):
+            head = req_bytes.split(b"\r\n\r\n", 1)[0]
+            auth = None
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"authorization:"):
+                    auth = line.split(b":", 1)[1].strip()
+            if auth == b"Bearer PINTOKEN":
+                return (b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n"
+                        b"Connection: close\r\n\r\n")
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+        chain = _RecordingChain(_reject_pin_token)
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+
+            def _send(path):
+                c = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                try:
+                    c.sendall(
+                        f"POST https://api.anthropic.com{path} HTTP/1.1\r\n"
+                        f"Host: api.anthropic.com\r\n"
+                        f"Authorization: Bearer disk-token\r\n"
+                        f"Content-Length: 0\r\n\r\n".encode("latin1"))
+                    c.settimeout(10)
+                    got = b""
+                    while b"\r\n\r\n" not in got:
+                        d = c.recv(4096)
+                        if not d:
+                            break
+                        got += d
+                    return got
+                finally:
+                    c.close()
+
+            resp_files = _send("/api/oauth/files/id1/content?sig=abc")
+            resp_validate = _send("/api/oauth/validate")
+            resp_validate2 = _send("/api/oauth/validate?x=2")
+            for name, got in (("files", resp_files),
+                              ("validate", resp_validate),
+                              ("validate2", resp_validate2)):
+                assert got.startswith(b"HTTP/1.1 200"), f"{name}: {got[:60]!r}"
+
+            swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
+            assert swap_lines == [
+                "swap refused (401) on POST /api/oauth/files/id1/content: "
+                "fell-back",
+                "swap refused (401) on POST /api/oauth/validate: fell-back",
+            ], (
+                f"a files fall-back must not share a line with a validate "
+                f"fall-back, and a second validate fall-back (even with a "
+                f"different query) must fold into the first instead of "
+                f"printing its own line: {lines}"
+            )
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
             pp._log_lifecycle = real_log
 
     def case_the_refetch_takes_every_shape_the_real_provider_can_answer(
@@ -15207,7 +15297,8 @@ class TestAMisroutedSwapCannotKillASession:
                  reject_bearer="stale-token", reject_status=401,
                  status_ok=lambda s: s == 200,
                  expect_auths=["Bearer stale-token", "Bearer disk-token"],
-                 expect_reads=2, expect_can_pin_cached=True),
+                 expect_reads=2, expect_can_pin_cached=True,
+                 expect_blind_reason=""),
             dict(name="d: a foreign re-read is not spliced in",
                  token_for_read=lambda n: "pin-token" if n == 1 else "foreign-token",
                  reject_bearer="pin-token", reject_status=401,
@@ -15263,6 +15354,14 @@ class TestAMisroutedSwapCannotKillASession:
                     assert (provider.can_pin_cached()
                            is row["expect_can_pin_cached"]), (
                         f"{row['name']}: can_pin_cached mismatch")
+                if row.get("expect_blind_reason") is not None:
+                    # AN EMPTY RE-READ MUST NOT BLIND `provider` when a
+                    # live credential is already cached -- `can_pin_cached`
+                    # alone does not prove that: it is set from the cache,
+                    # never from `blind_reason`, so a docstring's claim
+                    # about blinding needs its own assertion.
+                    assert provider.blind_reason == row["expect_blind_reason"], (
+                        f"{row['name']}: blind_reason={provider.blind_reason!r}")
             finally:
                 proxy.stop()
                 upstream.stop()

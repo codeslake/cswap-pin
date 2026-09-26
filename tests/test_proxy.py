@@ -4466,6 +4466,52 @@ class TestASpawnFailureIsNotFatal:
         finally:
             holder.stop()
 
+    def case_a_raising_standby_spawn_does_not_kill_the_promotion(
+            self, tmp_path, monkeypatch):
+        """T1294: `_spawn_standby()`'s own `Popen` was unwrapped in
+        `start()` -- an `OSError` (fork EAGAIN/EMFILE) or `ValueError` (a
+        closed fd) right after a promotion's own spawn used to escape
+        uncaught and kill the very process that had JUST won the
+        promotion, taking the daemon it had started down with it. Wrapped
+        the same way `_on_replace_request` wraps its own one-shot spawn:
+        no retry ladder -- a missing standby is a warning (`_reap_standby`
+        already covers it), not a reason to fight the same failure
+        twice."""
+        from cswap_pin.proxy import PortHolder
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+
+        def _spawn_ok(self):
+            self._proc = TestASpawnFailureIsNotFatal._BlockingProc()
+            self.daemon_pid = 4242
+
+        def _raising_standby(self):
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _spawn_ok)
+        monkeypatch.setattr(PortHolder, "_spawn_standby", _raising_standby)
+
+        holder = PortHolder(tmp_path, "1", "a@b.c", sock=srv)
+        try:
+            result = holder.start()
+            assert result is True, (
+                f"a raising standby spawn must not stop the promotion "
+                f"from reporting success: start() -> {result!r}"
+            )
+            assert holder._thread is not None and holder._thread.is_alive(), (
+                "the supervisor thread never started -- a raising standby "
+                "spawn killed the promotion instead of being logged and "
+                "skipped"
+            )
+        finally:
+            holder.stop()
+
     def case_a_permanently_raising_respawn_reaches_degrade_now(
             self, tmp_path, monkeypatch):
         """The cold start succeeds; the daemon then crashes, and every
@@ -4549,6 +4595,86 @@ class TestASpawnFailureIsNotFatal:
                     f"a non-capping attempt should still say retrying: "
                     f"{line!r}"
                 )
+        finally:
+            holder.stop()
+
+    def case_failures_reset_after_a_daemon_has_served_for_a_while(
+            self, tmp_path, monkeypatch):
+        """T1294: `self._failures` was reset only on a clean exit or a
+        redeploy ask -- never after an ORDINARY crash respawned
+        successfully -- so it counted crashes over the HOLDER's whole
+        life, not the CONSECUTIVE ones `_HOLD_DEGRADE_AT`'s own docstring
+        describes. A daemon that served for hours between two unrelated
+        crashes was already most of the way to a degrade neither crash,
+        alone, deserved. Two drives, same total crash count (more than
+        `_HOLD_DEGRADE_AT`): every daemon served past
+        `_HOLD_FAILURE_RESET_AFTER_S` before its own crash (must never
+        degrade -- each one resets), then a tight burst where none of
+        them did (must still degrade). The "served past" state is set
+        directly on `_proc_spawned_at` rather than by really sleeping,
+        so this case costs milliseconds either way."""
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, PortHolder, ensure_ca
+        from cswap_pin import proxy as pin_proxy
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+
+        procs = []
+        served_long = {"on": False}
+
+        def _spawn_ok(self):
+            proc = TestASpawnFailureIsNotFatal._BlockingProc()
+            procs.append(proc)
+            self._proc = proc
+            self.daemon_pid = 1000 + len(procs)
+            self._proc_spawned_at = (
+                time.monotonic() - pin_proxy._HOLD_FAILURE_RESET_AFTER_S - 1
+                if served_long["on"] else time.monotonic())
+
+        monkeypatch.setattr(PortHolder, "_spawn", _spawn_ok)
+
+        degraded = {"on": False}
+        monkeypatch.setattr(
+            PortHolder, "degrade_now",
+            lambda self: degraded.__setitem__("on", True))
+
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        try:
+            holder.start()
+            assert len(procs) == 1, "premise: the cold start did not spawn cleanly"
+
+            served_long["on"] = True
+            for _ in range(_HOLD_DEGRADE_AT + 3):
+                if degraded["on"]:
+                    break
+                n_before = len(procs)
+                procs[-1].exit(1)
+                deadline = time.time() + 5
+                while (len(procs) <= n_before and not degraded["on"]
+                       and time.time() < deadline):
+                    time.sleep(0.01)
+            assert not degraded["on"], (
+                f"{holder._failures} failures accumulated even though "
+                f"every daemon served past _HOLD_FAILURE_RESET_AFTER_S "
+                f"before crashing -- each one should have reset the count"
+            )
+
+            served_long["on"] = False
+            for _ in range(_HOLD_DEGRADE_AT + 3):
+                if degraded["on"]:
+                    break
+                n_before = len(procs)
+                procs[-1].exit(1)
+                deadline = time.time() + 5
+                while (len(procs) <= n_before and not degraded["on"]
+                       and time.time() < deadline):
+                    time.sleep(0.01)
+            assert degraded["on"], (
+                "a tight burst of crashes, none served long enough to "
+                "reset, must still degrade"
+            )
         finally:
             holder.stop()
 
@@ -4652,10 +4778,10 @@ class TestASpawnFailureIsNotFatal:
         attempt, with no retry ladder in between, so `holder_main`'s `except
         OSError` can end the process and free the launcher, which is
         already waiting on a state file that will never appear. A ladder
-        here would cost up to `_HOLD_DEGRADE_AT` backoffs (measured: up to
-        22.5s), longer than the launcher's own `_SPAWN_WAIT_S`, during which
-        `unwire_if_dead` keeps wiring live sessions to a port about to be
-        refused anyway.
+        here would cost up to `_HOLD_DEGRADE_AT` backoffs -- COMPUTED, not
+        measured: 0.5+1+2+4+5+5+5 = 22.5s, longer than the launcher's own
+        `_SPAWN_WAIT_S`, during which `unwire_if_dead` keeps wiring live
+        sessions to a port about to be refused anyway.
         """
         from cswap_pin.proxy import PortHolder, ensure_ca
 
@@ -4685,13 +4811,16 @@ class TestASpawnFailureIsNotFatal:
         -- raising out of `start()` here would kill this process mid-call
         rather than through its own control flow, so a permanently failing
         spawn climbs the retry ladder and reports failure instead of
-        raising. It does NOT end up serving the port unpinned: nobody past
-        `start()` joins on a `None` `holder._thread`, so `_standby_revive`
-        returns, `standby_main` returns, and the interpreter exits right
-        behind it, taking `degrade_now()`'s acceptor thread down with it --
-        the port ends refused, same as a cold start's raise, just a little
-        later. Driven off-thread and joined with a timeout for the same
-        reason as the cold-start case above."""
+        raising. This case is about that report alone -- `start()` ->
+        False, no supervisor thread -- so `degrade_now()` is stubbed the
+        same way `case_the_capping_attempt_does_not_say_retrying` stubs
+        it: the real one now starts a degraded acceptor and `start()`
+        blocks on it (`_wait_out_degraded`, T1294) before handing the
+        False back, which is exactly what keeps THAT process serving --
+        covered by its own case below -- but would hang this one's 5s
+        join on a thread nothing here ever tells to stop. Driven
+        off-thread and joined with a timeout so a regression to an
+        uncapped retry hangs this case instead of the whole suite."""
         from cswap_pin.proxy import PortHolder
 
         certdir = tmp_path / "pin-proxy"
@@ -4703,6 +4832,7 @@ class TestASpawnFailureIsNotFatal:
         srv.listen(8)
 
         monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "degrade_now", lambda self: None)
 
         def _always_raise(self):
             raise OSError("fork: Resource temporarily unavailable")
@@ -4746,6 +4876,96 @@ class TestASpawnFailureIsNotFatal:
             )
         finally:
             holder.stop()
+
+    def case_a_degraded_holder_stays_up_through_holder_mains_own_join(
+            self, tmp_path, monkeypatch):
+        """T1294: `holder_main`'s own tail is `run_service()` then, only if
+        a supervisor thread exists, `holder._thread.join()` -- and once
+        that join returns, `holder_main` returns right behind it and the
+        PROCESS exits, taking every daemon thread with it, including
+        `degrade_now()`'s own `_accept_degraded` acceptor and the socket
+        it serves. `_supervise` used to return right after `degrade_now()`
+        started that acceptor, so the join returned almost at once and the
+        process exited behind it.
+
+        FORKED, not run in-process: an in-process check could never see
+        this defect. THIS test's own daemon threads survive regardless of
+        whether `_supervise`'s thread has returned -- only a real process
+        boundary shows a thread dying with its process. The child never
+        returns to pytest; it always ends in `os._exit`, matching
+        `holder_main`'s own shape (spawn, degrade, join, exit)."""
+        import contextlib
+        import signal
+
+        from cswap_pin.proxy import PortHolder, ensure_ca, run_service
+
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+
+        calls = []
+
+        def _flaky_spawn(self):
+            calls.append(1)
+            if len(calls) == 1:
+                # THE COLD START SUCCEEDS -- this case is about the
+                # RESPAWNS after it, not the first spawn.
+                self._proc = TestASpawnFailureIsNotFatal._BlockingProc()
+                self.daemon_pid = 1000
+                return
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _flaky_spawn)
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r_fd)
+            try:
+                holder = run_service(tmp_path, "1", "a@b.c")
+                os.write(w_fd, str(holder.port).encode())
+                os.close(w_fd)
+                # A SINGLE CRASH, cascading through the WHOLE ladder: the
+                # daemon exits non-zero, `_supervise` respawns, every
+                # respawn past the first raises (see `_flaky_spawn`), and
+                # with `_backoff` patched to 0.0 the ladder reaches
+                # `_HOLD_DEGRADE_AT` in milliseconds, not seconds.
+                holder._proc.exit(1)
+                if holder._thread is not None:
+                    holder._thread.join()
+            finally:
+                os._exit(0)  # holder_main's own tail: the process just ends
+
+        os.close(w_fd)
+        try:
+            port = int(os.read(r_fd, 32).decode())
+            os.close(r_fd)
+
+            # LET THE CASCADE FINISH AND `holder_main`'S OWN JOIN EITHER
+            # RETURN (the bug: this process has exited by now) OR BLOCK ON
+            # THE DEGRADED ACCEPTOR (the fix: still up, still serving).
+            time.sleep(1.0)
+
+            try:
+                conn = socket.create_connection(
+                    ("127.0.0.1", port), timeout=2)
+                conn.close()
+                answered = True
+            except OSError:
+                answered = False
+            assert answered, (
+                f"port {port} refused once the holder_main-shaped join "
+                f"returned -- the degraded holder's own process exited "
+                f"behind it and took the acceptor and the socket down "
+                f"with it"
+            )
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
 
 
 class TestHolderCrashIsSurvivable:
@@ -10040,6 +10260,34 @@ class TestDaemonPortStability:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
+    @staticmethod
+    def _probe_no_refusal_window(addr, other_pid_seen, deadline_s=5,
+                                 connect_timeout_s=3):
+        """Poll `addr` until `other_pid_seen()` is truthy or `deadline_s`
+        elapses, with NO SLEEP between tries — a structural window here is
+        narrow, and a probe that pauses is looking away for most of what
+        it is meant to catch. Returns how many attempts were refused.
+
+        A CONNECT TIMEOUT COUNTS THE SAME AS A REFUSAL (T1294): MEASURED
+        on a macOS CI run, attempt 1 raised `TimeoutError` rather than
+        `ConnectionRefusedError` — a slow runner's own hiccup, since
+        T1274 did not change the respawn timing before or after. Bare
+        `except ConnectionRefusedError` let that escape uncaught and
+        failed the case with the wrong exception instead of a clean
+        assertion. `connect_timeout_s` is also raised past the daemon
+        case's old 2s so a slow runner is less likely to hit it at all.
+        """
+        refused = 0
+        deadline = time.monotonic() + deadline_s
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(addr, timeout=connect_timeout_s).close()
+            except (ConnectionRefusedError, TimeoutError):
+                refused += 1
+            if other_pid_seen():
+                break
+        return refused
+
     def _accept_conn_readable(self) -> bool:
         """Whether THIS platform can read SO_ACCEPTCONN off a live socket.
 
@@ -12698,21 +12946,63 @@ print("OK", port)
             # own local repro missed it 8 runs out of 8. A probe that pauses
             # 20 ms between attempts is looking away for most of the window it
             # is meant to catch.
-            refused = 0
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                try:
-                    socket.create_connection(("127.0.0.1", port), timeout=2).close()
-                except ConnectionRefusedError:
-                    refused += 1
-                if holder.daemon_pid not in (None, first):
-                    break
+            refused = self._probe_no_refusal_window(
+                ("127.0.0.1", port),
+                lambda: holder.daemon_pid not in (None, first))
             assert refused == 0, f"{refused} connections refused while the daemon was dead"
             assert holder.daemon_pid not in (None, first), (
                 "the holder did not restart the daemon it supervises"
             )
         finally:
             holder.stop()
+
+    def case_a_connect_timeout_does_not_escape_the_no_refusal_probe(
+            self, tmp_path):
+        """T1294: MEASURED on a macOS CI run (36189117014, attempt 1) --
+        the SIGKILL case's own polling loop raised a bare `TimeoutError`
+        instead of `ConnectionRefusedError`, once, on a slow runner (T1274
+        did not change the respawn timing before or after, so the daemon
+        side is not what moved). The loop caught only
+        `ConnectionRefusedError` and had no sleep, so that escaped
+        uncaught. Reproduced here the same way T1272 did, deterministic
+        and without a real daemon or SIGKILL: fill a real listener's
+        backlog by completing handshakes and never accepting them, so the
+        NEXT connect times out rather than being refused."""
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(0)
+        addr = lsn.getsockname()
+
+        clients = []
+        try:
+            for _ in range(200):
+                c = socket.socket()
+                c.settimeout(0.3)
+                try:
+                    c.connect(addr)
+                    clients.append(c)
+                except OSError:
+                    c.close()
+                    break
+            else:
+                raise AssertionError(
+                    "never filled the backlog — the queue kept accepting"
+                )
+
+            # A SATURATED BACKLOG FOR THE WHOLE PROBE: `other_pid_seen`
+            # never fires, so this runs to its own short deadline and
+            # every attempt inside it must hit the timeout this case
+            # exists to reproduce.
+            refused = TestDaemonPortStability._probe_no_refusal_window(
+                addr, lambda: False, deadline_s=0.6, connect_timeout_s=0.2)
+            assert refused >= 1, (
+                "premise: the saturated backlog never actually produced "
+                "a connect timeout for the probe to survive"
+            )
+        finally:
+            for c in clients:
+                c.close()
+            lsn.close()
 
     def case_a_term_is_never_dropped_by_a_parked_main_thread(self, tmp_path):
         """One SIGTERM must be enough, whichever thread the kernel picks.
