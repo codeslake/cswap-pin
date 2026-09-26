@@ -15190,19 +15190,24 @@ class PinProxy:
             # A WINDOW-BASED VERDICT NEEDS AN OBSERVER THAT LIVED THROUGH THE
             # WHOLE WINDOW. A bridge inherited on a handover may have held its
             # stream with a predecessor that had just closed every
-            # connection, so this process never saw it hold one -- and a hop
-            # that relays an upstream error INSIDE the tunnel (a 502 answered
-            # after CONNECT, not a refusal) never stamps
-            # `_egress_refused_last_monotonic`, so `blind_refused` alone
-            # misses that case. `deaf_for(b) is None` is this process's own
+            # connection, so this process never saw it hold one.
+            # `deaf_for(b) is None` is this process's own
             # "never watched it": mute already ruled out the not-`now`-list
             # shape above, so `now` here is the plain bridge-id list.
             started = getattr(self, "_started_monotonic", None)
+            first_post = getattr(self, "_bridge_first_post", None) or {}
             young = (
                 started is not None
                 and time.monotonic() - started <= _DEAF_WINDOW_S
                 and not mute
-                and any(self.deaf_for(b) is None for b in now)
+                # A BRIDGE BORN IN THIS PROCESS is not the ambiguous case
+                # `young` exists for: this process watched its whole life, so
+                # `deaf_for(b) is None` here means "never got a stream", not
+                # "might have missed a handover" -- excluding it lets a
+                # from-birth deaf bridge MARK instead of waiting out the
+                # window plus a cooldown for no reason.
+                and any(self.deaf_for(b) is None and b not in first_post
+                        for b in now)
             )
             prev = getattr(self, "_last_deaf", None)
             # A BLIND EMITTED BECAUSE *THIS* PROCESS WAS DRAINING, OR
@@ -15283,8 +15288,7 @@ class PinProxy:
                     f"shorter than the {int(_DEAF_WINDOW_S)}s window it "
                     "judges, and never saw these bridges hold a stream here "
                     "-- the stream may have been held by a predecessor that "
-                    "is gone, or a hop relaying errors inside the tunnel "
-                    "never stamps the refused clock: "
+                    "is gone: "
                     + " ".join(self._with_deaf_age(b) for b in now)
                 )
             elif now:

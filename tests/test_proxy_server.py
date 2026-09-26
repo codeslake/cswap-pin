@@ -8117,6 +8117,47 @@ class _Chatty:
         return 1
 
 
+def test_a_hot_stamp_left_by_a_plain_test_does_not_blind_the_first_run_cases_deaf_case(
+        request, tmp_path_factory):
+    """T1327 #3: `run_cases` (`conftest.py`) resets `_hop_trouble_at` only
+    AFTER each case it drives. A plain test outside that loop which pokes the
+    global directly and never restores it -- no `finally` of its own, exactly
+    what `TestATransportOutageIsNotASessionEnding` does in `test_proxy.py` --
+    leaves it hot for whatever `run_cases` call comes next: the after-reset
+    only clears it once THAT case has already run under the polluted value.
+    """
+    import cswap_pin.proxy as pp
+
+    # SIMULATES THE POLLUTION, wall clock (matches `_note_hop_trouble`, not
+    # `time.monotonic`): a plain test just stamped it and left.
+    with pp._hop_trouble_lock:
+        pp._hop_trouble_at = time.time()
+
+    lines = []
+    real_log = pp._log_lifecycle
+    pp._log_lifecycle = lines.append
+
+    class _Holder:
+        def case_first(self):
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_HOT/worker/messages")
+            srv._connected_bridges = {"cse_HOT"}
+            srv._report_deaf_bridges()
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+
+    try:
+        run_cases(_Holder(), request, tmp_path_factory)
+    finally:
+        pp._log_lifecycle = real_log
+        with pp._hop_trouble_lock:
+            pp._hop_trouble_at = 0.0
+
+
 class TestDrainReportsWhatItCut:
     """The drain line must say what was still open, not always zero.
 
@@ -11646,6 +11687,44 @@ class TestDrainReportsWhatItCut:
             assert lines and pp.DEAF_REPORT_MARK in lines[-1], (
                 "a process older than the window it judges suppressed a "
                 f"true MARK: {lines!r}")
+            assert pp.DEAF_REPORT_BLIND not in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_a_bridge_born_in_a_young_process_still_marks(self, monkeypatch):
+        """T1327 #4: `young` exists for a bridge this process only INHERITED
+        and never watched hold a stream -- `cse_INHERITED` above. A bridge
+        BORN here (`_bridge_first_post` holds it) is not that case: this
+        process watched its whole life, so a deaf verdict for it is real and
+        must MARK even though the process itself is still young."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1000.0)
+            srv._started_monotonic = 960.0  # 40s old: still young (<300s)
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_BORN/worker/messages")
+            # BORN HERE, not inherited: its first post predates the grace
+            # window (40s ago, past `_DEAF_STARTUP_GRACE_S` of 30s) but is
+            # still within this young process's own life.
+            srv._bridge_first_post["cse_BORN"] = 960.0
+            srv._connected_bridges = {"cse_BORN"}
+
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], (
+                "a bridge born in this process, never streamed, was named "
+                f"BLIND instead of a real MARK: {lines!r}")
             assert pp.DEAF_REPORT_BLIND not in lines[-1], lines[-1]
         finally:
             pp._log_lifecycle = real_log
