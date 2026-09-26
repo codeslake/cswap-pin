@@ -11702,6 +11702,98 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_relayed_5xx_blinds_an_old_process_too(self, monkeypatch):
+        """I1: `_egress_refused_last_monotonic` is stamped only for a DIAL
+        the hop itself refused. A hop that accepts CONNECT and relays the
+        pin's own upstream's 5xx INSIDE the tunnel never stamps it, so an
+        OLD process (unlike the young-process case above, this one has no
+        `_started_monotonic` at all) still MARKed a bridge whose post may
+        never have reached the server. `_note_hop_trouble` already records
+        this on the module global `_hop_trouble_at`; `_report_deaf_bridges`
+        must read it too.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        real_hop_trouble_at = pp._hop_trouble_at
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+            # No `_started_monotonic`: an old process, same as every
+            # instance built via `__new__` before that attribute existed --
+            # the `young` latch must not be why this fires.
+
+            monkeypatch.setattr(pp.time, "time", lambda: 2000.0)
+            pp._hop_trouble_at = 2000.0 - 10.0  # the upstream's 5xx, 10s ago
+
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_RELAYED/worker/messages")
+            srv._connected_bridges = {"cse_RELAYED"}
+
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_BLIND in lines[-1], (
+                "a relayed 5xx inside the tunnel did not blind an old "
+                f"process's verdict: {lines!r}")
+            assert pp.DEAF_REPORT_MARK not in lines[-1], lines[-1]
+            assert "cse_RELAYED" in lines[-1], lines[-1]
+            assert "10s ago" in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+            pp._hop_trouble_at = real_hop_trouble_at
+
+    def case_CONTROL_a_stale_hop_trouble_stamp_still_marks(self, monkeypatch):
+        """The control: a 5xx from long before the window must not blind a
+        verdict it has nothing to do with."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        real_hop_trouble_at = pp._hop_trouble_at
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            monkeypatch.setattr(pp.time, "time", lambda: 2000.0)
+            pp._hop_trouble_at = 2000.0 - pp._DEAF_WINDOW_S - 1.0
+
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_STALEHOP/worker/messages")
+            srv._connected_bridges = {"cse_STALEHOP"}
+
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], (
+                "a hop-trouble stamp older than the window suppressed a "
+                f"true MARK: {lines!r}")
+            assert pp.DEAF_REPORT_BLIND not in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+            pp._hop_trouble_at = real_hop_trouble_at
+
+    def case_the_production_wiring_stamps_started_monotonic(self, certdir):
+        """m2: nothing exercised `PinProxy.__init__` itself for this stamp --
+        every deaf-report case above builds one through `__new__`, which
+        skips `__init__` entirely and would stay green even if the real
+        constructor stopped setting it."""
+        from cswap_pin.proxy import PinProxy
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        assert isinstance(proxy._started_monotonic, float), (
+            "a PinProxy built through __init__ must carry its own start "
+            "clock")
+
     def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
         """Nothing recorded whether a claude.ai attachment ever downloaded.
 

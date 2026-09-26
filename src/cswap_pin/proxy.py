@@ -13551,10 +13551,11 @@ class PinProxy:
         self._certdir = Path(certdir)
         # MONOTONIC, stamped once here — `_report_deaf_bridges` reads this to
         # tell an instance too young to have watched a bridge through its
-        # whole `_DEAF_WINDOW_S` from one old enough to judge it. Every
-        # existing test builds a `PinProxy` via `__new__`, which never runs
-        # this line, so `getattr(self, "_started_monotonic", None)` reads
-        # None there and behaves exactly as before this attribute existed.
+        # whole `_DEAF_WINDOW_S` from one old enough to judge it. The
+        # deaf-report tests build a `PinProxy` via `__new__`, which never
+        # runs this line, so `getattr(self, "_started_monotonic", None)`
+        # reads None there and behaves exactly as before this attribute
+        # existed.
         self._started_monotonic = time.monotonic()
         self._pin_token_provider = pin_token_provider
         # Where the MITM'd anthropic request is really sent. Defaults to the
@@ -15168,9 +15169,24 @@ class PinProxy:
             # one taken while a predecessor drains.
             refused_last = getattr(self, "_egress_refused_last_monotonic",
                                     None)
-            blind_refused = (refused_last is not None
-                              and time.monotonic() - refused_last
-                              <= _DEAF_WINDOW_S)
+            egress_blind = (refused_last is not None
+                             and time.monotonic() - refused_last
+                             <= _DEAF_WINDOW_S)
+            # A REFUSED DIAL AND A RELAYED FAILURE ARE THE SAME QUESTION: the
+            # hop that accepts CONNECT and answers the pin's own upstream's
+            # 5xx INSIDE the tunnel never stamps `_egress_refused_last_
+            # monotonic` -- that stamp is for a dial the hop itself refused,
+            # not for a request the hop forwarded and the far end failed.
+            # `_note_hop_trouble` already records that case on the module
+            # global `_hop_trouble_at` (wall clock); read it here too rather
+            # than `_hop_recently_failed()`, whose `_HOP_TROUBLE_SECONDS` is
+            # a different, shorter question about the stream-404 guard.
+            with _hop_trouble_lock:
+                hop_trouble_at = _hop_trouble_at
+            hop_blind = (bool(hop_trouble_at)
+                         and 0 <= time.time() - hop_trouble_at
+                         <= _DEAF_WINDOW_S)
+            blind_refused = egress_blind or hop_blind
             # A WINDOW-BASED VERDICT NEEDS AN OBSERVER THAT LIVED THROUGH THE
             # WHOLE WINDOW. A bridge inherited on a handover may have held its
             # stream with a predecessor that had just closed every
@@ -15240,13 +15256,25 @@ class PinProxy:
                 )
             elif now and blind_refused:
                 self._last_deaf_blind_refused = True
-                age = int(time.monotonic() - refused_last)
-                _log_lifecycle(
-                    f"{DEAF_REPORT_BLIND} — egress was refused {age}s ago, "
-                    "so a post inside that window may never have reached "
-                    "the server: "
-                    + " ".join(self._with_deaf_age(b) for b in now)
-                )
+                # WHICH ONE FIRED, not just that one did: `egress_blind`
+                # guards `refused_last` here, so this never reaches
+                # `int(... - None)` when only the hop-trouble side is true.
+                if egress_blind:
+                    age = int(time.monotonic() - refused_last)
+                    _log_lifecycle(
+                        f"{DEAF_REPORT_BLIND} — egress was refused {age}s "
+                        "ago, so a post inside that window may never have "
+                        "reached the server: "
+                        + " ".join(self._with_deaf_age(b) for b in now)
+                    )
+                else:
+                    age = int(time.time() - hop_trouble_at)
+                    _log_lifecycle(
+                        f"{DEAF_REPORT_BLIND} — the upstream answered a 5xx "
+                        f"{age}s ago, so a post inside that window may "
+                        "never have reached the server: "
+                        + " ".join(self._with_deaf_age(b) for b in now)
+                    )
             elif now and young:
                 self._last_deaf_blind_young = True
                 age = int(time.monotonic() - started)
