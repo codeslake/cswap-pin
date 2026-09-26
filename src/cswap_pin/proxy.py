@@ -10662,6 +10662,21 @@ class PortHolder:
                     f"on its own"
                 )
                 return
+            # ponytail: a SIGTERM (`_cleanup`, see `_install_signal_teardown`)
+            # nested INSIDE this call, between `_spawn`'s `Popen()` and its
+            # `self._proc = proc` (T1401), leaves the successor unassigned
+            # and therefore invisible to `stop()`'s re-read forever: this
+            # frame never resumes, because `_install_signal_teardown`'s own
+            # `finally: os._exit(...)` runs unconditionally after `_cleanup`
+            # returns, whether or not `_cleanup` actually stopped anything.
+            # A deferred-cleanup shape (mark a spawn in flight, have the
+            # nested handler stash itself and return, run it once `_spawn`
+            # finishes) would have to change that `finally` too — a second
+            # process's teardown (the daemon's own, ~13293) shares it, and
+            # widening a signal-exit contract on a hunch is a worse bet than
+            # the narrow window this leaves open. Upgrade path: give
+            # `_install_signal_teardown` its own defer hook if this window is
+            # ever the one actually measured, rather than guessed at here.
             try:
                 self._spawn()
             except (OSError, ValueError) as exc:
@@ -10711,12 +10726,7 @@ class PortHolder:
                 # that here, before this thread's next lap just exits on
                 # `self._stop` and abandons it.
                 if self._stop:
-                    proc = self._proc
-                    if proc is not None and getattr(proc, "returncode", 0) is None:
-                        try:
-                            proc.terminate()
-                        except (OSError, ValueError):
-                            pass
+                    self._terminate_proc(getattr(self, "_proc", None))
                     return
                 self._degraded = False
                 if self._standby is None:
@@ -10727,6 +10737,16 @@ class PortHolder:
                             f"could not spawn a standby for port "
                             f"{self.port}: {exc!r} — continuing without one"
                         )
+                    # STOP RACED THIS SPAWN TOO (T1401): `_spawn_standby`
+                    # runs without `self._replace_lock` (see the ban at the
+                    # top of this branch's own docstring), so a `stop()` on
+                    # another thread can read `self._standby` as `None`
+                    # and finish before this assignment lands — the same
+                    # gap the `_proc` re-check just above closes, mirrored
+                    # here for the standby.
+                    if self._stop:
+                        self._release_standby(getattr(self, "_standby", None))
+                        return
                 continue
             # CAPTURED BEFORE THE WAIT, so it still names the PREDECESSOR
             # after `wait()` returns, whatever `self._proc` has become by
@@ -10972,10 +10992,27 @@ class PortHolder:
         where it is written. ANY future path that drops a holder without first
         stopping its daemon re-opens that resurrection silently, and there is
         no guard here that would catch it.
-        """
-        import signal
-        import subprocess
 
+        A RESPAWN CAN LAND ASTRIDE THE FIRST PASS BELOW (T1401). `_spawn()`
+        assigns `self._proc` (and `_spawn_standby()` assigns `self._standby`)
+        as its own last line, and three respawn sites run on the SUPERVISOR
+        thread while this method runs on another one — nothing before T1401
+        stopped a successor from finishing its assignment right after this
+        method had already read the old value and moved on, leaving it alive,
+        never signalled, holding the fd: the exact resurrection this
+        docstring already forbids, just reached from a different direction.
+        The join below is what catches most of it (the thread cannot exit
+        while a respawn it started is still running), but a bare
+        `join(timeout=5.0)` can itself time out while the supervisor sits in
+        its own locked backoff sleep — so this re-reads `self._proc` and
+        `self._standby` a second time, under `self._replace_lock`, closing
+        `self._srv` in that same hold so a spawn under the lock can never
+        read `fileno()` astride the close. NEVER ACROSS THE JOIN ITSELF: the
+        supervisor can hold that lock for up to `_HOLD_RESTART_MAX_S` inside
+        its own backoff, and holding it while joining would deadlock the two
+        waits against each other for that whole span whenever the supervisor
+        is caught between `wait()` returning and re-taking the lock.
+        """
         self._stop = True
         # RELEASE THE STANDBY FIRST, and by SIGHUP. It is detached and outlives
         # us on purpose, so the ordering trick that saves us from the daemon's
@@ -10983,45 +11020,14 @@ class PortHolder:
         # is still there, still holding the descriptor, and will arm the moment
         # `getppid()` moves. SIGHUP, never SIGTERM. Death must keep the
         # address. Only being asked releases it.
-        #
-        # RE-SENT UNTIL CONFIRMED DEAD — see `_STANDBY_RELEASE_BOUND_S`. A
-        # single `send_signal` that `os.kill` accepts is not proof the
-        # standby is gone: the signal can arrive before `standby_main` has
-        # installed its own handler, and a stop that only fires once leaves
-        # exactly that standby behind, still holding the descriptor.
-        standby = getattr(self, "_standby", None)
-        if standby is not None and getattr(standby, "returncode", 0) is None:
-            deadline = time.monotonic() + _STANDBY_RELEASE_BOUND_S
-            while True:
-                try:
-                    standby.send_signal(signal.SIGHUP)
-                except (OSError, ValueError):
-                    break
-                try:
-                    standby.wait(timeout=0.2)
-                    break  # confirmed gone
-                except subprocess.TimeoutExpired:
-                    pass
-                if time.monotonic() >= deadline:
-                    break
+        self._release_standby(getattr(self, "_standby", None))
         # KILL THE CHILD WE STARTED, not a number we are holding. `daemon_pid`
         # is only meaningful while the Popen it came from is ours — and a pid
         # is reused freely, so signalling it after the child is gone aims at
         # whatever inherited the number. `Popen.terminate` cannot make that
         # mistake: it signals the process object, and CPython refuses once it
         # has been reaped.
-        proc = getattr(self, "_proc", None)
-        if proc is not None and getattr(proc, "returncode", 0) is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=_DRAIN_SECONDS + 2)
-            except (OSError, ValueError):
-                pass
-            except Exception:  # noqa: BLE001 — TimeoutExpired: escalate
-                try:
-                    proc.kill()
-                except (OSError, ValueError):
-                    pass
+        self._terminate_proc(getattr(self, "_proc", None))
         # JOINED BEFORE THE CLOSE, not merely signalled (T1193). ONE THREAD
         # now covers both ordinary supervision and the degraded branch, and
         # while degraded it is ACTIVELY calling `poller.poll()`/
@@ -11042,10 +11048,63 @@ class PortHolder:
         thread = getattr(self, "_thread", None)
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5.0)
+        # RE-READ, LOCKED (T1401) — see the docstring above. `_terminate_proc`
+        # and `_release_standby` are both no-ops on whatever this method's
+        # own first pass already reaped, so this only ever acts on a
+        # successor that landed in between.
+        with self._replace_lock:
+            self._terminate_proc(getattr(self, "_proc", None))
+            self._release_standby(getattr(self, "_standby", None))
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _terminate_proc(proc) -> None:
+        """Kill and reap ONE `Popen` this holder started, unless it has
+        already exited. Shared by `stop()`'s two passes (T1401) — the one
+        it captures before joining the supervisor, and the re-check after,
+        for whichever respawn might have landed in between."""
+        if proc is None or getattr(proc, "returncode", 0) is not None:
+            return
         try:
-            self._srv.close()
-        except OSError:
+            proc.terminate()
+            proc.wait(timeout=_DRAIN_SECONDS + 2)
+        except (OSError, ValueError):
             pass
+        except Exception:  # noqa: BLE001 — TimeoutExpired: escalate
+            try:
+                proc.kill()
+            except (OSError, ValueError):
+                pass
+
+    @staticmethod
+    def _release_standby(standby) -> None:
+        """SIGHUP a standby until it is confirmed gone, or
+        `_STANDBY_RELEASE_BOUND_S` runs out. RE-SENT UNTIL CONFIRMED DEAD: a
+        single `send_signal` that `os.kill` accepts is not proof the standby
+        is gone — the signal can arrive before `standby_main` has installed
+        its own handler, and a stop that only fires once leaves exactly that
+        standby behind, still holding the descriptor. Shared by `stop()`'s
+        two passes (T1401), the same way `_terminate_proc` is."""
+        import subprocess
+
+        if standby is None or getattr(standby, "returncode", 0) is not None:
+            return
+        deadline = time.monotonic() + _STANDBY_RELEASE_BOUND_S
+        while True:
+            try:
+                standby.send_signal(signal.SIGHUP)
+            except (OSError, ValueError):
+                return
+            try:
+                standby.wait(timeout=0.2)
+                return  # confirmed gone
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() >= deadline:
+                return
 
 
 def run_service(certdir: Path, account_num: str, email: str,
