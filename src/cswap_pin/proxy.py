@@ -20466,6 +20466,54 @@ def _switch_takes_exclude() -> bool:
         return False
 
 
+_EXHAUSTED_RESET_CAP_S = 300.0
+# Epoch seconds the fleet is provably exhausted until, or 0.0 when it is
+# not (or its return cannot be proved). Written ONLY inside
+# `_switch_off_walled_account`, under `_walled_switch_lock`, after the
+# `switch()` call whose verdict this is about — a debounced repeat and the
+# per-session stale-bearer early return read whatever the last decision
+# wrote and never recompute it. `_relay_response`'s `_wall_relay` branch is
+# the only reader.
+_fleet_exhausted_until: float = 0.0
+
+
+def _fleet_earliest_provable_reset() -> float | None:
+    """The fleet's earliest provable recovery — mirrors `_earliest_recovery`
+    (claude_swap/autoswitch.py) plus the disabled-slot filter it lacks: a
+    slot the user disabled is never a `switch()` candidate, so folding it in
+    here would announce a reset the fleet cannot actually reach.
+
+    ``None`` when any blocked slot's own reset is unprovable (absent, or
+    already past — it could recover at any moment, so nothing is
+    announced), or on any exception (an older host without these symbols, a
+    fake that lacks them). Call under `_walled_switch_lock`, exactly like
+    `_live_account_headroom` — `fetch=set()` forbids a network fetch, so
+    this reads store rows only.
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        poll_policy = require("poll_policy")
+        now = time.time()
+        earliest: float | None = None
+        for num, entry in sw.usage_entries_by_account(fetch=set()).items():
+            if sw.is_account_disabled(num):
+                continue
+            usage = entry.decision_value(("all",))
+            if not isinstance(usage, dict):
+                continue
+            if not any(pct >= 100.0 for _, pct, _ in
+                       oauth.relevant_windows(usage, ("all",))):
+                continue
+            reset = poll_policy.limiting_reset_ts(usage, ("all",))
+            if reset is None or reset <= now:
+                return None
+            if earliest is None or reset < earliest:
+                earliest = reset
+        return earliest
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return None
+
+
 def _switch_off_walled_account(
     reset: bytes, retry_after: bytes, auth: str = "", session: str = "",
 ) -> bool:
@@ -20543,6 +20591,7 @@ def _switch_off_walled_account(
     still debounces a storm without silencing the wall for its whole
     window.
     """
+    global _fleet_exhausted_until
     if not reset:
         _log_lifecycle(
             "429 on /v1/messages — no reset header, not an account-level "
@@ -20797,8 +20846,21 @@ def _switch_off_walled_account(
                 f"{exc.__class__.__name__}, relaying the 429 with headers "
                 f"stripped"
             )
+            _fleet_exhausted_until = 0.0
             _remember_walled_switch(key, False, cap_epoch)
             return False
+        # THE FLEET FACT, decided for every `switch()` verdict on this wall
+        # — never on the debounced-repeat or stale-bearer-session returns
+        # above, which read whatever this wrote last instead of
+        # recomputing it. `candidates-exhausted` means every switchable
+        # slot is walled and the fleet is merely exhausted, not that this
+        # particular switch failed (see `_fleet_earliest_provable_reset`);
+        # any other reason, or a landed switch, means the fact does not
+        # hold and the memo clears.
+        _fleet_exhausted_until = (
+            (_fleet_earliest_provable_reset() or 0.0)
+            if result.get("reason") == "candidates-exhausted" else 0.0
+        )
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
         )
@@ -20818,8 +20880,9 @@ def _switch_off_walled_account(
                 if ok else
                 f"429 on /v1/messages — switch() reported switched="
                 f"{result.get('switched') if result else None} needsLogin="
-                f"{result.get('needsLogin') if result else None}, relaying "
-                f"the 429 with headers stripped"
+                f"{result.get('needsLogin') if result else None} "
+                f"reason={result.get('reason') if result else None}, "
+                f"relaying the 429 with headers stripped"
             )
         _remember_walled_switch(key, ok, cap_epoch)
         return ok
@@ -21069,6 +21132,13 @@ def _relay_response(
         )
         _walled_401 = _switch_off_walled_account(reset, retry_after, auth, session)
         _wall_relay = bool(reset) and not _walled_401
+    # The fleet's own reset for an unconverted wall — computed once, read by
+    # both the trace note below and the synthetic headers further down.
+    # `None` unless the fleet is provably exhausted right now.
+    _fleet_reset = (
+        min(_fleet_exhausted_until, time.time() + _EXHAUSTED_RESET_CAP_S)
+        if _wall_relay and _fleet_exhausted_until > time.time() else None
+    )
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
@@ -21082,7 +21152,10 @@ def _relay_response(
         _TRACE.write(
             f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
             " (wall could not be converted — rate-limit headers stripped so"
-            " the client backs off instead of sleeping the wall's window)\n"
+            " the client backs off instead of sleeping the wall's window)"
+            + (f" (fleet exhausted — relaying reset={int(_fleet_reset)})"
+               if _fleet_reset is not None else "")
+            + "\n"
         )
         _TRACE.flush()
     if (status_line.startswith(b"HTTP/1.1 404")
@@ -21148,6 +21221,25 @@ def _relay_response(
         if kl in _HOP_BY_HOP_BYTES:
             continue
         out.append(line)
+    if _fleet_reset is not None:
+        # AN UNCONVERTED WALL WITH A PROVABLY EXHAUSTED FLEET is otherwise
+        # indistinguishable, to Claude Code's own retry loop, from a
+        # subscriber 429 with no unified rate-limit headers at all —
+        # measured in its 2.1.283 source, that shape backs off for
+        # ~160-200s and then ends the turn, instead of sleeping to a
+        # stated reset and quota-auto-resuming. These three headers give
+        # it that reset instead, capped at `_EXHAUSTED_RESET_CAP_S`. The
+        # reset is ONLY EVER the fleet's own value, never this 429's own
+        # `reset` header: that can belong to a frozen bearer on another
+        # walled account whose own reset is days away, and telling the
+        # client to sleep until then is worse than the wall it already
+        # backs off from.
+        out.append(b"anthropic-ratelimit-unified-status: rejected")
+        out.append(
+            b"anthropic-ratelimit-unified-reset: "
+            + str(int(_fleet_reset)).encode())
+        out.append(
+            b"anthropic-ratelimit-unified-representative-claim: five_hour")
     if chunked:
         # Transfer-Encoding is hop-by-hop, so the loop above drops it — but
         # _pipe_chunked relays the chunk-size lines VERBATIM. Announcing no
