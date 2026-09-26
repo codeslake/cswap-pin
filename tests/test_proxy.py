@@ -5778,9 +5778,10 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
         return real_join
 
     def _drive_ordinary_site(self, exit_code, tmp_path, monkeypatch, *, pinned=False):
-        """The three `_supervise_locked` respawn sites (10857 still-pinned
-        clean exit, 10885 redeploy ask, 10948 crash backoff) share one
-        shape: the predecessor exits with `exit_code`, and the respawn that
+        """The three `_supervise_locked` respawn sites (its still-pinned
+        clean exit, its `code == _RESTART_ME_CODE` redeploy ask, its crash
+        backoff) share one shape: the predecessor exits with `exit_code`, and
+        the respawn that
         decision makes is `_spawn()`, patched here to block until `stop()`
         (called once this thread is confirmed inside it) releases it."""
         import threading
@@ -5846,8 +5847,8 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
         successor = self._drive_ordinary_site(0, tmp_path, monkeypatch, pinned=True)
         assert successor.returncode is not None, (
             "stop() never terminated the successor the still-pinned "
-            "clean-exit respawn (10857) landed while stop() was already "
-            "joining -- it is orphaned, holding the fd"
+            "clean-exit respawn (`_supervise_locked`) landed while stop() "
+            "was already joining -- it is orphaned, holding the fd"
         )
 
     def case_the_redeploy_respawn_lands_during_stop(self, tmp_path, monkeypatch):
@@ -5856,22 +5857,24 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
         successor = self._drive_ordinary_site(_RESTART_ME_CODE, tmp_path, monkeypatch)
         assert successor.returncode is not None, (
             "stop() never terminated the successor the redeploy respawn "
-            "(10885) landed while stop() was already joining -- it is "
-            "orphaned, holding the fd"
+            "(`_supervise_locked`'s `code == _RESTART_ME_CODE`) landed "
+            "while stop() was already joining -- it is orphaned, holding "
+            "the fd"
         )
 
     def case_the_crash_backoff_respawn_lands_during_stop(self, tmp_path, monkeypatch):
         successor = self._drive_ordinary_site(1, tmp_path, monkeypatch)
         assert successor.returncode is not None, (
             "stop() never terminated the successor the crash-backoff "
-            "respawn (10948) landed while stop() was already joining -- "
-            "it is orphaned, holding the fd"
+            "respawn (`_supervise_locked`) landed while stop() was already "
+            "joining -- it is orphaned, holding the fd"
         )
 
     def case_a_standby_spawned_after_a_landed_degraded_retry_gets_signalled(
             self, tmp_path):
-        """The degraded loop's own site (10724): `_supervise`'s degraded
-        branch retries a successor, lands it, then places a standby --
+        """The degraded loop's own site (`_supervise`'s degraded branch,
+        `_spawn_standby`): it retries a successor, lands it, then places a
+        standby --
         `stop()`, called from another thread in the gap, had already read
         `self._standby` as `None` and never signals the one that lands a
         moment later."""
@@ -5939,10 +5942,11 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
         """proxy.py:10728: the degraded loop's own early-stop check used
         to do a bare `proc.terminate()` with no reap, so `returncode`
         stayed `None`; a later `_terminate_proc` call on the same proc
-        (stop()'s own second pass, 11051) would then signal it AGAIN. A
+        (stop()'s own second pass) would then signal it AGAIN. A
         real Popen re-signalled while `_install_signal_teardown` is
-        mid-`_teardown` re-enters it -- there is no re-entry guard -- and
-        its `finally: os._exit(...)` cuts the drain short.
+        mid-`_teardown` re-enters the handler; its first-entry guard
+        (T1410) now drops that second entry instead of letting it cut the
+        drain short a second time.
 
         Driven synchronously (no threads): `_spawn_retrying` sets
         `self._stop` itself, standing in for a `stop()` call that landed
@@ -10983,6 +10987,66 @@ class TestDaemonSignalTeardown:
         real_signal = pin_proxy.signal.signal if hasattr(pin_proxy, "signal") else None
         # daemon_main is heavy (starts a server); instead unit-test the helper.
         assert hasattr(pin_proxy, "_install_signal_teardown")
+
+    def case_a_second_signal_while_draining_does_not_re_enter(self):
+        """A second SIGTERM while the first `cleanup` is still draining must
+        not start a second drain or exit twice (T1410). Without a first-entry
+        guard, the nested handler runs `cleanup` again with a fresh budget
+        and then exits through ITS OWN `finally`, so the outer call's
+        `finally` exits a second time on the way back up -- the first drain
+        never completes and a `.draining-<pid>` marker it left behind
+        outlives both. `cleanup` here re-enters the handler itself, which is
+        what a signal arriving mid-drain does for real (see
+        `case_a_term_is_never_dropped_by_a_parked_main_thread`)."""
+        import signal as _signal
+
+        from cswap_pin import proxy
+
+        handlers = {}
+        entries = []
+        exits = []
+
+        def _fake_signal(sig, handler):
+            handlers[sig] = handler
+            return None
+
+        real_signal = _signal.signal
+        _signal.signal = _fake_signal
+
+        def _cleanup(reason="refcount"):
+            entries.append(reason)
+            if len(entries) == 1:
+                # The second signal, landing while this drain is still
+                # running. Bounded to one extra delivery -- this is a signal
+                # arriving mid-drain, not a storm.
+                handlers[_signal.SIGTERM](_signal.SIGTERM, None)
+
+        try:
+            proxy._install_signal_teardown(_cleanup)
+        finally:
+            _signal.signal = real_signal
+
+        assert _signal.SIGTERM in handlers, "SIGTERM was never registered"
+
+        real_exit = os._exit
+
+        def _fake_exit(code):
+            exits.append(code)
+            raise SystemExit(code)
+
+        os._exit = _fake_exit
+        try:
+            with pytest.raises(SystemExit):
+                handlers[_signal.SIGTERM](_signal.SIGTERM, None)
+        finally:
+            os._exit = real_exit
+
+        assert entries == ["signal SIGTERM"], (
+            f"the re-entrant signal ran cleanup a second time: {entries}"
+        )
+        assert exits == [0], (
+            f"the re-entrant signal exited a second time: {exits}"
+        )
 
 
 class TestOrphanSweep:
