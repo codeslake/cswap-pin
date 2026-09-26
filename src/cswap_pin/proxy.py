@@ -7706,7 +7706,23 @@ def _install_signal_teardown(cleanup) -> None:
     the daemon leaves no stale state or bound port behind."""
     import signal
 
+    # FIRST-ENTRY CLAIM (T1410). A second signal while the first `cleanup`
+    # drains re-entered this handler: the first drain never completed, a
+    # second drain started with a fresh budget, and the process exited
+    # through whichever run's `os._exit` below landed first — sometimes
+    # leaving a `.draining-<pid>` marker the first drain never released.
+    # `acquire(blocking=False)` is one C call, so a signal cannot land
+    # between the check and the set. Prior art: ccf 84ba7c2's `stopping`
+    # first-entry flag.
+    claimed = threading.Lock()
+
     def _handler(signum, frame):
+        if not claimed.acquire(blocking=False):
+            _log_lifecycle(
+                f"signal {signal.Signals(signum).name} ignored — a "
+                f"teardown is already running"
+            )
+            return
         try:
             # NAME THE SIGNAL. A TERM from a recycle and an idle teardown are
             # the same code path and left the same (empty) trace, so a daemon
