@@ -5703,6 +5703,227 @@ class TestASpawnFailureIsNotFatal:
             )
 
 
+class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
+    """T1401: `stop()` called from ANOTHER thread while a respawn is inside
+    `_spawn()` used to leave the new daemon alive, never signalled, holding
+    the listening fd -- the resurrection `stop()`'s own docstring forbids
+    (a2d2a9d; ccf 705e643 measured nine holders back on the same ports in
+    23s once exactly this order was lost once). `stop()` read `self._proc`
+    (and `self._standby`) ONCE, before a `_spawn()`/`_spawn_standby()`
+    already in flight assigned the successor a moment later.
+
+    Every case joins a REAL thread through a WRAPPED `.join()` that clamps
+    the delegated wait to 10ms and releases the blocked spawn the instant
+    `stop()` calls it -- so the fix's own fallback (taking `self._replace_
+    lock` after the join, whether or not that join actually caught the
+    thread finishing) is what every assertion here actually exercises, not
+    the ordinary case where the first join happens to be long enough.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    class _Proc:
+        def __init__(self, pid, exit_code=None):
+            self.pid = pid
+            self.returncode = None
+            self._exit_code = exit_code
+
+        def wait(self, timeout=None):
+            return self._exit_code if self._exit_code is not None else 0
+
+        def terminate(self):
+            if self.returncode is None:
+                self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    class _Standby:
+        def __init__(self, pid):
+            self.pid = pid
+            self.returncode = None
+            self.signals = []
+
+        def send_signal(self, sig):
+            self.signals.append(sig)
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    @staticmethod
+    def _wrap_join(thread, release):
+        """Delegate to the real `Thread.join`, clamped to 10ms, after
+        setting `release` -- see the class docstring for why the clamp is
+        the point, not an incidental detail."""
+        real_join = thread.join
+
+        def _wrapped(timeout=None):
+            release.set()
+            return real_join(0.01)
+
+        thread.join = _wrapped
+
+    def _drive_ordinary_site(self, exit_code, tmp_path, monkeypatch, *, pinned=False):
+        """The three `_supervise_locked` respawn sites (10857 still-pinned
+        clean exit, 10885 redeploy ask, 10948 crash backoff) share one
+        shape: the predecessor exits with `exit_code`, and the respawn that
+        decision makes is `_spawn()`, patched here to block until `stop()`
+        (called once this thread is confirmed inside it) releases it."""
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder
+
+        if pinned:
+            monkeypatch.setattr(pin_proxy, "load_pin", lambda root: ("a@b.c", "org-1"))
+            monkeypatch.setattr(
+                pin_proxy, "_standby_port_still_wanted", lambda certdir, port: True)
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+
+        predecessor = self._Proc(1000, exit_code=exit_code)
+        successor = self._Proc(1001)
+        spawn_started = threading.Event()
+        release_spawn = threading.Event()
+
+        class _Holder(PortHolder):
+            def __init__(self):
+                self._stop = False
+                self._proc = predecessor
+                self._standby = None
+                self._srv = type("_Srv", (), {"close": lambda self: None})()
+                self._replace_lock = threading.RLock()
+                self.port = 36301
+                self.daemon_pid = predecessor.pid
+                self._failures = 0
+                self._proc_spawned_at = None
+                self._certdir = tmp_path
+
+            def _reap_standby(self):
+                pass
+
+            def _spawn(self):
+                spawn_started.set()
+                assert release_spawn.wait(timeout=5), (
+                    "test never released the respawn"
+                )
+                self._proc = successor
+                self.daemon_pid = successor.pid
+
+        h = _Holder()
+        t = threading.Thread(target=h._supervise)
+        h._thread = t
+        self._wrap_join(t, release_spawn)
+
+        t.start()
+        try:
+            assert spawn_started.wait(timeout=5), (
+                "the respawn never reached _spawn"
+            )
+            h.stop()
+            assert not t.is_alive(), "the supervisor thread never finished"
+        finally:
+            release_spawn.set()
+            t.join(timeout=5)
+        return successor
+
+    def case_the_still_pinned_clean_exit_respawn_lands_during_stop(
+            self, tmp_path, monkeypatch):
+        successor = self._drive_ordinary_site(0, tmp_path, monkeypatch, pinned=True)
+        assert successor.returncode is not None, (
+            "stop() never terminated the successor the still-pinned "
+            "clean-exit respawn (10857) landed while stop() was already "
+            "joining -- it is orphaned, holding the fd"
+        )
+
+    def case_the_redeploy_respawn_lands_during_stop(self, tmp_path, monkeypatch):
+        from cswap_pin.proxy import _RESTART_ME_CODE
+
+        successor = self._drive_ordinary_site(_RESTART_ME_CODE, tmp_path, monkeypatch)
+        assert successor.returncode is not None, (
+            "stop() never terminated the successor the redeploy respawn "
+            "(10885) landed while stop() was already joining -- it is "
+            "orphaned, holding the fd"
+        )
+
+    def case_the_crash_backoff_respawn_lands_during_stop(self, tmp_path, monkeypatch):
+        successor = self._drive_ordinary_site(1, tmp_path, monkeypatch)
+        assert successor.returncode is not None, (
+            "stop() never terminated the successor the crash-backoff "
+            "respawn (10948) landed while stop() was already joining -- "
+            "it is orphaned, holding the fd"
+        )
+
+    def case_a_standby_spawned_after_a_landed_degraded_retry_gets_signalled(
+            self, tmp_path):
+        """The degraded loop's own site (10724): `_supervise`'s degraded
+        branch retries a successor, lands it, then places a standby --
+        `stop()`, called from another thread in the gap, had already read
+        `self._standby` as `None` and never signals the one that lands a
+        moment later."""
+        import signal
+        import threading
+
+        from cswap_pin.proxy import PortHolder
+
+        successor = self._Proc(2000)
+        standby = self._Standby(3000)
+        entered = threading.Event()
+        release_standby = threading.Event()
+
+        class _Holder(PortHolder):
+            def __init__(self):
+                self._stop = False
+                self._degraded = True
+                self._proc = None
+                self._standby = None
+                self._srv = type("_Srv", (), {"close": lambda self: None})()
+                self._replace_lock = threading.RLock()
+                self.port = 36301
+                self.daemon_pid = None
+                self._failures = 0
+                self._certdir = tmp_path
+
+            def _accept_degraded(self, retry_after=None):
+                return  # the deadline has "already" run out
+
+            def _spawn_retrying(self):
+                self._proc = successor
+                return True
+
+            def _spawn_standby(self):
+                entered.set()
+                assert release_standby.wait(timeout=5), (
+                    "test never released the standby spawn"
+                )
+                self._standby = standby
+
+        h = _Holder()
+        t = threading.Thread(target=h._supervise)
+        h._thread = t
+        self._wrap_join(t, release_standby)
+
+        t.start()
+        try:
+            assert entered.wait(timeout=5), (
+                "the degraded retry never reached _spawn_standby"
+            )
+            h.stop()
+            assert not t.is_alive(), "the supervisor thread never finished"
+        finally:
+            release_standby.set()
+            t.join(timeout=5)
+
+        assert standby.signals == [signal.SIGHUP], (
+            "stop() never signalled the standby that landed after it had "
+            "already read `self._standby` as None"
+        )
+
+
 class TestHolderCrashIsSurvivable:
     """A crash of the process HOLDING the socket — the case one level up
     from its sibling in :class:`TestDaemonPortStability`, which kills the
