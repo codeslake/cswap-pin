@@ -5713,11 +5713,16 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
     already in flight assigned the successor a moment later.
 
     Every case joins a REAL thread through a WRAPPED `.join()` that clamps
-    the delegated wait to 10ms and releases the blocked spawn the instant
-    `stop()` calls it -- so the fix's own fallback (taking `self._replace_
-    lock` after the join, whether or not that join actually caught the
-    thread finishing) is what every assertion here actually exercises, not
-    the ordinary case where the first join happens to be long enough.
+    the delegated wait to a non-blocking check (a 10ms clamp normally
+    catches these fast mocks anyway, which would leave the LOCK doing
+    nothing observable) and releases the blocked spawn the instant `stop()`
+    calls it -- so the fix's own fallback (taking `self._replace_lock`
+    after the join, whether or not that join actually caught the thread
+    finishing) is what every assertion here actually exercises, not the
+    ordinary case where the first join happens to be long enough. Each
+    case keeps its own handle on the REAL `Thread.join` (returned by
+    `_wrap_join`) for its own bounded wait once `stop()` returns -- the
+    wrapped one is `stop()`'s alone.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -5757,16 +5762,20 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
 
     @staticmethod
     def _wrap_join(thread, release):
-        """Delegate to the real `Thread.join`, clamped to 10ms, after
-        setting `release` -- see the class docstring for why the clamp is
-        the point, not an incidental detail."""
+        """Delegate to the real `Thread.join`, clamped to a non-blocking
+        check, after setting `release` -- see the class docstring for why
+        the clamp is the point, not an incidental detail. Returns the real
+        (unwrapped) `Thread.join` so a caller can still do a genuine
+        bounded wait of its own for assertions and cleanup, since `stop()`
+        itself now owns the wrapped one."""
         real_join = thread.join
 
         def _wrapped(timeout=None):
             release.set()
-            return real_join(0.01)
+            return real_join(0)
 
         thread.join = _wrapped
+        return real_join
 
     def _drive_ordinary_site(self, exit_code, tmp_path, monkeypatch, *, pinned=False):
         """The three `_supervise_locked` respawn sites (10857 still-pinned
@@ -5817,7 +5826,7 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
         h = _Holder()
         t = threading.Thread(target=h._supervise)
         h._thread = t
-        self._wrap_join(t, release_spawn)
+        real_join = self._wrap_join(t, release_spawn)
 
         t.start()
         try:
@@ -5825,10 +5834,11 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
                 "the respawn never reached _spawn"
             )
             h.stop()
+            real_join(timeout=5)
             assert not t.is_alive(), "the supervisor thread never finished"
         finally:
             release_spawn.set()
-            t.join(timeout=5)
+            real_join(timeout=5)
         return successor
 
     def case_the_still_pinned_clean_exit_respawn_lands_during_stop(
@@ -5905,7 +5915,7 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
         h = _Holder()
         t = threading.Thread(target=h._supervise)
         h._thread = t
-        self._wrap_join(t, release_standby)
+        real_join = self._wrap_join(t, release_standby)
 
         t.start()
         try:
@@ -5913,14 +5923,78 @@ class TestStopCatchesARespawnThatLandsDuringItsOwnJoin:
                 "the degraded retry never reached _spawn_standby"
             )
             h.stop()
+            real_join(timeout=5)
             assert not t.is_alive(), "the supervisor thread never finished"
         finally:
             release_standby.set()
-            t.join(timeout=5)
+            real_join(timeout=5)
 
         assert standby.signals == [signal.SIGHUP], (
             "stop() never signalled the standby that landed after it had "
             "already read `self._standby` as None"
+        )
+
+    def case_the_degraded_early_stop_check_terminates_the_successor_once(
+            self, tmp_path):
+        """proxy.py:10728: the degraded loop's own early-stop check used
+        to do a bare `proc.terminate()` with no reap, so `returncode`
+        stayed `None`; a later `_terminate_proc` call on the same proc
+        (stop()'s own second pass, 11051) would then signal it AGAIN. A
+        real Popen re-signalled while `_install_signal_teardown` is
+        mid-`_teardown` re-enters it -- there is no re-entry guard -- and
+        its `finally: os._exit(...)` cuts the drain short.
+
+        Driven synchronously (no threads): `_spawn_retrying` sets
+        `self._stop` itself, standing in for a `stop()` call that landed
+        astride the retry, then a real `stop()` call afterwards stands in
+        for its own second pass."""
+        from cswap_pin.proxy import PortHolder
+
+        class _Proc:
+            def __init__(self, pid):
+                self.pid = pid
+                self.returncode = None
+                self.terminate_calls = 0
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return self.returncode
+
+        successor = _Proc(4000)
+
+        class _Holder(PortHolder):
+            def __init__(self):
+                self._stop = False
+                self._degraded = True
+                self._proc = None
+                self._standby = None
+                self._srv = type("_Srv", (), {"close": lambda self: None})()
+                self._replace_lock = threading.RLock()
+                self.port = 36301
+                self.daemon_pid = None
+                self._failures = 0
+                self._certdir = tmp_path
+                self._thread = None
+
+            def _accept_degraded(self, retry_after=None):
+                return  # the deadline has "already" run out
+
+            def _spawn_retrying(self):
+                self._proc = successor
+                self._stop = True  # a stop() call landed astride this retry
+                return True
+
+        h = _Holder()
+        h._supervise()  # runs the degraded branch's early-stop check once
+        h.stop()  # the second pass a real stop() call still runs
+
+        assert successor.terminate_calls == 1, (
+            f"the successor got {successor.terminate_calls} SIGTERMs, not "
+            f"exactly one -- the early-stop check and stop()'s own second "
+            f"pass both signalled it"
         )
 
 

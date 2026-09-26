@@ -10726,12 +10726,7 @@ class PortHolder:
                 # that here, before this thread's next lap just exits on
                 # `self._stop` and abandons it.
                 if self._stop:
-                    proc = self._proc
-                    if proc is not None and getattr(proc, "returncode", 0) is None:
-                        try:
-                            proc.terminate()
-                        except (OSError, ValueError):
-                            pass
+                    self._terminate_proc(getattr(self, "_proc", None))
                     return
                 self._degraded = False
                 if self._standby is None:
@@ -10742,6 +10737,16 @@ class PortHolder:
                             f"could not spawn a standby for port "
                             f"{self.port}: {exc!r} — continuing without one"
                         )
+                    # STOP RACED THIS SPAWN TOO (T1401): `_spawn_standby`
+                    # runs without `self._replace_lock` (see the ban at the
+                    # top of this branch's own docstring), so a `stop()` on
+                    # another thread can read `self._standby` as `None`
+                    # and finish before this assignment lands — the same
+                    # gap the `_proc` re-check just above closes, mirrored
+                    # here for the standby.
+                    if self._stop:
+                        self._release_standby(getattr(self, "_standby", None))
+                        return
                 continue
             # CAPTURED BEFORE THE WAIT, so it still names the PREDECESSOR
             # after `wait()` returns, whatever `self._proc` has become by
