@@ -911,6 +911,15 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             # on a tunnel it did not own — two failures that read as
             # production defects and were neither.
             _pp._PUMP.reset_for_tests()
+            # AND THE HOP-TROUBLE STAMP. `_note_hop_trouble` fires on any
+            # real 5xx a case relays through `_relay_response(note_hop=True)`
+            # -- most of them about something else entirely -- and
+            # `_report_deaf_bridges` now reads it over a 300s WALL-CLOCK
+            # window (`_DEAF_WINDOW_S`), so one case's incidental 502 blinded
+            # every deaf-report case for the next several minutes of real
+            # test time. Same shape as `_DRAINING_DEPTH` above.
+            with _pp._hop_trouble_lock:
+                _pp._hop_trouble_at = 0.0
     if failures:
         raise AssertionError(
             f"{len(failures)} of {len(work)} cases failed:\n\n" + "\n".join(failures)
