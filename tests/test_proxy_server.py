@@ -11571,6 +11571,137 @@ class TestDrainReportsWhatItCut:
         finally:
             pp._log_lifecycle = real_log
 
+    def case_a_young_process_names_its_own_blind_spot_not_a_mark(
+            self, monkeypatch):
+        """Measured: a successor 4s old inherited a bridge from a
+        predecessor that had just closed every connection. The bridge's
+        first request on the NEW process is the worker POST that stamps
+        `_bridge_posts`; the stream GET that would prove it healthy is the
+        NEXT request on the same connection and had not arrived yet when
+        this sweep ran. Its upstream hop was accepting CONNECT and relaying
+        a 502 INSIDE the tunnel, so `_egress_refused_last_monotonic` was
+        never stamped either and `blind_refused` could not fire.
+
+        DEAF_REPORT_MARK stood for this bridge for the whole
+        `_BRIDGE_SWEEP_COOLDOWN_S`, and a downstream gate reads MARK as
+        FAIL. A process this young never watched the bridge through a
+        whole `_DEAF_WINDOW_S` and must say so instead of asserting a
+        verdict it has no basis for.
+        """
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1000.0)
+            srv._started_monotonic = 996.0  # 4s old
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_INHERITED/worker/messages")
+            srv._connected_bridges = {"cse_INHERITED"}
+
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_BLIND in lines[-1], (
+                "a process 4s old marked a bridge it never watched deaf, "
+                f"instead of admitting it cannot say: {lines!r}")
+            assert pp.DEAF_REPORT_MARK not in lines[-1], lines[-1]
+            assert "cse_INHERITED" in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_CONTROL_an_old_process_still_marks_the_same_bridge(
+            self, monkeypatch):
+        """The same bridge, the same shape, on a process old enough to have
+        watched the whole window: a true verdict must not be suppressed --
+        the control that proves `young` does not swallow every MARK."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1000.0)
+            srv._started_monotonic = 1000.0 - pp._DEAF_WINDOW_S - 1.0
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_OLDPROC/worker/messages")
+            srv._connected_bridges = {"cse_OLDPROC"}
+
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_MARK in lines[-1], (
+                "a process older than the window it judges suppressed a "
+                f"true MARK: {lines!r}")
+            assert pp.DEAF_REPORT_BLIND not in lines[-1], lines[-1]
+        finally:
+            pp._log_lifecycle = real_log
+
+    def case_a_young_blind_ages_into_a_mark_with_the_same_deaf_set(
+            self, monkeypatch):
+        """The latch, same shape as the draining- and refusal-BLIND cases
+        above: a young sweep's BLIND must not stand forever once this
+        process has aged past the window with the IDENTICAL deaf set --
+        `now == prev` alone would otherwise dedupe the MARK away for the
+        rest of this process's life."""
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            srv = pp.PinProxy.__new__(pp.PinProxy)
+            srv._reset_bridge_traffic()
+            srv._live_lock = threading.Lock()
+            srv._stream_conns = set()
+            srv._open_conns = set()
+
+            monkeypatch.setattr(pp.time, "monotonic", lambda: 1000.0)
+            srv._started_monotonic = 996.0  # 4s old
+            srv._note_bridge_traffic(
+                "/v1/code/sessions/cse_LATCH/worker/messages")
+            srv._connected_bridges = {"cse_LATCH"}
+
+            srv._report_deaf_bridges()
+            assert lines and pp.DEAF_REPORT_BLIND in lines[-1], (
+                f"the young sweep was not BLIND: {lines!r}")
+
+            # PAST THE WINDOW this process is judging (996 + 300), the SAME
+            # post still inside ITS OWN window (1000 + 300): the MARK must
+            # return, not stay dedupe-silenced by the young-BLIND above.
+            past_window = 1298.0
+            monkeypatch.setattr(pp.time, "monotonic", lambda: past_window)
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) > before, (
+                "the young-BLIND latched permanently -- no MARK ever "
+                "followed for a bridge that is genuinely still deaf")
+            assert pp.DEAF_REPORT_MARK in lines[-1], lines[-1]
+
+            # THE ORDINARY DEDUPE STILL APPLIES once the MARK itself stands.
+            before = len(lines)
+            srv._report_deaf_bridges()
+            assert len(lines) == before, (
+                "an unchanged MARK was re-logged; the young-window fix "
+                "must not defeat the dedupe generally")
+        finally:
+            pp._log_lifecycle = real_log
+
     def case_an_attachment_fetch_says_whether_it_worked(self, certdir):
         """Nothing recorded whether a claude.ai attachment ever downloaded.
 
