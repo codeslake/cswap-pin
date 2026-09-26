@@ -9954,6 +9954,15 @@ _HOLD_RESTART_MAX_S = 5.0
 # is what the ladder is for; the second is this.
 _HOLD_DEGRADE_AT = 8
 
+# HOW OFTEN A DEGRADED HOLDER TRIES A SUCCESSOR AGAIN (T1193). Degrading used
+# to be permanent -- "cswap pin --heal or the next launch rebuilds one" was a
+# claim about a HUMAN acting, never about this process. A slow timer, not the
+# ladder's own backoff: the fault that capped the ladder (a broken install, a
+# missing interpreter) does not clear itself in seconds, and retrying at the
+# ladder's own pace would just re-run the same failure dozens of times before
+# anyone could fix anything. See `_run_degraded`.
+_HOLD_DEGRADE_RETRY_S = 30.0
+
 # Consecutive failed respawns before the holder says the successor cannot
 # start. NOT a ceiling — it keeps retrying, because a machine that recovers on
 # attempt 20 should. It is the line between "it crashed, the next one will be
@@ -10150,17 +10159,19 @@ class PortHolder:
         # failure must raise immediately so `holder_main`'s `except OSError`
         # can end the process and free the launcher, already waiting on a
         # state file that will never appear. COMPUTED, not measured: a
-        # retry ladder here costs up to `_HOLD_DEGRADE_AT` backoffs
-        # (0.5+1+2+4+5+5+5 = 22.5s), longer than the launcher's own
-        # `_SPAWN_WAIT_S`, during which `unwire_if_dead` keeps wiring live
-        # sessions to a port about to be refused anyway.
+        # retry ladder here costs up to `_HOLD_DEGRADE_AT - 1` backoffs
+        # (0.5+1+2+4+5+5+5 = 22.5s -- the cap itself ends with no sleep),
+        # longer than the launcher's own `_SPAWN_WAIT_S`, during which
+        # `unwire_if_dead` keeps wiring live sessions to a port about to be
+        # refused anyway.
         #
         # A STANDBY'S OWN PROMOTION (`_is_promotion`, see `__init__`) climbs
         # the retry ladder (`_spawn_retrying`) instead: raising here would
         # take the standby process down mid-call rather than through its own
-        # control flow. A permanent failure still ends the process — see
-        # `_spawn_retrying`'s docstring and `_is_promotion`'s comment for
-        # what that really means.
+        # control flow. A permanent failure now DEGRADES and RETRIES a
+        # successor of its own accord (T1193) rather than ending the process
+        # -- see `_spawn_retrying`'s docstring, `_is_promotion`'s comment,
+        # and `_run_degraded` for what that really means.
         if self._is_promotion:
             if not self._spawn_retrying():
                 # CAPPED OUT — `_spawn_retrying` already ran `degrade_now()`.
@@ -10210,8 +10221,11 @@ class PortHolder:
         the code is already in this process's memory, so it keeps working when
         the package is gone from disk, which is what put a machine here.
 
-        Idempotent, and it does not un-degrade: recovery is a fresh triad, and
-        `heal` builds one before the next `claude`.
+        Idempotent while still degraded: a retry that lands un-degrades in
+        place (`_run_degraded` clears the flag itself), and one that fails
+        re-degrades through the SAME cap rather than a second ladder — see
+        `_run_degraded`. This method itself only ever starts the retrying
+        acceptor once per degrade.
         """
         if getattr(self, "_degraded", False):
             return
@@ -10219,8 +10233,9 @@ class PortHolder:
         _log_lifecycle(
             f"no successor could start — this holder is serving port "
             f"{self.port} itself, UNPINNED. Remote Control and artifacts "
-            f"follow the active account until a daemon starts again; "
-            f"`cswap pin --heal` or the next launch rebuilds one."
+            f"follow the active account until a daemon starts again; this "
+            f"holder retries one itself every {_HOLD_DEGRADE_RETRY_S:.0f}s, "
+            f"or `cswap pin --heal` tries sooner."
         )
         # KEPT, so `_wait_out_degraded` can join it. Every caller that
         # reaches this holder's return joins `self._thread` (or, for a
@@ -10228,29 +10243,104 @@ class PortHolder:
         # exit — and this acceptor is the only thing still serving once
         # that happens.
         self._degraded_thread = threading.Thread(
-            target=self._accept_degraded, daemon=True)
+            target=self._run_degraded, daemon=True)
         self._degraded_thread.start()
 
+    def _run_degraded(self) -> None:
+        """Own the socket while degraded: serve it ourselves, and retry a
+        successor every `_HOLD_DEGRADE_RETRY_S` until one sticks or
+        `stop()` ends the holder (T1193).
+
+        ONE ATTEMPT PER WAKE, NOT A FRESH LADDER. `self._failures` is set
+        to `_HOLD_DEGRADE_AT - 1` first, so a spawn that fails outright
+        reaches the SAME cap `_spawn_retrying` already knows on its very
+        first try and re-degrades at once: its own `degrade_now()` call
+        no-ops here (`self._degraded` is still True), so this loop just
+        resumes accepting where it left off.
+
+        A spawn that starts hands off to ordinary supervision
+        (`_supervise`), which re-enters this same method through
+        `degrade_now()` if THAT daemon fails too — a retry that dies
+        right away re-degrades through `_supervise`'s own cap check, one
+        crash away, exactly like a resumed-but-fragile holder should.
+
+        ponytail: each re-degrade nests one more `_supervise` call inside
+        this thread's own stack (the call below never returns until the
+        nested one does). A host that flaps between degraded and pinned
+        for as long as it keeps retrying grows that stack for as long —
+        bound it with a depth counter if one is ever seen doing that.
+        """
+        while not self._stop:
+            self._accept_degraded(retry_after=_HOLD_DEGRADE_RETRY_S)
+            if self._stop:
+                return
+            self._failures = _HOLD_DEGRADE_AT - 1
+            if not self._spawn_retrying():
+                continue
+            self._degraded = False
+            self._supervise()
+            return
+
     def _wait_out_degraded(self) -> None:
-        """Block until a degraded holder is told to stop.
+        """Block until a degraded holder's retrying is over for good.
 
         `_supervise` returning ends only ITS OWN thread — but `holder_main`
         and `_standby_revive` both join that thread (or, for a capped
         promotion, `start()` itself) to learn when the PROCESS may exit,
         and a process that exits takes every daemon thread down with it,
-        `_accept_degraded` included, socket and all. MEASURED: a holder
-        that had just degraded refused every connect the instant that join
-        returned. A no-op unless `degrade_now()` actually ran (`self._stop`
-        already true is the other way a caller gets here, mid-teardown,
-        with nothing to wait for): it only returns once `stop()` closes
-        `self._srv`, which every caller here already treats as "done".
+        `_run_degraded`'s acceptor included, socket and all.
+
+        THIS CAN RESUME SUPERVISING BEFORE IT EVER RETURNS. A retry that
+        lands hands off to `_supervise` from inside the same thread this
+        joins, and a later re-degrade there starts a NEW thread and joins
+        THAT one before returning — so this call keeps blocking through
+        however many degrade/retry cycles follow, same as it always did
+        for the plain no-retry case, and only returns once the process may
+        actually exit. A no-op unless `degrade_now()` actually ran
+        (`self._stop` already true is the other way a caller gets here,
+        mid-teardown, with nothing to wait for).
+
+        WAKES WITHIN A POLL INTERVAL OF `stop()`, not by relying on the
+        socket closing: closing a listening socket from another thread
+        does NOT interrupt a thread already blocked in `accept()` on
+        Linux (see `_accept_degraded`'s own `select.poll()`, and
+        `tests/test_proxy_server.py`'s `_ProbeChain.stop` for the same
+        measurement) — `self._stop` is what actually ends this, checked
+        every poll, not the close. TIMED, in a loop (`_join_for_signals`):
+        the PROMOTION caller runs this on the process's own MAIN thread, and
+        an untimed join there drops a SIGTERM the kernel delivers to a
+        different thread — see that helper's own docstring.
         """
         thread = getattr(self, "_degraded_thread", None)
         if thread is not None:
-            thread.join()
+            _join_for_signals(thread)
 
-    def _accept_degraded(self) -> None:
+    def _accept_degraded(self, retry_after: float | None = None) -> None:
+        """Serve the held socket ourselves until `stop()` ends the holder,
+        or, when `retry_after` is given, until that many seconds pass
+        first — so `_run_degraded` can pause us to try a successor.
+
+        `select.poll()`, NEVER `settimeout()` or non-blocking mode on
+        `self._srv` (T1193): O_NONBLOCK is a property of the OPEN FILE
+        DESCRIPTION, not of any one fd referencing it, so it is shared
+        with any daemon a retry hands this same descriptor to — making
+        our own wait non-blocking would make theirs non-blocking too, the
+        moment it inherits the fd. `poll()` over `select.select()` for the
+        same reason `_client_hung_up` picks it: no FD_SETSIZE ceiling.
+        """
+        deadline = None if retry_after is None else time.monotonic() + retry_after
+        poller = select.poll()
+        poller.register(self._srv, select.POLLIN)
         while not self._stop:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                wait_ms = int(min(remaining, 1.0) * 1000)
+            else:
+                wait_ms = 1000
+            if not poller.poll(wait_ms):
+                continue
             try:
                 conn, _ = self._srv.accept()
             except OSError:
@@ -10403,12 +10493,14 @@ class PortHolder:
         a private, unbounded local count.
 
         ONLY WHERE THIS HOLDER IS NOT THE ONLY THING COVERING THE PORT:
-        `_supervise`'s three respawn sites, and a standby's own PROMOTION in
+        `_supervise`'s three respawn sites, a standby's own PROMOTION in
         `start()` (see `_is_promotion`) — there, unlike a cold start, raising
         out of `start()` would take the standby PROCESS down mid-call rather
-        than through its own control flow. A COLD START calls bare `_spawn()`
-        instead and lets a permanent failure raise immediately, exactly as
-        the base did — see `start()`.
+        than through its own control flow — and, since T1193, `_run_degraded`'s
+        own one retry attempt per wake, which is already degraded and has
+        nothing to lose by trying. A COLD START calls bare `_spawn()` instead
+        and lets a permanent failure raise immediately, exactly as the base
+        did — see `start()`.
 
         `OSError` (fork EAGAIN/EMFILE, or the interpreter itself unrunnable)
         and `ValueError` (`Popen(pass_fds=(-1,))` on our own closed socket,
@@ -10421,10 +10513,10 @@ class PortHolder:
         daemon that started and immediately died.
 
         Returns True once spawned. At the cap: `degrade_now()` and return
-        False — a permanently failing promotion ends there rather than
-        raising, but it ends all the same: nobody past this method's own
-        caller joins on it, so the process exits a little later than the
-        base's immediate raise would have. See `_is_promotion`'s comment in
+        False — a permanently failing promotion serves the socket itself
+        rather than raising, and (T1193) keeps trying a successor of its
+        own accord on `_HOLD_DEGRADE_RETRY_S` rather than ending there for
+        good — see `_run_degraded`. See `_is_promotion`'s comment in
         `__init__` for the full chain.
         """
         while True:
@@ -10607,6 +10699,19 @@ class PortHolder:
             # the port.
             if self._stop:
                 return
+            # A DEGRADED ACCEPTOR IS STILL ON THIS SOCKET (T1193). Spawning
+            # here would put a daemon's own accept() loop beside it — the
+            # exact two-acceptors bug this class refuses to have
+            # (test_meta.py:388's ban). `_run_degraded` already retries a
+            # successor on its own timer; this request can only log and
+            # decline, never trigger a spawn that races it.
+            if getattr(self, "_degraded", False):
+                _log_lifecycle(
+                    f"replace request for port {self.port} ignored — this "
+                    f"holder is degraded and already retrying a successor "
+                    f"on its own"
+                )
+                return
             try:
                 self._spawn()
             except (OSError, ValueError) as exc:
@@ -10624,203 +10729,213 @@ class PortHolder:
             code = proc.wait()
             if self._stop:
                 return
-            # THE SAME LOCK `_on_replace_request` HOLDS ACROSS ITS OWN SPAWN.
-            # That method reassigns `self._proc` to the successor as
-            # `_spawn()`'s very last line, and the predecessor's own exit is
-            # asked for across a process boundary (an external `os.kill`, a
-            # 0.25s settle, a drain that can be instant with nothing
-            # inflight) — nothing orders that exit after `_spawn()` returns,
-            # so `wait()` above can return while a replace is still inside an
-            # "unbounded" `Popen`. Taking the same lock here means this
-            # WHOLE decision — the identity check AND whichever of
-            # stop()/respawn it leads to — runs only before that spawn
-            # starts or after it has fully landed, never astride it. Astride
-            # it is exactly what let a still-assigning `_spawn()` be read as
-            # a plain release, and then let `stop()` — which reads
-            # `self._proc` a SECOND time, later — terminate the successor
-            # that had finished being assigned by then.
+            # THE DECISION RUNS LOCKED; THE JOIN DOES NOT (T1193). A retry
+            # can now keep `_wait_out_degraded()` blocked for the rest of
+            # this process's life, and holding `self._replace_lock` across
+            # that would park this thread on the lock forever — `_on_replace_
+            # request`'s own degraded-refusal check (also new) could then
+            # never run again either, since it takes the same lock. The
+            # join itself touches nothing `_on_replace_request` needs
+            # (`self._proc`), so it alone moves outside the `with` below;
+            # see `_supervise_locked` for the decision itself, which still
+            # takes the backoff sleep and every respawn under the lock.
             with self._replace_lock:
-                # A HANDOVER, NOT A RELEASE. The predecessor asked us to
-                # replace it while it was still serving, we did, and it then
-                # drained and left with 0. That 0 means "released — do not
-                # restart" everywhere else, and acting on it here would close
-                # the listening socket the successor is already accepting
-                # on. `self._proc is not proc` is the only proof needed: only
-                # a successor's own `_spawn()` call — never a bare wait()
-                # return — can move `self._proc` away from what this
-                # iteration captured.
-                if self._proc is not proc:
-                    _log_lifecycle(
-                        f"daemon {proc.pid} retired (exit {code}) after "
-                        f"handing over — successor already serving on port "
-                        f"{self.port}"
-                    )
-                    continue
-                # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
-                # this loop already wakes on every daemon exit, so it costs a
-                # `poll()` and no timer. Reaping is the load-bearing half: an
-                # unreaped child stays `<defunct>` in the process table forever,
-                # and `ps`, `kill -0` and every check that asks the TABLE rather
-                # than the STATE then report a standby that is not there.
-                self._reap_standby()
-                # A CLEAN EXIT IS A DECISION, NOT A FAILURE. The pin tears itself
-                # down when the last refcount holder closes the FIFO — that is the
-                # whole idle-teardown design. Restarting it would make the port
-                # this class holds immortal too, and the daemon would respawn
-                # forever with nobody to serve.
-                #
-                # Exit status is the only thing that separates them: 0 means the
-                # daemon chose to go (teardown, SIGTERM handler), anything else
-                # means it was killed or crashed.
-                if code == 0:
-                    # AUTO-HEAL WITH NO ONE AT A KEYBOARD. This holder is the
-                    # LAST pin process alive when its daemon exits cleanly, and a
-                    # clean exit is not always the owner clearing the pin -- an
-                    # idle-teardown that should not have fired is also code 0.
-                    # `load_pin`, read fresh immediately before the spawn (never
-                    # cached: the owner may clear it in this same window), is the
-                    # one witness a holder with no human nearby can still ask.
-                    # Still pinned -> respawn on the held port ourselves, same as
-                    # a redeploy; nothing pinned -> release, exactly as today.
-                    # ``getattr``: a test double built without ``__init__`` has
-                    # no ``_certdir``; that is "cannot tell" and falls to the
-                    # release path below, same as every real holder without one.
-                    #
-                    # THREE MORE GUARDS, ALL ON THE SAME RELEASE PATH.
-                    # `self._self_heal_on()`: the switch means "do not act on
-                    # your own", and this respawn is exactly that, same as the
-                    # non-zero-exit branch below.
-                    # `_standby_port_still_wanted`: a redeploy or a re-pin may
-                    # already have moved the pin to a DIFFERENT held port, and
-                    # respawning here too would leave two lineages superseding
-                    # each other on two ports forever.
-                    # `load_pin` CAN RAISE (a host gone missing, an ImportError a
-                    # deploy left behind) -- and this loop runs in a daemon
-                    # thread, so an escaping exception does not fail loudly, it
-                    # ends the THREAD only: `_stop` is never set and `self._srv`
-                    # is never closed, so `getppid() == born_of` still reads
-                    # "holder alive" to the standby forever, port held, nothing
-                    # supervising it. `stop()` is the same release a genuinely
-                    # unpinned clean exit takes.
-                    certdir = getattr(self, "_certdir", None)
-                    try:
-                        pinned = bool(
-                            certdir is not None
-                            and self._self_heal_on()
-                            and _standby_port_still_wanted(certdir, self.port)
-                            and load_pin(certdir.parent)
-                        )
-                    except Exception as exc:  # noqa: BLE001 — see above
-                        _log_lifecycle(
-                            f"could not tell whether the pin is still set "
-                            f"({exc!r}) — releasing port {self.port} rather than "
-                            f"leaving the standby thinking a dead supervisor is "
-                            f"still watching it")
-                        pinned = False
-                    if pinned:
-                        _log_lifecycle(
-                            f"daemon {self.daemon_pid} exited cleanly but the pin "
-                            f"is still set — respawning on the held port "
-                            f"{self.port}"
-                        )
-                        self._failures = 0
-                        if not self._spawn_retrying():
-                            # CAPPED OUT — degrade_now() already ran. Block
-                            # on its acceptor before returning: this thread
-                            # ending is what every caller here joins on to
-                            # learn the process may exit, and exiting is
-                            # exactly what would take that acceptor down.
-                            self._wait_out_degraded()
-                            return
-                        continue
-                    _log_lifecycle(
-                        f"daemon {self.daemon_pid} exited cleanly — releasing port "
-                        f"{self.port}"
-                    )
-                    # `stop()`, NOT A BARE CLOSE. Closing only our own listener
-                    # left the standby holding its OWN dup of the same descriptor,
-                    # un-signalled — still LISTENing, still completing handshakes
-                    # into a backlog nobody ever drains. Measured: port 36301
-                    # accepted connects and answered nothing for 13 minutes after
-                    # exactly this exit, until a human ran `cswap pin --heal`.
-                    # `stop()` SIGHUPs the standby and confirms it gone before
-                    # closing our own socket (see its own docstring for why that
-                    # order matters), so a session that dials afterwards gets
-                    # ConnectionRefused at once instead of queueing forever.
-                    self.stop()
-                    return
-                if code == _RESTART_ME_CODE:
-                    # A REDEPLOY, not a teardown. Respawn at once and skip the
-                    # backoff: this exit was asked for, so treating it as a failure
-                    # would make every update wait out a ladder rung.
-                    _log_lifecycle(
-                        f"daemon {self.daemon_pid} asked for a successor — "
-                        f"restarting on the held port {self.port}"
-                    )
-                    self._failures = 0
-                    if not self._spawn_retrying():
-                        # CAPPED OUT — see the same-shaped comment above.
-                        self._wait_out_degraded()
-                        return
-                    continue
-                if not self._self_heal_on():
-                    # SAY WHAT HAPPENS, which is not what this used to claim. The
-                    # old line promised "the port stays bound but nothing is
-                    # serving it". A human who set this switch to debug a daemon
-                    # read "stays bound" and would expect their live sessions to
-                    # hang rather than be refused; they are refused, immediately,
-                    # all of them. The switch is still doing what it was built for
-                    # — its own rationale is that a respawner fighting a human is
-                    # "worse than a dead port", which accepts this cost out loud.
-                    # Only the line describing it was wrong, and a wrong line in
-                    # the one place a debugging session looks is worse than no
-                    # line.
-                    _log_lifecycle(
-                        f"daemon {self.daemon_pid} exited and {_SELF_HEAL_ENV}=off — "
-                        f"NOT respawning, and this holder is exiting with it, so "
-                        f"port {self.port} stops answering. Every session wired to "
-                        f"it gets ConnectionRefused until a pin is started again."
-                    )
-                    return
-                # A DAEMON THAT SERVED FOR A WHILE CRASHING IS A FRESH
-                # FAILURE, not one more on an old streak — see
-                # `_HOLD_FAILURE_RESET_AFTER_S`. `proc` is the one that just
-                # exited (captured before `wait()`, above), so its own
-                # spawn time is still what `_proc_spawned_at` names here:
-                # nothing has spawned a successor yet this iteration.
-                served_s = (0.0 if self._proc_spawned_at is None
-                           else time.monotonic() - self._proc_spawned_at)
-                if served_s >= _HOLD_FAILURE_RESET_AFTER_S:
-                    self._failures = 0
-                self._failures += 1
-                _log_lifecycle(
-                    f"daemon {self.daemon_pid} exited (code {code}); restarting "
-                    f"under the held port {self.port}"
+                outcome = self._supervise_locked(proc, code)
+            if outcome == "continue":
+                continue
+            if outcome == "wait_out":
+                self._wait_out_degraded()
+            return
+
+    def _supervise_locked(self, proc, code: int) -> str:
+        """One `_supervise` iteration's decision, taken under
+        `self._replace_lock` — see that method for why the LOCK stops here
+        and a caller-side sentinel carries the outcome out past it.
+
+        Returns "continue" (go on supervising), "return" (the loop is
+        over, nothing more to do), or "wait_out" (the loop is over, and
+        the caller must join the degraded acceptor OUTSIDE the lock before
+        it, too, returns).
+        """
+        # A HANDOVER, NOT A RELEASE. The predecessor asked us to
+        # replace it while it was still serving, we did, and it then
+        # drained and left with 0. That 0 means "released — do not
+        # restart" everywhere else, and acting on it here would close
+        # the listening socket the successor is already accepting
+        # on. `self._proc is not proc` is the only proof needed: only
+        # a successor's own `_spawn()` call — never a bare wait()
+        # return — can move `self._proc` away from what this
+        # iteration captured.
+        if self._proc is not proc:
+            _log_lifecycle(
+                f"daemon {proc.pid} retired (exit {code}) after "
+                f"handing over — successor already serving on port "
+                f"{self.port}"
+            )
+            return "continue"
+        # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
+        # this loop already wakes on every daemon exit, so it costs a
+        # `poll()` and no timer. Reaping is the load-bearing half: an
+        # unreaped child stays `<defunct>` in the process table forever,
+        # and `ps`, `kill -0` and every check that asks the TABLE rather
+        # than the STATE then report a standby that is not there.
+        self._reap_standby()
+        # A CLEAN EXIT IS A DECISION, NOT A FAILURE. The pin tears itself
+        # down when the last refcount holder closes the FIFO — that is the
+        # whole idle-teardown design. Restarting it would make the port
+        # this class holds immortal too, and the daemon would respawn
+        # forever with nobody to serve.
+        #
+        # Exit status is the only thing that separates them: 0 means the
+        # daemon chose to go (teardown, SIGTERM handler), anything else
+        # means it was killed or crashed.
+        if code == 0:
+            # AUTO-HEAL WITH NO ONE AT A KEYBOARD. This holder is the
+            # LAST pin process alive when its daemon exits cleanly, and a
+            # clean exit is not always the owner clearing the pin -- an
+            # idle-teardown that should not have fired is also code 0.
+            # `load_pin`, read fresh immediately before the spawn (never
+            # cached: the owner may clear it in this same window), is the
+            # one witness a holder with no human nearby can still ask.
+            # Still pinned -> respawn on the held port ourselves, same as
+            # a redeploy; nothing pinned -> release, exactly as today.
+            # ``getattr``: a test double built without ``__init__`` has
+            # no ``_certdir``; that is "cannot tell" and falls to the
+            # release path below, same as every real holder without one.
+            #
+            # THREE MORE GUARDS, ALL ON THE SAME RELEASE PATH.
+            # `self._self_heal_on()`: the switch means "do not act on
+            # your own", and this respawn is exactly that, same as the
+            # non-zero-exit branch below.
+            # `_standby_port_still_wanted`: a redeploy or a re-pin may
+            # already have moved the pin to a DIFFERENT held port, and
+            # respawning here too would leave two lineages superseding
+            # each other on two ports forever.
+            # `load_pin` CAN RAISE (a host gone missing, an ImportError a
+            # deploy left behind) -- and this loop runs in a daemon
+            # thread, so an escaping exception does not fail loudly, it
+            # ends the THREAD only: `_stop` is never set and `self._srv`
+            # is never closed, so `getppid() == born_of` still reads
+            # "holder alive" to the standby forever, port held, nothing
+            # supervising it. `stop()` is the same release a genuinely
+            # unpinned clean exit takes.
+            certdir = getattr(self, "_certdir", None)
+            try:
+                pinned = bool(
+                    certdir is not None
+                    and self._self_heal_on()
+                    and _standby_port_still_wanted(certdir, self.port)
+                    and load_pin(certdir.parent)
                 )
-                # SAY IT ONCE when the successor is not merely crashing but cannot
-                # start at all — see `_report_if_stuck`, shared with a `Popen`
-                # that keeps raising instead of a daemon that keeps exiting.
-                self._report_if_stuck()
-                if self._failures >= _HOLD_DEGRADE_AT:
-                    # STOP WAITING FOR A SUCCESSOR THAT IS NOT COMING. Retrying
-                    # past here is not patience, it is an outage held open: the
-                    # socket stays bound and unaccepted, so every wired session
-                    # hangs rather than failing over. See `degrade_now`.
-                    self.degrade_now()
-                    self._wait_out_degraded()
-                    return
-                time.sleep(self._backoff(self._failures))
-                if self._stop:
-                    return
-                # NOT A BARE `proc.wait()` RE-ENTRY. `_spawn_retrying` owns its
-                # own retry-and-degrade past this point, so a `Popen` failure
-                # here never loops back through the top of this `while` to
-                # wait on the SAME already-dead `self._proc` again — it climbs
-                # this exact ladder itself and either lands a new `self._proc`
-                # (True) or has already called `degrade_now()` (False).
+            except Exception as exc:  # noqa: BLE001 — see above
+                _log_lifecycle(
+                    f"could not tell whether the pin is still set "
+                    f"({exc!r}) — releasing port {self.port} rather than "
+                    f"leaving the standby thinking a dead supervisor is "
+                    f"still watching it")
+                pinned = False
+            if pinned:
+                _log_lifecycle(
+                    f"daemon {self.daemon_pid} exited cleanly but the pin "
+                    f"is still set — respawning on the held port "
+                    f"{self.port}"
+                )
+                self._failures = 0
                 if not self._spawn_retrying():
-                    self._wait_out_degraded()
-                    return
+                    # CAPPED OUT — degrade_now() already ran.
+                    return "wait_out"
+                return "continue"
+            _log_lifecycle(
+                f"daemon {self.daemon_pid} exited cleanly — releasing port "
+                f"{self.port}"
+            )
+            # `stop()`, NOT A BARE CLOSE. Closing only our own listener
+            # left the standby holding its OWN dup of the same descriptor,
+            # un-signalled — still LISTENing, still completing handshakes
+            # into a backlog nobody ever drains. Measured: port 36301
+            # accepted connects and answered nothing for 13 minutes after
+            # exactly this exit, until a human ran `cswap pin --heal`.
+            # `stop()` SIGHUPs the standby and confirms it gone before
+            # closing our own socket (see its own docstring for why that
+            # order matters), so a session that dials afterwards gets
+            # ConnectionRefused at once instead of queueing forever.
+            self.stop()
+            return "return"
+        if code == _RESTART_ME_CODE:
+            # A REDEPLOY, not a teardown. Respawn at once and skip the
+            # backoff: this exit was asked for, so treating it as a failure
+            # would make every update wait out a ladder rung.
+            _log_lifecycle(
+                f"daemon {self.daemon_pid} asked for a successor — "
+                f"restarting on the held port {self.port}"
+            )
+            self._failures = 0
+            if not self._spawn_retrying():
+                # CAPPED OUT — see the same-shaped comment above.
+                return "wait_out"
+            return "continue"
+        if not self._self_heal_on():
+            # SAY WHAT HAPPENS, which is not what this used to claim. The
+            # old line promised "the port stays bound but nothing is
+            # serving it". A human who set this switch to debug a daemon
+            # read "stays bound" and would expect their live sessions to
+            # hang rather than be refused; they are refused, immediately,
+            # all of them. The switch is still doing what it was built for
+            # — its own rationale is that a respawner fighting a human is
+            # "worse than a dead port", which accepts this cost out loud.
+            # Only the line describing it was wrong, and a wrong line in
+            # the one place a debugging session looks is worse than no
+            # line.
+            _log_lifecycle(
+                f"daemon {self.daemon_pid} exited and {_SELF_HEAL_ENV}=off — "
+                f"NOT respawning, and this holder is exiting with it, so "
+                f"port {self.port} stops answering. Every session wired to "
+                f"it gets ConnectionRefused until a pin is started again."
+            )
+            return "return"
+        # A DAEMON THAT SERVED FOR A WHILE CRASHING IS A FRESH
+        # FAILURE, not one more on an old streak — see
+        # `_HOLD_FAILURE_RESET_AFTER_S`. `proc` is the one that just
+        # exited (captured before `wait()`, above), so its own
+        # spawn time is still what `_proc_spawned_at` names here:
+        # nothing has spawned a successor yet this iteration.
+        served_s = (0.0 if self._proc_spawned_at is None
+                   else time.monotonic() - self._proc_spawned_at)
+        if served_s >= _HOLD_FAILURE_RESET_AFTER_S:
+            self._failures = 0
+        self._failures += 1
+        _log_lifecycle(
+            f"daemon {self.daemon_pid} exited (code {code}); restarting "
+            f"under the held port {self.port}"
+        )
+        # SAY IT ONCE when the successor is not merely crashing but cannot
+        # start at all — see `_report_if_stuck`, shared with a `Popen`
+        # that keeps raising instead of a daemon that keeps exiting.
+        self._report_if_stuck()
+        if self._failures >= _HOLD_DEGRADE_AT:
+            # STOP WAITING FOR A SUCCESSOR THAT IS NOT COMING. Retrying
+            # past here is not patience, it is an outage held open: the
+            # socket stays bound and unaccepted, so every wired session
+            # hangs rather than failing over. See `degrade_now`.
+            self.degrade_now()
+            return "wait_out"
+        # STILL LOCKED, deliberately: the backoff is bounded (at most
+        # `_HOLD_RESTART_MAX_S`) and the retry it leads into writes
+        # `self._proc`, which is exactly what this lock serializes against
+        # `_on_replace_request`'s own write — unlike the join above, this
+        # sleep-then-spawn is still part of the SAME decision.
+        time.sleep(self._backoff(self._failures))
+        if self._stop:
+            return "return"
+        # NOT A BARE `proc.wait()` RE-ENTRY. `_spawn_retrying` owns its
+        # own retry-and-degrade past this point, so a `Popen` failure
+        # here never loops back through the top of this `while` to
+        # wait on the SAME already-dead `self._proc` again — it climbs
+        # this exact ladder itself and either lands a new `self._proc`
+        # (True) or has already called `degrade_now()` (False).
+        if not self._spawn_retrying():
+            return "wait_out"
+        return "continue"
 
     def stop(self) -> None:
         """Let go of the port: the DAEMON dies first, then the socket closes.
@@ -10896,6 +11011,19 @@ class PortHolder:
                     proc.kill()
                 except (OSError, ValueError):
                     pass
+        # JOINED BEFORE THE CLOSE, not merely signalled (T1193). Unlike the
+        # ordinary supervisor thread, `_run_degraded` (when running) is
+        # ACTIVELY calling `poller.poll()`/`self._srv.accept()` on this same
+        # socket from another thread — closing it out from under a still-
+        # running syscall on the same fd is a use-after-close race, not
+        # merely the accept()-does-not-wake-on-close gap documented
+        # elsewhere in this file. `self._stop` (set above) is what it is
+        # actually waiting on, and it checks that at least once a second
+        # (`_accept_degraded`'s own poll granularity), so a bounded join
+        # here is a real wait, not a guess.
+        degraded_thread = getattr(self, "_degraded_thread", None)
+        if degraded_thread is not None:
+            degraded_thread.join(timeout=5.0)
         try:
             self._srv.close()
         except OSError:
@@ -11119,6 +11247,26 @@ def standby_main(account_num: str, email: str, certdir: Path) -> None:
     _standby_revive(certdir, srv, account_num, email)
 
 
+def _join_for_signals(thread: threading.Thread) -> None:
+    """`thread.join()`, but TIMED, in a loop — never the bare untimed form.
+
+    CPython runs a signal callback on the MAIN thread only, and only when
+    that thread next executes bytecode. An untimed `Thread.join()` parked on
+    a thread that can now run for the rest of the process's life (a
+    degraded holder retrying forever, T1193) blocks at the C level and never
+    returns to the bytecode loop to notice a SIGTERM the kernel delivered to
+    a DIFFERENT thread — measured on the daemon side of this exact bug
+    (`tests/test_proxy.py`'s ``case_a_term_is_never_dropped_by_a_parked_
+    main_thread``): a second TERM aimed at the process itself killed it in
+    0.10s where one aimed at a worker thread left it "STILL ALIVE after 8s".
+    0.5s, the same interval `daemon_main`'s own `done.wait(0.5)` uses, for
+    the same reason: negligible cost against a process that is otherwise
+    idle, frequent enough that a signal is never held pending for long.
+    """
+    while thread.is_alive():
+        thread.join(timeout=0.5)
+
+
 def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
                     email: str) -> None:
     """Hand the still-open port to a freshly-resolved holder, or promote in
@@ -11212,7 +11360,7 @@ def _standby_revive(certdir: Path, srv: socket.socket, account_num: str,
     holder = PortHolder(certdir, account_num, email, sock=srv)
     holder.start()
     if holder._thread is not None:
-        holder._thread.join()
+        _join_for_signals(holder._thread)
 
 
 def holder_main(account_num: str, email: str, certdir: Path,
@@ -11275,7 +11423,7 @@ def holder_main(account_num: str, email: str, certdir: Path,
     # do. Joining it means the holder exits exactly when it stops supervising
     # — a clean daemon exit (idle teardown) or a self-heal switched off.
     if holder._thread is not None:
-        holder._thread.join()
+        _join_for_signals(holder._thread)
 
 
 def _spawn_daemon(
@@ -18238,77 +18386,87 @@ class PinProxy:
             ) and self._pin_token_provider.mint_stalled():
                 return self._refuse_stalled_mint(tls, method, path)
             token = self._wait_for_pin_token(method, path, token)
-            if token and any(k.lower() == "authorization" for k, v in headers):
-                # ARMED ONLY WHEN THERE WAS AN Authorization HEADER TO
-                # REWRITE (T1193), the same guard the absolute-form path
-                # already applies before ever calling in (see its own
-                # `unswapped = list(headers)` above). Without it, a request
-                # with NO Authorization header still set `swapped = True`
-                # -- nothing there to substitute -- and a refusal's
-                # take-back re-sent the SAME headers a third time: no
-                # Authorization the first time, none on the "fresh" retry,
-                # none on the unswapped fall-back, logging a `swap refused
-                # ... fell-back` line for a request that was never actually
-                # swapped.
-                headers = [
-                    (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
-                    for k, v in headers
-                ]
-                swapped = True
-                # TWO MOMENTS, not one. A create is when a NEW bridge opens
-                # beside an older connected one. Sweeping on THIS instead of a
-                # timer means a quiet daemon never wakes to find nothing, and
-                # the fix lands when it is needed rather than up to an hour
-                # later. Fired on the request rather than the response: the
-                # sweep re-lists from the server anyway, so a create that fails
-                # simply finds nothing new to supersede.
+            if token:
+                # NESTED, NOT A SINGLE `and` (T1193). A token that resolved
+                # fine but meets a request with no Authorization header to
+                # rewrite is not a fail-open case -- there is nothing wrong
+                # with the pin, only nothing here to substitute -- so it
+                # must never fall into the `else` below and trip
+                # `_warn_unpinnable()` for a store that reads perfectly well.
+                if any(k.lower() == "authorization" for k, v in headers):
+                    # ARMED ONLY WHEN THERE WAS AN Authorization HEADER TO
+                    # REWRITE, the same guard the absolute-form path
+                    # already applies before ever calling in (see its own
+                    # `unswapped = list(headers)` above). Without it, a request
+                    # with NO Authorization header still set `swapped = True`
+                    # -- nothing there to substitute -- and a refusal's
+                    # take-back re-sent the SAME headers a third time: no
+                    # Authorization the first time, none on the "fresh" retry,
+                    # none on the unswapped fall-back, logging a `swap refused
+                    # ... fell-back` line for a request that was never actually
+                    # swapped.
+                    headers = [
+                        (k, f"Bearer {token}") if k.lower() == "authorization" else (k, v)
+                        for k, v in headers
+                    ]
+                    swapped = True
+                    # TWO MOMENTS, not one. A create is when a NEW bridge opens
+                    # beside an older connected one. Sweeping on THIS instead of a
+                    # timer means a quiet daemon never wakes to find nothing, and
+                    # the fix lands when it is needed rather than up to an hour
+                    # later. Fired on the request rather than the response: the
+                    # sweep re-lists from the server anyway, so a create that fails
+                    # simply finds nothing new to supersede.
 
-                # THE ONE MOMENT A DENIED SESSION BECOMES UN-DENIED, and the
-                # only evidence of it. Claude Code caches the policy answer per
-                # process and its `/remote-control` pre-fetch returns early
-                # when a document is already cached, so a session that once
-                # read a denial keeps refusing with no request on the wire.
-                # This poll is the sole thing that replaces that cache, and
-                # only on a 200 — a failure or a 304 re-seeds the same
-                # document. Saying so here is the difference between "the fix
-                # will reach it" and having watched it arrive.
-                #
-                # THE ONE CALL THAT CAN SAVE A LIVE BRIDGE, and until now it
-                # was invisible. Claude Code asks this when the identity file
-                # names an account other than the bridge's owner; our answer
-                # names the PINNED account, which makes CC re-baseline rather
-                # than disconnect — and it REASSIGNS the owner to that answer,
-                # so every later rotation compares pin against pin. Its absence
-                # is the other half of the diagnosis: a bridge that died
-                # without this line never asked, and one that died after it
-                # asked is a different fault entirely. The `[bridge:owner-pin]`
-                # traces only exist under --debug, which no session here runs,
-                # so nothing else can tell those apart.
-                if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
-                    # HOW MANY DID NOT ASK, in the same line. The absence of
-                    # this line is half the diagnosis, and a bare "a session
-                    # asked" cannot say whether that was one of two or one of
-                    # fourteen. A rotation that tears one bridge down while
-                    # ONE of fourteen asked is a different fault from one
-                    # where all fourteen asked, and the counts were being
-                    # reconstructed by hand afterwards from a log that never
-                    # recorded the denominator.
-                    try:
-                        held = len(self.held_bridge_ids())
-                    except Exception:  # noqa: BLE001 — a log must not cost a request
-                        held = -1
-                    _log_lifecycle(
-                        "a session asked who its credential belongs to — "
-                        "answered as the pinned account, which is what lets a "
-                        "live bridge survive the account rotation"
-                        + (f" (this daemon is carrying {held} bridge(s))"
-                           if held >= 0 else ""))
-                if path.split("?", 1)[0].rstrip("/") == \
-                        "/api/claude_code/policy_limits":
-                    _log_lifecycle(
-                        "a session asked for its org policy — answered as the "
-                        "pinned account, so a cached denial from another "
-                        "account is replaced without a restart")
+                    # THE ONE MOMENT A DENIED SESSION BECOMES UN-DENIED, and the
+                    # only evidence of it. Claude Code caches the policy answer per
+                    # process and its `/remote-control` pre-fetch returns early
+                    # when a document is already cached, so a session that once
+                    # read a denial keeps refusing with no request on the wire.
+                    # This poll is the sole thing that replaces that cache, and
+                    # only on a 200 — a failure or a 304 re-seeds the same
+                    # document. Saying so here is the difference between "the fix
+                    # will reach it" and having watched it arrive.
+                    #
+                    # THE ONE CALL THAT CAN SAVE A LIVE BRIDGE, and until now it
+                    # was invisible. Claude Code asks this when the identity file
+                    # names an account other than the bridge's owner; our answer
+                    # names the PINNED account, which makes CC re-baseline rather
+                    # than disconnect — and it REASSIGNS the owner to that answer,
+                    # so every later rotation compares pin against pin. Its absence
+                    # is the other half of the diagnosis: a bridge that died
+                    # without this line never asked, and one that died after it
+                    # asked is a different fault entirely. The `[bridge:owner-pin]`
+                    # traces only exist under --debug, which no session here runs,
+                    # so nothing else can tell those apart.
+                    if path.split("?", 1)[0].rstrip("/") == "/api/oauth/validate":
+                        # HOW MANY DID NOT ASK, in the same line. The absence of
+                        # this line is half the diagnosis, and a bare "a session
+                        # asked" cannot say whether that was one of two or one of
+                        # fourteen. A rotation that tears one bridge down while
+                        # ONE of fourteen asked is a different fault from one
+                        # where all fourteen asked, and the counts were being
+                        # reconstructed by hand afterwards from a log that never
+                        # recorded the denominator.
+                        try:
+                            held = len(self.held_bridge_ids())
+                        except Exception:  # noqa: BLE001 — a log must not cost a request
+                            held = -1
+                        _log_lifecycle(
+                            "a session asked who its credential belongs to — "
+                            "answered as the pinned account, which is what lets a "
+                            "live bridge survive the account rotation"
+                            + (f" (this daemon is carrying {held} bridge(s))"
+                               if held >= 0 else ""))
+                    if path.split("?", 1)[0].rstrip("/") == \
+                            "/api/claude_code/policy_limits":
+                        _log_lifecycle(
+                            "a session asked for its org policy — answered as the "
+                            "pinned account, so a cached denial from another "
+                            "account is replaced without a restart")
+                # else: a resolved token with nothing to substitute. Not the
+                # fail-open case below -- the pin is fine, this request just
+                # carries no Authorization header to rewrite.
             else:
                 # Fail-open: the request still goes, on the disk bearer. That
                 # is deliberate — a pin that cannot resolve must never block

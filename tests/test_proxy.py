@@ -4814,13 +4814,15 @@ class TestASpawnFailureIsNotFatal:
         raising. This case is about that report alone -- `start()` ->
         False, no supervisor thread -- so `degrade_now()` is stubbed the
         same way `case_the_capping_attempt_does_not_say_retrying` stubs
-        it: the real one now starts a degraded acceptor and `start()`
-        blocks on it (`_wait_out_degraded`, T1294) before handing the
-        False back, which is exactly what keeps THAT process serving --
-        covered by its own case below -- but would hang this one's 5s
-        join on a thread nothing here ever tells to stop. Driven
-        off-thread and joined with a timeout so a regression to an
-        uncapped retry hangs this case instead of the whole suite."""
+        it: the real one now starts a degraded, RETRYING acceptor and
+        `start()` blocks on it (`_wait_out_degraded`, T1294/T1193) before
+        handing the False back, which is exactly what keeps THAT process
+        serving -- covered by `case_a_degraded_promotion_retries_and_
+        recovers_once_pinned` and its re-degrade sibling below, not by
+        this one, which would hang its own 5s join on a thread nothing
+        here ever tells to stop. Driven off-thread and joined with a
+        timeout so a regression to an uncapped retry hangs this case
+        instead of the whole suite."""
         from cswap_pin.proxy import PortHolder
 
         certdir = tmp_path / "pin-proxy"
@@ -4865,9 +4867,9 @@ class TestASpawnFailureIsNotFatal:
             )
             assert outcome.get("result") is False, (
                 "a permanently failing promotion spawn must report failure "
-                "(start() -> False) so _standby_revive skips its join and "
-                "lets the process end, rather than looking like a holder "
-                "that came up fine"
+                "(start() -> False) so _standby_revive skips joining a "
+                "supervisor thread that was never started, rather than "
+                "looking like a holder that came up fine"
             )
             assert holder._thread is None, (
                 "a supervisor thread started over a promotion that never "
@@ -4893,11 +4895,25 @@ class TestASpawnFailureIsNotFatal:
         whether `_supervise`'s thread has returned -- only a real process
         boundary shows a thread dying with its process. The child never
         returns to pytest; it always ends in `os._exit`, matching
-        `holder_main`'s own shape (spawn, degrade, join, exit)."""
+        `holder_main`'s own shape (spawn, degrade, join, exit).
+
+        SIGNALLED, NOT SLEPT ON, and the reply is REQUIRED, not merely
+        "the connect did not raise" (T1193): a bare `create_connection`
+        succeeds against any bound listener via the kernel's own backlog,
+        whether or not anything is behind it to accept and answer, so the
+        old check passed even against a holder that had degraded, then
+        had its process exit behind the acceptor -- exactly the bug this
+        case exists to catch. The child writes the port, THEN blocks on
+        its own poll of `holder._degraded` and writes a second marker only
+        once THAT is true, so the parent's CONNECT is never raced against
+        a cascade still in flight; requiring a reply byte (same pattern as
+        `case_a_degraded_holder_answers_on_the_held_port`, 4151-4160) is
+        what actually proves something is accepting AND relaying, not
+        just listening."""
         import contextlib
         import signal
 
-        from cswap_pin.proxy import PortHolder, ensure_ca, run_service
+        from cswap_pin.proxy import PortHolder, _join_for_signals, ensure_ca, run_service
 
         monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
         monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
@@ -4925,47 +4941,423 @@ class TestASpawnFailureIsNotFatal:
             os.close(r_fd)
             try:
                 holder = run_service(tmp_path, "1", "a@b.c")
-                os.write(w_fd, str(holder.port).encode())
-                os.close(w_fd)
+                os.write(w_fd, str(holder.port).encode().ljust(32))
                 # A SINGLE CRASH, cascading through the WHOLE ladder: the
                 # daemon exits non-zero, `_supervise` respawns, every
                 # respawn past the first raises (see `_flaky_spawn`), and
                 # with `_backoff` patched to 0.0 the ladder reaches
                 # `_HOLD_DEGRADE_AT` in milliseconds, not seconds.
                 holder._proc.exit(1)
+                deadline = time.time() + 10
+                while not getattr(holder, "_degraded", False) and time.time() < deadline:
+                    time.sleep(0.01)
+                os.write(w_fd, b"D" if getattr(holder, "_degraded", False) else b"N")
+                os.close(w_fd)
+                # THE SAME CALL `holder_main` NOW MAKES, not a bare
+                # untimed `.join()` -- see `_join_for_signals`.
                 if holder._thread is not None:
-                    holder._thread.join()
+                    _join_for_signals(holder._thread)
             finally:
                 os._exit(0)  # holder_main's own tail: the process just ends
 
         os.close(w_fd)
         try:
             port = int(os.read(r_fd, 32).decode())
+            marker = os.read(r_fd, 1)
             os.close(r_fd)
-
-            # LET THE CASCADE FINISH AND `holder_main`'S OWN JOIN EITHER
-            # RETURN (the bug: this process has exited by now) OR BLOCK ON
-            # THE DEGRADED ACCEPTOR (the fix: still up, still serving).
-            time.sleep(1.0)
-
-            try:
-                conn = socket.create_connection(
-                    ("127.0.0.1", port), timeout=2)
-                conn.close()
-                answered = True
-            except OSError:
-                answered = False
-            assert answered, (
-                f"port {port} refused once the holder_main-shaped join "
-                f"returned -- the degraded holder's own process exited "
-                f"behind it and took the acceptor and the socket down "
-                f"with it"
+            assert marker == b"D", (
+                "the crash cascade never reached degrade_now() -- this "
+                "case measures nothing about the join that follows it"
             )
+
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            try:
+                s.settimeout(5)
+                s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                          b"Host: api.anthropic.com:443\r\n\r\n")
+                assert s.recv(64), (
+                    f"port {port} accepted the CONNECT but never replied -- "
+                    f"the degraded holder's own process exited behind "
+                    f"`holder_main`'s join and took the acceptor down with "
+                    f"it, leaving nothing to relay to"
+                )
+            finally:
+                s.close()
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
             with contextlib.suppress(ChildProcessError):
                 os.waitpid(pid, 0)
+
+    def _drive_degrade_and_retry(self, tmp_path, monkeypatch, *,
+                                  promotion, recovers):
+        """Shared drive for T1193's degrade-then-retry cases: reach
+        `degrade_now()` for real (a crash-loop to `_HOLD_DEGRADE_AT` for a
+        cold start, or a permanently-raising `_spawn` for a promotion —
+        same two drives `TestASpawnFailureIsNotFatal` already uses),
+        shorten the retry timer, then either let the NEXT `_spawn` succeed
+        (`recovers=True`) or keep it raising (`recovers=False`). Returns
+        (holder, procs, spawn_calls); the caller owns `holder.stop()`.
+        """
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        monkeypatch.setattr(pin_proxy, "_HOLD_DEGRADE_RETRY_S", 0.05)
+
+        procs = []
+        spawn_calls = []
+        broken = {"on": False}
+
+        def _spawn(self):
+            spawn_calls.append(1)
+            if broken["on"]:
+                raise OSError("fork: Resource temporarily unavailable")
+            proc = TestASpawnFailureIsNotFatal._BlockingProc()
+            procs.append(proc)
+            self._proc = proc
+            self.daemon_pid = 1000 + len(spawn_calls)
+
+        monkeypatch.setattr(PortHolder, "_spawn", _spawn)
+
+        if promotion:
+            certdir = tmp_path / "pin-proxy"
+            certdir.mkdir()
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(8)
+            # THE PROMOTION'S OWN SPAWN IS THE FAILURE HERE, climbing
+            # `_spawn_retrying`'s ladder to the cap (`case_promotion_with_
+            # an_always_raising_spawn_reports_failure` drives the SAME
+            # shape, with `degrade_now()` stubbed; this one lets it run).
+            broken["on"] = True
+            holder = PortHolder(certdir, "1", "a@b.c", sock=srv)
+            threading.Thread(target=holder.start, daemon=True).start()
+        else:
+            holder = PortHolder(tmp_path, "1", "a@b.c")
+            holder.start()
+            assert len(procs) == 1, (
+                "premise: the cold start did not spawn cleanly"
+            )
+
+        deadline = time.time() + 10
+        while not getattr(holder, "_degraded", False) and time.time() < deadline:
+            if not promotion:
+                procs[-1].exit(1)
+                n_before = len(procs)
+                inner_deadline = time.time() + 1
+                while (len(procs) <= n_before
+                       and not getattr(holder, "_degraded", False)
+                       and time.time() < inner_deadline):
+                    time.sleep(0.01)
+            else:
+                time.sleep(0.02)
+        assert getattr(holder, "_degraded", False), (
+            "premise: the drive never reached degrade_now()"
+        )
+
+        broken["on"] = not recovers
+        return holder, procs, spawn_calls
+
+    def case_a_ladder_cap_degrade_retries_and_recovers_once_pinned(
+            self, tmp_path, monkeypatch):
+        """T1193: degrading is no longer permanent. Reaching
+        `_HOLD_DEGRADE_AT` through the immediate-cap check inside an
+        ordinary crash loop (`_supervise_locked`'s tail, not `_spawn_
+        retrying`'s own ladder) must leave the supervisor thread BLOCKED
+        in `_wait_out_degraded()` rather than ended -- proving
+        `degrade_now()`'s retrying acceptor is the only thing left
+        holding the process up -- and, once the fault clears and the
+        (patched-short) retry timer fires, a fresh daemon must land and
+        `_degraded` must clear."""
+        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+            tmp_path, monkeypatch, promotion=False, recovers=True)
+        try:
+            assert holder._thread.is_alive(), (
+                "the supervisor thread ended instead of blocking in "
+                "_wait_out_degraded() -- the process would exit behind "
+                "the still-serving degraded acceptor"
+            )
+            n_before = len(procs)
+            deadline = time.time() + 5
+            while getattr(holder, "_degraded") and time.time() < deadline:
+                time.sleep(0.02)
+            assert not holder._degraded, (
+                "the retry never un-degraded once the fault cleared"
+            )
+            assert len(procs) > n_before, (
+                "no fresh daemon was actually spawned by the retry"
+            )
+        finally:
+            holder.stop()
+
+    def case_a_ladder_cap_degrade_re_degrades_if_the_retry_still_fails(
+            self, tmp_path, monkeypatch):
+        """A retry that fails outright must resume serving degraded
+        rather than leave nothing accepting -- ONE attempt, not a second
+        ladder (`_run_degraded` resumes `self._failures` one short of the
+        cap, so a fresh failure re-degrades at once)."""
+        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+            tmp_path, monkeypatch, promotion=False, recovers=False)
+        try:
+            n_calls_before = len(spawn_calls)
+            deadline = time.time() + 5
+            while len(spawn_calls) <= n_calls_before and time.time() < deadline:
+                time.sleep(0.02)
+            assert len(spawn_calls) > n_calls_before, (
+                "the retry timer never fired a fresh attempt"
+            )
+            deadline = time.time() + 2
+            while not holder._degraded and time.time() < deadline:
+                time.sleep(0.02)
+            assert holder._degraded, (
+                "a retry that failed outright left the holder un-degraded "
+                "with nothing accepting"
+            )
+            # STILL SERVING: the accept loop resumed rather than the
+            # process falling through with no acceptor left at all.
+            with socket.create_connection(("127.0.0.1", holder.port), timeout=2):
+                pass
+        finally:
+            holder.stop()
+
+    def case_stop_joins_the_degraded_thread_before_closing_the_socket(
+            self, tmp_path, monkeypatch):
+        """T1193: unlike the ordinary supervisor, `_run_degraded` keeps
+        actively calling `poller.poll()`/`self._srv.accept()` on this same
+        socket from ANOTHER thread -- so `stop()` closing it from the
+        caller's thread while that call is still in flight is a
+        use-after-close race on the shared fd, not merely the documented
+        "close does not wake a blocked accept()" gap. MEASURED: leaving
+        it un-joined here produced garbled `inspect.getsource()` reads in
+        UNRELATED, LATER tests once enough of these threads were still
+        alive at once -- a stray fd, reused by something else entirely,
+        read as if it were still this socket. `stop()` must not return
+        with this thread still alive."""
+        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+            tmp_path, monkeypatch, promotion=False, recovers=False)
+        thread = holder._degraded_thread
+        holder.stop()
+        assert not thread.is_alive(), (
+            "stop() returned with the degraded acceptor thread still "
+            "running its own accept()/poll() on the socket stop() just "
+            "closed"
+        )
+
+    def case_a_degraded_promotion_retries_and_recovers_once_pinned(
+            self, tmp_path, monkeypatch):
+        """The SAME retry, driven from the capped-promotion site
+        (`start()`'s own `_wait_out_degraded()`, T1294/T1193) instead of
+        `_supervise`'s: nothing there starts a supervisor thread at all,
+        so the retry loop is the only thing keeping the process up, and
+        recovery must still land a real daemon."""
+        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+            tmp_path, monkeypatch, promotion=True, recovers=True)
+        try:
+            n_before = len(procs)
+            deadline = time.time() + 5
+            while getattr(holder, "_degraded") and time.time() < deadline:
+                time.sleep(0.02)
+            assert not holder._degraded, (
+                "the promotion's retry never un-degraded once the fault "
+                "cleared"
+            )
+            assert len(procs) > n_before, (
+                "no fresh daemon was actually spawned by the promotion's "
+                "retry"
+            )
+        finally:
+            holder.stop()
+
+    def case_a_degraded_promotion_re_degrades_if_the_retry_still_fails(
+            self, tmp_path, monkeypatch):
+        """Same as the `_supervise`-side re-degrade case, driven from the
+        capped-promotion site instead."""
+        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+            tmp_path, monkeypatch, promotion=True, recovers=False)
+        try:
+            n_calls_before = len(spawn_calls)
+            deadline = time.time() + 5
+            while len(spawn_calls) <= n_calls_before and time.time() < deadline:
+                time.sleep(0.02)
+            assert len(spawn_calls) > n_calls_before, (
+                "the promotion's retry timer never fired a fresh attempt"
+            )
+            deadline = time.time() + 2
+            while not holder._degraded and time.time() < deadline:
+                time.sleep(0.02)
+            assert holder._degraded, (
+                "a promotion retry that failed outright left the holder "
+                "un-degraded with nothing accepting"
+            )
+            with socket.create_connection(("127.0.0.1", holder.port), timeout=2):
+                pass
+        finally:
+            holder.stop()
+
+    def case_the_clean_exit_still_pinned_cap_also_blocks_on_the_retry(
+            self, tmp_path, monkeypatch):
+        """T1193's own coverage gap: `_supervise`'s clean-exit-still-pinned
+        respawn (`code == 0`, pin still set) climbs `_spawn_retrying`'s
+        OWN ladder to the cap the same as an ordinary crash does, but
+        NOTHING before this case ever drove it there -- deleting this
+        site's `_wait_out_degraded()` left every existing case green. The
+        supervisor thread staying alive (blocked, not ended) is what only
+        that call, not `degrade_now()` alone, can prove."""
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT
+
+        holder, procs, spawn_calls = (
+            self._respawn_after_exit_survives_a_raising_spawn(
+                tmp_path, monkeypatch, 0, raises=_HOLD_DEGRADE_AT, pinned=True))
+        try:
+            deadline = time.time() + 5
+            while not getattr(holder, "_degraded", False) and time.time() < deadline:
+                time.sleep(0.02)
+            assert holder._degraded, (
+                "premise: the ladder never capped inside the clean-exit "
+                "still-pinned respawn"
+            )
+            assert holder._thread.is_alive(), (
+                "the supervisor thread ended instead of blocking in "
+                "_wait_out_degraded() at the clean-exit still-pinned site"
+            )
+        finally:
+            holder.stop()
+
+    def case_the_redeploy_respawn_cap_also_blocks_on_the_retry(
+            self, tmp_path, monkeypatch):
+        """Same coverage gap, at the `code == _RESTART_ME_CODE` respawn
+        site."""
+        from cswap_pin.proxy import _HOLD_DEGRADE_AT, _RESTART_ME_CODE
+
+        holder, procs, spawn_calls = (
+            self._respawn_after_exit_survives_a_raising_spawn(
+                tmp_path, monkeypatch, _RESTART_ME_CODE,
+                raises=_HOLD_DEGRADE_AT))
+        try:
+            deadline = time.time() + 5
+            while not getattr(holder, "_degraded", False) and time.time() < deadline:
+                time.sleep(0.02)
+            assert holder._degraded, (
+                "premise: the ladder never capped inside the redeploy "
+                "(exit 75) respawn"
+            )
+            assert holder._thread.is_alive(), (
+                "the supervisor thread ended instead of blocking in "
+                "_wait_out_degraded() at the redeploy respawn site"
+            )
+        finally:
+            holder.stop()
+
+    def case_a_replace_request_to_a_degraded_holder_neither_deadlocks_nor_races(
+            self, tmp_path, monkeypatch):
+        """T1193: a SIGUSR1 "replace me" arriving at a degraded holder
+        must never deadlock (`_supervise`'s own `with self._replace_lock:`
+        used to wrap the now-indefinite `_wait_out_degraded()` wait) and
+        must never spawn a daemon beside the still-accepting degraded
+        acceptor (the two-acceptors-on-one-socket bug `test_meta.py:388`
+        bans) -- it can only decline. Driven directly (`_on_replace_
+        request` is the SIGUSR1 handler body, called here without a
+        signal so the case is not racing tgkill), on a REAL degraded
+        holder reached via the SAME crash-loop drive the recovery cases
+        above use (a COLD START's own `_spawn()` failure raises straight
+        out of `start()`, per its own contract, and never reaches
+        `degrade_now()` at all -- there is nothing to install a replace
+        handler over there), from a separate thread so a deadlock hangs
+        this case instead of the whole suite."""
+        from cswap_pin import proxy as pin_proxy
+
+        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+            tmp_path, monkeypatch, promotion=False, recovers=False)
+        try:
+            # DECLINED, NOT MERELY "no new spawn count" -- the background
+            # retry (patched to 0.05s by the shared drive) keeps calling
+            # `_spawn` on its own regardless of this request, so a bare
+            # counter comparison would pass or fail on THAT timing, not on
+            # what `_on_replace_request` itself did. The log line it emits
+            # only on the decline path is unambiguous either way.
+            lines = []
+            monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+
+            replier = threading.Thread(
+                target=holder._on_replace_request, args=(0, None), daemon=True)
+            replier.start()
+            replier.join(timeout=3)
+            assert not replier.is_alive(), (
+                "_on_replace_request deadlocked against a degraded "
+                "holder's own indefinite _wait_out_degraded() wait"
+            )
+            assert any("replace request" in l and "ignored" in l for l in lines), (
+                f"no decline line from a replace request against a "
+                f"degraded holder -- it either spawned a daemon beside "
+                f"the still-accepting degraded acceptor, or said nothing: "
+                f"{lines}"
+            )
+        finally:
+            holder.stop()
+
+    def case_join_for_signals_is_a_timed_loop_not_a_bare_join(self, tmp_path):
+        """T1193: `holder_main` and `_standby_revive` both used to park
+        their MAIN thread in a bare, untimed `Thread.join()` over the
+        supervisor (or, now, the degraded-retry) thread -- and that
+        thread can now run for the REST OF THE PROCESS'S LIFE once a
+        degrade retries forever instead of ending it. CPython runs a
+        signal callback on the MAIN thread only, and only when that
+        thread next returns to bytecode -- a main thread blocked in an
+        untimed `Thread.join()` never does, so a SIGTERM the kernel
+        delivers to a DIFFERENT thread is dropped for as long as the join
+        never returns (measured on the ANALOGOUS `daemon_main` bug,
+        `case_a_term_is_never_dropped_by_a_parked_main_thread` above).
+        `_join_for_signals` fixes it with a bounded, repeated join, same
+        0.5s `daemon_main`'s own `done.wait(0.5)` uses.
+
+        DRIVEN ON THE STRUCTURE, not with a real signal: a real `tgkill`
+        across `os.fork()` measures the KERNEL and CPython's C-level
+        signal plumbing together, and in this sandbox that combination
+        did not reliably wake even the ALREADY-timed `done.wait(0.5)`
+        loop the daemon side uses -- a sandbox artifact, not a property
+        of this code, and not this case's to chase (never test a
+        refusal, or a fix, with a real signal where the harness itself
+        is the unknown). A fake thread that records each `join(timeout=)`
+        call is what actually discriminates: it fails the moment either
+        `_join_for_signals` reaches an untimed line, or degrades to a
+        single call instead of a loop."""
+        from cswap_pin.proxy import _join_for_signals
+
+        class _FakeThread:
+            """`is_alive()` answers YES for `still_alive_for` calls, then
+            NO -- so returning at all requires the LOOP to have actually
+            re-checked it, not just made one `join()` call and trusted
+            it."""
+
+            def __init__(self, still_alive_for):
+                self.still_alive_for = still_alive_for
+                self.join_calls = []
+                self._checks = 0
+
+            def is_alive(self):
+                self._checks += 1
+                return self._checks <= self.still_alive_for
+
+            def join(self, timeout=None):
+                self.join_calls.append(timeout)
+
+        fake = _FakeThread(still_alive_for=3)
+        _join_for_signals(fake)
+
+        assert fake.join_calls, "_join_for_signals never called join() at all"
+        assert len(fake.join_calls) >= 3, (
+            f"only {len(fake.join_calls)} join() call(s) -- a single call "
+            f"is the untimed-join shape this case exists to catch"
+        )
+        assert all(t is not None and t <= 1.0 for t in fake.join_calls), (
+            f"an untimed (None) or long join() call would drop a SIGTERM "
+            f"delivered to a different thread: {fake.join_calls}"
+        )
 
 
 class TestHolderCrashIsSurvivable:

@@ -15120,6 +15120,11 @@ class TestAMisroutedSwapCannotKillASession:
                 f"nothing was swapped, so there is nothing to take back and "
                 f"no 'swap refused' line to log: {lines}"
             )
+            assert getattr(proxy, "_warned_unpinnable", False) is False, (
+                "a resolved token with no Authorization header to rewrite "
+                "fell into the fail-open branch and warned UNPINNED, though "
+                "the pin itself resolved fine"
+            )
         finally:
             proxy.stop()
             upstream.stop()
