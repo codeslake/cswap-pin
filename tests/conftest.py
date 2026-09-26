@@ -853,6 +853,15 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
         # A per-case dir, not the shared one: two cases writing `pin-proxy/`
         # under one tmp_path would see each other's files.
         case_tmp = tmp_path_factory.mktemp(f"c{i}")
+        # THE HOP-TROUBLE STAMP, BEFORE TOO. The `finally` below only clears
+        # it AFTER a case, so a plain test outside this loop that pokes it
+        # directly and never restores it -- no `finally` of its own -- is
+        # still hot when THIS case starts, and the after-reset clears it only
+        # once this case has already run under the polluted value.
+        import cswap_pin.proxy as _pp
+
+        with _pp._hop_trouble_lock:
+            _pp._hop_trouble_at = 0.0
         try:
             # The autouse guards ran once for the DRIVER's tmp_path. Re-point
             # them at this case's dir, or a case's config writes land in the
