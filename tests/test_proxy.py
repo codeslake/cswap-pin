@@ -4110,6 +4110,25 @@ class TestRepinIsLive:
         assert pin_proxy.daemon_fingerprint() == pin_proxy.daemon_fingerprint()
 
 
+def _assert_degraded_acceptor_relays(port):
+    """Prove the degraded acceptor is actually ACCEPTING AND RELAYING,
+    not merely listening (T1193). A bare `create_connection` succeeds
+    against any bound listener straight out of the kernel's own
+    backlog, whether or not anything behind it ever calls `accept()`
+    -- exactly the gap that let a re-degrade case pass against a
+    socket nothing was serving. A plain GET gets `_relay_one`'s own
+    405 with no network involved, which only a live acceptor thread
+    can produce."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.settimeout(10)
+        s.sendall(b"GET / HTTP/1.1\r\n\r\n")
+        reply = s.recv(64)
+    assert b"405" in reply, (
+        f"port {port} did not answer 405 to a plain GET -- nothing is "
+        f"actually accepting on the degraded socket: {reply!r}"
+    )
+
+
 class TestASuccessorThatCannotStart:
     """The port stays BOUND and stops ANSWERING, which is the worst shape.
 
@@ -4142,10 +4161,10 @@ class TestASuccessorThatCannotStart:
         `self._degraded` (T1193: ONE THREAD) — the actual serving is
         `_supervise`'s own degraded branch, started here the same way
         `start()` always starts it, never a thread `degrade_now()` spins
-        up on its own.
+        up on its own. `_assert_degraded_acceptor_relays`'s local GET ->
+        405 probe, not a CONNECT to a real upstream: this case has no
+        network dependency to prove the acceptor is live.
         """
-        import socket
-
         from cswap_pin.proxy import PortHolder, ensure_ca
 
         ensure_ca(tmp_path, "api.anthropic.com")
@@ -4155,18 +4174,7 @@ class TestASuccessorThatCannotStart:
             holder._thread = threading.Thread(
                 target=holder._supervise, daemon=True)
             holder._thread.start()
-            s = socket.create_connection(("127.0.0.1", holder.port), timeout=5)
-            try:
-                s.settimeout(5)
-                s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
-                          b"Host: api.anthropic.com:443\r\n\r\n")
-                assert s.recv(64), (
-                    "bound with nobody accepting — the hang that took the "
-                    "machine out, which is worse than a refusal because it "
-                    "fails slowly and everywhere at once"
-                )
-            finally:
-                s.close()
+            _assert_degraded_acceptor_relays(holder.port)
         finally:
             holder.stop()
 
@@ -4182,8 +4190,10 @@ class TestASuccessorThatCannotStart:
         holder = PortHolder(tmp_path, "1", "a@b.c")
         seen = {"degraded": False}
         monkeypatch.setattr(PortHolder, "_backoff", staticmethod(lambda n: 0.0))
-        monkeypatch.setattr(PortHolder, "degrade_now",
-                            lambda self: seen.__setitem__("degraded", True))
+        def _degrade(self):
+            self._degraded = True
+            seen["degraded"] = True
+        monkeypatch.setattr(PortHolder, "degrade_now", _degrade)
 
         class _DeadProc:
             def wait(self):
@@ -4534,8 +4544,10 @@ class TestASpawnFailureIsNotFatal:
         monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
         monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
         seen = {"degraded": False}
-        monkeypatch.setattr(PortHolder, "degrade_now",
-                            lambda self: seen.__setitem__("degraded", True))
+        def _degrade(self):
+            self._degraded = True
+            seen["degraded"] = True
+        monkeypatch.setattr(PortHolder, "degrade_now", _degrade)
 
         spawn_calls = []
 
@@ -4643,9 +4655,10 @@ class TestASpawnFailureIsNotFatal:
         monkeypatch.setattr(PortHolder, "_spawn", _spawn_ok)
 
         degraded = {"on": False}
-        monkeypatch.setattr(
-            PortHolder, "degrade_now",
-            lambda self: degraded.__setitem__("on", True))
+        def _degrade(self):
+            self._degraded = True
+            degraded["on"] = True
+        monkeypatch.setattr(PortHolder, "degrade_now", _degrade)
 
         holder = PortHolder(tmp_path, "1", "a@b.c")
         try:
@@ -4980,7 +4993,7 @@ class TestASpawnFailureIsNotFatal:
                 "case measures nothing about the join that follows it"
             )
 
-            self._assert_degraded_acceptor_relays(port)
+            _assert_degraded_acceptor_relays(port)
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
@@ -5007,6 +5020,14 @@ class TestASpawnFailureIsNotFatal:
         back on the SAME thread that is about to call `_spawn` (the
         holder's own, whether that is the merged supervisor thread or a
         promotion's `start()` call) — no cross-thread race to lose.
+
+        A `recovers=True` post-cap attempt still lands only once
+        `observed` is set below, never on the retry timer alone: that
+        timer can fire and succeed within ~50ms of the cap, well inside
+        a 20ms poll's own scheduling jitter on a loaded runner, closing
+        the degraded window before anything outside this thread ever
+        saw it. An attempt before `observed` is set just re-degrades
+        (harmless — it already was), so the window cannot close unseen.
         """
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PortHolder, ensure_ca
@@ -5019,6 +5040,7 @@ class TestASpawnFailureIsNotFatal:
 
         procs = []
         spawn_calls = []
+        observed = threading.Event()
 
         def _spawn(self):
             spawn_calls.append(1)
@@ -5028,8 +5050,12 @@ class TestASpawnFailureIsNotFatal:
             # the cap. A cold start instead climbs via real crashes (the
             # drive loop below), so it must succeed here.
             # POST-CAP (`_degraded` already True): a single retry attempt,
-            # decided by `recovers` fresh on every call.
+            # decided by `recovers` fresh on every call -- and, for
+            # `recovers=True`, only once `observed` is set (see the
+            # docstring above).
             if (not degraded and promotion) or (degraded and not recovers):
+                raise OSError("fork: Resource temporarily unavailable")
+            if degraded and recovers and not observed.is_set():
                 raise OSError("fork: Resource temporarily unavailable")
             proc = TestASpawnFailureIsNotFatal._BlockingProc()
             procs.append(proc)
@@ -5073,26 +5099,9 @@ class TestASpawnFailureIsNotFatal:
         assert getattr(holder, "_degraded", False), (
             "premise: the drive never reached degrade_now()"
         )
+        observed.set()
 
         return holder, procs, spawn_calls
-
-    def _assert_degraded_acceptor_relays(self, port):
-        """Prove the degraded acceptor is actually ACCEPTING AND RELAYING,
-        not merely listening (T1193). A bare `create_connection` succeeds
-        against any bound listener straight out of the kernel's own
-        backlog, whether or not anything behind it ever calls `accept()`
-        -- exactly the gap that let a re-degrade case pass against a
-        socket nothing was serving. A plain GET gets `_relay_one`'s own
-        405 with no network involved, which only a live acceptor thread
-        can produce."""
-        with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
-            s.settimeout(10)
-            s.sendall(b"GET / HTTP/1.1\r\n\r\n")
-            reply = s.recv(64)
-        assert b"405" in reply, (
-            f"port {port} did not answer 405 to a plain GET -- nothing is "
-            f"actually accepting on the degraded socket: {reply!r}"
-        )
 
     def case_a_ladder_cap_degrade_retries_and_recovers_once_pinned(
             self, tmp_path, monkeypatch):
@@ -5157,7 +5166,7 @@ class TestASpawnFailureIsNotFatal:
             # STILL SERVING: the accept loop resumed and is actually
             # relaying, not merely listening (a bare `create_connection`
             # would succeed even with nothing behind it).
-            self._assert_degraded_acceptor_relays(holder.port)
+            _assert_degraded_acceptor_relays(holder.port)
         finally:
             holder.stop()
 
@@ -5269,7 +5278,7 @@ class TestASpawnFailureIsNotFatal:
                 "a promotion retry that failed outright left the holder "
                 "un-degraded with nothing accepting"
             )
-            self._assert_degraded_acceptor_relays(holder.port)
+            _assert_degraded_acceptor_relays(holder.port)
         finally:
             holder.stop()
 
@@ -5297,10 +5306,16 @@ class TestASpawnFailureIsNotFatal:
 
         procs = []
         spawn_calls = []
+        # GATED ON `observed`, same reasoning as `_drive_degrade_and_retry`:
+        # the post-cap retry can land within ~50ms of the cap, inside a
+        # 20ms poll's own scheduling jitter on a loaded runner -- an
+        # attempt before the test has observed `_degraded` just
+        # re-degrades instead of closing the window unseen.
+        observed = threading.Event()
 
         def _spawn(self):
             spawn_calls.append(1)
-            if not getattr(self, "_degraded", False):
+            if not getattr(self, "_degraded", False) or not observed.is_set():
                 # PRE-CAP: raise every attempt, the only way this reaches
                 # the cap at all -- same drive as `_drive_degrade_and_retry`.
                 raise OSError("fork: Resource temporarily unavailable")
@@ -5325,6 +5340,7 @@ class TestASpawnFailureIsNotFatal:
             while not getattr(holder, "_degraded", False) and time.time() < deadline:
                 time.sleep(0.02)
             assert holder._degraded, "premise: the promotion never capped"
+            observed.set()
 
             deadline = time.time() + 5
             while not standby_calls and time.time() < deadline:
@@ -5395,6 +5411,84 @@ class TestASpawnFailureIsNotFatal:
             assert procs[0].returncode is not None, (
                 "the landed retry's own daemon was never terminated after "
                 "stop() raced it -- it lives on holding the listening fd"
+            )
+        finally:
+            holder.stop()
+
+    def case_a_landed_retry_that_crashes_at_once_still_re_degrades(
+            self, tmp_path, monkeypatch):
+        """T1193: `_supervise`'s degraded branch presets `self._failures =
+        _HOLD_DEGRADE_AT - 1` right before its own retry lands ("ONE
+        ATTEMPT PER WAKE, NOT A FRESH LADDER") so a daemon that crashes
+        AT ONCE, right behind a `Popen` that itself succeeded, re-degrades
+        on the very next lap instead of climbing a fresh ladder of
+        `_HOLD_DEGRADE_AT` crashes first -- a `Popen` landing and the
+        daemon it started staying up are two different things, and only
+        the first is what a bare spawn success proves. Driven three
+        times in a row, on the SAME supervisor thread throughout (T1193:
+        ONE THREAD, ONE LOOP): reverting the preset back to
+        `self._failures = 0` turns this red (checked directly: revert,
+        run, restore)."""
+        from cswap_pin.proxy import PortHolder
+
+        supervise_threads = set()
+        real_supervise = PortHolder._supervise
+
+        def _tracking_supervise(self):
+            supervise_threads.add(threading.get_ident())
+            return real_supervise(self)
+
+        monkeypatch.setattr(PortHolder, "_supervise", _tracking_supervise)
+
+        holder, procs, spawn_calls = self._drive_degrade_and_retry(
+            tmp_path, monkeypatch, promotion=False, recovers=False)
+        try:
+            # A FRESH `_spawn`, gated the same way `_drive_degrade_and_
+            # retry`'s own `observed` is: a retry lands only once this
+            # thread has released the gate, so the immediate crash below
+            # can never be missed behind an un-gated auto-recovery.
+            observed = threading.Event()
+
+            def _spawn(self):
+                if getattr(self, "_degraded", False) and not observed.is_set():
+                    raise OSError("fork: Resource temporarily unavailable")
+                proc = TestASpawnFailureIsNotFatal._BlockingProc()
+                procs.append(proc)
+                self._proc = proc
+                self.daemon_pid = 1000 + len(procs)
+
+            monkeypatch.setattr(PortHolder, "_spawn", _spawn)
+
+            for i in range(3):
+                observed.set()
+                n_before = len(procs)
+                deadline = time.time() + 5
+                while len(procs) <= n_before and time.time() < deadline:
+                    time.sleep(0.01)
+                assert len(procs) > n_before, (
+                    f"retry #{i + 1} of the failed-after-start cycle "
+                    f"never landed a successor"
+                )
+                # RE-ARM THE GATE before the crash, so the automatic
+                # recovery cannot land -- and clear _degraded -- before
+                # this thread gets to observe the re-degrade the crash
+                # below is about to cause.
+                observed.clear()
+                procs[-1].exit(1)
+                deadline = time.time() + 5
+                while not holder._degraded and time.time() < deadline:
+                    time.sleep(0.01)
+                assert holder._degraded, (
+                    f"crash #{i + 1} right after landing did not "
+                    f"re-degrade within one lap -- self._failures must "
+                    f"survive the landing at _HOLD_DEGRADE_AT - 1 rather "
+                    f"than reset to 0"
+                )
+
+            assert len(supervise_threads) == 1, (
+                f"{len(supervise_threads)} distinct supervisor thread(s) "
+                f"ran _supervise across the re-degrade cycles -- T1193 "
+                f"is ONE THREAD, never one per re-degrade"
             )
         finally:
             holder.stop()
