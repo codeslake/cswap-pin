@@ -16633,14 +16633,14 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     def case_a_live_walls_own_clear_bounds_a_fleet_blocked_on_a_scoped_window(
         self, monkeypatch,
     ):
-        """A live-token 429's own wall can clear soon while
+        """A live-token 429's own reset can clear soon while
         `_fleet_earliest_provable_reset`'s `("all",)` basis reads the SAME
         slot as blocked for days on an unrelated per-model weekly window —
         and every other enabled slot proves an equally far reset, so the
-        naive fleet earliest is days out too. The live account still serves
-        this exact request again at its OWN wall's reset, so that reset
-        (recorded into `_walled_slots` for this very 429, just above) must
-        bound what gets announced, never the far scoped-window reset."""
+        naive fleet earliest is days out too. The relay bounds the fleet
+        value by THIS 429's own reset header, so the live wall's near
+        clear time is what gets announced, never the far scoped-window
+        one."""
         now = time.time()
         days_out = now + 86400 * 5
         live_reset = int(now) + 3600
@@ -16662,34 +16662,53 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
                 .encode() not in got), got
 
-    def case_a_known_live_wall_bounds_even_a_frozen_bearers_far_reset(
+    def case_a_frozen_bearers_far_own_reset_never_beats_a_nearer_fleet_value(
         self, monkeypatch,
     ):
-        """The live slot's wall can already be known (`_walled_slots`, from
-        an earlier live-token 429) while THIS particular 429 rides in on a
-        frozen bearer whose own reset is days away — that frozen bearer's
-        reset belongs to no account cswap has live, and the fleet is
-        exhausted on the same `("all",)` basis, so the announced value must
-        still be the live wall's own clear time, not the stale bearer's far
-        reset nor the fleet's naive days-out minimum."""
-        from cswap_pin import proxy as pp
+        """A frozen bearer's own reset header can be days out while the
+        fleet itself proves a nearer reset through some other slot. Both
+        are upper bounds on when this client is served again, so the
+        minimum — the nearer fleet value — is what gets relayed; the far
+        bearer reset never reaches the client."""
         now = time.time()
-        live_wall = int(now) + 3600
+        fleet_reset = int(now) + 3600
         days_out = now + 86400 * 5
         self._wire(
-            monkeypatch, switched=False, live_token=self.LIVE, usage=None,
-            fleet={"6": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
-                         "scoped": [{"name": "opus", "pct": 100.0}],
-                         "_reset_ts": days_out}},
+            monkeypatch, switched=False,
+            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
+                         "_reset_ts": fleet_reset}},
         )
-        pp._walled_slots["1"] = float(live_wall)
         got = self._relay(
             reset=f"anthropic-ratelimit-unified-reset: {int(days_out)}"
             .encode(),
             auth="Bearer stale-account-token",
         )
         assert got.startswith(b"HTTP/1.1 429"), got[:40]
-        assert (f"anthropic-ratelimit-unified-reset: {live_wall}".encode()
+        assert (f"anthropic-ratelimit-unified-reset: {fleet_reset}".encode()
+                in got), got
+        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+                .encode() not in got), got
+
+    def case_a_frozen_bearers_nearer_own_reset_bounds_a_far_fleet_value(
+        self, monkeypatch,
+    ):
+        """A frozen bearer's own reset header can be nearer than the
+        fleet's provable worst case — the minimum, the bearer's own nearer
+        reset, is what gets relayed."""
+        now = time.time()
+        own_reset = int(now) + 1800
+        days_out = now + 86400 * 5
+        self._wire(
+            monkeypatch, switched=False,
+            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
+                         "_reset_ts": days_out}},
+        )
+        got = self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {own_reset}".encode(),
+            auth="Bearer stale-account-token",
+        )
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert (f"anthropic-ratelimit-unified-reset: {own_reset}".encode()
                 in got), got
         assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
                 .encode() not in got), got
@@ -16697,10 +16716,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     def case_an_unknown_live_wall_leaves_the_fleet_value_unbounded(
         self, monkeypatch,
     ):
-        """THE CONTROL for both cases above: with no live wall recorded at
-        all, the bound must not engage on its own — the announced value
-        stays the fleet's own provable worst case, exactly as it read
-        before this bound existed."""
+        """THE CONTROL: a default reset header far past the fleet's own
+        provable value must not engage the minimum — the announced value
+        stays the fleet's own provable worst case."""
         days_out = time.time() + 86400 * 5
         self._wire(
             monkeypatch, switched=False,
@@ -16710,6 +16728,83 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         )
         got = self._relay()
         assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+                .encode() in got), got
+
+    def case_a_debounced_repeat_relays_its_own_wall_not_a_later_walls(
+        self, monkeypatch,
+    ):
+        """CONTAMINATION, fails on f7ebfbd. Wall W1 (live-token, own reset
+        now+3600) is decided against a fleet blocked days out — f7ebfbd's
+        module-wide `_fleet_exhausted_until` bounds itself to W1's own wall
+        at that moment, by design. A second live-token wall W2 on the SAME
+        slot then lands with its own reset days out and gets decided too —
+        overwriting `_walled_slots[slot]` and, on f7ebfbd, re-bounding the
+        SAME module-wide fact to W2's far value. W1 then reappears inside
+        its own debounce window: the debounced repeat never recomputes the
+        fact, so it relays whatever the fact holds NOW — W2's far value on
+        f7ebfbd, not W1's own near one. The fix bounds at relay time, from
+        each request's own reset header, so a wall never leaks another
+        wall's bound into a debounced repeat of itself."""
+        now = time.time()
+        w1_reset = int(now) + 3600
+        days_out = now + 86400 * 5
+        self._wire(
+            monkeypatch, switched=False, live_token=self.LIVE,
+            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
+                         "_reset_ts": days_out}},
+        )
+        first = self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {w1_reset}".encode(),
+            auth="Bearer " + self.LIVE,
+        )
+        assert (f"anthropic-ratelimit-unified-reset: {w1_reset}".encode()
+                in first), first
+        self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+            .encode(),
+            auth="Bearer " + self.LIVE,
+        )
+        repeat = self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {w1_reset}".encode(),
+            auth="Bearer " + self.LIVE,
+        )
+        assert (f"anthropic-ratelimit-unified-reset: {w1_reset}".encode()
+                in repeat), repeat
+        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+                .encode() not in repeat), repeat
+
+    def case_an_unparseable_own_reset_leaves_the_fleet_value_alone(
+        self, monkeypatch,
+    ):
+        """This 429's own reset header can fail to parse as a number —
+        nothing to bound with, so the fleet's own provable value is
+        relayed exactly as decided."""
+        fleet_reset = time.time() + 3600
+        self._wire(
+            monkeypatch, switched=False,
+            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
+                         "_reset_ts": fleet_reset}},
+        )
+        got = self._relay(
+            reset=b"anthropic-ratelimit-unified-reset: not-a-number")
+        assert (f"anthropic-ratelimit-unified-reset: {int(fleet_reset)}"
+                .encode() in got), got
+
+    def case_a_past_own_reset_leaves_the_fleet_value_alone(self, monkeypatch):
+        """This 429's own reset header can already be past — it could
+        recover at any moment and is no upper bound at all, so the fleet's
+        own provable value is relayed exactly as decided."""
+        now = time.time()
+        fleet_reset = now + 3600
+        self._wire(
+            monkeypatch, switched=False,
+            fleet={"6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
+                         "_reset_ts": fleet_reset}},
+        )
+        got = self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {int(now) - 100}"
+            .encode())
+        assert (f"anthropic-ratelimit-unified-reset: {int(fleet_reset)}"
                 .encode() in got), got
 
     def case_a_disabled_slot_is_never_the_fleets_earliest(self, monkeypatch):
