@@ -16582,16 +16582,43 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert self.SHOULD_RETRY not in got, got
         assert self.UNIFIED_STATUS not in got, got
 
-    def case_an_exhausted_fleet_reset_caps_at_five_minutes(self, monkeypatch):
-        """A reset days out must not put the watchdog client to sleep for
-        days — capped at `_EXHAUSTED_RESET_CAP_S`, the same backoff a
-        stripped wall already reaches."""
-        from cswap_pin import proxy as pp
+    def case_an_all_provable_fleet_reset_relays_uncapped_even_days_out(
+        self, monkeypatch,
+    ):
+        """Every blocked slot proving its own reset means the fleet's real
+        worst case IS that far out — capping it would wake an interactive
+        client early into a wall that has not lifted. No cap applies when
+        every blocked slot is provable, however far its reset is."""
         days_out = time.time() + 86400 * 5
         self._wire(
             monkeypatch, switched=False,
             fleet={"6": {"five_hour": {"pct": 100.0},
                          "seven_day": {"pct": 0.0}, "_reset_ts": days_out}},
+        )
+        got = self._relay()
+        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+                .encode() in got), got
+
+    def case_a_not_all_provable_fleet_reset_announces_the_bounded_minimum(
+        self, monkeypatch,
+    ):
+        """One blocked slot proves a far reset; another proves none at all
+        — that second slot could beat the far one at any moment, so the
+        far reset cannot be relayed unbounded. Announced instead as
+        `min(earliest, decision time + _EXHAUSTED_RESET_CAP_S)`, mirroring
+        `_earliest_recovery`'s own "announce the earliest provable moment
+        and keep a bounded re-check rather than sleeping toward a reset
+        that peer may beat"."""
+        from cswap_pin import proxy as pp
+        far = time.time() + 86400 * 3
+        self._wire(
+            monkeypatch, switched=False,
+            fleet={
+                "6": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
+                      "_reset_ts": far},
+                "7": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0},
+                      "_reset_ts": None},
+            },
         )
         before = time.time()
         got = self._relay()
@@ -16599,6 +16626,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         m = re.search(rb"anthropic-ratelimit-unified-reset: (\d+)", got)
         assert m, got
         relayed = int(m.group(1))
+        assert relayed < far, relayed
         assert before + pp._EXHAUSTED_RESET_CAP_S - 1 <= relayed, relayed
         assert relayed <= after + pp._EXHAUSTED_RESET_CAP_S + 1, relayed
 
@@ -16624,9 +16652,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert (f"anthropic-ratelimit-unified-reset: {int(now + 50)}"
                 .encode() not in got), got
 
-    def case_an_unprovable_fleet_reset_is_not_announced(self, monkeypatch):
-        """A blocked slot with no reset at all could recover any moment —
-        nothing is announced, and the plain strip stands."""
+    def case_no_provable_fleet_reset_is_not_announced(self, monkeypatch):
+        """No blocked slot can prove a reset at all — it could recover any
+        moment — so nothing is announced, and the plain strip stands."""
         self._wire(
             monkeypatch, switched=False,
             fleet={"6": {"five_hour": {"pct": 100.0},
@@ -16661,6 +16689,40 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._fleet_exhausted_until = time.time() + 500
         got = self._relay()
         assert b"anthropic-ratelimit-unified-status: rejected" not in got, got
+        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+
+    def case_the_fleet_fact_clears_on_a_landed_switch(self, monkeypatch):
+        """A switch that actually lands says the fleet is not exhausted —
+        even when a stale exhausted verdict from an earlier wall is still
+        sitting in the fact."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=True)
+        pp._fleet_exhausted_until = time.time() + 500
+        self._relay()
+        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+
+    def case_the_fleet_fact_clears_when_switch_raises(self, monkeypatch):
+        """A raising `switch()` proves nothing about the fleet — a stale
+        exhausted verdict from an earlier wall must not survive it."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
+        self._wire(monkeypatch, switched=True, raises_once=OSError("locked"))
+        pp._fleet_exhausted_until = time.time() + 500
+        self._relay()
+        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+
+    def case_the_fleet_fact_clears_on_a_stale_bearer_conversion(
+        self, monkeypatch,
+    ):
+        """The stale-bearer 401 branch never calls `switch()` — it judged
+        the LIVE slot able to take a retry, so a stale exhausted verdict
+        from an earlier wall must not survive it either."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, switched=False,
+                   live_token=self.LIVE, usage=self.HEADROOM)
+        pp._fleet_exhausted_until = time.time() + 500
+        got = self._relay(auth="Bearer stale-account-token")
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
 
     def case_a_debounced_repeat_of_an_exhausted_wall_still_carries_the_headers(
