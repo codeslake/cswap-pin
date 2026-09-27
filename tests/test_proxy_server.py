@@ -16630,6 +16630,88 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert before + pp._EXHAUSTED_RESET_CAP_S - 1 <= relayed, relayed
         assert relayed <= after + pp._EXHAUSTED_RESET_CAP_S + 1, relayed
 
+    def case_a_live_walls_own_clear_bounds_a_fleet_blocked_on_a_scoped_window(
+        self, monkeypatch,
+    ):
+        """A live-token 429's own wall can clear soon while
+        `_fleet_earliest_provable_reset`'s `("all",)` basis reads the SAME
+        slot as blocked for days on an unrelated per-model weekly window —
+        and every other enabled slot proves an equally far reset, so the
+        naive fleet earliest is days out too. The live account still serves
+        this exact request again at its OWN wall's reset, so that reset
+        (recorded into `_walled_slots` for this very 429, just above) must
+        bound what gets announced, never the far scoped-window reset."""
+        now = time.time()
+        days_out = now + 86400 * 5
+        live_reset = int(now) + 3600
+        blocked_days_out = {
+            "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "opus", "pct": 100.0}], "_reset_ts": days_out,
+        }
+        self._wire(
+            monkeypatch, switched=False, live_token=self.LIVE,
+            usage=blocked_days_out, fleet={"6": blocked_days_out},
+        )
+        got = self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {live_reset}".encode(),
+            auth="Bearer " + self.LIVE,
+        )
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert (f"anthropic-ratelimit-unified-reset: {live_reset}".encode()
+                in got), got
+        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+                .encode() not in got), got
+
+    def case_a_known_live_wall_bounds_even_a_frozen_bearers_far_reset(
+        self, monkeypatch,
+    ):
+        """The live slot's wall can already be known (`_walled_slots`, from
+        an earlier live-token 429) while THIS particular 429 rides in on a
+        frozen bearer whose own reset is days away — that frozen bearer's
+        reset belongs to no account cswap has live, and the fleet is
+        exhausted on the same `("all",)` basis, so the announced value must
+        still be the live wall's own clear time, not the stale bearer's far
+        reset nor the fleet's naive days-out minimum."""
+        from cswap_pin import proxy as pp
+        now = time.time()
+        live_wall = int(now) + 3600
+        days_out = now + 86400 * 5
+        self._wire(
+            monkeypatch, switched=False, live_token=self.LIVE, usage=None,
+            fleet={"6": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+                         "scoped": [{"name": "opus", "pct": 100.0}],
+                         "_reset_ts": days_out}},
+        )
+        pp._walled_slots["1"] = float(live_wall)
+        got = self._relay(
+            reset=f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+            .encode(),
+            auth="Bearer stale-account-token",
+        )
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+        assert (f"anthropic-ratelimit-unified-reset: {live_wall}".encode()
+                in got), got
+        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+                .encode() not in got), got
+
+    def case_an_unknown_live_wall_leaves_the_fleet_value_unbounded(
+        self, monkeypatch,
+    ):
+        """THE CONTROL for both cases above: with no live wall recorded at
+        all, the bound must not engage on its own — the announced value
+        stays the fleet's own provable worst case, exactly as it read
+        before this bound existed."""
+        days_out = time.time() + 86400 * 5
+        self._wire(
+            monkeypatch, switched=False,
+            fleet={"6": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+                         "scoped": [{"name": "opus", "pct": 100.0}],
+                         "_reset_ts": days_out}},
+        )
+        got = self._relay()
+        assert (f"anthropic-ratelimit-unified-reset: {int(days_out)}"
+                .encode() in got), got
+
     def case_a_disabled_slot_is_never_the_fleets_earliest(self, monkeypatch):
         """A slot the user disabled is never a `switch()` candidate, so its
         earlier reset must not be the one announced. Both resets stay under

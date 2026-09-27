@@ -20480,10 +20480,15 @@ _fleet_exhausted_until: float = 0.0
 
 def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
     """The fleet's earliest provable recovery and whether every blocked slot
-    could prove one — mirrors `_earliest_recovery` (claude_swap/autoswitch.py)
-    exactly, plus the disabled-slot filter it lacks: a slot the user disabled
-    is never a `switch()` candidate, so folding it in here would announce a
-    reset the fleet cannot actually reach.
+    could prove one — mirrors `_earliest_recovery`'s (claude_swap/autoswitch.py)
+    SHAPE: per account, the latest reset among its >=100% relevant windows,
+    then the minimum across accounts. Not its basis: `_earliest_recovery`
+    ranks on the switcher's configured models, while this always ranks on
+    `("all",)`, the same basis the pin's own `switch()` call uses for this
+    wall — so a reset proved here is one `switch()` itself would have
+    weighed. Plus the disabled-slot filter `_earliest_recovery` lacks: a
+    slot the user disabled is never a `switch()` candidate, so folding it in
+    here would announce a reset the fleet cannot actually reach.
 
     Returns ``(earliest, all_provable)``. ``earliest`` is the minimum reset
     among the blocked slots that DID prove one, or ``None`` if none did.
@@ -20494,6 +20499,13 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
     exception (an older host without these symbols, a fake that lacks them)
     this returns ``(None, True)``, which the caller reads as "nothing
     proven" the same as an empty fleet.
+
+    The caller (`_switch_off_walled_account`) additionally bounds this
+    result by the LIVE slot's own wall reset (`_walled_slots.get(slot)`)
+    when that is known and still in the future: the `("all",)` basis here
+    can read "blocked for days" off an unrelated scoped weekly window while
+    the live slot's own unified wall — the one this 429 is actually about —
+    clears far sooner.
 
     Call under `_walled_switch_lock`, exactly like `_live_account_headroom`
     — `fetch=set()` forbids a network fetch, so this reads store rows only.
@@ -20876,30 +20888,49 @@ def _switch_off_walled_account(
             earliest, all_provable = _fleet_earliest_provable_reset()
             if earliest is None:
                 _fleet_exhausted_until = 0.0
-            elif all_provable:
-                # Every blocked slot proved its own reset: relay the
-                # fleet's real worst case AS IS, however far out. Claude
-                # Code 2.1.283's quota auto-resume re-arms at most twice
-                # (`consecutiveRearms >= H`, `H = 2`), so capping this at
-                # `_EXHAUSTED_RESET_CAP_S` would buy an interactive session
-                # only ~3 short resumes against a measured 53-minute wall
-                # and then let it stop cold. The residual this accepts: a
-                # sleeping client cannot see capacity added mid-sleep (a
-                # slot re-enabled, a fresh login) — but the sleep is
-                # visible in the client and interruptible, and while every
-                # blocked slot's own reset is provable no switch could
-                # have freed it any sooner anyway.
-                _fleet_exhausted_until = earliest
             else:
-                # NOT every blocked slot proved a reset: the one(s) that
-                # did not could beat `earliest`, so relaying it unbounded
-                # risks sleeping past a slot that frees up sooner. Capped
-                # at `_EXHAUSTED_RESET_CAP_S` instead — the earliest
-                # provable moment, with a bounded re-check rather than a
-                # sleep toward a reset an unprovable peer may beat (the
-                # same trade `_earliest_recovery`'s own caller makes).
-                _fleet_exhausted_until = min(
-                    earliest, time.time() + _EXHAUSTED_RESET_CAP_S)
+                # BOUND BY THE LIVE SLOT'S OWN WALL, WHEN KNOWN AND STILL
+                # AHEAD. `earliest` ranks on `("all",)`, so an unrelated
+                # per-model weekly window sitting at 100% can make the live
+                # slot read "blocked for days" there even though the wall
+                # THIS request actually hit clears in an hour. That wall's
+                # own reset is exactly `_walled_slots.get(slot)` — written
+                # above for a live-token 429, or by an earlier live-token
+                # 429 on the same slot — never a frozen bearer's reset (the
+                # bearer branch above never reaches here, and never writes
+                # `_walled_slots`). The live account serves this request
+                # again at its own wall reset whatever the scoped window
+                # still says, so this can only ever tighten `earliest`, and
+                # never smuggle in another account's reset: any other slot
+                # is a `switch()` target only on the same `("all",)` basis
+                # `_fleet_earliest_provable_reset` already measures.
+                live_wall = _walled_slots.get(slot)
+                if live_wall is not None and live_wall > time.time():
+                    earliest = min(earliest, live_wall)
+                if all_provable:
+                    # Every blocked slot proved its own reset: relay the
+                    # fleet's real worst case AS IS, however far out. Claude
+                    # Code 2.1.283's quota auto-resume re-arms at most twice
+                    # (`consecutiveRearms >= H`, `H = 2`), so capping this at
+                    # `_EXHAUSTED_RESET_CAP_S` would buy an interactive session
+                    # only ~3 short resumes against a measured 53-minute wall
+                    # and then let it stop cold. The residual this accepts: a
+                    # sleeping client cannot see capacity added mid-sleep (a
+                    # slot re-enabled, a fresh login) — but the sleep is
+                    # visible in the client and interruptible, and while every
+                    # blocked slot's own reset is provable no switch could
+                    # have freed it any sooner anyway.
+                    _fleet_exhausted_until = earliest
+                else:
+                    # NOT every blocked slot proved a reset: the one(s) that
+                    # did not could beat `earliest`, so relaying it unbounded
+                    # risks sleeping past a slot that frees up sooner. Capped
+                    # at `_EXHAUSTED_RESET_CAP_S` instead — the earliest
+                    # provable moment, with a bounded re-check rather than a
+                    # sleep toward a reset an unprovable peer may beat (the
+                    # same trade `_earliest_recovery`'s own caller makes).
+                    _fleet_exhausted_until = min(
+                        earliest, time.time() + _EXHAUSTED_RESET_CAP_S)
         else:
             _fleet_exhausted_until = 0.0
         landed = bool(
@@ -21278,11 +21309,10 @@ def _relay_response(
         # `_EXHAUSTED_RESET_CAP_S` only when some blocked slot's own return
         # could not be proved (see where `_fleet_exhausted_until` is
         # written). The reset is ONLY EVER the fleet's own value, never
-        # this 429's own
-        # `reset` header: that can belong to a frozen bearer on another
-        # walled account whose own reset is days away, and telling the
-        # client to sleep until then is worse than the wall it already
-        # backs off from.
+        # this 429's own `reset` header: that can belong to a frozen
+        # bearer on another walled account whose own reset is days away,
+        # and telling the client to sleep until then is worse than the
+        # wall it already backs off from.
         out.append(b"anthropic-ratelimit-unified-status: rejected")
         out.append(
             b"anthropic-ratelimit-unified-reset: "
