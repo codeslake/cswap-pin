@@ -23,6 +23,7 @@ import glob
 import inspect
 import itertools
 import json
+import math
 import os
 import warnings
 import re
@@ -20473,8 +20474,9 @@ _EXHAUSTED_RESET_CAP_S = 300.0
 # `switch()` call whose verdict this is about — a debounced repeat and the
 # per-session stale-bearer early return read whatever the last decision
 # wrote and never recompute it. `_relay_response`'s `_wall_relay` branch is
-# the only reader, and relays this value exactly as written: any capping
-# already happened here, at decision time (see `_fleet_earliest_provable_reset`).
+# the only reader; this value is stored uncapped when every blocked slot
+# proved its own reset (see `_fleet_earliest_provable_reset`), and each
+# relay bounds it at relay time by that one request's own wall.
 _fleet_exhausted_until: float = 0.0
 
 
@@ -20883,8 +20885,10 @@ def _switch_off_walled_account(
                 _fleet_exhausted_until = 0.0
             else:
                 if all_provable:
-                    # Every blocked slot proved its own reset: relay the
-                    # fleet's real worst case AS IS, however far out. Claude
+                    # Every blocked slot proved its own reset: store the
+                    # fleet's real worst case UNCAPPED, however far out —
+                    # each relay is bounded by its own wall instead (see
+                    # `_relay_response`'s `_fleet_reset`). Claude
                     # Code 2.1.283's quota auto-resume re-arms at most twice
                     # (`consecutiveRearms >= H`, `H = 2`), so capping this at
                     # `_EXHAUSTED_RESET_CAP_S` would buy an interactive session
@@ -21205,8 +21209,22 @@ def _relay_response(
     _fleet_reset = None
     if _wall_relay and _exhausted_until > time.time():
         _fleet_reset = _exhausted_until
-        if _own_reset is not None and _own_reset > time.time():
-            _fleet_reset = min(_fleet_reset, _own_reset)
+        # `math.isfinite` first: `float("nan")`/`float("inf")` both parse
+        # without raising, and a NaN compares False against everything
+        # (silently skipping both branches below, same as a reset that
+        # never parsed) while an `inf` would win the `min()` and then blow
+        # up `int()` when it reached the header further down.
+        if _own_reset is not None and math.isfinite(_own_reset):
+            if _own_reset > time.time():
+                _fleet_reset = min(_fleet_reset, _own_reset)
+            else:
+                # A PAST own reset is the same case
+                # `_fleet_earliest_provable_reset` treats as unprovable:
+                # this request's own account could recover at any moment,
+                # so the far fleet value is bounded at the cap rather than
+                # relayed as-is.
+                _fleet_reset = min(
+                    _fleet_reset, time.time() + _EXHAUSTED_RESET_CAP_S)
     if _walled_401:
         if _TRACE is not None:
             _TRACE.write(
