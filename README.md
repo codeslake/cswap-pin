@@ -679,22 +679,27 @@ untouched. The trust it hands the child is wider than that: the CA is a full CA
 (`CA:TRUE`) with no name constraints, so a Node child reading
 `NODE_EXTRA_CA_CERTS` accepts a certificate that CA signs for any host.
 
-To take a session's children off the pin, put this in `~/.zshenv`, which zsh
-reads for every shell, the Bash tool's non-interactive `zsh -c` included (the
-test is valid bash too):
+To take a session's Bash-tool shells off the pin, put this in `~/.zshenv`,
+which zsh reads for every shell, the Bash tool's non-interactive `zsh -c`
+included:
 
 ```bash
-[[ -n ${CLAUDECODE-} && ${HTTPS_PROXY-} == *[/@]127.0.0.1:${CSWAP_PIN_PORT-} ]] &&
+if [[ -n ${CLAUDECODE-} && ${HTTPS_PROXY-} == *[/@]127.0.0.1:${CSWAP_PIN_PORT-} ]]; then
+  [[ ${all_proxy-} == *[/@]127.0.0.1:$CSWAP_PIN_PORT ]] && unset all_proxy
   unset HTTPS_PROXY https_proxy ALL_PROXY NODE_EXTRA_CA_CERTS
+fi
 ```
 
 It fires only in a Claude Code child whose proxy is this pin's own loopback
 port, so a corporate `HTTPS_PROXY` in any other shell is left alone, and Claude
-Code itself stays pinned, since the `unset` runs in the child only. It also
-removes what the pin was carrying for the child: the upstream proxy the pin
-chains through and, when `NODE_EXTRA_CA_CERTS` is a merged bundle, the CA
-merged into it. On a network that needs a proxy, export your own after the
-`unset`.
+Code itself stays pinned, since the `unset` runs in the child only. A lowercase
+`all_proxy` is the pin's only when a `cswap` launch pointed one you already had
+at it, hence its own test. A child Claude Code starts without zsh, such as a
+stdio MCP server, keeps all of it. The `unset` also removes what the pin was
+carrying for the child: the upstream proxy the pin chains through and, when
+`NODE_EXTRA_CA_CERTS` is a merged bundle, the CA merged into it. On a network
+that needs its own proxy or CA, export your own `HTTPS_PROXY` and
+`NODE_EXTRA_CA_CERTS` after the `unset`.
 
 ## License
 
