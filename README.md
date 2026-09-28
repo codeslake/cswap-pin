@@ -670,6 +670,17 @@ credential. If you share a machine with logins you do not trust, do not run
 this — the pinned account's token is reachable by anything that can reach the
 port.
 
+**Every shell a session starts inherits the pin.** Claude Code applies the `env` block of `.claude.json` to its own process, so every child it starts, Bash-tool shells included, inherits `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `NODE_EXTRA_CA_CERTS` and `CSWAP_PIN_PORT`. The child's HTTPS then goes through the proxy, which re-signs only `api.anthropic.com` and tunnels every other host untouched. The trust it hands the child is wider than that: the CA is a full CA (`CA:TRUE`) with no name constraints, so a Node child reading `NODE_EXTRA_CA_CERTS` accepts a certificate that CA signs for any host.
+
+To take a session's children off the pin, put this in `~/.zshenv`, which zsh reads for every shell, the Bash tool's non-interactive `zsh -c` included (the test is valid bash too):
+
+```bash
+[[ -n ${CLAUDECODE-} && ${HTTPS_PROXY-} == *[/@]127.0.0.1:${CSWAP_PIN_PORT-} ]] &&
+  unset HTTPS_PROXY https_proxy ALL_PROXY NODE_EXTRA_CA_CERTS
+```
+
+It fires only in a Claude Code child whose proxy is this pin's own loopback port, so a corporate `HTTPS_PROXY` in any other shell is left alone, and Claude Code itself stays pinned, since the `unset` runs in the child only. It also removes what the pin was carrying for the child: the upstream proxy the pin chains through and, when `NODE_EXTRA_CA_CERTS` is a merged bundle, the CA merged into it. On a network that needs a proxy, export your own after the `unset`.
+
 ## License
 
 MIT
