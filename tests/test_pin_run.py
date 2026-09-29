@@ -548,6 +548,71 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
         assert spliced == [None]
 
 
+class TestTheUnspliceDecidesOnTheAccount:
+    """`_restore_pin` grades the un-splice on the ACCOUNT in the file, not the bool.
+
+    Ported from cswap's #210, which faked `_impl`; here the seams are `apply_pin`
+    and `splice_config_identity`, and `set_pin` shows the verdict through the
+    rollback tail it picks.
+    """
+
+    _config = TestConfigAlreadyNames._config
+
+    def test_an_already_correct_config_is_not_a_failed_rollback(
+            self, host, tmp_path, monkeypatch):
+        """`splice_config_identity` returns False for a SKIPPED write and for a
+        config that already names the identity. Only the file separates them."""
+        sw = _sw(tmp_path)
+        named = {"emailAddress": "user2@example.com",
+                 "accountUuid": "uuid-personal", "organizationUuid": ""}
+        self._config(named)                       # the config ALREADY names it
+        host._live_login_for_config = lambda s: named
+        monkeypatch.setattr(pin_proxy, "apply_pin",
+                            _apply_recording(sw, returns=False))   # no proxy
+        monkeypatch.setattr(pin_proxy, "splice_config_identity", lambda i: False)
+
+        ok, msg = pin_proxy.set_pin(sw, "user2@example.com", None, num="2")
+
+        # PREMISES: the pin did not take and the record IS rolled back.
+        assert ok is False
+        assert _record(sw.backup_dir) is None
+        assert "check with" not in msg.lower(), (
+            "DEFECT: the rollback was clean and the command sent the user to "
+            f"check a state it could already disprove: {msg}")
+
+    def test_a_rollback_that_skipped_the_splice_must_not_report_success(
+            self, host, tmp_path, monkeypatch):
+        """`splice_config_identity` SKIPS and returns False on a busy lock.
+
+        Reading only the record announces a clean rollback over a config that
+        still names the pin that failed.
+        """
+        sw = _sw(tmp_path)
+        live = {"emailAddress": "live@example.com", "accountUuid": "uuid-1"}
+        self._config(live)
+        host._live_login_for_config = lambda s: live
+        record = _apply_recording(sw, returns=False)
+
+        def pin_then_skip(switcher, email=None, org_uuid=None, identity=None):
+            if email:                             # apply_pin splices BEFORE it fails
+                self._config({"emailAddress": email, "accountUuid": "uuid-cloud"})
+            return record(switcher, email, org_uuid, identity)
+
+        monkeypatch.setattr(pin_proxy, "apply_pin", pin_then_skip)
+        monkeypatch.setattr(pin_proxy, "splice_config_identity", lambda i: False)
+
+        ok, msg = pin_proxy.set_pin(sw, "cloud@example.com", None, num="2")
+
+        # PREMISES: the pin did not take and the record was rolled back.
+        assert ok is False
+        assert _record(sw.backup_dir) is None
+        # `set_pin`'s own prefix legitimately says "nothing is pinned yet"; the
+        # ROLLBACK TAIL is what must not claim a clean state.
+        assert "check with" in msg.lower(), (
+            "DEFECT: the rollback verdict reads only the record, so a skipped "
+            f"un-splice is announced as a clean rollback: {msg}")
+
+
 class TestTheRepairPinsTheIDENTITYToo:
     """`repin_current` is the ONLY re-pin that runs without a person, and it
     was the only one that did not name the pin in the live config: without
