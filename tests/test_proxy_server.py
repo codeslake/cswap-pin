@@ -15451,7 +15451,12 @@ class TestAMisroutedSwapCannotKillASession:
         the pin`, never `fell-back`. THE CONTROL is a pinned route that is
         not an artifact, on the same proxy: it still falls back to the
         session's own bearer (4e8fcd3: a 401/403/404 is terminal to the
-        client)."""
+        client).
+
+        T1596: a 401 twin of each row. Claude Code reads a 401 as ITS OWN
+        credential failing (a relayed 401 kills subagents), so the pin's
+        refusal reaches the client as a 403 and the unarmed third send does
+        not happen."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
 
@@ -15460,20 +15465,28 @@ class TestAMisroutedSwapCannotKillASession:
             lambda token: {"emailAddress": "pin@example.com"})
         pp.save_pin(certdir, "pin@example.com", "org")
         rows = [
-            ("dead", "/api/frame/frames/external", lambda n: "dead-token",
+            ("dead", 403, "/api/frame/frames/external", lambda n: "dead-token",
              ["Bearer dead-token"] * 2, ["relayed as the pin"]),
-            ("rotated", "/api/oauth/files/abc/content",
+            ("rotated", 403, "/api/oauth/files/abc/content",
              lambda n: "stale-token" if n == 1 else "fresh-token",
              ["Bearer stale-token", "Bearer fresh-token", "Bearer fresh-token"],
              ["retried-fresh", "relayed as the pin"]),
+            ("dead-401", 401, "/api/frame/frames/external",
+             lambda n: "dead-token", ["Bearer dead-token"],
+             ["relayed as the pin as 403"]),
+            ("rotated-401", 401, "/api/oauth/files/abc/content",
+             lambda n: "stale-token" if n == 1 else "fresh-token",
+             ["Bearer stale-token", "Bearer fresh-token"],
+             ["retried-fresh", "relayed as the pin as 403"]),
         ]
-        for name, path, token_for_read, expect_auths, expect_outcomes in rows:
+        for (name, code, path, token_for_read, expect_auths,
+             expect_outcomes) in rows:
             provider = pp.make_pin_token_provider(
                 _refetch_switcher(certdir, token_for_read), "2",
                 "pin@example.com")
             upstream = _FakeUpstream(
-                certdir, reject_bearer={"dead-token", "stale-token",
-                                        "fresh-token"})
+                certdir, reject_status=code,
+                reject_bearer={"dead-token", "stale-token", "fresh-token"})
             proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
                              upstream=("127.0.0.1", upstream.port))
             lines = []
@@ -15490,7 +15503,7 @@ class TestAMisroutedSwapCannotKillASession:
                     f"{name}: only the pinned bearer may reach the upstream "
                     f"on an artifact route: {upstream.auths_seen}")
                 assert [ln for ln in lines if ln.startswith("swap refused")
-                        ] == [f"swap refused (403) on POST {path}: {o}"
+                        ] == [f"swap refused ({code}) on POST {path}: {o}"
                               for o in expect_outcomes], f"{name}: {lines}"
                 # THE CONTROL: not an artifact route, so it still falls back.
                 upstream.auths_seen.clear()
@@ -15501,7 +15514,7 @@ class TestAMisroutedSwapCannotKillASession:
                     "Bearer disk-token"), (
                     f"{name}: a non-artifact pinned route must still fall "
                     f"back: {status} {upstream.auths_seen}")
-                assert ("swap refused (403) on POST /api/oauth/validate: "
+                assert (f"swap refused ({code}) on POST /api/oauth/validate: "
                         "fell-back") in lines, f"{name}: {lines}"
             finally:
                 proxy.stop()
@@ -15513,8 +15526,10 @@ class TestAMisroutedSwapCannotKillASession:
         """T1592: the absolute-form twin of the MITM case above. A refused
         pinned request on an artifact route (`/api/frame/...`) is relayed as
         the pin's own 403 after the refetch retry, and no request carrying
-        the session's own bearer reaches the hop. THE CONTROL, on the same
-        proxy: `/api/oauth/validate` still falls back."""
+        the session's own bearer reaches the hop. T1596: a 401 there is
+        answered to the client as a 403 (Claude Code reads a 401 as its own
+        credential failing). THE CONTROL, on the same proxy:
+        `/api/oauth/validate` still falls back."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
@@ -15528,7 +15543,8 @@ class TestAMisroutedSwapCannotKillASession:
                 lambda n: "stale-token" if n == 1 else "fresh-token"),
             "2", "pin@example.com")
         chain = _RecordingChain(
-            lambda req: (b"HTTP/1.1 403 X\r\nContent-Length: 0\r\n\r\n"
+            lambda req: (b"HTTP/1.1 %d X\r\nContent-Length: 0\r\n\r\n"
+                         % (401 if b"/api/oauth/files/" in req else 403)
                          if (b"Bearer stale-token" in req
                              or b"Bearer fresh-token" in req) else
                          b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
@@ -15568,6 +15584,17 @@ class TestAMisroutedSwapCannotKillASession:
                 "swap refused (403) on GET /api/frame/frames/external: "
                 "relayed as the pin",
             ], lines
+            # T1596: the pin's 401 (chain answers 401 on the files route)
+            # reaches the client as a 403, sent from here, not as a third send.
+            sent = len(chain.seen)
+            got = _send("/api/oauth/files/abc/content")
+            assert got.startswith(b"HTTP/1.1 403"), (
+                f"a 401 on an artifact route must not reach the client: "
+                f"{got[:60]!r}")
+            assert len(chain.seen) == sent + 1 and not any(
+                b"disk-token" in r for r in chain.seen), chain.seen
+            assert ("swap refused (401) on GET /api/oauth/files/abc/content: "
+                    "relayed as the pin as 403") in lines, lines
             # THE CONTROL: not an artifact route, so it still falls back.
             got = _send("/api/oauth/validate")
             assert got.startswith(b"HTTP/1.1 200"), got[:60]
@@ -16004,6 +16031,38 @@ class TestAMisroutedSwapCannotKillASession:
             up.stop()
         assert up.auths_seen == ["Bearer stale-token", "Bearer fresh-token"], (
             up.auths_seen)
+
+    def case_a_dead_pinned_token_on_an_artifact_upgrade_answers_403_not_401(
+            self, certdir, monkeypatch):
+        """T1596: `/api/frame/sync` is an artifact route, so a dead pinned
+        token is never taken back to the active account, and the client must
+        not see the 401 either: Claude Code reads a 401 as its own
+        credential failing. It gets a 403, after ONE upstream attempt."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(
+            _refetch_switcher(certdir, lambda n: "dead-token"), "2",
+            "pin@example.com")
+        up = _WebSocketAuthUpstream(certdir, reject_bearer="dead-token",
+                                    reject_status=401)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", up.port))
+        proxy.start()
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem", "/api/frame/sync",
+                bearer="disk-token")
+            tls.close()
+        finally:
+            proxy.stop()
+            up.stop()
+        assert b"403" in status, status
+        assert up.auths_seen == ["Bearer dead-token"], up.auths_seen
 
     def case_a_dead_pinned_token_on_an_upgrade_falls_back_unswapped(
             self, certdir, monkeypatch):

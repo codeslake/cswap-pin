@@ -18722,6 +18722,13 @@ class PinProxy:
             for hdrs, retry in _swap_attempts():
                 if hdrs is None:
                     break
+                if pending_refusal == 401 and artifact and not retry:
+                    # T1596: the last attempt is the pin's own, and a 401
+                    # from it is answered 403 here, not sent again.
+                    self._note_swap_refused(
+                        401, method, rel.split("?", 1)[0],
+                        "relayed as the pin as 403")
+                    return self._artifact_403(conn, close=True)
                 if pending_refusal is not None:
                     # NAMES THIS ATTEMPT -- the one actually about to be
                     # retried -- not the one that was just refused: whether
@@ -19207,15 +19214,21 @@ class PinProxy:
                     # AN ARTIFACT ROUTE NEVER FALLS BACK TO ANOTHER ACCOUNT
                     # (T1592): the pin's request is sent again, unarmed, so its
                     # refusal reaches the client (`_AuthRejected` sent nothing).
+                    # A 401 is answered 403 from here instead (T1596).
                     # Every other pinned route keeps the take-back (4e8fcd3).
                     artifact = is_artifact_route(clean_path)
+                    as_403 = artifact and keep.code == 401
                     self._note_swap_refused(
                         keep.code, method, clean_path,
+                        "relayed as the pin as 403" if as_403 else
                         "relayed as the pin" if artifact else "fell-back")
-                    keep = self._forward(
-                        method, path,
-                        pin_headers if artifact else original_headers,
-                        body, tls)
+                    if as_403:
+                        keep = self._artifact_403(tls, close=False)
+                    else:
+                        keep = self._forward(
+                            method, path,
+                            pin_headers if artifact else original_headers,
+                            body, tls)
         except NoChainHopError:
             # No hop and no direct: a retryable answer, not a dropped
             # connection and never the inspector's 403.
@@ -19255,11 +19268,27 @@ class PinProxy:
         except Exception:
             return None
 
+    @staticmethod
+    def _artifact_403(sock, close: bool) -> bool:
+        """T1596: answer a 401 the pin took on an artifact route, in place of
+        a resend. Claude Code reads a relayed 401 as ITS OWN credential
+        failing (its client rebuild is 401-only, and `authentication_failed`
+        kills a subagent); a 403 is what these routes already give it. Never
+        a resend as the active account. True when the connection lives on."""
+        try:
+            sock.sendall(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: "
+                + (b"close" if close else b"keep-alive") + b"\r\n\r\n")
+        except OSError:
+            return False
+        return not close
+
     def _note_swap_refused(self, code: int, method: str, clean_path: str,
                             outcome: str) -> None:
         """Log a refused swap, at most once per `_BUSY_REPORT_COOLDOWN_S`
         per (`outcome` ("retried-fresh"/"fell-back", or "relayed as the pin"
-        on an artifact route, T1592), PATH FAMILY) -- see
+        on an artifact route, T1592, "... as 403" for a 401, T1596), PATH
+        FAMILY) -- see
         `_swap_refused` on `__init__`. A polled legitimate 404, or a store
         that has not rotated yet, refuses the identical way on every
         request, and this used to write one `_log_lifecycle` line per
