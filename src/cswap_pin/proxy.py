@@ -3326,6 +3326,14 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     )
 
 
+def is_artifact_route(path: str) -> bool:
+    """A pinned route that must never go out as another account (T1592, rc
+    requirement 13): a refused swap here relays the pin's own answer instead
+    of resending as the session's active account. The two prefixes rc_six_gate
+    row 13 counts a `fell-back` on."""
+    return path.startswith(("/api/frame/", "/api/oauth/files/"))
+
+
 @dataclass(frozen=True)
 class CertBundle:
     """Paths to the generated MITM material.
@@ -15558,6 +15566,12 @@ class PinProxy:
         #: cannot gate the line; this is cleared on re-registration, which
         #: is when the id starts a new life worth its own line.
         self._bridge_superseded_logged: set = set()
+        #: T1592: bridge ids a draining predecessor held at the previous
+        #: `_report_deaf_bridges`, and when each was seen to leave that set.
+        #: ponytail: never pruned (dozens per process life); age out if a
+        #: daemon ever outlives thousands.
+        self._elsewhere_prev: set = set()
+        self._elsewhere_gone: dict = {}
         # conn -> bridge id, for connections carrying that bridge's inbound
         # stream. NOT "when a stream was last opened": the stream is issued
         # once and held for the life of the session, so a recency stamp ages
@@ -15877,6 +15891,16 @@ class PinProxy:
                 # is right HERE and wrong as the general rule, because it
                 # lasts only until the last old daemon leaves.
                 (elsewhere.update(ids) if said else mute.append(p))
+            # A PREDECESSOR THAT EXITED TAKES ITS BRIDGES OUT OF `elsewhere`
+            # AT ONCE (T1587), while Claude Code needs seconds to reopen each
+            # stream here, and a report in that gap stood as a false MARK for
+            # a whole sweep cooldown. Date the departure so `deaf_bridges`
+            # gives it the dwell of a first post. Assigned, not `setdefault`:
+            # a bridge a later predecessor held again departs anew.
+            _left = time.monotonic()
+            for b in self._elsewhere_prev - elsewhere:
+                self._elsewhere_gone[b] = _left
+            self._elsewhere_prev = elsewhere
             now = (("mute", tuple(sorted(mute))) if mute
                    else sorted(self.deaf_bridges(elsewhere=elsewhere)))
             # RE-COUNTED BESIDE ITS OWN NUMERATOR. The loop above reads pid
@@ -16021,7 +16045,9 @@ class PinProxy:
                 _log_lifecycle(
                     f"{len(now)} of {posted} bridge(s) {DEAF_REPORT_MARK} — "
                     "claude.ai can see them and messages reach the server, "
-                    "but the session never receives them; only a NEW PROCESS "
+                    "but the session never receives them until its stream is "
+                    "reopened (the same Claude Code process can do it, else a "
+                    "NEW PROCESS): "
                     # WITH HOW LONG, from the instant the stream went rather
                     # than from the spacing of these lines. This report runs at
                     # most once per `_BRIDGE_SWEEP_COOLDOWN_S`, so a reader
@@ -16029,7 +16055,7 @@ class PinProxy:
                     # `deaf_for` is local state and measures the bridge.
                     # UNKNOWN stays unknown -- a daemon that took the port over
                     # mid-life never saw the loss.
-                    f"clears it: {' '.join(self._with_deaf_age(b) for b in now)}"
+                    f"{' '.join(self._with_deaf_age(b) for b in now)}"
                 )
             else:
                 _log_lifecycle(self._deaf_clear_line(posted, prev))
@@ -16103,13 +16129,18 @@ class PinProxy:
         # momentary age there (0s, measured). Shielded while that age is
         # still inside the grace; a loss still there once it passes is
         # judged exactly as before.
+        #
+        # A PREDECESSOR'S DEPARTURE (`_elsewhere_gone`) DATES THE GRACE TOO,
+        # as the later of it and the first post (T1592).
         first_post = getattr(self, "_bridge_first_post", None) or {}
+        gone = getattr(self, "_elsewhere_gone", None) or {}
         deaf_for = getattr(self, "deaf_for", None)
 
         def _too_young(bid):
             age = None if deaf_for is None else deaf_for(bid, now=stamp)
             if age is None:
-                return stamp - first_post.get(bid, -1e9) < grace
+                return stamp - max(first_post.get(bid, -1e9),
+                                   gone.get(bid, -1e9)) < grace
             return age < grace
 
         out = [bid for bid in out if not _too_young(bid)]
@@ -18651,6 +18682,8 @@ class PinProxy:
             len(rl) > 2 and rl[2] == "HTTP/1.0"
         )
 
+        artifact = is_artifact_route(rel)
+
         def _swap_attempts():
             """Swapped once, refetched once on a refusal, then unswapped --
             the same take-back order `_forward` uses, via the SAME shared
@@ -18659,7 +18692,8 @@ class PinProxy:
             back unswapped. LAZY: nothing past the first `yield` runs
             unless the loop below actually asks for a second attempt,
             which only happens on a refusal (see the `retry` checks
-            below).
+            below). An artifact route's last attempt is the pin's own
+            (T1592), unarmed, so its refusal is relayed.
             """
             if unswapped is None:
                 yield headers, False
@@ -18669,11 +18703,13 @@ class PinProxy:
                 (h.split(":", 1)[1].strip() for h in headers
                  if h.split(":", 1)[0].strip().lower() == "authorization"), "")
             fresh = self._refetch_swap_token(refused_auth)
+            pin_hdrs = headers
             if fresh:
-                yield ([f"Authorization: Bearer {fresh}"
-                        if h.split(":", 1)[0].strip().lower() == "authorization"
-                        else h for h in headers], True)
-            yield unswapped, False
+                pin_hdrs = [f"Authorization: Bearer {fresh}"
+                            if h.split(":", 1)[0].strip().lower() == "authorization"
+                            else h for h in headers]
+                yield pin_hdrs, True
+            yield (pin_hdrs if artifact else unswapped), False
 
         pending_refusal = None
         try:
@@ -18692,8 +18728,8 @@ class PinProxy:
                     # a fresh swap exists at all is `_swap_attempts`' own
                     # lazy decision, not known until the generator has
                     # already advanced to it, which is only now.
-                    kind = ("as it arrived" if hdrs is unswapped
-                            else "with a fresh swap")
+                    kind = ("with a fresh swap" if retry
+                            else "as the pin" if artifact else "as it arrived")
                     self._tunnel_trace(
                         f"{method} {rel} swap refused ({pending_refusal}) — "
                         f"retrying {kind} (absolute-form)")
@@ -18705,7 +18741,8 @@ class PinProxy:
                     # among them -- could see.
                     self._note_swap_refused(
                         pending_refusal, method, rel.split("?", 1)[0],
-                        "fell-back" if hdrs is unswapped else "retried-fresh")
+                        "retried-fresh" if retry else
+                        "relayed as the pin" if artifact else "fell-back")
                     pending_refusal = None
                 try:
                     up, head = dial(hdrs)
@@ -19154,24 +19191,31 @@ class PinProxy:
                     (v for k, v in headers if k.lower() == "authorization"), "")
                 self._drop_upstream()
                 fresh_token = self._refetch_swap_token(refused_auth)
+                pin_headers = headers
                 if fresh_token:
                     self._note_swap_refused(keep.code, method, clean_path,
                                             "retried-fresh")
-                    retry_headers = [
+                    pin_headers = [
                         (k, f"Bearer {fresh_token}") if k.lower() == "authorization"
                         else (k, v) for k, v in headers
                     ]
-                    keep = self._forward(method, path, retry_headers, body, tls,
+                    keep = self._forward(method, path, pin_headers, body, tls,
                                          swapped=True)
                     if isinstance(keep, _AuthRejected):
-                        self._note_swap_refused(keep.code, method, clean_path,
-                                                "fell-back")
                         self._drop_upstream()
-                        keep = self._forward(method, path, original_headers, body, tls)
-                else:
-                    self._note_swap_refused(keep.code, method, clean_path,
-                                            "fell-back")
-                    keep = self._forward(method, path, original_headers, body, tls)
+                if isinstance(keep, _AuthRejected):
+                    # AN ARTIFACT ROUTE NEVER FALLS BACK TO ANOTHER ACCOUNT
+                    # (T1592): the pin's request is sent again, unarmed, so its
+                    # refusal reaches the client (`_AuthRejected` sent nothing).
+                    # Every other pinned route keeps the take-back (4e8fcd3).
+                    artifact = is_artifact_route(clean_path)
+                    self._note_swap_refused(
+                        keep.code, method, clean_path,
+                        "relayed as the pin" if artifact else "fell-back")
+                    keep = self._forward(
+                        method, path,
+                        pin_headers if artifact else original_headers,
+                        body, tls)
         except NoChainHopError:
             # No hop and no direct: a retryable answer, not a dropped
             # connection and never the inspector's 403.
@@ -19214,7 +19258,8 @@ class PinProxy:
     def _note_swap_refused(self, code: int, method: str, clean_path: str,
                             outcome: str) -> None:
         """Log a refused swap, at most once per `_BUSY_REPORT_COOLDOWN_S`
-        per (`outcome` ("retried-fresh"/"fell-back"), PATH FAMILY) -- see
+        per (`outcome` ("retried-fresh"/"fell-back", or "relayed as the pin"
+        on an artifact route, T1592), PATH FAMILY) -- see
         `_swap_refused` on `__init__`. A polled legitimate 404, or a store
         that has not rotated yet, refuses the identical way on every
         request, and this used to write one `_log_lifecycle` line per

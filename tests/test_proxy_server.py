@@ -11252,7 +11252,8 @@ class TestDrainReportsWhatItCut:
             pp._log_lifecycle = real_log
             pp._pin_daemon_pids = real_pids
 
-    def case_a_draining_predecessor_hides_the_streams_from_this_one(self, certdir):
+    def case_a_draining_predecessor_hides_the_streams_from_this_one(
+            self, certdir, monkeypatch):
         """A successor cannot answer this question, and must not guess at it.
 
         `deaf_bridges` reads `_stream_conns & _open_conns`, which is
@@ -11285,6 +11286,10 @@ class TestDrainReportsWhatItCut:
 
         import cswap_pin.proxy as pp
 
+        real_mono = time.monotonic
+        skew = [0.0]
+        monkeypatch.setattr(pp.time, "monotonic",
+                            lambda: real_mono() + skew[0])
         lines = []
         real_log = pp._log_lifecycle
         real_pids = pp._pin_daemon_pids
@@ -11341,16 +11346,84 @@ class TestDrainReportsWhatItCut:
             # THE CONTROL. The same state with no predecessor MUST still
             # report — a gate that suppressed everything would pass every
             # assertion above and silence the check this feature exists for.
+            # PAST THE GRACE (T1592): the predecessor has just left, and a
+            # bridge it held is shielded for `_DEAF_STARTUP_GRACE_S` from the
+            # report that saw it go (see the next case).
             pp._pin_daemon_pids = lambda _c: [os.getpid()]
             pp.draining_marker_path(certdir, 4242).unlink()
+            srv._report_deaf_bridges()
+            skew[0] += pp._DEAF_STARTUP_GRACE_S + 1
             srv._report_deaf_bridges()
             assert pp.DEAF_REPORT_MARK in lines[-1], (
                 "with no predecessor to hide the stream the bridge really is "
                 f"deaf, and the report stayed quiet: {lines[-1]!r}")
+            # THE SAME PROCESS REOPENING ITS STREAM CLEARS IT TOO (T1586), so
+            # the line must not claim that only a new process does.
+            assert "only a NEW PROCESS" not in lines[-1], lines[-1]
         finally:
             pp._log_lifecycle = real_log
             pp._pin_daemon_pids = real_pids
             pp.is_draining = real_draining
+
+    def case_a_predecessor_that_has_just_exited_does_not_leave_its_bridge_deaf(
+            self, certdir, monkeypatch):
+        """T1592 (T1587, via-work-mac 2026-09-29 03:51:31Z): a bridge whose
+        stream a draining predecessor held drops out of `elsewhere` the moment
+        that predecessor exits (its marker is deleted before "drained clean"
+        is logged). A sweep landing in the few seconds before Claude Code
+        reopens the stream on THIS process then called it deaf, and the mark
+        stood for a whole sweep cooldown (600 s), though the stream was back
+        seconds later. `_too_young` shielded only a loss this process
+        measured or a first post inside the grace; this process never saw
+        that stream, so neither applied.
+
+        (a) the predecessor exits and a report inside the grace does not mark
+        the bridge, and does not clear it either (nothing was judged).
+        (b) a report after the grace with still no stream marks it: the
+        shield is a dwell, not an amnesty (1f8bcbe, e489cba)."""
+        import os
+        import threading
+
+        import cswap_pin.proxy as pp
+
+        real_mono = time.monotonic
+        skew = [0.0]
+        monkeypatch.setattr(pp.time, "monotonic",
+                            lambda: real_mono() + skew[0])
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        pids = [os.getpid(), 4242]
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda _c: list(pids))
+        monkeypatch.setattr(pp, "is_draining", lambda _c, pid: pid == 4242)
+        monkeypatch.setattr(pp, "draining_bridges",
+                            lambda _c, _pid: ({"cse_HELD"}, True))
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._reset_bridge_traffic()
+        srv._live_lock = threading.Lock()
+        srv._stream_conns = set()
+        srv._open_conns = set()
+        srv._certdir = certdir
+        srv._note_bridge_traffic("/v1/code/sessions/cse_HELD/worker/messages")
+        srv._connected_bridges = {"cse_HELD"}
+
+        srv._report_deaf_bridges()
+        assert lines[-1].startswith(pp.DEAF_REPORT_CLEAR), (
+            f"the draining predecessor's stream was not counted: {lines!r}")
+
+        # THE PREDECESSOR EXITS: its marker is gone, its bridges leave.
+        pids.remove(4242)
+        skew[0] += 5.0
+        before = list(lines)
+        srv._report_deaf_bridges()
+        assert lines == before, (
+            "a report seconds after the predecessor left judged a bridge "
+            f"whose stream has not had time to reopen: {lines[len(before):]!r}")
+
+        skew[0] += pp._DEAF_STARTUP_GRACE_S
+        srv._report_deaf_bridges()
+        assert pp.DEAF_REPORT_MARK in lines[-1] and "cse_HELD" in lines[-1], (
+            "still no stream after the grace, and the report stayed quiet: "
+            f"{lines[-1]!r}")
 
     def case_a_draining_process_must_not_claim_a_deaf_bridge_is_fresh(
             self, certdir):
@@ -15362,6 +15435,151 @@ class TestAMisroutedSwapCannotKillASession:
             proxy.stop()
             upstream.stop()
 
+    def case_an_artifact_route_never_falls_back_to_the_active_account(
+            self, certdir, monkeypatch):
+        """T1592: on `/api/frame/` and `/api/oauth/files/` the take-back must
+        never resend as the ACTIVE account. Measured on lmd42 2026-09-29
+        04:36:09Z: `GET /api/frame/frames/external` went out swapped to the
+        pinned slot, got 403, found no newer token and was resent with the
+        session's own bearer, so an artifact request left as another account
+        (rc-gate row 13). The pinned account's own answer goes to the client.
+
+        Each row is a refused pinned request on an artifact route, with no
+        rotation (`dead`) and with a rotation that is refused too (`rotated`,
+        so the refetch retry still runs). Nothing but a pin bearer may reach
+        the upstream, the client gets the 403, and the log says `relayed as
+        the pin`, never `fell-back`. THE CONTROL is a pinned route that is
+        not an artifact, on the same proxy: it still falls back to the
+        session's own bearer (4e8fcd3: a 401/403/404 is terminal to the
+        client)."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        rows = [
+            ("dead", "/api/frame/frames/external", lambda n: "dead-token",
+             ["Bearer dead-token"] * 2, ["relayed as the pin"]),
+            ("rotated", "/api/oauth/files/abc/content",
+             lambda n: "stale-token" if n == 1 else "fresh-token",
+             ["Bearer stale-token", "Bearer fresh-token", "Bearer fresh-token"],
+             ["retried-fresh", "relayed as the pin"]),
+        ]
+        for name, path, token_for_read, expect_auths, expect_outcomes in rows:
+            provider = pp.make_pin_token_provider(
+                _refetch_switcher(certdir, token_for_read), "2",
+                "pin@example.com")
+            upstream = _FakeUpstream(
+                certdir, reject_bearer={"dead-token", "stale-token",
+                                        "fresh-token"})
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             upstream=("127.0.0.1", upstream.port))
+            lines = []
+            real_log = pp._log_lifecycle
+            pp._log_lifecycle = lines.append
+            proxy.start()
+            try:
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", path, bearer="disk-token")
+                assert status == 403, (
+                    f"{name}: the pinned account's own refusal must reach "
+                    f"the client: {status}")
+                assert upstream.auths_seen == expect_auths, (
+                    f"{name}: only the pinned bearer may reach the upstream "
+                    f"on an artifact route: {upstream.auths_seen}")
+                assert [ln for ln in lines if ln.startswith("swap refused")
+                        ] == [f"swap refused (403) on POST {path}: {o}"
+                              for o in expect_outcomes], f"{name}: {lines}"
+                # THE CONTROL: not an artifact route, so it still falls back.
+                upstream.auths_seen.clear()
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", "/api/oauth/validate",
+                    bearer="disk-token")
+                assert status == 200 and upstream.auths_seen[-1] == (
+                    "Bearer disk-token"), (
+                    f"{name}: a non-artifact pinned route must still fall "
+                    f"back: {status} {upstream.auths_seen}")
+                assert ("swap refused (403) on POST /api/oauth/validate: "
+                        "fell-back") in lines, f"{name}: {lines}"
+            finally:
+                proxy.stop()
+                upstream.stop()
+                pp._log_lifecycle = real_log
+
+    def case_an_absolute_form_artifact_route_never_falls_back_to_the_active_account(
+            self, certdir, monkeypatch):
+        """T1592: the absolute-form twin of the MITM case above. A refused
+        pinned request on an artifact route (`/api/frame/...`) is relayed as
+        the pin's own 403 after the refetch retry, and no request carrying
+        the session's own bearer reaches the hop. THE CONTROL, on the same
+        proxy: `/api/oauth/validate` still falls back."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        provider = pp.make_pin_token_provider(
+            _refetch_switcher(
+                certdir,
+                lambda n: "stale-token" if n == 1 else "fresh-token"),
+            "2", "pin@example.com")
+        chain = _RecordingChain(
+            lambda req: (b"HTTP/1.1 403 X\r\nContent-Length: 0\r\n\r\n"
+                         if (b"Bearer stale-token" in req
+                             or b"Bearer fresh-token" in req) else
+                         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             rediscover_chain=True)
+            proxy.start()
+
+            def _send(path):
+                c = socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=10)
+                try:
+                    c.sendall(
+                        f"GET https://api.anthropic.com{path} HTTP/1.1\r\n"
+                        f"Host: api.anthropic.com\r\n"
+                        f"Authorization: Bearer disk-token\r\n\r\n"
+                        .encode("latin1"))
+                    return c.recv(256)
+                finally:
+                    c.close()
+
+            got = _send("/api/frame/frames/external")
+            assert got.startswith(b"HTTP/1.1 403"), (
+                f"the pinned account's own refusal must reach the client: "
+                f"{got[:60]!r}")
+            assert not any(b"disk-token" in r for r in chain.seen), (
+                "an artifact request went out as the session's own account: "
+                f"{chain.seen!r}")
+            assert [ln for ln in lines if ln.startswith("swap refused")] == [
+                "swap refused (403) on GET /api/frame/frames/external: "
+                "retried-fresh",
+                "swap refused (403) on GET /api/frame/frames/external: "
+                "relayed as the pin",
+            ], lines
+            # THE CONTROL: not an artifact route, so it still falls back.
+            got = _send("/api/oauth/validate")
+            assert got.startswith(b"HTTP/1.1 200"), got[:60]
+            assert b"Bearer disk-token" in chain.seen[-1]
+            assert ("swap refused (403) on GET /api/oauth/validate: "
+                    "fell-back") in lines, lines
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+            pp._log_lifecycle = real_log
+
     def case_a_missing_authorization_header_is_not_falsely_retried_fresh(
             self, certdir, monkeypatch):
         """T1193: a pinned request that arrives with NO `Authorization`
@@ -15450,7 +15668,12 @@ class TestAMisroutedSwapCannotKillASession:
         (files and validate would share one line), two segments (both
         collapse to `/api/oauth`, same result), or a dropped query strip
         (the second validate would print its own line instead of
-        folding)."""
+        folding).
+
+        T1592: an artifact route no longer falls back at all, so the files
+        request of the first version is now `/api/oauth/file_upload` (the
+        write half of that pair, pinned and not an artifact route): the
+        same three-segment split, the same three reverts."""
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy, write_upstream_hint
 
@@ -15497,21 +15720,21 @@ class TestAMisroutedSwapCannotKillASession:
                 finally:
                     c.close()
 
-            resp_files = _send("/api/oauth/files/id1/content?sig=abc")
+            resp_upload = _send("/api/oauth/file_upload?sig=abc")
             resp_validate = _send("/api/oauth/validate")
             resp_validate2 = _send("/api/oauth/validate?x=2")
-            for name, got in (("files", resp_files),
+            for name, got in (("upload", resp_upload),
                               ("validate", resp_validate),
                               ("validate2", resp_validate2)):
                 assert got.startswith(b"HTTP/1.1 200"), f"{name}: {got[:60]!r}"
 
             swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
             assert swap_lines == [
-                "swap refused (401) on POST /api/oauth/files/id1/content: "
+                "swap refused (401) on POST /api/oauth/file_upload: "
                 "fell-back",
                 "swap refused (401) on POST /api/oauth/validate: fell-back",
             ], (
-                f"a files fall-back must not share a line with a validate "
+                f"an upload fall-back must not share a line with a validate "
                 f"fall-back, and a second validate fall-back (even with a "
                 f"different query) must fold into the first instead of "
                 f"printing its own line: {lines}"
@@ -15551,6 +15774,10 @@ class TestAMisroutedSwapCannotKillASession:
              every other cold-path read runs.
           e: a re-read that RAISES (a locked Keychain) must still fall
              back rather than drop the connection.
+
+        Sent to `/api/oauth/validate`, a pinned route that is NOT an
+        artifact route: `/api/frame/` and `/api/oauth/files/` relay the
+        pin's own refusal and never fall back (T1592).
         """
         import cswap_pin.proxy as pp
         from cswap_pin.proxy import PinProxy
@@ -15577,7 +15804,7 @@ class TestAMisroutedSwapCannotKillASession:
                  expect_auths=["Bearer stale-token", "Bearer fresh-token"],
                  expect_reads=2,
                  expect_swap_lines=[
-                     "swap refused (401) on POST /api/frame/deploy/direct: "
+                     "swap refused (401) on POST /api/oauth/validate: "
                      "retried-fresh"]),
             dict(name="CONTROL: the same dead token still falls back",
                  token_for_read=lambda n: "dead-token",
@@ -15586,7 +15813,7 @@ class TestAMisroutedSwapCannotKillASession:
                  expect_auths=["Bearer dead-token", "Bearer disk-token"],
                  expect_reads=2,
                  expect_swap_lines=[
-                     "swap refused (403) on POST /api/frame/deploy/direct: "
+                     "swap refused (403) on POST /api/oauth/validate: "
                      "fell-back"]),
             dict(name="b: a fresh retry that is also refused falls back unswapped",
                  token_for_read=lambda n: "stale-token" if n == 1 else "also-stale-token",
@@ -15595,9 +15822,9 @@ class TestAMisroutedSwapCannotKillASession:
                  expect_auths=["Bearer stale-token", "Bearer also-stale-token",
                                "Bearer disk-token"],
                  expect_swap_lines=[
-                     "swap refused (401) on POST /api/frame/deploy/direct: "
+                     "swap refused (401) on POST /api/oauth/validate: "
                      "retried-fresh",
-                     "swap refused (401) on POST /api/frame/deploy/direct: "
+                     "swap refused (401) on POST /api/oauth/validate: "
                      "fell-back"]),
             dict(name="c: an empty re-read falls back without emptying the cache",
                  token_for_read=lambda n: "stale-token" if n == 1 else "",
@@ -15642,7 +15869,7 @@ class TestAMisroutedSwapCannotKillASession:
             try:
                 status = _request_through_proxy(
                     proxy.port, certdir / "ca.pem",
-                    "/api/frame/deploy/direct", bearer="disk-token",
+                    "/api/oauth/validate", bearer="disk-token",
                 )
                 assert row["status_ok"](status), f"{row['name']}: got {status}"
                 assert upstream.auths_seen == row["expect_auths"], (
@@ -15708,14 +15935,14 @@ class TestAMisroutedSwapCannotKillASession:
         try:
             status1 = _request_through_proxy(
                 proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
+                "/api/oauth/validate", bearer="disk-token",
             )
             assert status1 == 200, (
                 f"the first (unrotated) refusal must still fall back "
                 f"cleanly: got {status1}")
             status2 = _request_through_proxy(
                 proxy.port, certdir / "ca.pem",
-                "/api/frame/deploy/direct", bearer="disk-token",
+                "/api/oauth/validate", bearer="disk-token",
             )
             assert status2 == 200, (
                 "a rotation landing between two refused requests must "
@@ -15805,7 +16032,7 @@ class TestAMisroutedSwapCannotKillASession:
         proxy.start()
         try:
             status, tls = _upgrade_via_proxy(
-                proxy.port, certdir / "ca.pem", "/api/frame/sync",
+                proxy.port, certdir / "ca.pem", "/api/oauth/validate",
                 bearer="disk-token")
             assert b"101" in status, (
                 f"the unswapped fallback must still complete the upgrade: "
@@ -15815,7 +16042,7 @@ class TestAMisroutedSwapCannotKillASession:
                 up.auths_seen)
             swap_lines = [ln for ln in lines if ln.startswith("swap refused")]
             assert swap_lines == [
-                "swap refused (403) on GET /api/frame/sync: fell-back"
+                "swap refused (403) on GET /api/oauth/validate: fell-back"
             ], lines
         finally:
             proxy.stop()
