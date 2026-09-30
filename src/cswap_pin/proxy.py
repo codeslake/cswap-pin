@@ -21988,6 +21988,10 @@ class _PumpLoop:
         self._peer: dict = {}
         # Bytes accepted from one side that the other has not taken yet.
         self._pending: dict = {}
+        # A side that has hit EOF while its peer still had bytes queued,
+        # keyed by that peer: the pair closes once the backlog is delivered,
+        # not before. See the EOF branch in `_run`.
+        self._closing: dict = {}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         # A self-pipe so `add` wakes the selector instead of waiting out its
@@ -22035,6 +22039,7 @@ class _PumpLoop:
         with self._lock:
             self._peer.clear()
             self._pending.clear()
+            self._closing.clear()
             self._last_move = 0.0
 
     def live_pairs(self, kind: str | None = None) -> int:
@@ -22083,6 +22088,7 @@ class _PumpLoop:
                 self._peer.pop(s_, None)
                 self._kind.pop(s_, None)
                 self._pending.pop(s_, None)
+                self._closing.pop(s_, None)
                 try:
                     self._sel.unregister(s_)
                 except (KeyError, ValueError, OSError):
@@ -22161,6 +22167,12 @@ class _PumpLoop:
                     pass
             else:
                 self._pending.pop(dst, None)
+                ended = self._closing.pop(dst, None)
+                if ended is not None:
+                    # THE BACKLOG IS DELIVERED, so the close the far side
+                    # asked for can happen now. See the EOF branch in `_run`.
+                    self._close_pair(dst, ended, on_close, closed_by=ended)
+                    return
                 try:
                     self._sel.modify(dst, selectors.EVENT_READ)
                 except (KeyError, ValueError, OSError):
@@ -22173,6 +22185,10 @@ class _PumpLoop:
         for s in (a, b):
             self._peer.pop(s, None)
             self._kind.pop(s, None)
+            # A closed socket's backlog can never be sent, and a key left
+            # here holds the bytes (tens of MB on a bulk download) forever.
+            self._pending.pop(s, None)
+            self._closing.pop(s, None)
             try:
                 self._sel.unregister(s)
             except (KeyError, ValueError):
@@ -22232,7 +22248,27 @@ class _PumpLoop:
                     data = b""
                 if not data:
                     with self._lock:
-                        self._close_pair(src, dst, on_close, closed_by=src)
+                        if self._pending.get(dst) and dst in self._peer:
+                            # EOF IS NOT THE END OF THE RESPONSE WHILE BYTES
+                            # FOR THE OTHER SIDE ARE STILL QUEUED. This loop
+                            # reads a fast upstream faster than a client that
+                            # writes to disk can take it, so a server that
+                            # sends its last byte and closes leaves the tail
+                            # of the body here. Closing now threw that tail
+                            # away: `claude install` through this proxy
+                            # received ~70 MB of an ~84 MB download, the
+                            # remaining 10-17 MB queued and discarded at the
+                            # upstream's FIN, and the installer aborted all
+                            # three attempts. Stop reading the ended side
+                            # and let `_flush` close the pair once the
+                            # backlog is delivered.
+                            self._closing[dst] = src
+                            try:
+                                self._sel.unregister(src)
+                            except (KeyError, ValueError):
+                                pass
+                        else:
+                            self._close_pair(src, dst, on_close, closed_by=src)
                     continue
                 # NEVER BLOCK THIS THREAD. It carries every tunnel, so a
                 # peer that stops reading would stall all of them — releasing

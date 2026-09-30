@@ -3156,6 +3156,68 @@ class TestChainRediscovery:
             "reading — one stalled connection stops them all"
         )
 
+    def case_a_tunnel_delivers_its_backlog_before_closing_on_eof(self):
+        """An upstream that sends its last byte and closes loses nothing.
+
+        The shared pump reads each side as fast as it can and queues what the
+        other side has not taken yet. A download server is faster than a
+        client writing to disk, so by the time the server sends its final
+        byte and closes, megabytes of the body can still be queued here. The
+        EOF branch closed both sockets at once and threw that queue away:
+        `claude install` through the proxy lost the last 10-17 MB of every
+        attempt and aborted three times in ten seconds, while the same
+        download through a plain tunnel or with curl completed.
+
+        Shaped the same way: the client end does not read until the upstream
+        has written everything and closed, so the pump MUST be holding a
+        backlog at the EOF.
+        """
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import _PumpLoop
+
+        pump = _PumpLoop()
+        server, up = socket.socketpair()      # the upstream and our side of it
+        down, client = socket.socketpair()    # our side of the client, and it
+        closed = threading.Event()
+        pump.add(up, down, closed.set)
+
+        body = bytes(range(256)) * (8 * 1024 * 1024 // 256)   # 8 MiB
+
+        def _serve():
+            server.sendall(body)
+            server.close()
+
+        writer = threading.Thread(target=_serve, daemon=True)
+        writer.start()
+        writer.join(10)
+        # Let the pump read up to the EOF while the client still reads nothing.
+        time.sleep(0.5)
+
+        got = bytearray()
+        client.settimeout(5)
+        try:
+            while True:
+                chunk = client.recv(1 << 20)
+                if not chunk:
+                    break
+                got += chunk
+        except (socket.timeout, OSError):
+            pass
+        finally:
+            client.close()
+
+        assert not writer.is_alive(), "the upstream never finished writing"
+        assert len(got) == len(body), (
+            f"the client received {len(got)} of {len(body)} bytes: the pump "
+            "closed the tunnel at the upstream's EOF with the rest still queued"
+        )
+        assert bytes(got) == body, "the bytes arrived reordered or corrupted"
+        assert closed.wait(3), "the tunnel never closed after the backlog drained"
+        assert pump.live_pairs() == 0
+
     def case_connections_do_not_become_threads(self, tmp_path, monkeypatch):
         """CONNECTIONS MUST NOT BECOME THREADS.
 
