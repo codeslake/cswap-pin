@@ -16759,6 +16759,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         # pre-spawn gate, keyed on the bearer.
         pp._usage_header_seen.clear()
         pp._usage_header_spawn_seen.clear()
+        # The once-per-daemon warning for a host without
+        # `record_usage_headers` is the same kind of process memo: left set,
+        # it would hide the warning from whichever case asserts it next.
+        monkeypatch.setattr(pp, "_usage_recorder_missing_warned", False)
         return calls
 
     @classmethod
@@ -17482,6 +17486,47 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert not any("usage-header record raised" in m for m in logged), (
             f"the missing method must be a no-op, not a caught exception: "
             f"{logged}")
+
+    _MISSING_RECORDER_WARNING = "has no ClaudeAccountSwitcher.record_usage_headers"
+
+    def case_a_switcher_without_the_method_warns_once_per_daemon(
+            self, monkeypatch):
+        """A host older than `record_usage_headers` loses every header
+        reading, so the active account's usage rests on the usage endpoint
+        alone; that must be said in `daemon.log`, and said ONCE, not once per
+        throttle window. Two replies that each reach `_run` (the throttle
+        memos are cleared between them) log exactly one warning."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._run_usage_thread_synchronously(monkeypatch)
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE)
+        for _ in range(2):
+            pp._usage_header_seen.clear()
+            pp._usage_header_spawn_seen.clear()
+            got = self._relay(status=b"200 OK", reset=False,
+                              auth="Bearer " + self.LIVE,
+                              extra_headers=self._5H_HEADER)
+            assert got.startswith(b"HTTP/1.1 200"), got[:40]
+        warned = [m for m in logged if self._MISSING_RECORDER_WARNING in m]
+        assert len(warned) == 1, logged
+        assert warned[0].startswith("warning:"), warned
+
+    def case_a_switcher_with_the_method_never_warns(self, monkeypatch):
+        """The warning names a missing method; a host that has it records
+        the reading and logs nothing about it."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   record_usage_headers=lambda *a: recorded.append(a))
+        self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
+                    extra_headers=self._5H_HEADER)
+        assert len(recorded) == 1, recorded
+        assert not any(self._MISSING_RECORDER_WARNING in m for m in logged), (
+            logged)
 
     def case_a_thread_spawn_failure_does_not_abort_the_reply(self, monkeypatch):
         """`_spawn_usage_header_recorder` is a bare `Thread.start()`, which

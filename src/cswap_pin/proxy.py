@@ -21512,6 +21512,7 @@ def _note_usage_headers(
                     del _usage_header_seen[next(iter(_usage_header_seen))]
             sw = require("switcher").ClaudeAccountSwitcher()
             if not hasattr(sw, "record_usage_headers"):
+                _warn_no_usage_recorder_once()
                 return
             sw.record_usage_headers(slot, headers)
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
@@ -21521,6 +21522,40 @@ def _note_usage_headers(
             )
 
     _spawn_usage_header_recorder(_run)
+
+
+# Set by the first `_warn_no_usage_recorder_once` in this process, under
+# `_usage_header_lock`. Module state on purpose: the fact it records (the host
+# lacks the method) holds for the life of the daemon.
+_usage_recorder_missing_warned = False
+
+
+def _warn_no_usage_recorder_once() -> None:
+    """Say ONCE per daemon that the installed claude-swap cannot take the
+    usage headers `_note_usage_headers` reads off `/v1/messages` replies.
+
+    A host older than `record_usage_headers` is still installable as a peer,
+    so the missing method stays a no-op rather than a raise. But a SILENT
+    no-op hid a real loss: with no header record, the active account's 5h/7d
+    figure rests on the usage endpoint alone, and once that endpoint answers
+    429 the figure can sit hours stale. Measured: the switcher kept reading
+    30% five-hour for two hours while the account was at 93%, and nothing in
+    `daemon.log` said why. One line, not one per reply: the recorder runs
+    once per throttle window for as long as the daemon lives, and the answer
+    does not change until the host is upgraded and the daemon restarted.
+    """
+    global _usage_recorder_missing_warned
+    with _usage_header_lock:
+        if _usage_recorder_missing_warned:
+            return
+        _usage_recorder_missing_warned = True
+    _log_lifecycle(
+        "warning: the installed claude-swap has no "
+        "ClaudeAccountSwitcher.record_usage_headers (it predates that "
+        "method), so usage from /v1/messages reply headers is NOT recorded "
+        "and the usage figure rests on the usage endpoint alone; upgrade "
+        "claude-swap to a build that has it"
+    )
 
 
 def _spawn_usage_header_recorder(fn) -> None:
