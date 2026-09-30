@@ -21948,6 +21948,22 @@ def _drain_ready(src) -> bytes:
     return data
 
 
+# HOW MUCH ONE TUNNEL MAY HOLD FOR A SLOW READER before the pump stops reading
+# the side that is feeding it. Without a bound the pump read a fast server as
+# fast as it could send: a single `claude install` tunnel held 12-17 MB for an
+# installer writing to disk, and every such download on the host multiplies
+# that inside the one daemon every Claude Code process routes through.
+#
+# 1 MiB because the bound only has to cover what the destination can take
+# between two selector passes, and the destination's own kernel send buffer
+# absorbs most of that: a read is at most 64 KiB, so this is sixteen reads of
+# headroom, and a fast client never sees the pause. Reading resumes at 256 KiB
+# rather than just under the bound so a paused side is woken once per ~768 KiB
+# drained, not once per read.
+_PUMP_PAUSE_AT = 1024 * 1024
+_PUMP_RESUME_AT = 256 * 1024
+
+
 class _PumpLoop:
     """ONE selector thread for EVERY tunnel, instead of one thread each.
 
@@ -21992,6 +22008,9 @@ class _PumpLoop:
         # keyed by that peer: the pair closes once the backlog is delivered,
         # not before. See the EOF branch in `_run`.
         self._closing: dict = {}
+        # Sides whose reading is suspended because the bytes queued for their
+        # peer reached `_PUMP_PAUSE_AT`. `_flush` resumes them.
+        self._paused: set = set()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         # A self-pipe so `add` wakes the selector instead of waiting out its
@@ -22040,6 +22059,7 @@ class _PumpLoop:
             self._peer.clear()
             self._pending.clear()
             self._closing.clear()
+            self._paused.clear()
             self._last_move = 0.0
 
     def live_pairs(self, kind: str | None = None) -> int:
@@ -22089,6 +22109,7 @@ class _PumpLoop:
                 self._kind.pop(s_, None)
                 self._pending.pop(s_, None)
                 self._closing.pop(s_, None)
+                self._paused.discard(s_)
                 try:
                     self._sel.unregister(s_)
                 except (KeyError, ValueError, OSError):
@@ -22159,12 +22180,6 @@ class _PumpLoop:
         with self._lock:
             if buf:
                 self._pending[dst] = buf
-                try:
-                    self._sel.modify(
-                        dst, selectors.EVENT_READ | selectors.EVENT_WRITE
-                    )
-                except (KeyError, ValueError, OSError):
-                    pass
             else:
                 self._pending.pop(dst, None)
                 ended = self._closing.pop(dst, None)
@@ -22173,10 +22188,49 @@ class _PumpLoop:
                     # asked for can happen now. See the EOF branch in `_run`.
                     self._close_pair(dst, ended, on_close, closed_by=ended)
                     return
-                try:
-                    self._sel.modify(dst, selectors.EVENT_READ)
-                except (KeyError, ValueError, OSError):
-                    pass
+            # THE FEEDING SIDE RESUMES once this backlog is low again. Each
+            # direction pauses only on its OWN destination's queue, and that
+            # queue drains on the destination's writability alone, so two
+            # sides paused at once each resume independently: no pause waits
+            # on the other direction.
+            entry = self._peer.get(dst)
+            src = entry[0] if entry is not None else None
+            if src in self._paused and len(buf) <= _PUMP_RESUME_AT:
+                self._paused.discard(src)
+                self._set_interest(src)
+            self._set_interest(dst)
+
+    def _set_interest(self, s) -> None:
+        """Register `s` for exactly the events it should wake the loop for.
+
+        CALLER HOLDS THE LOCK. READ unless its reading is paused or it has
+        already ended (see the EOF branch in `_run`); WRITE only while bytes
+        are queued for it. With neither it leaves the selector, since a
+        registration with no events is not allowed.
+        """
+        entry = self._peer.get(s)
+        if entry is None:
+            return
+        want = 0
+        ended = self._closing.get(entry[0]) is s
+        if s not in self._paused and not ended:
+            want |= selectors.EVENT_READ
+        if self._pending.get(s):
+            want |= selectors.EVENT_WRITE
+        try:
+            key = self._sel.get_key(s)
+        except (KeyError, ValueError):
+            key = None
+        try:
+            if not want:
+                if key is not None:
+                    self._sel.unregister(s)
+            elif key is None:
+                self._sel.register(s, want)
+            elif key.events != want:
+                self._sel.modify(s, want)
+        except (KeyError, ValueError, OSError):
+            pass
 
     def _close_pair(self, a, b, on_close, closed_by=None) -> None:
         # CALLER HOLDS THE LOCK. It mutates `_peer`, and the run loop now
@@ -22189,6 +22243,7 @@ class _PumpLoop:
             # here holds the bytes (tens of MB on a bulk download) forever.
             self._pending.pop(s, None)
             self._closing.pop(s, None)
+            self._paused.discard(s)
             try:
                 self._sel.unregister(s)
             except (KeyError, ValueError):
@@ -22237,7 +22292,10 @@ class _PumpLoop:
                 # the outage produced.
                 with self._lock:
                     entry = self._peer.get(src)
-                if entry is None:
+                    # PAUSED IN THIS SAME PASS. `select` reported the read
+                    # before the pause below took `src` out of the read set.
+                    paused = src in self._paused
+                if entry is None or paused:
                     continue
                 dst, on_close = entry
                 try:
@@ -22263,10 +22321,8 @@ class _PumpLoop:
                             # and let `_flush` close the pair once the
                             # backlog is delivered.
                             self._closing[dst] = src
-                            try:
-                                self._sel.unregister(src)
-                            except (KeyError, ValueError):
-                                pass
+                            self._paused.discard(src)
+                            self._set_interest(src)
                         else:
                             self._close_pair(src, dst, on_close, closed_by=src)
                     continue
@@ -22284,6 +22340,13 @@ class _PumpLoop:
                     # heartbeat the drain would read as traffic.
                     self._last_move = time.monotonic()
                     self._pending[dst] = self._pending.get(dst, b"") + data
+                    # BACKPRESSURE. A destination this far behind stops the
+                    # side feeding it: the bytes wait in the source's kernel
+                    # buffer and TCP window instead of this process's memory.
+                    # `_flush` resumes it at `_PUMP_RESUME_AT`.
+                    if len(self._pending[dst]) >= _PUMP_PAUSE_AT:
+                        self._paused.add(src)
+                        self._set_interest(src)
                 self._flush(dst, on_close)
 
 

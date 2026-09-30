@@ -3184,7 +3184,10 @@ class TestChainRediscovery:
         closed = threading.Event()
         pump.add(up, down, closed.set)
 
-        body = bytes(range(256)) * (8 * 1024 * 1024 // 256)   # 8 MiB
+        # UNDER THE PAUSE BOUND, so the pump reads the whole body and sees the
+        # EOF without the client reading at all; the client's socket buffer
+        # takes only ~230 KB of it, so the rest is still queued at the EOF.
+        body = bytes(range(256)) * (768 * 1024 // 256)   # 768 KiB
 
         def _serve():
             server.sendall(body)
@@ -3192,9 +3195,10 @@ class TestChainRediscovery:
 
         writer = threading.Thread(target=_serve, daemon=True)
         writer.start()
-        writer.join(10)
+        writer.join(5)
         # Let the pump read up to the EOF while the client still reads nothing.
         time.sleep(0.5)
+        held_at_eof = self._queued_for(pump, down)
 
         got = bytearray()
         client.settimeout(5)
@@ -3210,6 +3214,10 @@ class TestChainRediscovery:
             client.close()
 
         assert not writer.is_alive(), "the upstream never finished writing"
+        assert held_at_eof > 0, (
+            "the pump held nothing at the upstream's EOF, so this case "
+            "proves nothing about delivering a backlog"
+        )
         assert len(got) == len(body), (
             f"the client received {len(got)} of {len(body)} bytes: the pump "
             "closed the tunnel at the upstream's EOF with the rest still queued"
@@ -3217,6 +3225,168 @@ class TestChainRediscovery:
         assert bytes(got) == body, "the bytes arrived reordered or corrupted"
         assert closed.wait(3), "the tunnel never closed after the backlog drained"
         assert pump.live_pairs() == 0
+
+    @staticmethod
+    def _queued_for(pump, sock) -> int:
+        with pump._lock:
+            return len(pump._pending.get(sock, b""))
+
+    def case_a_slow_reader_stops_the_pump_reading_its_feeder(self):
+        """What one tunnel holds for a slow reader is bounded.
+
+        The pump read a fast side as fast as it could send and queued the
+        rest in memory, so a client writing a download to disk left the
+        daemon holding 12-17 MB per `claude install` tunnel, multiplied by
+        every such download on the host. Past `_PUMP_PAUSE_AT` the pump must
+        stop reading the feeding side and leave the bytes in its kernel
+        buffer, resume as the client drains, and still deliver every byte.
+
+        The ceiling is the bound plus one read: the pause is decided after the
+        read that crossed it.
+        """
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import _PUMP_PAUSE_AT, _PumpLoop
+
+        pump = _PumpLoop()
+        server, up = socket.socketpair()
+        down, client = socket.socketpair()
+        closed = threading.Event()
+        pump.add(up, down, closed.set)
+
+        body = bytes(range(256)) * (16 * 1024 * 1024 // 256)   # 16 MiB
+
+        def _serve():
+            server.sendall(body)
+            server.close()
+
+        writer = threading.Thread(target=_serve, daemon=True)
+        writer.start()
+        most = 0
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            most = max(most, self._queued_for(pump, down))
+            time.sleep(0.01)
+        with pump._lock:
+            feeder_paused = up in pump._paused
+
+        got = bytearray()
+        client.settimeout(5)
+        try:
+            while True:
+                most = max(most, self._queued_for(pump, down))
+                chunk = client.recv(1 << 20)
+                if not chunk:
+                    break
+                got += chunk
+        except (socket.timeout, OSError):
+            pass
+        finally:
+            client.close()
+        writer.join(5)
+
+        assert most <= _PUMP_PAUSE_AT + 65536, (
+            f"the pump queued {most} bytes for a reader that took nothing; "
+            f"the bound is {_PUMP_PAUSE_AT} plus one read"
+        )
+        assert feeder_paused, "the feeding side was never paused"
+        assert writer.is_alive() is False, "the upstream never finished writing"
+        assert len(got) == len(body), (
+            f"the client received {len(got)} of {len(body)} bytes after the "
+            "pause: reading never resumed"
+        )
+        assert bytes(got) == body, "the bytes arrived reordered or corrupted"
+        assert closed.wait(3), "the tunnel never closed after the backlog drained"
+        assert pump.live_pairs() == 0
+
+    def case_both_directions_over_the_bound_at_once_still_complete(self):
+        """Two sides paused at the same moment each resume on their own.
+
+        Each direction pauses on its own destination's queue, and that queue
+        drains on the destination's writability alone, so a pair with BOTH
+        directions over the bound (each side paused, waiting on the other
+        side's reader) is not a deadlock. Both ends write 8 MiB while neither
+        reads, then both start reading: both must receive everything in
+        order, and neither queue may pass the bound on the way.
+        """
+        import socket
+        import threading
+        import time
+
+        from cswap_pin.proxy import _PUMP_PAUSE_AT, _PumpLoop
+
+        pump = _PumpLoop()
+        left, a = socket.socketpair()
+        b, right = socket.socketpair()
+        pump.add(a, b)
+
+        size = 8 * 1024 * 1024
+        to_right = bytes(range(256)) * (size // 256)
+        to_left = bytes(reversed(range(256))) * (size // 256)
+        received = {}
+
+        def _write(sock, data):
+            sock.sendall(data)
+
+        def _read(sock, key):
+            sock.settimeout(10)
+            got = bytearray()
+            try:
+                while len(got) < size:
+                    chunk = sock.recv(1 << 20)
+                    if not chunk:
+                        break
+                    got += chunk
+            except (socket.timeout, OSError):
+                pass
+            received[key] = bytes(got)
+
+        writers = [
+            threading.Thread(target=_write, args=(left, to_right), daemon=True),
+            threading.Thread(target=_write, args=(right, to_left), daemon=True),
+        ]
+        for t in writers:
+            t.start()
+        most = 0
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            most = max(most, self._queued_for(pump, a), self._queued_for(pump, b))
+            time.sleep(0.01)
+        with pump._lock:
+            both_paused = a in pump._paused and b in pump._paused
+
+        readers = [
+            threading.Thread(target=_read, args=(right, "right"), daemon=True),
+            threading.Thread(target=_read, args=(left, "left"), daemon=True),
+        ]
+        for t in readers:
+            t.start()
+        while any(t.is_alive() for t in readers):
+            most = max(most, self._queued_for(pump, a), self._queued_for(pump, b))
+            time.sleep(0.01)
+        for t in writers:
+            t.join(5)
+        for s in (left, a, b, right):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+        assert both_paused, "the case never reached both sides paused at once"
+        assert most <= _PUMP_PAUSE_AT + 65536, (
+            f"a direction queued {most} bytes; the bound is {_PUMP_PAUSE_AT} "
+            "plus one read"
+        )
+        assert received.get("right") == to_right, (
+            f"left to right delivered {len(received.get('right', b''))} of "
+            f"{size} bytes, or out of order"
+        )
+        assert received.get("left") == to_left, (
+            f"right to left delivered {len(received.get('left', b''))} of "
+            f"{size} bytes, or out of order"
+        )
 
     def case_connections_do_not_become_threads(self, tmp_path, monkeypatch):
         """CONNECTIONS MUST NOT BECOME THREADS.
