@@ -19305,3 +19305,115 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
             srv._open_conns.add(a)
             srv._stream_conns.add(a)             # no _content_at entry
         assert srv.release_idle_streams() == 0
+
+
+def _handshake(ctx, port, host="api.anthropic.com"):
+    """One TLS handshake to a loopback server, `host` being the name checked.
+    Raises ssl.SSLCertVerificationError when `ctx` does not trust what it
+    serves."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        ctx.wrap_socket(raw, server_hostname=host).close()
+
+
+def _pin_dir():
+    """The directory `_verifying_context()` derives (conftest redirects the
+    store it lives under to the case's tmp_path)."""
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    return _mkdir(ClaudeAccountSwitcher().backup_dir / "pin-proxy")
+
+
+class TestTheVerifyingContextTrustsTheHop:
+    """The daemon's own profile and policy fetches go out through the pin and
+    through whatever re-signing hop is recorded behind it. A third-party hop's
+    CA is recorded in upstream.json and carries no keyUsage."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _hop_signed_dir(tmp_path):
+        """A directory holding a leaf signed by a CA with NO keyUsage (the pin's
+        own `ensure_ca` always adds one, so it cannot make this)."""
+        import datetime as dt
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        from cswap_pin.proxy import _make_leaf
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hop CA")])
+        now = dt.datetime.now(dt.timezone.utc)
+        ca = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+              .public_key(key.public_key()).serial_number(x509.random_serial_number())
+              .not_valid_before(now - dt.timedelta(days=1))
+              .not_valid_after(now + dt.timedelta(days=30))
+              .add_extension(x509.BasicConstraints(ca=True, path_length=None),
+                             critical=True)
+              .sign(key, hashes.SHA256()))
+        with pytest.raises(x509.ExtensionNotFound):
+            ca.extensions.get_extension_for_class(x509.KeyUsage)
+        leaf, leaf_key = _make_leaf("api.anthropic.com", ca, key)
+        signer = tmp_path / "hop"
+        signer.mkdir()
+        (signer / "ca.pem").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+        (signer / "leaf.pem").write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        (signer / "leaf.key").write_bytes(leaf_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+        return signer
+
+    def case_the_recorded_hop_ca_is_trusted_even_with_the_host_helper(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        # The affected box HAS the host's helper, and it trusts roots plus the
+        # pin's own CA only: the context that failed.
+        monkeypatch.setattr(proxy.oauth, "_pin_aware_ssl_context",
+                            ssl.create_default_context, raising=False)
+        signer = self._hop_signed_dir(tmp_path)
+        upstream = _FakeUpstream(signer)
+        try:
+            # CONTROL: nothing recorded, so the hop's leaf must be refused.
+            with pytest.raises(ssl.SSLCertVerificationError):
+                _handshake(proxy._verifying_context(), upstream.port)
+            proxy.write_upstream_hint(
+                _pin_dir(), "http://127.0.0.1:1", str(signer / "ca.pem"))
+            _handshake(proxy._verifying_context(), upstream.port)
+        finally:
+            upstream.stop()
+
+    def case_a_leaf_the_pins_own_ca_signed_verifies_alone(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        pin_dir = _pin_dir()
+        ensure_ca(pin_dir, "api.anthropic.com")
+        assert not (pin_dir / "ca-bundle.pem").exists()
+        assert proxy.read_upstream_ca(pin_dir) is None
+        upstream = _FakeUpstream(pin_dir)
+        try:
+            _handshake(proxy._verifying_context(), upstream.port)
+        finally:
+            upstream.stop()
+
+    def case_strict_verification_is_off(self, monkeypatch):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        real = ssl.create_default_context
+
+        def strict_like_3_13(*a, **kw):
+            ctx = real(*a, **kw)
+            ctx.verify_flags |= ssl.VERIFY_X509_STRICT
+            return ctx
+
+        monkeypatch.setattr(ssl, "create_default_context", strict_like_3_13)
+        assert not proxy._verifying_context().verify_flags & ssl.VERIFY_X509_STRICT

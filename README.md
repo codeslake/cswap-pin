@@ -1092,6 +1092,14 @@ the one `$BASH_ENV` names. So with bash, save the lines to a file and export
 `BASH_ENV` pointing at it in the environment you start `claude` from. Measured
 for zsh only.
 
+**Accept Claude Code's trust dialog in your home directory by hand.** Trust
+accepted in your home directory does not persist (Claude Code keeps it per
+session by design), so a process started there, such as Claude Code's
+background daemon or a background session, evaluates Remote Control as an
+anonymous user and `/remote-control` can disappear. Set
+`projects["<your home directory>"].hasTrustDialogAccepted` to `true` in
+`~/.claude.json` yourself. This is Claude Code's behaviour, not the pin's.
+
 ## License
 
 MIT

@@ -39,6 +39,7 @@ import time
 from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
+import urllib.error
 import urllib.request
 from urllib.parse import quote, unquote, urlsplit
 
@@ -14207,35 +14208,29 @@ def _sweep_witness() -> "dict | None":
 
 
 def _verifying_context() -> "ssl.SSLContext":
-    """A context that trusts the pin's own MITM certificate.
+    """A context that trusts what the daemon's own egress can present.
 
-    THE HOST MAY NOT HAVE THE HELPER. `oauth._pin_aware_ssl_context` ships
-    with a host that is still unreleased, and claude-swap is a PEER whose
-    version we do not choose — the RELEASED one has no such attribute. Naming
-    it unconditionally raises AttributeError inside a function whose `except`
-    turns everything into `None`, so on a released host the policy repair goes
-    back to being the silent no-op it was before it was fixed. Measured on CI,
-    which installs exactly that host.
+    The daemon's fetches go out through the pin, which re-signs the API host
+    with its own CA, and through whatever hop is recorded behind it, whose CA
+    is in `upstream.json`. So the anchors are the pin's `ca.pem` (NAMED:
+    `ca-bundle.pem` exists only once a second CA was merged, and the fetch may
+    go out through the pin itself), the recorded hop's CA and the bundle, on
+    top of the roots and `NODE_EXTRA_CA_CERTS`.
 
-    We do not need the host for this. The pin ISSUES the CA in question, so it
-    can add it itself; the helper is used when present only because it also
-    picks up whatever else that host knows to trust.
+    NOT THE HOST'S `_pin_aware_ssl_context`. It trusts roots plus `ca.pem`
+    only, so through a re-signing hop it fails "unable to get local issuer
+    certificate", and a released host lacks it altogether. `_verifying_ctx`
+    clears VERIFY_X509_STRICT, which Python 3.13 turns on and a released
+    re-signing CA (no keyUsage) fails. This trusts a superset of the helper
+    and narrows nothing.
     """
-    helper = getattr(oauth, "_pin_aware_ssl_context", None)
-    if helper is not None:
-        try:
-            return helper()
-        except Exception:  # noqa: BLE001 — fall through to our own
-            pass
-    ctx = ssl.create_default_context()
     try:
-        bundle = require("switcher").ClaudeAccountSwitcher().backup_dir \
-            / "pin-proxy" / "ca-bundle.pem"
-        if bundle.exists():
-            ctx.load_verify_locations(cafile=str(bundle))
-    except Exception:  # noqa: BLE001 — an unpinned machine has no bundle
-        pass
-    return ctx
+        certdir = require("switcher").ClaudeAccountSwitcher().backup_dir \
+            / "pin-proxy"
+    except Exception:  # noqa: BLE001 — an unpinned machine has no certdir
+        return _verifying_ctx()
+    return _verifying_ctx(certdir / "ca.pem", read_upstream_ca(certdir),
+                          certdir / "ca-bundle.pem")
 
 
 def policy_limits_for(token: "str | None") -> "dict | None":
@@ -14337,6 +14332,12 @@ def profile_identity_from(doc, now_ms=None) -> "dict | None":
     return out
 
 
+#: WHY the last `pin_profile_for` on THIS thread answered None (`.kind`), for
+#: the one caller that logs it. A side channel because the function's
+#: dict-or-None answer is what its callers and stubs are written against.
+_profile_failure = threading.local()
+
+
 def pin_profile_for(token: "str | None") -> "dict | None":
     """The pinned account's own profile in `oauthAccount` shape, or None.
 
@@ -14361,9 +14362,19 @@ def pin_profile_for(token: "str | None") -> "dict | None":
         with urllib.request.urlopen(
                 req, timeout=10, context=_verifying_context()) as resp:
             doc = json.loads(resp.read().decode())
-        return profile_identity_from(doc)
-    except Exception:  # noqa: BLE001 — never take the daemon down
-        return None
+        ident = profile_identity_from(doc)
+        if ident is None:
+            _profile_failure.kind = "no account uuid in the answer"
+        return ident
+    except urllib.error.HTTPError as e:
+        _profile_failure.kind = f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        _profile_failure.kind = str(e.reason)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _profile_failure.kind = "unparseable body"
+    except Exception as e:  # noqa: BLE001 — never take the daemon down
+        _profile_failure.kind = f"{type(e).__name__}: {e}"
+    return None
 
 
 def _canonical_body_sha(doc: dict) -> str:
@@ -17166,6 +17177,7 @@ class PinProxy:
         note_verdict = provider_token and getattr(
             self._pin_token_provider, "note_verdict", None)
         token = provider_token or _active_oauth_token()
+        _profile_failure.kind = None
         fresh = pin_profile_for(token) if token else None
         if not fresh or fresh.get("accountUuid") != ident.get("accountUuid"):
             # SAY WHY, or a stale stamp on one host and a fresh one on another
@@ -17174,8 +17186,10 @@ class PinProxy:
             now = time.time()
             if now - getattr(self, "_freshen_warned_at", 0.0) > 3600.0:
                 self._freshen_warned_at = now
+                kind = (f" ({_profile_failure.kind})"
+                        if _profile_failure.kind else "")
                 why = ("no bearer to ask with" if not token
-                       else "the profile request failed" if not fresh
+                       else f"the profile request failed{kind}" if not fresh
                        else "the bearer answers as "
                             f"{str(fresh.get('accountUuid'))[:12]}, not the pin")
                 _log_lifecycle(

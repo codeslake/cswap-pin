@@ -28,6 +28,9 @@ from cswap_pin.proxy import (
     is_pinned_route,
     parse_upstream_proxy,
 )
+# The real function, saved before the autouse `_pin_profile_never_dials_out`
+# stubs the module attribute for every test.
+from cswap_pin.proxy import pin_profile_for as _real_pin_profile_for
 
 from conftest import PIN_STAMP, run_cases
 
@@ -1536,13 +1539,18 @@ class TestLiveRemoteControlSessions:
         silently, forever. `grep 'refreshed the org-policy cache' daemon.log`
         returned 0 across every rotation on this host.
 
-        `oauth._pin_aware_ssl_context()` exists for exactly this and its own
-        docstring names this failure; this call simply never used it. Assert
-        the context is passed, because the symptom is invisible: a repair that
-        cannot reach the server looks identical to one with nothing to repair.
+        Assert TRUST, because the symptom is invisible: a repair that cannot
+        reach the server looks identical to one with nothing to repair. The
+        context the fetch goes out on must verify a leaf the pin's own CA
+        signed, whether or not the host lends a helper (none is consulted).
         """
+        from test_proxy_server import _FakeUpstream, _handshake, _pin_dir
+
         from cswap_pin import proxy as pin_proxy
 
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        pin_dir = _pin_dir()
+        ensure_ca(pin_dir, "api.anthropic.com")
         seen = {}
 
         class _Resp:
@@ -1561,41 +1569,13 @@ class TestLiveRemoteControlSessions:
             seen["context"] = context
             return _Resp()
 
-        # THE CONTEXT BUILDER IS STUBBED TOO, and the first cut of this test
-        # forgot to. It is called as an ARGUMENT to `urlopen`, so replacing
-        # `urlopen` alone does not stop it running: it reads the pin's CA
-        # bundle off disk, which exists on a machine that runs the pin and not
-        # on a CI runner. The test passed here and failed there, asserting
-        # about the developer's filesystem rather than about the code.
-        sentinel = object()
-        # `raising=False` because the RELEASED host has no such attribute and
-        # setattr refuses to invent one — the same asymmetry the code under
-        # test exists to absorb.
-        monkeypatch.setattr(pin_proxy.oauth, "_pin_aware_ssl_context",
-                            lambda: sentinel, raising=False)
         monkeypatch.setattr(pin_proxy.urllib.request, "urlopen", fake_urlopen)
         assert pin_proxy.policy_limits_for("tok") == {"restrictions": {}}
-        assert seen["context"] is sentinel, (
-            "the policy fetch did not go out on the PIN-AWARE context, so "
-            "through the pin it dies CERTIFICATE_VERIFY_FAILED and the "
-            "repair is a silent no-op — which is what production was doing")
-
-        # AND ON A HOST THAT DOES NOT HAVE THAT HELPER. claude-swap is a PEER,
-        # not a dependency, so cswap-pin runs against whatever version is
-        # installed — and the RELEASED one has no `_pin_aware_ssl_context`;
-        # it ships with the host that is still unreleased. Referencing it
-        # unconditionally raises AttributeError, which this function's `except`
-        # turns into None: the same silent no-op, reintroduced for everyone on
-        # the released host. MEASURED on CI, which installs exactly that.
-        monkeypatch.delattr(pin_proxy.oauth, "_pin_aware_ssl_context",
-                            raising=False)
-        seen.clear()
-        assert pin_proxy.policy_limits_for("tok") == {"restrictions": {}}, (
-            "an older host made the policy fetch fail outright — the pin has "
-            "to build its own context when the host cannot lend one")
-        assert seen["context"] is not None, (
-            "fell back to the default TLS context, which cannot verify the "
-            "pin's own MITM certificate")
+        upstream = _FakeUpstream(pin_dir)
+        try:
+            _handshake(seen["context"], upstream.port)
+        finally:
+            upstream.stop()
 
     def case_an_unaskable_policy_leaves_the_file_alone(self, tmp_path,
                                                        monkeypatch):
@@ -28897,6 +28877,95 @@ class TestTheSpliceHoldsTheConfigLock:
         with contextlib.redirect_stderr(err):
             assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
         assert "no bearer to ask with" in err.getvalue(), err.getvalue()
+
+    def case_a_failed_profile_request_says_what_failed(self, monkeypatch):
+        """`pin_profile_for` still answers dict-or-None; WHY it answered None
+        is left on a per-thread side channel for the one caller that logs it."""
+        import io
+        import urllib.error
+
+        from cswap_pin import proxy as pin_proxy
+
+        class _Body:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def read(self):
+                return self.raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def kind_of(outcome):
+            def fake_urlopen(req, timeout=None, context=None):
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return _Body(outcome)
+
+            monkeypatch.setattr(pin_proxy.urllib.request, "urlopen", fake_urlopen)
+            pin_proxy._profile_failure.kind = None
+            assert _real_pin_profile_for("tok") is None
+            return pin_proxy._profile_failure.kind
+
+        assert kind_of(urllib.error.HTTPError(
+            "u", 403, "Forbidden", {}, io.BytesIO(b""))) == "HTTP 403"
+        reason = "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer"
+        assert kind_of(urllib.error.URLError(reason)) == reason
+        assert kind_of(b"<html>") == "unparseable body"
+        assert kind_of(b'{"account": {}, "organization": {}}') == (
+            "no account uuid in the answer")
+        assert kind_of(RuntimeError("boom")) == "RuntimeError: boom"
+        # CONTROL: an answer that parses is None-free, and leaves no kind.
+        monkeypatch.setattr(
+            pin_proxy.urllib.request, "urlopen",
+            lambda req, timeout=None, context=None: _Body(
+                b'{"account": {"uuid": "U"}, "organization": {}}'))
+        pin_proxy._profile_failure.kind = None
+        assert _real_pin_profile_for("tok")["accountUuid"] == "U"
+        assert pin_proxy._profile_failure.kind is None
+
+    def case_the_stale_stamp_line_carries_the_failure_once(
+            self, tmp_path, monkeypatch):
+        import contextlib
+        import io
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        old_ms = int((_time.time() - 13 * 3600) * 1000)
+        pin_proxy.remember_pin_identity(
+            certdir, {**self.PIN, "profileFetchedAt": old_ms})
+
+        def failing(token):
+            pin_proxy._profile_failure.kind = "HTTP 403"
+            return None
+
+        monkeypatch.setattr(pin_proxy, "pin_profile_for", failing)
+        me = _t.SimpleNamespace(_certdir=certdir,
+                                _pin_token_provider=lambda: "PINTOKEN")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(2):
+                assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+        assert "the profile request failed (HTTP 403)" in err.getvalue()
+        assert err.getvalue().count("could not be refreshed") == 1, err.getvalue()
+
+        # CONTROL: a stub that says nothing must not inherit the last failure
+        # this thread saw.
+        monkeypatch.setattr(pin_proxy, "pin_profile_for", lambda token: None)
+        me = _t.SimpleNamespace(_certdir=certdir,
+                                _pin_token_provider=lambda: "PINTOKEN")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+        assert "the profile request failed" in err.getvalue(), err.getvalue()
+        assert "failed (" not in err.getvalue(), err.getvalue()
 
     def case_the_beat_keys_on_its_own_mail_not_the_profiles(
             self, tmp_path, monkeypatch):
