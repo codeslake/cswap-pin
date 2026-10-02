@@ -14369,11 +14369,23 @@ def pin_profile_for(token: "str | None") -> "dict | None":
     except urllib.error.HTTPError as e:
         _profile_failure.kind = f"HTTP {e.code}"
     except urllib.error.URLError as e:
-        _profile_failure.kind = str(e.reason)
+        # NEVER `str(e.reason)` or `str(e)` in a kind: the line lands in
+        # daemon.log, and a reason's text or an exception's message can quote
+        # the tunnel's answer or the request (http.client's ValueError for a
+        # bad header quotes the whole `Bearer <token>`). Types, errno and
+        # OpenSSL's fixed verify string only.
+        r = e.reason
+        facts = []
+        if isinstance(r, OSError) and r.errno is not None:
+            facts.append(f"errno {r.errno}")
+        if isinstance(r, ssl.SSLCertVerificationError):
+            facts.append(f"verify code {r.verify_code}: {r.verify_message}")
+        _profile_failure.kind = type(r).__name__ + (
+            f" ({', '.join(facts)})" if facts else "")
     except (json.JSONDecodeError, UnicodeDecodeError):
         _profile_failure.kind = "unparseable body"
     except Exception as e:  # noqa: BLE001 — never take the daemon down
-        _profile_failure.kind = f"{type(e).__name__}: {e}"
+        _profile_failure.kind = type(e).__name__
     return None
 
 

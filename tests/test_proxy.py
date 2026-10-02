@@ -28882,6 +28882,7 @@ class TestTheSpliceHoldsTheConfigLock:
         """`pin_profile_for` still answers dict-or-None; WHY it answered None
         is left on a per-thread side channel for the one caller that logs it."""
         import io
+        import ssl
         import urllib.error
 
         from cswap_pin import proxy as pin_proxy
@@ -28912,12 +28913,22 @@ class TestTheSpliceHoldsTheConfigLock:
 
         assert kind_of(urllib.error.HTTPError(
             "u", 403, "Forbidden", {}, io.BytesIO(b""))) == "HTTP 403"
-        reason = "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer"
-        assert kind_of(urllib.error.URLError(reason)) == reason
+        # A reason's text is never echoed: a string reason or an OSError's
+        # message can quote the tunnel's answer or other request data.
+        assert kind_of(urllib.error.URLError("tunnel said SECRET")) == "str"
+        assert kind_of(urllib.error.URLError(
+            ConnectionRefusedError(111, "tunnel said SECRET"))) == (
+            "ConnectionRefusedError (errno 111)")
+        cert = ssl.SSLCertVerificationError(1, "tunnel said SECRET")
+        cert.verify_code = 20
+        cert.verify_message = "unable to get local issuer certificate"
+        assert kind_of(urllib.error.URLError(cert)) == (
+            "SSLCertVerificationError (errno 1, verify code 20: "
+            "unable to get local issuer certificate)")
         assert kind_of(b"<html>") == "unparseable body"
         assert kind_of(b'{"account": {}, "organization": {}}') == (
             "no account uuid in the answer")
-        assert kind_of(RuntimeError("boom")) == "RuntimeError: boom"
+        assert kind_of(RuntimeError("boom")) == "RuntimeError"
         # CONTROL: an answer that parses is None-free, and leaves no kind.
         monkeypatch.setattr(
             pin_proxy.urllib.request, "urlopen",
@@ -28966,6 +28977,39 @@ class TestTheSpliceHoldsTheConfigLock:
             assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
         assert "the profile request failed" in err.getvalue(), err.getvalue()
         assert "failed (" not in err.getvalue(), err.getvalue()
+
+    def case_a_bearer_with_a_line_break_never_reaches_the_log(
+            self, tmp_path, monkeypatch):
+        """http.client refuses a header value carrying CR/LF, and its
+        ValueError quotes the whole `Bearer <token>`. urlopen does not wrap
+        it, so the failure kind must be the type alone: the hourly line
+        lands in daemon.log."""
+        import contextlib
+        import io
+        import time as _time
+        import types as _t
+
+        from cswap_pin import proxy as pin_proxy
+
+        for var in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.delenv(var, raising=False)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        old_ms = int((_time.time() - 13 * 3600) * 1000)
+        pin_proxy.remember_pin_identity(
+            certdir, {**self.PIN, "profileFetchedAt": old_ms})
+        token = "sk-ant-oat01-SECRETMARK\r\nX-Injected: 1"
+        monkeypatch.setattr(pin_proxy, "pin_profile_for", _real_pin_profile_for)
+        me = _t.SimpleNamespace(_certdir=certdir,
+                                _pin_token_provider=lambda: token)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pin_proxy.PinProxy._freshen_pin_identity(me) is False
+        # The real urllib path raised, at the header, before any connection.
+        assert pin_proxy._profile_failure.kind == "ValueError"
+        assert "the profile request failed (" in err.getvalue(), err.getvalue()
+        assert "SECRETMARK" not in err.getvalue(), err.getvalue()
+        assert token not in err.getvalue(), err.getvalue()
 
     def case_the_beat_keys_on_its_own_mail_not_the_profiles(
             self, tmp_path, monkeypatch):
