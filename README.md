@@ -343,7 +343,8 @@ from a shell exporting the outer egress proxy, `upstream.json` holds it as
 N` from the shell that exports the inner cache proxy: when that hop reports
 its own upstream as `https_proxy` on `GET /health`, and the recorded hop
 answers that request with a 4xx, the pin re-records the chain inner first.
-Only a re-pin does this; `--ensure` and `heal` never re-stamp the record.
+Only a re-pin, or a `cswap run`, from that shell does this; `--ensure` and
+`heal` never re-stamp the record.
 
 **Which certificates the pin itself checks.** Through a loopback hop the pin
 does not verify `api.anthropic.com`'s certificate: it trusts the local hop, the

@@ -209,10 +209,13 @@ def _probe_next_hop(
     # leaves a 4xx hop getting one /health per launch, forever, because a
     # launch is a fresh process and `_ASKED_NOHEALTH` cannot amortise across
     # launches (see that set's own comment above for why nothing on disk
-    # covers it either). One differing-export shape now ends: a shell
-    # exporting the inner cache proxy over a record of the outer hop is
-    # re-recorded by `ensure_proxy` after one /health, so the next launch asks
-    # nothing. No replacement is built here for the rest.
+    # covers it either). One differing-export shape ends after one /health: a
+    # shell exporting the inner cache proxy over a record of the outer hop is
+    # re-recorded by `ensure_proxy`. Its mirror does not: a generic loopback
+    # intercepting proxy recorded as the hop that 4xxs /health, in front of
+    # the outer hop, launched from a shell exporting the outer hop, never
+    # swaps, and each launch adds one loopback request to that outer hop,
+    # answered at once. No replacement is built here for the rest.
     own = parse_upstream_proxy(own_proxy)
     if own is not None and own.address == hop.address:
         return None
@@ -7669,8 +7672,10 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # this probe, since the shell's own export is the hop asked. The
             # recorded hop has just declared itself a 4xx non-/health hop, so
             # this is the only moment asking the shell's export can learn
-            # anything, and it happens once: the next launch from this shell
-            # sees recorded == shell and probes nothing new.
+            # anything. After a swap the next launch from this shell sees
+            # recorded == shell and probes nothing new; with no swap (the
+            # shape `_probe_next_hop`'s ponytail ceiling names) every launch
+            # asks the shell's hop once more.
             behind = parse_upstream_proxy(_probe_next_hop(observed_next))
             if behind is not None and behind.address == hop.address:
                 ambient, next_hop = observed_next, ambient

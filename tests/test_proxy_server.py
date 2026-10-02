@@ -6972,7 +6972,8 @@ class TestChainRediscovery:
             assert [h.address for h in pp._chain_hops(certdir)] == want
             assert outer_served == [1], "the outer hop is asked once, to learn it"
 
-            launch()  # the next launch from the same shell, nothing reset
+            pp._ASKED_NOHEALTH.clear()  # a fresh process remembers nothing
+            launch()  # the next launch from the same shell
             assert [h.address for h in pp._chain_hops(certdir)] == want
             assert outer_served == [1], "the settled record asks no one again"
         finally:
@@ -6996,6 +6997,51 @@ class TestChainRediscovery:
 
             launch()
             assert shell_served == [], "the shell's own hop was asked /health"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
+
+    def case_ensure_proxy_never_asks_the_shells_hop_of_a_recorded_hop_that_did_not_decline(
+        self, tmp_path, monkeypatch
+    ):
+        """The recorded hop answers 200 without an `https_proxy`: it is a
+        /health server with nothing behind it, not a hop that declared itself
+        a non-/health one, so the shell's hop (which WOULD name it) is never
+        asked and the record is not swapped."""
+        import cswap_pin.proxy as pp
+
+        rec_srv, recorded, _ = _http_hop(b"200 OK", b"{}")
+        body = json.dumps({"https_proxy": recorded}).encode()
+        shell_srv, shell, shell_served = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [], "the shell's own hop was asked /health"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
+
+    def case_ensure_proxy_keeps_the_record_when_the_shells_hop_does_not_name_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The recorded hop declares itself non-/health (400) and the shell's
+        hop is asked, but it names a THIRD address: not a chain through the
+        recorded hop, so the record is not swapped."""
+        import cswap_pin.proxy as pp
+
+        rec_srv, recorded, _ = _http_hop(b"400 Bad Request")
+        body = json.dumps({"https_proxy": "http://192.0.2.1:3128"}).encode()
+        shell_srv, shell, shell_served = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [1], "the gate was never reached: no control"
             assert pp._read_upstream(certdir, "proxy") == recorded
         finally:
             rec_srv.close()
