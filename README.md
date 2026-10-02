@@ -4,11 +4,33 @@ Keep Claude Code's **Remote Control** and **Artifacts** on one account while
 inference keeps following [`cswap`](https://github.com/realiti4/claude-swap)'s
 account swap.
 
+## Quick start
+
+1. Install (the commit is tagged `pin-install-85764e7`):
+
+   ```bash
+   uv tool install --force --python 3.12 \
+     "claude-swap[pin] @ git+https://github.com/codeslake/claude-swap@85764e77dc63c02f35caffdf64ddcc5cc61ea0dd" \
+     --with cswap-pin==0.1.306
+   ```
+
+2. `cswap pin N`, N being an account from `cswap list`. If you reach the
+   internet through a proxy, pin with it exported:
+   `HTTPS_PROXY=http://127.0.0.1:<port> cswap pin N`.
+3. Run `cswap pin --ensure >/dev/null 2>&1 &` on every `claude` launch: as this
+   one line in `~/.bashrc` or `~/.zshrc` for hand launches, and in your
+   `CLAUDE_CODE_PROCESS_WRAPPER` script too if you use one.
+
+   ```bash
+   claude() { (cswap pin --ensure >/dev/null 2>&1 &); command claude "$@"; }
+   ```
+
+If it breaks: `cswap pin --clear`. Everything below is reference.
+
 ## Before you start, and if it breaks
 
 Pinning rewrites files Claude Code reads at startup (every one is listed under
-[What the pin writes](#what-the-pin-writes)), so here is the way back before
-the way in.
+[What the pin writes](#what-the-pin-writes)). This is the full way back.
 
 **`cswap pin --clear` is the undo**, and it works even when the `cswap-pin`
 package is broken or gone. It:
@@ -32,7 +54,10 @@ What it does not undo:
   yourself if you had them.
 - The proxy keeps running. A session that is already open had the pin's port
   fixed in its environment when it started, so it keeps going through the
-  proxy, now unpinned. New sessions start without it.
+  proxy, now unpinned. And a daemon that restarts after `--clear` (a crash, an
+  upgrade) points `.claude.json` at itself again without checking that a pin
+  is still set, so new sessions can end up on the proxy again. So after
+  `--clear`, stop the proxy (below) once the last pinned session has closed.
 
 **By hand, when `cswap` itself will not run.** `<data>` below is cswap's data
 directory: `~/.local/share/claude-swap` on Linux (`$XDG_DATA_HOME/claude-swap`
@@ -73,6 +98,22 @@ back on the port (see [When the holder and its daemon die
 together](#when-the-holder-and-its-daemon-die-together)). A pid still listed
 afterwards is a daemon running without a holder; `kill` it.
 
+**Removing it completely.** `--clear` undoes the pin; these also remove what
+you and the pin added around it:
+
+1. Take out the `cswap pin --ensure` line (the rc `claude()` function, a
+   launcher or `CLAUDE_CODE_PROCESS_WRAPPER` script), and the `~/.zshenv` block
+   or `BASH_ENV` file from [Trust](#trust) if you added one.
+2. Run `cswap pin --clear`. With `CLAUDE_CONFIG_DIR` set there are two
+   configs, `~/.claude.json` and `$CLAUDE_CONFIG_DIR/.claude.json`, each with
+   its own receipt; `--clear` clears both when `CLAUDE_CONFIG_DIR` is exported
+   in its own environment, and only `~/.claude.json` from a shell without it.
+3. Stop the proxy as above, once the last pinned session has closed.
+4. Delete `ca-trust.d/cswap-pin.pem` under `~/.claude` (and under
+   `$CLAUDE_CONFIG_DIR`) if it is there, and `<data>/pin-proxy/`. The pin's CA
+   is a full CA (`CA:TRUE`, no name constraints) and its private key stays in
+   `pin-proxy/ca.key` until you delete it.
+
 **Back to upstream claude-swap.** Run `cswap pin --clear` first, while this
 build is still installed: upstream has no `cswap pin` and nothing that removes
 a wiring. Then reinstall from PyPI, naming the release you want:
@@ -85,6 +126,8 @@ uv tool install --force --python 3.12 claude-swap==<version>    # e.g. 0.26.0
 
 - **macOS or Linux.** The pin needs POSIX file locks and FIFOs; on Windows
   `cswap pin` refuses.
+- **Not root, unless inside a container.** As root outside one, `cswap pin`
+  refuses to run, and `cswap pin --ensure` exits 0 having done nothing.
 - **[uv](https://docs.astral.sh/uv/)**, and **git** for uv to fetch the host
   from GitHub. `pipx` should take the same arguments, but this was verified
   with `uv` only.
@@ -127,9 +170,12 @@ No cloud account pinned
 ```
 
 - **A commit, not a branch.** The fork's `integration` branch is force-pushed,
-  so a branch name installs whatever it points at that day. When you upgrade,
-  change the commit and the `cswap-pin` version together; the pair above is
-  the one this README was checked against.
+  so a branch name installs whatever it points at that day. The commit above
+  is tagged `pin-install-85764e7`, so it stays fetchable after `integration`
+  is force-pushed; the URL keeps the full SHA because a tag can move. When you
+  upgrade, change the commit and the `cswap-pin` version together; the pair
+  above is the one this README was checked against, and the next verified
+  pair is announced here.
 - **`--python 3.12`**, because claude-swap needs 3.12 or newer and without the
   flag uv takes whichever interpreter it finds first. Under a narrowed `PATH`
   that was a 3.11, and the install failed. With the flag uv uses a 3.12 it
@@ -159,6 +205,23 @@ it came from to PyPI, so a later upgrade comes from there. `cswap upgrade` on
 its own is safe: it runs `uv tool upgrade claude-swap`, which keeps the pinned
 commit (measured: `Nothing to upgrade`).
 
+**Do not run a plain `uv tool install claude-swap` over it either**, the line
+a bootstrap script usually carries. Measured with uv 0.12.18 over the install
+line above: it exits 0, keeps the fork's code (`cswap 0.27.0b1`), rewrites the
+tool's record to PyPI's `claude-swap`, and uninstalls `cswap-pin` and
+`cryptography` from the tool. The pin can then no longer respawn its daemon,
+and the first `cswap pin --ensure` that finds the daemon dead removes the
+wiring. Re-install only with the `git+...@<sha>` line, and make a bootstrap
+script install claude-swap only when it is missing:
+
+```sh
+[ -d "$(uv --color never tool dir)/claude-swap" ] || uv tool install -q claude-swap
+```
+
+`--color never` because uv colours even piped output when `FORCE_COLOR` is set,
+and Claude Code sessions export it; the path then carries escape codes and the
+test never matches.
+
 **On a machine running claude-swap from a checkout, keep it editable.** Any
 `uv tool install --force` replaces the tool, extras included, so pointing one
 at an editable install swaps your checkout out, and a line without the `pin`
@@ -167,7 +230,7 @@ survives (its code is in memory) but every successor it spawns dies with
 `ModuleNotFoundError`, which is invisible until something tries to restart it:
 
 ```bash
-uv tool install --force --editable '.[pin]'     # from the checkout
+uv tool install --force --python 3.12 --editable '.[pin]'     # from the checkout
 ```
 
 ### Upgrading a machine that is already serving
@@ -236,20 +299,30 @@ Ports below are examples (8118 is privoxy's default):
 | your chain | export before `cswap pin N` | `upstream.json` then holds | when a hop dies |
 | :-- | :-- | :-- | :-- |
 | none: direct to the internet | nothing (`unset HTTPS_PROXY https_proxy`) | an empty `proxy` | nothing to fall through; the pin dials direct |
-| privoxy, or any plain forwarding proxy | `HTTPS_PROXY=http://127.0.0.1:8118` | `proxy`; no `next`, since privoxy answers `/health` with a 400 | `503` until it is back |
-| a local intercepting proxy (cache-fix / CCF style) that dials out itself | `HTTPS_PROXY=http://127.0.0.1:<its port>` and `NODE_EXTRA_CA_CERTS=<its CA>` | `proxy`, `ca` | `503` until it is back |
-| that intercepting proxy in front of privoxy | the same two, for the intercepting proxy: the first hop, not privoxy | `proxy`, `ca`, and `next` (privoxy) once the intercepting proxy's `/health` names it | falls through to privoxy; `503` only while both are down |
+| privoxy, or any plain forwarding proxy | `HTTPS_PROXY=http://127.0.0.1:8118` | `proxy`; no `next`, since privoxy answers `/health` with a 400 | `503` until it is back; set `CSWAP_PIN_ALLOW_DIRECT=1` only when direct internet works, to dial direct instead |
+| a local TLS-intercepting proxy that dials out itself | `HTTPS_PROXY=http://127.0.0.1:<its port>` and `NODE_EXTRA_CA_CERTS=<its CA>` | `proxy`, `ca` | `503` until it is back; set `CSWAP_PIN_ALLOW_DIRECT=1` only when direct internet works, to dial direct instead |
+| a local intercepting proxy that reports its upstream on `/health`, in front of privoxy | the same two, for the intercepting proxy: the first hop, not privoxy | `proxy`, `ca`, and `next` (privoxy) once the intercepting proxy's `/health` names it | falls through to privoxy; `503` only while both are down |
 | any other TLS-intercepting hop: a corporate inspector, a remote proxy | `HTTPS_PROXY=<its URL>`, and `NODE_EXTRA_CA_CERTS=<its root CA>` unless your system trust store already has it | `proxy`, `ca`; no `next`, because only loopback hops are asked | `503` until it is back |
+
+**`next` is learned only from the first hop's `/health`.** It is recorded
+only when that hop's `GET /health` returns JSON naming its `https_proxy`. A
+generic intercepting proxy has no such endpoint, so in front of privoxy it
+leaves no `next`, and a dead first hop gives `503` instead of falling through.
+Then set `next` in `upstream.json` by hand (e.g.
+`"next": "http://127.0.0.1:8118"`); it survives re-pins, because a pin that
+learns no `next` keeps the recorded one.
 
 **A dead hop is never bypassed silently.** The pin tries `proxy`, then `next`,
 for 2.5 s, then answers Claude Code `503 Service Unavailable` with
 `Retry-After: 2`, and Claude Code retries. While any hop is recorded it does
-not fall back to a direct dial: on a network that needs a proxy the direct
-route answers 403, and Claude Code shows that as "Please run /login".
-`CSWAP_PIN_ALLOW_DIRECT=1` in the daemon's environment restores the direct
-fallback (see [The port](#the-port)). With no hop recorded at all, direct is
-simply the route. [Falling through a dead hop](#falling-through-a-dead-hop)
-says why `next` is asked while the first hop still answers.
+not fall back to a direct dial: where only the proxy may reach the internet, a
+direct dial fails, and on the network this was measured on it answered 403,
+which Claude Code shows as "Please run /login". If a direct dial from your
+machine does reach the internet, `CSWAP_PIN_ALLOW_DIRECT=1` in the daemon's
+environment restores the direct fallback (see [The port](#the-port)). With no
+hop recorded at all, direct is simply the route. [Falling through a dead
+hop](#falling-through-a-dead-hop) says why `next` is asked while the first hop
+still answers.
 
 **Which certificates the pin itself checks.** Through a loopback hop the pin
 does not verify `api.anthropic.com`'s certificate: it trusts the local hop, the
@@ -302,6 +375,12 @@ removes the wiring so the session starts unpinned instead of dialling a port
 nothing answers. It prints nothing, always exits 0, and does nothing when no
 pin is set.
 
+**The trigger is every `claude` launch**, in whatever every launch passes
+through: a shell function for hand launches, and the script
+`CLAUDE_CODE_PROCESS_WRAPPER` names, so the daemon and background sessions
+Claude Code spawns itself are covered too. That is what the maintainers' own
+hosts run.
+
 **Run it in the background, never in front of the launch.** It returns in
 about 70 ms when nothing is pinned (measured; that is interpreter start-up) and
 is cheap on a healthy pin (a state read and one loopback connect). With a dead
@@ -338,9 +417,20 @@ exec "$@"        # or: exec claude ...
 ```
 
 A daemon that `--ensure` starts inherits this launcher's environment. It needs
-`cswap` on `PATH` (`uv tool dir --bin` prints where uv put it) and, if your
-chain needs them, the same `NODE_EXTRA_CA_CERTS` and `CSWAP_PIN_ALLOW_DIRECT`
-you pin with.
+`cswap` on the launcher's `PATH` (`uv tool dir --bin` prints where uv put it)
+and, if your chain needs them, the same `NODE_EXTRA_CA_CERTS` and
+`CSWAP_PIN_ALLOW_DIRECT` you pin with.
+
+**Not from a systemd service's `ExecStart`.** A daemon that `--ensure` starts
+there joins that unit's cgroup, and with the default `KillMode=control-group`
+it dies when the unit stops, freeing the port every pinned session is wired
+to. Run the line from a launcher that is not a service's `ExecStart`, and
+after the first pin check where the holder runs:
+
+```bash
+pgrep -f '[c]swap_pin.proxy --hold-port'    # the holder's pid
+cat /proc/<pid>/cgroup                    # a last component ending in .service is that unit's
+```
 
 ### A settings `env` overrides the pin
 
@@ -366,7 +456,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
 | `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped |
 | `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO | left in place |
-| `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for launchers that build one trust bundle from that directory | left in place |
+| `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
 | `~/.claude/jobs/<id>/state.json`, and a transcript's `bridge-session` record | the account in the bridge pointer of a session that is not running, restamped (see [Keeping a session's bridge when the account rotates](#keeping-a-sessions-bridge-when-the-account-rotates)) | not touched |
 
 ## The problem
@@ -609,11 +699,13 @@ daemon and a respawner fighting you is worse than a dead port. `cswap pin
 --heal` and a launch still repair, because those are you asking.
 
 `CSWAP_PIN_ALLOW_DIRECT=1` restores the old fall-through to a DIRECT dial when
-every configured hop is unusable. Off by default since 0.1.251: on the machines
-that configure a chain, the direct route is the corporate TLS-inspecting proxy,
+every configured hop is unusable. Off by default since 0.1.251: on the network
+it was measured on, the direct route is a corporate TLS-inspecting proxy,
 which answers 403 "Access restricted by network policy" to API and Remote
 Control requests, and Claude Code renders that as "Please run /login" (measured
-2026-09-07, 49 direct dials in 22 minutes, one fleet-wide login wave). Without
+2026-09-07, 49 direct dials in 22 minutes, one fleet-wide login wave). That is
+one network's behaviour: set the opt-in only when a direct dial from your
+machine reaches the internet. Without
 the opt-in the pin answers `503 Service Unavailable` with `Retry-After: 2` and
 logs `egress REFUSED` once per outage; the client retries, nothing is asked to
 log in. A host with no chain configured is unaffected and dials direct as
