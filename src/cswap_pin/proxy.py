@@ -9078,10 +9078,20 @@ def ensure_wired_to(port: int, certdir: Path) -> bool:
     under the same ``$HOME`` rewired the shared ``.claude.json`` away from
     the live pin four times in one day. A wiring naming a DEAD port (or
     nothing) is still corrected, exactly as before.
+
+    ONLY WHILE A PIN RECORD EXISTS. `cswap pin --clear` drops the record and
+    the wiring and leaves this daemon serving the sessions it holds; a
+    restart (a holder's respawn, a self-upgrade) that rewired here routed
+    new sessions back through the proxy the owner had turned off.
     """
     try:
         wired = _wired_port()
         if wired == port:
+            return False
+        if not load_pin(Path(certdir).parent):
+            _log_lifecycle(
+                "not wiring .claude.json to this port: no pin record, so this "
+                "daemon only serves the sessions it already holds")
             return False
         if wired is not None and _wired_names_a_live_pin(wired):
             _log_lifecycle(
