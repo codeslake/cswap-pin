@@ -2376,20 +2376,25 @@ def _wire_global_config_locked(
     # these REPLACES a trust store rather than adding to it, so leaving one
     # behind leaves a machine one MDM change away from trusting nothing.
     #
-    # Unconditional, and deliberately not restored from `saved` below: if the
-    # user had set one themselves we would rather hand it back to them
-    # explicitly than resurrect it here, and no machine of ours ever had one
-    # that we did not write.
-    for banned in _REPLACE_CLASS_CA_VARS:
-        env.pop(banned, None)
-        saved.pop(banned, None)
+    # THE RECEIPT'S OWN COPIES COME BACK (T1612). A wiring removes the user's
+    # values too, so it records them in `saved` (below), and the restore
+    # just after this puts them back: an unwire hands them over, a re-wire
+    # removes and records them again. What an unwire drops is only a value
+    # the receipt never recorded, and only inside a wiring of ours: a config
+    # we never wired is not ours to heal.
+    strays = {k: env.pop(k) for k in _REPLACE_CLASS_CA_VARS if k in env}
     for key, value in saved.items():
         env[key] = value
 
     ledger = {_WIRE_MARK: [], f"{_WIRE_MARK}Saved": {},
               "writtenBy": _own_version()}
     if port is None or ca_path is None:
-        pass  # `ledger` above already records "not wired"
+        # `ledger` above already records "not wired". Not one naming a file
+        # in our own cert dir, by the same rule as the wiring below.
+        if not ours:
+            own = Path(require("paths").get_backup_root()) / "pin-proxy"
+            env.update({k: v for k, v in strays.items()
+                        if Path(v).parent != own})
     else:
         # Bare only once `proxy.json` says the serving daemon retired the
         # gate — else the old userinfo form, rebuilt from the gated holder's
@@ -2437,6 +2442,14 @@ def _wire_global_config_locked(
         # is left for a replace-class variable to do. Remember what we are
         # about to displace, so unwiring is lossless.
         displaced = {k: env[k] for k in wanted if k in env}
+        # THE REPLACE-CLASS VALUES THIS WIRING REMOVES, so the unwire can hand
+        # them back. Not one naming a file in our own cert dir: that is an
+        # older cswap-pin's merged bundle whose receipt was lost, and handing
+        # it back would narrow python's trust to that file with no pin.
+        for key in _REPLACE_CLASS_CA_VARS:
+            value = env.pop(key, None) or strays.get(key)
+            if value and Path(value).parent != Path(ca_path).parent:
+                displaced[key] = value
         env.update(wanted)
         ledger = {_WIRE_MARK: list(wanted),
                   f"{_WIRE_MARK}Saved": displaced,
@@ -2682,7 +2695,7 @@ def _as_chain(value) -> "_Chain | None":
     return value if isinstance(value, _Chain) else _Chain(*value)
 
 
-def _verifying_ctx(extra_ca: "Path | None" = None) -> ssl.SSLContext:
+def _verifying_ctx(*extra_ca: "Path | str | None") -> ssl.SSLContext:
     """A verifying TLS context that trusts what THIS machine trusts.
 
     System roots, plus any corporate root on ``NODE_EXTRA_CA_CERTS`` — which
@@ -2696,7 +2709,7 @@ def _verifying_ctx(extra_ca: "Path | None" = None) -> ssl.SSLContext:
     # Python 3.13+ VERIFY_X509_STRICT rejects a leaf with no Authority Key
     # Identifier; a corp MITM leaf may lack one. Chain-of-trust stays on.
     ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
-    for cafile in (extra_ca, os.environ.get("NODE_EXTRA_CA_CERTS")):
+    for cafile in (*extra_ca, os.environ.get("NODE_EXTRA_CA_CERTS")):
         if not cafile:
             continue
         try:
@@ -5598,6 +5611,91 @@ def titles_to_restore(
     return out
 
 
+# THE WHOLE PIN-TIME CHECK, dial to handshake: each read alone waits up to
+# `_HOP_REPLY_BUDGET_S`, so a hop that trickles a byte under that held
+# `cswap pin` (and the TUI's repair on mount) for as long as it trickled.
+# Above dial + reply (8 s), so it never cuts a hop the daemon would use.
+_HOP_PROBE_BUDGET_S = 10.0
+# A CONNECT reply is a status line and a few headers.
+_HOP_PROBE_HEAD_CAP = 16384
+
+
+def hop_trust_problem(certdir: Path) -> "str | None":
+    """One line for the operator when the recorded hop will fail the daemon's
+    TLS or did not answer; None when it verifies, or when nothing is recorded.
+
+    ONE CONNECT to the API host through the hop, with the trust the daemon
+    builds for that hop: `_dial_chain` for the hop's own TLS, then
+    `_upstream_ctx`'s rule for the origin leg -- verified through a remote
+    hop, CERT_NONE through a loopback one, so a loopback hop has no leg here
+    that can fail. Without this, a hop that re-signs with a CA nobody
+    recorded is found only by every pinned request failing, silently.
+
+    Never raises: a pin must not fail on its own diagnostic.
+    """
+    hop = read_upstream_hint(certdir)
+    if hop is None:
+        return None
+    ca = read_upstream_ca(certdir)
+    where = f"{hop.host}:{hop.port}"
+    target = f"{UPSTREAM_HOST}:443"
+    budget = _HOP_PROBE_BUDGET_S
+    deadline = time.monotonic() + budget
+
+    def left() -> float:
+        rest = deadline - time.monotonic()
+        if rest <= 0:
+            raise TimeoutError(f"no complete answer within {budget:g}s")
+        return rest
+
+    raw = None
+    try:
+        raw = _dial_chain(hop, extra_ca=ca)
+        raw.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                    f"{hop.connect_headers()}\r\n".encode("latin1"))
+        # The reply head, read as `_read_line` does (LF ends a line, a CR
+        # before it is dropped) but under the one deadline and the cap.
+        head = bytearray()
+        while not (head.endswith(b"\n\n") or head.endswith(b"\n\r\n")):
+            if len(head) >= _HOP_PROBE_HEAD_CAP:
+                raise ValueError(f"CONNECT reply head over "
+                                 f"{_HOP_PROBE_HEAD_CAP} bytes")
+            raw.settimeout(left())
+            b = raw.recv(1)
+            if not b:
+                break
+            head += b
+        status = (head.split(b"\n", 1)[0].rstrip(b"\r").decode("latin1")
+                  if head else None)
+        if not _connect_ok(status):
+            return (f"the egress proxy {where} did not tunnel {target} at pin "
+                    f"time (CONNECT -> {status!r}); pinned requests need it to")
+        if hop.host not in _LOOPBACK:
+            # A plain socket's handshake honours this as one deadline.
+            # ponytail: through an `https://` hop `_TLSInTLS` applies it per
+            # read, not in total; bound its `_drive` loop if a hop trickles
+            # the inner handshake.
+            raw.settimeout(left())
+            _wrap_upstream(_verifying_ctx(Path(certdir) / "ca.pem", ca),
+                           raw, UPSTREAM_HOST).close()
+        return None
+    except ssl.SSLCertVerificationError as exc:
+        return (f"PINNED REQUESTS WILL FAIL: the egress proxy {where} "
+                f"intercepts TLS with a CA the pin does not trust "
+                f"({getattr(exc, 'verify_message', None) or exc}). Export "
+                "that proxy's CA in NODE_EXTRA_CA_CERTS and re-run "
+                "`cswap pin <n>`")
+    except Exception as exc:  # noqa: BLE001 -- reported, never fatal
+        return (f"could not check the egress proxy {where} at pin time "
+                f"({exc!r}); the pin is set and uses it once it answers")
+    finally:
+        if raw is not None:
+            try:
+                raw.close()
+            except OSError:
+                pass
+
+
 def apply_pin(switcher, email: str | None, org_uuid: str | None,
               identity: dict | None = None) -> bool:
     """Set (or clear, with ``email=None``) the pin AND bring the world in line.
@@ -5817,7 +5915,18 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                                "account until the next switch")
     except Exception:  # noqa: BLE001 — the pin is already live
         pass
-    return ensure_proxy(switcher) is not None
+    if ensure_proxy(switcher) is None:
+        return False
+    # PRINTED, NOT ENFORCED. The proxy IS serving, which is what this returns,
+    # and False here makes `set_pin` roll the pin back and say "no proxy is
+    # running". A launcher's CA also reaches upstream.json only at its first
+    # launch (see `write_upstream_hint`), so a plain-shell pin can fail this
+    # and still come right. Here and not in `ensure_proxy`: that runs before
+    # every launch, whose budget has no room for a network round trip.
+    problem = hop_trust_problem(certdir)
+    if problem:
+        _log_lifecycle(problem)
+    return True
 
 
 
@@ -19647,8 +19756,13 @@ class PinProxy:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             return ctx
-        # Our own CA too, so a test's fake upstream verifies.
-        return _verifying_ctx(self._bundle.ca_path)
+        # Our own CA too, so a test's fake upstream verifies. AND THE HOP'S
+        # RECORDED CA, re-read per connection as `_dial_chain` already does:
+        # a remote hop that intercepts re-signs THIS leg with it. The daemon's
+        # env is its spawner's, so without this the fix `hop_trust_problem`
+        # prints (export the CA, re-run `cswap pin`) reaches upstream.json
+        # and never the daemon `ensure_proxy` then reuses.
+        return _verifying_ctx(self._bundle.ca_path, self._chain_ca())
 
     def _chain_ca(self) -> "Path | None":
         """The egress proxy's own CA, as recorded beside the proxy address.
