@@ -19490,6 +19490,8 @@ class TestTheDaemonWatchesItsOwnCode:
         import claude_swap.paths as paths
         from cswap_pin import proxy as pin_proxy
 
+        # A PIN RECORD: a daemon wires only while one exists.
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org")
         certdir, cfg, _ = self._live_daemon(tmp_path, monkeypatch, paths)
         try:
             st = pin_proxy.read_daemon_state(certdir)
@@ -19557,6 +19559,8 @@ class TestTheDaemonWatchesItsOwnCode:
         hold = socket.socket()
         hold.bind(("127.0.0.1", 0))
         dead = hold.getsockname()[1]
+        # A PIN RECORD: a daemon wires only while one exists.
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org")
         try:
             certdir, cfg, _ = self._live_daemon(
                 tmp_path, monkeypatch, paths, stale_port=dead)
@@ -19588,6 +19592,8 @@ class TestTheDaemonWatchesItsOwnCode:
         import claude_swap.paths as paths
         from cswap_pin import proxy as pin_proxy
 
+        # A PIN RECORD: a daemon wires only while one exists.
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org")
         certdir, cfg, _ = self._live_daemon(
             tmp_path, monkeypatch, paths,
             cfg_text=json.dumps({"env": {"CSWAP_PIN_PORT": "41111"}}))
@@ -30848,24 +30854,144 @@ class TestTheServingDaemonOwnsTheWiring:
     unpinned until a heal was run by hand.
     """
 
-    def _wire(self, monkeypatch, wired, port=36301):
+    def _wire(self, tmp_path, monkeypatch, wired, port=36301, pinned=True):
+        """`ensure_wired_to` on a certdir under `tmp_path`, the backup root.
+
+        THE REAL RECORD, through the real writer: the daemon reads the pin
+        with `load_pin(certdir.parent)`, so a stubbed reader would test the
+        stub. `pinned=False` leaves whatever the caller wrote there.
+        """
         import cswap_pin.proxy as p
+        if pinned:
+            p.save_pin(tmp_path, "pin@example.com", "org")
         wrote = []
         monkeypatch.setattr(p, "_wired_port", lambda: wired)
         monkeypatch.setattr(p, "wire_global_config",
                             lambda po, ca, **k: wrote.append(po) or True)
         monkeypatch.setattr(p, "_log_lifecycle", lambda _m: None)
-        rc = p.ensure_wired_to(port, "/nonexistent")
+        rc = p.ensure_wired_to(port, tmp_path / "pin-proxy")
         return rc, wrote
 
-    def test_a_config_naming_nothing_is_rewired(self, monkeypatch):
+    def test_a_config_naming_nothing_is_rewired(self, tmp_path, monkeypatch):
         """THE BUG. `unwire_if_dead` leaves None behind."""
-        rc, wrote = self._wire(monkeypatch, wired=None)
+        rc, wrote = self._wire(tmp_path, monkeypatch, wired=None)
         assert rc is True and wrote == [36301], (rc, wrote)
 
-    def test_a_config_naming_ANOTHER_port_is_rewired(self, monkeypatch):
-        rc, wrote = self._wire(monkeypatch, wired=41111)
+    def test_a_config_naming_ANOTHER_port_is_rewired(self, tmp_path, monkeypatch):
+        rc, wrote = self._wire(tmp_path, monkeypatch, wired=41111)
         assert rc is True and wrote == [36301], (rc, wrote)
+
+    def test_a_CLEARED_pin_is_not_rewired(self, tmp_path, monkeypatch):
+        """`cswap pin --clear` drops the record and the wiring, and leaves the
+        daemon serving the sessions it already holds. Any restart of that
+        daemon (a holder's crash respawn, a self-upgrade) saw a config naming
+        nothing and wired it again, so NEW sessions went through the unpinned
+        proxy and `--clear` was not a rollback. The clear here is the real
+        one: file present, pin keys stripped."""
+        import cswap_pin.proxy as p
+        p.save_pin(tmp_path, "pin@example.com", "org")
+        p.save_pin(tmp_path, None, None)
+        rc, wrote = self._wire(tmp_path, monkeypatch, wired=None, pinned=False)
+        assert rc is False and wrote == [], (
+            f"a daemon rewired .claude.json with no pin record: "
+            f"rc={rc} wrote={wrote}")
+
+    def _successor_wiring(self, tmp_path, monkeypatch, pinned):
+        """(CSWAP_PIN_PORT the successor left in `.claude.json`, its port).
+
+        A REAL handed-down successor, because that is what both a
+        self-upgrade and a holder's handover start: `_spawn_daemon` with the
+        predecessor's listening socket, then `daemon_main` in a new process.
+        """
+        import subprocess as _sp
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as p
+
+        p.save_pin(tmp_path, "pin@example.com", "org")
+        if not pinned:
+            p.save_pin(tmp_path, None, None)
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        p.ensure_ca(certdir, "api.anthropic.com")
+        # THE CHILD'S CONFIG. conftest patches `get_global_config_path` in
+        # this process only; the child resolves it from CLAUDE_CONFIG_DIR.
+        # PRESENT, as Claude Code always leaves it: the wiring never creates
+        # an absent config, so an absent one could not tell wired from not.
+        cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / ".claude.json"
+        cfg.write_text("{}", encoding="utf-8")
+        log = certdir / "daemon.log"
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(5)
+        port = lsn.getsockname()[1]
+        monkeypatch.setattr(p, "_SPAWN_WAIT_S", 5.0)
+        children = []
+        real_popen = _sp.Popen
+
+        def _tracked(*a, **k):
+            proc = real_popen(*a, **k)
+            children.append(proc)
+            return proc
+
+        try:
+            _sp.Popen = _tracked
+            try:
+                spawned = p._spawn_daemon("1", "pin@example.com", certdir,
+                                          listen_fd=lsn.fileno())
+            finally:
+                _sp.Popen = real_popen
+            tail = lambda: log.read_text()[-800:] if log.exists() else "(no log)"
+            assert spawned == port, (
+                f"premise: the successor came up on {spawned}, not the handed "
+                f"down {port}; log:\n{tail()}")
+            # THE MARKER THAT `ensure_wired_to` ANSWERED, written after the
+            # config is: without it an unwired file proves only that the
+            # successor had not got there yet.
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                text = log.read_text() if log.exists() else ""
+                if "rewired .claude.json" in text or "no pin record" in text:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError(
+                    f"the successor never answered the wiring; log:\n{tail()}")
+            env = json.loads(cfg.read_text()).get("env") or {}
+            return env.get("CSWAP_PIN_PORT"), port
+        finally:
+            # PARENTS FIRST: a holder replaces a daemon that dies.
+            for proc in children:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:  # noqa: BLE001 — already gone, or too slow
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+            _reap_pin_processes(certdir)
+            lsn.close()
+
+    def test_a_handed_down_successor_of_a_CLEARED_pin_leaves_it_unwired(
+            self, tmp_path, monkeypatch):
+        """The self-upgrade handover after `pin --clear`: the old daemon is
+        still serving its sessions, the deploy starts a successor on the same
+        socket, and that successor must not route new sessions back through
+        the proxy the owner just turned off."""
+        wired, port = self._successor_wiring(tmp_path, monkeypatch,
+                                             pinned=False)
+        assert wired is None, (
+            f"a successor started with no pin record wired .claude.json to "
+            f"{wired} (serving {port})")
+
+    def test_CONTROL_a_handed_down_successor_of_a_SET_pin_wires(
+            self, tmp_path, monkeypatch):
+        """Without this the case above passes on a harness that never wires
+        anything."""
+        wired, port = self._successor_wiring(tmp_path, monkeypatch,
+                                             pinned=True)
+        assert wired == str(port), (wired, port)
 
     def test_a_config_naming_a_LIVE_PINS_port_is_left_alone(
             self, tmp_path, monkeypatch):
@@ -30888,8 +31014,11 @@ class TestTheServingDaemonOwnsTheWiring:
         monkeypatch.setattr(p, "wire_global_config",
                             lambda po, ca, **k: wrote.append(po) or True)
         monkeypatch.setattr(p, "_log_lifecycle", lambda _m: None)
+        # A RECORD, or this passes on the no-record refusal instead of on the
+        # live-pin branch it exists for.
+        p.save_pin(tmp_path, "pin@example.com", "org")
         try:
-            rc = p.ensure_wired_to(36301, "/nonexistent")
+            rc = p.ensure_wired_to(36301, tmp_path / "pin-proxy")
         finally:
             live.stop(drain=0)
         assert rc is False and wrote == [], (
@@ -30897,25 +31026,30 @@ class TestTheServingDaemonOwnsTheWiring:
             f"that is not its own: rc={rc} wrote={wrote}"
         )
 
-    def test_CONTROL_a_correct_config_is_left_alone(self, monkeypatch):
+    def test_CONTROL_a_correct_config_is_left_alone(self, tmp_path, monkeypatch):
         """`.claude.json` is watched live by Claude Code. Rewriting it on every
         daemon start would be churn on a file whose changes it reacts to, so
         the no-op case must write NOTHING, not write the same value."""
-        rc, wrote = self._wire(monkeypatch, wired=36301)
+        rc, wrote = self._wire(tmp_path, monkeypatch, wired=36301)
         assert rc is False and wrote == [], (rc, wrote)
 
-    def test_CONTROL_a_failure_to_wire_does_not_raise(self, monkeypatch):
+    def test_CONTROL_a_failure_to_wire_does_not_raise(self, tmp_path, monkeypatch):
         """A daemon that is serving must not die because the config write
         failed; the next launch or heal repairs it."""
         import cswap_pin.proxy as p
 
+        tried = []
+
         def _boom(*a, **k):
+            tried.append(a)
             raise OSError("read-only config home")
 
         monkeypatch.setattr(p, "_wired_port", lambda: None)
         monkeypatch.setattr(p, "wire_global_config", _boom)
         monkeypatch.setattr(p, "_log_lifecycle", lambda _m: None)
-        assert p.ensure_wired_to(36301, "/nonexistent") is False
+        p.save_pin(tmp_path, "pin@example.com", "org")
+        assert p.ensure_wired_to(36301, tmp_path / "pin-proxy") is False
+        assert tried, "the write was never attempted, so nothing was tested"
 
 
 
