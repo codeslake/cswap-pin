@@ -11,7 +11,7 @@ account swap.
    ```bash
    uv tool install --force --python 3.12 \
      "claude-swap[pin] @ git+https://github.com/codeslake/claude-swap@85764e77dc63c02f35caffdf64ddcc5cc61ea0dd" \
-     --with cswap-pin==0.1.306
+     --with cswap-pin==0.1.311
    ```
 
 2. `cswap pin N`, N being an account from `cswap list`. If you reach the
@@ -172,7 +172,7 @@ carries the extra, at a fixed commit, with this package beside it:
 ```bash
 uv tool install --force --python 3.12 \
   "claude-swap[pin] @ git+https://github.com/codeslake/claude-swap@85764e77dc63c02f35caffdf64ddcc5cc61ea0dd" \
-  --with cswap-pin==0.1.306
+  --with cswap-pin==0.1.311
 ```
 
 ```console
