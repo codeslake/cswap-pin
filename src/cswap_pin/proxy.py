@@ -5762,10 +5762,12 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     notice and repair, not this call.
 
     A CLEAR IS LOCAL WHEN `settings.json` IS A SYMLINK (a file shared across
-    machines) and the host can name a marker (`pin_cleared_path`): the shared
-    record is left alone and `<data>/pin-cleared` is written instead, which
-    `load_pin` reads as "nothing pinned here" and the set arm removes.
-    ``everywhere=True`` drops the shared record, as a clear always did.
+    machines) holding a pin and the host can name a marker
+    (`pin_cleared_path`): the shared record is left alone and
+    `<data>/pin-cleared` is written instead, which `load_pin` reads as
+    "nothing pinned here" and the set arm removes. ``everywhere=True`` drops
+    the shared record, as a clear always did: a ROLLBACK of a failed pin
+    passes it, since it undoes this package's own write to that record.
     """
     certdir = switcher.backup_dir / "pin-proxy"
     if not email:
@@ -5861,8 +5863,11 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
         # one record for every machine that links it and the host writes
         # THROUGH the link, so dropping the pair here, committed, unpins
         # them all. A host with no marker keeps today's behaviour exactly.
-        local = (marker is not None and not everywhere and require(
-            "settings").settings_path(switcher.backup_dir).is_symlink())
+        # AND ONLY OVER A RECORD: with none, a marker keeps nothing and makes
+        # this machine ignore the pin another machine records next.
+        local = (marker is not None and prior is not None and not everywhere
+                 and require("settings").settings_path(
+                     switcher.backup_dir).is_symlink())
         if local:
             # IN THE SAME SLOT save_pin HAD, LAST: the durable half of a
             # clear (82f00f5). A kill before this leaves the record
@@ -6382,8 +6387,15 @@ def _rollback_tail(rolled: bool, before, email: str) -> str:
     return "the previous pin is unchanged" if before else "nothing is pinned"
 
 
-def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
+def _restore_pin(switcher, before: tuple[str, str] | None,
+                 was_cleared: bool = False) -> bool:
     """Put the record back the way ``before`` had it. True when it IS back.
+
+    ``before`` is the MARKER-BLIND record and ``was_cleared`` whether this
+    machine's clear marker stood: a rollback undoes this package's own write to
+    the shared record, so it restores that record exactly and then this
+    machine's marker, and never goes through a local clear (which would leave
+    the failed account in the file every other machine reads).
 
     The verdict is MEASURED, never inferred from the restore call: when
     ``apply_pin`` itself is what raised, the record may never have been
@@ -6399,15 +6411,28 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
     # is the job, and a raising lookup sharing the guard below skipped
     # `apply_pin` entirely.
     _back = None
+    # A host put back to cleared names the live login, like one put back to
+    # nothing: it is not pinned to anything.
+    recleared = bool(before) and was_cleared
+    to_login = not before or was_cleared
     # Best-effort whenever there IS a pin to go back to; see below.
-    unspliced = bool(before)
-    if not before:
+    unspliced = not to_login
+    if to_login:
         try:
             _back = host._live_login_for_config(switcher)
         except Exception:  # noqa: BLE001 -- a name must not cost the rollback
             _back = None
     try:
-        apply_pin(switcher, *(before or (None, None)))
+        try:
+            apply_pin(switcher, *(before or (None, None)), everywhere=True)
+        except Exception:
+            # The record is written before the proxy starts, and a host about
+            # to be cleared again has no use for a proxy: the clear below
+            # supersedes it.
+            if not recleared:
+                raise
+        if recleared:
+            apply_pin(switcher, None, None)
         # And the config, which the record alone does not put back:
         # `apply_pin` splices `~/.claude.json` BEFORE it starts the proxy, so
         # a pin that failed to start has already written its account there.
@@ -6415,7 +6440,7 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
         # live login, exactly as `clear_pin` decides it -- without the second
         # case a failed FIRST pin left its own account named in a config
         # nobody is logged in as.
-        if before:
+        if not to_login:
             # Safe to ask now: `apply_pin` has just RESTORED this record, so
             # the lookup sees the state it is naming. The None case cannot,
             # which is why it is resolved above.
@@ -6444,7 +6469,8 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
         )
     except Exception:  # noqa: BLE001 -- the re-read below is the verdict
         pass
-    return unspliced and host._pinned_email_now(switcher) == before
+    return (unspliced and _load_pin_record(switcher.backup_dir) == before
+            and _cleared_here(switcher.backup_dir) == recleared)
 
 
 def _config_already_names(identity: dict | None) -> bool:
@@ -6540,7 +6566,10 @@ def set_pin(
             f"{email} is an API-key account, which the cloud pin cannot "
             "use: Remote Control and Artifacts need an OAuth bearer"
         )
-    before = host._pinned_email_now(switcher)
+    # THE RECORD AND THE MARKER, NOT THE HOST'S ANSWER: its reader reads None
+    # under this machine's clear marker, which is not what the file holds.
+    before = _load_pin_record(switcher.backup_dir)
+    was_cleared = _cleared_here(switcher.backup_dir)
     try:
         # Hand over the identity, do not apply it here. Once a pin is set the
         # live config must name it (`oauthAccount` is what Claude Code reads
@@ -6553,7 +6582,7 @@ def set_pin(
             switcher, email, org_uuid,
             identity=host.identity_for_config(switcher, email=email, num=num))
     except Exception as exc:  # noqa: BLE001 -- a traceback tells a user nothing
-        rolled = _restore_pin(switcher, before)
+        rolled = _restore_pin(switcher, before, was_cleared)
         return False, (
             f"Could not pin the cloud account: {host._safe(exc)}. "
             + _rollback_tail(rolled, before, email)
@@ -6565,7 +6594,7 @@ def set_pin(
         # pinned yet" and exited 1 while `cswap pin` then printed the address
         # and exited 0, with the ○ cloud badge lit. Roll back to whatever was
         # pinned before, exactly as a raise does.
-        rolled = _restore_pin(switcher, before)
+        rolled = _restore_pin(switcher, before, was_cleared)
         return False, (
             f"Could not pin the cloud account to {email}: no proxy is running, "
             "so nothing is pinned yet. " + _rollback_tail(rolled, before, email)

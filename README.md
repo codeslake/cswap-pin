@@ -53,8 +53,11 @@ record in it belongs to all of them, so `--clear` unpins THIS machine only. It
 unwires `.claude.json`, leaves the shared record alone and writes
 `<data>/pin-cleared`; the other machines keep their pin, and so does the shared
 file you commit. `cswap pin <account>` removes `pin-cleared` and pins this
-machine again. `cswap pin --clear --everywhere` drops the shared record, for
-every machine that links it. This needs a claude-swap that has the matching
+machine again. With no pin recorded there is nothing to keep, so `--clear`
+writes no `pin-cleared` and a pin recorded later from another machine reaches
+this one. `cswap pin --clear --everywhere` drops the shared record, for
+every machine that links it. A `cswap pin <account>` that fails puts the shared
+record, and this machine's `pin-cleared`, back as they were. This needs a claude-swap that has the matching
 support; with an older one `--clear` drops the record from the shared file as
 before.
 
@@ -465,7 +468,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | `~/.claude.json` `oauthAccount` | the pinned account's identity, re-asserted by every `--ensure` | the account you are logged in as |
 | `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
 | `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
-| `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json`: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
+| `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json` that records a pin: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
 | `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO | left in place |
 | `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
 | `~/.claude/jobs/<id>/state.json`, and a transcript's `bridge-session` record | the account in the bridge pointer of a session that is not running, restamped (see [Keeping a session's bridge when the account rotates](#keeping-a-sessions-bridge-when-the-account-rotates)) | not touched |

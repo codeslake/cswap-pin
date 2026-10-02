@@ -31334,6 +31334,11 @@ class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
             monkeypatch.setattr(p.require("settings"), "pin_cleared_path",
                                 lambda root: root / "pin-cleared",
                                 raising=False)
+        else:
+            # A release that HAS the capability is installed in CI one day:
+            # the control must hold the host without it, not the host it ran on.
+            monkeypatch.delattr(p.require("settings"), "pin_cleared_path",
+                                raising=False)
         shared = tmp_path / "shared-settings.json"
         shared.write_text(json.dumps({"remoteControl": {
             "pinnedEmail": self._PAIR[0], "pinnedOrganizationUuid":
@@ -31354,6 +31359,9 @@ class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
 
             def resolve_account(self, identifier):
                 return ("2", "pin@example.com", "org-1")
+
+            def _account_kind(self, num):
+                return "oauth"
         return _Sw()
 
     def _wired(self, monkeypatch):
@@ -31404,6 +31412,10 @@ class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
 
         assert p.heal(a) is False
         assert cfg.read_bytes() == cfg_before, "heal rewired a cleared host"
+        # THE CONTROL, same fixture and same patches: the second host, which
+        # holds no marker, is brought back by the same call, so the False
+        # above is the marker's and not the fixture's.
+        assert p.heal(b) is True, "the second host did not pin on --ensure"
 
         # `ensure_wired_to` is the daemon-start half: a restart there must
         # not route new sessions back through the proxy either.
@@ -31432,6 +31444,112 @@ class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
         assert not (a / "pin-cleared").exists(), (
             "`cswap pin N` left this host marked as cleared")
         assert p.load_pin(a) == self._PAIR
+
+    def test_a_clear_with_nothing_recorded_writes_no_marker(
+            self, tmp_path, monkeypatch):
+        """A marker with no record keeps nothing, and silently makes this
+        machine ignore the pin another machine records next."""
+        import cswap_pin.proxy as p
+
+        shared, a, b = self._hosts(tmp_path, monkeypatch)
+        shared.write_text(json.dumps({"remoteControl": {"debugSlowMs": 1500}}))
+        self._wired(monkeypatch)
+
+        p.apply_pin(self._sw(a), None, None)
+
+        assert not (a / "pin-cleared").exists(), (
+            "a clear with no record wrote a marker")
+        shared.write_text(json.dumps({"remoteControl": {
+            "pinnedEmail": self._PAIR[0],
+            "pinnedOrganizationUuid": self._PAIR[1]}}))
+        assert p.load_pin(a) == self._PAIR, (
+            "a pin recorded from another machine is ignored here")
+
+    def _failed_pin_b(self, monkeypatch, a, how):
+        """`cswap pin B` on host A through `set_pin`, B's proxy failing the way
+        `ensure_proxy` does: AFTER the record and the wiring are written. The
+        failure outlasts the rollback, whose own `apply_pin` hits it too."""
+        import types
+
+        import cswap_pin.proxy as p
+
+        real = p.require
+        host = types.SimpleNamespace(
+            _safe=str, identity_for_config=lambda sw, email=None, num=None: None,
+            _slot_for=lambda sw, email, org: None,
+            _live_login_for_config=lambda sw: None,
+            _config_address=lambda oauth: oauth.get("emailAddress", ""))
+        monkeypatch.setattr(
+            p, "require", lambda n: host if n == "pin" else real(n))
+        cfg = real("paths").get_global_config_path()
+
+        def ensure(sw):
+            p.wire_global_config(9955, cfg.parent / "ca.pem")
+            if how == "raises":
+                raise RuntimeError("the proxy could not start")
+            return None
+
+        monkeypatch.setattr(p, "ensure_proxy", ensure)
+        return p.set_pin(self._sw(a), "b@example.com", "org-b", num="2")
+
+    _FAILS = pytest.mark.parametrize("how", ["returns-none", "raises"])
+
+    @_FAILS
+    def test_a_failed_pin_on_a_host_with_nothing_recorded_leaves_no_trace(
+            self, tmp_path, monkeypatch, how):
+        """The rollback undoes THIS package's write to the shared record. It
+        was a local clear, which wrote the marker and left B in the file every
+        other machine reads."""
+        shared, a, b = self._hosts(tmp_path, monkeypatch)
+        empty = {"remoteControl": {"debugSlowMs": 1500}}
+        shared.write_text(json.dumps(empty))
+        cfg = self._wired(monkeypatch)
+
+        ok, msg = self._failed_pin_b(monkeypatch, a, how)
+
+        assert not ok
+        assert json.loads(shared.read_text()) == empty, (
+            f"B was left in the shared file: {shared.read_text()}")
+        assert not (a / "pin-cleared").exists(), "the rollback wrote a marker"
+        assert "env" not in json.loads(cfg.read_text()), "left wired"
+        assert "check with" not in msg, msg
+
+    @_FAILS
+    def test_a_failed_pin_restores_the_record_the_host_had(
+            self, tmp_path, monkeypatch, how):
+        shared, a, b = self._hosts(tmp_path, monkeypatch)
+        recorded = json.loads(shared.read_text())
+        self._wired(monkeypatch)
+
+        ok, msg = self._failed_pin_b(monkeypatch, a, how)
+
+        assert not ok
+        assert json.loads(shared.read_text()) == recorded, shared.read_text()
+        assert not (a / "pin-cleared").exists()
+        assert "the previous pin is unchanged" in msg, msg
+
+    @_FAILS
+    def test_a_failed_pin_puts_a_cleared_host_back_to_cleared(
+            self, tmp_path, monkeypatch, how):
+        """Record A and this host's marker. The set arm lifts the marker and
+        wires the config; the rollback restores all three."""
+        import cswap_pin.proxy as p
+
+        shared, a, b, cfg, _before = self._cleared_on_a(tmp_path, monkeypatch)
+        recorded = json.loads(shared.read_text())
+        assert (a / "pin-cleared").exists() and "env" not in json.loads(
+            cfg.read_text()), "premise: not a cleared host"
+
+        ok, msg = self._failed_pin_b(monkeypatch, a, how)
+
+        assert not ok
+        assert json.loads(shared.read_text()) == recorded, (
+            f"the other machines' record changed: {shared.read_text()}")
+        assert (a / "pin-cleared").exists(), "this host is no longer cleared"
+        assert p.load_pin(a) is None
+        assert "env" not in json.loads(cfg.read_text()), (
+            "this host was left wired to a pin it had cleared")
+        assert "check with" not in msg, msg
 
     def test_clearing_everywhere_drops_the_shared_record_and_the_marker(
             self, tmp_path, monkeypatch):

@@ -101,7 +101,8 @@ def _sw(tmp_path, *, account=("2", "user2@example.com", None), kind="oauth"):
 
 def _apply_recording(sw, *, returns=True, raises=None, seen=None):
     """`apply_pin` as the package has it: the record is written FIRST."""
-    def apply_pin(switcher, email=None, org_uuid=None, identity=None):
+    def apply_pin(switcher, email=None, org_uuid=None, identity=None,
+                  everywhere=False):
         if seen is not None:
             seen.append({"email": email, "org": org_uuid, "identity": identity})
         _write_record(switcher.backup_dir, email, org_uuid)
@@ -226,7 +227,8 @@ class TestTheRollbackVerdictIsNotFooledByShape:
             json.dumps({"remoteControl": {"pinnedEmail": "old@e.com"}}))
         n = [0]
 
-        def apply_pin(switcher, email=None, org_uuid=None, identity=None):
+        def apply_pin(switcher, email=None, org_uuid=None, identity=None,
+                      everywhere=False):
             n[0] += 1
             _write_record(switcher.backup_dir, email, org_uuid)
             if n[0] == 1:                      # the set writes, then the proxy dies
@@ -252,7 +254,8 @@ class TestTheRollbackVerdictIsNotFooledByShape:
         _write_record(sw.backup_dir, "old@e.com", "org")
         n = [0]
 
-        def apply_pin(switcher, email=None, org_uuid=None, identity=None):
+        def apply_pin(switcher, email=None, org_uuid=None, identity=None,
+                      everywhere=False):
             n[0] += 1
             if n[0] == 1:
                 _write_record(switcher.backup_dir, email, org_uuid)
@@ -457,7 +460,8 @@ class TestARolledBackPinDoesNotLeaveItsNameBehind:
     def _impl(self, monkeypatch, tmp_path, spliced, *, splice_raises=None):
         sw = _sw(tmp_path)
 
-        def apply_pin(switcher, email=None, org_uuid=None, identity=None):
+        def apply_pin(switcher, email=None, org_uuid=None, identity=None,
+                      everywhere=False):
             _write_record(switcher.backup_dir, email, org_uuid)
             return True
 
@@ -513,7 +517,8 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
         _write_record(sw.backup_dir, "failed@example.com", "org-F")
         spliced = []
 
-        def apply_pin(switcher, email=None, org_uuid=None, identity=None):
+        def apply_pin(switcher, email=None, org_uuid=None, identity=None,
+                      everywhere=False):
             _write_record(switcher.backup_dir, email, org_uuid)
             return True
 
@@ -593,7 +598,8 @@ class TestTheUnspliceDecidesOnTheAccount:
         host._live_login_for_config = lambda s: live
         record = _apply_recording(sw, returns=False)
 
-        def pin_then_skip(switcher, email=None, org_uuid=None, identity=None):
+        def pin_then_skip(switcher, email=None, org_uuid=None, identity=None,
+                          everywhere=False):
             if email:                             # apply_pin splices BEFORE it fails
                 self._config({"emailAddress": email, "accountUuid": "uuid-cloud"})
             return record(switcher, email, org_uuid, identity)
