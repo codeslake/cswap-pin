@@ -3722,7 +3722,53 @@ def resolve_pin_token(
     return new_data.get("accessToken"), outcome.credentials
 
 
+def _pin_cleared_path(backup_root: Path) -> Path | None:
+    """This machine's clear marker, or None on a host that cannot name one.
+
+    ``pin_cleared_path`` is newer than this package's floor on the host and
+    its EXISTENCE is the capability. The marker is written AND read only
+    when it is there: the host's own reader answers from the same file, so a
+    marker only this package honoured would split the two across a skew.
+    """
+    path_of = getattr(require("settings"), "pin_cleared_path", None)
+    return path_of(backup_root) if path_of else None
+
+
+def _cleared_here(backup_root: Path) -> bool:
+    """Whether this machine's clear marker stands. An unreadable one reads as
+    absent (`os.path.exists`): still pinned, which `heal` repairs."""
+    marker = _pin_cleared_path(backup_root)
+    return marker is not None and os.path.exists(marker)
+
+
+def _drop_clear_marker(backup_root: Path) -> None:
+    """Remove this machine's clear marker. Loud on a refused unlink, never
+    raises: left standing it keeps a re-pinned machine reading as cleared."""
+    marker = _pin_cleared_path(backup_root)
+    try:
+        if marker is not None:
+            marker.unlink(missing_ok=True)
+    except OSError as exc:
+        _log_lifecycle(
+            f"could not remove the clear marker ({exc!r}) -- this machine "
+            "keeps reading as unpinned until it is removed by hand")
+
+
 def load_pin(backup_root: Path) -> tuple[str, str] | None:
+    """The pinned account identity, or ``None`` when nothing is pinned HERE.
+
+    ``None`` while this machine's clear marker stands: a settings file shared
+    across machines keeps its record for the others (see `apply_pin`).
+    Every reader that decides whether to wire, spawn or swap goes through
+    here; `_load_pin_record` is the marker-blind read for the one caller that
+    needs the record itself.
+    """
+    if _cleared_here(backup_root):
+        return None
+    return _load_pin_record(backup_root)
+
+
+def _load_pin_record(backup_root: Path) -> tuple[str, str] | None:
     """Read the pinned account identity from settings.json.
 
     Returns ``(email, organizationUuid)`` or ``None`` when nothing is pinned.
@@ -5697,7 +5743,8 @@ def hop_trust_problem(certdir: Path) -> "str | None":
 
 
 def apply_pin(switcher, email: str | None, org_uuid: str | None,
-              identity: dict | None = None) -> bool:
+              identity: dict | None = None, *,
+              everywhere: bool = False) -> bool:
     """Set (or clear, with ``email=None``) the pin AND bring the world in line.
 
     Storing the pin is only half the job: hand-launched sessions read the
@@ -5713,6 +5760,12 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
     (a receipt read, not a live probe): a pinned-and-wired host with no
     daemon actually listening is exactly the state `heal` exists to
     notice and repair, not this call.
+
+    A CLEAR IS LOCAL WHEN `settings.json` IS A SYMLINK (a file shared across
+    machines) and the host can name a marker (`pin_cleared_path`): the shared
+    record is left alone and `<data>/pin-cleared` is written instead, which
+    `load_pin` reads as "nothing pinned here" and the set arm removes.
+    ``everywhere=True`` drops the shared record, as a clear always did.
     """
     certdir = switcher.backup_dir / "pin-proxy"
     if not email:
@@ -5789,18 +5842,45 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
             # trusting this return value can make `--clear` never durably
             # take on a host whose lock stays contended across every retry
             # -- `heal` re-syncs the record back from this memo every
-            # launch. Fixing that needs the caller to trust `True` here, or
-            # a new clear-intent marker; both are out of this arm's scope,
-            # and the caller is in another repository.
+            # launch. The clear-intent marker (`pin-cleared`, below) is the
+            # upgrade path, but it is written only after an unwire that took
+            # and only for a symlinked settings.json, so this bail-out still
+            # writes none, and the caller that force-clears is in another
+            # repository.
             return True
         # CAPTURED BEFORE THE DROP, so a failed racing-undo below can put
         # this exact pair straight back. Not `pin-identity.json`: the set
         # arm unlinks it only when it names a DIFFERENT account than the
         # one it is pinning (a rollback does exactly that), so a memo
         # already naming the right account is left standing -- still not
-        # durable enough to lean on here.
-        prior = load_pin(switcher.backup_dir)
-        save_pin(switcher.backup_dir, email, org_uuid)
+        # durable enough to lean on here. MARKER-BLIND: under a marker
+        # `load_pin` reads None, which is not the record.
+        prior = _load_pin_record(switcher.backup_dir)
+        marker = _pin_cleared_path(switcher.backup_dir)
+        # LOCAL ONLY WHEN THE FILE IS SHARED. A symlinked settings.json is
+        # one record for every machine that links it and the host writes
+        # THROUGH the link, so dropping the pair here, committed, unpins
+        # them all. A host with no marker keeps today's behaviour exactly.
+        local = (marker is not None and not everywhere and require(
+            "settings").settings_path(switcher.backup_dir).is_symlink())
+        if local:
+            # IN THE SAME SLOT save_pin HAD, LAST: the durable half of a
+            # clear (82f00f5). A kill before this leaves the record
+            # standing and `heal` re-wires, which is recoverable.
+            try:
+                marker.touch()
+            except OSError as exc:
+                _log_carry(certdir, f"clear did not take: could not write "
+                                     f"{marker.name} ({exc!r}), left the "
+                                     "pin record standing")
+                _log_lifecycle(f"the clear did not take — {marker.name} could "
+                               "not be written, so this machine still reads "
+                               "as pinned and the next launch re-wires it; "
+                               "try again")
+                return True
+        else:
+            save_pin(switcher.backup_dir, email, org_uuid)
+            _drop_clear_marker(switcher.backup_dir)
         wiring_confirmed_gone = True
         if _read_ledger(cfg, _read_json(cfg)).get(_WIRE_MARK):
             # A RACING `heal`, NOT A RETRY OF OURS -- same receipt as the
@@ -5830,7 +5910,11 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                 # way, and the memo is `_restore_record_from_wiring`'s only
                 # remaining input.
                 wiring_confirmed_gone = False
-                if prior:
+                if local:
+                    # THE SHARED RECORD WAS NEVER TOUCHED: lifting the
+                    # marker is what puts the pin back.
+                    _drop_clear_marker(switcher.backup_dir)
+                elif prior:
                     save_pin(switcher.backup_dir, prior[0], prior[1])
         if wiring_confirmed_gone:
             # THE OWNER SPLICE MOVES HERE TOO, not before the race check:
@@ -5846,12 +5930,17 @@ def apply_pin(switcher, email: str | None, org_uuid: str | None,
                                "the next switch")
             remember_pin_identity(certdir, None)
             _log_carry(certdir, "cleared the pin: unwired .claude.json "
-                                 "first, then dropped the settings.json "
-                                 "record")
+                                 "first, then " + (
+                "wrote the clear marker, leaving the shared settings.json "
+                "record" if local else "dropped the settings.json record"))
         # NOT MEASURED, same as the bail-out above: this reads the receipt,
         # it does not probe a daemon (see this function's own docstring).
         return not wiring_confirmed_gone
     save_pin(switcher.backup_dir, email, org_uuid)
+    # `cswap pin N` UN-CLEARS THIS MACHINE. AFTER the record, so a kill
+    # between leaves this machine cleared with the record named, which a
+    # retry of the same command finishes.
+    _drop_clear_marker(switcher.backup_dir)
     try:
         certdir.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -6055,6 +6144,11 @@ def _restore_record_from_wiring(
     try:
         ident = remembered_pin_identity(certdir)
         if not ident or not ident.get("emailAddress"):
+            return None
+        # A CLEAR ON THIS MACHINE IS NOT A LOST RECORD: the shared record is
+        # still there, and this function would write it from the memo and
+        # hand `heal` a pin to re-wire.
+        if _cleared_here(backup_root):
             return None
         cfg = require("paths").get_global_config_path()
         raw = _read_json(cfg)
