@@ -9727,6 +9727,23 @@ class TestWireGlobalConfig:
         assert pin_proxy.wire_global_config(None, None) is True
         assert "SSL_CERT_FILE" not in json.loads(path.read_text()).get("env", {})
 
+    def case_an_unwire_of_a_never_wired_config_drops_only_the_pin_bundle(
+        self, tmp_path, monkeypatch
+    ):
+        """The never-wired unwire leaves the user's values alone, by the same
+        rule as the wiring: not one naming a file in the pin's own cert dir,
+        which is an older cswap-pin's bundle and narrows trust with no pin."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        own = Path(tmp_path) / "data-home" / "claude-swap" / "pin-proxy"
+        path = self._config(tmp_path, monkeypatch, {"env": {
+            "SSL_CERT_FILE": str(own / "ca-bundle.pem"),
+            "REQUESTS_CA_BUNDLE": "/etc/corp/requests.pem"}})
+        assert pin_proxy.wire_global_config(None, None) is True
+        assert json.loads(path.read_text())["env"] == {
+            "REQUESTS_CA_BUNDLE": "/etc/corp/requests.pem"}
+
     def case_apply_pin_reports_an_untrusted_hop_and_still_pins(
         self, tmp_path, monkeypatch
     ):

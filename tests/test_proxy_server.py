@@ -2344,6 +2344,66 @@ class TestPinTimeHopTrust:
         assert msg and f"127.0.0.1:{dead}" in msg, msg
         assert "NODE_EXTRA_CA_CERTS" not in msg, msg
 
+    @staticmethod
+    def _slow_hop(chunk, every):
+        """A hop that answers a CONNECT with `chunk` every `every` seconds,
+        never a blank line, for at most 6 s (so a probe with no overall
+        deadline still returns, late)."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        done = threading.Event()
+
+        def serve():
+            conn, _ = srv.accept()
+            with conn:
+                end = time.monotonic() + 6
+                while time.monotonic() < end and not done.wait(every):
+                    try:
+                        conn.sendall(chunk)
+                    except OSError:
+                        return
+
+        thr = threading.Thread(target=serve, daemon=True)
+        thr.start()
+        return srv, done, thr
+
+    def _timed(self, certdir, monkeypatch, chunk, every, budget):
+        from cswap_pin import proxy
+
+        monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        # raising=False: a misspelt name still fails, on the 10 s default.
+        monkeypatch.setattr(proxy, "_HOP_PROBE_BUDGET_S", budget, raising=False)
+        srv, done, thr = self._slow_hop(chunk, every)
+        port = srv.getsockname()[1]
+        try:
+            proxy.write_upstream_hint(certdir, f"http://127.0.0.1:{port}")
+            t0 = time.monotonic()
+            msg = proxy.hop_trust_problem(certdir)
+            took = time.monotonic() - t0
+        finally:
+            done.set()
+            thr.join(timeout=8)
+            srv.close()
+        assert msg and f"127.0.0.1:{port}" in msg, msg
+        assert "NODE_EXTRA_CA_CERTS" not in msg, msg
+        return took
+
+    def case_a_hop_that_trickles_its_reply_is_cut_at_the_deadline(
+        self, certdir, monkeypatch
+    ):
+        """One byte every 0.3 s never trips the 6 s per-read timeout, so only
+        an overall deadline stops `cswap pin` (and the TUI's repair on mount)
+        waiting on it."""
+        took = self._timed(certdir, monkeypatch, b"x", 0.3, budget=1.5)
+        assert took < 1.5 + 1.0, took
+
+    def case_a_hop_that_floods_its_reply_is_cut_at_the_cap(
+        self, certdir, monkeypatch
+    ):
+        took = self._timed(certdir, monkeypatch, b"x" * 65536, 0.01, budget=30)
+        assert took < 2.0, took
+
     def case_a_running_daemon_trusts_a_ca_recorded_after_it_started(
         self, certdir, tmp_path, monkeypatch
     ):

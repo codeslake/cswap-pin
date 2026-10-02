@@ -2389,9 +2389,12 @@ def _wire_global_config_locked(
     ledger = {_WIRE_MARK: [], f"{_WIRE_MARK}Saved": {},
               "writtenBy": _own_version()}
     if port is None or ca_path is None:
-        # `ledger` above already records "not wired"
+        # `ledger` above already records "not wired". Not one naming a file
+        # in our own cert dir, by the same rule as the wiring below.
         if not ours:
-            env.update(strays)
+            own = Path(require("paths").get_backup_root()) / "pin-proxy"
+            env.update({k: v for k, v in strays.items()
+                        if Path(v).parent != own})
     else:
         # Bare only once `proxy.json` says the serving daemon retired the
         # gate — else the old userinfo form, rebuilt from the gated holder's
@@ -5608,6 +5611,15 @@ def titles_to_restore(
     return out
 
 
+# THE WHOLE PIN-TIME CHECK, dial to handshake: each read alone waits up to
+# `_HOP_REPLY_BUDGET_S`, so a hop that trickles a byte under that held
+# `cswap pin` (and the TUI's repair on mount) for as long as it trickled.
+# Above dial + reply (8 s), so it never cuts a hop the daemon would use.
+_HOP_PROBE_BUDGET_S = 10.0
+# A CONNECT reply is a status line and a few headers.
+_HOP_PROBE_HEAD_CAP = 16384
+
+
 def hop_trust_problem(certdir: Path) -> "str | None":
     """One line for the operator when the recorded hop will fail the daemon's
     TLS or did not answer; None when it verifies, or when nothing is recorded.
@@ -5627,18 +5639,43 @@ def hop_trust_problem(certdir: Path) -> "str | None":
     ca = read_upstream_ca(certdir)
     where = f"{hop.host}:{hop.port}"
     target = f"{UPSTREAM_HOST}:443"
+    budget = _HOP_PROBE_BUDGET_S
+    deadline = time.monotonic() + budget
+
+    def left() -> float:
+        rest = deadline - time.monotonic()
+        if rest <= 0:
+            raise TimeoutError(f"no complete answer within {budget:g}s")
+        return rest
+
     raw = None
     try:
         raw = _dial_chain(hop, extra_ca=ca)
         raw.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
                     f"{hop.connect_headers()}\r\n".encode("latin1"))
-        status = _read_line(raw)
-        while _read_line(raw) not in ("", None):
-            pass
+        # The reply head, read as `_read_line` does (LF ends a line, a CR
+        # before it is dropped) but under the one deadline and the cap.
+        head = bytearray()
+        while not (head.endswith(b"\n\n") or head.endswith(b"\n\r\n")):
+            if len(head) >= _HOP_PROBE_HEAD_CAP:
+                raise ValueError(f"CONNECT reply head over "
+                                 f"{_HOP_PROBE_HEAD_CAP} bytes")
+            raw.settimeout(left())
+            b = raw.recv(1)
+            if not b:
+                break
+            head += b
+        status = (head.split(b"\n", 1)[0].rstrip(b"\r").decode("latin1")
+                  if head else None)
         if not _connect_ok(status):
             return (f"the egress proxy {where} did not tunnel {target} at pin "
                     f"time (CONNECT -> {status!r}); pinned requests need it to")
         if hop.host not in _LOOPBACK:
+            # A plain socket's handshake honours this as one deadline.
+            # ponytail: through an `https://` hop `_TLSInTLS` applies it per
+            # read, not in total; bound its `_drive` loop if a hop trickles
+            # the inner handshake.
+            raw.settimeout(left())
             _wrap_upstream(_verifying_ctx(Path(certdir) / "ca.pem", ca),
                            raw, UPSTREAM_HOST).close()
         return None
