@@ -19122,3 +19122,318 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
             srv._open_conns.add(a)
             srv._stream_conns.add(a)             # no _content_at entry
         assert srv.release_idle_streams() == 0
+
+
+class TestClaudeCodesUsageRequestsAreCounted:
+    """Claude Code's own `GET /api/oauth/usage` spends the account's hourly
+    budget, so the proxy decides each one through cswap's usage store:
+    answered from a fresh stored body, forwarded with the attempt counted in
+    the ledger cswap's own polls use, or held when the cap is spent or a 429
+    block is running. Measured 2026-10-02: the ledger held one attempt in the
+    hour for an account whose own reads were answered 429 for an hour twice,
+    because every request Claude Code sent went upstream uncounted.
+
+    Driven through the real request path with a fake upstream socket and
+    claude_swap's real `UsageStore` behind a stand-in switcher.
+    """
+
+    LIVE = "live-token"
+    IDENT = {"3": ("acct3@example.com", "")}
+    BODY = {
+        "five_hour": {"utilization": 41.0, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 97.0, "resets_at": "2099-01-05T00:00:00Z"},
+        "seven_day_opus": {"utilization": 12.0, "resets_at": None},
+        "extra_usage": {"is_enabled": False},
+    }
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    class _FakeTLS:
+        def __init__(self, raw: bytes):
+            self._in = raw
+            self.sent = b""
+
+        def recv(self, n):
+            out, self._in = self._in[:n], self._in[n:]
+            return out
+
+        def sendall(self, b):
+            self.sent += b
+
+        def close(self):
+            pass
+
+    class _FakeUpstream:
+        def __init__(self, reply: bytes):
+            self._reply = reply
+            self.sent = b""
+
+        def sendall(self, b):
+            self.sent += b
+
+        def recv(self, n):
+            out, self._reply = self._reply[:n], self._reply[n:]
+            return out
+
+        def pending(self):
+            return 0
+
+        def close(self):
+            pass
+
+    class _Switcher:
+        def __init__(self, store, ident):
+            self.store = store
+            self.ident = ident
+
+        def answer_client_usage(self, num, variant):
+            if num not in self.ident:
+                return None
+            return self.store.answer_client_usage(num, self.ident, variant)
+
+        def record_client_usage(self, num, variant, **kw):
+            return self.store.record_client_usage(num, self.ident, variant, **kw)
+
+    def _wire(self, tmp_path, monkeypatch, live_token=LIVE, live_slot="3"):
+        """A proxy whose live account is slot 3 on token `LIVE`, a real usage
+        store, and a log collector. Returns (proxy, store, log)."""
+        from claude_swap import switcher as host_switcher
+        from claude_swap.usage_store import UsageStore
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        store = UsageStore(tmp_path / "cache")
+        sw = self._Switcher(store, self.IDENT)
+        monkeypatch.setattr(host_switcher, "ClaudeAccountSwitcher", lambda: sw)
+        monkeypatch.setattr(pp, "_live_account_slot", lambda: live_slot)
+        monkeypatch.setattr(pp, "_active_oauth_token", lambda: live_token)
+        log: list[str] = []
+        monkeypatch.setattr(pp, "_log_lifecycle", log.append)
+        proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: None,
+                         upstream=("127.0.0.1", 1))
+        return proxy, store, log
+
+    def _request(self, proxy, monkeypatch, query="", upstream=None,
+                 auth="Bearer " + LIVE):
+        """Send one usage request; return (client bytes, upstream or None)."""
+        path = "/api/oauth/usage" + (f"?{query}" if query else "")
+        raw = (b"Host: api.anthropic.com\r\n"
+               b"Authorization: " + auth.encode() + b"\r\n"
+               b"Accept-Encoding: gzip, br\r\n\r\n")
+        tls = self._FakeTLS(raw)
+        dialed = []
+
+        def _conn():
+            if upstream is None:
+                raise AssertionError("the usage request went upstream")
+            dialed.append(upstream)
+            return upstream
+
+        monkeypatch.setattr(proxy, "_upstream_conn", _conn)
+        proxy._handle_one_request_inner(f"GET {path} HTTP/1.1", tls)
+        return tls.sent, (dialed[0] if dialed else None)
+
+    def _reply(self, status=b"200 OK", body=None, headers=b"", chunked=False):
+        data = json.dumps(self.BODY if body is None else body).encode()
+        if chunked:
+            mid = len(data) // 2
+            framed = (f"{mid:x}\r\n".encode() + data[:mid] + b"\r\n"
+                      + f"{len(data) - mid:x}\r\n".encode() + data[mid:]
+                      + b"\r\n0\r\n\r\n")
+            return (b"HTTP/1.1 " + status + b"\r\nContent-Type: application/json"
+                    b"\r\nTransfer-Encoding: chunked\r\n" + headers + b"\r\n"
+                    + framed)
+        return (b"HTTP/1.1 " + status + b"\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(data)}\r\n".encode() + headers
+                + b"\r\n" + data)
+
+    @staticmethod
+    def _body_of(sent: bytes):
+        return json.loads(sent.partition(b"\r\n\r\n")[2])
+
+    @staticmethod
+    def _row(store):
+        return json.loads(store.path.read_text())["accounts"]["3"]
+
+    def case_a_forwarded_request_is_counted_and_its_body_kept(
+        self, tmp_path, monkeypatch,
+    ):
+        """Asserts: with nothing stored the request goes upstream asking for
+        an uncompressed body, the client gets the upstream reply unchanged,
+        and the store gains the attempt, the body and lastGood."""
+        from claude_swap import oauth
+
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+        reply = self._reply()
+        sent, up = self._request(proxy, monkeypatch,
+                                 upstream=self._FakeUpstream(reply))
+        assert up is not None
+        head = up.sent.split(b"\r\n\r\n")[0].lower()
+        assert b"accept-encoding: identity" in head, head
+        assert b"gzip" not in head, head
+        assert sent.startswith(b"HTTP/1.1 200"), sent[:40]
+        assert self._body_of(sent) == self.BODY
+        row = self._row(store)
+        assert len(row["attempts"]) == 1
+        assert row["usageBodies"]["plain"]["body"] == self.BODY
+        assert row["lastGood"] == oauth.build_usage_result(self.BODY)
+        assert log == [], log
+
+    def case_the_next_request_is_served_from_the_store(
+        self, tmp_path, monkeypatch,
+    ):
+        """Asserts: a second plain request inside SERVE_TTL_S is answered
+        locally with the stored body, never dialed, never counted, and logs
+        nothing."""
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+        self._request(proxy, monkeypatch,
+                      upstream=self._FakeUpstream(self._reply()))
+        sent, up = self._request(proxy, monkeypatch, upstream=None)
+        assert up is None
+        assert sent.startswith(b"HTTP/1.1 200 OK"), sent[:40]
+        assert b"content-type: application/json" in sent.lower()
+        assert self._body_of(sent) == self.BODY
+        assert len(self._row(store)["attempts"]) == 1
+        assert log == [], log
+
+    def case_a_chunked_reply_is_recorded_decoded(self, tmp_path, monkeypatch):
+        """Asserts: a chunked upstream reply reaches the client as framed and
+        is recorded as the decoded JSON body."""
+        proxy, store, _ = self._wire(tmp_path, monkeypatch)
+        reply = self._reply(chunked=True)
+        sent, _ = self._request(proxy, monkeypatch,
+                                upstream=self._FakeUpstream(reply))
+        assert sent.endswith(b"0\r\n\r\n"), sent[-20:]
+        assert self._row(store)["usageBodies"]["plain"]["body"] == self.BODY
+
+    def case_a_reset_offer_form_is_never_served(self, tmp_path, monkeypatch):
+        """Asserts: `?at_wall=1&skip_spend=1` goes upstream counted even with
+        a fresh plain body stored, and its own body never replaces
+        lastGood."""
+        proxy, store, _ = self._wire(tmp_path, monkeypatch)
+        self._request(proxy, monkeypatch,
+                      upstream=self._FakeUpstream(self._reply()))
+        good = self._row(store)["lastGood"]
+        offer = {"juniper_tide": {"eligible": True}}
+        _, up = self._request(
+            proxy, monkeypatch, query="at_wall=1&skip_spend=1",
+            upstream=self._FakeUpstream(self._reply(body=offer)))
+        assert up is not None
+        row = self._row(store)
+        assert len(row["attempts"]) == 2
+        assert row["usageBodies"]["at_wall"]["body"] == offer
+        assert row["lastGood"] == good
+
+    def case_a_429_is_recorded_and_the_next_request_held(
+        self, tmp_path, monkeypatch,
+    ):
+        """Asserts: an upstream 429 records the block with its Retry-After;
+        the next request (another form, nothing stored for it) is not
+        forwarded, gets a local 429 with Retry-After, and one WARNING names
+        the account, form, attempts, reason and what was answered."""
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+        reply = self._reply(status=b"429 Too Many Requests",
+                            body={"error": {"type": "rate_limit_error"}},
+                            headers=b"Retry-After: 3600\r\n")
+        sent, _ = self._request(proxy, monkeypatch,
+                                upstream=self._FakeUpstream(reply))
+        assert sent.startswith(b"HTTP/1.1 429"), sent[:40]
+        assert self._row(store)["lastError"] == "http-429"
+        sent, up = self._request(proxy, monkeypatch,
+                                 query="cedar_ember=1&skip_spend=1",
+                                 upstream=None)
+        assert up is None
+        assert sent.startswith(b"HTTP/1.1 429"), sent[:40]
+        retry = re.search(rb"(?i)retry-after: (\d+)", sent)
+        assert retry and int(retry.group(1)) > 3000, sent[:200]
+        assert len(log) == 1, log
+        line = log[0]
+        assert line.startswith("WARNING usage request held on account 3 "
+                               "(cedar_ember)"), line
+        assert "1 attempts in the trailing hour" in line, line
+        assert "reason backoff" in line and "local 429" in line, line
+
+    def case_the_cap_holds_with_the_stored_body(self, tmp_path, monkeypatch):
+        """Asserts: at the hourly cap a stale plain body is answered instead
+        of forwarding, with a WARNING naming its age and the cap."""
+        from claude_swap.poll_policy import ATTEMPTS_PER_HOUR_MAX
+        from claude_swap.usage_store import SERVE_TTL_S
+
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+        self._request(proxy, monkeypatch,
+                      upstream=self._FakeUpstream(self._reply()))
+        rows = json.loads(store.path.read_text())
+        row = rows["accounts"]["3"]
+        stale = row["usageBodies"]["plain"]["fetchedAt"] - SERVE_TTL_S - 60
+        row["usageBodies"]["plain"]["fetchedAt"] = stale
+        row["attempts"] = [time.time() - 10] * ATTEMPTS_PER_HOUR_MAX
+        store.path.write_text(json.dumps(rows))
+        sent, up = self._request(proxy, monkeypatch, upstream=None)
+        assert up is None
+        assert sent.startswith(b"HTTP/1.1 200"), sent[:40]
+        assert self._body_of(sent) == self.BODY
+        assert len(log) == 1, log
+        assert f"{ATTEMPTS_PER_HOUR_MAX} attempts" in log[0], log
+        assert "reason cap" in log[0], log
+        assert "answered the stored body, 2" in log[0], log
+
+    def case_a_request_on_a_token_that_is_not_live_goes_uncounted(
+        self, tmp_path, monkeypatch,
+    ):
+        """Asserts: a bearer that is not the live token is forwarded as it
+        arrived (its Accept-Encoding untouched), nothing is recorded, and a
+        WARNING says it went uncounted."""
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+        up = self._FakeUpstream(self._reply())
+        sent, dialed = self._request(proxy, monkeypatch, upstream=up,
+                                     auth="Bearer some-older-token")
+        assert dialed is up
+        assert b"gzip, br" in up.sent, up.sent[:300]
+        assert sent.startswith(b"HTTP/1.1 200"), sent[:40]
+        assert not store.path.exists()
+        assert len(log) == 1 and "forwarded uncounted" in log[0], log
+
+    def case_no_live_slot_goes_uncounted(self, tmp_path, monkeypatch):
+        """Asserts: with no live slot known the request is forwarded and the
+        WARNING fires, rather than charging some other account."""
+        proxy, store, log = self._wire(tmp_path, monkeypatch, live_slot=None)
+        _, dialed = self._request(proxy, monkeypatch,
+                                  upstream=self._FakeUpstream(self._reply()))
+        assert dialed is not None
+        assert not store.path.exists()
+        assert len(log) == 1 and "forwarded uncounted" in log[0], log
+
+    def case_a_store_error_forwards_uncounted_and_says_so(
+        self, tmp_path, monkeypatch,
+    ):
+        """Asserts: when the store raises, the request still reaches Claude
+        Code's upstream and the WARNING names the exception."""
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+
+        def _boom(*a, **k):
+            raise OSError("store unreadable")
+
+        monkeypatch.setattr(self._Switcher, "answer_client_usage", _boom)
+        _, dialed = self._request(proxy, monkeypatch,
+                                  upstream=self._FakeUpstream(self._reply()))
+        assert dialed is not None
+        assert len(log) == 1, log
+        assert "OSError: store unreadable" in log[0], log
+
+    def case_other_routes_are_untouched(self, tmp_path, monkeypatch):
+        """Asserts: a path that only starts with the usage route is not
+        gated."""
+        from cswap_pin import proxy as pp
+
+        calls = []
+        proxy, _, _ = self._wire(tmp_path, monkeypatch)
+        monkeypatch.setattr(proxy, "_gate_usage_request",
+                            lambda *a: calls.append(a) or (None, None))
+        tls = self._FakeTLS(b"Host: api.anthropic.com\r\n\r\n")
+        up = self._FakeUpstream(self._reply())
+        monkeypatch.setattr(proxy, "_upstream_conn", lambda: up)
+        proxy._handle_one_request_inner(
+            "GET /api/oauth/usage_history HTTP/1.1", tls)
+        assert calls == []
+        assert pp._USAGE_ROUTE == "/api/oauth/usage"

@@ -16,6 +16,9 @@ This module IS that shape. Eight symbols, eight modules, listed once:
     switcher.ClaudeAccountSwitcher    the account store
     switcher.switch_off_at_limit_account   walls the account a 429 just hit
     oauth                             token extraction and refresh
+    usage_store                       Claude Code's usage requests: their
+                                      forms and the store's serve/forward/
+                                      hold answers (switcher decides them)
     claude_locks.claude_config_lock   serialize config rewrites
     pin                               cswap's identity readers over its own
                                       backup store, for set/show/re-pin

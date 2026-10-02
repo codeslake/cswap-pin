@@ -18936,6 +18936,19 @@ class PinProxy:
                 headers.append((k.strip(), v.strip()))
         body = _read_body(tls, headers)
 
+        _usage_forward = None
+        if method == "GET" and path.split("?", 1)[0].rstrip("/") == _USAGE_ROUTE:
+            _answered, _usage_forward = self._gate_usage_request(
+                path, headers, tls)
+            if _answered is not None:
+                return _answered
+            if _usage_forward is not None:
+                # IDENTITY, so the reply this records is the JSON as sent; a
+                # few KiB, so asking for no compression costs nothing.
+                headers = [(k, v) for k, v in headers
+                           if k.lower() != "accept-encoding"]
+                headers.append(("Accept-Encoding", "identity"))
+
         ua = next((v for k, v in headers if k.lower() == "user-agent"), "")
         pinned = is_pinned_route(path, ua)
         # TWO CLOCKS, because the total alone cannot say who was slow — see
@@ -19168,7 +19181,11 @@ class PinProxy:
 
         try:
             keep = self._forward(method, path, headers, body, tls,
-                                 swapped=swapped, bridge_hold=_bridge_hold)
+                                 swapped=swapped, bridge_hold=_bridge_hold,
+                                 capture=(_usage_forward.capture
+                                          if _usage_forward else None))
+            if _usage_forward is not None:
+                self._record_usage_reply(_usage_forward)
             if isinstance(keep, _AuthRejected):
                 # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
                 # 401/403/404 is terminal to the client — SSETransport treats
@@ -19268,6 +19285,104 @@ class PinProxy:
         except Exception:
             return None
 
+    def _gate_usage_request(self, path: str, headers: list, tls
+                            ) -> "tuple[bool | None, _UsageForward | None]":
+        """Decide one `GET /api/oauth/usage` before it is forwarded.
+
+        Returns ``(keep, None)`` when the request was answered here (from a
+        stored body, or held), ``(None, forward)`` when it must go upstream
+        with its reply recorded (``forward`` is what `_record_usage_reply`
+        takes), and ``(None, None)`` when it goes upstream uncounted, which
+        only happens with a WARNING naming why.
+        """
+        query = path.split("?", 1)[1] if "?" in path else ""
+        auth = next((v for k, v in headers if k.lower() == "authorization"), "")
+        keep = not any(k.lower() == "connection" and "close" in v.lower()
+                       for k, v in headers)
+        variant = query
+        try:
+            usage_store = require("usage_store")
+            variant = usage_store.usage_variant(query)
+            slot = _usage_request_slot(auth)
+            if slot is None:
+                _log_lifecycle(
+                    f"WARNING usage request ({variant}) forwarded uncounted: "
+                    "its bearer is not the live account's token, or no live "
+                    "slot is known, so no account's hourly budget can be "
+                    "charged for it")
+                return None, None
+            sw = require("switcher").ClaudeAccountSwitcher()
+            answer = sw.answer_client_usage(slot, variant)
+        except Exception as exc:  # noqa: BLE001 -- the request still goes
+            _log_lifecycle(
+                f"WARNING usage request ({variant}) forwarded uncounted: "
+                f"cswap's usage store raised {exc.__class__.__name__}: {exc}")
+            return None, None
+        if answer is None:
+            _log_lifecycle(
+                f"WARNING usage request ({variant}) forwarded uncounted: "
+                f"slot {slot} is live but not in cswap's roster")
+            return None, None
+        if answer.action == usage_store.CLIENT_SERVE:
+            return self._send_usage_reply(
+                tls, _usage_json_reply("200 OK", answer.body, keep), keep), None
+        if answer.action == usage_store.CLIENT_HOLD:
+            retry = max(1, math.ceil(answer.retry_after_s or 0.0))
+            if answer.body is not None:
+                what = (f"answered the stored body, "
+                        f"{int(answer.body_age_s or 0)}s old")
+                reply = _usage_json_reply("200 OK", answer.body, keep)
+            else:
+                what = f"answered a local 429, retry-after {retry}s"
+                reply = _usage_json_reply(
+                    "429 Too Many Requests",
+                    {"type": "error", "error": {
+                        "type": "rate_limit_error",
+                        "message": "usage request held: this account's usage "
+                                   "reads are at their hourly limit"}},
+                    keep, extra=[f"Retry-After: {retry}"])
+            _log_lifecycle(
+                f"WARNING usage request held on account {slot} ({variant}): "
+                f"{answer.attempts_in_window} attempts in the trailing hour, "
+                f"reason {answer.reason}; not forwarded, {what}")
+            return self._send_usage_reply(tls, reply, keep), None
+        return None, _UsageForward(sw, slot, variant, _UsageCapture())
+
+    @staticmethod
+    def _send_usage_reply(tls, reply: bytes, keep: bool) -> bool:
+        try:
+            tls.sendall(reply)
+        except OSError:
+            return False
+        return keep
+
+    @staticmethod
+    def _record_usage_reply(forward: _UsageForward) -> None:
+        """Record a forwarded usage reply in cswap's store (its attempt was
+        counted before it went). A reply the store cannot take is said, not
+        dropped silently: the next request would then be decided on a
+        reading that never arrived."""
+        sw, slot, variant, capture = forward
+        status = capture.status
+        if status not in (200, 429):
+            return
+        body = capture.json_body() if status == 200 else None
+        if status == 200 and body is None:
+            _log_lifecycle(
+                f"WARNING usage reply on account {slot} ({variant}) not "
+                "recorded: the 200's body was incomplete, encoded or not a "
+                "JSON object")
+            return
+        try:
+            sw.record_client_usage(
+                slot, variant, status=status, body=body,
+                retry_after_s=capture.retry_after_s())
+        except Exception as exc:  # noqa: BLE001 -- the reply already went
+            _log_lifecycle(
+                f"WARNING usage reply on account {slot} ({variant}) not "
+                f"recorded: cswap's usage store raised "
+                f"{exc.__class__.__name__}: {exc}")
+
     @staticmethod
     def _artifact_403(sock, close: bool) -> bool:
         """T1596: answer a 401 the pin took on an artifact route, in place of
@@ -19332,7 +19447,8 @@ class PinProxy:
 
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
                  swapped: bool = False,
-                 bridge_hold: "tuple[str, threading.Event] | None" = None
+                 bridge_hold: "tuple[str, threading.Event] | None" = None,
+                 capture: "_UsageCapture | None" = None,
                  ) -> bool:
         """Relay one request upstream and stream the response back.
 
@@ -19567,6 +19683,7 @@ class PinProxy:
                 # Content-Length included, but no body — only the request
                 # method says so.
                 method=method,
+                capture=capture,
             )
         except (OSError, ssl.SSLError):
             self._drop_upstream()
@@ -21530,6 +21647,115 @@ def _spawn_usage_header_recorder(fn) -> None:
     threading.Thread(target=fn, daemon=True).start()
 
 
+# CLAUDE CODE'S OWN USAGE READS. Claude Code sends `GET /api/oauth/usage`
+# itself (2.1.287: the plain URL, `?at_wall=1&skip_spend=1` and
+# `?cedar_ember=1&skip_spend=1`), on the account cswap has live, and the
+# endpoint's budget is the account's: about 30 requests per trailing hour,
+# against which cswap caps its own polls at `ATTEMPTS_PER_HOUR_MAX` in the
+# store's `attempts` ledger. Relayed unseen, these requests spent that budget
+# outside the ledger: on 2026-10-02 the ledger held one attempt in the hour
+# for an account whose own fetches were answered `429, retry-after 3600`
+# twice. So every usage request is decided by cswap's store
+# (`answer_client_usage`): answered from a fresh stored body, forwarded with
+# the attempt counted, or held.
+_USAGE_ROUTE = "/api/oauth/usage"
+# The largest usage body recorded. A real one is a few KiB; a reply larger
+# than this is relayed in full but not recorded.
+_USAGE_BODY_MAX = 1 << 20
+
+
+class _UsageCapture:
+    """What `_relay_response` saw of one forwarded usage reply: the upstream
+    status, its headers, and the decoded body, so the reply can be recorded
+    in cswap's store after it has reached the client."""
+
+    def __init__(self) -> None:
+        self.status: int | None = None
+        self.headers: dict[str, str] = {}
+        self.body = bytearray()
+        self.complete = False
+
+    def note_head(self, status_line: bytes, header_lines: list[bytes]) -> None:
+        try:
+            self.status = int(status_line.split(b" ", 2)[1])
+        except (IndexError, ValueError):
+            self.status = None
+        for line in header_lines:
+            if b":" not in line:
+                continue
+            k, v = line.split(b":", 1)
+            self.headers[k.strip().lower().decode("latin1", "replace")] = (
+                v.strip().decode("latin1", "replace"))
+
+    def json_body(self) -> "dict | None":
+        """The body as a JSON object, or None when it is incomplete, encoded,
+        oversized or not an object."""
+        if not self.complete or len(self.body) > _USAGE_BODY_MAX:
+            return None
+        if self.headers.get("content-encoding", "identity").lower() != "identity":
+            return None
+        try:
+            parsed = json.loads(bytes(self.body).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def retry_after_s(self) -> "float | None":
+        raw = self.headers.get("retry-after")
+        if raw is None:
+            return None
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return None
+        return max(0.0, value) if math.isfinite(value) else None
+
+
+class _UsageForward(NamedTuple):
+    """A usage request `_gate_usage_request` let go upstream, counted: what
+    `_record_usage_reply` needs to record its reply."""
+
+    switcher: object
+    slot: str
+    variant: str
+    capture: _UsageCapture
+
+
+def _usage_request_slot(auth: str) -> "str | None":
+    """The slot a usage request is spending, or None when it cannot be named.
+
+    `is_pinned_route` does not swap the usage route's bearer, so the
+    request goes upstream on its own bearer, which is the live account's
+    when it matches cswap's live token: the same rule `_note_usage_headers`
+    applies before it records a reply's headers on the live slot. A bearer
+    that is not the live one (a session still holding a token cswap has
+    rotated away from) belongs to an account this cannot name.
+    """
+    token = auth.strip()
+    token = token[7:].strip() if token[:7].lower() == "bearer " else ""
+    if not token:
+        return None
+    slot = _live_account_slot()
+    live = _active_oauth_token()
+    if slot is None or live is None or token != live:
+        return None
+    return slot
+
+
+def _usage_json_reply(status: str, payload: dict, keep: bool,
+                      extra: "list[str] | None" = None) -> bytes:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    head = [
+        f"HTTP/1.1 {status}",
+        "Content-Type: application/json",
+        f"Content-Length: {len(body)}",
+        "Cache-Control: no-store",
+        *(extra or []),
+        "Connection: " + ("keep-alive" if keep else "close"),
+    ]
+    return ("\r\n".join(head) + "\r\n\r\n").encode("latin1") + body
+
+
 def _relay_response(
     up: ssl.SSLSocket,
     client: ssl.SSLSocket,
@@ -21543,9 +21769,15 @@ def _relay_response(
     auth: str = "",
     session: str = "",
     note_hop: bool = True,
+    capture: "_UsageCapture | None" = None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
+
+    ``capture``, when given, is filled with the upstream status, the
+    response headers and the decoded body bytes as they are relayed, for a
+    caller that must record what came back (`_UsageCapture`). The bytes the
+    client receives are unchanged.
 
     ``session`` is the request's ``x-claude-code-session-id``, threaded
     through to `_switch_off_walled_account` so a stale-bearer 401 debounces
@@ -21741,6 +21973,8 @@ def _relay_response(
         _note_usage_headers(_upstream_status_line, lines, path, auth)
     except Exception:  # noqa: BLE001 — never let a statistic break a reply
         pass
+    if capture is not None and not _is_interim(_upstream_status_line):
+        capture.note_head(_upstream_status_line, lines[1:])
     out = [status_line]
     length: int | None = None
     chunked = False
@@ -21848,12 +22082,14 @@ def _relay_response(
                 reject_on_auth_error=reject_on_auth_error, method=method,
                 on_headers=None, on_status=on_status, path=path,
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
+                capture=capture,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
             on_headers=None, on_status=on_status, path=path,
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
+            capture=capture,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
@@ -21866,7 +22102,14 @@ def _relay_response(
     _send_head(b"\r\n".join(out) + b"\r\n\r\n" + rest)
 
     if chunked:
-        return _pipe_chunked(up, client, bytearray(rest)) and keep
+        relayed = _pipe_chunked(
+            up, client, bytearray(rest),
+            sink=capture.body if capture is not None else None)
+        if capture is not None:
+            capture.complete = relayed
+        return relayed and keep
+    if capture is not None:
+        capture.body += rest
     if length is not None:
         remaining = length - len(rest)
         while remaining > 0:
@@ -21877,7 +22120,11 @@ def _relay_response(
             if not chunk:
                 return False
             client.sendall(chunk)
+            if capture is not None:
+                capture.body += chunk
             remaining -= len(chunk)
+        if capture is not None:
+            capture.complete = True
         return keep
     # No framing: body runs to EOF (SSE and close-delimited replies).
     while True:
@@ -21888,14 +22135,20 @@ def _relay_response(
         if not chunk:
             break
         client.sendall(chunk)
+        if capture is not None:
+            capture.body += chunk
+    if capture is not None:
+        capture.complete = True
     return False
 
 
-def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> bool:
+def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray,
+                  sink: "bytearray | None" = None) -> bool:
     """Forward a chunked body verbatim until the terminating 0-length chunk.
 
     Parses only enough to find the end of the body (so the next response on
     this connection starts at the right offset); every byte is relayed as-is.
+    ``sink``, when given, collects the decoded chunk data (no size lines).
     """
     while True:
         while b"\r\n" not in buf:
@@ -21923,6 +22176,8 @@ def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> b
                 return False
             client.sendall(chunk)
             buf += chunk
+        if sink is not None:
+            sink += buf[:size]
         buf = bytearray(buf[need:])
         if size == 0:
             return True
