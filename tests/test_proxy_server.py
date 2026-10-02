@@ -2645,6 +2645,80 @@ class TestLongPollSurvives:
             srv.close()
 
 
+def _http_hop(status, body=b""):
+    """A loopback hop answering every HTTP request with `status` and `body`.
+
+    Returns ``(server, url, served)``. `served` counts requests that sent
+    bytes, NOT bare connects: `_ambient_proxy`'s `_port_is_serving` opens one
+    and closes it without a word, which is not a probe of the hop.
+    """
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    served = []
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    d = c.recv(4096)
+                    if not d:
+                        break
+                    buf += d
+                if buf:
+                    served.append(1)  # before the reply: the client may race it
+                    c.sendall(
+                        b"HTTP/1.1 " + status + b"\r\nContent-Length: "
+                        + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.getsockname()[1]}", served
+
+
+def _launch_from(shell_proxy, tmp_path, monkeypatch):
+    """``(ensure_proxy_once, certdir)``: the real call site, one launch whose
+    shell exports `shell_proxy`, with everything past the hint block stubbed."""
+    import functools
+
+    import cswap_pin.proxy as pp
+
+    certdir = tmp_path / "pin-proxy"
+    certdir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HTTPS_PROXY", shell_proxy)
+    for name, fake in (
+        ("load_pin", lambda _bd: ("a@b.c", "")),
+        ("_carry_history_pointers", lambda _cd: None),
+        ("daemon_fingerprint", lambda *_a: "FP"),
+        ("ensure_ca", lambda *_a: None),
+        ("publish_ca", lambda _p: None),
+        ("wire_global_config", lambda *_a: None),
+        ("_read_alive_port", lambda *_a, **_k: 41000),
+        ("_ASKED_NOHEALTH", set()),
+        # timeout=10: a server-thread reply, not the network (T1076).
+        ("_probe_next_hop", functools.partial(pp._probe_next_hop, timeout=10)),
+    ):
+        monkeypatch.setattr(pp, name, fake)
+
+    class _SW:
+        backup_dir = tmp_path
+
+        def resolve_account(self, email):
+            return "1", email, None
+
+    return lambda: pp.ensure_proxy(_SW()), certdir
+
+
 class TestChainRediscovery:
     """The daemon outlives the launch that spawned it, and a cache proxy picks
     its port from a family and can restart. A chain bound once at spawn
@@ -6870,6 +6944,108 @@ class TestChainRediscovery:
             assert pp._chain_hops(certdir)[-1].address == ("192.0.2.1", 3128)
         finally:
             srv.close()
+
+    def case_ensure_proxy_re_records_a_chain_recorded_outer_first(
+        self, tmp_path, monkeypatch
+    ):
+        """The first pin ran from a shell exporting the OUTER egress proxy
+        (answers every /health with 400), so it is what upstream.json holds;
+        a re-pin from a shell exporting the INNER cache proxy (whose /health
+        names the outer one) used to keep it, record proxy=outer next=inner,
+        and send every pinned request past the cache proxy, silently. The
+        record must end up [inner, outer], and stay so on the next launch
+        from the same shell, which must not ask the outer hop again."""
+        import cswap_pin.proxy as pp
+
+        outer_srv, outer, outer_served = _http_hop(b"400 Bad Request")
+        body = json.dumps({"status": "ok", "https_proxy": outer}).encode()
+        inner_srv, inner, _ = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(inner, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, outer)
+            want = [
+                pp.parse_upstream_proxy(inner).address,
+                pp.parse_upstream_proxy(outer).address,
+            ]
+
+            launch()
+            assert [h.address for h in pp._chain_hops(certdir)] == want
+            assert outer_served == [1], "the outer hop is asked once, to learn it"
+
+            pp._ASKED_NOHEALTH.clear()  # a fresh process remembers nothing
+            launch()  # the next launch from the same shell
+            assert [h.address for h in pp._chain_hops(certdir)] == want
+            assert outer_served == [1], "the settled record asks no one again"
+        finally:
+            outer_srv.close()
+            inner_srv.close()
+
+    def case_ensure_proxy_never_asks_the_shells_hop_while_the_recorded_one_answers(
+        self, tmp_path, monkeypatch
+    ):
+        """The design case stays quiet: the recorded hop answers /health 200
+        and names a third address, so there is no reversed record to find and
+        the shell's own exported hop is never asked anything."""
+        import cswap_pin.proxy as pp
+
+        body = json.dumps({"https_proxy": "http://192.0.2.1:3128"}).encode()
+        rec_srv, recorded, _ = _http_hop(b"200 OK", body)
+        shell_srv, shell, shell_served = _http_hop(b"400 Bad Request")
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [], "the shell's own hop was asked /health"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
+
+    def case_ensure_proxy_never_asks_the_shells_hop_of_a_recorded_hop_that_did_not_decline(
+        self, tmp_path, monkeypatch
+    ):
+        """The recorded hop answers 200 without an `https_proxy`: it is a
+        /health server with nothing behind it, not a hop that declared itself
+        a non-/health one, so the shell's hop (which WOULD name it) is never
+        asked and the record is not swapped."""
+        import cswap_pin.proxy as pp
+
+        rec_srv, recorded, _ = _http_hop(b"200 OK", b"{}")
+        body = json.dumps({"https_proxy": recorded}).encode()
+        shell_srv, shell, shell_served = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [], "the shell's own hop was asked /health"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
+
+    def case_ensure_proxy_keeps_the_record_when_the_shells_hop_does_not_name_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The recorded hop declares itself non-/health (400) and the shell's
+        hop is asked, but it names a THIRD address: not a chain through the
+        recorded hop, so the record is not swapped."""
+        import cswap_pin.proxy as pp
+
+        rec_srv, recorded, _ = _http_hop(b"400 Bad Request")
+        body = json.dumps({"https_proxy": "http://192.0.2.1:3128"}).encode()
+        shell_srv, shell, shell_served = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(shell, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, recorded)
+
+            launch()
+            assert shell_served == [1], "the gate was never reached: no control"
+            assert pp._read_upstream(certdir, "proxy") == recorded
+        finally:
+            rec_srv.close()
+            shell_srv.close()
 
 
 

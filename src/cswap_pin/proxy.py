@@ -164,7 +164,9 @@ def _probe_next_hop(
     timeout on every launch.
 
     ``own_proxy`` is the proxy THIS CALLER's own environment already named,
-    unrelated to any probing. Passed only by ``ensure_proxy``: a shell that
+    unrelated to any probing. Passed only by ``ensure_proxy``, at its probe
+    of the ambient hop (its one probe of the shell's own export omits it, and
+    says why there): a shell that
     DOES export HTTPS_PROXY (an ssh shell forwarding the machine-wide egress
     is the common shape of that) would, when that is also the hop about to
     be probed, send a /health it already knows will 400 on every launch (a
@@ -207,7 +209,13 @@ def _probe_next_hop(
     # leaves a 4xx hop getting one /health per launch, forever, because a
     # launch is a fresh process and `_ASKED_NOHEALTH` cannot amortise across
     # launches (see that set's own comment above for why nothing on disk
-    # covers it either). No replacement is built here.
+    # covers it either). One differing-export shape ends after one /health: a
+    # shell exporting the inner cache proxy over a record of the outer hop is
+    # re-recorded by `ensure_proxy`. Its mirror does not: a generic loopback
+    # intercepting proxy recorded as the hop that 4xxs /health, in front of
+    # the outer hop, launched from a shell exporting the outer hop, never
+    # swaps, and each launch adds one loopback request to that outer hop,
+    # answered at once. No replacement is built here for the rest.
     own = parse_upstream_proxy(own_proxy)
     if own is not None and own.address == hop.address:
         return None
@@ -7647,15 +7655,35 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     # while the shell's own proxy is visible whether or not it is. Prefer the
     # probe (it is what the hop reports about itself) and fall back to what
     # this launch observed directly.
+    next_hop = _probe_next_hop(
+        ambient or _read_upstream(certdir, "proxy"), own_proxy=_shell_proxy(),
+    )
+    # A RECORD THE WRONG WAY ROUND. A first pin from a shell exporting the
+    # OUTER hop records it, and `_ambient_proxy` then keeps preferring it over
+    # the inner cache proxy a later shell exports: the chain is [outer, inner]
+    # and every pinned request skips the cache proxy, silently. Detected only
+    # when the recorded hop DECLARED itself a non-/health 4xx hop (it is in
+    # `_ASKED_NOHEALTH` now: what it said, never what it is) and the shell's
+    # hop names it as its own upstream. Re-record [shell's hop, recorded hop].
+    if next_hop is None and observed_next:
+        hop = parse_upstream_proxy(ambient)
+        if f"{hop.host}:{hop.port}" in _ASKED_NOHEALTH:
+            # `own_proxy` is deliberately NOT passed: it would refuse exactly
+            # this probe, since the shell's own export is the hop asked. The
+            # recorded hop has just declared itself a 4xx non-/health hop, so
+            # this is the only moment asking the shell's export can learn
+            # anything. After a swap the next launch from this shell sees
+            # recorded == shell and probes nothing new; with no swap (the
+            # shape `_probe_next_hop`'s ponytail ceiling names) every launch
+            # asks the shell's hop once more.
+            behind = parse_upstream_proxy(_probe_next_hop(observed_next))
+            if behind is not None and behind.address == hop.address:
+                ambient, next_hop = observed_next, ambient
     write_upstream_hint(
         certdir,
         ambient,
         os.environ.get("NODE_EXTRA_CA_CERTS"),
-        next_hop=_probe_next_hop(
-            ambient or _read_upstream(certdir, "proxy"),
-            own_proxy=_shell_proxy(),
-        )
-        or observed_next,
+        next_hop=next_hop or observed_next,
     )
     fp = daemon_fingerprint(account_num, email)
 
