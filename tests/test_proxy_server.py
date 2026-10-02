@@ -14430,6 +14430,117 @@ class TestFailOpenIsNotSilent:
             "an unreadable credential must still warn"
         )
 
+    def test_terminal_reauth_tracks_known_generations_after_rejection(
+            self, tmp_path, monkeypatch):
+        import hashlib
+        import json
+        from types import SimpleNamespace
+
+        from cswap_pin import proxy as pp
+
+        snapshot_a = json.dumps({"claudeAiOauth": {
+            "accessToken": "expired", "expiresAt": 1,
+            "refreshToken": "snapshot-a"}})
+        live_a = json.dumps({"claudeAiOauth": {
+            "accessToken": "live-a", "expiresAt": 4102444800000,
+            "refreshToken": "snapshot-a"}})
+        substituted_b = json.dumps({"claudeAiOauth": {
+            "accessToken": "expired", "expiresAt": 1,
+            "refreshToken": "substituted-b"}})
+        live_c = json.dumps({"claudeAiOauth": {
+            "accessToken": "live-c", "expiresAt": 4102444800000,
+            "refreshToken": "fresh-c"}})
+        b_fp = "sha256:" + hashlib.sha256(b"substituted-b").hexdigest()
+        state = {
+            "credentials": snapshot_a,
+            "error": "invalid_grant",
+            "active": "1",
+            "consumed_fp": b_fp,
+        }
+
+        class _Switcher:
+            backup_dir = tmp_path
+
+            def current_account_number(self):
+                return state["active"]
+
+            def read_account_credentials(self, _number, _email):
+                return state["credentials"]
+
+            def resolve_account(self, identifier):
+                if identifier == "other@example.com":
+                    return "3", identifier, "tenant"
+                return "2", identifier, "tenant"
+
+            def consume_backup_grant(self, _number, _email, _snapshot):
+                return SimpleNamespace(
+                    credentials=None,
+                    error=state["error"],
+                    consumed_fp=state["consumed_fp"],
+                )
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda _token: {"emailAddress": "pin@example.com"})
+        pp.save_pin(tmp_path, "pin@example.com", "tenant")
+        provider = pp.make_pin_token_provider(_Switcher(), "2", "pin@example.com")
+
+        assert provider() is None
+        assert provider.terminal_reauth is True
+        assert provider.pin_is_noop() is False
+
+        marked = []
+        proxy = pp.PinProxy.__new__(pp.PinProxy)
+        proxy._certdir = tmp_path
+        proxy._pin_token_provider = provider
+        monkeypatch.setattr(pp, "mark_daemon_unpinnable", marked.append)
+        proxy._warn_unpinnable()
+        assert marked == [], (
+            "a terminal refresh result was recorded as an unreadable store")
+
+        state["credentials"] = "{malformed"
+        assert provider() is None
+        assert provider.terminal_reauth is True, (
+            "malformed credentials cleared a confirmed rejection")
+
+        state["credentials"] = live_a
+        assert provider() == "live-a"
+        assert provider.terminal_reauth is True, (
+            "a usable access token from the known snapshot cleared it")
+
+        state["credentials"] = substituted_b
+        assert provider(refused="Bearer live-a") is None
+        assert provider.terminal_reauth is True, (
+            "a reread of the consumed grant reset the terminal result")
+
+        state["credentials"] = live_a
+        assert provider() == "live-a"
+        assert provider.terminal_reauth is True, (
+            "a later reread of a known snapshot or rejected grant cleared it")
+
+        state["credentials"] = live_c
+        assert provider(refused="Bearer live-a") == "live-c"
+        assert provider.terminal_reauth is False, (
+            "a fresh login generation did not recover in place")
+
+        state["credentials"] = snapshot_a
+        state["error"] = "transient"
+        state["consumed_fp"] = None
+        assert provider(refused="Bearer live-c") is None
+        assert provider.terminal_reauth is False, (
+            "a transient refresh failure was treated as terminal")
+
+        state["error"] = "invalid_grant"
+        state["consumed_fp"] = b_fp
+        assert provider() is None
+        assert provider.terminal_reauth is True
+        pp.save_pin(tmp_path, "other@example.com", "tenant")
+        state["active"] = "3"
+        state["credentials"] = live_c
+        assert provider() is None
+        assert provider.terminal_reauth is False, (
+            "re-pinning carried a terminal result onto another slot")
+
     def case_warns_when_the_token_cannot_be_minted(self, certdir, monkeypatch):
         import io
         import sys as _sys
@@ -14568,7 +14679,15 @@ class TestFailOpenIsNotSilent:
         """A daemon being up is not the same as the pin working. The sweep
         needs the second fact, and only the daemon can answer it."""
         import json as _json, socket as _s
-        for provider, expect in ((lambda: "TOK", True), (lambda: None, False)):
+
+        def terminal():
+            return None
+
+        terminal.terminal_reauth = True
+        for provider, expect, expect_terminal in (
+                (lambda: "TOK", True, False),
+                (lambda: None, False, False),
+                (terminal, False, True)):
             p = self._proxy(certdir, provider)
             p.start()
             try:
@@ -14587,7 +14706,9 @@ class TestFailOpenIsNotSilent:
                         break
                     body += d
                 c.close()
-                assert _json.loads(body)["can_pin"] is expect
+                health = _json.loads(body)
+                assert health["can_pin"] is expect
+                assert health["terminal_reauth"] is expect_terminal
             finally:
                 p.stop()
 

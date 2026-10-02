@@ -20,6 +20,7 @@ import base64
 import contextlib
 import datetime as _dt
 import glob
+import hashlib
 import inspect
 import itertools
 import json
@@ -6680,6 +6681,10 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # {account_num: (read_at, credential_json)}. Per provider, so it dies with
     # the daemon and no state outlives a recycle.
     _cred_cache: dict = {}
+    # A terminal refresh rejection applies to one selected slot and its known
+    # refresh-token generations. This is lifecycle state only: the host still
+    # owns refresh policy and every later call reaches it as before.
+    _terminal_reauth = {"target": None, "generations": set()}
     # SET/CLEARED ONLY BY WHOEVER HOLDS `refresh_lock`. Lets a reader that
     # peeks the lock non-blocking (`_mint_lock_busy`) say how long it has
     # been held -- the fact that tells a stalled Keychain read apart from a
@@ -6700,6 +6705,49 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         answer 503 instead of going out unpinned -- see
         `_refuse_stalled_mint`."""
         return getattr(_stalled, "flag", False)
+
+    def _credential_generation(creds: str) -> str | None:
+        """Return an opaque refresh-token generation for valid credentials."""
+        try:
+            data = oauth.extract_oauth_data(creds)
+            refresh = data.get("refreshToken") if isinstance(data, dict) else None
+            if not isinstance(refresh, str) or not refresh:
+                return None
+            return "sha256:" + hashlib.sha256(
+                refresh.encode("utf-8")).hexdigest()
+        except Exception:  # noqa: BLE001 -- malformed data proves nothing
+            return None
+
+    def _clear_terminal_reauth() -> None:
+        _terminal_reauth["target"] = None
+        _terminal_reauth["generations"] = set()
+        provider.terminal_reauth = False
+
+    def _observe_generation(target: tuple[str, str], creds: str) -> None:
+        """Clear a terminal status only after a valid generation changes."""
+        generation = _credential_generation(creds)
+        if not generation:
+            return
+        if (_terminal_reauth["target"] == target
+                and generation not in _terminal_reauth["generations"]):
+            _clear_terminal_reauth()
+
+    def _note_terminal_reauth(target: tuple[str, str], creds: str, outcome) -> None:
+        """Record a terminal rejection and its observed generations."""
+        if getattr(outcome, "error", None) != "invalid_grant":
+            return
+        submitted = _credential_generation(creds)
+        consumed = getattr(outcome, "consumed_fp", None)
+        generation = consumed if isinstance(consumed, str) and consumed else submitted
+        if not isinstance(generation, str) or not generation:
+            return
+        if _terminal_reauth["target"] != target:
+            _terminal_reauth["target"] = target
+            _terminal_reauth["generations"] = set()
+        _terminal_reauth["generations"].add(generation)
+        if submitted:
+            _terminal_reauth["generations"].add(submitted)
+        provider.terminal_reauth = True
 
     def _consume(creds: str, num: str, mail: str) -> "oauth.RefreshOutcome":
         """Refresh through the host's interprocess gate, direct POST as
@@ -7019,6 +7067,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # a foreign verdict this same provider gave on some earlier call.
         provider._tls.foreign = False
         target = _current_target()
+        if _terminal_reauth["target"] != target:
+            _clear_terminal_reauth()
         if target is None:
             return None
         num, mail = target
@@ -7153,7 +7203,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # Someone may have rotated it while we waited, or this is the
                 # cold-cache case above and this IS the first read — either way
                 # the read happens here, under the lock.
-                creds = switcher.read_account_credentials(num, mail) or creds
+                stored = switcher.read_account_credentials(num, mail)
+                creds = stored or creds
                 if not creds:
                     # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
                     # empty read and a read of the WRONG slot are indistinguishable
@@ -7166,6 +7217,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # REPLACE THE HELD COPY, or the cache keeps handing back the
                 # expired blob and every later request re-enters this lock.
                 _cred_cache[ckey] = creds
+                if stored:
+                    _observe_generation(ckey, stored)
                 token = _live_token(creds)
                 if not token:
                     # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error`
@@ -7175,6 +7228,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     def _consume_recording(c):
                         out = _consume(c, num, mail)
                         err = getattr(out, "error", None)
+                        _note_terminal_reauth(ckey, c, out)
                         if err:
                             provider.blind_reason = (
                                 f"refresh {err} for slot {num} ({mail})")
@@ -7328,6 +7382,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
+    provider.terminal_reauth = False
     provider._lock_acquired_at = None
     # None: never evaluated yet (no mint, no beat). False: the last
     # verified mint answered as the pin. A dict ({"pinned": ...,
@@ -10235,8 +10290,8 @@ def _health_probe(port: int, timeout: float) -> bytes | None:
     return buf
 
 
-def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
-    """What the daemon on ``port`` says about minting, or None if it will not say.
+def _serving_pin_status(port: int, timeout: float = 1.0) -> tuple[bool | None, bool]:
+    """Return the daemon's ``(can_pin, terminal_reauth)`` health status.
 
     Measured, and the reason this exists rather than a record read: `cswap pin
     <n>` run to completion returned rc=0, printed "Pinned the cloud account",
@@ -10255,21 +10310,32 @@ def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
     for attempt in range(_PIN_PROBE_ATTEMPTS):
         buf = _health_probe(port, timeout)
         if buf is None:
-            return None
+            return None, False
         if b"\r\n\r\n" not in buf:
             continue  # connected, but no full answer either -- a wedge
         parts = buf.split(b"\r\n\r\n", 1)
         try:
             body = json.loads(parts[1])
         except ValueError:
-            return None  # a real, if malformed, answer -- not silence
+            return None, False  # a real, if malformed, answer -- not silence
+        if not isinstance(body, dict):
+            return None, False
         held = body.get("mint_stalled_s")
         if isinstance(held, (int, float)) and held > _MINT_STALL_WEDGE_S:
-            return False
+            return False, False
         val = body.get("can_pin")
-        return val if isinstance(val, bool) else None
+        return (val if isinstance(val, bool) else None,
+                body.get("terminal_reauth") is True)
     # Every attempt connected and none produced an answer.
-    return False
+    return False, False
+
+
+def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
+    """What the daemon on ``port`` says about minting, or None if it will not say.
+
+    Compatibility wrapper for callers that only need the minting verdict.
+    """
+    return _serving_pin_status(port, timeout)[0]
 
 
 def _health_pid(port: int, timeout: float = 1.0) -> int | None:
@@ -10337,14 +10403,6 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
         return None
     if fingerprint is not None and st.get("fingerprint") != fingerprint:
         return None
-    # A daemon that has proven it cannot read the pinned credential is not a
-    # daemon worth reusing. It answers /health, serves every request, and
-    # silently applies no pin — so reusing it makes `cswap pin` report success
-    # forever while Remote Control sessions keep landing on the wrong account.
-    # Only the caller asking for a SPECIFIC fingerprint is spawning a pin, so
-    # only that caller recycles; a bare liveness probe still sees it.
-    if fingerprint is not None and st.get("unpinnable"):
-        return None
     port = int(st["port"])
     pid = int(st["pid"])
     try:
@@ -10370,9 +10428,18 @@ def _read_alive_port(certdir: Path, fingerprint: str | None = None) -> int | Non
     # Only an explicit False refuses: None is "it would not say", which must
     # read as healthy here for the same reason it does everywhere else in this
     # file — a busy daemon that misses the deadline must not be recycled on
-    # every launch.
-    if fingerprint is not None and _serving_can_pin(int(st["port"])) is False:
-        return None
+    # every launch. A terminal refresh rejection is different from an
+    # unreadable credential or a wedged daemon: a replacement would observe
+    # the same generation, while retaining this daemon lets a later login
+    # recover in place. It must be a complete, explicit health verdict; an
+    # unpinnable record with any other health result remains non-reusable.
+    if fingerprint is not None:
+        can_pin, terminal_reauth = _serving_pin_status(port)
+        terminal_failure = can_pin is False and terminal_reauth
+        if st.get("unpinnable") and not terminal_failure:
+            return None
+        if can_pin is False and not terminal_failure:
+            return None
     return int(st["port"])
 
 
@@ -12536,6 +12603,8 @@ def _watch_own_code(
             # own case, not as either verdict.
             _busy_s = _mint_lock_busy(_mint_provider) if _mint_provider else None
             blind = _can_mint(_mint_provider) is False
+            terminal_reauth = getattr(
+                _mint_provider, "terminal_reauth", False) is True
             now = time.time()
             if _busy_s is not None:
                 _note_mint_busy(_busy_s)
@@ -12553,7 +12622,8 @@ def _watch_own_code(
                         "the pinned token can be minted again — cleared the "
                         "unpinnable mark"
                     )
-            replace_for_blind = blind and blind_recycle_due(certdir, now)
+            replace_for_blind = (
+                blind and not terminal_reauth and blind_recycle_due(certdir, now))
             if (daemon_fingerprint() == own and not orphaned
                     and not replace_for_blind):
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
@@ -18306,11 +18376,17 @@ class PinProxy:
         # recycle instead of reusing (`ensure_proxy` reuses any daemon whose
         # fingerprint matches). `_read_alive_port` refuses ANY daemon
         # carrying this mark outright (`st.get("unpinnable")`), independent
-        # of `can_pin`.
-        try:
-            mark_daemon_unpinnable(self._certdir)
-        except Exception:  # noqa: BLE001 — advisory; never break a request
-            pass
+        # of `can_pin`. A confirmed terminal refresh rejection is excluded:
+        # a replacement cannot repair it, and the live daemon must observe a
+        # later login generation.
+        terminal_reauth = getattr(
+            getattr(self, "_pin_token_provider", None),
+            "terminal_reauth", False) is True
+        if not terminal_reauth:
+            try:
+                mark_daemon_unpinnable(self._certdir)
+            except Exception:  # noqa: BLE001 — advisory; never break a request
+                pass
         # THE HOLDER IS NOT RETIRED HERE, and the reason is measured. Doing
         # that manufactures the orphan condition on the very next tick, and the
         # orphan branch of the code watchdog has no backoff -- so a machine
@@ -18417,6 +18493,8 @@ class PinProxy:
         # carries the foreign state.
         pin_identity_mismatch = getattr(
             self._pin_token_provider, "identity_mismatch", None)
+        terminal_reauth = getattr(
+            self._pin_token_provider, "terminal_reauth", False) is True
         can_pin = (True if mint_stalled_s is not None
                    else _can_pin_from_cache(self._pin_token_provider))
         # WHAT EGRESS IS ACTUALLY DOING, not what it is configured to do.
@@ -18463,6 +18541,7 @@ class PinProxy:
              # behaviour is present need this one.
              "version": _own_version(),
              "can_pin": can_pin, "pin_identity_mismatch": pin_identity_mismatch,
+             "terminal_reauth": terminal_reauth,
              "egress": egress,
              # THE RESPONDING PROCESS'S OWN PID -- comparable against
              # proxy.json's `pid` (`holder_pid` above is NOT this: it is the

@@ -21062,7 +21062,8 @@ class TestAWedgeIsNotTrustedForever:
                 conn.close()
         threading.Thread(target=_accept_until_closed, daemon=True).start()
 
-        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+        monkeypatch.setattr(proxy, "_serving_pin_status",
+                            lambda *a, **k: (False, False))
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True)
@@ -21128,7 +21129,8 @@ class TestAWedgeIsNotTrustedForever:
                 conn.close()
         threading.Thread(target=_accept_until_closed, daemon=True).start()
 
-        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+        monkeypatch.setattr(proxy, "_serving_pin_status",
+                            lambda *a, **k: (False, False))
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True)
@@ -21196,7 +21198,8 @@ class TestAWedgeIsNotTrustedForever:
                 conn.close()
         threading.Thread(target=_accept_until_closed, daemon=True).start()
 
-        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+        monkeypatch.setattr(proxy, "_serving_pin_status",
+                            lambda *a, **k: (False, False))
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True)
@@ -21272,7 +21275,8 @@ class TestAWedgeIsNotTrustedForever:
                 conn.close()
         threading.Thread(target=_accept_until_closed, daemon=True).start()
 
-        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+        monkeypatch.setattr(proxy, "_serving_pin_status",
+                            lambda *a, **k: (False, False))
 
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir(parents=True)
@@ -21337,7 +21341,8 @@ class TestAWedgeIsNotTrustedForever:
                 conn.close()
         threading.Thread(target=_accept_until_closed, daemon=True).start()
 
-        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+        monkeypatch.setattr(proxy, "_serving_pin_status",
+                            lambda *a, **k: (False, False))
         monkeypatch.setattr(proxy, "_watchdog_had_its_turn", lambda *a: True)
 
         certdir = tmp_path / "pin-proxy"
@@ -21593,7 +21598,8 @@ class TestAWedgeIsNotTrustedForever:
 
         monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
         monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
-        monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+        monkeypatch.setattr(proxy, "_serving_pin_status",
+                            lambda *a, **k: (False, False))
 
         def _fake_kill_daemon(pid, cd=None, **k):
             # ESRCH: no signal delivered -- but someone ELSE already
@@ -22048,7 +22054,8 @@ class TestAWedgeIsNotTrustedForever:
 
             monkeypatch.setattr(proxy, "_read_alive_port", _fake_read_alive_port)
             monkeypatch.setattr(proxy, "_pin_daemon_pids", lambda cd: [stale_pid])
-            monkeypatch.setattr(proxy, "_serving_can_pin", lambda *a, **k: False)
+            monkeypatch.setattr(proxy, "_serving_pin_status",
+                                lambda *a, **k: (False, False))
 
             asked = []
             _real_kill = os.kill
@@ -29595,6 +29602,26 @@ class TestABlindHolderIsRetiredAndABlindDaemonIsNotReused:
         finally:
             srv.close()
 
+    def test_a_marked_terminal_reauth_daemon_is_reused(self, tmp_path):
+        """Only an explicit terminal health verdict overrides the mark."""
+        import json
+
+        from cswap_pin import proxy as pin_proxy
+
+        srv, port = self._health_server(
+            b'{"can_pin": false, "terminal_reauth": true}')
+        try:
+            cd = self._record(tmp_path, port)
+            state = cd / pin_proxy._STATE_FILE
+            record = json.loads(state.read_text())
+            record["unpinnable"] = True
+            state.write_text(json.dumps(record))
+            assert pin_proxy._read_alive_port(cd, fingerprint="FP") == port, (
+                "a terminal rejection was recycled despite its live daemon")
+            assert pin_proxy._serving_pin_status(port) == (False, True)
+        finally:
+            srv.close()
+
     def test_a_healthy_daemon_is_still_reused(self, tmp_path):
         """The control. Without it the test above passes on any refusal."""
         from cswap_pin import proxy as pin_proxy
@@ -30071,6 +30098,16 @@ class TestABlindDaemonRepairsItself:
         signalled, exited = self._drive(monkeypatch, tmp_path, lambda: "a-token")
         assert signalled == [] and exited == [], (
             "a HEALTHY pin was recycled on a timer")
+
+    def test_a_terminal_reauth_daemon_is_not_recycled(self, monkeypatch,
+                                                        tmp_path):
+        def terminal():
+            return None
+
+        terminal.terminal_reauth = True
+        signalled, exited = self._drive(monkeypatch, tmp_path, terminal)
+        assert signalled == [] and exited == [], (
+            "a terminal refresh rejection was recycled into the same result")
 
     def test_a_server_with_no_provider_is_left_alone(self, monkeypatch, tmp_path):
         """`_can_mint` answers None for a stand-in with no provider. Acting on
