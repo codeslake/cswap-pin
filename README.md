@@ -337,6 +337,14 @@ hop recorded at all, direct is simply the route. [Falling through a dead
 hop](#falling-through-a-dead-hop) says why `next` is asked while the first hop
 still answers.
 
+**A chain recorded outer-first is fixed by a re-pin.** If the first pin ran
+from a shell exporting the outer egress proxy, `upstream.json` holds it as
+`proxy` and the cache proxy in front of it is skipped. Re-pin with `cswap pin
+N` from the shell that exports the inner cache proxy: when that hop reports
+its own upstream as `https_proxy` on `GET /health`, and the recorded hop
+answers that request with a 4xx, the pin re-records the chain inner first.
+Only a re-pin does this; `--ensure` and `heal` never re-stamp the record.
+
 **Which certificates the pin itself checks.** Through a loopback hop the pin
 does not verify `api.anthropic.com`'s certificate: it trusts the local hop, the
 same way Claude Code trusts that hop's CA. Through a remote hop, or direct, it
