@@ -54,10 +54,8 @@ What it does not undo:
   yourself if you had them.
 - The proxy keeps running. A session that is already open had the pin's port
   fixed in its environment when it started, so it keeps going through the
-  proxy, now unpinned. And a daemon that restarts after `--clear` (a crash, an
-  upgrade) points `.claude.json` at itself again without checking that a pin
-  is still set, so new sessions can end up on the proxy again. So after
-  `--clear`, stop the proxy (below) once the last pinned session has closed.
+  proxy, now unpinned, and stopping the proxy would cut it. So stop the proxy
+  (below) once the last pinned session has closed.
 
 **By hand, when `cswap` itself will not run.** `<data>` below is cswap's data
 directory: `~/.local/share/claude-swap` on Linux (`$XDG_DATA_HOME/claude-swap`

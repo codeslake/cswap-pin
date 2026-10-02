@@ -19592,6 +19592,8 @@ class TestTheDaemonWatchesItsOwnCode:
         import claude_swap.paths as paths
         from cswap_pin import proxy as pin_proxy
 
+        # A PIN RECORD: a daemon wires only while one exists.
+        pin_proxy.save_pin(tmp_path, "a@b.c", "org")
         certdir, cfg, _ = self._live_daemon(
             tmp_path, monkeypatch, paths,
             cfg_text=json.dumps({"env": {"CSWAP_PIN_PORT": "41111"}}))
