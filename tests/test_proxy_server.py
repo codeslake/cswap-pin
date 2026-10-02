@@ -2254,6 +2254,129 @@ class TestLoopbackChainTrust:
             upstream.stop()
 
 
+class TestPinTimeHopTrust:
+    """T1612: `cswap pin N` makes ONE CONNECT to the API host through the
+    recorded hop, with the trust the daemon will use, and names the fix when
+    the hop re-signs with a CA nobody gave it.
+
+    A NON-LOOPBACK hop is what the daemon verifies through (`_upstream_ctx`);
+    a loopback one gets CERT_NONE, see
+    `case_relays_through_untrusted_loopback_mitm`. These cases empty
+    `_LOOPBACK` so a 127.0.0.1 fake stands in for a remote hop.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _mitm(tmp_path, signer=None):
+        """A CONNECT hop in front of an origin whose leaf `signer` signed: a
+        foreign CA (a MITM) by default, or the pin's own (a plain tunnel to
+        an origin the daemon trusts)."""
+        if signer is None:
+            signer = tmp_path / "foreign"
+            signer.mkdir()
+            ensure_ca(signer, "api.anthropic.com")
+        upstream = _FakeUpstream(signer)
+        return signer, upstream, _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+
+    def _verdict(self, certdir, tmp_path, monkeypatch, *, ca=None,
+                 remote=True, signer=None):
+        from cswap_pin import proxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        if remote:
+            monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        signer, upstream, hop = self._mitm(tmp_path, signer)
+        try:
+            proxy.write_upstream_hint(
+                certdir, f"http://127.0.0.1:{hop.port}",
+                str(signer / "ca.pem") if ca else None)
+            return proxy.hop_trust_problem(certdir), hop.port
+        finally:
+            hop.stop()
+            upstream.stop()
+
+    def case_a_mitm_hop_without_its_ca_names_the_fix(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        msg, port = self._verdict(certdir, tmp_path, monkeypatch)
+        assert msg and "NODE_EXTRA_CA_CERTS" in msg, msg
+        assert f"127.0.0.1:{port}" in msg, msg
+
+    def case_a_mitm_hop_with_its_ca_is_clean(self, certdir, tmp_path, monkeypatch):
+        msg, _ = self._verdict(certdir, tmp_path, monkeypatch, ca=True)
+        assert msg is None, msg
+
+    def case_a_plain_connect_proxy_is_clean(self, certdir, tmp_path, monkeypatch):
+        # The origin's own certificate comes through untouched, and it is one
+        # the daemon's context trusts.
+        msg, _ = self._verdict(certdir, tmp_path, monkeypatch, signer=certdir)
+        assert msg is None, msg
+
+    def case_a_loopback_mitm_is_clean_because_the_daemon_does_not_verify_it(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        msg, _ = self._verdict(certdir, tmp_path, monkeypatch, remote=False)
+        assert msg is None, msg
+
+    def case_no_proxy_is_no_check(self, certdir, monkeypatch):
+        from cswap_pin import proxy
+
+        def _no_dial(*a, **k):
+            raise AssertionError("dialled with no proxy recorded")
+
+        monkeypatch.setattr(proxy, "_dial_chain", _no_dial)
+        assert proxy.hop_trust_problem(certdir) is None
+
+    def case_a_hop_that_does_not_answer_is_reported_not_blamed_on_trust(
+        self, certdir, monkeypatch
+    ):
+        from cswap_pin import proxy
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead = probe.getsockname()[1]
+        probe.close()
+        monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        proxy.write_upstream_hint(certdir, f"http://127.0.0.1:{dead}")
+        msg = proxy.hop_trust_problem(certdir)
+        assert msg and f"127.0.0.1:{dead}" in msg, msg
+        assert "NODE_EXTRA_CA_CERTS" not in msg, msg
+
+    def case_a_running_daemon_trusts_a_ca_recorded_after_it_started(
+        self, certdir, tmp_path, monkeypatch
+    ):
+        """THE FIX TEXT MUST WORK ON A REUSED DAEMON. Re-running `cswap pin`
+        with the CA exported records it in upstream.json, and `ensure_proxy`
+        then reuses the daemon already serving, whose own environment never
+        had it. So the origin leg has to read the recorded CA per connection,
+        as the hop's own TLS (`_dial_chain`) already does."""
+        from cswap_pin import proxy
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+        monkeypatch.setattr(proxy, "_LOOPBACK", frozenset())
+        foreign, upstream, hop = self._mitm(tmp_path)
+        proxy.write_upstream_hint(
+            certdir, f"http://127.0.0.1:{hop.port}", str(foreign / "ca.pem"))
+        daemon = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", upstream.port),
+            rediscover_chain=True,
+        )
+        daemon.start()
+        try:
+            status = _request_through_proxy(
+                daemon.port, certdir / "ca.pem", "/v1/messages", bearer="t")
+        finally:
+            daemon.stop()
+            hop.stop()
+            upstream.stop()
+        assert status == 200
+
+
 class TestPortReclamationAcrossRespawn:
     """A respawn must come back on the SAME port. A live session's
     HTTPS_PROXY is fixed at exec, so a new port strands it on a dead

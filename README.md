@@ -656,6 +656,22 @@ The proxy generates its own CA to re-sign `api.anthropic.com` and names it in
 otherwise the session silently loses trust in every host the other proxy
 re-signs.
 
+**A remote proxy that intercepts TLS needs its CA.** When the pin chains
+through a proxy, `cswap pin N` makes one CONNECT to `api.anthropic.com` through
+it with the trust the daemon uses. If that proxy re-signs with a CA the pin was
+never given, it prints a line starting `PINNED REQUESTS WILL FAIL` with the fix:
+export the proxy's CA in `NODE_EXTRA_CA_CERTS` and re-run `cswap pin N`. The pin
+is set either way, and the daemon already serving picks the CA up on its next
+connection. A proxy that does not answer is reported, not fatal. A loopback
+proxy's certificate is not checked, because the daemon does not verify the
+origin through one.
+
+**Replace-class CA variables are handed back.** `SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` each replace a trust store, so the pin
+never writes them and removes them from the `env` block of `.claude.json` while
+it is wired. The values it removed are kept in the wiring receipt, and
+`cswap pin --clear` puts them back.
+
 **The proxy does not authenticate its callers, deliberately.** It listens on
 `127.0.0.1` only, so the population it could turn away is other processes
 running *as you* — and an earlier version did exactly that, with a secret file

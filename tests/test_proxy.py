@@ -9669,6 +9669,95 @@ class TestWireGlobalConfig:
         assert not ident_path.exists(), (
             "a clear that took left the old identity memo behind")
 
+    def case_wire_and_clear_hand_back_the_replace_class_ca_vars(
+        self, tmp_path, monkeypatch
+    ):
+        """T1612: wiring REMOVES SSL_CERT_FILE, REQUESTS_CA_BUNDLE and
+        CURL_CA_BUNDLE, so the receipt must carry them and the clear must put
+        them back verbatim. Before, they were dropped from the receipt too
+        and a `--clear` left the user without the trust store they set."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        user = {"SSL_CERT_FILE": "/etc/corp/ssl.pem",
+                "REQUESTS_CA_BUNDLE": "/etc/corp/requests.pem",
+                "CURL_CA_BUNDLE": "/etc/corp/curl.pem"}
+        path = self._config(tmp_path, monkeypatch,
+                            {"env": dict(user, KEEP_ME="1")})
+        backup = Path(tmp_path)
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        # A config we never wired is not ours to heal: an unwire there (a
+        # `--clear` with nothing pinned) must leave the user's values alone.
+        assert pin_proxy.wire_global_config(None, None) is False
+        assert json.loads(path.read_text())["env"] == dict(user, KEEP_ME="1")
+
+        ca = Path(tmp_path) / "pin-proxy" / "ca.pem"
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: (9955, ca))
+        pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1")
+        for _ in range(2):  # a re-wire must carry the receipt forward
+            assert pin_proxy.wire_global_config(9955, ca) is True
+            env = json.loads(path.read_text())["env"]
+            assert not set(user) & set(env), env
+            saved = pin_proxy._read_ledger(path, {})[
+                f"{pin_proxy._WIRE_MARK}Saved"]
+            assert {k: saved.get(k) for k in user} == user, saved
+
+        pin_proxy.apply_pin(_Sw(), None, None)
+        assert json.loads(path.read_text())["env"] == dict(user, KEEP_ME="1")
+
+    def case_a_pin_written_ca_var_is_removed_not_handed_back(
+        self, tmp_path, monkeypatch
+    ):
+        """An older cswap-pin wrote SSL_CERT_FILE as its own merged bundle in
+        the cert dir. One whose receipt was lost reads like the user's, and
+        handing it back after the clear would narrow python's trust to that
+        bundle on a machine with no pin."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        ca = Path(tmp_path) / "pin-proxy" / "ca.pem"
+        path = self._config(tmp_path, monkeypatch, {"env": {
+            "SSL_CERT_FILE": str(ca.parent / "ca-bundle.pem")}})
+        assert pin_proxy.wire_global_config(9955, ca) is True
+        assert pin_proxy.wire_global_config(None, None) is True
+        assert "SSL_CERT_FILE" not in json.loads(path.read_text()).get("env", {})
+
+    def case_apply_pin_reports_an_untrusted_hop_and_still_pins(
+        self, tmp_path, monkeypatch
+    ):
+        """The verdict is printed, not enforced: the proxy IS serving, which
+        is what `apply_pin` reports, and a launcher may supply the CA at the
+        first launch. The check runs only when a proxy is serving."""
+        from pathlib import Path
+        from cswap_pin import proxy as pin_proxy
+
+        self._config(tmp_path, monkeypatch, {})
+        backup = Path(tmp_path)
+
+        class _Sw:
+            backup_dir = backup
+            def resolve_account(self, identifier):
+                return ("2", "pin@example.com", "org-1")
+
+        lines = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+        monkeypatch.setattr(pin_proxy, "hop_trust_problem",
+                            lambda certdir: "THE HOP LINE")
+        monkeypatch.setattr(pin_proxy, "ensure_proxy",
+                            lambda sw: (9955, backup / "ca.pem"))
+        assert pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1") is True
+        assert "THE HOP LINE" in lines
+
+        lines.clear()
+        monkeypatch.setattr(pin_proxy, "ensure_proxy", lambda sw: None)
+        assert pin_proxy.apply_pin(_Sw(), "pin@example.com", "org-1") is False
+        assert "THE HOP LINE" not in lines
+
     def case_apply_pin_clear_survives_a_lock_it_cannot_take(self, tmp_path, monkeypatch):
         """`wire_global_config` takes the `.claude.json` lock on a 5s budget
         and, when it cannot get it, degrades to "skip the write" and RETURNS
