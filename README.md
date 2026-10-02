@@ -133,7 +133,8 @@ No cloud account pinned
 - **`--python 3.12`**, because claude-swap needs 3.12 or newer and without the
   flag uv takes whichever interpreter it finds first. Under a narrowed `PATH`
   that was a 3.11, and the install failed. With the flag uv uses a 3.12 it
-  finds, or downloads one. Any 3.12+ works: `--python 3.13`, or a path to an
+  finds, or downloads one (under `env -i` it downloaded 3.12.14 and the line
+  above installed cleanly). Any 3.12+ works: `--python 3.13`, or a path to an
   interpreter.
 - **Already have claude-swap as a uv tool?** If its interpreter is 3.12 or
   newer, reuse it, so whatever already runs `cswap` keeps the same runtime:
@@ -212,7 +213,7 @@ N` (and `cswap run`). Export these there:
   re-signs TLS.
 
 What it learned goes into `upstream.json`, in the directory `cswap pin
---get_certdir` prints:
+--get_certdir` prints (the first successful pin creates it):
 
 | key | holds | learned from |
 | :-- | :-- | :-- |
@@ -273,8 +274,8 @@ No accounts are managed yet.
 No active Claude account found. Please log in first.
 ```
 
-Log in with `claude` and let cswap pick the account up (`cswap list` shows the
-numbers), then, in a shell that exports your chain (see [Proxy
+Log in with `claude`, add that account with `cswap add` (`cswap list` shows
+the numbers), then, in a shell that exports your chain (see [Proxy
 chains](#proxy-chains)):
 
 ```bash
