@@ -230,7 +230,8 @@ class _RecordingChain:
 def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
                            bearer: "str | None" = None,
                            ua: str | None = None, body: str = "{}",
-                           extra_headers: "dict[str, str] | None" = None):
+                           extra_headers: "dict[str, str] | None" = None,
+                           method: str = "POST"):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
     trusting the proxy's CA. Returns the response status.
 
@@ -251,7 +252,7 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
         headers["User-Agent"] = ua
     if extra_headers:
         headers.update(extra_headers)
-    conn.request("POST", path, body=body, headers=headers)
+    conn.request(method, path, body=body, headers=headers)
     resp = conn.getresponse()
     resp.read()
     conn.close()
@@ -16493,6 +16494,313 @@ class TestAMisroutedSwapCannotKillASession:
             up.stop()
         assert up.auths_seen == ["Bearer disk-token"], (
             f"a non-pinned route must never retry on refusal: {up.auths_seen}")
+
+
+class TestThePolicyQuestionIsNeverAnsweredAsAnotherAccount:
+    """CC 2.1.286 TEARS DOWN EVERY CONNECTED REMOTE CONTROL BRIDGE when its
+    org-policy verdict turns to an explicit `allow_remote_control` deny, and a
+    FAILED fetch of `/api/claude_code/policy_limits` keeps CC on its cached
+    verdict or the document on disk, so a request this daemon cannot answer as
+    the pin must not be answered as the ACTIVE account: that account's org may
+    deny. A failed or deferred mint, and a pinned token that is still refused
+    after the refetch, answer a local 503 on this ONE route. A pin that is
+    cleared, or that IS the live login, has nothing to swap and keeps relaying
+    on the session's own bearer."""
+
+    POLICY = "/api/claude_code/policy_limits"
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _provider(self, certdir, monkeypatch, token=lambda n: "",
+                  pinned=True, active="1", busy=False):
+        """A REAL provider over a store whose n-th read answers `token(n)`
+        ("" is an unreadable credential, "expired" an expired one).
+        `pinned=False` is a CLEARED pin; `active="2"` makes the pinned slot
+        the live login; `busy` makes the refresh gate answer `consume-busy`
+        (a deferral)."""
+        import cswap_pin.proxy as pp
+
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        reads = []
+
+        class _Sw:
+            backup_dir = certdir
+
+            def current_account_number(self):
+                return active
+
+            def _get_sequence_data(self):
+                return {"activeAccountNumber": active}
+
+            def read_account_credentials(self, n, e):
+                reads.append(n)
+                t = token(len(reads))
+                if not t:
+                    return ""
+                return json.dumps({"claudeAiOauth": {
+                    "accessToken": t, "refreshToken": "rt",
+                    "expiresAt": 1 if t == "expired" else 4102444800000}})
+
+            def resolve_account(self, i):
+                return ("2", "pin@example.com", "org")
+
+        if busy:
+            from claude_swap.oauth import RefreshOutcome
+            _Sw.consume_backup_grant = lambda self, n, e, snap: \
+                RefreshOutcome(None, "consume-busy")
+        if pinned:
+            pp.save_pin(certdir, "pin@example.com", "org")
+        return pp.make_pin_token_provider(_Sw(), "2", "pin@example.com")
+
+    def _ask(self, certdir, provider, path=None, lines=None,
+             reject=("pin-token",), reject_status=403):
+        """One GET of `path` (the policy route by default) with the session's
+        own bearer through a real daemon; `(status, bearers the upstream
+        saw)`. `lines` collects the lifecycle log."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        upstream = _FakeUpstream(certdir, reject_bearer=set(reject),
+                                 reject_status=reject_status)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                         upstream=("127.0.0.1", upstream.port))
+        real_log = pp._log_lifecycle
+        if lines is not None:
+            pp._log_lifecycle = lines.append
+        proxy.start()
+        try:
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", path or self.POLICY,
+                bearer="session-bearer", method="GET", body=None)
+            return status, list(upstream.auths_seen)
+        finally:
+            proxy.stop()
+            upstream.stop()
+            pp._log_lifecycle = real_log
+
+    def case_a_failed_mint_answers_503_in_every_form_of_the_route(
+            self, certdir, monkeypatch):
+        """Nothing may leave on the session's bearer, bare, with a query, or
+        with a trailing slash (`is_pinned_route`'s own normalisation). THE
+        CONTROL, same daemon state: another pinned route still falls open."""
+        for path in (self.POLICY, self.POLICY + "?x=1", self.POLICY + "/"):
+            lines = []
+            status, seen = self._ask(
+                certdir, self._provider(certdir, monkeypatch), path, lines)
+            assert status == 503 and seen == [], (
+                f"{path}: a failed mint was relayed as the active account: "
+                f"{status} {seen}")
+            assert any(f"GET {path} refused (503)" in ln
+                       and "org-policy" in ln for ln in lines), lines
+        status, seen = self._ask(
+            certdir, self._provider(certdir, monkeypatch),
+            "/api/oauth/validate")
+        assert status == 200 and seen == ["Bearer session-bearer"], (
+            f"another route must still fail open: {status} {seen}")
+
+    def case_a_deferred_mint_answers_503(self, certdir, monkeypatch):
+        """`consume-busy` (another process holds the slot) yields no token
+        and `pin_is_noop()` reads True, but the answer would still be the
+        ACTIVE account's verdict on a pin that is neither cleared nor the
+        live login."""
+        provider = self._provider(
+            certdir, monkeypatch, lambda n: "expired", busy=True)
+        status, seen = self._ask(certdir, provider)
+        assert provider.pin_is_noop() is True  # the deferral was real
+        assert status == 503 and seen == [], (status, seen)
+
+    def case_a_cleared_pin_and_the_live_login_still_relay(
+            self, certdir, monkeypatch):
+        """Nothing to swap, so the session's own bearer IS the right one."""
+        for name, kw in (("cleared", {"pinned": False}),
+                         ("live login", {"active": "2"})):
+            status, seen = self._ask(
+                certdir, self._provider(certdir, monkeypatch, **kw))
+            assert status == 200 and seen == ["Bearer session-bearer"], (
+                f"{name}: {status} {seen}")
+
+    def case_a_minted_token_still_swaps(self, certdir, monkeypatch):
+        """THE CONTROL: the pin answers as the pin."""
+        status, seen = self._ask(
+            certdir,
+            self._provider(certdir, monkeypatch, lambda n: "pin-token"),
+            reject=())
+        assert status == 200 and seen == ["Bearer pin-token"], (status, seen)
+
+    def case_a_pin_token_still_refused_after_the_refetch_answers_503(
+            self, certdir, monkeypatch):
+        """The take-back must not resend the policy question as the active
+        account: `dead` (no rotation) and `rotated` (a refetch that is
+        refused too). THE CONTROL, same daemon: another pinned route still
+        resends on the session's own bearer and logs `fell-back`."""
+        for name, token, expect in (
+                ("dead", lambda n: "pin-token", ["Bearer pin-token"]),
+                ("rotated", lambda n: "pin-token" if n == 1 else "fresh",
+                 ["Bearer pin-token", "Bearer fresh"])):
+            provider = self._provider(certdir, monkeypatch, token)
+            lines = []
+            status, seen = self._ask(
+                certdir, provider, lines=lines, reject=("pin-token", "fresh"))
+            assert status == 503 and seen == expect, (
+                f"{name}: the refused pin token was resent as another "
+                f"account: {status} {seen}")
+            assert any(f"GET {self.POLICY} refused (503)" in ln
+                       for ln in lines), (name, lines)
+            assert not any("fell-back" in ln and "policy_limits" in ln
+                           for ln in lines), (name, lines)
+            # ONCE: the refusal is one event, and the take-back used to log it
+            # twice (`swap refused ... not resent` and `refused (503)`).
+            assert len([ln for ln in lines if "policy_limits" in ln
+                        and "retried-fresh" not in ln]) == 1, (name, lines)
+            lines.clear()
+            status, seen = self._ask(
+                certdir, provider, "/api/oauth/validate", lines,
+                reject=("pin-token", "fresh"))
+            assert status == 200 and seen[-1] == "Bearer session-bearer", (
+                name, status, seen)
+            assert ("swap refused (403) on GET /api/oauth/validate: "
+                    "fell-back") in lines, (name, lines)
+
+    def _ask_absolute(self, certdir, provider, path=None, lines=None,
+                      reject=("pin-token",)):
+        """The absolute-form twin of `_ask` (`claude remote-control`'s own
+        form): one GET of `path` with the session's own bearer through a real
+        daemon and a recording hop that refuses every bearer in `reject`;
+        `(the reply's first bytes, the requests the hop saw)`."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(
+            lambda req: (b"HTTP/1.1 403 X\r\nContent-Length: 0\r\n\r\n"
+                         if any(f"Bearer {b}".encode() in req for b in reject)
+                         else b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+        real_log = pp._log_lifecycle
+        if lines is not None:
+            pp._log_lifecycle = lines.append
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir, pin_token_provider=provider,
+                             rediscover_chain=True)
+            proxy.start()
+            c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            try:
+                c.sendall(
+                    f"GET https://api.anthropic.com{path or self.POLICY} "
+                    "HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                    "Authorization: Bearer session-bearer\r\n\r\n"
+                    .encode("latin1"))
+                got = c.recv(256)
+            finally:
+                c.close()
+            return got, list(chain.seen)
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
+            pp._log_lifecycle = real_log
+
+    def case_an_absolute_form_failed_or_deferred_mint_answers_503(
+            self, certdir, monkeypatch):
+        """The MITM rule, on the path `claude remote-control` uses: nothing
+        may leave on the session's bearer, bare, with a query or with a
+        trailing slash, for a failed mint or a deferred one. THE CONTROL,
+        same daemon state: another pinned route still falls open."""
+        for path in (self.POLICY, self.POLICY + "?x=1", self.POLICY + "/"):
+            lines = []
+            got, seen = self._ask_absolute(
+                certdir, self._provider(certdir, monkeypatch), path, lines)
+            assert got.startswith(b"HTTP/1.1 503") and seen == [], (
+                f"{path}: a failed mint was relayed as the active account: "
+                f"{got[:40]!r} {seen}")
+            assert any(f"GET {path} refused (503)" in ln
+                       and "org-policy" in ln for ln in lines), lines
+        got, seen = self._ask_absolute(
+            certdir, self._provider(certdir, monkeypatch, lambda n: "expired",
+                                    busy=True))
+        assert got.startswith(b"HTTP/1.1 503") and seen == [], (
+            f"a deferred mint was relayed: {got[:40]!r} {seen}")
+        got, seen = self._ask_absolute(
+            certdir, self._provider(certdir, monkeypatch),
+            "/api/oauth/validate")
+        assert got.startswith(b"HTTP/1.1 200") and len(seen) == 1 \
+            and b"Bearer session-bearer" in seen[0], (
+            f"another route must still fail open: {got[:40]!r} {seen}")
+
+    def case_an_absolute_form_pin_token_refused_answers_503_without_a_resend(
+            self, certdir, monkeypatch):
+        """The take-back's last send is the session's own bearer, which
+        answers the policy question as the ACTIVE account: `dead` (no
+        rotation) and `rotated` (a refetch refused too). Only pin bearers
+        may reach the hop and the refusal is one log line. THE CONTROL, same
+        daemon: another pinned route still resends and logs `fell-back`."""
+        for name, token, expect in (
+                ("dead", lambda n: "pin-token", [b"Bearer pin-token"]),
+                ("rotated", lambda n: "pin-token" if n == 1 else "fresh",
+                 [b"Bearer pin-token", b"Bearer fresh"])):
+            provider = self._provider(certdir, monkeypatch, token)
+            lines = []
+            got, seen = self._ask_absolute(
+                certdir, provider, lines=lines, reject=("pin-token", "fresh"))
+            assert got.startswith(b"HTTP/1.1 503"), (name, got[:40])
+            assert len(seen) == len(expect) and all(
+                e in r for e, r in zip(expect, seen)) and not any(
+                b"session-bearer" in r for r in seen), (
+                f"{name}: the refused pin token was resent as another "
+                f"account: {seen}")
+            assert len([ln for ln in lines if "policy_limits" in ln
+                        and "retried-fresh" not in ln]) == 1, (name, lines)
+            lines.clear()
+            got, seen = self._ask_absolute(
+                certdir, provider, "/api/oauth/validate", lines,
+                reject=("pin-token", "fresh"))
+            assert got.startswith(b"HTTP/1.1 200") and (
+                b"Bearer session-bearer" in seen[-1]), (name, got[:40], seen)
+            assert ("swap refused (403) on GET /api/oauth/validate: "
+                    "fell-back") in lines, (name, lines)
+
+    def case_an_absolute_form_cleared_pin_and_live_login_still_relay(
+            self, certdir, monkeypatch):
+        """THE CONTROL: nothing to swap, so the session's own bearer is the
+        right one on this path too."""
+        for name, kw in (("cleared", {"pinned": False}),
+                         ("live login", {"active": "2"})):
+            got, seen = self._ask_absolute(
+                certdir, self._provider(certdir, monkeypatch, **kw))
+            assert got.startswith(b"HTTP/1.1 200") and len(seen) == 1 \
+                and b"Bearer session-bearer" in seen[0], (name, got[:40], seen)
+
+    def case_a_policy_503_does_not_silence_a_following_blind_mint_line(
+            self, certdir):
+        """`_refuse_stalled_mint`'s line is rate-limited, and the blind-mint
+        one it writes for a bridge create is load-bearing (a respawning
+        worker would otherwise log one per respawn). An hourly policy 503
+        burst shares none of that budget: its own slot, still limited."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import PinProxy
+
+        class Tls:
+            def sendall(self, _b):
+                pass
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        lines = []
+        real_log = pp._log_lifecycle
+        pp._log_lifecycle = lines.append
+        try:
+            proxy._refuse_stalled_mint(Tls(), "GET", self.POLICY, "policy")
+            proxy._refuse_stalled_mint(
+                Tls(), "POST", "/v1/environments/bridge", "blind")
+            proxy._refuse_stalled_mint(Tls(), "GET", self.POLICY, "policy")
+            proxy._refuse_stalled_mint(
+                Tls(), "POST", "/v1/environments/bridge", "blind")
+        finally:
+            pp._log_lifecycle = real_log
+        assert lines == [
+            f"GET {self.POLICY} refused (503): policy",
+            "POST /v1/environments/bridge refused (503): blind"], lines
 
 
 class TestEverySmallCaseHolder:

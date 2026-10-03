@@ -1499,32 +1499,100 @@ class TestLiveRemoteControlSessions:
             "govern a session whose requests go out as the pin")
         assert json.loads((cfg / "policy-limits.json").read_text()) == allows
 
+    def _sweep_provider(self, tmp_path, state):
+        """A REAL provider that mints nothing, in one of three states:
+        `cleared` (the pin was cleared), `live login` (the pinned slot IS the
+        login) or `failed` (an unreadable credential: a pin that should have
+        answered and could not)."""
+        from cswap_pin import proxy as pin_proxy
+
+        sw = _FakeSwitcher(active_num="2" if state == "live login" else "1",
+                           roster_active="2" if state == "live login" else "1")
+        sw.backup_dir = tmp_path
+        if state == "cleared":
+            pin_proxy.save_pin(tmp_path, None, None)
+        else:
+            pin_proxy.save_pin(tmp_path, "pin@example.com", "org")
+        sw.resolve_account = lambda i: ("2", "pin@example.com", "org")
+        return pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
     def case_with_no_pin_the_active_account_still_answers(
         self, tmp_path, monkeypatch
     ):
         """THE CONTROL for the case above. An unpinned machine has only one
         account, so its answer is the right one — the pin must not become a
-        precondition for repairing the file at all."""
+        precondition for repairing the file at all. A pin that IS the live
+        login has the same one account, so it answers the same way."""
+        from cswap_pin import proxy as pin_proxy
+
+        for state in ("cleared", "live login"):
+            cfg = tmp_path / state.replace(" ", "-")
+            cfg.mkdir()
+            asked = []
+            doc = {"restrictions": {}, "compliance_taints": []}
+
+            def fake(token):
+                asked.append(token)
+                return doc
+
+            monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                                lambda: cfg)
+            monkeypatch.setattr(pin_proxy, "policy_limits_for", fake)
+            monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                                lambda: "active-token")
+
+            daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+            daemon._pin_token_provider = self._sweep_provider(tmp_path, state)
+            assert daemon.sweep_policy_once() is True, state
+            assert asked == ["active-token"], (state, asked)
+
+    def case_a_failed_mint_makes_the_sweep_fetch_nothing_and_write_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """A PIN THAT SHOULD ANSWER AND CANNOT MUST NOT HAND THE QUESTION TO
+        THE ACTIVE ACCOUNT. The sweep writes its answer to the machine-wide
+        file with a stamp CC admits, and CC 2.1.286 tears every live bridge
+        down on an explicit `allow_remote_control` deny, so another org's deny
+        written here is adopted on any failed fetch. "A fetch that fails
+        changes nothing" (411680a): nothing goes on the wire, and the pin's
+        own document stays on disk. Driven through the REAL
+        `policy_limits_for`: the wire is what is asserted, not a stub's
+        argument."""
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
         cfg.mkdir()
-        asked = []
-        doc = {"restrictions": {}, "compliance_taints": []}
+        pin_doc = {"restrictions": {"allow_remote_control": {"allowed": True}}}
+        (cfg / "policy-limits.json").write_text(json.dumps(pin_doc))
+        wire = []
 
-        def fake(token):
-            asked.append(token)
-            return doc
+        class _Deny:
+            def read(self):
+                return json.dumps({"restrictions": {
+                    "allow_remote_control": {"allowed": False}}}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout=None, context=None):
+            wire.append(req.get_header("Authorization"))
+            return _Deny()
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
-        monkeypatch.setattr(pin_proxy, "policy_limits_for", fake)
         monkeypatch.setattr(pin_proxy, "_active_oauth_token",
                             lambda: "active-token")
+        monkeypatch.setattr(pin_proxy, "_verifying_context", lambda: None)
+        monkeypatch.setattr(pin_proxy.urllib.request, "urlopen", urlopen)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
-        daemon._pin_token_provider = lambda: None
-        assert daemon.sweep_policy_once() is True
-        assert asked == ["active-token"]
+        daemon._pin_token_provider = self._sweep_provider(tmp_path, "failed")
+        assert daemon._pin_token_provider() is None  # the mint did fail
+        assert daemon.sweep_policy_once() is False
+        assert wire == [], f"the sweep asked as another account: {wire}"
+        assert json.loads((cfg / "policy-limits.json").read_text()) == pin_doc
 
     def case_the_policy_fetch_trusts_the_pins_own_certificate(
         self, monkeypatch
@@ -10228,6 +10296,270 @@ class TestEnsureProxy:
             f"spawn path: port={port} spawned={spawned}"
         )
 
+    def case_a_held_current_code_daemon_with_a_live_watchdog_is_not_signalled(
+            self, tmp_path, monkeypatch):
+        """T1598, T1681: `repin_current` -> `ensure_proxy` read a held,
+        current-code daemon that reached the stale arm (marked `unpinnable`,
+        or unmarked with `/health` saying `can_pin: false`) as "nothing is
+        serving" and TERMed it. On the capped signal drain that closes every
+        held CONNECT tunnel, and under a holder the TERM gains nothing (the
+        holder respawns on the same socket): the daemon's own watchdog is the
+        gapless repair, for the mark and for a false `can_pin` alike, so the
+        mark is NOT a clause. A REAL daemon (`PinProxy`), because `/health`
+        naming the recorded pid and carrying the watchdog's beat is half the
+        condition. ONE ROW PER CLAUSE of the early return: the fingerprint,
+        the daemon's OWN parent being the holder (not merely some holder for
+        the certdir), the ONE `/health` answer naming the recorded pid with no
+        mint stall past `_MINT_STALL_WEDGE_S`, and a watchdog beat no older
+        than `_CODE_WATCH_BEAT_MAX_AGE_S` (a watchdog that died while the
+        daemon kept serving repairs nothing). Each other row must still
+        recycle exactly once; a STALL, unmarked or marked, is one (the
+        watchdog never replaces on a busy mint lock)."""
+        import json
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+        fp = pin_proxy.daemon_fingerprint("2", "pin@example.com")
+        me = os.getpid()
+        signalled, spawned = [], []
+        real_probe = pin_proxy._health_probe
+        max_age = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+
+        def answers(**body):
+            """A `/health` round trip's raw bytes carrying ``body``."""
+            raw = b"HTTP/1.0 200 OK\r\n\r\n" + json.dumps(body).encode()
+            return lambda p, timeout=1.0: raw
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [me])
+        monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+        daemon_env = {}  # the recorded daemon's environment, key -> value
+
+        def read_daemon_env(pid, key):
+            assert pid == me, f"read the environment of pid {pid}, not the daemon's"
+            return daemon_env.get(key)
+        monkeypatch.setattr(pin_proxy, "_daemon_env_value", read_daemon_env)
+        # Every row reaches the stale arm: a marked one through the mark, an
+        # unmarked one through `/health` saying `can_pin: false` or a stall.
+        monkeypatch.setattr(
+            pin_proxy, "_serving_can_pin", lambda p, timeout=1.0: False)
+        monkeypatch.setattr(
+            pin_proxy, "_kill_daemon",
+            lambda pid, *a, **k: signalled.append(pid) or True)
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon",
+            lambda a, e, c, **kw: spawned.append(a) or 9955)
+
+        def expect(label, want, fingerprint=fp, *, mark=True, parent=4242,
+                   owns=False, health=real_probe, beat=0.0):
+            """`parent` is `_wedged_parent_holder`'s answer, `owns` is
+            `_holder_owns`'s (any holder for the certdir). `beat` is the age
+            in seconds of the real daemon's last watchdog beat, None for a
+            daemon whose watchdog never beat."""
+            signalled.clear()
+            spawned.clear()
+            live.__dict__.pop("_code_watch_beat", None)
+            if beat is not None:
+                live._code_watch_beat = time.monotonic() - beat
+            pin_proxy.write_daemon_state(certdir, live.port, me, fingerprint)
+            if mark:
+                pin_proxy.mark_daemon_unpinnable(certdir)
+            assert bool(pin_proxy.read_daemon_state(certdir).get("unpinnable")) is mark
+            monkeypatch.setattr(pin_proxy, "_wedged_parent_holder", lambda p, cd: parent)
+            monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: owns)
+            monkeypatch.setattr(pin_proxy, "_health_probe", health)
+            port = pin_proxy.ensure_proxy(self._Sw(tmp_path))[0]
+            assert (port, signalled, spawned) == want, (
+                f"{label}: port={port} signalled={signalled} spawned={spawned}")
+
+        try:
+            expect("a held current-code unpinnable daemon was replaced from "
+                   "here", (live.port, [], []))
+            expect("CONTROL: a stale fingerprint under a holder stopped "
+                   "recycling", (live.port, [me], []), "OTHER-FINGERPRINT")
+            expect("CONTROL: an unheld unpinnable daemon stopped recycling",
+                   (9955, [me], ["2"]), parent=None)
+            # An UNMARKED daemon is the same arm's other entrant (a fresh blind
+            # successor starts unmarked; a cold token reads `can_pin: false`):
+            # its watchdog settles both, and a TERM from here cuts them.
+            expect("an unmarked current-code held daemon whose `/health` "
+                   "says can_pin false was replaced from here",
+                   (live.port, [], []), mark=False,
+                   health=answers(pid=me, can_pin=False, code_watch_age_s=1.0))
+            expect("CONTROL: an unmarked stall stopped recycling",
+                   (live.port, [me], []), mark=False,
+                   health=answers(
+                       pid=me, can_pin=True, code_watch_age_s=1.0,
+                       mint_stalled_s=pin_proxy._MINT_STALL_WEDGE_S + 1))
+            # A dead watchdog repairs nothing: its beat is the only sign of one.
+            expect("CONTROL: a watchdog beat older than the bound stopped "
+                   "recycling", (live.port, [me], []), beat=max_age + 1)
+            expect("CONTROL: a watchdog that never beat stopped recycling",
+                   (live.port, [me], []), beat=None)
+            expect("CONTROL: an older daemon whose `/health` has no beat "
+                   "field stopped recycling", (live.port, [me], []),
+                   health=answers(pid=me, can_pin=False))
+            expect("CONTROL: another holder for the certdir is not this "
+                   "daemon's holder", (live.port, [me], []),
+                   parent=None, owns=True)
+            # A wedged loop cannot answer `/health` as the recorded pid.
+            expect("CONTROL: a held daemon that does not answer stopped "
+                   "recycling", (live.port, [me], []),
+                   health=lambda p, timeout=1.0: None)
+            expect("CONTROL: `/health` answering another pid stopped "
+                   "recycling", (live.port, [me], []),
+                   health=answers(pid=me + 1, code_watch_age_s=0.0))
+            # The mark stays and, on a busy mint lock, `can_pin` is None (not
+            # blind), so the watchdog repairs neither: this call must.
+            expect("CONTROL: a MARKED daemon in a mint stall past the wedge "
+                   "stopped recycling", (live.port, [me], []),
+                   health=answers(
+                       pid=me, code_watch_age_s=0.0,
+                       mint_stalled_s=pin_proxy._MINT_STALL_WEDGE_S + 1))
+            # `heal` and `ensure_proxy` are a direct instruction, which the
+            # switch must not refuse: with the watchdog off nobody else repairs.
+            # THE DAEMON'S switch, not the caller's: the watchdog and the
+            # holder read their OWN exec-time environment. The daemon here is
+            # this very process, so the stub is the only thing telling the two
+            # environments apart.
+            daemon_env[pin_proxy._SELF_HEAL_ENV] = "OFF"
+            expect("CONTROL: with the DAEMON's self-heal switch off (the "
+                   "caller's unset) the leave-alone row stopped recycling",
+                   (live.port, [me], []))
+            daemon_env.clear()
+            monkeypatch.setenv(pin_proxy._SELF_HEAL_ENV, "off")
+            expect("the caller's own switch, off, recycled a daemon whose "
+                   "watchdog is on and would hand it over gaplessly",
+                   (live.port, [], []))
+        finally:
+            live.stop(drain=0)
+
+    def case_a_health_body_that_is_not_an_object_is_no_answer(
+            self, monkeypatch):
+        """`_health_body` is typed `dict | None`; a JSON list or number would
+        make the caller's `health.get` raise under the spawn lock."""
+        from cswap_pin import proxy as pin_proxy
+
+        for body, want in ((b"[1]", None), (b"7", None), (b"{", None),
+                           (b'{"pid": 1}', {"pid": 1})):
+            monkeypatch.setattr(
+                pin_proxy, "_health_probe",
+                lambda p, timeout=1.0, raw=b"HTTP/1.0 200 OK\r\n\r\n" + body: raw)
+            assert pin_proxy._health_body(1) == want, body
+
+    def case_a_real_health_carries_the_watchdogs_beat_age_and_every_tick_moves_it(
+            self, tmp_path):
+        """T1681: `/health` publishes `code_watch_age_s`, the seconds since
+        `_watch_own_code` last beat on the server: `null` for a daemon whose
+        watchdog never ran, set at THREAD START (a daemon younger than one
+        interval must pass `ensure_proxy`'s liveness clause) and again on every
+        tick. The real watchdog on a real `PinProxy`, the ticks gated by the
+        test so no interval is slept; each reading is taken with the beat
+        first aged by hand, so only the stamp under test can bring it down."""
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+
+        class Gate:
+            """A `done` whose `wait` parks until the test lets one tick run."""
+            def __init__(self):
+                self.parked, self.go, self.stop = (
+                    threading.Event(), threading.Event(), False)
+
+            def wait(self, _interval):
+                self.parked.set()
+                self.go.wait(10)
+                self.go.clear()
+                return self.stop
+
+            def set(self):
+                self.stop = True
+
+        def age():
+            return pin_proxy._health_body(live.port)["code_watch_age_s"]
+        gate = Gate()
+        t = threading.Thread(target=pin_proxy._watch_own_code, args=(
+            live, "1", "a@b.c", certdir, gate, lambda *a: None),
+            kwargs={"interval": 0.01,
+                    "_own_fingerprint": pin_proxy.daemon_fingerprint()})
+        try:
+            assert age() is None, "a daemon with no watchdog reported a beat"
+            t.start()
+            assert gate.parked.wait(10), "the watchdog never reached its first wait"
+            first = age()
+            assert first is not None and first < 5, (
+                f"no beat at thread start: age={first}")
+            gate.parked.clear()
+            live._code_watch_beat -= 1000
+            assert age() > 900
+            gate.go.set()
+            assert gate.parked.wait(10), "the watchdog never finished its tick"
+            second = age()
+            assert second is not None and second < 5, (
+                f"a tick did not beat: age={second}")
+        finally:
+            gate.stop = True
+            gate.go.set()
+            if t.ident is not None:
+                t.join(10)
+            live.stop(drain=0)
+        assert not t.is_alive()
+
+    def case_a_watchdog_that_returned_leaves_no_beat(self, tmp_path):
+        """T1681: a watchdog that RETURNS while the daemon keeps serving (the
+        holder did not survive the ask, the handovers ran out, an exception)
+        repairs nothing, so its last stamp must not be trusted for the whole
+        `_CODE_WATCH_BEAT_MAX_AGE_S` after it: the beat is cleared on every
+        way out, `/health` then answering `null` (dead) at once. A normal
+        end, and one by an exception out of the loop."""
+        import threading
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        fp = pin_proxy.daemon_fingerprint()
+
+        def run(done):
+            srv = types.SimpleNamespace()
+            try:
+                pin_proxy._watch_own_code(
+                    srv, "1", "a@b.c", certdir, done, lambda *a: None,
+                    interval=0.01, _own_fingerprint=fp)
+            except RuntimeError:
+                pass
+            return srv
+
+        done = threading.Event()
+        done.set()
+        srv = run(done)
+        assert hasattr(srv, "_code_watch_beat"), "premise: the watchdog beat"
+        assert srv._code_watch_beat is None, (
+            "a watchdog that ended still reads alive for the beat's whole age")
+
+        class Boom:
+            def wait(self, _interval):
+                raise RuntimeError("the loop died")
+
+        srv = run(Boom())
+        assert hasattr(srv, "_code_watch_beat"), "premise: the watchdog beat"
+        assert srv._code_watch_beat is None, (
+            "a watchdog that died on an exception still reads alive")
+
 
 
 
@@ -15680,7 +16012,7 @@ print("OK", port)
             # reaches this only on the branch where it would otherwise have
             # gone back to sleep.
             pin_proxy._watch_own_code(
-                None, "1", "a@b.c", tmp_path, stop,
+                types.SimpleNamespace(), "1", "a@b.c", tmp_path, stop,
                 lambda *a: None, interval=0.01,
                 _own_fingerprint=pin_proxy.daemon_fingerprint(),
             )
@@ -15730,7 +16062,7 @@ print("OK", port)
         threading.Timer(1.5, stop.set).start()
         try:
             pin_proxy._watch_own_code(
-                None, "1", "a@b.c", tmp_path, stop,
+                types.SimpleNamespace(), "1", "a@b.c", tmp_path, stop,
                 lambda *a: None, interval=0.01,
                 _own_fingerprint=pin_proxy.daemon_fingerprint(),
             )
@@ -15827,7 +16159,7 @@ print("OK", port)
         threading.Timer(1.0, stop.set).start()
         try:
             pin_proxy._watch_own_code(
-                None, "1", "a@b.c", tmp_path, stop,
+                types.SimpleNamespace(), "1", "a@b.c", tmp_path, stop,
                 lambda *a: None, interval=0.01,
                 _own_fingerprint=pin_proxy.daemon_fingerprint(),
             )
@@ -19084,6 +19416,34 @@ class TestTheDaemonWatchesItsOwnCode:
             "nothing calls is exactly the 22h outage this release fixes"
         )
 
+    def case_daemon_main_stamps_the_beat_before_it_publishes(self):
+        """T1681: `proxy.json` is what a concurrent launch finds a daemon by,
+        and it then asks `/health`. The watchdog thread stamps the beat only
+        once it starts, after `ensure_wired_to` (seconds), so a fresh blind
+        successor answered `code_watch_age_s: null` for that long and a
+        concurrent `ensure_proxy` read it as a dead watchdog and TERMed it.
+        The beat is stamped before the record is written. READ OFF THE PARSE
+        TREE: the property is an ordering."""
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy as pin_proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+        stamp = [n.lineno for n in ast.walk(tree)
+                 if isinstance(n, ast.Assign)
+                 and any(getattr(t, "attr", None) == "_code_watch_beat"
+                         for t in n.targets)]
+        publish = [n.lineno for n in ast.walk(tree)
+                   if isinstance(n, ast.Call)
+                   and getattr(n.func, "id", None) == "write_daemon_state"]
+        assert stamp and publish, (
+            f"the scan is broken: stamp={stamp} publish={publish}")
+        assert min(stamp) < min(publish), (
+            f"the beat is stamped at line {min(stamp)}, after the record is "
+            f"published at line {min(publish)}")
+
     def case_the_watchdog_is_handed_the_account_and_email_in_that_order(self):
         """The AST test above proves the thread STARTS, not that it is handed
         the right arguments. Swapping `account_num` and `email` in the `args=`
@@ -21900,6 +22260,41 @@ class TestAWedgeIsNotTrustedForever:
             "CONTROL: an earlier argv token naming a decoy pid was trusted "
             "over the real trailing environment value"
         )
+
+    def case_a_daemons_own_env_value_is_read_from_its_environment(
+            self, monkeypatch):
+        """T1598: `_daemon_env_value` reads ONE value of a pid's exec-time
+        environment, absent or unreadable as None, on /proc and on the
+        ``ps eww`` fallback (whose last anchored token wins, see
+        `_ps_env_token`). A real subprocess: nothing in THIS process's
+        `os.environ` can fake it."""
+        import subprocess
+        import sys
+
+        from cswap_pin import proxy
+
+        key = proxy._SELF_HEAL_ENV
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            env={**os.environ, key: "off"})
+        try:
+            # exec closes Popen's error pipe a moment BEFORE the kernel fills
+            # in the environment block, so a first read can be empty: poll.
+            deadline = time.monotonic() + 5
+            while (time.monotonic() < deadline
+                   and proxy._daemon_env_value(child.pid, key) is None):
+                time.sleep(0.02)
+            assert proxy._daemon_env_value(child.pid, key) == "off"
+            assert proxy._daemon_env_value(child.pid, key + "_X") is None
+            assert proxy._daemon_env_value(999_999_999, key) is None
+            with monkeypatch.context() as no_proc_mp:
+                self._no_proc(no_proc_mp)
+                assert proxy._daemon_env_value(child.pid, key) == "off", (
+                    "the ps fallback did not read the real environment")
+                assert proxy._daemon_env_value(999_999_999, key) is None
+        finally:
+            child.kill()
+            child.wait(timeout=5)
 
     def case_a_standby_promoted_in_place_still_qualifies_as_the_holder(
             self, tmp_path):

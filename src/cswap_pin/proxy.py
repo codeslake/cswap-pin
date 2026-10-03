@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import datetime as _dt
+import functools
 import glob
 import inspect
 import itertools
@@ -3174,6 +3175,19 @@ def _is_cc_axios_ua(ua: str) -> bool:
     return bool(ua) and ua.lstrip().lower().startswith("axios/")
 
 
+def _is_policy_route(path: str) -> bool:
+    """CC's org-policy question, bare or with a query (`is_pinned_route`'s
+    own normalisation)."""
+    return path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits"
+
+
+# WHY a policy 503 says it, on the MITM and the absolute-form path alike.
+_POLICY_NO_MINT = ("the org-policy question needs the pinned token and none "
+                   "could be minted; no other account answers it")
+_POLICY_REFUSED = ("the pinned token was refused ({code}) on the org-policy "
+                   "question; no other account answers it")
+
+
 def is_pinned_route(path: str, ua: str = "") -> bool:
     """Whether a request path's bearer must be swapped to the pinned account.
 
@@ -3284,7 +3298,7 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     # prevent. EXACT MATCH, not an ``/api/claude_code/`` prefix, for the same
     # reason validate is: nothing else known under that subtree is decided by
     # ownership, and a prefix would swap routes nobody has looked at.
-    if path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits":
+    if _is_policy_route(path):
         return True
     # Bridge attachments: CC fetches `/api/oauth/files/<uuid>/content` with the
     # OAuth bearer and renders any non-200 as "could not be downloaded". The
@@ -6360,7 +6374,15 @@ def repin_current(switcher) -> bool:
     ``return ensure_proxy(switcher) is not None``, and `ensure_proxy` reads the
     daemon record WITH a fingerprint -- the read an `unpinnable` daemon answers
     "nothing is serving" to. So it spawns a successor, and a successor born
-    somewhere that CAN read the credential mints again.
+    somewhere that CAN read the credential mints again. EXCEPT under a held
+    daemon on current code with a live watchdog: there `ensure_proxy` wires
+    the port and leaves the replacement to the daemon's own watchdog
+    (`replace_for_blind`, backed off up to `_BLIND_RECYCLE_MAX_S`), because a
+    TERM from here cuts the open tunnels and the holder respawns it anyway. A
+    current-code daemon reaches that arm only through the `unpinnable` mark or
+    a false `can_pin`, both of which the watchdog settles. With the DAEMON's
+    `CSWAP_PIN_SELF_HEAL` off (its own environment, not this caller's), or its
+    watchdog not beating, nothing repairs it, so `ensure_proxy` recycles.
 
     Returns False on anything unexpected. A repair that raises is worse than a
     pin that stays broken: it takes down whatever asked for it.
@@ -7384,6 +7406,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             # it records into proxy.json permanently, so one lost race would
             # condemn a healthy daemon for good.
             return True
+        return pin_stands_down()
+
+    def pin_stands_down() -> bool:
+        """True when the pin is cleared or IS the live login: the bearer a
+        request already carries is the right one. NOT a deferred refresh, which
+        `pin_is_noop` also counts: that one has a token owed and not yet in
+        hand, so a caller that must never answer as another account (the
+        org-policy question) refuses it."""
         target = _current_target()
         if target is None:
             return True  # pin cleared: leaving every bearer alone IS the job
@@ -7457,6 +7487,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
 
     provider.refetch = refetch
     provider.pin_is_noop = pin_is_noop
+    provider.pin_stands_down = pin_stands_down
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
@@ -7583,6 +7614,18 @@ def _pin_is_noop(provider) -> bool:
     """
     try:
         return bool(getattr(provider, "pin_is_noop", None) and provider.pin_is_noop())
+    except Exception:
+        return False
+
+
+def _pin_stands_down(provider) -> bool:
+    """Whether the pin is cleared or IS the live login (`pin_stands_down`),
+    False for a provider without the hook: a bare test callable is a pin that
+    simply failed to mint, which is the safe reading for the org-policy
+    question."""
+    try:
+        return bool(getattr(provider, "pin_stands_down", None)
+                    and provider.pin_stands_down())
     except Exception:
         return False
 
@@ -7755,6 +7798,54 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # wiring is rewritten to it — degraded, but nobody else's process
         # gets killed. The same blind spot already bounds the orphan sweep.
         if stale and int(stale["pid"]) in _pin_daemon_pids(certdir):
+            # A HELD DAEMON ON CURRENT CODE THAT STILL ANSWERS AS ITSELF, WITH
+            # A LIVE WATCHDOG, IS NOT OURS TO SIGNAL. The TERM takes the CAPPED
+            # signal drain, which never waits on tunnels, so every held CONNECT
+            # channel is cut (measured: ConnectionResetError on the one held
+            # tunnel), and under a holder it gains nothing, the holder
+            # respawning on the same socket (see `_recycle_daemon`). The
+            # daemon's own watchdog is the repair: `replace_for_blind` asks the
+            # holder for a successor and drains UNCAPPED (gapless), or clears a
+            # false mark. A current-code daemon reaches this arm only through
+            # the `unpinnable` mark or a false `can_pin`, both of which the
+            # watchdog settles, so the mark is not a clause. So wire and leave
+            # it. A holder that never claimed the replace channel
+            # (`_holder_pid()` None) gets the capped drain and exit 75 instead,
+            # and is left alone on purpose: a TERM from here cuts now AND the
+            # blind successor's own watchdog cuts again, so leaving it costs one
+            # cut, not two. With the DAEMON's self-heal switch OFF the
+            # watchdog repairs nothing, and `ensure_proxy` is a direct
+            # instruction (see `_watch_own_code`): the path below runs. THE
+            # DAEMON'S, read from its own exec-time environment like the
+            # watchdog and the holder read it, never this caller's
+            # `os.environ`; absent or unreadable reads as on, so it is left
+            # alone.
+            # A LIVE WATCHDOG IS READ, NOT ASSUMED: `_watch_own_code` can
+            # return on an exception (or after `_HANDOVER_ATTEMPTS` failed
+            # handovers) while the daemon keeps serving, and then nothing
+            # repairs it. `/health`'s `code_watch_age_s` is its beat; null or
+            # absent (an older daemon) reads as dead.
+            # A missing clause takes the path below: a STALL, unmarked or
+            # marked (the watchdog never replaces on a busy mint lock, nor
+            # clears the mark there), a stale FINGERPRINT, a daemon whose OWN
+            # parent is not the holder (`_holder_owns` is only "some holder
+            # exists"; an unheld watchdog never repairs current code), one
+            # whose `/health` does not name its pid (wedged), one whose
+            # watchdog beat is stale or absent (an older daemon).
+            if ((_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
+                 or "").lower() not in ("off", "0", "no")
+                    and stale.get("fingerprint") == fp
+                    and isinstance(stale.get("port"), int)
+                    and _wedged_parent_holder(
+                        int(stale["pid"]), certdir) is not None
+                    and (health := _health_body(stale["port"])) is not None
+                    and health.get("pid") == int(stale["pid"])
+                    and not _mint_stalled(health)
+                    and isinstance(beat_age := health.get("code_watch_age_s"),
+                                   (int, float))
+                    and beat_age <= _CODE_WATCH_BEAT_MAX_AGE_S):
+                wire_global_config(stale["port"], ca)
+                return stale["port"], ca
             # Save the port BEFORE the kill: the daemon unlinks its own state
             # on TERM, so afterwards there is nothing left to reclaim from and
             # the successor would take a fresh port — stranding every session
@@ -8155,12 +8246,51 @@ def _wedged_daemon_can_be_asked(pid: int, holder_pid: int) -> bool:
     guess.
     """
     try:
-        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        env = _proc_environ(pid)
     except OSError:
         return _wedged_env_via_ps(pid, holder_pid)
-    env = dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
     return (env.get(_HOLDER_REPLACE_ENV.encode()) == b"1"
             and env.get(_HELD_BY_ENV.encode()) == str(holder_pid).encode())
+
+
+def _proc_environ(pid: int) -> "dict[bytes, bytes]":
+    """The exec-time environment snapshot of ``pid`` as a dict (the last
+    duplicate wins). OSError when it cannot be read."""
+    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    return dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
+
+
+def _ps_env_token(out: str, key: str) -> "str | None":
+    """``key``'s value on a ``ps eww`` line, or None.
+
+    ANCHORED, NOT A BARE SUBSTRING -- `ps eww`'s output is a command line,
+    not a dict, and `f"{KEY}={v}" in out` reads `CSWAP_PIN_HELD_BY=90` as
+    present inside `CSWAP_PIN_HELD_BY=901`. Matched as a whole token, the
+    same exact equality the `_proc_environ` dict path already gets.
+
+    THE LAST MATCH, NOT THE FIRST -- `ps eww` appends the process's own
+    ENVIRONMENT after its ARGV on the same line, and a token that merely
+    looks like the marker can occur inside the command line itself before
+    the real environment assignment that follows it. `re.search` returns
+    whichever comes first, which is that argv token; the real value is
+    the trailing one. Same reading `runtime_health.py` uses for this
+    exact shape.
+    """
+    matches = re.findall(rf"(?:^|\s){re.escape(key)}=(\S*)", out)
+    return matches[-1] if matches else None
+
+
+def _daemon_env_value(pid: int, key: str) -> "str | None":
+    """One exec-time environment value of the daemon ``pid`` -- what ITS
+    code reads, not the caller's -- or None when absent or unreadable.
+    `_proc_environ` first, ``ps eww`` where there is no /proc: the same two
+    readings `_wedged_daemon_can_be_asked` takes."""
+    try:
+        value = _proc_environ(pid).get(key.encode())
+        return None if value is None else value.decode("utf-8", "replace")
+    except OSError:
+        out = _ps_out(["ps", "eww", "-o", "command=", "-p", str(pid)])
+        return None if out is None else _ps_env_token(out, key)
 
 
 def _wedged_env_via_ps(pid: int, holder_pid: int) -> bool:
@@ -8178,24 +8308,8 @@ def _wedged_env_via_ps(pid: int, holder_pid: int) -> bool:
             f"ps could not read {pid}'s environment -- falling back to the "
             "ordinary TERM path")
         return False
-    # ANCHORED, NOT A BARE SUBSTRING -- `ps eww`'s output is a command line,
-    # not a dict, and `f"{KEY}={v}" in out` reads `CSWAP_PIN_HELD_BY=90` as
-    # present inside `CSWAP_PIN_HELD_BY=901`. Matched as a whole token, the
-    # same exact equality the `/proc/<pid>/environ` dict path already gets.
-    #
-    # THE LAST MATCH, NOT THE FIRST -- `ps eww` appends the process's own
-    # ENVIRONMENT after its ARGV on the same line, and a token that merely
-    # looks like the marker can occur inside the command line itself before
-    # the real environment assignment that follows it. `re.search` returns
-    # whichever comes first, which is that argv token; the real value is
-    # the trailing one. Same reading `runtime_health.py` uses for this
-    # exact shape.
-    def _token(key: str) -> "str | None":
-        matches = re.findall(rf"(?:^|\s){re.escape(key)}=(\S*)", out)
-        return matches[-1] if matches else None
-
-    return (_token(_HELD_BY_ENV) == str(holder_pid)
-            and _token(_HOLDER_REPLACE_ENV) == "1")
+    return (_ps_env_token(out, _HELD_BY_ENV) == str(holder_pid)
+            and _ps_env_token(out, _HOLDER_REPLACE_ENV) == "1")
 
 
 def _pin_daemon_pids(certdir: Path) -> list[int]:
@@ -10415,13 +10529,34 @@ def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
             body = json.loads(parts[1])
         except ValueError:
             return None  # a real, if malformed, answer -- not silence
-        held = body.get("mint_stalled_s")
-        if isinstance(held, (int, float)) and held > _MINT_STALL_WEDGE_S:
+        if _mint_stalled(body):
             return False
         val = body.get("can_pin")
         return val if isinstance(val, bool) else None
     # Every attempt connected and none produced an answer.
     return False
+
+
+def _mint_stalled(body: dict) -> bool:
+    """Does this ``/health`` body report a mint stall past the wedge bound?"""
+    held = body.get("mint_stalled_s")
+    return isinstance(held, (int, float)) and held > _MINT_STALL_WEDGE_S
+
+
+def _health_body(port: int, timeout: float = 1.0) -> dict | None:
+    """The parsed ``/health`` body on ``port``, or None if it did not answer.
+
+    One round trip for a caller that reads several fields of ONE answer
+    (`ensure_proxy`'s held-daemon return: the pid and `_mint_stalled`).
+    """
+    buf = _health_probe(port, timeout)
+    if not buf or b"\r\n\r\n" not in buf:
+        return None
+    try:
+        body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 def _health_pid(port: int, timeout: float = 1.0) -> int | None:
@@ -10442,14 +10577,7 @@ def _health_pid(port: int, timeout: float = 1.0) -> int | None:
     when `_pid_alive` has already said no, so a miss here just leaves that
     answer standing rather than mattering to a wedge verdict.
     """
-    buf = _health_probe(port, timeout)
-    if not buf or b"\r\n\r\n" not in buf:
-        return None
-    try:
-        body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
-    except ValueError:
-        return None
-    pid = body.get("pid")
+    pid = (_health_body(port, timeout) or {}).get("pid")
     return pid if isinstance(pid, int) else None
 
 
@@ -12536,12 +12664,34 @@ def _release_daemon_state(certdir: Path) -> bool:
 
 
 _CODE_WATCH_INTERVAL_S = 30.0
+# THE OLDEST WATCHDOG BEAT A CALLER MAY TRUST. `_watch_own_code` stamps the
+# server each tick and `/health` publishes its age (`code_watch_age_s`); a
+# watchdog that returned on an exception while the daemon kept serving stops
+# beating and repairs nothing. Three intervals: a tick that ran long, or one
+# missed beat, must not read as a dead thread.
+_CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
 # Consecutive failed handovers before the watchdog stops trying. A ceiling on
 # NEVER-SUCCEEDING, not on total recycles: a daemon that hands over cleanly and
 # later goes stale again starts from zero.
 _HANDOVER_ATTEMPTS = 5
 
 
+def _beat_ends_with_the_watchdog(watch):
+    """A watchdog that RETURNED (the holder did not survive the ask, the
+    handovers ran out, an exception) repairs nothing, so the beat it leaves
+    must not read alive for `_CODE_WATCH_BEAT_MAX_AGE_S` after it: cleared on
+    every way out, so `/health` answers `null` at once. A decorator rather
+    than a `try` around the loop, which would re-indent all of it."""
+    @functools.wraps(watch)
+    def run(server, *args, **kwargs):
+        try:
+            return watch(server, *args, **kwargs)
+        finally:
+            setattr(server, "_code_watch_beat", None)
+    return run
+
+
+@_beat_ends_with_the_watchdog
 def _watch_own_code(
     server,
     account_num: str,
@@ -12614,9 +12764,14 @@ def _watch_own_code(
     # returns from this function instead of exiting. A second SIGUSR1 is
     # therefore never reachable: the process asking is gone, or this watcher
     # is, before a second tick could ask again.
+    # THE BEAT `/health` PUBLISHES as `code_watch_age_s`, stamped once here so
+    # a daemon younger than one interval passes, and at the top of every tick.
+    # A thread that returned or died stops stamping.
+    setattr(server, "_code_watch_beat", time.monotonic())
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
     while not done.wait(interval):
+        setattr(server, "_code_watch_beat", time.monotonic())
         # ONE EXIT, TAKEN ON EVERY PATH. 0.1.27 had three exits and one of them
         # took neither: `_spawn_daemon` RAISING (fork() EAGAIN under a post-
         # deploy herd) landed in the guard below, which logged and returned
@@ -13880,6 +14035,11 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
         rediscover_chain=True,
     )
+    # BORN BEATING. `/health` publishes this as `code_watch_age_s`, and the
+    # watchdog thread stamps it only once it starts, after `ensure_wired_to`
+    # (seconds): a concurrent launch that found this daemon through the record
+    # below read `null` as a dead watchdog and TERMed a fresh successor.
+    proxy._code_watch_beat = time.monotonic()
     proxy.start()
     # `_OWN_FINGERPRINT`, NOT a fresh read. This record is an IDENTITY — it is
     # what `runtime_health`, a deploy check or a human answers "is the running
@@ -15318,9 +15478,17 @@ class PinProxy:
         process's cache, and `/remote-control` refused for hours on sessions
         pinned to an account the server placed no restriction on. Two accounts
         in different orgs is the pin's whole purpose, not an edge case.
+
+        THE ACTIVE ACCOUNT ANSWERS ONLY WHERE IT IS THE PIN'S ANSWER TOO: the
+        pin is cleared or IS the live login. A pin that cannot mint asks
+        nothing and writes nothing -- CC 2.1.286 tears every live bridge down
+        on an explicit deny, and a failed fetch keeps CC on this very file, so
+        another org's deny written here is adopted.
         """
+        provider = self._pin_token_provider
         doc = policy_limits_for(
-            self._pin_token_provider() or _active_oauth_token())
+            provider() or (_active_oauth_token()
+                           if _pin_stands_down(provider) else None))
         if not isinstance(doc, dict):
             return False
         path = _config_home_for_policy() / "policy-limits.json"
@@ -17205,7 +17373,8 @@ class PinProxy:
         # THE ACTIVE BEARER WHEN THE PIN IS THE ACTIVE ACCOUNT. The provider
         # answers None then -- there is nothing to swap -- but that token IS
         # the pin's, and the uuid check below is what keeps a foreign answer
-        # out. Same fallback `sweep_policy_once` makes.
+        # out. `sweep_policy_once` makes this fallback only while the pin
+        # stands down (`_pin_stands_down`); here it is safe unconditionally.
         provider_token = self._pin_token_provider()
         # ONLY A provider()-SOURCED TOKEN FEEDS THE MINT-TIME STATE below,
         # via `note_verdict`: the `_active_oauth_token()` fallback answers
@@ -18428,11 +18597,17 @@ class PinProxy:
         mint, via ``_BlindMintRefusal``); ``None`` keeps the original
         stalled-store wording, which is the only cause this used to answer
         for.
+
+        THE ORG-POLICY ROUTE HAS ITS OWN COOLDOWN SLOT: its 503 repeats for as
+        long as the pin cannot mint, and sharing the budget would let that
+        burst swallow the next blind-mint line above.
         """
         now = time.monotonic()
-        last = getattr(self, "_stall_refused_at", None)
+        slot = ("_policy_refused_at" if _is_policy_route(path)
+                else "_stall_refused_at")
+        last = getattr(self, slot, None)
         if last is None or now - last >= _BUSY_REPORT_COOLDOWN_S:
-            self._stall_refused_at = now
+            setattr(self, slot, now)
             _log_lifecycle(
                 f"{method} {path} refused (503): "
                 + (reason if reason else
@@ -18631,6 +18806,7 @@ class PinProxy:
         # bare `getppid()` instead would name an unrelated process as the
         # holder of a socket it has never heard of.
         holder_pid = os.getppid() if held_by_a_holder() else None
+        code_watch_beat = getattr(self, "_code_watch_beat", None)
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
              # THE VERSION THE LIVE PROCESS IS RUNNING, which is not what the
@@ -18667,7 +18843,13 @@ class PinProxy:
              # Never CALLS the provider; reads the field its last real mint
              # attempt already left set (blank on a live or no-op pin).
              "blind_reason": getattr(
-                 self._pin_token_provider, "blind_reason", "") or None}
+                 self._pin_token_provider, "blind_reason", "") or None,
+             # ADDITIVE: seconds since `_watch_own_code` last beat on this
+             # server, `null` if it never did. The only sign a caller has that
+             # the watchdog it is leaving a repair to is still running.
+             "code_watch_age_s": (
+                 None if code_watch_beat is None
+                 else round(time.monotonic() - code_watch_beat, 1))}
         )
         try:
             conn.sendall(
@@ -18844,6 +19026,14 @@ class PinProxy:
                 ) and self._pin_token_provider.mint_stalled():
                     self._refuse_stalled_mint(conn, method, rel, close=True)
                     return False
+                # THE MITM PATH'S ORG-POLICY RULE, FOR THE SAME REASON (see
+                # the note above its own call): a failed or deferred mint
+                # answers 503, never the session's bearer.
+                if token is None and _is_policy_route(rel) \
+                        and not _pin_stands_down(self._pin_token_provider):
+                    self._refuse_stalled_mint(
+                        conn, method, rel, _POLICY_NO_MINT, close=True)
+                    return False
                 token = self._wait_for_pin_token(method, rel, token)
                 if token and any(h.split(":", 1)[0].strip().lower()
                                  == "authorization" for h in headers):
@@ -19018,6 +19208,17 @@ class PinProxy:
             for hdrs, retry in _swap_attempts():
                 if hdrs is None:
                     break
+                if pending_refusal is not None and not retry \
+                        and _is_policy_route(rel):
+                    # THE ORG-POLICY QUESTION NEVER FALLS BACK (the MITM
+                    # take-back's rule): the last attempt would be the
+                    # session's own bearer, so the pin's refusal is a local
+                    # 503 instead, and the refusal's own line is the one log.
+                    self._refuse_stalled_mint(
+                        conn, method, rel,
+                        _POLICY_REFUSED.format(code=pending_refusal),
+                        close=True)
+                    return False
                 if pending_refusal == 401 and artifact and not retry:
                     # T1596: the last attempt is the pin's own, and a 401
                     # from it is answered 403 here, not sent again.
@@ -19284,6 +19485,20 @@ class PinProxy:
                     self._pin_token_provider, "mint_stalled", None
             ) and self._pin_token_provider.mint_stalled():
                 return self._refuse_stalled_mint(tls, method, path)
+            # THE ORG-POLICY QUESTION IS NEVER ANSWERED AS ANOTHER ACCOUNT.
+            # CC 2.1.286 tears every connected bridge down when its verdict
+            # turns to an explicit `allow_remote_control` deny, and a FAILED
+            # fetch keeps CC on its cached or on-disk verdict, so a failed or
+            # deferred mint answers 503 here rather than relaying on the
+            # session's bearer, whose org may deny. A cleared pin or one that
+            # IS the live login has nothing to swap and still relays below.
+            # ponytail: a cache-less cold start then refuses only a NEW
+            # /remote-control ("Couldn't verify"), never a live bridge;
+            # accepted, since the fall-open's cost is cutting live sessions.
+            if token is None and _is_policy_route(path) \
+                    and not _pin_stands_down(self._pin_token_provider):
+                return self._refuse_stalled_mint(
+                    tls, method, path, _POLICY_NO_MINT)
             token = self._wait_for_pin_token(method, path, token)
             if token:
                 # NESTED, NOT A SINGLE `and` (T1193). A token that resolved
@@ -19514,11 +19729,21 @@ class PinProxy:
                     # Every other pinned route keeps the take-back (4e8fcd3).
                     artifact = is_artifact_route(clean_path)
                     as_403 = artifact and keep.code == 401
-                    self._note_swap_refused(
-                        keep.code, method, clean_path,
-                        "relayed as the pin as 403" if as_403 else
-                        "relayed as the pin" if artifact else "fell-back")
-                    if as_403:
+                    # THE ORG-POLICY QUESTION NEVER FALLS BACK EITHER: the same
+                    # rule as the failed mint above, so the pin's refusal is
+                    # a local 503, not a resend on the session's bearer. ONE
+                    # LOG LINE: the refusal's own, which carries the code.
+                    policy = _is_policy_route(clean_path)
+                    if not policy:
+                        self._note_swap_refused(
+                            keep.code, method, clean_path,
+                            "relayed as the pin as 403" if as_403 else
+                            "relayed as the pin" if artifact else "fell-back")
+                    if policy:
+                        keep = self._refuse_stalled_mint(
+                            tls, method, path,
+                            _POLICY_REFUSED.format(code=keep.code))
+                    elif as_403:
                         keep = self._artifact_403(tls, close=False)
                     else:
                         keep = self._forward(
