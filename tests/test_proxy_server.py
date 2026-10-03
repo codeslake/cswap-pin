@@ -19138,7 +19138,8 @@ class TestClaudeCodesUsageRequestsAreCounted:
     """
 
     LIVE = "live-token"
-    IDENT = {"3": ("acct3@example.com", "")}
+    EARLIER = "slot-1-stored-token"
+    IDENT = {"3": ("acct3@example.com", ""), "1": ("acct1@example.com", "")}
     BODY = {
         "five_hour": {"utilization": 41.0, "resets_at": "2099-01-01T00:00:00Z"},
         "seven_day": {"utilization": 97.0, "resets_at": "2099-01-05T00:00:00Z"},
@@ -19183,9 +19184,13 @@ class TestClaudeCodesUsageRequestsAreCounted:
             pass
 
     class _Switcher:
-        def __init__(self, store, ident):
+        def __init__(self, store, ident, tokens):
             self.store = store
             self.ident = ident
+            self.tokens = tokens
+
+        def slot_for_access_token(self, token):
+            return self.tokens.get(token)
 
         def answer_client_usage(self, num, variant):
             if num not in self.ident:
@@ -19195,19 +19200,25 @@ class TestClaudeCodesUsageRequestsAreCounted:
         def record_client_usage(self, num, variant, **kw):
             return self.store.record_client_usage(num, self.ident, variant, **kw)
 
-    def _wire(self, tmp_path, monkeypatch, live_token=LIVE, live_slot="3"):
-        """A proxy whose live account is slot 3 on token `LIVE`, a real usage
-        store, and a log collector. Returns (proxy, store, log)."""
+    def _wire(self, tmp_path, monkeypatch, tokens=None):
+        """A proxy whose stand-in switcher stores token `LIVE` under slot 3
+        (the live account) and `EARLIER` under slot 1 (an account a session
+        can still hold after a switch), a real usage store, and a log
+        collector. Returns (proxy, store, log)."""
         from claude_swap import switcher as host_switcher
         from claude_swap.usage_store import UsageStore
         from cswap_pin import proxy as pp
         from cswap_pin.proxy import PinProxy
 
         store = UsageStore(tmp_path / "cache")
-        sw = self._Switcher(store, self.IDENT)
+        if tokens is None:
+            tokens = {self.LIVE: "3", self.EARLIER: "1"}
+        sw = self._Switcher(store, self.IDENT, tokens)
         monkeypatch.setattr(host_switcher, "ClaudeAccountSwitcher", lambda: sw)
-        monkeypatch.setattr(pp, "_live_account_slot", lambda: live_slot)
-        monkeypatch.setattr(pp, "_active_oauth_token", lambda: live_token)
+        # The live account is not how a request is charged: a live slot or
+        # token answering something else must change nothing.
+        monkeypatch.setattr(pp, "_live_account_slot", lambda: "3")
+        monkeypatch.setattr(pp, "_active_oauth_token", lambda: self.LIVE)
         log: list[str] = []
         monkeypatch.setattr(pp, "_log_lifecycle", log.append)
         proxy = PinProxy(certdir=tmp_path, pin_token_provider=lambda: None,
@@ -19253,8 +19264,8 @@ class TestClaudeCodesUsageRequestsAreCounted:
         return json.loads(sent.partition(b"\r\n\r\n")[2])
 
     @staticmethod
-    def _row(store):
-        return json.loads(store.path.read_text())["accounts"]["3"]
+    def _row(store, num="3"):
+        return json.loads(store.path.read_text())["accounts"][num]
 
     def case_a_forwarded_request_is_counted_and_its_body_kept(
         self, tmp_path, monkeypatch,
@@ -19378,12 +19389,38 @@ class TestClaudeCodesUsageRequestsAreCounted:
         assert "reason cap" in log[0], log
         assert "answered the stored body, 2" in log[0], log
 
-    def case_a_request_on_a_token_that_is_not_live_goes_uncounted(
+    def case_a_stored_token_of_another_account_charges_that_account(
         self, tmp_path, monkeypatch,
     ):
-        """Asserts: a bearer that is not the live token is forwarded as it
+        """Asserts: a bearer cswap stores under slot 1 while slot 3 is live
+        (a session still on the account it started on) is charged to slot 1:
+        the attempt and body land in slot 1's row, slot 3's row is never
+        written, the next plain request on it is served from slot 1's row,
+        and nothing is logged."""
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+        sent, up = self._request(proxy, monkeypatch,
+                                 upstream=self._FakeUpstream(self._reply()),
+                                 auth="Bearer " + self.EARLIER)
+        assert up is not None
+        assert sent.startswith(b"HTTP/1.1 200"), sent[:40]
+        rows = json.loads(store.path.read_text())["accounts"]
+        assert "3" not in rows, rows.keys()
+        assert len(rows["1"]["attempts"]) == 1
+        assert rows["1"]["usageBodies"]["plain"]["body"] == self.BODY
+        sent, up = self._request(proxy, monkeypatch, upstream=None,
+                                 auth="Bearer " + self.EARLIER)
+        assert up is None
+        assert self._body_of(sent) == self.BODY
+        assert len(self._row(store, "1")["attempts"]) == 1
+        assert log == [], log
+
+    def case_a_token_no_account_stores_goes_uncounted(
+        self, tmp_path, monkeypatch,
+    ):
+        """Asserts: a bearer no stored account holds is forwarded as it
         arrived (its Accept-Encoding untouched), nothing is recorded, and a
-        WARNING says it went uncounted."""
+        WARNING says it went uncounted because it matches no stored
+        account's token."""
         proxy, store, log = self._wire(tmp_path, monkeypatch)
         up = self._FakeUpstream(self._reply())
         sent, dialed = self._request(proxy, monkeypatch, upstream=up,
@@ -19392,17 +19429,44 @@ class TestClaudeCodesUsageRequestsAreCounted:
         assert b"gzip, br" in up.sent, up.sent[:300]
         assert sent.startswith(b"HTTP/1.1 200"), sent[:40]
         assert not store.path.exists()
-        assert len(log) == 1 and "forwarded uncounted" in log[0], log
+        assert len(log) == 1, log
+        assert log[0] == (
+            "WARNING usage request (plain) forwarded uncounted: its bearer "
+            "matches no stored account's token, so no account's hourly "
+            "budget can be charged for it"), log
 
-    def case_no_live_slot_goes_uncounted(self, tmp_path, monkeypatch):
-        """Asserts: with no live slot known the request is forwarded and the
-        WARNING fires, rather than charging some other account."""
-        proxy, store, log = self._wire(tmp_path, monkeypatch, live_slot=None)
+    def case_a_bearerless_request_goes_uncounted(self, tmp_path, monkeypatch):
+        """Asserts: a request with no bearer is never matched to an account:
+        it is forwarded, nothing is recorded, and the WARNING fires."""
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+        _, dialed = self._request(proxy, monkeypatch,
+                                  upstream=self._FakeUpstream(self._reply()),
+                                  auth="Basic abc")
+        assert dialed is not None
+        assert not store.path.exists()
+        assert len(log) == 1 and "matches no stored account" in log[0], log
+
+    def case_a_matcher_error_forwards_uncounted_and_says_so(
+        self, tmp_path, monkeypatch,
+    ):
+        """Asserts: when cswap cannot read a backup it needed to name the
+        account, the request is forwarded uncounted and the WARNING names
+        the exception, never charging a guessed account."""
+        from claude_swap.exceptions import CredentialReadError
+
+        proxy, store, log = self._wire(tmp_path, monkeypatch)
+
+        def _unreadable(*a, **k):
+            raise CredentialReadError("slots ['2'] could not be read")
+
+        monkeypatch.setattr(self._Switcher, "slot_for_access_token",
+                            _unreadable)
         _, dialed = self._request(proxy, monkeypatch,
                                   upstream=self._FakeUpstream(self._reply()))
         assert dialed is not None
         assert not store.path.exists()
-        assert len(log) == 1 and "forwarded uncounted" in log[0], log
+        assert len(log) == 1, log
+        assert "CredentialReadError: slots ['2']" in log[0], log
 
     def case_a_store_error_forwards_uncounted_and_says_so(
         self, tmp_path, monkeypatch,

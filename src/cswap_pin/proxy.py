@@ -19307,21 +19307,21 @@ class PinProxy:
             if slot is None:
                 _log_lifecycle(
                     f"WARNING usage request ({variant}) forwarded uncounted: "
-                    "its bearer is not the live account's token, or no live "
-                    "slot is known, so no account's hourly budget can be "
-                    "charged for it")
+                    "its bearer matches no stored account's token, so no "
+                    "account's hourly budget can be charged for it")
                 return None, None
             sw = require("switcher").ClaudeAccountSwitcher()
             answer = sw.answer_client_usage(slot, variant)
         except Exception as exc:  # noqa: BLE001 -- the request still goes
             _log_lifecycle(
                 f"WARNING usage request ({variant}) forwarded uncounted: "
-                f"cswap's usage store raised {exc.__class__.__name__}: {exc}")
+                f"cswap's account or usage store raised "
+                f"{exc.__class__.__name__}: {exc}")
             return None, None
         if answer is None:
             _log_lifecycle(
                 f"WARNING usage request ({variant}) forwarded uncounted: "
-                f"slot {slot} is live but not in cswap's roster")
+                f"slot {slot} holds its bearer but is not in cswap's roster")
             return None, None
         if answer.action == usage_store.CLIENT_SERVE:
             return self._send_usage_reply(
@@ -21722,24 +21722,27 @@ class _UsageForward(NamedTuple):
 
 
 def _usage_request_slot(auth: str) -> "str | None":
-    """The slot a usage request is spending, or None when it cannot be named.
+    """The slot a usage request is spending, or None when no stored account
+    holds its bearer.
 
     `is_pinned_route` does not swap the usage route's bearer, so the
-    request goes upstream on its own bearer, which is the live account's
-    when it matches cswap's live token: the same rule `_note_usage_headers`
-    applies before it records a reply's headers on the live slot. A bearer
-    that is not the live one (a session still holding a token cswap has
-    rotated away from) belongs to an account this cannot name.
+    request goes upstream on the session's own token, and that token's
+    account is the one whose hourly budget it spends. That is not always
+    the live account: a session that read its credential before a
+    `cswap switch` still sends the account it started on. So the bearer is
+    matched against every token cswap stores (the live login's, and each
+    slot's saved credential in its current and retained previous
+    generation) by `switcher.slot_for_access_token`, which compares in
+    constant time and raises when a saved credential it needed could not
+    be read. Read per usage request, which is a few an hour; nothing on
+    /v1/messages comes here.
     """
     token = auth.strip()
     token = token[7:].strip() if token[:7].lower() == "bearer " else ""
     if not token:
         return None
-    slot = _live_account_slot()
-    live = _active_oauth_token()
-    if slot is None or live is None or token != live:
-        return None
-    return slot
+    return require("switcher").ClaudeAccountSwitcher().slot_for_access_token(
+        token)
 
 
 def _usage_json_reply(status: str, payload: dict, keep: bool,
