@@ -3174,6 +3174,12 @@ def _is_cc_axios_ua(ua: str) -> bool:
     return bool(ua) and ua.lstrip().lower().startswith("axios/")
 
 
+def _is_policy_route(path: str) -> bool:
+    """CC's org-policy question, bare or with a query (`is_pinned_route`'s
+    own normalisation)."""
+    return path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits"
+
+
 def is_pinned_route(path: str, ua: str = "") -> bool:
     """Whether a request path's bearer must be swapped to the pinned account.
 
@@ -3284,7 +3290,7 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     # prevent. EXACT MATCH, not an ``/api/claude_code/`` prefix, for the same
     # reason validate is: nothing else known under that subtree is decided by
     # ownership, and a prefix would swap routes nobody has looked at.
-    if path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits":
+    if _is_policy_route(path):
         return True
     # Bridge attachments: CC fetches `/api/oauth/files/<uuid>/content` with the
     # OAuth bearer and renders any non-200 as "could not be downloaded". The
@@ -7390,6 +7396,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             # it records into proxy.json permanently, so one lost race would
             # condemn a healthy daemon for good.
             return True
+        return pin_stands_down()
+
+    def pin_stands_down() -> bool:
+        """True when the pin is cleared or IS the live login: the bearer a
+        request already carries is the right one. NOT a deferred refresh, which
+        `pin_is_noop` also counts: that one has a token owed and not yet in
+        hand, so a caller that must never answer as another account (the
+        org-policy question) refuses it."""
         target = _current_target()
         if target is None:
             return True  # pin cleared: leaving every bearer alone IS the job
@@ -7463,6 +7477,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
 
     provider.refetch = refetch
     provider.pin_is_noop = pin_is_noop
+    provider.pin_stands_down = pin_stands_down
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
@@ -7589,6 +7604,18 @@ def _pin_is_noop(provider) -> bool:
     """
     try:
         return bool(getattr(provider, "pin_is_noop", None) and provider.pin_is_noop())
+    except Exception:
+        return False
+
+
+def _pin_stands_down(provider) -> bool:
+    """Whether the pin is cleared or IS the live login (`pin_stands_down`),
+    False for a provider without the hook: a bare test callable is a pin that
+    simply failed to mint, which is the safe reading for the org-policy
+    question."""
+    try:
+        return bool(getattr(provider, "pin_stands_down", None)
+                    and provider.pin_stands_down())
     except Exception:
         return False
 
@@ -15398,9 +15425,17 @@ class PinProxy:
         process's cache, and `/remote-control` refused for hours on sessions
         pinned to an account the server placed no restriction on. Two accounts
         in different orgs is the pin's whole purpose, not an edge case.
+
+        THE ACTIVE ACCOUNT ANSWERS ONLY WHERE IT IS THE PIN'S ANSWER TOO: the
+        pin is cleared or IS the live login. A pin that cannot mint asks
+        nothing and writes nothing -- CC 2.1.286 tears every live bridge down
+        on an explicit deny, and a failed fetch keeps CC on this very file, so
+        another org's deny written here is adopted.
         """
+        provider = self._pin_token_provider
         doc = policy_limits_for(
-            self._pin_token_provider() or _active_oauth_token())
+            provider() or (_active_oauth_token()
+                           if _pin_stands_down(provider) else None))
         if not isinstance(doc, dict):
             return False
         path = _config_home_for_policy() / "policy-limits.json"
@@ -19364,6 +19399,22 @@ class PinProxy:
                     self._pin_token_provider, "mint_stalled", None
             ) and self._pin_token_provider.mint_stalled():
                 return self._refuse_stalled_mint(tls, method, path)
+            # THE ORG-POLICY QUESTION IS NEVER ANSWERED AS ANOTHER ACCOUNT.
+            # CC 2.1.286 tears every connected bridge down when its verdict
+            # turns to an explicit `allow_remote_control` deny, and a FAILED
+            # fetch keeps CC on its cached or on-disk verdict, so a failed or
+            # deferred mint answers 503 here rather than relaying on the
+            # session's bearer, whose org may deny. A cleared pin or one that
+            # IS the live login has nothing to swap and still relays below.
+            # ponytail: a cache-less cold start then refuses only a NEW
+            # /remote-control ("Couldn't verify"), never a live bridge;
+            # accepted, since the fall-open's cost is cutting live sessions.
+            if token is None and _is_policy_route(path) \
+                    and not _pin_stands_down(self._pin_token_provider):
+                return self._refuse_stalled_mint(
+                    tls, method, path, "the org-policy question needs the "
+                    "pinned token and none could be minted; no other account "
+                    "answers it")
             token = self._wait_for_pin_token(method, path, token)
             if token:
                 # NESTED, NOT A SINGLE `and` (T1193). A token that resolved
@@ -19594,11 +19645,21 @@ class PinProxy:
                     # Every other pinned route keeps the take-back (4e8fcd3).
                     artifact = is_artifact_route(clean_path)
                     as_403 = artifact and keep.code == 401
+                    # THE ORG-POLICY QUESTION NEVER FALLS BACK EITHER: the same
+                    # rule as the failed mint above, so the pin's refusal is
+                    # a local 503, not a resend on the session's bearer.
+                    policy = _is_policy_route(clean_path)
                     self._note_swap_refused(
                         keep.code, method, clean_path,
+                        "answered 503, not resent" if policy else
                         "relayed as the pin as 403" if as_403 else
                         "relayed as the pin" if artifact else "fell-back")
-                    if as_403:
+                    if policy:
+                        keep = self._refuse_stalled_mint(
+                            tls, method, path, "the pinned token was refused "
+                            "on the org-policy question; no other account "
+                            "answers it")
+                    elif as_403:
                         keep = self._artifact_403(tls, close=False)
                     else:
                         keep = self._forward(

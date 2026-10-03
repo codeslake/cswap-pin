@@ -1499,32 +1499,100 @@ class TestLiveRemoteControlSessions:
             "govern a session whose requests go out as the pin")
         assert json.loads((cfg / "policy-limits.json").read_text()) == allows
 
+    def _sweep_provider(self, tmp_path, state):
+        """A REAL provider that mints nothing, in one of three states:
+        `cleared` (the pin was cleared), `live login` (the pinned slot IS the
+        login) or `failed` (an unreadable credential: a pin that should have
+        answered and could not)."""
+        from cswap_pin import proxy as pin_proxy
+
+        sw = _FakeSwitcher(active_num="2" if state == "live login" else "1",
+                           roster_active="2" if state == "live login" else "1")
+        sw.backup_dir = tmp_path
+        if state == "cleared":
+            pin_proxy.save_pin(tmp_path, None, None)
+        else:
+            pin_proxy.save_pin(tmp_path, "pin@example.com", "org")
+        sw.resolve_account = lambda i: ("2", "pin@example.com", "org")
+        return pin_proxy.make_pin_token_provider(sw, "2", "pin@example.com")
+
     def case_with_no_pin_the_active_account_still_answers(
         self, tmp_path, monkeypatch
     ):
         """THE CONTROL for the case above. An unpinned machine has only one
         account, so its answer is the right one — the pin must not become a
-        precondition for repairing the file at all."""
+        precondition for repairing the file at all. A pin that IS the live
+        login has the same one account, so it answers the same way."""
+        from cswap_pin import proxy as pin_proxy
+
+        for state in ("cleared", "live login"):
+            cfg = tmp_path / state.replace(" ", "-")
+            cfg.mkdir()
+            asked = []
+            doc = {"restrictions": {}, "compliance_taints": []}
+
+            def fake(token):
+                asked.append(token)
+                return doc
+
+            monkeypatch.setattr(pin_proxy, "_config_home_for_policy",
+                                lambda: cfg)
+            monkeypatch.setattr(pin_proxy, "policy_limits_for", fake)
+            monkeypatch.setattr(pin_proxy, "_active_oauth_token",
+                                lambda: "active-token")
+
+            daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
+            daemon._pin_token_provider = self._sweep_provider(tmp_path, state)
+            assert daemon.sweep_policy_once() is True, state
+            assert asked == ["active-token"], (state, asked)
+
+    def case_a_failed_mint_makes_the_sweep_fetch_nothing_and_write_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """A PIN THAT SHOULD ANSWER AND CANNOT MUST NOT HAND THE QUESTION TO
+        THE ACTIVE ACCOUNT. The sweep writes its answer to the machine-wide
+        file with a stamp CC admits, and CC 2.1.286 tears every live bridge
+        down on an explicit `allow_remote_control` deny, so another org's deny
+        written here is adopted on any failed fetch. "A fetch that fails
+        changes nothing" (411680a): nothing goes on the wire, and the pin's
+        own document stays on disk. Driven through the REAL
+        `policy_limits_for`: the wire is what is asserted, not a stub's
+        argument."""
         from cswap_pin import proxy as pin_proxy
 
         cfg = tmp_path / "config"
         cfg.mkdir()
-        asked = []
-        doc = {"restrictions": {}, "compliance_taints": []}
+        pin_doc = {"restrictions": {"allow_remote_control": {"allowed": True}}}
+        (cfg / "policy-limits.json").write_text(json.dumps(pin_doc))
+        wire = []
 
-        def fake(token):
-            asked.append(token)
-            return doc
+        class _Deny:
+            def read(self):
+                return json.dumps({"restrictions": {
+                    "allow_remote_control": {"allowed": False}}}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout=None, context=None):
+            wire.append(req.get_header("Authorization"))
+            return _Deny()
 
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: cfg)
-        monkeypatch.setattr(pin_proxy, "policy_limits_for", fake)
         monkeypatch.setattr(pin_proxy, "_active_oauth_token",
                             lambda: "active-token")
+        monkeypatch.setattr(pin_proxy, "_verifying_context", lambda: None)
+        monkeypatch.setattr(pin_proxy.urllib.request, "urlopen", urlopen)
 
         daemon = pin_proxy.PinProxy.__new__(pin_proxy.PinProxy)
-        daemon._pin_token_provider = lambda: None
-        assert daemon.sweep_policy_once() is True
-        assert asked == ["active-token"]
+        daemon._pin_token_provider = self._sweep_provider(tmp_path, "failed")
+        assert daemon._pin_token_provider() is None  # the mint did fail
+        assert daemon.sweep_policy_once() is False
+        assert wire == [], f"the sweep asked as another account: {wire}"
+        assert json.loads((cfg / "policy-limits.json").read_text()) == pin_doc
 
     def case_the_policy_fetch_trusts_the_pins_own_certificate(
         self, monkeypatch
