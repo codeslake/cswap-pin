@@ -10228,6 +10228,105 @@ class TestEnsureProxy:
             f"spawn path: port={port} spawned={spawned}"
         )
 
+    def case_a_held_daemon_on_current_code_marked_unpinnable_is_not_signalled(
+            self, tmp_path, monkeypatch):
+        """T1598: `repin_current` -> `ensure_proxy` read a held, current-code,
+        `unpinnable` daemon as "nothing is serving" and TERMed it. On the
+        capped signal drain that closes every held CONNECT tunnel, and under
+        a holder the TERM gains nothing (the holder respawns on the same
+        socket): the daemon's own watchdog is the gapless repair. A REAL
+        daemon (`PinProxy`), because `/health` naming the recorded pid is
+        half the condition. ONE ROW PER CLAUSE of the early return: the mark,
+        the fingerprint, the daemon's OWN parent being the holder (not merely
+        some holder for the certdir), and the ONE `/health` answer naming the
+        recorded pid with no mint stall past `_MINT_STALL_WEDGE_S`. Each other
+        row must still recycle exactly once; a STALL, unmarked or marked, is
+        one (the watchdog never replaces on a busy mint lock)."""
+        import json
+        import os
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        pin_proxy.save_pin(tmp_path, "pin@example.com", "org-1")
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+        fp = pin_proxy.daemon_fingerprint("2", "pin@example.com")
+        me = os.getpid()
+        signalled, spawned = [], []
+        real_probe = pin_proxy._health_probe
+
+        def answers(**body):
+            """A `/health` round trip's raw bytes carrying ``body``."""
+            raw = b"HTTP/1.0 200 OK\r\n\r\n" + json.dumps(body).encode()
+            return lambda p, timeout=1.0: raw
+        monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [me])
+        monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+        # Every row reaches the stale arm: a marked one through the mark, the
+        # unmarked one through `/health` reporting a stalled mint.
+        monkeypatch.setattr(
+            pin_proxy, "_serving_can_pin", lambda p, timeout=1.0: False)
+        monkeypatch.setattr(
+            pin_proxy, "_kill_daemon",
+            lambda pid, *a, **k: signalled.append(pid) or True)
+        monkeypatch.setattr(
+            pin_proxy, "_spawn_daemon",
+            lambda a, e, c, **kw: spawned.append(a) or 9955)
+
+        def expect(label, want, fingerprint=fp, *, mark=True, parent=4242,
+                   owns=False, health=real_probe):
+            """`parent` is `_wedged_parent_holder`'s answer, `owns` is
+            `_holder_owns`'s (any holder for the certdir)."""
+            signalled.clear()
+            spawned.clear()
+            pin_proxy.write_daemon_state(certdir, live.port, me, fingerprint)
+            if mark:
+                pin_proxy.mark_daemon_unpinnable(certdir)
+            assert bool(pin_proxy.read_daemon_state(certdir).get("unpinnable")) is mark
+            monkeypatch.setattr(pin_proxy, "_wedged_parent_holder", lambda p, cd: parent)
+            monkeypatch.setattr(pin_proxy, "_holder_owns", lambda cd: owns)
+            monkeypatch.setattr(pin_proxy, "_health_probe", health)
+            port = pin_proxy.ensure_proxy(self._Sw(tmp_path))[0]
+            assert (port, signalled, spawned) == want, (
+                f"{label}: port={port} signalled={signalled} spawned={spawned}")
+
+        try:
+            expect("a held current-code unpinnable daemon was replaced from "
+                   "here", (live.port, [], []))
+            expect("CONTROL: a stale fingerprint under a holder stopped "
+                   "recycling", (live.port, [me], []), "OTHER-FINGERPRINT")
+            expect("CONTROL: an unheld unpinnable daemon stopped recycling",
+                   (9955, [me], ["2"]), parent=None)
+            expect("CONTROL: an unmarked stall stopped recycling",
+                   (live.port, [me], []), mark=False)
+            expect("CONTROL: another holder for the certdir is not this "
+                   "daemon's holder", (live.port, [me], []),
+                   parent=None, owns=True)
+            # A wedged loop cannot answer `/health` as the recorded pid.
+            expect("CONTROL: a held daemon that does not answer stopped "
+                   "recycling", (live.port, [me], []),
+                   health=lambda p, timeout=1.0: None)
+            expect("CONTROL: `/health` answering another pid stopped "
+                   "recycling", (live.port, [me], []),
+                   health=answers(pid=me + 1))
+            # The mark stays and, on a busy mint lock, `can_pin` is None (not
+            # blind), so the watchdog repairs neither: this call must.
+            expect("CONTROL: a MARKED daemon in a mint stall past the wedge "
+                   "stopped recycling", (live.port, [me], []),
+                   health=answers(
+                       pid=me,
+                       mint_stalled_s=pin_proxy._MINT_STALL_WEDGE_S + 1))
+            # `heal` and `ensure_proxy` are a direct instruction, which the
+            # switch must not refuse: with the watchdog off nobody else repairs.
+            monkeypatch.setenv(pin_proxy._SELF_HEAL_ENV, "off")
+            expect("CONTROL: with the self-heal switch off the leave-alone "
+                   "row stopped recycling", (live.port, [me], []))
+        finally:
+            live.stop(drain=0)
+
 
 
 

@@ -6360,7 +6360,12 @@ def repin_current(switcher) -> bool:
     ``return ensure_proxy(switcher) is not None``, and `ensure_proxy` reads the
     daemon record WITH a fingerprint -- the read an `unpinnable` daemon answers
     "nothing is serving" to. So it spawns a successor, and a successor born
-    somewhere that CAN read the credential mints again.
+    somewhere that CAN read the credential mints again. EXCEPT under a held,
+    `unpinnable` daemon on current code: there `ensure_proxy` wires the port
+    and leaves the replacement to the daemon's own watchdog
+    (`replace_for_blind`, backed off up to `_BLIND_RECYCLE_MAX_S`), because a
+    TERM from here cuts the open tunnels and the holder respawns it anyway.
+    With `CSWAP_PIN_SELF_HEAL` off the watchdog repairs nothing, so it recycles.
 
     Returns False on anything unexpected. A repair that raises is worse than a
     pin that stays broken: it takes down whatever asked for it.
@@ -7755,6 +7760,39 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # wiring is rewritten to it — degraded, but nobody else's process
         # gets killed. The same blind spot already bounds the orphan sweep.
         if stale and int(stale["pid"]) in _pin_daemon_pids(certdir):
+            # A HELD, `unpinnable` DAEMON ON CURRENT CODE THAT STILL ANSWERS AS
+            # ITSELF IS NOT OURS TO SIGNAL. The TERM takes the CAPPED signal
+            # drain, which never waits on tunnels, so every held CONNECT channel
+            # is cut (measured: ConnectionResetError on the one held tunnel), and
+            # under a holder it gains nothing, the holder respawning on the same
+            # socket (see `_recycle_daemon`). The daemon's own watchdog is the
+            # repair: `replace_for_blind` asks the holder for a successor and
+            # drains UNCAPPED (gapless), or clears a false mark. So wire and
+            # leave it. A holder that never claimed the replace channel
+            # (`_holder_pid()` None) gets the capped drain and exit 75 instead,
+            # and is left alone on purpose: a TERM from here cuts now AND the
+            # blind successor's own watchdog cuts again, so leaving it costs one
+            # cut, not two. With the self-heal switch OFF the watchdog repairs
+            # nothing, and `ensure_proxy` is a direct instruction (see
+            # `_watch_own_code`): the path below runs.
+            # A missing clause takes the path below: a STALL, unmarked or
+            # marked (the watchdog never replaces on a busy mint lock, nor
+            # clears the mark there), a stale FINGERPRINT, a daemon whose OWN
+            # parent is not the holder (`_holder_owns` is only "some holder
+            # exists"; an unheld watchdog never repairs current code), one
+            # whose `/health` does not name its pid (wedged).
+            if (stale.get("unpinnable")
+                    and os.environ.get(_SELF_HEAL_ENV, "").lower()
+                    not in ("off", "0", "no")
+                    and stale.get("fingerprint") == fp
+                    and isinstance(stale.get("port"), int)
+                    and _wedged_parent_holder(
+                        int(stale["pid"]), certdir) is not None
+                    and (health := _health_body(stale["port"])) is not None
+                    and health.get("pid") == int(stale["pid"])
+                    and not _mint_stalled(health)):
+                wire_global_config(stale["port"], ca)
+                return stale["port"], ca
             # Save the port BEFORE the kill: the daemon unlinks its own state
             # on TERM, so afterwards there is nothing left to reclaim from and
             # the successor would take a fresh port — stranding every session
@@ -10415,13 +10453,33 @@ def _serving_can_pin(port: int, timeout: float = 1.0) -> bool | None:
             body = json.loads(parts[1])
         except ValueError:
             return None  # a real, if malformed, answer -- not silence
-        held = body.get("mint_stalled_s")
-        if isinstance(held, (int, float)) and held > _MINT_STALL_WEDGE_S:
+        if _mint_stalled(body):
             return False
         val = body.get("can_pin")
         return val if isinstance(val, bool) else None
     # Every attempt connected and none produced an answer.
     return False
+
+
+def _mint_stalled(body: dict) -> bool:
+    """Does this ``/health`` body report a mint stall past the wedge bound?"""
+    held = body.get("mint_stalled_s")
+    return isinstance(held, (int, float)) and held > _MINT_STALL_WEDGE_S
+
+
+def _health_body(port: int, timeout: float = 1.0) -> dict | None:
+    """The parsed ``/health`` body on ``port``, or None if it did not answer.
+
+    One round trip for a caller that reads several fields of ONE answer
+    (`ensure_proxy`'s held-daemon return: the pid and `_mint_stalled`).
+    """
+    buf = _health_probe(port, timeout)
+    if not buf or b"\r\n\r\n" not in buf:
+        return None
+    try:
+        return json.loads(buf.split(b"\r\n\r\n", 1)[1])
+    except ValueError:
+        return None
 
 
 def _health_pid(port: int, timeout: float = 1.0) -> int | None:
@@ -10442,14 +10500,7 @@ def _health_pid(port: int, timeout: float = 1.0) -> int | None:
     when `_pid_alive` has already said no, so a miss here just leaves that
     answer standing rather than mattering to a wedge verdict.
     """
-    buf = _health_probe(port, timeout)
-    if not buf or b"\r\n\r\n" not in buf:
-        return None
-    try:
-        body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
-    except ValueError:
-        return None
-    pid = body.get("pid")
+    pid = (_health_body(port, timeout) or {}).get("pid")
     return pid if isinstance(pid, int) else None
 
 
