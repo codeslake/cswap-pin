@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import datetime as _dt
+import functools
 import glob
 import inspect
 import itertools
@@ -3178,6 +3179,13 @@ def _is_policy_route(path: str) -> bool:
     """CC's org-policy question, bare or with a query (`is_pinned_route`'s
     own normalisation)."""
     return path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits"
+
+
+# WHY a policy 503 says it, on the MITM and the absolute-form path alike.
+_POLICY_NO_MINT = ("the org-policy question needs the pinned token and none "
+                   "could be minted; no other account answers it")
+_POLICY_REFUSED = ("the pinned token was refused ({code}) on the org-policy "
+                   "question; no other account answers it")
 
 
 def is_pinned_route(path: str, ua: str = "") -> bool:
@@ -12668,6 +12676,22 @@ _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
 _HANDOVER_ATTEMPTS = 5
 
 
+def _beat_ends_with_the_watchdog(watch):
+    """A watchdog that RETURNED (the holder did not survive the ask, the
+    handovers ran out, an exception) repairs nothing, so the beat it leaves
+    must not read alive for `_CODE_WATCH_BEAT_MAX_AGE_S` after it: cleared on
+    every way out, so `/health` answers `null` at once. A decorator rather
+    than a `try` around the loop, which would re-indent all of it."""
+    @functools.wraps(watch)
+    def run(server, *args, **kwargs):
+        try:
+            return watch(server, *args, **kwargs)
+        finally:
+            setattr(server, "_code_watch_beat", None)
+    return run
+
+
+@_beat_ends_with_the_watchdog
 def _watch_own_code(
     server,
     account_num: str,
@@ -14011,6 +14035,11 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
         rediscover_chain=True,
     )
+    # BORN BEATING. `/health` publishes this as `code_watch_age_s`, and the
+    # watchdog thread stamps it only once it starts, after `ensure_wired_to`
+    # (seconds): a concurrent launch that found this daemon through the record
+    # below read `null` as a dead watchdog and TERMed a fresh successor.
+    proxy._code_watch_beat = time.monotonic()
     proxy.start()
     # `_OWN_FINGERPRINT`, NOT a fresh read. This record is an IDENTITY — it is
     # what `runtime_health`, a deploy check or a human answers "is the running
@@ -17344,7 +17373,8 @@ class PinProxy:
         # THE ACTIVE BEARER WHEN THE PIN IS THE ACTIVE ACCOUNT. The provider
         # answers None then -- there is nothing to swap -- but that token IS
         # the pin's, and the uuid check below is what keeps a foreign answer
-        # out. Same fallback `sweep_policy_once` makes.
+        # out. `sweep_policy_once` makes this fallback only while the pin
+        # stands down (`_pin_stands_down`); here it is safe unconditionally.
         provider_token = self._pin_token_provider()
         # ONLY A provider()-SOURCED TOKEN FEEDS THE MINT-TIME STATE below,
         # via `note_verdict`: the `_active_oauth_token()` fallback answers
@@ -18567,11 +18597,17 @@ class PinProxy:
         mint, via ``_BlindMintRefusal``); ``None`` keeps the original
         stalled-store wording, which is the only cause this used to answer
         for.
+
+        THE ORG-POLICY ROUTE HAS ITS OWN COOLDOWN SLOT: its 503 repeats for as
+        long as the pin cannot mint, and sharing the budget would let that
+        burst swallow the next blind-mint line above.
         """
         now = time.monotonic()
-        last = getattr(self, "_stall_refused_at", None)
+        slot = ("_policy_refused_at" if _is_policy_route(path)
+                else "_stall_refused_at")
+        last = getattr(self, slot, None)
         if last is None or now - last >= _BUSY_REPORT_COOLDOWN_S:
-            self._stall_refused_at = now
+            setattr(self, slot, now)
             _log_lifecycle(
                 f"{method} {path} refused (503): "
                 + (reason if reason else
@@ -18990,6 +19026,14 @@ class PinProxy:
                 ) and self._pin_token_provider.mint_stalled():
                     self._refuse_stalled_mint(conn, method, rel, close=True)
                     return False
+                # THE MITM PATH'S ORG-POLICY RULE, FOR THE SAME REASON (see
+                # the note above its own call): a failed or deferred mint
+                # answers 503, never the session's bearer.
+                if token is None and _is_policy_route(rel) \
+                        and not _pin_stands_down(self._pin_token_provider):
+                    self._refuse_stalled_mint(
+                        conn, method, rel, _POLICY_NO_MINT, close=True)
+                    return False
                 token = self._wait_for_pin_token(method, rel, token)
                 if token and any(h.split(":", 1)[0].strip().lower()
                                  == "authorization" for h in headers):
@@ -19164,6 +19208,17 @@ class PinProxy:
             for hdrs, retry in _swap_attempts():
                 if hdrs is None:
                     break
+                if pending_refusal is not None and not retry \
+                        and _is_policy_route(rel):
+                    # THE ORG-POLICY QUESTION NEVER FALLS BACK (the MITM
+                    # take-back's rule): the last attempt would be the
+                    # session's own bearer, so the pin's refusal is a local
+                    # 503 instead, and the refusal's own line is the one log.
+                    self._refuse_stalled_mint(
+                        conn, method, rel,
+                        _POLICY_REFUSED.format(code=pending_refusal),
+                        close=True)
+                    return False
                 if pending_refusal == 401 and artifact and not retry:
                     # T1596: the last attempt is the pin's own, and a 401
                     # from it is answered 403 here, not sent again.
@@ -19443,9 +19498,7 @@ class PinProxy:
             if token is None and _is_policy_route(path) \
                     and not _pin_stands_down(self._pin_token_provider):
                 return self._refuse_stalled_mint(
-                    tls, method, path, "the org-policy question needs the "
-                    "pinned token and none could be minted; no other account "
-                    "answers it")
+                    tls, method, path, _POLICY_NO_MINT)
             token = self._wait_for_pin_token(method, path, token)
             if token:
                 # NESTED, NOT A SINGLE `and` (T1193). A token that resolved
@@ -19678,18 +19731,18 @@ class PinProxy:
                     as_403 = artifact and keep.code == 401
                     # THE ORG-POLICY QUESTION NEVER FALLS BACK EITHER: the same
                     # rule as the failed mint above, so the pin's refusal is
-                    # a local 503, not a resend on the session's bearer.
+                    # a local 503, not a resend on the session's bearer. ONE
+                    # LOG LINE: the refusal's own, which carries the code.
                     policy = _is_policy_route(clean_path)
-                    self._note_swap_refused(
-                        keep.code, method, clean_path,
-                        "answered 503, not resent" if policy else
-                        "relayed as the pin as 403" if as_403 else
-                        "relayed as the pin" if artifact else "fell-back")
+                    if not policy:
+                        self._note_swap_refused(
+                            keep.code, method, clean_path,
+                            "relayed as the pin as 403" if as_403 else
+                            "relayed as the pin" if artifact else "fell-back")
                     if policy:
                         keep = self._refuse_stalled_mint(
-                            tls, method, path, "the pinned token was refused "
-                            "on the org-policy question; no other account "
-                            "answers it")
+                            tls, method, path,
+                            _POLICY_REFUSED.format(code=keep.code))
                     elif as_403:
                         keep = self._artifact_403(tls, close=False)
                     else:

@@ -10518,6 +10518,48 @@ class TestEnsureProxy:
             live.stop(drain=0)
         assert not t.is_alive()
 
+    def case_a_watchdog_that_returned_leaves_no_beat(self, tmp_path):
+        """T1681: a watchdog that RETURNS while the daemon keeps serving (the
+        holder did not survive the ask, the handovers ran out, an exception)
+        repairs nothing, so its last stamp must not be trusted for the whole
+        `_CODE_WATCH_BEAT_MAX_AGE_S` after it: the beat is cleared on every
+        way out, `/health` then answering `null` (dead) at once. A normal
+        end, and one by an exception out of the loop."""
+        import threading
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        fp = pin_proxy.daemon_fingerprint()
+
+        def run(done):
+            srv = types.SimpleNamespace()
+            try:
+                pin_proxy._watch_own_code(
+                    srv, "1", "a@b.c", certdir, done, lambda *a: None,
+                    interval=0.01, _own_fingerprint=fp)
+            except RuntimeError:
+                pass
+            return srv
+
+        done = threading.Event()
+        done.set()
+        srv = run(done)
+        assert hasattr(srv, "_code_watch_beat"), "premise: the watchdog beat"
+        assert srv._code_watch_beat is None, (
+            "a watchdog that ended still reads alive for the beat's whole age")
+
+        class Boom:
+            def wait(self, _interval):
+                raise RuntimeError("the loop died")
+
+        srv = run(Boom())
+        assert hasattr(srv, "_code_watch_beat"), "premise: the watchdog beat"
+        assert srv._code_watch_beat is None, (
+            "a watchdog that died on an exception still reads alive")
+
 
 
 
@@ -19373,6 +19415,34 @@ class TestTheDaemonWatchesItsOwnCode:
             "daemon_main must START a _watch_own_code thread; a self-recycle "
             "nothing calls is exactly the 22h outage this release fixes"
         )
+
+    def case_daemon_main_stamps_the_beat_before_it_publishes(self):
+        """T1681: `proxy.json` is what a concurrent launch finds a daemon by,
+        and it then asks `/health`. The watchdog thread stamps the beat only
+        once it starts, after `ensure_wired_to` (seconds), so a fresh blind
+        successor answered `code_watch_age_s: null` for that long and a
+        concurrent `ensure_proxy` read it as a dead watchdog and TERMed it.
+        The beat is stamped before the record is written. READ OFF THE PARSE
+        TREE: the property is an ordering."""
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy as pin_proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+        stamp = [n.lineno for n in ast.walk(tree)
+                 if isinstance(n, ast.Assign)
+                 and any(getattr(t, "attr", None) == "_code_watch_beat"
+                         for t in n.targets)]
+        publish = [n.lineno for n in ast.walk(tree)
+                   if isinstance(n, ast.Call)
+                   and getattr(n.func, "id", None) == "write_daemon_state"]
+        assert stamp and publish, (
+            f"the scan is broken: stamp={stamp} publish={publish}")
+        assert min(stamp) < min(publish), (
+            f"the beat is stamped at line {min(stamp)}, after the record is "
+            f"published at line {min(publish)}")
 
     def case_the_watchdog_is_handed_the_account_and_email_in_that_order(self):
         """The AST test above proves the thread STARTS, not that it is handed
