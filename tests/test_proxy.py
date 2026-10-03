@@ -10296,20 +10296,25 @@ class TestEnsureProxy:
             f"spawn path: port={port} spawned={spawned}"
         )
 
-    def case_a_held_daemon_on_current_code_marked_unpinnable_is_not_signalled(
+    def case_a_held_current_code_daemon_with_a_live_watchdog_is_not_signalled(
             self, tmp_path, monkeypatch):
-        """T1598: `repin_current` -> `ensure_proxy` read a held, current-code,
-        `unpinnable` daemon as "nothing is serving" and TERMed it. On the
-        capped signal drain that closes every held CONNECT tunnel, and under
-        a holder the TERM gains nothing (the holder respawns on the same
-        socket): the daemon's own watchdog is the gapless repair. A REAL
-        daemon (`PinProxy`), because `/health` naming the recorded pid is
-        half the condition. ONE ROW PER CLAUSE of the early return: the mark,
-        the fingerprint, the daemon's OWN parent being the holder (not merely
-        some holder for the certdir), and the ONE `/health` answer naming the
-        recorded pid with no mint stall past `_MINT_STALL_WEDGE_S`. Each other
-        row must still recycle exactly once; a STALL, unmarked or marked, is
-        one (the watchdog never replaces on a busy mint lock)."""
+        """T1598, T1681: `repin_current` -> `ensure_proxy` read a held,
+        current-code daemon that reached the stale arm (marked `unpinnable`,
+        or unmarked with `/health` saying `can_pin: false`) as "nothing is
+        serving" and TERMed it. On the capped signal drain that closes every
+        held CONNECT tunnel, and under a holder the TERM gains nothing (the
+        holder respawns on the same socket): the daemon's own watchdog is the
+        gapless repair, for the mark and for a false `can_pin` alike, so the
+        mark is NOT a clause. A REAL daemon (`PinProxy`), because `/health`
+        naming the recorded pid and carrying the watchdog's beat is half the
+        condition. ONE ROW PER CLAUSE of the early return: the fingerprint,
+        the daemon's OWN parent being the holder (not merely some holder for
+        the certdir), the ONE `/health` answer naming the recorded pid with no
+        mint stall past `_MINT_STALL_WEDGE_S`, and a watchdog beat no older
+        than `_CODE_WATCH_BEAT_MAX_AGE_S` (a watchdog that died while the
+        daemon kept serving repairs nothing). Each other row must still
+        recycle exactly once; a STALL, unmarked or marked, is one (the
+        watchdog never replaces on a busy mint lock)."""
         import json
         import os
 
@@ -10326,6 +10331,7 @@ class TestEnsureProxy:
         me = os.getpid()
         signalled, spawned = [], []
         real_probe = pin_proxy._health_probe
+        max_age = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
 
         def answers(**body):
             """A `/health` round trip's raw bytes carrying ``body``."""
@@ -10339,8 +10345,8 @@ class TestEnsureProxy:
             assert pid == me, f"read the environment of pid {pid}, not the daemon's"
             return daemon_env.get(key)
         monkeypatch.setattr(pin_proxy, "_daemon_env_value", read_daemon_env)
-        # Every row reaches the stale arm: a marked one through the mark, the
-        # unmarked one through `/health` reporting a stalled mint.
+        # Every row reaches the stale arm: a marked one through the mark, an
+        # unmarked one through `/health` saying `can_pin: false` or a stall.
         monkeypatch.setattr(
             pin_proxy, "_serving_can_pin", lambda p, timeout=1.0: False)
         monkeypatch.setattr(
@@ -10351,11 +10357,16 @@ class TestEnsureProxy:
             lambda a, e, c, **kw: spawned.append(a) or 9955)
 
         def expect(label, want, fingerprint=fp, *, mark=True, parent=4242,
-                   owns=False, health=real_probe):
+                   owns=False, health=real_probe, beat=0.0):
             """`parent` is `_wedged_parent_holder`'s answer, `owns` is
-            `_holder_owns`'s (any holder for the certdir)."""
+            `_holder_owns`'s (any holder for the certdir). `beat` is the age
+            in seconds of the real daemon's last watchdog beat, None for a
+            daemon whose watchdog never beat."""
             signalled.clear()
             spawned.clear()
+            live.__dict__.pop("_code_watch_beat", None)
+            if beat is not None:
+                live._code_watch_beat = time.monotonic() - beat
             pin_proxy.write_daemon_state(certdir, live.port, me, fingerprint)
             if mark:
                 pin_proxy.mark_daemon_unpinnable(certdir)
@@ -10374,8 +10385,26 @@ class TestEnsureProxy:
                    "recycling", (live.port, [me], []), "OTHER-FINGERPRINT")
             expect("CONTROL: an unheld unpinnable daemon stopped recycling",
                    (9955, [me], ["2"]), parent=None)
+            # An UNMARKED daemon is the same arm's other entrant (a fresh blind
+            # successor starts unmarked; a cold token reads `can_pin: false`):
+            # its watchdog settles both, and a TERM from here cuts them.
+            expect("an unmarked current-code held daemon whose `/health` "
+                   "says can_pin false was replaced from here",
+                   (live.port, [], []), mark=False,
+                   health=answers(pid=me, can_pin=False, code_watch_age_s=1.0))
             expect("CONTROL: an unmarked stall stopped recycling",
-                   (live.port, [me], []), mark=False)
+                   (live.port, [me], []), mark=False,
+                   health=answers(
+                       pid=me, can_pin=True, code_watch_age_s=1.0,
+                       mint_stalled_s=pin_proxy._MINT_STALL_WEDGE_S + 1))
+            # A dead watchdog repairs nothing: its beat is the only sign of one.
+            expect("CONTROL: a watchdog beat older than the bound stopped "
+                   "recycling", (live.port, [me], []), beat=max_age + 1)
+            expect("CONTROL: a watchdog that never beat stopped recycling",
+                   (live.port, [me], []), beat=None)
+            expect("CONTROL: an older daemon whose `/health` has no beat "
+                   "field stopped recycling", (live.port, [me], []),
+                   health=answers(pid=me, can_pin=False))
             expect("CONTROL: another holder for the certdir is not this "
                    "daemon's holder", (live.port, [me], []),
                    parent=None, owns=True)
@@ -10385,13 +10414,13 @@ class TestEnsureProxy:
                    health=lambda p, timeout=1.0: None)
             expect("CONTROL: `/health` answering another pid stopped "
                    "recycling", (live.port, [me], []),
-                   health=answers(pid=me + 1))
+                   health=answers(pid=me + 1, code_watch_age_s=0.0))
             # The mark stays and, on a busy mint lock, `can_pin` is None (not
             # blind), so the watchdog repairs neither: this call must.
             expect("CONTROL: a MARKED daemon in a mint stall past the wedge "
                    "stopped recycling", (live.port, [me], []),
                    health=answers(
-                       pid=me,
+                       pid=me, code_watch_age_s=0.0,
                        mint_stalled_s=pin_proxy._MINT_STALL_WEDGE_S + 1))
             # `heal` and `ensure_proxy` are a direct instruction, which the
             # switch must not refuse: with the watchdog off nobody else repairs.
@@ -10423,6 +10452,71 @@ class TestEnsureProxy:
                 pin_proxy, "_health_probe",
                 lambda p, timeout=1.0, raw=b"HTTP/1.0 200 OK\r\n\r\n" + body: raw)
             assert pin_proxy._health_body(1) == want, body
+
+    def case_a_real_health_carries_the_watchdogs_beat_age_and_every_tick_moves_it(
+            self, tmp_path):
+        """T1681: `/health` publishes `code_watch_age_s`, the seconds since
+        `_watch_own_code` last beat on the server: `null` for a daemon whose
+        watchdog never ran, set at THREAD START (a daemon younger than one
+        interval must pass `ensure_proxy`'s liveness clause) and again on every
+        tick. The real watchdog on a real `PinProxy`, the ticks gated by the
+        test so no interval is slept; each reading is taken with the beat
+        first aged by hand, so only the stamp under test can bring it down."""
+        import threading
+
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy, ensure_ca
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        ensure_ca(certdir, "api.anthropic.com")
+        live = PinProxy(certdir=certdir, pin_token_provider=lambda: "T")
+        live.start()
+
+        class Gate:
+            """A `done` whose `wait` parks until the test lets one tick run."""
+            def __init__(self):
+                self.parked, self.go, self.stop = (
+                    threading.Event(), threading.Event(), False)
+
+            def wait(self, _interval):
+                self.parked.set()
+                self.go.wait(10)
+                self.go.clear()
+                return self.stop
+
+            def set(self):
+                self.stop = True
+
+        def age():
+            return pin_proxy._health_body(live.port)["code_watch_age_s"]
+        gate = Gate()
+        t = threading.Thread(target=pin_proxy._watch_own_code, args=(
+            live, "1", "a@b.c", certdir, gate, lambda *a: None),
+            kwargs={"interval": 0.01,
+                    "_own_fingerprint": pin_proxy.daemon_fingerprint()})
+        try:
+            assert age() is None, "a daemon with no watchdog reported a beat"
+            t.start()
+            assert gate.parked.wait(10), "the watchdog never reached its first wait"
+            first = age()
+            assert first is not None and first < 5, (
+                f"no beat at thread start: age={first}")
+            gate.parked.clear()
+            live._code_watch_beat -= 1000
+            assert age() > 900
+            gate.go.set()
+            assert gate.parked.wait(10), "the watchdog never finished its tick"
+            second = age()
+            assert second is not None and second < 5, (
+                f"a tick did not beat: age={second}")
+        finally:
+            gate.stop = True
+            gate.go.set()
+            if t.ident is not None:
+                t.join(10)
+            live.stop(drain=0)
+        assert not t.is_alive()
 
 
 
@@ -15876,7 +15970,7 @@ print("OK", port)
             # reaches this only on the branch where it would otherwise have
             # gone back to sleep.
             pin_proxy._watch_own_code(
-                None, "1", "a@b.c", tmp_path, stop,
+                types.SimpleNamespace(), "1", "a@b.c", tmp_path, stop,
                 lambda *a: None, interval=0.01,
                 _own_fingerprint=pin_proxy.daemon_fingerprint(),
             )
@@ -15926,7 +16020,7 @@ print("OK", port)
         threading.Timer(1.5, stop.set).start()
         try:
             pin_proxy._watch_own_code(
-                None, "1", "a@b.c", tmp_path, stop,
+                types.SimpleNamespace(), "1", "a@b.c", tmp_path, stop,
                 lambda *a: None, interval=0.01,
                 _own_fingerprint=pin_proxy.daemon_fingerprint(),
             )
@@ -16023,7 +16117,7 @@ print("OK", port)
         threading.Timer(1.0, stop.set).start()
         try:
             pin_proxy._watch_own_code(
-                None, "1", "a@b.c", tmp_path, stop,
+                types.SimpleNamespace(), "1", "a@b.c", tmp_path, stop,
                 lambda *a: None, interval=0.01,
                 _own_fingerprint=pin_proxy.daemon_fingerprint(),
             )

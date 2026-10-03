@@ -6366,13 +6366,15 @@ def repin_current(switcher) -> bool:
     ``return ensure_proxy(switcher) is not None``, and `ensure_proxy` reads the
     daemon record WITH a fingerprint -- the read an `unpinnable` daemon answers
     "nothing is serving" to. So it spawns a successor, and a successor born
-    somewhere that CAN read the credential mints again. EXCEPT under a held,
-    `unpinnable` daemon on current code: there `ensure_proxy` wires the port
-    and leaves the replacement to the daemon's own watchdog
+    somewhere that CAN read the credential mints again. EXCEPT under a held
+    daemon on current code with a live watchdog: there `ensure_proxy` wires
+    the port and leaves the replacement to the daemon's own watchdog
     (`replace_for_blind`, backed off up to `_BLIND_RECYCLE_MAX_S`), because a
-    TERM from here cuts the open tunnels and the holder respawns it anyway.
-    With the DAEMON's `CSWAP_PIN_SELF_HEAL` off (its own environment, not this
-    caller's) the watchdog repairs nothing, so it recycles.
+    TERM from here cuts the open tunnels and the holder respawns it anyway. A
+    current-code daemon reaches that arm only through the `unpinnable` mark or
+    a false `can_pin`, both of which the watchdog settles. With the DAEMON's
+    `CSWAP_PIN_SELF_HEAL` off (its own environment, not this caller's), or its
+    watchdog not beating, nothing repairs it, so `ensure_proxy` recycles.
 
     Returns False on anything unexpected. A repair that raises is worse than a
     pin that stays broken: it takes down whatever asked for it.
@@ -7788,15 +7790,18 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # wiring is rewritten to it — degraded, but nobody else's process
         # gets killed. The same blind spot already bounds the orphan sweep.
         if stale and int(stale["pid"]) in _pin_daemon_pids(certdir):
-            # A HELD, `unpinnable` DAEMON ON CURRENT CODE THAT STILL ANSWERS AS
-            # ITSELF IS NOT OURS TO SIGNAL. The TERM takes the CAPPED signal
-            # drain, which never waits on tunnels, so every held CONNECT channel
-            # is cut (measured: ConnectionResetError on the one held tunnel), and
-            # under a holder it gains nothing, the holder respawning on the same
-            # socket (see `_recycle_daemon`). The daemon's own watchdog is the
-            # repair: `replace_for_blind` asks the holder for a successor and
-            # drains UNCAPPED (gapless), or clears a false mark. So wire and
-            # leave it. A holder that never claimed the replace channel
+            # A HELD DAEMON ON CURRENT CODE THAT STILL ANSWERS AS ITSELF, WITH
+            # A LIVE WATCHDOG, IS NOT OURS TO SIGNAL. The TERM takes the CAPPED
+            # signal drain, which never waits on tunnels, so every held CONNECT
+            # channel is cut (measured: ConnectionResetError on the one held
+            # tunnel), and under a holder it gains nothing, the holder
+            # respawning on the same socket (see `_recycle_daemon`). The
+            # daemon's own watchdog is the repair: `replace_for_blind` asks the
+            # holder for a successor and drains UNCAPPED (gapless), or clears a
+            # false mark. A current-code daemon reaches this arm only through
+            # the `unpinnable` mark or a false `can_pin`, both of which the
+            # watchdog settles, so the mark is not a clause. So wire and leave
+            # it. A holder that never claimed the replace channel
             # (`_holder_pid()` None) gets the capped drain and exit 75 instead,
             # and is left alone on purpose: a TERM from here cuts now AND the
             # blind successor's own watchdog cuts again, so leaving it costs one
@@ -7807,22 +7812,30 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # watchdog and the holder read it, never this caller's
             # `os.environ`; absent or unreadable reads as on, so it is left
             # alone.
+            # A LIVE WATCHDOG IS READ, NOT ASSUMED: `_watch_own_code` can
+            # return on an exception (or after `_HANDOVER_ATTEMPTS` failed
+            # handovers) while the daemon keeps serving, and then nothing
+            # repairs it. `/health`'s `code_watch_age_s` is its beat; null or
+            # absent (an older daemon) reads as dead.
             # A missing clause takes the path below: a STALL, unmarked or
             # marked (the watchdog never replaces on a busy mint lock, nor
             # clears the mark there), a stale FINGERPRINT, a daemon whose OWN
             # parent is not the holder (`_holder_owns` is only "some holder
             # exists"; an unheld watchdog never repairs current code), one
-            # whose `/health` does not name its pid (wedged).
-            if (stale.get("unpinnable")
-                    and (_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
-                         or "").lower() not in ("off", "0", "no")
+            # whose `/health` does not name its pid (wedged), one whose
+            # watchdog beat is stale or absent (an older daemon).
+            if ((_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
+                 or "").lower() not in ("off", "0", "no")
                     and stale.get("fingerprint") == fp
                     and isinstance(stale.get("port"), int)
                     and _wedged_parent_holder(
                         int(stale["pid"]), certdir) is not None
                     and (health := _health_body(stale["port"])) is not None
                     and health.get("pid") == int(stale["pid"])
-                    and not _mint_stalled(health)):
+                    and not _mint_stalled(health)
+                    and isinstance(beat_age := health.get("code_watch_age_s"),
+                                   (int, float))
+                    and beat_age <= _CODE_WATCH_BEAT_MAX_AGE_S):
                 wire_global_config(stale["port"], ca)
                 return stale["port"], ca
             # Save the port BEFORE the kill: the daemon unlinks its own state
@@ -12643,6 +12656,12 @@ def _release_daemon_state(certdir: Path) -> bool:
 
 
 _CODE_WATCH_INTERVAL_S = 30.0
+# THE OLDEST WATCHDOG BEAT A CALLER MAY TRUST. `_watch_own_code` stamps the
+# server each tick and `/health` publishes its age (`code_watch_age_s`); a
+# watchdog that returned on an exception while the daemon kept serving stops
+# beating and repairs nothing. Three intervals: a tick that ran long, or one
+# missed beat, must not read as a dead thread.
+_CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
 # Consecutive failed handovers before the watchdog stops trying. A ceiling on
 # NEVER-SUCCEEDING, not on total recycles: a daemon that hands over cleanly and
 # later goes stale again starts from zero.
@@ -12721,9 +12740,14 @@ def _watch_own_code(
     # returns from this function instead of exiting. A second SIGUSR1 is
     # therefore never reachable: the process asking is gone, or this watcher
     # is, before a second tick could ask again.
+    # THE BEAT `/health` PUBLISHES as `code_watch_age_s`, stamped once here so
+    # a daemon younger than one interval passes, and at the top of every tick.
+    # A thread that returned or died stops stamping.
+    setattr(server, "_code_watch_beat", time.monotonic())
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
     # thread at once instead of after a full interval.
     while not done.wait(interval):
+        setattr(server, "_code_watch_beat", time.monotonic())
         # ONE EXIT, TAKEN ON EVERY PATH. 0.1.27 had three exits and one of them
         # took neither: `_spawn_daemon` RAISING (fork() EAGAIN under a post-
         # deploy herd) landed in the guard below, which logged and returned
@@ -18746,6 +18770,7 @@ class PinProxy:
         # bare `getppid()` instead would name an unrelated process as the
         # holder of a socket it has never heard of.
         holder_pid = os.getppid() if held_by_a_holder() else None
+        code_watch_beat = getattr(self, "_code_watch_beat", None)
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
              # THE VERSION THE LIVE PROCESS IS RUNNING, which is not what the
@@ -18782,7 +18807,13 @@ class PinProxy:
              # Never CALLS the provider; reads the field its last real mint
              # attempt already left set (blank on a live or no-op pin).
              "blind_reason": getattr(
-                 self._pin_token_provider, "blind_reason", "") or None}
+                 self._pin_token_provider, "blind_reason", "") or None,
+             # ADDITIVE: seconds since `_watch_own_code` last beat on this
+             # server, `null` if it never did. The only sign a caller has that
+             # the watchdog it is leaving a repair to is still running.
+             "code_watch_age_s": (
+                 None if code_watch_beat is None
+                 else round(time.monotonic() - code_watch_beat, 1))}
         )
         try:
             conn.sendall(
