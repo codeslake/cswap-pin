@@ -10265,6 +10265,12 @@ class TestEnsureProxy:
             return lambda p, timeout=1.0: raw
         monkeypatch.setattr(pin_proxy, "_pin_daemon_pids", lambda cd: [me])
         monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+        daemon_env = {}  # the recorded daemon's environment, key -> value
+
+        def read_daemon_env(pid, key):
+            assert pid == me, f"read the environment of pid {pid}, not the daemon's"
+            return daemon_env.get(key)
+        monkeypatch.setattr(pin_proxy, "_daemon_env_value", read_daemon_env)
         # Every row reaches the stale arm: a marked one through the mark, the
         # unmarked one through `/health` reporting a stalled mint.
         monkeypatch.setattr(
@@ -10321,11 +10327,34 @@ class TestEnsureProxy:
                        mint_stalled_s=pin_proxy._MINT_STALL_WEDGE_S + 1))
             # `heal` and `ensure_proxy` are a direct instruction, which the
             # switch must not refuse: with the watchdog off nobody else repairs.
+            # THE DAEMON'S switch, not the caller's: the watchdog and the
+            # holder read their OWN exec-time environment. The daemon here is
+            # this very process, so the stub is the only thing telling the two
+            # environments apart.
+            daemon_env[pin_proxy._SELF_HEAL_ENV] = "OFF"
+            expect("CONTROL: with the DAEMON's self-heal switch off (the "
+                   "caller's unset) the leave-alone row stopped recycling",
+                   (live.port, [me], []))
+            daemon_env.clear()
             monkeypatch.setenv(pin_proxy._SELF_HEAL_ENV, "off")
-            expect("CONTROL: with the self-heal switch off the leave-alone "
-                   "row stopped recycling", (live.port, [me], []))
+            expect("the caller's own switch, off, recycled a daemon whose "
+                   "watchdog is on and would hand it over gaplessly",
+                   (live.port, [], []))
         finally:
             live.stop(drain=0)
+
+    def case_a_health_body_that_is_not_an_object_is_no_answer(
+            self, monkeypatch):
+        """`_health_body` is typed `dict | None`; a JSON list or number would
+        make the caller's `health.get` raise under the spawn lock."""
+        from cswap_pin import proxy as pin_proxy
+
+        for body, want in ((b"[1]", None), (b"7", None), (b"{", None),
+                           (b'{"pid": 1}', {"pid": 1})):
+            monkeypatch.setattr(
+                pin_proxy, "_health_probe",
+                lambda p, timeout=1.0, raw=b"HTTP/1.0 200 OK\r\n\r\n" + body: raw)
+            assert pin_proxy._health_body(1) == want, body
 
 
 
@@ -21999,6 +22028,41 @@ class TestAWedgeIsNotTrustedForever:
             "CONTROL: an earlier argv token naming a decoy pid was trusted "
             "over the real trailing environment value"
         )
+
+    def case_a_daemons_own_env_value_is_read_from_its_environment(
+            self, monkeypatch):
+        """T1598: `_daemon_env_value` reads ONE value of a pid's exec-time
+        environment, absent or unreadable as None, on /proc and on the
+        ``ps eww`` fallback (whose last anchored token wins, see
+        `_ps_env_token`). A real subprocess: nothing in THIS process's
+        `os.environ` can fake it."""
+        import subprocess
+        import sys
+
+        from cswap_pin import proxy
+
+        key = proxy._SELF_HEAL_ENV
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            env={**os.environ, key: "off"})
+        try:
+            # exec closes Popen's error pipe a moment BEFORE the kernel fills
+            # in the environment block, so a first read can be empty: poll.
+            deadline = time.monotonic() + 5
+            while (time.monotonic() < deadline
+                   and proxy._daemon_env_value(child.pid, key) is None):
+                time.sleep(0.02)
+            assert proxy._daemon_env_value(child.pid, key) == "off"
+            assert proxy._daemon_env_value(child.pid, key + "_X") is None
+            assert proxy._daemon_env_value(999_999_999, key) is None
+            with monkeypatch.context() as no_proc_mp:
+                self._no_proc(no_proc_mp)
+                assert proxy._daemon_env_value(child.pid, key) == "off", (
+                    "the ps fallback did not read the real environment")
+                assert proxy._daemon_env_value(999_999_999, key) is None
+        finally:
+            child.kill()
+            child.wait(timeout=5)
 
     def case_a_standby_promoted_in_place_still_qualifies_as_the_holder(
             self, tmp_path):

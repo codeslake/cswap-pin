@@ -6365,7 +6365,8 @@ def repin_current(switcher) -> bool:
     and leaves the replacement to the daemon's own watchdog
     (`replace_for_blind`, backed off up to `_BLIND_RECYCLE_MAX_S`), because a
     TERM from here cuts the open tunnels and the holder respawns it anyway.
-    With `CSWAP_PIN_SELF_HEAL` off the watchdog repairs nothing, so it recycles.
+    With the DAEMON's `CSWAP_PIN_SELF_HEAL` off (its own environment, not this
+    caller's) the watchdog repairs nothing, so it recycles.
 
     Returns False on anything unexpected. A repair that raises is worse than a
     pin that stays broken: it takes down whatever asked for it.
@@ -7772,9 +7773,13 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # (`_holder_pid()` None) gets the capped drain and exit 75 instead,
             # and is left alone on purpose: a TERM from here cuts now AND the
             # blind successor's own watchdog cuts again, so leaving it costs one
-            # cut, not two. With the self-heal switch OFF the watchdog repairs
-            # nothing, and `ensure_proxy` is a direct instruction (see
-            # `_watch_own_code`): the path below runs.
+            # cut, not two. With the DAEMON's self-heal switch OFF the
+            # watchdog repairs nothing, and `ensure_proxy` is a direct
+            # instruction (see `_watch_own_code`): the path below runs. THE
+            # DAEMON'S, read from its own exec-time environment like the
+            # watchdog and the holder read it, never this caller's
+            # `os.environ`; absent or unreadable reads as on, so it is left
+            # alone.
             # A missing clause takes the path below: a STALL, unmarked or
             # marked (the watchdog never replaces on a busy mint lock, nor
             # clears the mark there), a stale FINGERPRINT, a daemon whose OWN
@@ -7782,8 +7787,8 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
             # exists"; an unheld watchdog never repairs current code), one
             # whose `/health` does not name its pid (wedged).
             if (stale.get("unpinnable")
-                    and os.environ.get(_SELF_HEAL_ENV, "").lower()
-                    not in ("off", "0", "no")
+                    and (_daemon_env_value(int(stale["pid"]), _SELF_HEAL_ENV)
+                         or "").lower() not in ("off", "0", "no")
                     and stale.get("fingerprint") == fp
                     and isinstance(stale.get("port"), int)
                     and _wedged_parent_holder(
@@ -8193,12 +8198,51 @@ def _wedged_daemon_can_be_asked(pid: int, holder_pid: int) -> bool:
     guess.
     """
     try:
-        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        env = _proc_environ(pid)
     except OSError:
         return _wedged_env_via_ps(pid, holder_pid)
-    env = dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
     return (env.get(_HOLDER_REPLACE_ENV.encode()) == b"1"
             and env.get(_HELD_BY_ENV.encode()) == str(holder_pid).encode())
+
+
+def _proc_environ(pid: int) -> "dict[bytes, bytes]":
+    """The exec-time environment snapshot of ``pid`` as a dict (the last
+    duplicate wins). OSError when it cannot be read."""
+    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    return dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
+
+
+def _ps_env_token(out: str, key: str) -> "str | None":
+    """``key``'s value on a ``ps eww`` line, or None.
+
+    ANCHORED, NOT A BARE SUBSTRING -- `ps eww`'s output is a command line,
+    not a dict, and `f"{KEY}={v}" in out` reads `CSWAP_PIN_HELD_BY=90` as
+    present inside `CSWAP_PIN_HELD_BY=901`. Matched as a whole token, the
+    same exact equality the `_proc_environ` dict path already gets.
+
+    THE LAST MATCH, NOT THE FIRST -- `ps eww` appends the process's own
+    ENVIRONMENT after its ARGV on the same line, and a token that merely
+    looks like the marker can occur inside the command line itself before
+    the real environment assignment that follows it. `re.search` returns
+    whichever comes first, which is that argv token; the real value is
+    the trailing one. Same reading `runtime_health.py` uses for this
+    exact shape.
+    """
+    matches = re.findall(rf"(?:^|\s){re.escape(key)}=(\S*)", out)
+    return matches[-1] if matches else None
+
+
+def _daemon_env_value(pid: int, key: str) -> "str | None":
+    """One exec-time environment value of the daemon ``pid`` -- what ITS
+    code reads, not the caller's -- or None when absent or unreadable.
+    `_proc_environ` first, ``ps eww`` where there is no /proc: the same two
+    readings `_wedged_daemon_can_be_asked` takes."""
+    try:
+        value = _proc_environ(pid).get(key.encode())
+        return None if value is None else value.decode("utf-8", "replace")
+    except OSError:
+        out = _ps_out(["ps", "eww", "-o", "command=", "-p", str(pid)])
+        return None if out is None else _ps_env_token(out, key)
 
 
 def _wedged_env_via_ps(pid: int, holder_pid: int) -> bool:
@@ -8216,24 +8260,8 @@ def _wedged_env_via_ps(pid: int, holder_pid: int) -> bool:
             f"ps could not read {pid}'s environment -- falling back to the "
             "ordinary TERM path")
         return False
-    # ANCHORED, NOT A BARE SUBSTRING -- `ps eww`'s output is a command line,
-    # not a dict, and `f"{KEY}={v}" in out` reads `CSWAP_PIN_HELD_BY=90` as
-    # present inside `CSWAP_PIN_HELD_BY=901`. Matched as a whole token, the
-    # same exact equality the `/proc/<pid>/environ` dict path already gets.
-    #
-    # THE LAST MATCH, NOT THE FIRST -- `ps eww` appends the process's own
-    # ENVIRONMENT after its ARGV on the same line, and a token that merely
-    # looks like the marker can occur inside the command line itself before
-    # the real environment assignment that follows it. `re.search` returns
-    # whichever comes first, which is that argv token; the real value is
-    # the trailing one. Same reading `runtime_health.py` uses for this
-    # exact shape.
-    def _token(key: str) -> "str | None":
-        matches = re.findall(rf"(?:^|\s){re.escape(key)}=(\S*)", out)
-        return matches[-1] if matches else None
-
-    return (_token(_HELD_BY_ENV) == str(holder_pid)
-            and _token(_HOLDER_REPLACE_ENV) == "1")
+    return (_ps_env_token(out, _HELD_BY_ENV) == str(holder_pid)
+            and _ps_env_token(out, _HOLDER_REPLACE_ENV) == "1")
 
 
 def _pin_daemon_pids(certdir: Path) -> list[int]:
@@ -10477,9 +10505,10 @@ def _health_body(port: int, timeout: float = 1.0) -> dict | None:
     if not buf or b"\r\n\r\n" not in buf:
         return None
     try:
-        return json.loads(buf.split(b"\r\n\r\n", 1)[1])
+        body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
     except ValueError:
         return None
+    return body if isinstance(body, dict) else None
 
 
 def _health_pid(port: int, timeout: float = 1.0) -> int | None:
