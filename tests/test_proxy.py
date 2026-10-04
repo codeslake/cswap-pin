@@ -4244,7 +4244,7 @@ class TestASuccessorThatCannotStart:
         monkeypatch.setattr(PortHolder, "degrade_now", _degrade)
 
         class _DeadProc:
-            def wait(self, timeout=None):
+            def wait(self):
                 return 1
 
             def poll(self):
@@ -4761,9 +4761,7 @@ class TestASpawnFailureIsNotFatal:
             self._ev.set()
 
         def wait(self, timeout=None):
-            import subprocess
-            if not self._ev.wait(timeout):
-                raise subprocess.TimeoutExpired("daemon", timeout)
+            self._ev.wait(timeout)
             return self.returncode
 
         def poll(self):
@@ -15778,7 +15776,7 @@ print("OK", port)
                 self._code = code
                 self.pid = 4242
 
-            def wait(self, timeout=None):
+            def wait(self):
                 return self._code
 
         class _Handover(pin_proxy.PortHolder):
@@ -15816,13 +15814,13 @@ print("OK", port)
             holder._rounds += 1
             if holder._handed_over and holder._rounds == 1:
                 holder._proc = _Proc(0)
-                holder._proc.wait = lambda timeout=None: _twice(holder)
+                holder._proc.wait = lambda: _twice(holder)
             if holder._rounds > 1:
                 holder._stop = True
             return 0
 
         h_over = _Handover(handed_over=True)
-        h_over._proc.wait = lambda timeout=None: _twice(h_over)
+        h_over._proc.wait = lambda: _twice(h_over)
         h_over._supervise()
         assert h_over._rounds >= 2, (
             "premise: the loop must have gone round at least once WITH the "
@@ -15838,7 +15836,7 @@ print("OK", port)
         # the assertion above would pass on a holder that never closes at all.
         closed.clear()
         h_rel = _Handover(handed_over=False)
-        h_rel._proc.wait = lambda timeout=None: 0
+        h_rel._proc.wait = lambda: 0
         h_rel._supervise()
         assert closed == ["closed"], (
             "a plain exit 0 no longer releases the port — idle teardown would "
@@ -15889,7 +15887,7 @@ print("OK", port)
         """
         import threading
 
-        from cswap_pin.proxy import _CODE_WATCH_INTERVAL_S, PortHolder
+        from cswap_pin.proxy import PortHolder
 
         class _Proc:
             def __init__(self):
@@ -15956,15 +15954,15 @@ print("OK", port)
         successor_wait_calls = []
 
         def _successor_wait(timeout=None):
-            # ONLY THE SUPERVISOR'S OWN `proc.wait()` — called with the
-            # watch interval (T1743) — counts as round 2. `stop()` also calls
+            # ONLY THE SUPERVISOR'S OWN `proc.wait()` — called with no
+            # timeout — counts as round 2. `stop()` also calls
             # `proc.wait(timeout=_DRAIN_SECONDS + 2)` on whatever
             # `self._proc` names, so on a regression that wrongly takes the
             # release branch (and therefore also terminates the successor,
             # caught separately by the `terminated` assertion below) that
             # call would land here too and fill this list for the wrong
             # reason.
-            if timeout == _CODE_WATCH_INTERVAL_S:
+            if timeout is None:
                 successor_wait_calls.append(1)
             h._stop = True
             return 0
