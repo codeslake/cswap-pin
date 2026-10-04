@@ -4270,6 +4270,314 @@ class TestASuccessorThatCannotStart:
             holder.stop()
 
 
+class TestAHeldDaemonThatStoppedAccepting:
+    """T1743: a held daemon whose accept loop is gone while its process lives.
+
+    Measured on a third-party Mac (0.1.306): the daemon stopped accepting for
+    21+ minutes, its process and code watchdog alive, and nothing recycled it:
+    `_supervise` only waited for an EXIT, the watchdog never probes the port,
+    and a repair-cycle holder cannot bind. A TERM to the daemon recovered it at
+    once (exit 75, successor). So the holder now probes its own port while it
+    waits, and asks for that same successor when the daemon stays silent.
+
+    Nothing accepts on `holder._srv` here, which is what a dead accept loop
+    looks like from a client: the kernel completes the handshake in the
+    backlog and nothing ever answers. That is also the probe's READ bound
+    under test: an unbounded read would hang the supervise thread forever.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    class _Proc:
+        """A `Popen` double: `wait(timeout)` blocks until `terminate()`, and
+        raises `TimeoutExpired` when it runs out, as the real one does."""
+
+        def __init__(self, pid, log, drains=False):
+            self.pid, self.returncode, self._log = pid, None, log
+            self._ev = threading.Event()
+            self._drains = drains
+
+        def wait(self, timeout=None):
+            import subprocess
+            if not self._ev.wait(timeout):
+                raise subprocess.TimeoutExpired("daemon", timeout)
+            return self.returncode
+
+        def terminate(self):
+            self._log.append(f"terminate {self.pid}")
+            if not self._drains:
+                self.exit()
+
+        def exit(self):
+            self.returncode = 75
+            self._ev.set()
+
+    def _drive(self, tmp_path, monkeypatch, answer_pid=None, bound=0.4,
+               drain=False):
+        """A holder over a real socket whose first daemon is `_Proc(4242)`.
+        Returns (holder, log): `log` lists every spawn and terminate, in order.
+        `answer_pid` makes a thread serve `/health` with that pid, so the
+        daemon reads as healthy. `bound` is the silence that recycles. `drain`
+        makes the first daemon outlive its `terminate()` until `exit()`, as a
+        real one does through its drain."""
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PortHolder, ensure_ca
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        log = []
+        monkeypatch.setattr(pin_proxy, "_CODE_WATCH_INTERVAL_S", 0.1)
+        monkeypatch.setattr(pin_proxy, "_CODE_WATCH_BEAT_MAX_AGE_S", bound)
+        real_health_pid = pin_proxy._health_pid
+        monkeypatch.setattr(pin_proxy, "_health_pid",
+                            lambda port: real_health_pid(port, timeout=0.1))
+
+        def _spawn(self):
+            log.append("spawn")
+            self._proc = TestAHeldDaemonThatStoppedAccepting._Proc(
+                4242 + log.count("spawn") - 1, log,
+                drains=drain and log.count("spawn") == 1)
+            self.daemon_pid = self._proc.pid
+
+        monkeypatch.setattr(PortHolder, "_spawn", _spawn)
+        monkeypatch.setattr(PortHolder, "_spawn_standby", lambda self: None)
+        monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
+        holder = PortHolder(tmp_path, "1", "a@b.c")
+        if answer_pid is not None:
+            def _serve():
+                holder._srv.settimeout(0.1)
+                while not holder._stop:
+                    try:
+                        conn, _ = holder._srv.accept()
+                    except OSError:
+                        continue
+                    with conn:
+                        conn.recv(4096)
+                        conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n"
+                                     + json.dumps({"pid": answer_pid}).encode())
+            threading.Thread(target=_serve, daemon=True).start()
+        holder._spawn()
+        holder._thread = threading.Thread(target=holder._supervise, daemon=True)
+        holder._thread.start()
+        return holder, log
+
+    def _until(self, cond, seconds):
+        deadline = time.time() + seconds
+        while not cond() and time.time() < deadline:
+            time.sleep(0.02)
+
+    def case_a_daemon_that_never_answers_gets_its_successor_first(
+            self, tmp_path, monkeypatch):
+        holder, log = self._drive(tmp_path, monkeypatch, bound=1.0)
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            assert log == ["spawn", "spawn", "terminate 4242"], (
+                f"a daemon silent past the bound must be replaced successor "
+                f"FIRST, then terminated (holder-first, as heal does): {log}")
+            # The predecessor's exit must read as a HANDOVER (`_proc` moved),
+            # not a crash: a crash respawns, and that is a third spawn.
+            time.sleep(0.3)
+            assert log.count("spawn") == 2 and holder._thread.is_alive(), (
+                f"the retired predecessor was respawned over its successor: "
+                f"{log}")
+        finally:
+            holder.stop()
+
+    def case_a_daemon_that_answers_is_left_alone(self, tmp_path, monkeypatch):
+        holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4242)
+        try:
+            time.sleep(1.0)  # two and a half bounds
+            assert log == ["spawn"], (
+                f"a daemon answering /health as itself was recycled: {log}")
+        finally:
+            holder.stop()
+
+    def case_a_handover_in_flight_is_left_alone(self, tmp_path, monkeypatch):
+        """`self._proc` has moved to a successor while the supervisor still
+        waits on the predecessor, which now drains: the port answers as the
+        SUCCESSOR, so the predecessor's silence says nothing."""
+        holder, log = self._drive(tmp_path, monkeypatch)
+        predecessor = holder._proc
+        try:
+            with holder._replace_lock:
+                holder._proc = self._Proc(4243, log)
+            time.sleep(1.0)
+            assert log == ["spawn"], (
+                f"the predecessor of a handover was recycled: {log}")
+        finally:
+            # FIRST: the supervisor still waits on it, and `stop()` joins that
+            # thread for up to 5 s before it terminates anything else.
+            predecessor.terminate()
+            holder.stop()
+
+    def case_self_heal_off_leaves_it_alone(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CSWAP_PIN_SELF_HEAL", "off")
+        holder, log = self._drive(tmp_path, monkeypatch)
+        try:
+            time.sleep(1.0)
+            assert log == ["spawn"], (
+                f"CSWAP_PIN_SELF_HEAL=off still recycled the daemon: {log}")
+        finally:
+            holder.stop()
+
+    def case_a_successor_that_cannot_start_keeps_the_daemon(
+            self, tmp_path, monkeypatch):
+        """No successor, no terminate: killing the only daemon would leave the
+        port with nothing behind it, which is the outage this exists to end."""
+        holder, log = self._drive(tmp_path, monkeypatch)
+        from cswap_pin.proxy import PortHolder
+
+        def _refuse(self):
+            log.append("spawn refused")
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(PortHolder, "_spawn", _refuse)
+        try:
+            self._until(lambda: "spawn refused" in log, 10)
+            time.sleep(0.3)
+            assert "terminate 4242" not in log, (
+                f"the daemon was terminated with no successor started: {log}")
+        finally:
+            holder.stop()
+
+    def case_a_replace_ask_during_the_retired_predecessors_drain_is_declined(
+            self, tmp_path, monkeypatch):
+        """The retired daemon's own code watchdog keeps ticking through its
+        drain, and a deploy in that window makes it send SIGUSR1. The holder
+        cannot tell who asked: honouring it would spawn a second successor,
+        leave the first accepting beside it with no supervisor, and make
+        `stop()` miss it."""
+        import signal
+
+        holder, log = self._drive(tmp_path, monkeypatch, bound=1.0, drain=True)
+        predecessor = holder._proc
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            assert log == ["spawn", "spawn", "terminate 4242"], log
+            successor = holder._proc
+            holder._on_replace_request(signal.SIGUSR1, None)
+            predecessor.exit()
+            time.sleep(0.3)  # its exit is read as a handover, not a crash
+            assert log.count("spawn") == 2 and holder._proc is successor, (
+                f"the ask in the drain window spawned another successor "
+                f"beside the one the watcher put there: {log}")
+            assert holder._thread.is_alive(), "the supervisor ended"
+        finally:
+            predecessor.exit()
+            holder.stop()
+
+    def case_the_supervisors_wait_for_an_exit_is_not_a_poll(
+            self, tmp_path, monkeypatch):
+        """`Popen.wait(timeout=...)` on POSIX sleeps and re-polls (50 ms at
+        most), so a supervisor built on it wakes ~20 times a second for the
+        daemon's whole life. The wait must block, and still hear an exit at
+        once rather than at the next interval."""
+        import subprocess
+        import sys
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_CODE_WATCH_INTERVAL_S", 5.0)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.6)"])
+        sleeps, out = [], []
+        real_sleep = time.sleep
+
+        def _count(seconds):
+            if threading.current_thread() is waiter:
+                sleeps.append(seconds)
+            real_sleep(seconds)
+
+        monkeypatch.setattr(time, "sleep", _count)
+        holder = types.SimpleNamespace(_stop=True, port=0)
+        waiter = threading.Thread(
+            target=lambda: out.append(
+                pin_proxy.PortHolder._wait_for_exit(holder, proc)),
+            daemon=True)
+        try:
+            began = time.monotonic()
+            waiter.start()
+            waiter.join(10)
+            took = time.monotonic() - began
+            assert out == [0] and took < 3, (
+                f"the exit was heard late or not at all: {out} after {took}s")
+            assert not sleeps, (
+                f"the supervisor polled: {len(sleeps)} sleeps while it waited")
+        finally:
+            proc.kill()
+
+
+@pytest.mark.parametrize("ender", ["stop", "closed"])
+def test_a_transient_accept_error_does_not_end_the_accept_loop(
+        monkeypatch, ender):
+    """T1743: `_accept_loop` returned on ANY OSError, so one EMFILE ended the
+    thread for good with the process still up. Only `_stop` (set before
+    `release_listener` closes the socket) or a socket that is already closed
+    or detached (`fileno() == -1`, e.g. a `_resume_serving` cleared `_stop`
+    under a straggler thread) may end it."""
+    import errno
+
+    from cswap_pin import proxy as pin_proxy
+
+    calls = []
+
+    class _Srv:
+        def settimeout(self, _seconds):
+            pass
+
+        def fileno(self):
+            return -1 if ender == "closed" and len(calls) >= 2 else 7
+
+        def accept(self):
+            calls.append(1)
+            if len(calls) == 2 and ender == "stop" or len(calls) > 5:
+                server._stop = True  # what `release_listener` does first;
+                # past 5 it only keeps a spinning loop from hanging the run
+            raise OSError(errno.EMFILE if len(calls) == 1 else errno.EBADF, "x")
+
+    server = types.SimpleNamespace(_srv=_Srv(), _stop=False)
+    monkeypatch.setattr(pin_proxy, "_ADOPTED_BACKLOG", [])
+    pin_proxy.PinProxy._accept_loop(server)
+    assert len(calls) == 2, (
+        f"made {len(calls)} accept() calls, expected 2: 1 means EMFILE ended "
+        f"the loop, more means it kept spinning on a dead socket")
+
+
+def test_an_accept_error_streak_is_logged_once_and_dated(monkeypatch):
+    """T1743: the retry is silent otherwise, so a persistent EMFILE would be
+    invisible in daemon.log. One line opens a streak, naming the errno; a
+    timeout (accept works again) ends it, and the next error opens another."""
+    import errno
+
+    from cswap_pin import proxy as pin_proxy
+
+    script = [OSError(errno.EMFILE, "Too many open files")] * 2 + [
+        socket.timeout()] + [OSError(errno.EMFILE, "Too many open files")] * 2
+    lines = []
+
+    class _Srv:
+        def settimeout(self, _seconds):
+            pass
+
+        def fileno(self):
+            return 7
+
+        def accept(self):
+            exc = script.pop(0)
+            if not script:
+                server._stop = True  # the last error ends the loop, unlogged
+            raise exc
+
+    server = types.SimpleNamespace(_srv=_Srv(), _stop=False)
+    monkeypatch.setattr(pin_proxy, "_ADOPTED_BACKLOG", [])
+    monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+    monkeypatch.setattr(pin_proxy.time, "sleep", lambda _seconds: None)
+    pin_proxy.PinProxy._accept_loop(server)
+    assert len(lines) == 2 and all("EMFILE" in line for line in lines), (
+        f"expected one line per streak, each naming EMFILE: {lines}")
+
+
 class TestSuperviseCleanExitGuards:
     """T1168 (R): `PortHolder._supervise`'s clean-exit (code 0) respawn used
     to check only `load_pin`, so it respawned under `CSWAP_PIN_SELF_HEAL=off`

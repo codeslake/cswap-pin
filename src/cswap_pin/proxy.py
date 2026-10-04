@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import datetime as _dt
+import errno
 import functools
 import glob
 import inspect
@@ -11466,6 +11467,20 @@ class PortHolder:
             # the port.
             if self._stop:
                 return
+            # THE DAEMON `_wait_for_exit` IS RETIRING STILL DRAINS (T1743), and
+            # its code watchdog ticks until its teardown ends: a deploy in that
+            # window makes it send this very signal, which cannot say who
+            # asked. A second successor would sit beside the first with no
+            # supervisor, two acceptors on one socket. Declining loses nothing:
+            # the successor's own watchdog asks for any newer code once the
+            # drain is over.
+            retiring = getattr(self, "_retiring", None)
+            if getattr(retiring, "returncode", 0) is None:
+                _log_lifecycle(
+                    f"replace request for port {self.port} ignored — daemon "
+                    f"{retiring.pid} is still draining after its replacement"
+                )
+                return
             # A DEGRADED ACCEPTOR IS STILL ON THIS SOCKET (T1193). Spawning
             # here would put a daemon's own accept() loop beside it — the
             # exact two-acceptors bug this class refuses to have
@@ -11569,7 +11584,7 @@ class PortHolder:
             # after `wait()` returns, whatever `self._proc` has become by
             # then.
             proc = self._proc
-            code = proc.wait()
+            code = self._wait_for_exit(proc)
             if self._stop:
                 return
             # THE DECISION RUNS LOCKED; THE DEGRADED WAIT DOES NOT (T1193).
@@ -11592,6 +11607,74 @@ class PortHolder:
             # `_supervise_locked` just called `degrade_now()` — the next
             # lap's own top-of-loop check sends it into the degraded
             # branch above instead.
+
+    def _wait_for_exit(self, proc) -> int:
+        """`proc.wait()` that also watches the daemon ACCEPT (T1743).
+
+        A bare wait only hears an EXIT. Measured on a Mac (0.1.306): a held
+        daemon stopped accepting for 21+ minutes with its process and code
+        watchdog alive, and nothing here noticed. So every
+        `_CODE_WATCH_INTERVAL_S` the wait is cut short and the port is probed.
+        Silent for `_CODE_WATCH_BEAT_MAX_AGE_S` replaces the daemon the way
+        `heal`'s wedge branch does, SUCCESSOR FIRST (584cba8):
+        `_on_replace_request` puts it on the socket, only then is `proc`
+        terminated, so the port is never left with nobody behind it, and its
+        exit then reads as a handover (`self._proc is not proc`).
+
+        The probe's READ is bounded too (`_health_probe` times out each recv):
+        a daemon whose accept loop is dead still completes the TCP handshake
+        in the backlog and never answers, and an unbounded read would park
+        this thread for ever.
+
+        No grace after a spawn is needed: the first probe comes one interval
+        after the wait began, and only misses spanning the bound count. No
+        worker-traffic spare either (`heal` has one): live bridges on a daemon
+        that accepts nothing would spare it for as long as they live.
+        """
+        # A THREAD BLOCKS IN THE WAIT, THIS ONE IN A LOCK-BASED JOIN: on POSIX
+        # `Popen.wait(timeout=...)` is a WNOHANG poll that sleeps at most 50 ms,
+        # which would wake every holder about 20 times a second for life.
+        code = []
+        waiter = threading.Thread(
+            target=lambda: code.append(proc.wait()), daemon=True)
+        waiter.start()
+        silent_since = None
+        while True:
+            waiter.join(_CODE_WATCH_INTERVAL_S)
+            if not waiter.is_alive():
+                return code[0]
+            if (self._stop or not self._self_heal_on()
+                    or _health_pid(self.port) == proc.pid):
+                silent_since = None
+                continue
+            now = time.monotonic()
+            silent_since = silent_since or now
+            if now - silent_since < _CODE_WATCH_BEAT_MAX_AGE_S:
+                continue
+            silent_s, silent_since = now - silent_since, None
+            with self._replace_lock:
+                # A HANDOVER IN FLIGHT: `proc` is the draining predecessor and
+                # the port answers as its successor, never as `proc`.
+                # ponytail: the successor is not probed until `proc` exits
+                # (a drain can run for hours); a thread per daemon would.
+                if self._proc is not proc:
+                    continue
+                _log_lifecycle(
+                    f"daemon {proc.pid} has not answered on port {self.port} "
+                    f"for {silent_s:.0f}s — putting a successor on the "
+                    f"socket, then retiring it")
+                # Degraded, stopped, or a spawn that raised: it declines or
+                # logs and leaves `self._proc` alone, and terminating the only
+                # daemon with no successor would be the outage this ends.
+                self._on_replace_request(None, None)
+                if self._proc is proc:
+                    continue
+                # Read by `_on_replace_request`, which `proc`'s own watchdog
+                # reaches through its drain.
+                self._retiring = proc
+            # Outside the lock, which a `stop()` or a SIGUSR1 ask waits on.
+            # TERM, `_DRAIN_SECONDS + 2`, then KILL: what `_kill_daemon` does.
+            self._terminate_proc(proc)
 
     def _supervise_locked(self, proc, code: int) -> str:
         """One `_supervise` iteration's decision, taken under
@@ -17269,6 +17352,7 @@ class PinProxy:
         # closed underneath us — which is the only wake-up available when the
         # socket is not ours to close.
         srv.settimeout(0.5)
+        failing = False
         while not self._stop:
             # THE ADOPT PROBE'S CASUALTY, SERVED FIRST. It is older than
             # anything the kernel still has queued, and it has been waiting
@@ -17283,9 +17367,28 @@ class PinProxy:
                 try:
                     conn, _ = srv.accept()
                 except socket.timeout:
+                    failing = False
                     continue
-                except OSError:
-                    return
+                except OSError as exc:
+                    # ONLY A STOP OR A DEAD SOCKET ENDS THE LOOP (T1743):
+                    # `release_listener` sets `_stop` before it closes or
+                    # detaches the socket (`fileno()` is then -1, which also
+                    # covers a `_stop` that `_resume_serving` cleared again).
+                    # Any other error is transient (EMFILE under load), and
+                    # returning here left a live process that accepts nothing
+                    # for good. The same retry as `_accept_degraded`.
+                    if self._stop or srv.fileno() < 0:
+                        return
+                    # ONE LINE PER STREAK, so a persistent EMFILE is dated in
+                    # daemon.log without writing ten lines a second.
+                    if not failing:
+                        failing = True
+                        name = errno.errorcode.get(exc.errno, exc.errno)
+                        _log_lifecycle(f"accept failed ({name}: {exc.strerror})"
+                                       f" — retrying every 0.1s")
+                    time.sleep(0.1)
+                    continue
+            failing = False
             # A timeout on the LISTENER is inherited by every socket it
             # accepts, which would then cut a quiet-but-healthy stream. The
             # wait above is about noticing shutdown, not about the client.
