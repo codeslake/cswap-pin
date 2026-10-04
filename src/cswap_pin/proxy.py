@@ -11569,7 +11569,7 @@ class PortHolder:
             # after `wait()` returns, whatever `self._proc` has become by
             # then.
             proc = self._proc
-            code = proc.wait()
+            code = self._wait_for_exit(proc)
             if self._stop:
                 return
             # THE DECISION RUNS LOCKED; THE DEGRADED WAIT DOES NOT (T1193).
@@ -11592,6 +11592,67 @@ class PortHolder:
             # `_supervise_locked` just called `degrade_now()` — the next
             # lap's own top-of-loop check sends it into the degraded
             # branch above instead.
+
+    def _wait_for_exit(self, proc) -> int:
+        """`proc.wait()` that also watches the daemon ACCEPT (T1743).
+
+        A bare wait only hears an EXIT. Measured on a Mac (0.1.306): a held
+        daemon stopped accepting for 21+ minutes with its process and code
+        watchdog alive, and nothing here noticed. So every
+        `_CODE_WATCH_INTERVAL_S` the wait times out and the port is probed.
+        Silent for `_CODE_WATCH_BEAT_MAX_AGE_S` replaces the daemon the way
+        `heal`'s wedge branch does, SUCCESSOR FIRST (584cba8):
+        `_on_replace_request` puts it on the socket, only then is `proc`
+        terminated, so the port is never left with nobody behind it, and its
+        exit then reads as a handover (`self._proc is not proc`).
+
+        The probe's READ is bounded too (`_health_probe` times out each recv):
+        a daemon whose accept loop is dead still completes the TCP handshake
+        in the backlog and never answers, and an unbounded read would park
+        this thread for ever.
+
+        No grace after a spawn is needed: the first probe comes one interval
+        after the wait began, and only misses spanning the bound count. No
+        worker-traffic spare either (`heal` has one): live bridges on a daemon
+        that accepts nothing would spare it for as long as they live.
+        """
+        import subprocess
+
+        silent_since = None
+        while True:
+            try:
+                return proc.wait(timeout=_CODE_WATCH_INTERVAL_S)
+            except subprocess.TimeoutExpired:
+                pass
+            if (self._stop or not self._self_heal_on()
+                    or _health_pid(self.port) == proc.pid):
+                silent_since = None
+                continue
+            now = time.monotonic()
+            silent_since = silent_since or now
+            if now - silent_since < _CODE_WATCH_BEAT_MAX_AGE_S:
+                continue
+            silent_s, silent_since = now - silent_since, None
+            with self._replace_lock:
+                # A HANDOVER IN FLIGHT: `proc` is the draining predecessor and
+                # the port answers as its successor, never as `proc`.
+                # ponytail: the successor is not probed until `proc` exits
+                # (a drain can run for hours); a thread per daemon would.
+                if self._proc is not proc:
+                    continue
+                _log_lifecycle(
+                    f"daemon {proc.pid} has not answered on port {self.port} "
+                    f"for {silent_s:.0f}s — putting a successor on the "
+                    f"socket, then retiring it")
+                # Degraded, stopped, or a spawn that raised: it declines or
+                # logs and leaves `self._proc` alone, and terminating the only
+                # daemon with no successor would be the outage this ends.
+                self._on_replace_request(None, None)
+                if self._proc is proc:
+                    continue
+            # Outside the lock, which a `stop()` or a SIGUSR1 ask waits on.
+            # TERM, `_DRAIN_SECONDS + 2`, then KILL: what `_kill_daemon` does.
+            self._terminate_proc(proc)
 
     def _supervise_locked(self, proc, code: int) -> str:
         """One `_supervise` iteration's decision, taken under
@@ -17285,7 +17346,15 @@ class PinProxy:
                 except socket.timeout:
                     continue
                 except OSError:
-                    return
+                    # ONLY `_stop` ENDS THE LOOP (T1743): `release_listener`
+                    # sets it before it closes or detaches the socket. Any
+                    # other error is transient (EMFILE under load), and
+                    # returning here left a live process that accepts nothing
+                    # for good. The same retry as `_accept_degraded`.
+                    if self._stop:
+                        return
+                    time.sleep(0.1)
+                    continue
             # A timeout on the LISTENER is inherited by every socket it
             # accepts, which would then cut a quiet-but-healthy stream. The
             # wait above is about noticing shutdown, not about the client.
