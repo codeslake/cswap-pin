@@ -4318,9 +4318,10 @@ class TestAHeldDaemonThatStoppedAccepting:
         """A holder over a real socket whose first daemon is `_Proc(4242)`.
         Returns (holder, log): `log` lists every spawn and terminate, in order.
         `answer_pid` makes a thread serve `/health` with that pid, so the
-        daemon reads as healthy. `bound` is the silence that recycles. `drain`
-        makes the first daemon outlive its `terminate()` until `exit()`, as a
-        real one does through its drain."""
+        daemon reads as healthy, or a callable giving the pid of each probe's
+        answer (None: an answer that names no pid). `bound` is the silence
+        that recycles. `drain` makes the first daemon outlive its
+        `terminate()` until `exit()`, as a real one does through its drain."""
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PortHolder, ensure_ca
 
@@ -4353,8 +4354,9 @@ class TestAHeldDaemonThatStoppedAccepting:
                         continue
                     with conn:
                         conn.recv(4096)
+                        pid = answer_pid() if callable(answer_pid) else answer_pid
                         conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n"
-                                     + json.dumps({"pid": answer_pid}).encode())
+                                     + json.dumps({"pid": pid}).encode())
             threading.Thread(target=_serve, daemon=True).start()
         holder._spawn()
         holder._thread = threading.Thread(target=holder._supervise, daemon=True)
@@ -4389,6 +4391,47 @@ class TestAHeldDaemonThatStoppedAccepting:
             time.sleep(1.0)  # two and a half bounds
             assert log == ["spawn"], (
                 f"a daemon answering /health as itself was recycled: {log}")
+        finally:
+            holder.stop()
+
+    def case_a_daemon_only_another_pid_answers_for_is_left_alone(
+            self, tmp_path, monkeypatch):
+        """A foreign pid on the port neither resets the silence nor counts
+        toward it: the port is served, and that says nothing about `proc`."""
+        holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4243)
+        try:
+            time.sleep(1.0)  # two and a half bounds
+            assert log == ["spawn"], (
+                f"a foreign pid's answers counted as 4242's silence: {log}")
+        finally:
+            holder.stop()
+
+    def case_a_foreign_answer_does_not_reset_the_silence(
+            self, tmp_path, monkeypatch):
+        import itertools
+
+        seq = itertools.cycle([None, 4243])
+        holder, log = self._drive(tmp_path, monkeypatch,
+                                  answer_pid=lambda: next(seq))
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            assert log == ["spawn", "spawn", "terminate 4242"], (
+                f"a foreign pid between two no-pid answers reset the "
+                f"silence: {log}")
+        finally:
+            holder.stop()
+
+    def case_the_daemons_own_answer_resets_the_silence(
+            self, tmp_path, monkeypatch):
+        import itertools
+
+        seq = itertools.cycle([None, 4242])
+        holder, log = self._drive(tmp_path, monkeypatch,
+                                  answer_pid=lambda: next(seq))
+        try:
+            time.sleep(1.0)
+            assert log == ["spawn"], (
+                f"silence accrued across the daemon's own answers: {log}")
         finally:
             holder.stop()
 
@@ -4464,6 +4507,57 @@ class TestAHeldDaemonThatStoppedAccepting:
             assert holder._thread.is_alive(), "the supervisor ended"
         finally:
             predecessor.exit()
+            holder.stop()
+
+    def case_a_replace_ask_after_the_retired_predecessor_exited_spawns(
+            self, tmp_path, monkeypatch):
+        """The decline holds only while the retired daemon drains. The ask
+        lands well inside the bound that would have the watchdog replace 4243,
+        and a replacement by it would also log `terminate 4243`."""
+        import signal
+
+        holder, log = self._drive(tmp_path, monkeypatch, bound=1.0, drain=True)
+        predecessor = holder._proc
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            successor = holder._proc
+            predecessor.exit()
+            holder._on_replace_request(signal.SIGUSR1, None)
+            assert log.count("spawn") == 3 and "terminate 4243" not in log, (
+                f"an ask after the predecessor exited was declined: {log}")
+        finally:
+            successor.exit()
+            holder.stop()
+
+    def case_the_successors_own_ask_during_the_drain_spawns(
+            self, tmp_path, monkeypatch):
+        """The successor asks once and does not re-ask, so declining it leaves
+        nothing accepting until the supervisor reaps the retired daemon. Its
+        marker, written before it asks, is what separates it from the retired
+        daemon's own watchdog: the next daemon has none, and is declined."""
+        import signal
+
+        from cswap_pin.proxy import draining_marker_path
+
+        holder, log = self._drive(tmp_path, monkeypatch, bound=1.0, drain=True)
+        predecessor = holder._proc
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            successor = holder._proc
+            draining_marker_path(tmp_path, successor.pid).write_text(
+                str(time.time()))
+            holder._on_replace_request(signal.SIGUSR1, None)
+            assert log.count("spawn") == 3 and holder._proc is not successor, (
+                f"the successor's own ask in the drain window was declined: "
+                f"{log}")
+            third = holder._proc
+            holder._on_replace_request(signal.SIGUSR1, None)
+            assert log.count("spawn") == 3 and holder._proc is third, (
+                f"an ask from a daemon that never announced was honoured: "
+                f"{log}")
+        finally:
+            predecessor.exit()
+            successor.exit()
             holder.stop()
 
     def case_the_supervisors_wait_for_an_exit_is_not_a_poll(
