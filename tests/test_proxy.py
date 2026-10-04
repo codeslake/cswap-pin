@@ -4293,9 +4293,10 @@ class TestAHeldDaemonThatStoppedAccepting:
         """A `Popen` double: `wait(timeout)` blocks until `terminate()`, and
         raises `TimeoutExpired` when it runs out, as the real one does."""
 
-        def __init__(self, pid, log):
+        def __init__(self, pid, log, drains=False):
             self.pid, self.returncode, self._log = pid, None, log
             self._ev = threading.Event()
+            self._drains = drains
 
         def wait(self, timeout=None):
             import subprocess
@@ -4305,14 +4306,21 @@ class TestAHeldDaemonThatStoppedAccepting:
 
         def terminate(self):
             self._log.append(f"terminate {self.pid}")
+            if not self._drains:
+                self.exit()
+
+        def exit(self):
             self.returncode = 75
             self._ev.set()
 
-    def _drive(self, tmp_path, monkeypatch, answer_pid=None, bound=0.4):
+    def _drive(self, tmp_path, monkeypatch, answer_pid=None, bound=0.4,
+               drain=False):
         """A holder over a real socket whose first daemon is `_Proc(4242)`.
         Returns (holder, log): `log` lists every spawn and terminate, in order.
         `answer_pid` makes a thread serve `/health` with that pid, so the
-        daemon reads as healthy. `bound` is the silence that recycles."""
+        daemon reads as healthy. `bound` is the silence that recycles. `drain`
+        makes the first daemon outlive its `terminate()` until `exit()`, as a
+        real one does through its drain."""
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PortHolder, ensure_ca
 
@@ -4327,7 +4335,8 @@ class TestAHeldDaemonThatStoppedAccepting:
         def _spawn(self):
             log.append("spawn")
             self._proc = TestAHeldDaemonThatStoppedAccepting._Proc(
-                4242 + log.count("spawn") - 1, log)
+                4242 + log.count("spawn") - 1, log,
+                drains=drain and log.count("spawn") == 1)
             self.daemon_pid = self._proc.pid
 
         monkeypatch.setattr(PortHolder, "_spawn", _spawn)
@@ -4431,6 +4440,73 @@ class TestAHeldDaemonThatStoppedAccepting:
         finally:
             holder.stop()
 
+    def case_a_replace_ask_during_the_retired_predecessors_drain_is_declined(
+            self, tmp_path, monkeypatch):
+        """The retired daemon's own code watchdog keeps ticking through its
+        drain, and a deploy in that window makes it send SIGUSR1. The holder
+        cannot tell who asked: honouring it would spawn a second successor,
+        leave the first accepting beside it with no supervisor, and make
+        `stop()` miss it."""
+        import signal
+
+        holder, log = self._drive(tmp_path, monkeypatch, bound=1.0, drain=True)
+        predecessor = holder._proc
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            assert log == ["spawn", "spawn", "terminate 4242"], log
+            successor = holder._proc
+            holder._on_replace_request(signal.SIGUSR1, None)
+            predecessor.exit()
+            time.sleep(0.3)  # its exit is read as a handover, not a crash
+            assert log.count("spawn") == 2 and holder._proc is successor, (
+                f"the ask in the drain window spawned another successor "
+                f"beside the one the watcher put there: {log}")
+            assert holder._thread.is_alive(), "the supervisor ended"
+        finally:
+            predecessor.exit()
+            holder.stop()
+
+    def case_the_supervisors_wait_for_an_exit_is_not_a_poll(
+            self, tmp_path, monkeypatch):
+        """`Popen.wait(timeout=...)` on POSIX sleeps and re-polls (50 ms at
+        most), so a supervisor built on it wakes ~20 times a second for the
+        daemon's whole life. The wait must block, and still hear an exit at
+        once rather than at the next interval."""
+        import subprocess
+        import sys
+        import types
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_CODE_WATCH_INTERVAL_S", 5.0)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.6)"])
+        sleeps, out = [], []
+        real_sleep = time.sleep
+
+        def _count(seconds):
+            if threading.current_thread() is waiter:
+                sleeps.append(seconds)
+            real_sleep(seconds)
+
+        monkeypatch.setattr(time, "sleep", _count)
+        holder = types.SimpleNamespace(_stop=True, port=0)
+        waiter = threading.Thread(
+            target=lambda: out.append(
+                pin_proxy.PortHolder._wait_for_exit(holder, proc)),
+            daemon=True)
+        try:
+            began = time.monotonic()
+            waiter.start()
+            waiter.join(10)
+            took = time.monotonic() - began
+            assert out == [0] and took < 3, (
+                f"the exit was heard late or not at all: {out} after {took}s")
+            assert not sleeps, (
+                f"the supervisor polled: {len(sleeps)} sleeps while it waited")
+        finally:
+            proc.kill()
+
 
 @pytest.mark.parametrize("ender", ["stop", "closed"])
 def test_a_transient_accept_error_does_not_end_the_accept_loop(
@@ -4466,6 +4542,40 @@ def test_a_transient_accept_error_does_not_end_the_accept_loop(
     assert len(calls) == 2, (
         f"made {len(calls)} accept() calls, expected 2: 1 means EMFILE ended "
         f"the loop, more means it kept spinning on a dead socket")
+
+
+def test_an_accept_error_streak_is_logged_once_and_dated(monkeypatch):
+    """T1743: the retry is silent otherwise, so a persistent EMFILE would be
+    invisible in daemon.log. One line opens a streak, naming the errno; a
+    timeout (accept works again) ends it, and the next error opens another."""
+    import errno
+
+    from cswap_pin import proxy as pin_proxy
+
+    script = [OSError(errno.EMFILE, "Too many open files")] * 2 + [
+        socket.timeout()] + [OSError(errno.EMFILE, "Too many open files")] * 2
+    lines = []
+
+    class _Srv:
+        def settimeout(self, _seconds):
+            pass
+
+        def fileno(self):
+            return 7
+
+        def accept(self):
+            exc = script.pop(0)
+            if not script:
+                server._stop = True  # the last error ends the loop, unlogged
+            raise exc
+
+    server = types.SimpleNamespace(_srv=_Srv(), _stop=False)
+    monkeypatch.setattr(pin_proxy, "_ADOPTED_BACKLOG", [])
+    monkeypatch.setattr(pin_proxy, "_log_lifecycle", lines.append)
+    monkeypatch.setattr(pin_proxy.time, "sleep", lambda _seconds: None)
+    pin_proxy.PinProxy._accept_loop(server)
+    assert len(lines) == 2 and all("EMFILE" in line for line in lines), (
+        f"expected one line per streak, each naming EMFILE: {lines}")
 
 
 class TestSuperviseCleanExitGuards:
