@@ -17346,12 +17346,14 @@ class PinProxy:
                 except socket.timeout:
                     continue
                 except OSError:
-                    # ONLY `_stop` ENDS THE LOOP (T1743): `release_listener`
-                    # sets it before it closes or detaches the socket. Any
-                    # other error is transient (EMFILE under load), and
+                    # ONLY A STOP OR A DEAD SOCKET ENDS THE LOOP (T1743):
+                    # `release_listener` sets `_stop` before it closes or
+                    # detaches the socket (`fileno()` is then -1, which also
+                    # covers a `_stop` that `_resume_serving` cleared again).
+                    # Any other error is transient (EMFILE under load), and
                     # returning here left a live process that accepts nothing
                     # for good. The same retry as `_accept_degraded`.
-                    if self._stop:
+                    if self._stop or srv.fileno() < 0:
                         return
                     time.sleep(0.1)
                     continue

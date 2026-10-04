@@ -4432,10 +4432,14 @@ class TestAHeldDaemonThatStoppedAccepting:
             holder.stop()
 
 
-def test_a_transient_accept_error_does_not_end_the_accept_loop(monkeypatch):
+@pytest.mark.parametrize("ender", ["stop", "closed"])
+def test_a_transient_accept_error_does_not_end_the_accept_loop(
+        monkeypatch, ender):
     """T1743: `_accept_loop` returned on ANY OSError, so one EMFILE ended the
     thread for good with the process still up. Only `_stop` (set before
-    `release_listener` closes the socket) may end it."""
+    `release_listener` closes the socket) or a socket that is already closed
+    or detached (`fileno() == -1`, e.g. a `_resume_serving` cleared `_stop`
+    under a straggler thread) may end it."""
     import errno
 
     from cswap_pin import proxy as pin_proxy
@@ -4446,17 +4450,22 @@ def test_a_transient_accept_error_does_not_end_the_accept_loop(monkeypatch):
         def settimeout(self, _seconds):
             pass
 
+        def fileno(self):
+            return -1 if ender == "closed" and len(calls) >= 2 else 7
+
         def accept(self):
             calls.append(1)
-            if len(calls) == 2:
-                server._stop = True  # what `release_listener` does first
+            if len(calls) == 2 and ender == "stop" or len(calls) > 5:
+                server._stop = True  # what `release_listener` does first;
+                # past 5 it only keeps a spinning loop from hanging the run
             raise OSError(errno.EMFILE if len(calls) == 1 else errno.EBADF, "x")
 
     server = types.SimpleNamespace(_srv=_Srv(), _stop=False)
     monkeypatch.setattr(pin_proxy, "_ADOPTED_BACKLOG", [])
     pin_proxy.PinProxy._accept_loop(server)
     assert len(calls) == 2, (
-        f"the loop ended after {len(calls)} accept(): EMFILE killed it")
+        f"made {len(calls)} accept() calls, expected 2: 1 means EMFILE ended "
+        f"the loop, more means it kept spinning on a dead socket")
 
 
 class TestSuperviseCleanExitGuards:
