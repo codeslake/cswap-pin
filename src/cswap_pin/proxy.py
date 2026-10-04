@@ -11471,11 +11471,18 @@ class PortHolder:
             # its code watchdog ticks until its teardown ends: a deploy in that
             # window makes it send this very signal, which cannot say who
             # asked. A second successor would sit beside the first with no
-            # supervisor, two acceptors on one socket. Declining loses nothing:
-            # the successor's own watchdog asks for any newer code once the
-            # drain is over.
+            # supervisor, two acceptors on one socket. THE SUCCESSOR'S OWN ASK
+            # IS THE ONE EXCEPTION: it asks once and does not re-ask, and
+            # declining it sends it down the exit-75 fallback (release, a 30 s
+            # drain), so nothing accepts until the supervisor reaps the retired
+            # daemon. It announces draining BEFORE it asks, so a marker for the
+            # current daemon is what separates its ask from the retired one's.
+            # With no certdir that cannot be told, and the ask is declined.
             retiring = getattr(self, "_retiring", None)
-            if getattr(retiring, "returncode", 0) is None:
+            certdir = getattr(self, "_certdir", None)
+            if (getattr(retiring, "returncode", 0) is None
+                    and (certdir is None
+                         or not is_draining(certdir, self._proc.pid))):
                 _log_lifecycle(
                     f"replace request for port {self.port} ignored — daemon "
                     f"{retiring.pid} is still draining after its replacement"
@@ -11643,9 +11650,16 @@ class PortHolder:
             waiter.join(_CODE_WATCH_INTERVAL_S)
             if not waiter.is_alive():
                 return code[0]
-            if (self._stop or not self._self_heal_on()
-                    or _health_pid(self.port) == proc.pid):
+            if self._stop or not self._self_heal_on():
                 silent_since = None
+                continue
+            # THREE ANSWERS: its own pid resets the silence, none counts
+            # toward it, and another pid (a successor's) neither: the port is
+            # served, which says nothing about `proc`.
+            answered = _health_pid(self.port)
+            if answered == proc.pid:
+                silent_since = None
+            if answered is not None:
                 continue
             now = time.monotonic()
             silent_since = silent_since or now
