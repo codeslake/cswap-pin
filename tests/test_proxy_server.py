@@ -1514,7 +1514,7 @@ class _IdleClosingUpstream(_FakeUpstream):
                         if not chunk:
                             raise OSError("client closed")
                         rest += chunk
-                    tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    tls.sendall(self._reply())
             except (OSError, ssl.SSLError):
                 pass
             finally:
@@ -1524,6 +1524,21 @@ class _IdleClosingUpstream(_FakeUpstream):
                     (tls or conn).close()
                 except OSError:
                     pass
+
+    def _reply(self) -> bytes:
+        return b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+
+
+class _FirstConnection502Upstream(_IdleClosingUpstream):
+    """A hop that opened the tunnel and then failed inside it: every answer on
+    its first TCP connection is a 502 (Content-Length, NO `Connection: close`,
+    so the response alone does not retire the socket), every later connection
+    answers 200."""
+
+    def _reply(self) -> bytes:
+        if self.accepted == 1:
+            return b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\n\r\nbad"
+        return super()._reply()
 
 
 class _FramingUpstream:
@@ -8191,6 +8206,20 @@ class TestAStaleUpstreamIsRedialled:
             time.sleep(0.2)
             assert self._ask(conn) == (200, b"ok")
             assert up.accepted == 1, "a live keep-alive was dropped for nothing"
+            conn.close()
+        finally:
+            proxy.stop()
+            up.stop()
+
+    def case_a_5xx_retires_the_upstream_it_came_over(self, certdir):
+        up = _FirstConnection502Upstream(certdir, hold=5.0)
+        proxy = self._proxy(certdir, up)
+        try:
+            conn = self._keepalive(proxy.port, certdir / "ca.pem")
+            got = [self._ask(conn)[0], self._ask(conn)[0]]
+            assert got == [502, 200], (
+                f"the request after a 5xx rode the same broken upstream: {got}")
+            assert up.accepted == 2, "the pin did not dial a fresh upstream"
             conn.close()
         finally:
             proxy.stop()

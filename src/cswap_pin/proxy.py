@@ -20140,7 +20140,8 @@ class PinProxy:
             # a request still being read or written upstream, and the drain
             # then cut it "after 0s".
             _conn = getattr(self._local, "conn", None)
-            return _relay_response(
+            hop_failed = threading.Event()
+            keep = _relay_response(
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
                 # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
@@ -20205,7 +20206,20 @@ class PinProxy:
                 # Content-Length included, but no body — only the request
                 # method says so.
                 method=method,
+                on_hop_trouble=hop_failed.set,
             )
+            # A 5xx RETIRES THE UPSTREAM IT CAME OVER, once its body is out: a
+            # hop that failed inside the tunnel keeps failing on that socket
+            # whatever the response's `Connection` header says (measured: the
+            # next answer was a 502 in 130 of 179 cases, 57 of 411 on a fresh
+            # connection). The CLIENT connection stays open and nothing is
+            # resent: Claude Code retries a 5xx itself, and that retry dials
+            # fresh.
+            # ponytail: a genuine origin 5xx (529) costs that retry one fresh
+            # TLS dial too; keep the socket for it only if that ever shows.
+            if hop_failed.is_set():
+                self._drop_upstream()
+            return keep
         except (OSError, ssl.SSLError):
             self._drop_upstream()
             return False
@@ -21224,13 +21238,15 @@ _hop_trouble_at = 0.0
 _hop_trouble_lock = threading.Lock()
 
 
-def _note_hop_trouble(status_line: bytes) -> None:
-    """Record that this hop just returned a transport-shaped failure."""
+def _note_hop_trouble(status_line: bytes) -> bool:
+    """Record that this hop just returned a transport-shaped failure; True
+    when it did."""
     if not status_line.startswith(b"HTTP/1.1 5"):
-        return
+        return False
     global _hop_trouble_at
     with _hop_trouble_lock:
         _hop_trouble_at = time.time()
+    return True
 
 
 def _hop_recently_failed() -> bool:
@@ -22297,9 +22313,16 @@ def _relay_response(
     auth: str = "",
     session: str = "",
     note_hop: bool = True,
+    on_hop_trouble=None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
+
+    ``on_hop_trouble`` is called at the status line when `note_hop` stamped
+    the upstream's own 5xx; the caller retires its kept upstream once the body
+    is out (closing it here would cut that body). It reads the status BEFORE
+    the stream 404 -> 503 rewrite, which `on_status` does not: a 404 must never
+    arm it (bb5717c).
 
     ``session`` is the request's ``x-claude-code-session-id``, threaded
     through to `_switch_off_walled_account` so a stale-bearer 401 debounces
@@ -22381,8 +22404,8 @@ def _relay_response(
         # on.
         return _AuthRejected(int(status_line[9:12]))
     _note_worker_status(path, status_line, certdir)
-    if note_hop:
-        _note_hop_trouble(status_line)
+    if note_hop and _note_hop_trouble(status_line) and on_hop_trouble:
+        on_hop_trouble()
     # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
     # above cannot see it; 401 is a rebuild trigger, 429 is not.
     _walled_401 = False
@@ -22602,12 +22625,14 @@ def _relay_response(
                 reject_on_auth_error=reject_on_auth_error, method=method,
                 on_headers=None, on_status=on_status, path=path,
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
+                on_hop_trouble=on_hop_trouble,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
             on_headers=None, on_status=on_status, path=path,
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
+            on_hop_trouble=on_hop_trouble,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
