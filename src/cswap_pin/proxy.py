@@ -21595,6 +21595,9 @@ def _forget_walled_slots_that_changed_hands(slot: str | None) -> None:
         if _walled_slot_occupant.setdefault(num, who) == who:
             continue
         _walled_slot_occupant[num] = who
+        _log_lifecycle(
+            f"slot {num} now holds a different account than the one its wall "
+            "memos were recorded for; forgetting them")
         _walled_slots.pop(num, None)
         for memo in (_walled_switch_seen, _walled_switch_seen_by_session,
                      _walled_headroom_seen):

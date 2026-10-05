@@ -19471,9 +19471,13 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             pp._walled_switch_seen[(reset, slot)] = (True, None, 0.0)
             pp._walled_switch_seen_by_session[(reset, slot, "s")] = soon
             pp._walled_headroom_seen[(reset, slot)] = (50.0, 0.0)
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
         pp._forget_walled_slots_that_changed_hands("5")
+        assert not lines, lines
         who["5"] = "b@example.com"
         pp._forget_walled_slots_that_changed_hands("5")
+        assert len(lines) == 1 and "slot 5 " in lines[0], lines
         assert set(pp._walled_slots) == {"6"}, pp._walled_slots
         for memo in (pp._walled_switch_seen, pp._walled_switch_seen_by_session,
                      pp._walled_headroom_seen):
