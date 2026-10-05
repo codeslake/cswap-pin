@@ -22320,7 +22320,9 @@ def _relay_response(
 
     ``on_hop_trouble`` is called at the status line when `note_hop` stamped
     the upstream's own 5xx; the caller retires its kept upstream once the body
-    is out (closing it here would cut that body).
+    is out (closing it here would cut that body). It reads the status BEFORE
+    the stream 404 -> 503 rewrite, which `on_status` does not: a 404 must never
+    arm it (bb5717c).
 
     ``session`` is the request's ``x-claude-code-session-id``, threaded
     through to `_switch_off_walled_account` so a stale-bearer 401 debounces
