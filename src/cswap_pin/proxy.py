@@ -22973,11 +22973,20 @@ class _PumpLoop:
     def release_pairs(self, kind: str | None = None) -> int:
         """Let the driven tunnels of `kind` go, and say how many.
 
-        SHUT_WR, NOT CLOSE, and on BOTH sides: each peer sees a clean EOF
-        rather than the RST it would get when this process exits with the
-        sockets still open. That is the same policy `release_idle_streams`
-        uses for SSE, and the 2x2 in `_close_open_connections` is the
-        measurement behind preferring it.
+        SHUT_WR FIRST, THEN CLOSE, and on BOTH sides: each peer sees a clean
+        EOF rather than the RST it would get when this process exits with the
+        sockets still open. That is the sequence `_close_open_connections`
+        runs on every open connection, and its 2x2 is the measurement: a close
+        that follows the shutdown still reads as a clean EOF, unread bytes or
+        not.
+
+        THE CLOSE IS `_close_pair`, ONCE PER PAIR, because that also runs the
+        pair's `on_close`. For a blind CONNECT `on_close` is the only thing
+        that takes the client's socket out of `_open_conns`, so a release that
+        stopped at the shutdown left the daemon holding that fd until
+        `_close_open_connections`, which the uncapped arm of `await_inflight`
+        reaches only after a wait on no clock. `add` files the same `on_close`
+        under both sockets, so walking sockets would run it twice.
 
         THE PAIR LEAVES THE MAP FIRST, or the shutdown is undone by the next
         byte: a released socket still registered keeps being relayed, the
@@ -22999,6 +23008,7 @@ class _PumpLoop:
         with self._lock:
             socks = [s_ for s_ in self._peer
                      if kind is None or self._kind.get(s_, "tunnel") == kind]
+            ends = {s_: self._peer[s_] for s_ in socks}
             for s_ in socks:
                 self._peer.pop(s_, None)
                 self._kind.pop(s_, None)
@@ -23012,6 +23022,12 @@ class _PumpLoop:
                 s_.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
+        seen = set()
+        with self._lock:
+            for a, (b, on_close) in ends.items():
+                if a not in seen:
+                    seen.update((a, b))
+                    self._close_pair(a, b, on_close)
         return len(socks) // 2
 
     def add(self, a, b, on_close=None, kind: str = "tunnel") -> None:

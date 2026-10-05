@@ -941,10 +941,15 @@ class TestPinProxyServer:
         import cswap_pin.proxy as pp
 
         holds: list[tuple[str, bool]] = []
+        abandoned = threading.Event()
         real_hold = pp.PinProxy._hold_bridge_attach
 
         def _spy_hold(self, cse):
             event, waited = real_hold(self, cse)
+            # With no earlier entry the hung-up check is a single poll(0)
+            # the instant this returns, so it must not run before the client
+            # has actually closed. Bounded, so a broken run fails, not hangs.
+            abandoned.wait(5)
             holds.append((cse, waited))
             return event, waited
 
@@ -957,6 +962,7 @@ class TestPinProxyServer:
         try:
             _post_and_abandon(proxy.port, certdir / "ca.pem",
                               "/v1/code/sessions/cse_first/bridge", "FIRST")
+            abandoned.set()
             time.sleep(0.5)  # let the abandoned send actually land
             assert upstream.received == [], (
                 "a first attempt (no earlier hold entry) whose client "
@@ -13546,6 +13552,115 @@ class TestDrainReportsWhatItCut:
         assert "bridge" not in _Chatty.released and not _Chatty.released, (
             "a non-bridge tunnel was released by the bridge deadline: %r"
             % (_Chatty.released,))
+
+    def case_a_released_blind_tunnel_leaves_no_client_socket_behind(
+            self, certdir):
+        """THE DRAIN LET THE TUNNEL GO AND KEPT ITS CLIENT SOCKET.
+
+        `release_pairs` popped each pair and shut both sides down, but neither
+        closed them nor ran the pair's `on_close`, and for a blind CONNECT
+        `on_close` is the only thing that takes the client's socket out of
+        `_open_conns`. After the peer closed, the daemon sat on a dead fd in
+        state CLOSE until `_close_open_connections`, which the uncapped arm
+        reaches only after the owed-reply wait, on no clock. Measured: 20 of 20
+        client fds held. A stub of the pump cannot see this, so the tunnel and
+        the pump are real.
+
+        AND THE CUT STAYS CLEAN, because this is the handover path: what the
+        daemon had already delivered still reaches the client, then a FIN, not
+        a reset.
+        """
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import _PUMP
+
+        _PUMP.reset_for_tests()
+        peer = socket.socket()
+        peer.bind(("127.0.0.1", 0))
+        peer.listen(1)
+        port = peer.getsockname()[1]
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", 1))
+        proxy.start()
+        raw = far = None
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.settimeout(5)
+            raw.sendall(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{port}\r\n\r\n".encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = raw.recv(4096)
+                assert chunk, "the tunnel never answered the CONNECT"
+                head += chunk
+            peer.settimeout(5)
+            far, _ = peer.accept()
+            deadline = time.monotonic() + 5
+            while _PUMP.live_pairs() != 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert _PUMP.live_pairs() == 1, "precondition: the pump drives it"
+            with proxy._live_lock:
+                (served,) = proxy._open_conns
+
+            # DELIVERED BEFORE THE RELEASE: peeked, so it is in the client's
+            # queue (the daemon wrote it) without the client having read it.
+            far.sendall(b"BEFORE")
+            assert raw.recv(6, socket.MSG_PEEK) == b"BEFORE", "precondition"
+
+            assert _PUMP.release_pairs() == 1
+            got = b""
+            while True:
+                chunk = raw.recv(4096)  # a reset raises here: the Rule 0 half
+                if not chunk:
+                    break
+                got += chunk
+            assert got == b"BEFORE", (
+                f"the release lost what was already delivered: {got!r}")
+            raw.close()
+
+            deadline = time.monotonic() + 5
+            while ((proxy.live_client_count() or served.fileno() != -1)
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            assert proxy.live_client_count() == 0, (
+                "the client closed and the daemon still counts its connection: "
+                "the released tunnel's socket stays in `_open_conns`")
+            assert served not in proxy._open_conns
+            assert served.fileno() == -1, (
+                "the daemon still holds the accepted fd after the peer closed")
+        finally:
+            proxy.stop()
+            for s_ in (raw, far, peer):
+                if s_ is not None:
+                    s_.close()
+
+    def case_a_released_pair_runs_its_teardown_once_and_only_for_its_kind(self):
+        """`add` files each socket under the SAME `on_close`, so a release that
+        walks sockets rather than pairs runs it twice. The 101 path's teardown
+        also takes the closer, which a release has none of."""
+        from cswap_pin.proxy import _PUMP
+
+        _PUMP.reset_for_tests()
+        a, b = socket.socketpair()
+        c, d = socket.socketpair()
+        ended, other = [], []
+
+        def bridge_done(closed_by=None):
+            ended.append(closed_by)
+
+        bridge_done._wants_closer = True
+        try:
+            _PUMP.add(a, b, bridge_done, kind="bridge")
+            _PUMP.add(c, d, lambda: other.append(1))
+            assert _PUMP.release_pairs("bridge") == 1
+            assert ended == [None], f"the bridge teardown ran as {ended!r}"
+            assert a.fileno() == b.fileno() == -1, "the pair was left open"
+            assert other == [] and c.fileno() != -1, (
+                "a release of one kind closed the other")
+            assert _PUMP.release_pairs() == 1
+            assert other == [1]
+        finally:
+            for s_ in (a, b, c, d):
+                s_.close()
 
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
         """The channel a session cannot reopen for itself must survive a recycle.
