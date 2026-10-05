@@ -15605,17 +15605,23 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             # test here) spends no grant. A tick that refreshed every time is
             # a POST every 30 s, each one burning a one-time grant.
             rig.advance(200)
+            reads = len(rig.reads)
             self._tick(rig, certdir, monkeypatch, self_heal)
             assert len(rig.calls) == 1, (
                 f"self_heal={self_heal}: a second tick refreshed a token "
                 f"with hours left ({len(rig.calls)} refreshes)")
+            assert len(rig.reads) == reads, (
+                f"self_heal={self_heal}: a tick on a token not due read the "
+                f"store")
 
     def case_a_token_outside_the_margin_is_not_refreshed(
             self, certdir, monkeypatch):
         """15 minutes left is above the 10-minute margin: no grant is spent."""
         rig = self._rig(certdir, monkeypatch, minutes=15)
+        reads = len(rig.reads)
         self._tick(rig, certdir, monkeypatch, False)
         assert rig.calls == [], rig.calls
+        assert len(rig.reads) == reads, "a tick on a token not due read the store"
 
     def case_another_processs_rotation_is_adopted_before_a_grant_is_spent(
             self, certdir, monkeypatch):
@@ -15684,13 +15690,41 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         next read after it."""
         rig = self._rig(certdir, monkeypatch)
         rig.now += 3 * 60                      # 4 min left: inside the buffer
-        self._tick(rig, certdir, monkeypatch, False)
+        self._tick(rig, certdir, monkeypatch, True)
         assert len(rig.calls) == 1, "the tick did not refresh"
         assert len(rig.at_call[0]) == 1 and "True -> False" in rig.at_call[0][0], (
             rig.at_call)
         assert rig.provider.can_pin_cached() is True
         lines = self._transitions(rig)
         assert len(lines) == 2 and "False -> True" in lines[1], lines
+
+    def case_a_token_past_the_buffer_is_refreshed_once_per_tick(
+            self, certdir, monkeypatch):
+        """The early refresh is for a token that is still LIVE. Past the
+        buffer it is `_can_mint`'s to refresh (self-heal on: one POST a tick,
+        as before the early refresh existed) and nobody's with self-heal off.
+        The tick's `freshen()` used to reach the on-demand branch, which the
+        retry spacing does not hold, so a dead lineage cost a second POST (on)
+        or a POST a tick where there was none (off). It reads no store, and no
+        request went out, so a busy slot is no unpinned request."""
+        from cswap_pin import proxy as pp
+
+        for self_heal, posts in ((True, 1), (False, 0)):
+            for outcome in ("invalid_grant", "consume-busy"):
+                rig = self._rig(certdir, monkeypatch, outcome=outcome)
+                rig.now += 3 * 60              # 4 min left: inside the buffer
+                # The recycle a blind tick starts is not under test.
+                pp.note_blind_recycle(certdir, time.time())
+                reads = len(rig.reads)
+                self._tick(rig, certdir, monkeypatch, self_heal)
+                assert len(rig.calls) == posts, (
+                    f"self_heal={self_heal} {outcome}: {len(rig.calls)} "
+                    f"refreshes in one tick, want {posts}")
+                if not self_heal:
+                    assert len(rig.reads) == reads, "the tick read the store"
+                    assert rig.provider.pin_is_noop() is False
+                    assert not [ln for ln in rig.lines
+                                if "went out unpinned" in ln], rig.lines
 
     def case_a_failing_early_refresh_is_tried_once_per_retry_spacing(
             self, certdir, monkeypatch):
@@ -15766,6 +15800,29 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             holder.join(timeout=2.0)
         assert waited < 0.25, f"the tick queued behind the lock for {waited:.2f}s"
         assert rig.calls == []
+
+    def case_the_tick_leaves_a_requests_deferral_mark_alone(
+            self, certdir, monkeypatch):
+        """A request's `consume-busy` mark (`_deferred`, read only by
+        `pin_is_noop`) lasted until the NEXT request, because the tick never
+        called the provider. The tick's early return for a token already past
+        the buffer sat below the provider's own `_deferred.discard(1)`, so
+        with self-heal OFF (nothing else re-adds the mark) a request that was
+        only deferred read `can_pin: false` from the next tick on, and the
+        edge log wrote a `True -> False` the real state never had."""
+        rig = self._rig(certdir, monkeypatch, outcome="consume-busy")
+        rig.advance(3 * 60)                    # 4 min left: past the buffer
+        assert rig.provider() is None          # the request: deferred, not failed
+        assert len(rig.calls) == 1, rig.calls
+        assert rig.provider.pin_is_noop() is True, "the deferral left no mark"
+        assert rig.provider.can_pin_cached() is True
+        edges = self._transitions(rig)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, "the tick spent a grant on a past-buffer token"
+        assert rig.provider.pin_is_noop() is True, (
+            "the tick cleared a request's deferral mark")
+        assert rig.provider.can_pin_cached() is True
+        assert self._transitions(rig) == edges, self._transitions(rig)
 
 
 class TestTheRequestPathNeverOpensTheTraceFile:
