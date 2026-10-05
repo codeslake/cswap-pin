@@ -21855,13 +21855,14 @@ def _switch_off_walled_account(
     with _walled_switch_lock:
         # A SLOT NUMBER STANDS FOR AN ACCOUNT ONLY WHILE THE SAME ONE HOLDS
         # IT: a slot `cswap move` gave to another account loses its memos
-        # here, its wall following the account. `stale`: the roster now says
-        # something else about `slot` than it did at the read above (another
-        # account, an empty slot, or no answer), so nothing keyed on `slot`
+        # here, its wall following the account. `stale`: the roster cannot
+        # say who holds `slot` now, or says something else than at the read
+        # above (another account, an empty slot), so nothing keyed on `slot`
         # may be WRITTEN by this request -- comparing the two reads, not the
         # guard's memo, because the first waiter through records the new
         # occupant and the guard then finds nothing changed for the rest.
-        stale = _forget_walled_slots_that_changed_hands(slot) != seen_who
+        now_who = _forget_walled_slots_that_changed_hands(slot)
+        stale = slot is not None and (now_who is None or now_who != seen_who)
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
         # is 03:40:00Z exactly -- so two accounts reaching their window on the

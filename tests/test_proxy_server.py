@@ -17389,6 +17389,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             current_account_number=(
                 live_num if callable(live_num) else lambda: live_num),
             usage_entries_by_account=_usage_entries_by_account,
+            # Every slot holds one fixed account: a wall write needs a roster
+            # that answers (an unreadable one writes no wall).
+            resolve_account=lambda num: (num, f"acct-{num}@example.com", "org"),
         )
         if record_usage_headers is not None:
             _attrs["record_usage_headers"] = record_usage_headers
@@ -19206,8 +19209,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         case that needs to block inside it. ``occupant`` is a ``{slot:
         email}`` map `resolve_account` answers from, live, so a case can
         change who holds a slot between two relays (`cswap move`); omitted,
-        the fake has no `resolve_account` at all, which keeps every case
-        that predates it blind to who holds a slot."""
+        every slot holds one fixed account of its own."""
         from claude_swap.exceptions import AccountNotFoundError
         from cswap_pin import proxy as pp
         calls = []
@@ -19244,13 +19246,15 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             "current_account_number": _current_account_number,
             "switch": _switch,
         }
-        if occupant is not None:
-            def _resolve_account(self, num):
-                if num not in occupant:
-                    raise AccountNotFoundError(num)
-                return (num, occupant[num], "org")
+        def _resolve_account(self, num):
+            if occupant is None:
+                return (num, f"acct-{num}@example.com", "org")
+            if num not in occupant:
+                raise AccountNotFoundError(num)
+            return (num, occupant[num], "org")
 
-            attrs["resolve_account"] = _resolve_account
+        attrs["resolve_account"] = _resolve_account
+        if occupant is not None:
             attrs["_get_sequence_data"] = lambda self: {"accounts": {
                 n: {"email": e, "organizationUuid": "org"}
                 for n, e in list(occupant.items())}}
@@ -19569,17 +19573,19 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             return super().__getitem__(num)
 
     def _wall_while_the_roster_moves(
-        self, monkeypatch, move, auth=None, session="",
+        self, monkeypatch, move, auth=None, session="", torn=False,
     ):
         """Slot 5 holds account A and a live-token 429 has read (slot 5, A's
         token). `cswap move` then commits while that request waits on
         `_walled_switch_lock`: `move(who)` runs as the lock is entered. Then
         account C takes slot 5 and a stale bearer's 429 on the same wall
-        arrives. ``auth``/``session`` replace the first relay's live bearer.
-        Returns the first relay's answer, the memos it left (walls, shared
-        verdicts, per-session verdicts) and the second relay's answer."""
+        arrives. ``auth``/``session`` replace the first relay's live bearer;
+        ``torn`` makes the roster unreadable from the start. Returns the
+        first relay's answer, the memos it left (walls, shared verdicts,
+        per-session verdicts) and the second relay's answer."""
         from cswap_pin import proxy as pp
         who = self._Roster({"5": "a@example.com"})
+        who.torn = torn
         self._wire_exclude_capable(
             monkeypatch, switched=False, live_token=self.LIVE, live_num="5",
             occupant=who)
@@ -19637,6 +19643,18 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         could not be attributed to anyone in this call, so none is written."""
         first, left, got = self._wall_while_the_roster_moves(
             monkeypatch, lambda who: setattr(who, "torn", True))
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert left == ({}, {}, {}), left
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+
+    def case_a_wall_is_not_written_when_the_roster_is_unreadable_at_both_reads(
+        self, monkeypatch,
+    ):
+        """No pre-lock read to compare with and none at the lock either: the
+        two reads agree on "unknown", which is not "unchanged", so the wall is
+        attributed to nobody and none is written."""
+        first, left, got = self._wall_while_the_roster_moves(
+            monkeypatch, lambda who: None, torn=True)
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
         assert left == ({}, {}, {}), left
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
@@ -19718,6 +19736,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         fake_switcher = type("FakeSwitcher", (), {
             "_read_credentials": _read_credentials,
             "current_account_number": _current_account_number,
+            "resolve_account": lambda self, num: (
+                num, f"acct-{num}@example.com", "org"),
             "switch": _switch,
         })
         fake_module = type("M", (), {"ClaudeAccountSwitcher": fake_switcher})()
