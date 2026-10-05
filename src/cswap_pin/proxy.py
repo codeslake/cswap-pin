@@ -21426,11 +21426,9 @@ _WALLED_SWITCH_RAISE_TTL = 30.0
 
 
 def _remember_walled_switch(
-    key: tuple[bytes, str | None] | None, ok: bool, cap: float | None = None,
+    key: tuple[bytes, str | None], ok: bool, cap: float | None = None,
 ) -> None:
-    """Record this wall's verdict. Call under `_walled_switch_lock`. A
-    ``None`` key (a request whose slot read is stale, see
-    `_switch_off_walled_account`) records nothing.
+    """Record this wall's verdict. Call under `_walled_switch_lock`.
 
     ONE WRITER, because the asymmetry is the whole point and it was wrong in
     two of the three places that wrote it. A validated conversion is
@@ -21457,8 +21455,6 @@ def _remember_walled_switch(
     on that stale-bearer-already-walled branch; every other path keeps the
     full `_WALLED_SWITCH_RAISE_TTL` negative.
     """
-    if key is None:
-        return
     now = time.monotonic()
     if not ok:
         retry_at = now + _WALLED_SWITCH_RAISE_TTL
@@ -21640,7 +21636,7 @@ def _forget_walled_slots_that_changed_hands(slot: str | None) -> tuple | None:
                         if _slot_occupant(n, sw) == was)
         except Exception:  # noqa: BLE001 — left the roster, or it cannot be
             continue  # read now: the wall goes with the account
-        _walled_slots[dest] = wall
+        _walled_slots[dest] = max(wall, _walled_slots.get(dest, 0.0))
         _walled_slot_occupant[dest] = was
         changed.add(dest)
         followed.append(f"{num}->{dest}")
@@ -21871,8 +21867,10 @@ def _switch_off_walled_account(
         # no bearer test and no headroom test. NOT `(reset, token)`: a
         # rotation mints a new access token per retry, so every retry would be
         # a fresh key and the 401 -> 429 -> 401 loop below reopens; a slot
-        # number does not rotate.
-        key = None if stale else (reset, slot)
+        # number does not rotate. A `stale` read keys on `(reset, None)`, which
+        # no slot's new occupant can inherit, so the storm's waiters (all
+        # stale together) still share ONE `switch()` verdict.
+        key = (reset, None if stale else slot)
         # Set by the bearer branch below, ONLY when it finds the live slot
         # already known walled (`walled=True`): that fallthrough's own
         # `reset` belongs to the STALE account, not the live one, so the
@@ -22015,7 +22013,10 @@ def _switch_off_walled_account(
                 if session_key is not None:
                     _walled_switch_seen_by_session[session_key] = (
                         now2 + _WALLED_SWITCH_RAISE_TTL)
-                else:
+                elif not stale:
+                    # A stale read records no 401 memo at all: a shared
+                    # negative would hand the storm's other stale sessions a
+                    # relayed 429 where each is owed its own 401.
                     _remember_walled_switch(key, False)
                 # The live slot was just judged able to take a retry (known
                 # headroom, or unknown but not known walled) — a stale

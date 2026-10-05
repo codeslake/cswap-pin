@@ -19559,7 +19559,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     class _Roster(dict):
         """A `{slot: email}` roster that can be torn and lists the slots it
-        was asked about."""
+        has answered. A read is listed only AFTER its value is fetched, so a
+        case that waits for N reads and then moves the roster cannot move it
+        under a read already counted but not yet answered."""
         torn = False
 
         def __init__(self, *args):
@@ -19567,10 +19569,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             self.reads = []
 
         def __getitem__(self, num):
-            self.reads.append(num)
             if self.torn:
                 raise OSError("roster torn")
-            return super().__getitem__(num)
+            value = super().__getitem__(num)
+            self.reads.append(num)
+            return value
 
     def _wall_while_the_roster_moves(
         self, monkeypatch, move, auth=None, session="", torn=False,
@@ -19581,8 +19584,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         account C takes slot 5 and a stale bearer's 429 on the same wall
         arrives. ``auth``/``session`` replace the first relay's live bearer;
         ``torn`` makes the roster unreadable from the start. Returns the
-        first relay's answer, the memos it left (walls, shared verdicts,
-        per-session verdicts) and the second relay's answer."""
+        first relay's answer, the memos it left (walls, the slots the shared
+        verdicts are keyed on, per-session verdicts) and the second relay's
+        answer."""
         from cswap_pin import proxy as pp
         who = self._Roster({"5": "a@example.com"})
         who.torn = torn
@@ -19603,7 +19607,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         monkeypatch.setattr(pp, "_walled_switch_lock", _Lock())
         first = self._relay(auth=auth or "Bearer " + self.LIVE,
                             session=session)
-        left = (dict(pp._walled_slots), dict(pp._walled_switch_seen),
+        left = (dict(pp._walled_slots),
+                {k[1] for k in pp._walled_switch_seen},
                 dict(pp._walled_switch_seen_by_session))
         who.torn = False
         who["5"] = "c@example.com"
@@ -19620,7 +19625,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             monkeypatch, lambda who: who.update(
                 {"5": "b@example.com", "10": "a@example.com"}))
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
-        assert left == ({}, {}, {}), left
+        assert left == ({}, {None}, {}), left
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
 
     def case_a_wall_is_not_written_for_an_account_that_left_the_slot_while_waiting(
@@ -19633,7 +19638,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             monkeypatch, lambda who: (who.pop("5"),
                                       who.update({"8": "a@example.com"})))
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
-        assert left == ({}, {}, {}), left
+        assert left == ({}, {None}, {}), left
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
 
     def case_a_wall_is_not_written_when_the_roster_fails_at_the_wall_writing_call(
@@ -19644,7 +19649,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         first, left, got = self._wall_while_the_roster_moves(
             monkeypatch, lambda who: setattr(who, "torn", True))
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
-        assert left == ({}, {}, {}), left
+        assert left == ({}, {None}, {}), left
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
 
     def case_a_wall_is_not_written_when_the_roster_is_unreadable_at_both_reads(
@@ -19656,7 +19661,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         first, left, got = self._wall_while_the_roster_moves(
             monkeypatch, lambda who: None, torn=True)
         assert first.startswith(b"HTTP/1.1 429"), first[:40]
-        assert left == ({}, {}, {}), left
+        assert left == ({}, {None}, {}), left
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
 
     def case_a_stale_bearer_session_memo_is_not_written_for_a_slot_that_moved(
@@ -19670,7 +19675,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 {"5": "b@example.com", "10": "a@example.com"}),
             auth="Bearer stale-account-a-token", session="session-a")
         assert first.startswith(b"HTTP/1.1 401"), first[:40]
-        assert left == ({}, {}, {}), left
+        assert left == ({}, set(), {}), left
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
 
     def case_a_second_waiter_behind_the_move_writes_no_wall_either(
@@ -19686,7 +19691,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         so counting those reads says both are parked, with no sleep."""
         from cswap_pin import proxy as pp
         who = self._Roster({"5": "a@example.com"})
-        self._wire_exclude_capable(
+        calls = self._wire_exclude_capable(
             monkeypatch, switched=False, live_token=self.LIVE, live_num="5",
             occupant=who)
         answers = []
@@ -19704,6 +19709,24 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             t.join(10)
         assert len(answers) == 2, answers
         assert not pp._walled_slots, pp._walled_slots
+        assert len(calls) == 1, (
+            f"both waiters are stale, and the storm still debounces to one "
+            f"switch(): {calls}")
+
+    def case_a_followed_wall_never_shortens_the_account_own_newer_one(
+        self, monkeypatch,
+    ):
+        """Account A's wall follows it to slot 10, which already carries A's
+        own LATER wall (slot 10 is recorded as A's, so the guard leaves its
+        entry alone): the follow keeps the later epoch."""
+        from cswap_pin import proxy as pp
+        who = {"5": "b@example.com", "10": "a@example.com"}
+        self._wire_exclude_capable(monkeypatch, switched=False, occupant=who)
+        pp._walled_slots.update({"5": 1000.0, "10": 2000.0})
+        pp._walled_slot_occupant.update(
+            {"5": ("a@example.com", "org"), "10": ("a@example.com", "org")})
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert pp._walled_slots == {"10": 2000.0}, pp._walled_slots
 
     def case_switch_off_records_the_walled_slot_from_a_real_relay(
         self, monkeypatch,
