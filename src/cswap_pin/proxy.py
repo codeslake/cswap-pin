@@ -21563,6 +21563,97 @@ def _cached_live_account_headroom(reset: bytes, slot: str) -> float | None:
     return headroom
 
 
+# slot -> (email, organizationUuid) it held when the memos above last spoke
+# for it (`()` when it was empty). They are keyed on the slot NUMBER; a wall
+# belongs to the ACCOUNT, and `cswap move` renumbers.
+_walled_slot_occupant: dict[str, tuple] = {}
+
+
+def _slot_occupant(num: str, sw=None) -> tuple | None:
+    """(email, organizationUuid) of the account the roster says holds slot
+    ``num``; ``()`` for an empty slot; ``None`` when the roster cannot be
+    read. THREE ANSWERS, because an empty slot says where an account WENT (a
+    `cswap move` to a free number) and an unreadable roster says nothing.
+    The roster only (`resolve_account`, the accessor `_current_target` pins
+    by), never the credential store: cff03cd took that identity read off the
+    429 path."""
+    try:
+        if sw is None:
+            sw = require("switcher").ClaudeAccountSwitcher()
+        return sw.resolve_account(num)[1:]
+    except Exception as exc:  # noqa: BLE001 — never let this break the relay
+        return () if type(exc).__name__ == "AccountNotFoundError" else None
+
+
+def _forget_walled_slots_that_changed_hands(slot: str | None) -> tuple | None:
+    """Re-key every wall memo whose slot now holds a different account than
+    the one the memo was recorded for. Call under `_walled_switch_lock`,
+    before any memo is read. Returns who holds `slot` NOW (`_slot_occupant`'s
+    three answers), for the caller to compare with its own earlier read.
+
+    ONE GUARD for all four memos and for `exclude=`, which also names slots
+    other than the live one: the live `slot` and every slot `_walled_slots`
+    holds are checked.
+
+    THE WALL FOLLOWS ITS ACCOUNT, because it is the account's: the slot that
+    changed hands loses its `_walled_slots` entry, and the same epoch goes to
+    the number the roster now gives that account, so the next `exclude=` names
+    the new number until the epoch and the old one is free. An account the
+    roster no longer has takes its wall with it. The three sibling memos are
+    dropped, not moved: `_walled_switch_seen` and
+    `_walled_switch_seen_by_session` answer for the LIVE slot's switch-off and
+    a session's one 401 toward it (30 s negatives; the worst a drop costs is
+    one extra `switch()` or 401), and `_walled_headroom_seen` is a 5 s reading
+    of whoever held the slot.
+
+    UNKNOWN NEVER FORGETS: an unreadable roster keeps the memos, and a slot
+    seen for the first time is recorded, not forgotten. (A roster that fails
+    between the read that found a slot changed and the read that looks for
+    the account loses that one wall: the safe direction, one extra 429.)
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return None
+    now, changed, walls = None, set(), []
+    for num in {slot, *_walled_slots} - {None}:
+        who = _slot_occupant(num, sw)
+        if num == slot:
+            now = who
+        if who is None:
+            continue
+        was = _walled_slot_occupant.setdefault(num, who)
+        if was == who:
+            continue
+        _walled_slot_occupant[num] = who
+        changed.add(num)
+        if num in _walled_slots:
+            walls.append((num, was, _walled_slots.pop(num)))
+    followed = []
+    for num, was, wall in walls:
+        try:
+            dest = next(n for n in sw._get_sequence_data()["accounts"]
+                        if _slot_occupant(n, sw) == was)
+        except Exception:  # noqa: BLE001 — left the roster, or it cannot be
+            continue  # read now: the wall goes with the account
+        _walled_slots[dest] = max(wall, _walled_slots.get(dest, 0.0))
+        _walled_slot_occupant[dest] = was
+        changed.add(dest)
+        followed.append(f"{num}->{dest}")
+    forgotten = [(memo, key) for memo in (
+        _walled_switch_seen, _walled_switch_seen_by_session,
+        _walled_headroom_seen) for key in memo if key[1] in changed]
+    for memo, key in forgotten:
+        del memo[key]
+    if walls or forgotten:
+        _log_lifecycle(
+            f"slot(s) {','.join(sorted(changed))} now hold a different "
+            "account than the one their wall memos were recorded for; walls "
+            f"followed their account: {','.join(followed) or 'none'}; the "
+            "rest of those slots' memos forgotten")
+    return now
+
+
 def _switch_takes_exclude() -> bool:
     """Whether this host's `switch()` accepts `exclude`, the slot-skip kwarg
     a separate cswap task adds so a switch-off need not hand the account
@@ -21753,7 +21844,21 @@ def _switch_off_walled_account(
     seen_at = time.monotonic()
     slot = _live_account_slot()
     live = _active_oauth_token()
+    # WHO HOLDS THAT SLOT, read with the pair above: the wall written below is
+    # that account's, and the lock is held across `switch()`, so `cswap move`
+    # can commit while this thread waits for it.
+    seen_who = _slot_occupant(slot) if slot is not None else None
     with _walled_switch_lock:
+        # A SLOT NUMBER STANDS FOR AN ACCOUNT ONLY WHILE THE SAME ONE HOLDS
+        # IT: a slot `cswap move` gave to another account loses its memos
+        # here, its wall following the account. `stale`: the roster cannot
+        # say who holds `slot` now, or says something else than at the read
+        # above (another account, an empty slot), so nothing keyed on `slot`
+        # may be WRITTEN by this request -- comparing the two reads, not the
+        # guard's memo, because the first waiter through records the new
+        # occupant and the guard then finds nothing changed for the rest.
+        now_who = _forget_walled_slots_that_changed_hands(slot)
+        stale = slot is not None and (now_who is None or now_who != seen_who)
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
         # is 03:40:00Z exactly -- so two accounts reaching their window on the
@@ -21762,8 +21867,10 @@ def _switch_off_walled_account(
         # no bearer test and no headroom test. NOT `(reset, token)`: a
         # rotation mints a new access token per retry, so every retry would be
         # a fresh key and the 401 -> 429 -> 401 loop below reopens; a slot
-        # number does not rotate.
-        key = (reset, slot)
+        # number does not rotate. A `stale` read keys on `(reset, None)`, which
+        # no slot's new occupant can inherit, so the storm's waiters (all
+        # stale together) still share ONE `switch()` verdict.
+        key = (reset, None if stale else slot)
         # Set by the bearer branch below, ONLY when it finds the live slot
         # already known walled (`walled=True`): that fallthrough's own
         # `reset` belongs to the STALE account, not the live one, so the
@@ -21834,7 +21941,8 @@ def _switch_off_walled_account(
             # relay never reaches this function at all, see the docstring
             # above) falls through unchanged and is recorded into the shared
             # `key` below instead, exactly as before this parameter existed.
-            session_key = (reset, slot, session) if session else None
+            session_key = ((reset, slot, session)
+                           if session and not stale else None)
             now2 = time.monotonic()
             if session_key is not None:
                 for expired in [k for k, exp in
@@ -21905,7 +22013,10 @@ def _switch_off_walled_account(
                 if session_key is not None:
                     _walled_switch_seen_by_session[session_key] = (
                         now2 + _WALLED_SWITCH_RAISE_TTL)
-                else:
+                elif not stale:
+                    # A stale read records no 401 memo at all: a shared
+                    # negative would hand the storm's other stale sessions a
+                    # relayed 429 where each is owed its own 401.
                     _remember_walled_switch(key, False)
                 # The live slot was just judged able to take a retry (known
                 # headroom, or unknown but not known walled) — a stale
@@ -21927,7 +22038,7 @@ def _switch_off_walled_account(
         # is set ONLY by the walled branch above (`_walled_slots[slot]`, the
         # LIVE slot's own already-known clear time); every other path keeps
         # main's full `_WALLED_SWITCH_RAISE_TTL` negative.
-        if slot is not None and token and live and token == live:
+        if slot is not None and token and live and token == live and not stale:
             try:
                 _walled_slots[slot] = float(reset)
             except ValueError:
