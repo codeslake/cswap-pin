@@ -7272,6 +7272,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # whether the disk changed. Evicting bounds the blind window to one
         # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
+        if freshen and (cached is None or not _live_token(cached)):
+            # THE EARLY REFRESH IS FOR A TOKEN THAT IS STILL LIVE. Past the
+            # buffer (or cold) this is the on-demand branch below, which
+            # `_FRESHEN_RETRY_S` does not hold: with self-heal on `_can_mint`
+            # then asked again in the same tick, and with it off the tick
+            # spent a grant it never used to. No lock, no store read, no
+            # consume: `_can_mint` and the request path own that refresh.
+            return None
         bypass = False
         if cached is not None:
             provider.blind_reason = ""
@@ -7537,10 +7545,15 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         seen only by whoever read inside it. The first read is a baseline, not
         a change.
 
-        The swap is under a lock of its own, so two readers at an edge cannot
-        both see the old value. The log write is outside it: a blocked stderr
-        must not queue every `/health` thread, so two edges that race may land
-        in the file out of order, each exactly once."""
+        The swap is atomic, under a lock of its own. The SAMPLE is not: it is
+        taken before the lock, because `_can_pin_now` reads files and may
+        write stderr and must not queue every `/health` thread behind it. So
+        a stale sample can overwrite a newer one: A reads True, B reads False
+        and swaps, A swaps. That logs a `False -> True` no window ever held,
+        and the next reader logs `True -> False` again. A lone adjacent pair
+        in the log is therefore not a measurement of an outage. The log write
+        is outside the lock too, for the same reason, so two edges that race
+        may land in the file out of order."""
         ok = _can_pin_now()
         with _can_pin_seen_lock:
             was, _can_pin_seen[0] = _can_pin_seen[0], ok
