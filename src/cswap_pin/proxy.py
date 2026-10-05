@@ -6803,6 +6803,14 @@ _MINT_LOCK_BOUND_S = 45.0
 # refresh (`_MINT_LOCK_BOUND_S`).
 _FRESHEN_MARGIN_MS = 10 * 60 * 1000
 
+# THE EARLY REFRESH IS ATTEMPTED AT MOST ONCE PER THIS MANY SECONDS, whatever
+# the outcome. A refresh token that died inside the margin, or a token whose
+# whole lifetime is shorter than the margin, is "due" on every tick, and each
+# attempt spends a one-time grant. The 300 s between the margin and the
+# liveness buffer still holds three attempts. The on-demand refresh (a request,
+# `_can_mint`) is not held to this.
+_FRESHEN_RETRY_S = 120.0
+
 # HOW LONG AN "UNKNOWN" IDENTITY VERDICT IS TRUSTED BEFORE THE NEXT MINT
 # RE-ASKS. A settled verdict ("ok"/"foreign") never re-probes for the same
 # token string; an inconclusive one (a timed-out or errored profile call, or
@@ -6854,9 +6862,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # {account_num: (read_at, credential_json)}. Per provider, so it dies with
     # the daemon and no state outlives a recycle.
     _cred_cache: dict = {}
-    # The last `can_pin_cached` answer, for its transition line. Same lifetime
-    # as the cache.
+    # The last `can_pin_cached` answer, for its transition line, and the lock
+    # that makes reading and replacing it one step. Same lifetime as the cache.
     _can_pin_seen: list = [None]
+    _can_pin_seen_lock = threading.Lock()
+    # When the last early refresh was attempted (monotonic), for
+    # `_FRESHEN_RETRY_S`. Set only under `refresh_lock`.
+    _freshen_at: list = [None]
     # SET/CLEARED ONLY BY WHOEVER HOLDS `refresh_lock`. Lets a reader that
     # peeks the lock non-blocking (`_mint_lock_busy`) say how long it has
     # been held -- the fact that tells a stalled Keychain read apart from a
@@ -6948,9 +6960,13 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         return None
 
     def _freshen_due(creds: str) -> bool:
-        """The held token is inside `_FRESHEN_MARGIN_MS` of its expiry. The
-        host's predicate takes no buffer on every release the pin supports
-        (0.26.0 has none), so the margin moves the expiry instead."""
+        """The held token is inside `_FRESHEN_MARGIN_MS` of its expiry and the
+        last early attempt is over `_FRESHEN_RETRY_S` old. The host's predicate
+        takes no buffer on every release the pin supports (0.26.0 has none), so
+        the margin moves the expiry instead."""
+        at = _freshen_at[0]
+        if at is not None and time.monotonic() - at < _FRESHEN_RETRY_S:
+            return False
         exp = (oauth.extract_oauth_data(creds) or {}).get("expiresAt")
         return isinstance(exp, (int, float)) and oauth.is_oauth_token_expired(
             exp - (_FRESHEN_MARGIN_MS - oauth.OAUTH_EXPIRY_BUFFER_MS))
@@ -7375,7 +7391,9 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # token in hand is live, and `runtime_health` fails
                     # `pin-applied` on any), and a failure leaves `token`
                     # as it was. `rotated` is the outer one, so a host with
-                    # no gate still gets it persisted below.
+                    # no gate still gets it persisted below. STAMPED BEFORE
+                    # THE CALL, so a failure and a success both wait.
+                    _freshen_at[0] = time.monotonic()
                     _, rotated = resolve_pin_token(
                         creds, lambda c: _consume(c, num, mail, quiet=True),
                         force=True)
@@ -7510,12 +7528,22 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         return bool(cached and _live_token(cached))
 
     def can_pin_cached() -> bool:
-        """`_can_pin_now`, writing one line per change of its answer. LOGGED
-        HERE, NOT SAMPLED FROM A TICK: the window that was measured lasted
-        25 s and a tick is 30, so every reader's own read is the sample. The
-        first read is a baseline, not a change."""
+        """`_can_pin_now`, writing one line per change of its answer. THE
+        EDGE IS DETECTED HERE, so every reader is a sampler: `/health`, and
+        the watchdog tick, whose read comes BEFORE its refresh. With self-heal
+        on a window ends AT a tick (the tick's `_can_mint` refreshes), so the
+        tick's own read sees every window that reaches one, whether or not
+        anything polls `/health`; a window a request's refresh ends sooner is
+        seen only by whoever read inside it. The first read is a baseline, not
+        a change.
+
+        The swap is under a lock of its own, so two readers at an edge cannot
+        both see the old value. The log write is outside it: a blocked stderr
+        must not queue every `/health` thread, so two edges that race may land
+        in the file out of order, each exactly once."""
         ok = _can_pin_now()
-        was, _can_pin_seen[0] = _can_pin_seen[0], ok
+        with _can_pin_seen_lock:
+            was, _can_pin_seen[0] = _can_pin_seen[0], ok
         if was is not None and was != ok:
             _log_lifecycle(f"can_pin {was} -> {ok}")
         return ok
@@ -12963,21 +12991,26 @@ def _watch_own_code(
                 server.learn_next_hop()
             except (AttributeError, OSError):
                 pass  # a stand-in server in tests, or a hop that went away
-            # REFRESH THE PINNED TOKEN WHILE IT STILL HAS TIME ON IT, so
+            # READ `can_pin_cached` BEFORE REFRESHING, so a window that reaches
+            # a tick is logged by the daemon itself, with no `/health` reader.
+            # It reads what is in hand: no store, no lock, no provider call.
+            # THEN REFRESH THE PINNED TOKEN WHILE IT STILL HAS TIME ON IT, so
             # `can_pin_cached` never reads false across the refresh (see
             # `_FRESHEN_MARGIN_MS`). ABOVE THE OFF SWITCH, so it runs whether
             # or not self-heal is on: the switch stops REPLACEMENTS, and a
             # refresh replaces nothing. The lock peek is `_can_mint`'s: a
             # stalled store must not park the watchdog for the lock's bound.
             # An exception here would reach the `except` below, which ENDS the
-            # watchdog, so it is caught: the refresh is an optimisation.
+            # watchdog, so it is caught: both are optimisations.
             _fresh = getattr(server, "_pin_token_provider", None)
-            if (getattr(_fresh, "freshen", None) is not None
-                    and _mint_lock_busy(_fresh) is None):
-                try:
+            try:
+                if getattr(_fresh, "can_pin_cached", None) is not None:
+                    _fresh.can_pin_cached()
+                if (getattr(_fresh, "freshen", None) is not None
+                        and _mint_lock_busy(_fresh) is None):
                     _fresh.freshen()
-                except Exception:  # noqa: BLE001 — never end the watchdog
-                    pass
+            except Exception:  # noqa: BLE001 — never end the watchdog
+                pass
             # THE OFF SWITCH STOPS EVERY AUTOMATIC REPLACEMENT, not just the
             # holder's. `CSWAP_PIN_SELF_HEAL=off` is documented on PortHolder
             # as "a respawner fighting a human who is debugging the daemon is
