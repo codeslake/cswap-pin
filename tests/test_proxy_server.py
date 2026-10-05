@@ -15801,6 +15801,29 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         assert waited < 0.25, f"the tick queued behind the lock for {waited:.2f}s"
         assert rig.calls == []
 
+    def case_the_tick_leaves_a_requests_deferral_mark_alone(
+            self, certdir, monkeypatch):
+        """A request's `consume-busy` mark (`_deferred`, read only by
+        `pin_is_noop`) lasted until the NEXT request, because the tick never
+        called the provider. The tick's early return for a token already past
+        the buffer sat below the provider's own `_deferred.discard(1)`, so
+        with self-heal OFF (nothing else re-adds the mark) a request that was
+        only deferred read `can_pin: false` from the next tick on, and the
+        edge log wrote a `True -> False` the real state never had."""
+        rig = self._rig(certdir, monkeypatch, outcome="consume-busy")
+        rig.advance(3 * 60)                    # 4 min left: past the buffer
+        assert rig.provider() is None          # the request: deferred, not failed
+        assert len(rig.calls) == 1, rig.calls
+        assert rig.provider.pin_is_noop() is True, "the deferral left no mark"
+        assert rig.provider.can_pin_cached() is True
+        edges = self._transitions(rig)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, "the tick spent a grant on a past-buffer token"
+        assert rig.provider.pin_is_noop() is True, (
+            "the tick cleared a request's deferral mark")
+        assert rig.provider.can_pin_cached() is True
+        assert self._transitions(rig) == edges, self._transitions(rig)
+
 
 class TestTheRequestPathNeverOpensTheTraceFile:
     """The shared trace handle used to be opened FROM the request thread.

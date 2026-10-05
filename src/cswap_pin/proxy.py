@@ -7215,6 +7215,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         best-effort and says nothing when it fails: the held token is still
         live, so it is returned and no `blind_reason` is set -- the real
         failure surfaces at the buffer, through the path below, unchanged.
+        A cold cache or a token already past the buffer returns None
+        untouched: that refresh is `_can_mint`'s and the request path's.
 
         `refused` is the `Authorization` value (``"Bearer <token>"``) a
         swap carrying it was just REFUSED upstream -- `refetch` below passes
@@ -7224,7 +7226,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         keep re-deriving all of it. None (every other caller) never matches
         a live token's `Bearer {token}` form, so the fast path below behaves
         exactly as it does today."""
-        _deferred.discard(1)
+        if not freshen:
+            # A REQUEST'S MARK, NOT THE TICK'S: `_deferred` outlives the call
+            # that set it, until the next request. The tick leaves it alone,
+            # or a request that was only deferred reads `can_pin: false` from
+            # the next tick on. (`_stalled` and `_tls` are per-thread.)
+            _deferred.discard(1)
         _stalled.flag = False
         # PER-CALL, always reset here -- read by `_can_mint`,
         # `can_pin_cached` and the request path's `_warn_unpinnable`
@@ -7272,7 +7279,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # whether the disk changed. Evicting bounds the blind window to one
         # request instead of one token lifetime.
         cached = _cred_cache.get(ckey)
-        if freshen and (cached is None or not _live_token(cached)):
+        live = _live_token(cached) if cached is not None else None
+        if freshen and not live:
             # THE EARLY REFRESH IS FOR A TOKEN THAT IS STILL LIVE. Past the
             # buffer (or cold) this is the on-demand branch below, which
             # `_FRESHEN_RETRY_S` does not hold: with self-heal on `_can_mint`
@@ -7283,7 +7291,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         bypass = False
         if cached is not None:
             provider.blind_reason = ""
-            token = _live_token(cached)
+            token = live
             if token:
                 if f"Bearer {token}" == refused:
                     # THE VERY TOKEN THAT WAS JUST REFUSED: comparing first
