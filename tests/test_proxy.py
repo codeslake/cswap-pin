@@ -7856,6 +7856,21 @@ class TestResolvePinToken:
         assert token == "fresh-token"
         assert new_creds == rotated  # caller persists this
 
+    def case_force_refreshes_a_token_that_is_still_live(self):
+        """The proactive path: the token is live under oauth's 5-minute
+        buffer, and is refreshed anyway because the caller says it is due."""
+        from cswap_pin.proxy import resolve_pin_token
+        from claude_swap.oauth import RefreshOutcome
+        creds = self._creds("live-token", 10_000_000_000_000)
+        rotated = self._creds("fresh-token", 10_000_000_000_001, refresh="rt-2")
+        token, new_creds = resolve_pin_token(
+            creds, lambda _c: RefreshOutcome(rotated, None), force=True)
+        assert (token, new_creds) == ("fresh-token", rotated)
+        # A forced refresh that FAILS says so: no token, nothing rotated.
+        assert resolve_pin_token(
+            creds, lambda _c: RefreshOutcome(None, "transient"),
+            force=True) == (None, None)
+
 
 class _FakeSwitcher:
     """Duck-typed stand-in for ClaudeAccountSwitcher's provider-facing API."""

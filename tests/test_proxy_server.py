@@ -15462,6 +15462,312 @@ class TestFailOpenIsNotSilent:
             p.stop()
 
 
+class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
+    """`can_pin_cached` (so `/health`'s `can_pin`) read false from the moment
+    the cached token passed `expiresAt - 5 min` until the next `provider()`
+    call refreshed it. MEASURED 2026-10-05: a 25.022 s window, recurring every
+    7 h 55 m (the token's lifetime). One predicate decided both "refresh now"
+    and "report can_pin", so the report flipped before the refresh ran, and a
+    launch or `heal` that probed inside the window read a live daemon as
+    wedged. The 30 s watchdog tick now refreshes the pinned token while it
+    still has more than the liveness buffer left."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _rig(self, certdir, monkeypatch, outcome="ok", minutes=7,
+             new_minutes=480):
+        """A real provider over a stub switcher whose slot holds a token with
+        `minutes` left (7: live under oauth's 5-minute buffer, due under the
+        pin's wider margin). The HOST's clock is faked (`oauth.datetime`), so
+        the host's own predicate decides liveness, not a copy of it. A refresh
+        hands back a token with `new_minutes` left. `rig.advance(s)` moves the
+        wall clock and the monotonic one together; `rig.at_call` holds the
+        transition lines already written when each refresh began."""
+        import datetime as _dt
+        import json as _json
+
+        from claude_swap.oauth import RefreshOutcome
+        from cswap_pin import proxy as pp
+
+        # R11: the suite must never dial api.anthropic.com.
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: {"emailAddress": "pin@example.com"})
+        rig = types.SimpleNamespace(
+            now=1_800_000_000.0, calls=[], during=[], reads=[], lines=[],
+            at_call=[], skew=0.0)
+
+        class _Host(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt.datetime.fromtimestamp(rig.now, tz)
+
+        monkeypatch.setattr(pp.oauth, "datetime", _Host)
+        monkeypatch.setattr(pp, "_log_lifecycle", rig.lines.append)
+        # The real clock plus a skew, so a case that times itself still reads
+        # real elapsed time and a retry spacing can be stepped over.
+        real_monotonic = time.monotonic
+        monkeypatch.setattr(
+            pp.time, "monotonic", lambda: real_monotonic() + rig.skew)
+
+        def advance(seconds):
+            rig.now += seconds
+            rig.skew += seconds
+
+        rig.advance = advance
+
+        def blob(token, minutes):
+            return _json.dumps({"claudeAiOauth": {
+                "accessToken": token, "refreshToken": f"rt-{token}",
+                "expiresAt": int((rig.now + minutes * 60) * 1000)}})
+
+        rig.stored = blob("old", minutes)
+
+        class _Switcher:
+            backup_dir = certdir
+            def current_account_number(self): return "1"
+            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+            def read_account_credentials(self, n, e):
+                rig.reads.append(1)
+                return rig.stored
+            def consume_backup_grant(self, n, e, snap):
+                rig.calls.append(snap)
+                rig.at_call.append(
+                    [ln for ln in rig.lines if ln.startswith("can_pin ")])
+                rig.during.append(rig.provider.can_pin_cached())
+                if outcome == "ok":
+                    rig.stored = blob("new", new_minutes)
+                    return RefreshOutcome(rig.stored, None)
+                return RefreshOutcome(None, outcome)
+
+        pp.save_pin(certdir, "pin@example.com", "org")
+        rig.provider = pp.make_pin_token_provider(_Switcher(), "2",
+                                                  "pin@example.com")
+        assert rig.provider() == "old", "the fixture's warm read did not mint"
+        assert rig.provider.can_pin_cached() is True
+        return rig
+
+    def _tick(self, rig, certdir, monkeypatch, self_heal):
+        """Exactly ONE watchdog tick against a server carrying the provider."""
+        from cswap_pin import proxy as pp
+
+        class _OneTick:
+            n = 0
+            def wait(self, _interval):
+                self.n += 1
+                return self.n > 1
+            def set(self):
+                pass
+
+        if self_heal:
+            monkeypatch.delenv(pp._SELF_HEAL_ENV, raising=False)
+        else:
+            monkeypatch.setenv(pp._SELF_HEAL_ENV, "off")
+        # Never reach a REAL holder's SIGHUP from a suite run under one.
+        monkeypatch.setattr(pp, "_retire_stale_holder", lambda *a, **k: False)
+        pp._watch_own_code(
+            types.SimpleNamespace(_pin_token_provider=rig.provider), "2",
+            "pin@example.com", certdir, _OneTick(), teardown=lambda r: None,
+            interval=0.0, _own_fingerprint=pp.daemon_fingerprint())
+
+    def _transitions(self, rig):
+        return [ln for ln in rig.lines if ln.startswith("can_pin ")]
+
+    def case_a_tick_refreshes_ahead_and_can_pin_never_reads_false(
+            self, certdir, monkeypatch):
+        """The fix. SELF-HEAL OFF for one pass and ON for the other: the
+        refresh sits before the off switch, so it runs either way (the switch
+        stops REPLACEMENTS, and a refresh replaces nothing)."""
+        for self_heal in (False, True):
+            rig = self._rig(certdir, monkeypatch)
+            samples = [rig.provider.can_pin_cached()]
+            self._tick(rig, certdir, monkeypatch, self_heal)
+            assert len(rig.calls) == 1, (
+                f"self_heal={self_heal}: the tick did not refresh a token "
+                f"with 7 min left ({len(rig.calls)} refreshes)")
+            reads = len(rig.reads)
+            # THE ROTATED BLOB IS WHAT IS CACHED: a bare read of the held
+            # copy, with no store read, hands back the new token.
+            assert rig.provider() == "new"
+            assert len(rig.reads) == reads, "the rotation was not cached"
+            samples += rig.during
+            # Past the point where the OLD token would have read dead.
+            for minutes in (1, 3, 6):
+                rig.now += minutes * 60
+                samples.append(rig.provider.can_pin_cached())
+            assert samples == [True] * len(samples), (
+                f"self_heal={self_heal}: can_pin read false across the "
+                f"refresh: {samples}")
+            assert self._transitions(rig) == [], self._transitions(rig)
+            # THE NEGATIVE CONTROL: a token with 8 hours on it is not due, so
+            # a later tick (past the retry spacing, which is not what is under
+            # test here) spends no grant. A tick that refreshed every time is
+            # a POST every 30 s, each one burning a one-time grant.
+            rig.advance(200)
+            self._tick(rig, certdir, monkeypatch, self_heal)
+            assert len(rig.calls) == 1, (
+                f"self_heal={self_heal}: a second tick refreshed a token "
+                f"with hours left ({len(rig.calls)} refreshes)")
+
+    def case_a_token_outside_the_margin_is_not_refreshed(
+            self, certdir, monkeypatch):
+        """15 minutes left is above the 10-minute margin: no grant is spent."""
+        rig = self._rig(certdir, monkeypatch, minutes=15)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert rig.calls == [], rig.calls
+
+    def case_another_processs_rotation_is_adopted_before_a_grant_is_spent(
+            self, certdir, monkeypatch):
+        """The held copy is due, but the store already holds a rotation made
+        elsewhere (cswap's own freshen, the usage collector): the tick adopts
+        it and POSTs nothing, since the grant that made it is spent."""
+        rig = self._rig(certdir, monkeypatch)
+        rig.stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "elsewhere", "refreshToken": "rt-elsewhere",
+            "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+        self._tick(rig, certdir, monkeypatch, False)
+        assert rig.calls == [], rig.calls
+        assert rig.provider() == "elsewhere"
+
+    def case_the_margin_covers_one_tick_and_the_longest_refresh(self):
+        """A margin shorter than tick + refresh would let the token enter the
+        liveness buffer while the refresh was still running."""
+        from cswap_pin import proxy as pp
+
+        need_s = (pp.oauth.OAUTH_EXPIRY_BUFFER_MS / 1000
+                  + pp._CODE_WATCH_INTERVAL_S + pp._MINT_LOCK_BOUND_S)
+        assert pp._FRESHEN_MARGIN_MS / 1000 > need_s, (
+            pp._FRESHEN_MARGIN_MS, need_s)
+
+    def case_the_transition_line_fires_on_both_edges_and_only_there(
+            self, certdir, monkeypatch):
+        """THE CONTROL for the silence the fix leaves: with no refresh, the
+        token crossing into the liveness buffer writes one true->false line,
+        and the refresh one false->true. Edge, not level: repeated reads in
+        one state write nothing."""
+        rig = self._rig(certdir, monkeypatch)
+        assert self._transitions(rig) == []
+        rig.now += 3 * 60                      # 4 min left: inside the buffer
+        assert rig.provider.can_pin_cached() is False
+        assert rig.provider.can_pin_cached() is False
+        assert len(self._transitions(rig)) == 1, self._transitions(rig)
+        assert "True -> False" in self._transitions(rig)[0]
+        assert rig.provider() == "new"         # the ordinary, late refresh
+        assert rig.provider.can_pin_cached() is True
+        assert rig.provider.can_pin_cached() is True
+        lines = self._transitions(rig)
+        assert len(lines) == 2 and "False -> True" in lines[1], lines
+
+    def case_a_failed_refresh_inside_the_margin_does_not_hide_a_dead_token(
+            self, certdir, monkeypatch):
+        """True while the held token is live, because it IS live; false the
+        moment it is not. The refresh failing earlier must not flip either
+        way, and must not leave a blind mint on `/health`."""
+        rig = self._rig(certdir, monkeypatch, outcome="transient")
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, "the tick never tried the refresh"
+        assert rig.provider.can_pin_cached() is True
+        assert not rig.provider.blind_reason, rig.provider.blind_reason
+        assert rig.provider() == "old", "a live token was refused"
+        assert self._transitions(rig) == []
+        rig.now += 150                         # 4.5 min left: buffer reached
+        assert rig.provider.can_pin_cached() is False
+        assert len(self._transitions(rig)) == 1, self._transitions(rig)
+
+    def case_the_tick_logs_the_edge_itself_before_it_refreshes(
+            self, certdir, monkeypatch):
+        """No `/health` reader at all: a token already inside the liveness
+        buffer when the tick runs gets its `True -> False` line from the
+        tick's own read, written BEFORE the refresh begins (`at_call` is
+        snapshotted ahead of the stub's own read), and `False -> True` on the
+        next read after it."""
+        rig = self._rig(certdir, monkeypatch)
+        rig.now += 3 * 60                      # 4 min left: inside the buffer
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, "the tick did not refresh"
+        assert len(rig.at_call[0]) == 1 and "True -> False" in rig.at_call[0][0], (
+            rig.at_call)
+        assert rig.provider.can_pin_cached() is True
+        lines = self._transitions(rig)
+        assert len(lines) == 2 and "False -> True" in lines[1], lines
+
+    def case_a_failing_early_refresh_is_tried_once_per_retry_spacing(
+            self, certdir, monkeypatch):
+        """A refresh token that died inside the margin: one quiet POST in the
+        first 120 s of ticks 30 s apart, the next one after it. The on-demand
+        path (a request, `_can_mint`) is not held to this."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="transient", minutes=9)
+        for _ in range(4):                     # t = 0, 30, 60, 90
+            self._tick(rig, certdir, monkeypatch, False)
+            rig.advance(pp._CODE_WATCH_INTERVAL_S)
+        assert len(rig.calls) == 1, len(rig.calls)
+        self._tick(rig, certdir, monkeypatch, False)       # t = 120
+        assert len(rig.calls) == 2, len(rig.calls)
+        # NOT THROTTLED: a request's own `provider()` on a dead token refreshes.
+        rig.advance(300)                       # inside the liveness buffer
+        assert rig.provider() is None
+        assert len(rig.calls) == 3, len(rig.calls)
+
+    def case_a_token_still_inside_the_margin_after_a_refresh_is_left_alone(
+            self, certdir, monkeypatch):
+        """A short-lived token (8 min, so the NEW token is inside the margin
+        too): the next tick 30 s later does not refresh it again, and the one
+        after the retry spacing does."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, new_minutes=8)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1
+        rig.advance(pp._CODE_WATCH_INTERVAL_S)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, len(rig.calls)
+        rig.advance(pp._FRESHEN_RETRY_S)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 2, len(rig.calls)
+
+    def case_a_busy_slot_on_the_proactive_path_is_not_an_unpinned_request(
+            self, certdir, monkeypatch):
+        """`consume-busy` returns before any POST (no grant is spent), and
+        here no request went out unpinned either, so neither the deferral
+        flag nor the warning that says one did may be set."""
+        rig = self._rig(certdir, monkeypatch, outcome="consume-busy")
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1
+        assert rig.provider.pin_is_noop() is False
+        assert not [ln for ln in rig.lines if "went out unpinned" in ln]
+        assert rig.provider.can_pin_cached() is True
+
+    def case_a_held_refresh_lock_is_not_waited_on(self, certdir, monkeypatch):
+        """`/health` and the watchdog never queue behind a stalled store
+        (cd3eb0a); the proactive refresh must not either."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        # A bound the tick would visibly serve out if it queued: a held lock
+        # without the peek costs the whole bound, then reads as a stall.
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.5)
+        release = threading.Event()
+        holder = threading.Thread(
+            target=lambda: (rig.provider.refresh_lock.acquire(),
+                            release.wait(5), rig.provider.refresh_lock.release()),
+            daemon=True)
+        holder.start()
+        while not rig.provider.refresh_lock.locked():
+            time.sleep(0.001)
+        try:
+            started = time.monotonic()
+            self._tick(rig, certdir, monkeypatch, False)
+            waited = time.monotonic() - started
+        finally:
+            release.set()
+            holder.join(timeout=2.0)
+        assert waited < 0.25, f"the tick queued behind the lock for {waited:.2f}s"
+        assert rig.calls == []
+
+
 class TestTheRequestPathNeverOpensTheTraceFile:
     """The shared trace handle used to be opened FROM the request thread.
 
