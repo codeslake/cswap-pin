@@ -941,10 +941,15 @@ class TestPinProxyServer:
         import cswap_pin.proxy as pp
 
         holds: list[tuple[str, bool]] = []
+        abandoned = threading.Event()
         real_hold = pp.PinProxy._hold_bridge_attach
 
         def _spy_hold(self, cse):
             event, waited = real_hold(self, cse)
+            # With no earlier entry the hung-up check is a single poll(0)
+            # the instant this returns, so it must not run before the client
+            # has actually closed. Bounded, so a broken run fails, not hangs.
+            abandoned.wait(5)
             holds.append((cse, waited))
             return event, waited
 
@@ -957,6 +962,7 @@ class TestPinProxyServer:
         try:
             _post_and_abandon(proxy.port, certdir / "ca.pem",
                               "/v1/code/sessions/cse_first/bridge", "FIRST")
+            abandoned.set()
             time.sleep(0.5)  # let the abandoned send actually land
             assert upstream.received == [], (
                 "a first attempt (no earlier hold entry) whose client "
