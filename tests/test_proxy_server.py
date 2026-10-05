@@ -15593,8 +15593,8 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         assert pp._FRESHEN_MARGIN_MS / 1000 > need_s, (
             pp._FRESHEN_MARGIN_MS, need_s)
         # The literal says it is cswap's own freshen margin: hold it to that.
-        host = getattr(pp.require("autoswitch"), "FRESHEN_BUFFER_MS", None)
-        assert host in (None, pp._FRESHEN_MARGIN_MS), host
+        assert (pp.require("autoswitch").FRESHEN_BUFFER_MS
+                == pp._FRESHEN_MARGIN_MS)
 
     def case_the_transition_line_fires_on_both_edges_and_only_there(
             self, certdir, monkeypatch):
