@@ -21563,6 +21563,45 @@ def _cached_live_account_headroom(reset: bytes, slot: str) -> float | None:
     return headroom
 
 
+# slot -> (email, organizationUuid) it held when the memos above last spoke
+# for it. They are keyed on the slot NUMBER; a wall belongs to the ACCOUNT,
+# and `cswap move` renumbers.
+_walled_slot_occupant: dict[str, tuple[str, str]] = {}
+
+
+def _forget_walled_slots_that_changed_hands(slot: str | None) -> None:
+    """Drop every wall memo of a slot that now holds a different account than
+    the one the memo was recorded for. Call under `_walled_switch_lock`,
+    before any memo is read.
+
+    ONE GUARD for all four memos and for `exclude=`, which also names slots
+    other than the live one: the live `slot` and every slot `_walled_slots`
+    holds are checked. The roster only (`resolve_account`, the accessor
+    `_current_target` pins by), never the credential store: cff03cd took
+    that identity read off this path.
+
+    UNKNOWN NEVER FORGETS: an unreadable roster or an empty slot keeps the
+    memos, and a slot seen for the first time is recorded, not forgotten.
+    """
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return
+    for num in {slot, *_walled_slots} - {None}:
+        try:
+            who = sw.resolve_account(num)[1:]
+        except Exception:  # noqa: BLE001 — unknown is not "changed"
+            continue
+        if _walled_slot_occupant.setdefault(num, who) == who:
+            continue
+        _walled_slot_occupant[num] = who
+        _walled_slots.pop(num, None)
+        for memo in (_walled_switch_seen, _walled_switch_seen_by_session,
+                     _walled_headroom_seen):
+            for key in [k for k in memo if k[1] == num]:
+                del memo[key]
+
+
 def _switch_takes_exclude() -> bool:
     """Whether this host's `switch()` accepts `exclude`, the slot-skip kwarg
     a separate cswap task adds so a switch-off need not hand the account
@@ -21754,6 +21793,9 @@ def _switch_off_walled_account(
     slot = _live_account_slot()
     live = _active_oauth_token()
     with _walled_switch_lock:
+        # A SLOT NUMBER STANDS FOR AN ACCOUNT ONLY WHILE THE SAME ONE HOLDS
+        # IT: a slot `cswap move` gave to another account loses its memos here.
+        _forget_walled_slots_that_changed_hands(slot)
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
         # is 03:40:00Z exactly -- so two accounts reaching their window on the

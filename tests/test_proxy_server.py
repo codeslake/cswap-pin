@@ -19192,7 +19192,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     @staticmethod
     def _wire_exclude_capable(monkeypatch, switched, exclude_param=True,
                                validated=True, live_token=None, live_num="1",
-                               before=None):
+                               before=None, occupant=None):
         """`ClaudeAccountSwitcher` as a real CLASS carrying `switch` as an
         ordinary method, so `_switch_takes_exclude`'s
         `inspect.signature(...ClaudeAccountSwitcher.switch)` can actually see
@@ -19202,7 +19202,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         which is what keeps every case above this one immune to the
         re-decide gate regardless of timing. This wiring is what exercises
         it. ``before``, as in `_wire`, runs at the top of `switch()`, for a
-        case that needs to block inside it."""
+        case that needs to block inside it. ``occupant`` is a ``{slot:
+        email}`` map `resolve_account` answers from, live, so a case can
+        change who holds a slot between two relays (`cswap move`); omitted,
+        the fake has no `resolve_account` at all, which keeps every case
+        that predates it blind to who holds a slot."""
         from cswap_pin import proxy as pp
         calls = []
 
@@ -19233,11 +19237,18 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                         "validated": validated,
                         "reason": None if switched else "candidates-exhausted"}
 
-        fake_switcher = type("FakeSwitcher", (), {
+        attrs = {
             "_read_credentials": _read_credentials,
             "current_account_number": _current_account_number,
             "switch": _switch,
-        })
+        }
+        if occupant is not None:
+            attrs["resolve_account"] = (
+                lambda self, num: (num, occupant[num], "org"))
+            # `raising=False`: a tree without the guard fails these cases on
+            # the 429 they assert, not on a missing name.
+            monkeypatch.setattr(pp, "_walled_slot_occupant", {}, raising=False)
+        fake_switcher = type("FakeSwitcher", (), attrs)
         fake_module = type("M", (), {"ClaudeAccountSwitcher": fake_switcher})()
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
@@ -19378,6 +19389,95 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
         assert not calls, (
             f"an unmanaged slot read must not re-attempt the switch: {calls}")
+
+    # --- a wall belongs to the ACCOUNT, not to the slot number (T1800) ------
+
+    def _wall_slot_5_then_a_stale_bearer(self, monkeypatch, held_after):
+        """Wall slot 5 through a real live-token 429 while account A holds it,
+        let `held_after` hold slot 5 (`cswap move`), settle the wall's memo the
+        way the incident's own `switch()` had, then relay a STALE bearer's 429
+        for that same wall. Returns that relay's answer."""
+        from cswap_pin import proxy as pp
+        who = {"5": "a@example.com"}
+        self._wire_exclude_capable(
+            monkeypatch, switched=False, live_token=self.LIVE, live_num="5",
+            occupant=who)
+        first = self._relay(auth="Bearer " + self.LIVE)
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert "5" in pp._walled_slots, pp._walled_slots
+        who["5"] = held_after
+        pp._walled_switch_seen[(b"9999999999", "5")] = (
+            True, None, time.monotonic() - 1.0)
+        return self._relay(auth="Bearer stale-account-a-token")
+
+    def case_a_walled_slot_renumbered_to_a_fresh_account_is_not_walled(
+        self, monkeypatch,
+    ):
+        """THE INCIDENT. A wall was recorded while slot 5 held account A; then
+        `cswap move` put account B in slot 5. The memos are keyed on the slot
+        NUMBER, so they still spoke for A: the re-decide memo sent the stale
+        bearer back into the decision path, `_walled_slots` made it read B as
+        walled, and the client got a relayed 429 for a fresh account instead
+        of the 401 that rebuilds it onto B."""
+        got = self._wall_slot_5_then_a_stale_bearer(
+            monkeypatch, held_after="b@example.com")
+        assert got.startswith(b"HTTP/1.1 401"), (
+            "slot 5 holds a different account than the one that walled; the "
+            f"wall is not B's: {got[:40]}")
+
+    def case_a_walled_slot_still_held_by_the_same_account_stays_walled(
+        self, monkeypatch,
+    ):
+        """THE CONTROL: same seed, same occupant. The wall is still its
+        account's, so the stale bearer still falls to `switch()` and the
+        relay still answers the 429 it answered before the guard existed."""
+        got = self._wall_slot_5_then_a_stale_bearer(
+            monkeypatch, held_after="a@example.com")
+        assert got.startswith(b"HTTP/1.1 429"), got[:40]
+
+    def case_switch_does_not_exclude_a_slot_that_changed_hands(
+        self, monkeypatch,
+    ):
+        """`exclude=` also names slots OTHER than the live one. Slot 6 walled
+        under account A, cswap moved on to slot 4, and `cswap move` then put
+        account B in slot 6: excluding 6 would refuse B for A's wall, and
+        cswap persists a wall on whoever holds an excluded slot. The control
+        is slot 6 still held by A."""
+        for held_after, excluded in (("a@example.com", True),
+                                     ("b@example.com", False)):
+            who = {"6": "a@example.com", "4": "c@example.com"}
+            live = ["6"]
+            calls = self._wire_exclude_capable(
+                monkeypatch, switched=False, live_token=self.LIVE,
+                live_num=lambda: live[0], occupant=who)
+            self._relay(reset=self.RESET_HEADER, auth="Bearer " + self.LIVE)
+            live[0], who["6"] = "4", held_after
+            self._relay(reset=self.RESET_HEADER_2, auth="Bearer " + self.LIVE)
+            assert len(calls) == 2, calls
+            assert ("6" in calls[1]) is excluded, (held_after, calls)
+
+    def case_a_slot_that_changed_hands_forgets_all_four_memos_and_only_its_own(
+        self, monkeypatch,
+    ):
+        """ONE guard for every memo keyed on the slot: re-keying
+        `_walled_slots` alone would leave `_walled_switch_seen` firing its
+        re-decide. Slot 6 is the bystander whose occupant never changes."""
+        from cswap_pin import proxy as pp
+        who = {"5": "a@example.com", "6": "c@example.com"}
+        self._wire_exclude_capable(monkeypatch, switched=False, occupant=who)
+        reset, soon = b"9999999999", time.monotonic() + 60
+        for slot in ("5", "6"):
+            pp._walled_slots[slot] = time.time() + 3600
+            pp._walled_switch_seen[(reset, slot)] = (True, None, 0.0)
+            pp._walled_switch_seen_by_session[(reset, slot, "s")] = soon
+            pp._walled_headroom_seen[(reset, slot)] = (50.0, 0.0)
+        pp._forget_walled_slots_that_changed_hands("5")
+        who["5"] = "b@example.com"
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert set(pp._walled_slots) == {"6"}, pp._walled_slots
+        for memo in (pp._walled_switch_seen, pp._walled_switch_seen_by_session,
+                     pp._walled_headroom_seen):
+            assert {k[1] for k in memo} == {"6"}, memo
 
     def case_switch_off_records_the_walled_slot_from_a_real_relay(
         self, monkeypatch,
