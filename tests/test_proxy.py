@@ -12262,12 +12262,16 @@ class TestDaemonPortStability:
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PinProxy, ensure_ca
 
-        # BOUND THE SPAWN WAIT. `_spawn_daemon` polls for up to 10s, and a
-        # successor that publishes late is born AFTER this case has finished
-        # reaping — measured, processes 11s younger than a reap that reported
-        # nothing left. The successor here comes up in well under a second when
-        # it comes up at all, so the remaining 9s only buys orphans.
-        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 1.0)
+        # BOUND THE SPAWN WAIT, BUT NOT BELOW A CONTENDED CORE. `_spawn_daemon`
+        # polls for up to 10s. A cold successor is two interpreters in
+        # sequence: it publishes at 0.65-0.88s on a free CPU and 2.17s on a
+        # contended one, so a 1.0s bound read "came up on None" whenever the
+        # runner was busy: 3 of 3 runs pinned to one core beside a busy loop.
+        # 5.0s is more than twice the contended figure. The orphans a longer
+        # wait could buy are already covered: `_tracked` below records every
+        # holder at birth and the reap at the end of each arm takes it, and
+        # its daemon, down.
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 5.0)
 
         arms = []
         children = []
@@ -12316,7 +12320,15 @@ class TestDaemonPortStability:
                         time.sleep(0.002)
                         continue
                     try:
-                        s.settimeout(2)
+                        # AS LONG AS THE SPAWN WAIT, NOT SHORTER. The holder
+                        # queues a request that arrives while the successor
+                        # boots, and a boot is 2.3s on a core shared four ways
+                        # (measured), so a 2s wait read that queued request as
+                        # dropped: 10 of 12 runs failed with exactly one
+                        # "no reply (timeout)". A real hang is tens of seconds
+                        # (the 30s held-exit drain in the docstring), so this
+                        # still sees it.
+                        s.settimeout(5)
                         s.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
                                   b"Host: api.anthropic.com:443\r\n\r\n")
                         if s.recv(64):
