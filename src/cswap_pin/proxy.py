@@ -3721,6 +3721,8 @@ def _write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
 def resolve_pin_token(
     credentials: str,
     refresh: Callable[[str], "oauth.RefreshOutcome"],
+    *,
+    force: bool = False,
 ) -> tuple[str | None, str | None]:
     """Return a live access token for the pinned account, refreshing if needed.
 
@@ -3731,12 +3733,15 @@ def resolve_pin_token(
     element so the caller can persist it, and the new access token as the
     first. On refresh failure (or no data) the token is ``None`` so the proxy
     can fall back to leaving the request's original bearer in place.
+
+    ``force`` refreshes a token that is still live: the caller has decided it
+    is due (see `_FRESHEN_MARGIN_MS`), which oauth's own buffer cannot say.
     """
     data = oauth.extract_oauth_data(credentials)
     if not data:
         return None, None
     access = data.get("accessToken")
-    if access and not oauth.is_oauth_token_expired(data.get("expiresAt")):
+    if access and not force and not oauth.is_oauth_token_expired(data.get("expiresAt")):
         return access, None
 
     outcome = refresh(credentials)
@@ -6784,6 +6789,20 @@ def _warn_if_bridges_disagree(switcher) -> None:
 # is merely slow and contended gets cut off as if it were stalled.
 _MINT_LOCK_BOUND_S = 45.0
 
+# HOW EARLY THE PINNED TOKEN IS REFRESHED, as time left on it. Wider than
+# oauth's own 5-minute buffer (`OAUTH_EXPIRY_BUFFER_MS`), which is where
+# `can_pin_cached` stops calling the token live: refreshing only AT that point
+# left `/health` reading `can_pin: false` from the buffer until the next
+# `provider()` call took the lock (25.022 s on 2026-10-05, 12:53:25Z to
+# 12:53:50Z, every 7 h 55 m). The watchdog tick refreshes inside this margin,
+# so the buffer is never reached on a token that can be refreshed. cswap's own
+# freshen margin is the same 10 minutes (`autoswitch.FRESHEN_BUFFER_MS`,
+# ca285b20), a literal here because the pin requires no `autoswitch` (see
+# `_host.py`) and a host without it must still build a provider. Must exceed
+# the buffer plus one tick (`_CODE_WATCH_INTERVAL_S`) plus the longest
+# refresh (`_MINT_LOCK_BOUND_S`).
+_FRESHEN_MARGIN_MS = 10 * 60 * 1000
+
 # HOW LONG AN "UNKNOWN" IDENTITY VERDICT IS TRUSTED BEFORE THE NEXT MINT
 # RE-ASKS. A settled verdict ("ok"/"foreign") never re-probes for the same
 # token string; an inconclusive one (a timed-out or errored profile call, or
@@ -6835,6 +6854,9 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     # {account_num: (read_at, credential_json)}. Per provider, so it dies with
     # the daemon and no state outlives a recycle.
     _cred_cache: dict = {}
+    # The last `can_pin_cached` answer, for its transition line. Same lifetime
+    # as the cache.
+    _can_pin_seen: list = [None]
     # SET/CLEARED ONLY BY WHOEVER HOLDS `refresh_lock`. Lets a reader that
     # peeks the lock non-blocking (`_mint_lock_busy`) say how long it has
     # been held -- the fact that tells a stalled Keychain read apart from a
@@ -6856,7 +6878,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         `_refuse_stalled_mint`."""
         return getattr(_stalled, "flag", False)
 
-    def _consume(creds: str, num: str, mail: str) -> "oauth.RefreshOutcome":
+    def _consume(creds: str, num: str, mail: str,
+                 quiet: bool = False) -> "oauth.RefreshOutcome":
         """Refresh through the host's interprocess gate, direct POST as
         fallback. An older claude-swap has no gate; a pinned request must
         still be served, and a same-process race is still covered by
@@ -6868,6 +6891,10 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         for an unreadable credential, and strictly better than the direct
         POST it replaces, which answered ``invalid_grant`` and killed the
         lineage outright.
+
+        ``quiet`` is the proactive refresh's: its deferral is no unpinned
+        request, so it sets neither the flag nor the warning that says one
+        went out.
         """
         gate = getattr(switcher, "consume_backup_grant", None)
         if gate is None:
@@ -6877,7 +6904,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # slot right now, which is a race with the usage collector, not a
         # broken daemon — and the caller's only other signal is a None token,
         # which it reads as "this daemon cannot pin" and records permanently.
-        if getattr(outcome, "error", None) == "consume-busy":
+        if not quiet and getattr(outcome, "error", None) == "consume-busy":
             _deferred.add(1)
             _note_busy_slot()
         return outcome
@@ -6919,6 +6946,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         if access and not oauth.is_oauth_token_expired(data.get("expiresAt")):
             return access
         return None
+
+    def _freshen_due(creds: str) -> bool:
+        """The held token is inside `_FRESHEN_MARGIN_MS` of its expiry. The
+        host's predicate takes no buffer on every release the pin supports
+        (0.26.0 has none), so the margin moves the expiry instead."""
+        exp = (oauth.extract_oauth_data(creds) or {}).get("expiresAt")
+        return isinstance(exp, (int, float)) and oauth.is_oauth_token_expired(
+            exp - (_FRESHEN_MARGIN_MS - oauth.OAUTH_EXPIRY_BUFFER_MS))
 
     def _current_target() -> tuple[str, str] | None:
         """The account to pin RIGHT NOW, re-read so `cswap pin <other>` takes
@@ -7156,8 +7191,16 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         elif verdict == "ok":
             _set_identity(False)
 
-    def provider(refused: "str | None" = None) -> str | None:
-        """`refused` is the `Authorization` value (``"Bearer <token>"``) a
+    def provider(refused: "str | None" = None,
+                 freshen: bool = False) -> str | None:
+        """`freshen` (the watchdog tick's, via `provider.freshen`) refreshes a
+        token that is live but inside `_FRESHEN_MARGIN_MS` of its expiry, so
+        `can_pin_cached` never reads false across the refresh. It is
+        best-effort and says nothing when it fails: the held token is still
+        live, so it is returned and no `blind_reason` is set -- the real
+        failure surfaces at the buffer, through the path below, unchanged.
+
+        `refused` is the `Authorization` value (``"Bearer <token>"``) a
         swap carrying it was just REFUSED upstream -- `refetch` below passes
         it through so a retry routes through this SAME cold path (the
         store re-read, the racing-rotation re-check, `_identity_ok` on the
@@ -7224,6 +7267,11 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # bearer this call already knows to discard. Bypass, the
                     # same way a confirmed-foreign verdict does below, so
                     # the re-read under `refresh_lock` runs.
+                    bypass = True
+                elif freshen and _freshen_due(cached):
+                    # DUE FOR THE EARLY REFRESH: the cold section below,
+                    # whose store re-read comes first, so another process's
+                    # rotation is adopted before a grant is spent.
                     bypass = True
                 elif _identity_ok(token, mail):
                     return token
@@ -7322,6 +7370,18 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # expired blob and every later request re-enters this lock.
                 _cred_cache[ckey] = creds
                 token = _live_token(creds)
+                if token and freshen and _freshen_due(creds):
+                    # THROUGH THE SAME GATE, QUIETLY: no `blind_reason` (the
+                    # token in hand is live, and `runtime_health` fails
+                    # `pin-applied` on any), and a failure leaves `token`
+                    # as it was. `rotated` is the outer one, so a host with
+                    # no gate still gets it persisted below.
+                    _, rotated = resolve_pin_token(
+                        creds, lambda c: _consume(c, num, mail, quiet=True),
+                        force=True)
+                    if rotated:
+                        _cred_cache[ckey] = rotated
+                        token = _live_token(rotated) or token
                 if not token:
                     # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error`
                     # already classifies this -- `invalid_grant` means the
@@ -7420,7 +7480,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return True  # pin cleared: leaving every bearer alone IS the job
         return _pin_is_the_live_login(target[0])
 
-    def can_pin_cached() -> bool:
+    def _can_pin_now() -> bool:
         """Whether the pin can apply RIGHT NOW using only what is already in
         hand -- no store read, no lock, no network. This is what `/health`
         asks: the store read `provider()` may need to answer for real is
@@ -7448,6 +7508,17 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return True
         cached = _cred_cache.get(target)
         return bool(cached and _live_token(cached))
+
+    def can_pin_cached() -> bool:
+        """`_can_pin_now`, writing one line per change of its answer. LOGGED
+        HERE, NOT SAMPLED FROM A TICK: the window that was measured lasted
+        25 s and a tick is 30, so every reader's own read is the sample. The
+        first read is a baseline, not a change."""
+        ok = _can_pin_now()
+        was, _can_pin_seen[0] = _can_pin_seen[0], ok
+        if was is not None and was != ok:
+            _log_lifecycle(f"can_pin {was} -> {ok}")
+        return ok
 
     def refetch(refused_bearer: "str | None") -> "str | None":
         """A swap carrying `refused_bearer` was just REJECTED upstream RIGHT
@@ -7492,6 +7563,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
+    provider.freshen = functools.partial(provider, freshen=True)
     provider._lock_acquired_at = None
     # None: never evaluated yet (no mint, no beat). False: the last
     # verified mint answered as the pin. A dict ({"pinned": ...,
@@ -12891,6 +12963,21 @@ def _watch_own_code(
                 server.learn_next_hop()
             except (AttributeError, OSError):
                 pass  # a stand-in server in tests, or a hop that went away
+            # REFRESH THE PINNED TOKEN WHILE IT STILL HAS TIME ON IT, so
+            # `can_pin_cached` never reads false across the refresh (see
+            # `_FRESHEN_MARGIN_MS`). ABOVE THE OFF SWITCH, so it runs whether
+            # or not self-heal is on: the switch stops REPLACEMENTS, and a
+            # refresh replaces nothing. The lock peek is `_can_mint`'s: a
+            # stalled store must not park the watchdog for the lock's bound.
+            # An exception here would reach the `except` below, which ENDS the
+            # watchdog, so it is caught: the refresh is an optimisation.
+            _fresh = getattr(server, "_pin_token_provider", None)
+            if (getattr(_fresh, "freshen", None) is not None
+                    and _mint_lock_busy(_fresh) is None):
+                try:
+                    _fresh.freshen()
+                except Exception:  # noqa: BLE001 — never end the watchdog
+                    pass
             # THE OFF SWITCH STOPS EVERY AUTOMATIC REPLACEMENT, not just the
             # holder's. `CSWAP_PIN_SELF_HEAL=off` is documented on PortHolder
             # as "a respawner fighting a human who is debugging the daemon is
