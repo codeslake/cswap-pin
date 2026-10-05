@@ -15163,6 +15163,11 @@ class PinProxy:
         # separately because the drain must treat them the other way round:
         # every other connection is waited for, these are let go.
         self._stream_conns: set = set()
+        #: stream conn -> the TLS object that owns its descriptor. `_mitm`'s
+        #: `wrap_socket` DETACHES the raw conn every structure here is keyed
+        #: on (`fileno() == -1`), so only this object can be shut down.
+        #: Dropped with the stream, in `_forget_stream`.
+        self._stream_tls: dict = {}
         #: bridge id -> monotonic instant its LAST stream socket went.
         self._stream_lost: dict = {}
         # PER-BRIDGE, and initialised HERE or the accounting is dead in
@@ -17029,6 +17034,7 @@ class PinProxy:
         The caller holds `_live_lock`, so this must not take it.
         """
         self._stream_conns.discard(conn)
+        getattr(self, "_stream_tls", {}).pop(conn, None)
         owner = getattr(self, "_stream_owner", {})
         bid = owner.pop(conn, None)
         if bid is None:
@@ -17480,20 +17486,33 @@ class PinProxy:
         clean EOF rather than an RST even with unread bytes in our queue --
         the 2x2 in `_close_open_connections` is the measurement behind that.
 
+        ON THE TLS OBJECT. `_stream_conns` holds the raw accepted socket and
+        `wrap_socket` detached it, so its `shutdown` raised EBADF into a
+        swallowing except while the count still said 1 and the client kept
+        receiving. Not `unwrap()`: it blocks on a silent client and raises on
+        unread client bytes. No close here: the connection's own teardown
+        closes it, and the raw conn keeps its place in `_open_conns`.
+
+        RETURNS THE SHUTDOWNS THAT DID NOT RAISE, which the caller subtracts
+        from the streams the drain still owes and prints as handed over.
+
         `time.monotonic`, because `_content_at` is stamped with it. Comparing
         it against a wall clock reads as ~55 years of silence and would
         release every stream on the first pass.
         """
         now = time.monotonic()
         with self._live_lock:
-            victims = [c for c in (self._stream_conns & self._open_conns)
+            victims = [self._stream_tls.get(c, c)
+                       for c in (self._stream_conns & self._open_conns)
                        if now - self._content_at.get(c, now) >= older_than]
-        for conn in victims:
+        released = 0
+        for sock in victims:
             try:
-                conn.shutdown(socket.SHUT_WR)
+                sock.shutdown(socket.SHUT_WR)
+                released += 1
             except OSError:
                 pass
-        return len(victims)
+        return released
 
     # -- internals ----------------------------------------------------------
 
@@ -19668,6 +19687,7 @@ class PinProxy:
             if _EVENT_STREAM.search(request_line):
                 with self._live_lock:
                     self._stream_conns.add(conn)
+                    self._stream_tls[conn] = tls
         # PER BRIDGE, not per connection. `_stream_conns` answers "is this
         # SOCKET a stream", which is what the drain needs; this answers "does
         # this SESSION hold one", which is what a deaf bridge fails.
@@ -20268,7 +20288,9 @@ class PinProxy:
                             self._note_stream_end(
                                 _bridge, time.monotonic() - _t0,
                                 "upstream" if closed_by is up else
-                                "client" if closed_by is client else "unknown")
+                                "client" if closed_by is client else
+                                "drain" if closed_by is _RELEASED_BY_DRAIN
+                                else "unknown")
                     _release_tunnel._wants_closer = True
 
                     _pump_detached(up, client, _release_tunnel)
@@ -22868,6 +22890,10 @@ def _drain_ready(src) -> bytes:
     return data
 
 
+#: `closed_by` of a pair `release_pairs` let go: neither of its sockets ended it.
+_RELEASED_BY_DRAIN = object()
+
+
 class _PumpLoop:
     """ONE selector thread for EVERY tunnel, instead of one thread each.
 
@@ -22977,8 +23003,12 @@ class _PumpLoop:
         EOF rather than the RST it would get when this process exits with the
         sockets still open. That is the sequence `_close_open_connections`
         runs on every open connection, and its 2x2 is the measurement: a close
-        that follows the shutdown still reads as a clean EOF, unread bytes or
-        not.
+        that follows the shutdown still READS as a clean EOF, unread bytes or
+        not. What follows the EOF differs, measured on Linux over 100 runs of
+        each: with unread inbound bytes the close sends an RST after the FIN,
+        so the peer's socket then carries EPIPE (a later send fails); with none
+        it carries nothing. macOS is not measured, so the test of this asserts
+        only the read.
 
         THE CLOSE IS `_close_pair`, ONCE PER PAIR, because that also runs the
         pair's `on_close`. For a blind CONNECT `on_close` is the only thing
@@ -23027,7 +23057,8 @@ class _PumpLoop:
             for a, (b, on_close) in ends.items():
                 if a not in seen:
                     seen.update((a, b))
-                    self._close_pair(a, b, on_close)
+                    self._close_pair(a, b, on_close,
+                                     closed_by=_RELEASED_BY_DRAIN)
         return len(socks) // 2
 
     def add(self, a, b, on_close=None, kind: str = "tunnel") -> None:
@@ -23168,7 +23199,12 @@ class _PumpLoop:
                     data = b""
                 if not data:
                     with self._lock:
-                        self._close_pair(src, dst, on_close, closed_by=src)
+                        # A RELEASE MAY HAVE LANDED IN THE GAP since `entry`
+                        # was read: it pre-pops the pair on purpose and runs
+                        # `_close_pair` itself, so closing again here would
+                        # run `on_close` a second time.
+                        if self._peer.get(src) is not None:
+                            self._close_pair(src, dst, on_close, closed_by=src)
                     continue
                 # NEVER BLOCK THIS THREAD. It carries every tunnel, so a
                 # peer that stops reading would stall all of them — releasing
