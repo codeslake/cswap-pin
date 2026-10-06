@@ -2098,11 +2098,10 @@ def heal(backup_root: Path, identity: dict | None = None,
         # Fall through to the spawn path below, which reclaims that port.
     if alive is not None:
         # A DAEMON THE KEYCHAIN REFUSES STILL SERVES, AND IS REUSED RIGHT HERE:
-        # `cswap pin --ensure` (the rc hook, every Terminal launch) and
-        # `cswap pin --heal` are the commands that reach this arm, and neither
-        # reaches `ensure_proxy`. It only STARTS the helper and returns, and
-        # asks nothing off macOS, so this stays the cheap per-launch call. A
-        # dangling pin has no slot to start it for. See `_move_into_this_session`.
+        # `cswap pin --ensure` (every Terminal launch) and `cswap pin --heal`
+        # reach this arm and never `ensure_proxy`. It only STARTS the helper
+        # and asks nothing off macOS, so this stays the cheap per-launch call;
+        # a dangling pin has no slot. See `_move_into_this_session`.
         if account_num:
             _move_into_this_session(certdir, account_num, email, alive)
         # SERVING IS NOT THE SAME AS WIRED. Returning False here left that
@@ -12304,15 +12303,14 @@ class PortHolder:
             )
             return "continue"
         # THE SOCKET WENT TO A CALLER'S LINEAGE AND ANOTHER DAEMON SERVES IT:
-        # this daemon's exit is a STAND-DOWN, WHATEVER its code. 0 is its
-        # drain ending; 75 is a TERM during that uncapped drain (a recycle, the
-        # orphan sweep's excess reap, cc-update), which exits 75 because this
-        # holder is still its parent; anything else is a kill or a crash. Every
-        # one of them used to respawn a fresh daemon of this lineage onto a
-        # socket that is no longer ours to serve: two acceptors, the record
-        # overwritten, and the next sweep TERMs the good one. `stop()` keeps
-        # its order (the daemon is gone first, then the socket closes). Before
-        # `_reap_standby`: the standby is released here and not warned about.
+        # this daemon's exit is a STAND-DOWN, WHATEVER its code. 0 is its drain
+        # ending; 75 is a TERM during that uncapped drain (a recycle, the orphan
+        # sweep's excess reap, cc-update), which exits 75 because this holder
+        # is still its parent; the rest are a kill or a crash. Each used to
+        # respawn a daemon of this lineage onto a socket that is no longer ours
+        # to serve: two acceptors, the record overwritten, and the next sweep
+        # TERMs the good one. `stop()` keeps its order (daemon gone, then the
+        # socket closes). Before `_reap_standby`, so no "standby is gone" line.
         other = self._hand_off_served_by(proc)
         if other:
             _log_lifecycle(
@@ -13454,11 +13452,9 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
     that did not happen. The holder keeps its respawn duty, since its
     `_handed_off` only matters once ANOTHER daemon is the recorded one.
 
-    TAKEN WHATEVER THE CAUSE OF THE TICK: `_watch_own_code` routes here as soon
-    as a rendezvous is waiting, including a tick that wanted to replace stale
-    code or a blind mint, because the holder answers EVERY ask with the socket
-    for the helper (`PortHolder._hand_to_the_caller`) and the ordinary ask's
-    `_SPAWN_WAIT_S` and exit-75 fallback would then cut held tunnels for a
+    TAKEN WHATEVER THE CAUSE OF THE TICK, stale code or a blind mint included:
+    the holder answers any ask with the socket for a waiting helper, and the
+    ordinary ask's `_SPAWN_WAIT_S` and exit 75 would cut held tunnels for a
     successor the helper takes far longer to publish.
 
     THIS DAEMON OUTWAITS THE HELPER (1.25 x `_RELOCATE_WAIT_S`): a successor
