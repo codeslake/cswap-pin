@@ -21657,9 +21657,10 @@ _refused_slots: dict[str, float] = {}
 _REFUSAL_BAR_S = 900.0
 
 # (reset, slot, session) -> the monotonic deadline the bearer branch's OWN
-# 401 is good until. Separate from `_walled_switch_seen`, on purpose: that
-# memo is a SHARED verdict (did `switch()` actually move the account, a fact
-# every session should see alike), while a stale bearer is a PER-CLIENT fact
+# 401 is good until (`b"grant"` stands for `reset` on an access-grant 403).
+# Separate from `_walled_switch_seen`, on purpose: that memo is a SHARED
+# verdict (did `switch()` actually move the account, a fact every session
+# should see alike), while a stale bearer is a PER-CLIENT fact
 # — one session's frozen credential says nothing about another session's.
 # Sharing the key made N stale sessions take N * 30s to all recover (one
 # converts, the other N-1 read its memo and relay raw 429s until it
@@ -21936,15 +21937,22 @@ def _switch_takes_refused() -> bool:
     return _switch_takes("current_refused")
 
 
-def _mark_refused(slot: str) -> frozenset:
-    """Record ``slot`` as refused for `_REFUSAL_BAR_S`, drop the expired, and
-    answer every slot still inside the bar: the `exclude` of a refusal
-    `switch()`. Call under `_walled_switch_lock`."""
+def _refusal_exclude(slot: str) -> frozenset:
+    """``slot`` and every slot still inside the bar: the `exclude` of a
+    refusal `switch()`. Writes nothing. Call under `_walled_switch_lock`."""
+    now = time.time()
+    return frozenset(s for s, exp in _refused_slots.items() if exp > now) | {slot}
+
+
+def _mark_refused(exclude: frozenset) -> None:
+    """Restart the bar of every slot in ``exclude``, as `switch(
+    current_refused)` marks every one of them (`refusedUntil`, wall clock).
+    Call after `switch()` returned, never before: a raise marked nothing
+    there. Call under `_walled_switch_lock`."""
     now = time.time()
     for expired in [s for s, exp in _refused_slots.items() if exp <= now]:
         del _refused_slots[expired]
-    _refused_slots[slot] = now + _REFUSAL_BAR_S
-    return frozenset(_refused_slots)
+    _refused_slots.update(dict.fromkeys(exclude, now + _REFUSAL_BAR_S))
 
 
 def _bearer(auth: str) -> str:
@@ -22107,12 +22115,16 @@ def _switch_off_walled_account(
     ``b"grant:" + <bearer fingerprint>`` and no wall anywhere in it. It acts
     for the live slot's OWN bearer, asking `switch()` to mark and leave that
     slot (`current_refused`, `exclude` = `_refused_slots`, never
-    `current_at_limit`), and for a bearer the pin switched off earlier (a
-    validated switch on file for its fingerprint), which gets the bearer
-    branch's once-per-session 401 and no switch. It writes no `_walled_slots`
-    and no `_fleet_exhausted_until`, and answers False, so the 403 is relayed
-    UNCHANGED, on every path that does not end in a validated landing or in
-    that bearer branch's 401.
+    `current_at_limit`), and for any other bearer, which gets the bearer
+    branch's once-per-session 401 whatever bearer the session sends (the
+    memo is on `b"grant"` and the slot, not the fingerprint, which changes
+    on every retry) and no switch (one with a validated switch
+    on file also has its slot marked again once the pin's bar there has
+    lapsed). The pin's bar is written after `switch()` returns, for every
+    slot in `exclude` as the host marks them all, never on a raise. It writes
+    no `_walled_slots` and no `_fleet_exhausted_until`, and answers False, so
+    the 403 is relayed UNCHANGED, on every path that does not end in a
+    validated landing or in that bearer branch's 401.
 
     ``session`` is the request's ``x-claude-code-session-id`` — stable per
     session and never rotated on retry, unlike the bearer. The absolute-form
@@ -22248,22 +22260,21 @@ def _switch_off_walled_account(
         token = _bearer(auth)
         straggler = None
         if grant:
-            # A BEARER THE PIN ALREADY LEFT is owed a 401 only where a
-            # switch off its slot was VALIDATED: the slot it names is the
-            # one that switch recorded, the key's second element. The pin has
-            # no bearer-to-slot lookup (a credential-store read per request
-            # is what cff03cd took off this path), and "whichever slot is
-            # live" is the mark `switch()`'s own docstring warns against, so
-            # a bearer with no such record is relayed unchanged.
+            # A BEARER THE PIN ALREADY LEFT names its slot only where a
+            # switch off it was VALIDATED: the key's second element. The pin
+            # has no bearer-to-slot lookup (cff03cd took that read off this
+            # path) and "whichever slot is live" is the mark `switch()`'s own
+            # docstring warns against, so any other bearer has no
+            # `straggler`, marks nothing, and is still owed the bearer
+            # branch's 401 below.
             if token != live:
                 straggler = next((k[1] for k, v in _walled_switch_seen.items()
                                   if k[0] == reset and v[0]
                                   and k[1] not in (None, slot)), None)
-            if slot is None or stale or not live or (
-                    token != live and straggler is None):
+            if slot is None or stale or not live:
                 _log_lifecycle(
-                    f"{said} — the bearer is neither the live slot's own nor "
-                    f"one the pin switched off, relaying {relay_no}")
+                    f"{said} — the live slot is unknown or just changed "
+                    f"hands, relaying {relay_no}")
                 return False
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
@@ -22276,7 +22287,16 @@ def _switch_off_walled_account(
         # number does not rotate. A `stale` read keys on `(reset, None)`, which
         # no slot's new occupant can inherit, so the storm's waiters (all
         # stale together) still share ONE `switch()` verdict.
-        key = (reset, None if stale else slot)
+        #
+        # A GRANT's `reset` is the bearer's fingerprint, which changes on
+        # every retry, so a session-less bearer that is not the live one
+        # records its 401 on `b"grant"` and the slot: one entry, so ten
+        # fingerprints cannot push a validated record out of the 8-entry
+        # memo. The live bearer keeps `(fingerprint, slot)`, which is what the
+        # straggler lookup above reads. A session's own 401 is in the
+        # per-session memo below, never here.
+        key = (b"grant" if grant and token != live and not session else reset,
+               None if stale else slot)
         # Set by the bearer branch below, ONLY when it finds the live slot
         # already known walled (`walled=True`): that fallthrough's own
         # `reset` belongs to the STALE account, not the live one, so the
@@ -22342,7 +22362,13 @@ def _switch_off_walled_account(
             # relay never reaches this function at all, see the docstring
             # above) falls through unchanged and is recorded into the shared
             # `key` below instead, exactly as before this parameter existed.
-            session_key = ((reset, slot, session)
+            # A GRANT's `reset` is a bearer fingerprint, and the 401 sends the
+            # client to mint a new bearer (`/api/oauth/token` is not pinned):
+            # keyed on it, each retry is a new key, the loop reopens and every
+            # round spends a credential exchange. So a grant keys on
+            # `b"grant"`: one 401 per session per window, whatever bearer it
+            # sends.
+            session_key = (((b"grant" if grant else reset), slot, session)
                            if session and not stale else None)
             now2 = time.monotonic()
             if session_key is not None:
@@ -22364,20 +22390,24 @@ def _switch_off_walled_account(
                 # is not itself inside the refusal bar, which the 401 would
                 # send the client back onto. Once the pin's own bar on the
                 # bearer's slot has lapsed, a straggler is how cswap marks
-                # that slot again: `exclude` names it alone, so cswap marks
-                # it and leaves the live account where it is (no usage
-                # fetch, no probe, no credential write).
+                # that slot again: `exclude` is the straggler's slot plus
+                # every slot still inside the pin's bar, never the live one,
+                # so cswap marks them and leaves the live account where it
+                # is (no usage fetch, no probe, no credential write).
                 if _refused_slots.get(slot, 0.0) > time.time():
                     _log_lifecycle(
                         f"{said} — the live slot is itself refused, relaying "
                         f"{relay_no}")
                     return False
-                if _refused_slots.get(straggler, 0.0) <= time.time():
+                if (straggler is not None
+                        and _refused_slots.get(straggler, 0.0) <= time.time()):
+                    marked = _refusal_exclude(straggler)
                     try:
                         require("switcher").ClaudeAccountSwitcher().switch(
                             strategy="best", json_output=True,
                             models=("all",), current_refused=True,
-                            exclude=_mark_refused(straggler))
+                            exclude=marked)
+                        _mark_refused(marked)
                     except Exception as exc:  # noqa: BLE001 — never break the relay
                         _log_lifecycle(
                             f"{said} — marking slot {straggler} again raised "
@@ -22513,7 +22543,7 @@ def _switch_off_walled_account(
                 # cswap's own bar releases when nothing else is left and
                 # would land back on a refused account.
                 switch_kwargs.update(
-                    current_refused=True, exclude=_mark_refused(slot))
+                    current_refused=True, exclude=_refusal_exclude(slot))
             else:
                 switch_kwargs["current_at_limit"] = True
             if not grant and _switch_takes_exclude():
@@ -22523,6 +22553,8 @@ def _switch_off_walled_account(
                     del _walled_slots[expired]
                 switch_kwargs["exclude"] = frozenset(_walled_slots)
             result = switcher.ClaudeAccountSwitcher().switch(**switch_kwargs)
+            if grant:
+                _mark_refused(switch_kwargs["exclude"])  # whatever it returned
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
                 f"{said} — the {'refusal' if grant else 'at-limit'} switch raised "
