@@ -18287,12 +18287,20 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                auth="", session="", extra_headers=b"", body=b"no", withhold=0,
                framed=True, method="POST"):
         """``withhold`` holds back that many trailing body bytes and sends
-        them from a timer, so the head read ends before the body does.
-        ``framed=False`` omits `Content-Length`."""
+        them after a delay, so the head read ends before the body does.
+        ``framed=False`` omits `Content-Length`.
+
+        Both ends run from threads over sockets shrunk to macOS's 8 KB
+        AF_UNIX buffer (Linux's is ~208 KB): a body past 8 KB written whole
+        before the relay ran blocked there on macOS CI (T1891). Returns
+        every byte the client was sent."""
         import socket as _s
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
         cl_a, cl_b = _s.socketpair()
+        for x in (up_a, up_b, cl_a, cl_b):
+            x.setsockopt(_s.SOL_SOCKET, _s.SO_SNDBUF, 4096)
+            x.setsockopt(_s.SOL_SOCKET, _s.SO_RCVBUF, 4096)
         try:
             head = b"HTTP/1.1 " + status + b"\r\n"
             if reset is not False:  # False omits the header entirely
@@ -18303,18 +18311,29 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                      + b"\r\n")
             early, late = ((body[:-withhold], body[-withhold:]) if withhold
                            else (body, b""))
-            up_b.sendall(head + early)
-            if late:
-                def _later():
-                    up_b.sendall(late)
+            got = []
+
+            def _feed():
+                try:
+                    up_b.sendall(head + early)
+                    if late:
+                        time.sleep(0.1)
+                        up_b.sendall(late)
                     up_b.shutdown(_s.SHUT_WR)
-                threading.Timer(0.1, _later).start()
-            else:
-                up_b.shutdown(_s.SHUT_WR)
+                except OSError:  # the relay finished and the sockets closed first
+                    pass
+
+            def _drain():
+                while chunk := cl_b.recv(65536):
+                    got.append(chunk)
+            reader = threading.Thread(target=_drain, daemon=True)
+            threading.Thread(target=_feed, daemon=True).start()
+            reader.start()
             pp._relay_response(up_a, cl_a, 0, method=method, path=path,
                                auth=auth, session=session)
             cl_a.shutdown(_s.SHUT_WR)
-            return cl_b.recv(4096)
+            reader.join()
+            return b"".join(got)
         finally:
             for x in (up_a, up_b, cl_a, cl_b):
                 try: x.close()
@@ -21158,6 +21177,17 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         got = self._r403(body=body)
         assert got.startswith(b"HTTP/1.1 403"), got[:60]
         assert got == self._untouched(body=body)
+        assert not log, log
+
+    def case_a_body_over_the_real_cap_is_relayed_whole(self, monkeypatch):
+        """Read nothing, stall nothing: the arm leaves a body past
+        `_GRANT_BODY_CAP` to the plain relay, which carries every byte."""
+        log = []
+        self._wire(monkeypatch, log=log)
+        body = b"x" * 100000
+        got = self._r403(body=body)
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert got.endswith(body), len(got)
         assert not log, log
 
     def case_the_body_is_decoded_per_content_encoding_for_the_match(
