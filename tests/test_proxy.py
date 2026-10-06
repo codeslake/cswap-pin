@@ -12382,7 +12382,10 @@ class TestDaemonPortStability:
                 time.sleep(0.3)
             finally:
                 stop.set()
-                h.join(timeout=5)
+                # ABOVE THE HAMMER'S OWN WORST CASE: one iteration is a
+                # connect (2s) plus a reply wait (5s), so a 5s join could
+                # return while the hammer was still inside its last request.
+                h.join(timeout=10)
                 # PARENTS FIRST, and the holder is a parent. Killing the
                 # daemon alone made this test MULTIPLY processes: the holder's
                 # whole job is to replace a daemon that dies, so each kill

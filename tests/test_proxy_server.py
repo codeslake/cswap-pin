@@ -13636,7 +13636,8 @@ class TestDrainReportsWhatItCut:
     def case_a_released_pair_runs_its_teardown_once_and_only_for_its_kind(self):
         """`add` files each socket under the SAME `on_close`, so a release that
         walks sockets rather than pairs runs it twice. The 101 path's teardown
-        also takes the closer, which a release has none of."""
+        also takes the closer, which a release names as the drain."""
+        import cswap_pin.proxy as pp
         from cswap_pin.proxy import _PUMP
 
         _PUMP.reset_for_tests()
@@ -13652,7 +13653,8 @@ class TestDrainReportsWhatItCut:
             _PUMP.add(a, b, bridge_done, kind="bridge")
             _PUMP.add(c, d, lambda: other.append(1))
             assert _PUMP.release_pairs("bridge") == 1
-            assert ended == [None], f"the bridge teardown ran as {ended!r}"
+            assert ended == [pp._RELEASED_BY_DRAIN], (
+                f"the bridge teardown ran as {ended!r}")
             assert a.fileno() == b.fileno() == -1, "the pair was left open"
             assert other == [] and c.fileno() != -1, (
                 "a release of one kind closed the other")
@@ -13662,8 +13664,146 @@ class TestDrainReportsWhatItCut:
             for s_ in (a, b, c, d):
                 s_.close()
 
+    def case_a_release_landing_in_the_read_gap_runs_on_close_once(
+            self, monkeypatch):
+        """The run loop reads `entry` under the lock and drops it before
+        `_drain_ready`. A release landing in that gap closes the pair, and the
+        loop then reads EOF off the closed socket and closed it AGAIN: `on_close`
+        twice, which is a bridge's end logged twice and a debt given back twice.
+        The seam is `_drain_ready`, so the release lands where the race is."""
+        import cswap_pin.proxy as pp
+        from cswap_pin.proxy import _PUMP
+
+        _PUMP.reset_for_tests()
+        feed, a = socket.socketpair()
+        b, sink = socket.socketpair()
+        feed2, c = socket.socketpair()
+        d, sink2 = socket.socketpair()
+        ended = []
+
+        def on_close(closed_by=None):
+            ended.append(closed_by)
+
+        on_close._wants_closer = True
+        real, landed = pp._drain_ready, threading.Event()
+
+        def landing(src):
+            if not landed.is_set():
+                _PUMP.release_pairs()
+                landed.set()          # AFTER, or the next `add` beats the release
+            return real(src)
+
+        monkeypatch.setattr(pp, "_drain_ready", landing)
+        try:
+            _PUMP.add(a, b, on_close)
+            feed.send(b"x")
+            assert landed.wait(5), "precondition: the loop never read the pair"
+            # THE LOOP IS SINGLE-THREADED: once a byte crosses a second pair it
+            # has finished the pass that closed the first, so `ended` is final.
+            _PUMP.add(c, d, lambda: None)
+            feed2.send(b"y")
+            sink2.settimeout(5)
+            assert sink2.recv(1) == b"y", "precondition: the loop moved on"
+            assert len(ended) == 1, (
+                f"`on_close` ran {len(ended)} times for one pair: {ended!r}")
+        finally:
+            # RELEASE BEFORE THE RESET: `reset_for_tests` forgets the pair but
+            # leaves its sockets' selector keys, and a later test whose new
+            # socket reuses a closed fd number then has `add` swallow the
+            # KeyError and close its pair, so the tunnel never opens.
+            _PUMP.release_pairs()
+            _PUMP.reset_for_tests()
+            for s_ in (feed, a, b, sink, feed2, c, d, sink2):
+                s_.close()
+
+    def case_a_bridge_the_drain_releases_is_named_the_drain(
+            self, certdir, monkeypatch):
+        """`release_pairs` gave `on_close` no `closed_by`, so a 101 bridge cut
+        by a drain logged "closed by the unknown": the one line that says who
+        ended a Remote Control stream, blank exactly when the daemon did it."""
+        import cswap_pin.proxy as pp
+
+        lines: list[str] = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        pp._PUMP.reset_for_tests()
+        up = _WebSocketUpstream(certdir)     # holds the tunnel until we write
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "T",
+                            upstream=("127.0.0.1", up.port))
+        proxy.start()
+        tls = None
+        try:
+            status, tls = _upgrade_via_proxy(
+                proxy.port, certdir / "ca.pem",
+                "/v1/code/sessions/cse_x/worker/events/stream", bearer="DISK")
+            assert b"101" in status, status
+            deadline = time.monotonic() + 5
+            while (pp._PUMP.live_pairs("bridge") != 1
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            assert pp._PUMP.release_pairs("bridge") == 1
+            deadline = time.monotonic() + 5
+            while (not any("inbound stream for cse_x" in ln for ln in lines)
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            ended = [ln for ln in lines if "inbound stream for cse_x" in ln]
+            assert ended, lines
+            assert "closed by the drain" in ended[0], ended[0]
+        finally:
+            if tls is not None:
+                tls.close()
+            proxy.stop()
+            up.stop()
+
+    def case_a_released_pair_with_unread_bytes_ends_its_peers_read(self):
+        """WHAT THE PEER SEES when the released socket held unread inbound
+        bytes, measured and not assumed. No pump thread runs, so nothing reads
+        what the peer sent and it is unread by construction.
+
+        Asserted: the peer's read ENDS, as b"" (Linux) or as
+        ConnectionResetError (macOS), the two outcomes `release_pairs` records.
+        A reset is accepted on macOS only: on Linux it means the release closed
+        without the SHUT_WR."""
+        import select
+        import sys
+        from cswap_pin.proxy import _PumpLoop
+
+        def tcp_pair():
+            lsn = socket.socket()
+            lsn.bind(("127.0.0.1", 0))
+            lsn.listen(1)
+            peer = socket.create_connection(lsn.getsockname(), timeout=5)
+            served, _ = lsn.accept()
+            lsn.close()
+            return served, peer
+
+        loop = _PumpLoop()
+        loop._thread = threading.current_thread()    # `add` starts no thread
+        s, peer = tcp_pair()
+        u, far = tcp_pair()
+        try:
+            peer.sendall(b"unread")
+            assert select.select([s], [], [], 5)[0], "precondition"
+            assert s.recv(6, socket.MSG_PEEK) == b"unread", "precondition"
+            loop.add(s, u, lambda: None, kind="bridge")
+            assert loop.release_pairs("bridge") == 1
+            assert s.fileno() == -1, "the pair was left open"
+            peer.settimeout(5)
+            try:
+                assert peer.recv(4096) == b"", "the peer read data"
+            except ConnectionResetError:
+                # macOS reports the RST after the FIN; on Linux the same reset
+                # is a bare close with no SHUT_WR.
+                assert sys.platform == "darwin", (
+                    "the peer was reset: the release closed without the "
+                    "SHUT_WR that gives it a FIN first")
+        finally:
+            for s_ in (s, u, peer, far, loop._wake_r, loop._wake_w):
+                s_.close()
+            loop._sel.close()
+
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
-        """The channel a session cannot reopen for itself must survive a recycle.
+        """A held-open subscription must survive a recycle: the drain does not
+        cut it (only `release_idle_streams` ends a content-free one).
 
         A drain used to close every held-open `/worker/events/stream` on the
         grounds that it never completes, so waiting for it waits for ever. The
@@ -13742,8 +13882,8 @@ class TestDrainReportsWhatItCut:
                     got = None            # still open — nothing cut it
                 assert got is None, (
                     "the drain closed a held-open subscription. That is the "
-                    "channel claude.ai pushes through, and the session cannot "
-                    "reopen it for itself")
+                    "channel claude.ai pushes through, and only "
+                    "`release_idle_streams` may end a content-free one")
             finally:
                 for s_ in (e, f):
                     try:
@@ -20575,7 +20715,8 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
     in the window where a spurious 404 ends it.
 
     The successor already holds the listener, so a released client reconnects
-    at once -- `handleStreamEnd` backs off 1s and carries `from_sequence_num`.
+    to it: the worker stream's `handleConnectionError` waits about 1 s (+-25%,
+    doubling to a 30 s cap) and carries `from_sequence_num` and `Last-Event-ID`.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -20621,10 +20762,11 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
         b.send(b"x")                              # still a live socket
         assert a.recv(1) == b"x"
 
-    def case_the_threshold_is_the_CLIENTS_OWN(self, certdir):
-        """45s is `dn` in the 2.1.245 bundle, the liveness timeout the client
-        re-arms on every frame. If this drifts from what the client does, we
-        are cutting streams it would have kept."""
+    def case_the_content_free_threshold_is_the_clients_liveness_window(
+            self, certdir):
+        """45s is the client's default liveness window (2.1.290), re-armed on
+        every parsed frame. Here it is the drain's content-free threshold, not
+        a time at which the client drops a stream."""
         from cswap_pin import proxy as pp
         assert pp._CLIENT_LIVENESS_SECONDS == 45.0
 
@@ -20648,6 +20790,93 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
             srv._open_conns.add(a)
             srv._stream_conns.add(a)             # no _content_at entry
         assert srv.release_idle_streams() == 0
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mitm_stream(certdir, age):
+        """A client holding a REAL MITM'd event stream through an in-process
+        proxy, its last content `age` seconds ago. Yields `(proxy, upstream,
+        tls)`: the upstream holds its second event until `upstream.release`."""
+        from cswap_pin import proxy as pp
+        upstream = _StreamingUpstream(certdir)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        raw = tls = None
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                        b"Host: api.anthropic.com:443\r\n\r\n")
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += raw.recv(1)
+            ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+            tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
+            tls.sendall(b"GET /v1/code/sessions/cse_x/worker/events/stream "
+                        b"HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        b"Authorization: Bearer t\r\n\r\n")
+            tls.settimeout(5)
+            got = b""
+            while b"event: a" not in got:
+                chunk = tls.recv(4096)
+                assert chunk, "the stream closed before its first event"
+                got += chunk
+            with proxy._live_lock:
+                (conn,) = proxy._stream_conns
+                assert conn.fileno() == -1, "precondition: the wrap detached it"
+                proxy._content_at[conn] = time.monotonic() - age
+            yield proxy, upstream, tls
+        finally:
+            for s_ in (tls, raw):
+                if s_ is not None:
+                    s_.close()
+            proxy.stop()
+            upstream.stop()
+
+    def case_a_MITMd_stream_is_shut_down_for_real(self, certdir):
+        """THE RELEASE SHUT DOWN A DESCRIPTOR THAT WAS NOT THERE.
+
+        `_stream_conns` holds the raw accepted socket, which `wrap_socket`
+        detached, so `shutdown` raised EBADF into the swallowing except and
+        the function still returned 1: the drain logged "handed 1 stream" and
+        the client kept receiving. The socketpair cases above are never
+        wrapped, which is why they were green.
+        """
+        from cswap_pin import proxy as pp
+        with self._mitm_stream(
+                certdir, pp._CLIENT_LIVENESS_SECONDS + 5) as (proxy, up, tls):
+            with proxy._live_lock:
+                # `getattr`: the base has no `_stream_tls`, and this case must
+                # reach the EOF assertion there rather than die on the read.
+                served = list(getattr(proxy, "_stream_tls", {}).values())
+            assert proxy.release_idle_streams() == 1
+            # `SSLSocket.shutdown` nulls `_sslobj` on the object the serving
+            # thread writes through: a send past its check raises, and one
+            # between the null and the syscall goes out as plaintext.
+            assert all(s_._sslobj is not None for s_ in served), (
+                "the release shut down through the TLS object the serving "
+                "thread is writing to")
+            up.release.set()    # a stream NOT shut down delivers its 2nd event
+            assert tls.recv(4096) == b"", "the client was not given an EOF"
+
+    def case_CONTROL_a_MITMd_stream_still_delivering_is_not_released(
+            self, certdir):
+        """What 80455db defended: a live stream present during the release is
+        not selected, not counted, and keeps delivering."""
+        with self._mitm_stream(certdir, 1.0) as (proxy, up, tls):
+            assert proxy.release_idle_streams() == 0
+            up.release.set()
+            assert b"event: b" in tls.recv(4096), "the live stream was cut"
+
+    def case_a_stream_whose_shutdown_fails_is_not_counted(self, certdir):
+        """The count is the shutdowns that did not raise, not the victims."""
+        from cswap_pin import proxy as pp
+        srv = self._server(certdir)
+        a, b = self._register(srv, pp._CLIENT_LIVENESS_SECONDS + 5)
+        c, d = self._register(srv, pp._CLIENT_LIVENESS_SECONDS + 5)
+        a.close()                                 # shutdown(a) raises EBADF
+        assert srv.release_idle_streams() == 1
+        assert d.recv(16) == b"", "the live one was not shut down"
 
 
 def _handshake(ctx, port, host="api.anthropic.com"):
