@@ -20853,12 +20853,14 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         return self._wire_exclude_capable(
             monkeypatch, kwargs_log=log, **kw)
 
-    def _moving_fleet(self, monkeypatch, **kw):
-        """Two accounts, slot 1 (bearer `LIVE`) live. A `switch()` lands on a
-        slot that is neither the live one nor in `exclude`, as cswap's
-        candidate search does, and finds `candidates-exhausted` when none is
-        left. Returns the kwargs log and the live-slot cell."""
-        live, tokens = {"num": "1"}, {"1": self.LIVE, "2": self.B}
+    def _moving_fleet(self, monkeypatch, tokens=None, **kw):
+        """Two accounts (or ``tokens``, slot -> bearer), slot 1 (bearer
+        `LIVE`) live. A `switch()` lands on a slot that is neither the live
+        one nor in `exclude`, as cswap's candidate search does, and finds
+        `candidates-exhausted` when none is left. Returns the kwargs log and
+        the live-slot cell."""
+        live = {"num": "1"}
+        tokens = tokens or {"1": self.LIVE, "2": self.B}
 
         def lands(exclude):
             others = [n for n in tokens
@@ -21062,14 +21064,65 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
             assert self._r403() == got, what
             assert len(log) == 1, (what, "a repeat re-asked switch()", log)
 
-    def case_a_bearer_that_is_not_the_live_account_relays_the_403_unchanged(
+    def case_a_bearer_that_is_not_a_bearer_relays_the_403_unchanged(
         self, monkeypatch,
     ):
         log = []
         self._wire(monkeypatch, log=log)
-        for auth in ("Bearer some-other-account-token", "Basic abc", ""):
+        for auth in ("Basic abc", ""):
             assert self._r403(auth=auth) == self._untouched(auth=auth), auth
-        assert not log, f"a stale bearer's 403 drew a switch(): {log}"
+        assert not log, f"a 403 with no bearer drew a switch(): {log}"
+
+    def case_an_old_bearer_with_no_record_gets_one_401_per_session(
+        self, monkeypatch,
+    ):
+        """A bearer that is not the live one and has no validated switch on
+        file (a pin restart inside the bar, an eviction from the 8-entry
+        memo, an engine switch off an account that then refuses) drew the
+        403 unchanged, "Please run /login" until its credential turned over.
+        It gets what the 429 arm's bearer branch gives any stale bearer: one
+        401 per session, none for a repeat of that session inside the window
+        (the 403 unchanged, as the 429 is relayed), no `switch()` and no
+        slot marked, since the 401 makes the client re-read the live
+        credential, a different account."""
+        from cswap_pin import proxy as pp
+        log = []
+        self._wire(monkeypatch, log=log)
+        old = "Bearer some-old-account-token"
+        assert self._r403(auth=old, session="s1").startswith(b"HTTP/1.1 401")
+        again = self._r403(auth=old, session="s1")
+        assert again.startswith(b"HTTP/1.1 403"), (
+            f"the same session got a second 401 with nothing changed: {again[:60]}")
+        assert again == self._untouched(auth=old, session="s1")
+        assert self._r403(auth=old, session="s2").startswith(b"HTTP/1.1 401"), (
+            "another session's old bearer is owed its own 401")
+        assert not log, f"an old bearer's 403 drew a switch(): {log}"
+        assert pp._refused_slots == {} and pp._walled_slots == {}, (
+            pp._refused_slots, pp._walled_slots)
+        # The 401 sends the client to the live slot: not while it is refused.
+        pp._refused_slots["1"] = time.time() + 600
+        other = "Bearer another-old-token"
+        got = self._r403(auth=other, session="s3")
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert got == self._untouched(auth=other, session="s3")
+        assert not log, log
+
+    def case_an_old_bearer_with_no_session_shares_one_401_and_then_403s(
+        self, monkeypatch,
+    ):
+        """THE CONTROL: with no `x-claude-code-session-id` the 429 bearer
+        branch records into the shared `(reset, slot)` memo, so the first
+        request is converted and every repeat inside the window is relayed
+        unchanged."""
+        log = []
+        self._wire(monkeypatch, log=log)
+        old = "Bearer some-old-account-token"
+        assert self._r403(auth=old).startswith(b"HTTP/1.1 401")
+        for _ in (2, 3):
+            again = self._r403(auth=old)
+            assert again.startswith(b"HTTP/1.1 403"), again[:60]
+            assert again == self._untouched(auth=old)
+        assert not log, f"an old bearer's 403 drew a switch(): {log}"
 
     def case_a_late_403_on_the_bearer_the_pin_switched_off_gets_a_401(
         self, monkeypatch,
@@ -21126,9 +21179,57 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         log, live = self._moving_fleet(monkeypatch, before=_boom)
         assert self._r403().startswith(b"HTTP/1.1 401")
         pp._refused_slots["1"] = time.time() - 1.0
+        lapsed = dict(pp._refused_slots)
         got = self._r403(session="s1")
         assert got.startswith(b"HTTP/1.1 401"), got[:60]
         assert len(log) == 2, log
+        assert pp._refused_slots == lapsed, (
+            "a bar claude-swap never wrote was recorded after a raise: "
+            f"{pp._refused_slots}")
+
+    def case_a_switch_that_raises_leaves_no_bar_the_host_never_wrote(
+        self, monkeypatch,
+    ):
+        """`_mark_refused` ran as an argument, before `switch()` was entered,
+        so a raise left the pin barring a slot claude-swap had not marked."""
+        from cswap_pin import proxy as pp
+
+        def _boom():
+            raise RuntimeError("config lock held")
+
+        log = []
+        self._wire(monkeypatch, log=log, before=_boom)
+        assert self._r403().startswith(b"HTTP/1.1 403")
+        assert len(log) == 1, log
+        assert pp._refused_slots == {}, pp._refused_slots
+
+    def case_a_refusal_re_marks_every_slot_it_excludes(self, monkeypatch):
+        """claude-swap marks EVERY slot in `exclude` for a full bar, so the
+        pin restarts all of their bars too. Restarting only the live slot's
+        let A's bar lapse here while claude-swap still held it: A refused at
+        T0 (-> B), B at T0+600 (-> C, exclude {A, B}, both re-marked), C at
+        T0+1000 must carry A, whose mark from T0+600 is live."""
+        from cswap_pin import proxy as pp
+        tokens = {"1": self.LIVE, "2": self.B, "3": "third-account-token"}
+        log, live = self._moving_fleet(monkeypatch, tokens=tokens)
+
+        def _later(seconds):
+            for slot in pp._refused_slots:
+                pp._refused_slots[slot] -= seconds
+
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        _later(600)
+        assert self._r403(auth="Bearer " + self.B).startswith(b"HTTP/1.1 401")
+        assert live["num"] == "3", live
+        assert log[1]["exclude"] == {"1", "2"}, log
+        assert pp._refused_slots["1"] > time.time() + 800, (
+            "A was excluded and marked again by switch(), its bar was not: "
+            f"{pp._refused_slots}")
+        _later(400)
+        got = self._r403(auth="Bearer " + tokens["3"])
+        assert log[2]["exclude"] == {"1", "2", "3"}, (
+            f"a refusal on the live account must not be offered A: {log}")
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
 
     def case_a_fleet_where_every_account_refuses_gets_one_401_and_then_403s(
         self, monkeypatch,
