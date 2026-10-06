@@ -14399,14 +14399,19 @@ class TestDrainReportsWhatItCut:
         assert named, (
             "no `await_inflight(<CONSTANT>)` call found at all — the scan is "
             "broken, and a broken scan passes every assertion below it")
+        # THREE HAND OVER: the code watchdog's held and unheld branches, and
+        # the caller-side relocation (`_hand_over_to_the_caller`, T1936), whose
+        # successor is serving before it drains exactly as the held branch's.
         assert sorted(named) == [
             "_HANDOVER_DRAIN_SECONDS", "_HANDOVER_DRAIN_SECONDS",
+            "_HANDOVER_DRAIN_SECONDS",
             "_HELD_DRAIN_SECONDS", "_HELD_DRAIN_SECONDS",
         ], (
-            "the exit paths no longer drain on the ceilings that fit them. Two "
-            "hand over to a successor that is already serving (free to wait) "
-            "and two exit so a holder can start the successor the slow way "
-            "(every second is an unserved port). Got: " + ", ".join(sorted(named))
+            "the exit paths no longer drain on the ceilings that fit them. "
+            "Three hand over to a successor that is already serving (free to "
+            "wait) and two exit so a holder can start the successor the slow "
+            "way (every second is an unserved port). Got: "
+            + ", ".join(sorted(named))
         )
 
         # AND THE NUMBERS THEMSELVES, or the names above are decoration.

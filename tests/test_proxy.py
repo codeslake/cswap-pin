@@ -32817,7 +32817,7 @@ else:
         from conftest import _reap_pin_processes
         from cswap_pin import proxy as pp
 
-        base = Path(tempfile.mkdtemp(prefix="rl")).resolve()
+        base = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
         certdir = base / "pin-proxy"
         certdir.mkdir()
         echo = self._Echo()
@@ -32905,6 +32905,8 @@ else:
         the capped 75) and the old holder stood down without respawning; not
         one request was refused, reset or left unanswered across the switch, and
         a CONNECT tunnel held across it still echoes."""
+        import subprocess
+
         from cswap_pin import proxy as pp
 
         children = self._tracking_popen(monkeypatch)
@@ -32967,6 +32969,16 @@ else:
             assert "respawning on the held port" not in log
             assert pp._pin_daemon_pids(t.certdir) == [int(st["pid"])], (
                 "something besides the new daemon is still a pin daemon")
+            ps = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
+                                capture_output=True, text=True).stdout
+            standbys = [ln for ln in ps.splitlines()
+                        if pp._STANDBY_MODULE_ARG in ln
+                        and "cswap_pin.proxy" in ln
+                        and ln.rstrip().endswith(" " + str(t.certdir))]
+            assert len(standbys) == 1, (
+                f"the old lineage's standby was not retired: {standbys}")
+            assert not list(t.certdir.glob(".successor-*")), (
+                "the rendezvous was left behind")
 
     def case_CONTROL_a_denied_caller_or_another_namespace_moves_nothing(
             self, tmp_path, monkeypatch):
@@ -33072,7 +33084,7 @@ else:
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="rl")).resolve()
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
         spawned = []
         lsn = socket.socket()
         lsn.bind(("127.0.0.1", 0))
@@ -33120,14 +33132,73 @@ else:
             srv.close()
             assert spawned == [] and h._handed_off, (
                 "a live rendezvous: the holder must hand over, not spawn")
-            fd = got[0][1][0]
+            received = socket.socket(fileno=got[0][1][0])
             try:
-                assert socket.socket(fileno=fd).getsockname()[1] == h.port, (
+                assert received.getsockname()[1] == h.port, (
                     "the received descriptor is not the holder's listener")
             finally:
-                os.close(fd)
+                received.close()
         finally:
             lsn.close()
+            shutil.rmtree(certdir, ignore_errors=True)
+
+    def case_a_relocation_that_raises_never_fails_the_launch(
+            self, tmp_path, monkeypatch):
+        """`ensure_proxy`'s fast path runs on every launch and never raised:
+        a relocation that does (a fork EAGAIN in the spawn) hands back the
+        daemon it was asked about, and one that is merely busy does too."""
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(
+            pp, "_health_body",
+            lambda port, timeout=1.0: {"keychain_denied": True, "pid": 1})
+
+        def boom(*a, **k):
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(pp, "_take_the_socket_over", boom)
+        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        monkeypatch.setattr(pp, "_take_the_socket_over", lambda *a: None)
+        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        monkeypatch.setattr(pp, "_take_the_socket_over", lambda *a: 9999)
+        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 9999, (
+            "the control: a relocation that happened is the port to wire")
+
+    def case_a_dead_callers_rendezvous_is_ignored_and_removed(
+            self, tmp_path, monkeypatch):
+        """A caller killed before it could unlink leaves its socket file. The
+        pid in the name says it is dead, so nothing acts on it and it goes."""
+        import subprocess
+        import sys
+        import tempfile
+        import shutil
+
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        try:
+            gone = subprocess.Popen([sys.executable, "-c", "pass"])
+            gone.wait()
+
+            def leave(pid):
+                s = socket.socket(socket.AF_UNIX)
+                s.bind(str(certdir / f"{pp._SUCCESSOR_SOCK_PREFIX}{pid}.sock"))
+                s.close()
+
+            leave(gone.pid)
+            assert pp._waiting_caller(certdir) is None
+            assert not list(certdir.iterdir()), (
+                "the dead caller's file was left behind")
+            leave(os.getpid())
+            live = certdir / f"{pp._SUCCESSOR_SOCK_PREFIX}{os.getpid()}.sock"
+            assert pp._waiting_caller(certdir) == live
+            # A REUSED PID READS ALIVE FOR EVER: only the file's age says no.
+            old = time.time() - pp._RELOCATE_ASK_WAIT_S - 60
+            os.utime(live, (old, old))
+            assert pp._waiting_caller(certdir) is None, (
+                "a rendezvous older than any caller waits was acted on")
+            assert not list(certdir.iterdir())
+        finally:
             shutil.rmtree(certdir, ignore_errors=True)
 
     def case_a_holder_that_handed_its_socket_stands_down_only_when_another_serves(
@@ -33212,8 +33283,10 @@ else:
         s = socket.socket(socket.AF_UNIX)
         s.bind(str(certdir / f"{pp._SUCCESSOR_SOCK_PREFIX}{os.getpid()}.sock"))
         try:
+            # ONE PASS: a real caller unlinks its rendezvous once it has been
+            # handed the socket, so the tick that follows a failure finds none.
             pp._watch_own_code(
-                _Srv(), "1", "a@b.c", certdir, _Ticks(3), lambda *a: None,
+                _Srv(), "1", "a@b.c", certdir, _Ticks(2), lambda *a: None,
                 interval=0.01, _own_fingerprint=pp.daemon_fingerprint())
         except SystemExit:
             pass
@@ -33232,7 +33305,7 @@ else:
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="rl")).resolve()
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
         try:
             released, exited, signalled = self._watch(
                 pp, monkeypatch, certdir, 0.5, publish=True)
@@ -33252,7 +33325,7 @@ else:
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="rl")).resolve()
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
         try:
             released, exited, signalled = self._watch(
                 pp, monkeypatch, certdir, 0.3, publish=False)

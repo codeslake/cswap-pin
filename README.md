@@ -887,6 +887,37 @@ measured their graceful path as *more destructive than `kill -9`* for want of
 that distinction. `PortHolder.stop()` — a deliberate release — sends the
 `SIGHUP` itself, so releasing the port really releases it.
 
+### A daemon the macOS Keychain refuses is moved into the caller's session
+
+On macOS a process outside the login session (one started over `ssh`, say) is
+refused Claude Code's OAuth Keychain item (`security` rc=36), and every daemon
+it spawns inherits that, successors included: every successor is born of the
+holder. Such a daemon still serves and can report `can_pin` true, but its 429
+wall cannot switch slots. Killing the trio to start another cuts the held
+tunnels, so the **socket** moves instead.
+
+- The daemon reads its own refusal once, at start, and `/health` says
+  `"keychain_denied": true`. The key is absent for a daemon that is not
+  refused, and off macOS.
+- `cswap pin --ensure` (what `wire.zsh` runs on every Terminal launch) finds
+  such a daemon, and when the caller is **not** itself refused and sees the
+  daemon's pid (host and container share `$HOME`, not pids), binds
+  `pin-proxy/.successor-<pid>.sock` and waits. The daemon's next watchdog tick
+  (at most 30 s) sees it and asks its holder, which sends the caller the live
+  listening socket over that rendezvous instead of spawning. The caller runs
+  `_spawn_daemon(listen_fd=)` itself, so the new holder is its child and
+  `CSWAP_PIN_LISTEN_FROM` its pid, and the old daemon runs the ordinary
+  gapless sequence: wait for the successor's record, stop accepting, drain
+  **uncapped**, exit 0. The old holder stands down without respawning.
+- **Nothing is cut and nothing is stranded if it fails.** If the caller dies
+  or the successor never publishes, the old daemon keeps serving past its
+  bound (no capped drain, no exit 75) and its holder keeps its respawn duty.
+  The bound is `_RELOCATE_WAIT_S` (180 s), not the 10 s `_SPAWN_WAIT_S`: a
+  caller-spawned successor measured 0.54 s to serve on a quiet box and 9 s with
+  16 busy loops sharing its CPU, and 56-85 s on a loaded Mac (T1935).
+- Not verified on a Mac: that a lineage spawned from the login session is read
+  as not refused. The new daemon's own `/health` is the measurement.
+
 ## Falling through a dead hop
 
 The pin dials through whatever egress proxy the machine already has, and that
