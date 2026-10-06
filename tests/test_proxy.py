@@ -32942,8 +32942,13 @@ else:
             assert pp._wedged_parent_holder(
                 int(st["pid"]), t.certdir) == new_holder, (
                 "the serving daemon is not the new holder's child")
-            new_body = pp._health_body(t.port)
-            assert new_body["pid"] == int(st["pid"])
+            # THE OLD DAEMON STILL ACCEPTS FOR A TICK AFTER THE NEW ONE
+            # PUBLISHES (it polls the record every 0.1 s before it releases),
+            # and both are on the one socket: wait for the new one's answer.
+            new_body = self._until(
+                "the new daemon never answered /health",
+                lambda: (lambda b: b if b and b["pid"] == int(st["pid"])
+                         else None)(pp._health_body(t.port)), 10)
             assert "keychain_denied" not in new_body, (
                 "the new lineage is read as denied too")
 
@@ -33140,6 +33145,48 @@ else:
                 received.close()
         finally:
             lsn.close()
+            shutil.rmtree(certdir, ignore_errors=True)
+
+    def case_a_holder_born_of_a_caller_that_died_refuses_instead_of_stranding(
+            self, tmp_path, monkeypatch):
+        """A caller killed between its Popen and the new holder's adoption
+        leaves a holder whose LISTEN_FROM is no longer its parent. It must NOT
+        bind a fresh port (every session is wired to the old one): it was told
+        the old port, so it refuses it while the old lineage still listens and
+        exits, publishing nothing. Reproduced by naming a LISTEN_FROM that is
+        not the parent; the control is the adoption the other cases prove."""
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        old = socket.socket()
+        old.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        old.bind(("127.0.0.1", 0))
+        old.listen(8)
+        port = old.getsockname()[1]
+        try:
+            pp.ensure_ca(certdir, "api.anthropic.com")
+            env = dict(os.environ)
+            env[pp._HANDDOWN_FD_ENV] = str(old.fileno())
+            env[pp._HANDDOWN_FROM_ENV] = "1"      # not the parent: it "died"
+            run = subprocess.run(
+                [sys.executable, "-m", pp._DAEMON_MODULE, pp._HOLDER_MODULE_ARG,
+                 str(port), "2", self.EMAIL, str(certdir)],
+                env=env, pass_fds=(old.fileno(),), capture_output=True,
+                text=True, timeout=60)
+            assert run.returncode == 0, run.stderr[-800:]
+            assert "holder could not take the port" in run.stderr, run.stderr[-800:]
+            assert pp.read_daemon_state(certdir) is None, (
+                "the orphaned holder published a daemon on some other port")
+            assert old.getsockname()[1] == port
+        finally:
+            old.close()
+            _reap_pin_processes(certdir)
             shutil.rmtree(certdir, ignore_errors=True)
 
     def case_a_relocation_that_raises_never_fails_the_launch(
