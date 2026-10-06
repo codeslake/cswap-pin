@@ -12264,11 +12264,20 @@ class PortHolder:
             # THREE ANSWERS: its own pid resets the silence, none counts
             # toward it, and another pid (a successor's) neither: the port is
             # served, which says nothing about `proc`.
+            #
+            # AN EXIT IS READ BEFORE EACH PROBE'S ANSWER IS ACTED ON: a
+            # departed daemon leaves its listener open with nobody accepting,
+            # so a probe in flight runs its whole timeout, and its None is no
+            # wedge (replacing the dead daemon would skip `_failures`).
             answered = _health_pid(self.port, _PORT_WATCH_PROBE_S)
             now = time.monotonic()
+            if not waiter.is_alive():
+                return code[0]
             if (answered is None and silent_since is not None
                     and now - silent_since >= _CODE_WATCH_BEAT_MAX_AGE_S):
                 answered = _health_pid(self.port, _PORT_WATCH_CONFIRM_S)
+                if not waiter.is_alive():
+                    return code[0]
             if answered == proc.pid:
                 silent_since = None
             if answered is not None:
@@ -13411,14 +13420,18 @@ _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
 # HOW LONG THE HOLDER'S PORT WATCH WAITS FOR A `/health` ANSWER (`PortHolder.
 # _wait_for_exit`), and for the one LAST answer it asks for before it cuts a
 # daemon. A slow answer is not silence: on a loaded host (measured, wmac,
-# 2026-10-06: start-to-serving 56-85 s against 1 s) 1.0 s missed four times
-# running and four daemons still accepting were retired through a 30 s drain,
-# cutting their held streams. A wedged daemon (accepts nothing, or accepts and
-# never replies) misses every probe whatever its timeout, so the cost of the
-# long waits is only time: replaced at most
+# 2026-10-06: one `/health` reply took 1007 ms against the 1.0 s probe, and a
+# successor took 56-85 s to START serving, which is not a `/health` latency)
+# 1.0 s missed four times running and four daemons still accepting were retired
+# through a 30 s drain, cutting their held streams. A wedged daemon (accepts
+# nothing, or accepts and never replies) misses every probe whatever its
+# timeout, so the cost of the long waits is only time: replaced at most
 # (1 + ceil(BEAT_MAX_AGE / (INTERVAL + PROBE))) * (INTERVAL + PROBE) + CONFIRM
 # = 155 s after it stops answering with these values (124 s with the old 1.0 s
-# probe and no confirm).
+# probe and no confirm). An EXIT is read when the probe in flight returns (a
+# departed daemon's listener stays open and unanswered), so its respawn waits
+# up to PROBE = 5 s, or CONFIRM = 15 s when it lands in the confirming probe
+# (1 s with the old probe).
 _PORT_WATCH_PROBE_S = 5.0
 _PORT_WATCH_CONFIRM_S = 15.0
 # THE CALLER-SIDE RELOCATION (`_take_the_socket_over`). The rendezvous is

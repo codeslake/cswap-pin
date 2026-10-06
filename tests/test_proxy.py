@@ -4437,11 +4437,12 @@ class TestAHeldDaemonThatStoppedAccepting:
             holder.stop()
 
     def case_a_slow_health_answer_is_not_silence(self, tmp_path, monkeypatch):
-        """T1935: on a loaded host (wmac, 2026-10-06: start-to-serving 56-85 s
-        against 1 s) a daemon that still accepts and serves answered `/health`
-        late, the port watch's 1.0 s probe read each late answer as silence,
-        and four live daemons were retired through a capped drain. Each answer
-        here takes 1.5 s, past that 1.0 s and well inside the probe's timeout."""
+        """T1935: on a loaded host (wmac, 2026-10-06: one `/health` reply took
+        1007 ms against 1.0 s) a daemon that still accepts and serves answered
+        `/health` late, the port watch's 1.0 s probe read each late answer as
+        silence, and four live daemons were retired through a capped drain.
+        Each answer here takes 1.5 s, past that 1.0 s and well inside the
+        probe's timeout."""
         holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4242,
                                   delay=1.5, probe=3.0, confirm=3.0)
         try:
@@ -4501,6 +4502,65 @@ class TestAHeldDaemonThatStoppedAccepting:
             assert took <= limit + 2.0, (
                 f"replaced after {took:.1f}s, past the stated bound "
                 f"{limit:.1f}s (+2 s of scheduling)")
+        finally:
+            holder.stop()
+
+    def _exit_during_probe(self, tmp_path, monkeypatch, nth, confirm):
+        """An at-bound lap whose `nth` `/health` probe is one nobody accepts
+        on (it hangs for its timeout and reads None, as a held listener does
+        once its daemon is gone) and the daemon EXITS inside that probe.
+        Probe 1 starts the silence; probe 2 is the lap that reaches the bound
+        and probe 3 is the confirming one. Returns (holder, log, calls), with
+        `calls` the timeout of every probe asked."""
+        from cswap_pin import proxy as pin_proxy
+
+        calls = []
+
+        def _hang(port, timeout):
+            calls.append(timeout)
+            if len(calls) == nth:
+                holder._proc.exit()
+            time.sleep(timeout)
+            return None
+
+        monkeypatch.setattr(pin_proxy, "_health_pid", _hang)
+        holder, log = self._drive(tmp_path, monkeypatch, bound=0.3,
+                                  probe=0.3, confirm=confirm)
+        return holder, log, calls
+
+    def case_a_daemon_that_exited_in_the_at_bound_probe_is_not_asked_again(
+            self, tmp_path, monkeypatch):
+        """T1935 review: the exit is read before the confirming probe, which
+        would otherwise run its whole 3.0 s on a listener nobody accepts on,
+        and then replace the already-exited daemon as wedged."""
+        holder, log, calls = self._exit_during_probe(
+            tmp_path, monkeypatch, nth=2, confirm=3.0)
+        try:
+            self._until(lambda: len(log) > 1, 2.0)
+            assert log == ["spawn", "spawn"], (
+                f"an exit during the at-bound probe was not respawned "
+                f"promptly, or the dead daemon was replaced as wedged: {log}")
+            assert calls == [0.3, 0.3], (
+                f"the confirming probe was asked of an exited daemon: {calls}")
+        finally:
+            holder.stop()
+
+    def case_a_daemon_that_exited_in_the_confirming_probe_is_not_replaced(
+            self, tmp_path, monkeypatch):
+        """The same exit, inside the confirming probe: its None is not read as
+        a wedge. CONTROL: the confirming probe WAS asked (`calls`), so the
+        exit landed in it. The exit's own branch (75: a successor was asked
+        for) zeroes `_failures`; a wedge replace leaves it alone."""
+        holder, log, calls = self._exit_during_probe(
+            tmp_path, monkeypatch, nth=3, confirm=0.5)
+        holder._failures = 2
+        try:
+            self._until(lambda: len(log) > 1, 4.0)
+            assert calls[:3] == [0.3, 0.3, 0.5], calls
+            assert log == ["spawn", "spawn"] and holder._failures == 0, (
+                f"a daemon that exited during the confirming probe was "
+                f"replaced as wedged, not read as an exit: {log}, "
+                f"failures {holder._failures}")
         finally:
             holder.stop()
 
