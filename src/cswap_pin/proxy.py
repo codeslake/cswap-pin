@@ -2097,6 +2097,14 @@ def heal(backup_root: Path, identity: dict | None = None,
             return False
         # Fall through to the spawn path below, which reclaims that port.
     if alive is not None:
+        # A DAEMON THE KEYCHAIN REFUSES STILL SERVES, AND IS REUSED RIGHT HERE:
+        # `cswap pin --ensure` (the rc hook, every Terminal launch) and
+        # `cswap pin --heal` are the commands that reach this arm, and neither
+        # reaches `ensure_proxy`. It only STARTS the helper and returns, and
+        # asks nothing off macOS, so this stays the cheap per-launch call. A
+        # dangling pin has no slot to start it for. See `_move_into_this_session`.
+        if account_num:
+            _move_into_this_session(certdir, account_num, email, alive)
         # SERVING IS NOT THE SAME AS WIRED. Returning False here left that
         # state permanent: the proxy served on a port no session was told
         # about, and only a hand-typed `cswap pin <n>` restored it. Re-wiring
@@ -7937,8 +7945,10 @@ def _note_keychain_denial(server) -> None:
         setattr(server, "_keychain_denied", True)
         _log_lifecycle(
             "this process is refused the Keychain (security rc=36), and so "
-            "is every successor of its lineage -- `cswap pin --ensure` from "
-            "the login session moves the socket into its own")
+            "is every successor of its lineage -- a launch from the login "
+            "session moves the socket into its own: `cswap run` or `cswap pin "
+            "<n>` (`ensure_proxy`), `cswap pin --ensure` or `cswap pin --heal` "
+            "(`heal`)")
 
 
 def _start_noting_keychain_denial(server) -> None:
@@ -7955,22 +7965,27 @@ def _waiting_caller(certdir: Path) -> "Path | None":
     listener over (`.successor-<pid>.sock`, see `_take_the_socket_over`), or
     None.
 
-    Liveness is the pid in the name AND the file's age: a caller killed before
-    it could unlink leaves a file behind that nothing may act on, and a reused
-    pid would keep it "alive" for ever (and every tick would then replace the
-    daemon). A caller waits at most `_RELOCATE_ASK_WAIT_S`, so an older file is
-    stale. Stale files are removed here."""
+    Acted on only while the file is FRESH and its pid is alive: a caller killed
+    before it could unlink leaves a file behind that nothing may act on, and a
+    reused pid would keep it "alive" for ever (and every tick would then
+    replace the daemon). A caller listens for `_RELOCATE_ASK_WAIT_S`, and the
+    ask (a connect, a send) needs a margin of its own, so a file older than
+    `_RENDEZVOUS_FRESH_S` is never connected to: nobody may be accepting on it.
+    ONLY AGE REMOVES A FILE. A pid this namespace cannot see reads dead, and a
+    daemon in another pid namespace sharing the certdir must not delete a live
+    helper's file for it: such a file is left and not acted on."""
     prefix = _SUCCESSOR_SOCK_PREFIX
     for path in Path(certdir).glob(f"{prefix}*.sock"):
         try:
             pid = int(path.name[len(prefix):-len(".sock")])
-            fresh = time.time() - path.stat().st_mtime <= _RELOCATE_ASK_WAIT_S + 10
+            fresh = time.time() - path.stat().st_mtime <= _RENDEZVOUS_FRESH_S
         except (ValueError, OSError):
             continue
-        if fresh and _pid_alive(pid):
+        if not fresh:
+            with contextlib.suppress(OSError):  # the watchdog must not raise
+                path.unlink()
+        elif _pid_alive(pid):
             return path
-        with contextlib.suppress(OSError):  # the watchdog must not raise
-            path.unlink()
     return None
 
 
@@ -7990,6 +8005,13 @@ def _move_into_this_session(certdir: Path, account_num: str, email: str,
     this call's. The helper is this process's own CHILD, so it shares its macOS
     audit session (`start_new_session` does not change that), and every daemon
     it spawns inherits it.
+
+    WHAT TRIGGERS IT, exactly: `ensure_proxy`'s fast path and its held-daemon
+    arm (`cswap run`, a hand-typed `cswap pin <n>`, the TUI's repair) and
+    `heal`'s serving arm (`cswap pin --ensure`, which `wire.zsh` runs on every
+    Terminal launch, and `cswap pin --heal`). `--ensure` reaches `heal` and
+    never `ensure_proxy`, so heal is the call that makes a Terminal launch the
+    trigger.
 
     OFF macOS NOTHING IS ASKED, not even `/health`: the refusal does not exist
     there, and this runs on every launch. Cheapest question first: the
@@ -8036,8 +8058,13 @@ def relocate_main(certdir: Path, account_num: str, email: str) -> None:
     recorded daemon's `/health` and, only for one that says it is denied, run
     the relocation. A lock it cannot take in `_HEAL_LOCK_WAIT_S` ends it
     quietly: another spawn or relocation is running (or the launching caller,
-    in the `locked` arm, has not returned yet)."""
+    in the `locked` arm, has not returned yet).
+
+    IT STAMPS `_RELOCATED_ENV` into its own environment, which `_spawn_daemon`
+    copies into the holder it starts and every holder and daemon of that
+    lineage copies on: a lineage that was moved is never moved again."""
     certdir = Path(certdir)
+    os.environ[_RELOCATED_ENV] = "1"
     try:
         with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
             st = read_daemon_state(certdir)
@@ -8060,8 +8087,13 @@ def _relocation_is_due(certdir: Path, health: dict,
     on in ITS environment. It is visible in THIS pid namespace
     (`_pin_daemon_pids`): host and container share $HOME and not pids, and a
     handover begun across that boundary is what killed the container's pin
-    (dotfiles 98d57744). And THIS process is not itself refused, or the socket
-    would only go to another denied lineage (read last: it can take seconds)."""
+    (dotfiles 98d57744). It is not a lineage a helper already moved
+    (`_RELOCATED_ENV`): ONE MOVE PER LINEAGE, so if a login-session lineage is
+    refused too (the hypothesis this move rests on, unmeasured on a Mac) it
+    stays where it is instead of being moved by every launch, and its own
+    `/health` `keychain_denied` is the measurement. And THIS process is not
+    itself refused, or the socket would only go to another denied lineage
+    (read last: it can take seconds)."""
     st = read_daemon_state(certdir)
     pid = int(st["pid"]) if st else 0
     beat = health.get("code_watch_age_s")
@@ -8073,6 +8105,7 @@ def _relocation_is_due(certdir: Path, health: dict,
                    and _wedged_daemon_can_be_asked(pid, holder)
                    and (_daemon_env_value(pid, _SELF_HEAL_ENV) or "").lower()
                    not in ("off", "0", "no")
+                   and not _daemon_env_value(pid, _RELOCATED_ENV)
                    and pid in _pin_daemon_pids(certdir)
                    and not _keychain_denied_here(confirm)) else 0
 
@@ -8116,13 +8149,18 @@ def _take_the_socket_over(certdir: Path, account_num: str, email: str,
         path.unlink(missing_ok=True)
     # ponytail: that a lineage spawned from the login session inherits the
     # LOGIN audit session is the hypothesis this move rests on, and it is not
-    # measured on a Mac (no `security` on the box this was built on). If the
-    # new daemon reads refused too, every ensure repeats this gapless move.
-    # Upgrade path: a throttle record like `blind-recycle.json`, once a Mac
-    # says it is needed; the new daemon's `/health` is the measurement.
+    # measured on a Mac (no `security` on the box this was built on). It is
+    # bounded, not assumed: `relocate_main` stamped `_RELOCATED_ENV`, so a new
+    # daemon that reads refused too is moved no further, and its own `/health`
+    # `keychain_denied` is the measurement.
+    #
+    # THE OLD DAEMON KEEPS SERVING AND ITS RECORD STAYS VALID until the
+    # successor publishes, so the record is not marked as handed over
+    # (`mark_departing=False`): marking it made every launch's fast path read
+    # "nothing is serving" and block on this helper's spawn lock.
     try:
         return _spawn_daemon(account_num, email, certdir, listen_fd=fd,
-                             wait_s=_RELOCATE_WAIT_S)
+                             wait_s=_RELOCATE_WAIT_S, mark_departing=False)
     finally:
         os.close(fd)
 
@@ -11924,16 +11962,20 @@ class PortHolder:
             # nothing.
             pass
 
-    def _hand_to_the_caller(self) -> bool:
+    def _hand_to_the_caller(self) -> "bool | None":
         """Send our LISTENING socket to the live caller waiting at its
-        rendezvous (`_waiting_caller`), if there is one. False for none, a
-        stale file, or any failure, and then the caller of this does what it
-        always did: spawn on the socket. Nothing here can cost the port: the
-        descriptor is only COPIED to the receiver, ours stays open."""
+        rendezvous (`_waiting_caller`), if there is one. None for nobody
+        waiting (an old or unseen file is nobody), and then the caller of this
+        does what it always did: spawn on the socket. True once it is sent.
+        False for a caller that is waiting and could not be reached: the
+        daemon that asked is on the relocation's keep-serving arm, so the
+        caller of this spawns NOTHING (a successor of this lineage is the move
+        being ended). Nothing here can cost the port: the descriptor is only
+        COPIED to the receiver, ours stays open."""
         certdir = getattr(self, "_certdir", None)
         path = _waiting_caller(certdir) if certdir is not None else None
         if path is None:
-            return False
+            return None
         try:
             with socket.socket(socket.AF_UNIX) as s:
                 s.settimeout(5.0)
@@ -11942,12 +11984,25 @@ class PortHolder:
         except (OSError, ValueError) as exc:
             _log_lifecycle(
                 f"could not hand the listening socket to the caller at "
-                f"{path.name}: {exc!r} -- spawning a successor here instead")
+                f"{path.name}: {exc!r} -- keeping the daemon that is serving")
             return False
         _log_lifecycle(
             f"handed the listening socket for port {self.port} to a caller "
             f"outside this lineage ({path.name}) -- no successor spawned here")
         return True
+
+    def _hand_off_served_by(self, proc) -> int:
+        """The pid of ANOTHER live daemon on record once the socket went to a
+        caller's lineage (`_hand_to_the_caller`), else 0. A hand-off that
+        failed leaves the record naming ``proc`` itself, so it reads 0 and this
+        holder keeps its respawn duty. Read, never carried: it is proof the
+        successor published and still lives."""
+        certdir = getattr(self, "_certdir", None)
+        if not (self._handed_off and certdir is not None):
+            return 0
+        rec = read_daemon_state(certdir)
+        other = int(rec.get("pid") or 0) if rec else 0
+        return other if other not in (0, proc.pid) and _pid_alive(other) else 0
 
     def _on_replace_request(self, signum, frame) -> None:
         # THE SAME LOCK `_supervise` TAKES BEFORE ITS OWN DECISION. `_spawn()`
@@ -12028,9 +12083,15 @@ class PortHolder:
             #
             # A CALLER OUTSIDE THIS LINEAGE MAY BE WAITING FOR THE SOCKET
             # (`_take_the_socket_over`): it gets it INSTEAD of a spawn here,
-            # because a successor spawned here inherits this lineage.
-            self._handed_off = self._hand_to_the_caller()
-            if self._handed_off:
+            # because a successor spawned here inherits this lineage. ONLY ON
+            # THE DAEMON'S OWN ASK, which arrives as a signal: this holder's own
+            # replace of a wedged daemon (`_wait_for_exit`) calls with no
+            # signal and then terminates the daemon, which a hand-off would
+            # leave unreplaced. Read afresh on every ask, never carried over.
+            self._handed_off = False
+            handed = self._hand_to_the_caller() if signum is not None else None
+            if handed is not None:
+                self._handed_off = handed
                 return
             try:
                 self._spawn()
@@ -12166,6 +12227,16 @@ class PortHolder:
             waiter.join(_CODE_WATCH_INTERVAL_S)
             if not waiter.is_alive():
                 return code[0]
+            # THE OLD STANDBY HAS NOTHING LEFT TO COVER once the socket went to
+            # a caller's lineage and its daemon is on record, and this daemon
+            # may drain for hours beside a holder that lives on: released here,
+            # not at the exit (`_supervise_locked` stands down on that too).
+            # A release replaces nothing, so the self-heal switch is not asked.
+            standby = getattr(self, "_standby", None)
+            if (not self._stop and standby is not None
+                    and self._hand_off_served_by(proc)):
+                self._release_standby(standby)
+                self._standby = None
             if self._stop or not self._self_heal_on():
                 silent_since = None
                 continue
@@ -12232,6 +12303,24 @@ class PortHolder:
                 f"{self.port}"
             )
             return "continue"
+        # THE SOCKET WENT TO A CALLER'S LINEAGE AND ANOTHER DAEMON SERVES IT:
+        # this daemon's exit is a STAND-DOWN, WHATEVER its code. 0 is its
+        # drain ending; 75 is a TERM during that uncapped drain (a recycle, the
+        # orphan sweep's excess reap, cc-update), which exits 75 because this
+        # holder is still its parent; anything else is a kill or a crash. Every
+        # one of them used to respawn a fresh daemon of this lineage onto a
+        # socket that is no longer ours to serve: two acceptors, the record
+        # overwritten, and the next sweep TERMs the good one. `stop()` keeps
+        # its order (the daemon is gone first, then the socket closes). Before
+        # `_reap_standby`: the standby is released here and not warned about.
+        other = self._hand_off_served_by(proc)
+        if other:
+            _log_lifecycle(
+                f"daemon {proc.pid} retired (exit {code}) after the socket "
+                f"went to a caller's lineage -- {other} serves port "
+                f"{self.port}, standing down without respawning")
+            self.stop()
+            return "return"
         # A DEAD STANDBY MUST NOT BE A SILENT ONE. Checked here because
         # this loop already wakes on every daemon exit, so it costs a
         # `poll()` and no timer. Reaping is the load-bearing half: an
@@ -12279,22 +12368,6 @@ class PortHolder:
             # supervising it. `stop()` is the same release a genuinely
             # unpinned clean exit takes.
             certdir = getattr(self, "_certdir", None)
-            # THE HAND-OFF'S OWN EXIT 0, not a release: the socket went to a
-            # caller whose daemon is now the recorded one and is alive, so
-            # respawning here would put a second lineage on a socket that is no
-            # longer ours to serve. Only when ANOTHER live daemon is on record:
-            # a hand-off that failed leaves the record naming this daemon, and
-            # an exit 0 then is the ordinary one below.
-            if self._handed_off and certdir is not None:
-                rec = read_daemon_state(certdir)
-                other = int(rec.get("pid") or 0) if rec else 0
-                if other not in (0, proc.pid) and _pid_alive(other):
-                    _log_lifecycle(
-                        f"daemon {proc.pid} retired (exit {code}) after the "
-                        f"socket went to a caller's lineage -- {other} serves "
-                        f"port {self.port}, standing down without respawning")
-                    self.stop()
-                    return "return"
             try:
                 pinned = bool(
                     certdir is not None
@@ -12951,12 +13024,16 @@ def holder_main(account_num: str, email: str, certdir: Path,
 
 def _spawn_daemon(
     account_num: str, email: str, certdir: Path, listen_fd: int | None = None,
-    wait_s: float | None = None,
+    wait_s: float | None = None, mark_departing: bool = True,
 ) -> int | None:
     """Start the proxy daemon detached; wait for its state file. None on failure.
 
     ``wait_s`` replaces `_SPAWN_WAIT_S` for the one caller that must outlive
-    its holder's adoption of ``listen_fd`` (`_take_the_socket_over`).
+    its holder's adoption of ``listen_fd`` (`_take_the_socket_over`), and that
+    caller passes ``mark_departing=False``: the daemon it replaces keeps
+    serving and its record stays valid until the successor publishes its own,
+    so the record is not marked as handed over, and the wait is for a record
+    naming ANOTHER pid (the unmarked one still reads alive).
 
     Creates the refcount FIFO up front so a session can attach a holder the
     instant the daemon comes up (no gap where the daemon sees zero holders and
@@ -12995,7 +13072,9 @@ def _spawn_daemon(
     # SIGTERM unwires a successor that comes up perfectly healthy and never
     # rewires. The mark answers both: the record still names who is departing,
     # and every reader that asks "is anything serving here" is told no.
-    if isinstance(prev, dict) and isinstance(prev.get("pid"), int):
+    if not mark_departing:
+        pass  # the departing daemon is still serving: see the docstring
+    elif isinstance(prev, dict) and isinstance(prev.get("pid"), int):
         try:
             write_daemon_state(
                 certdir, prev.get("port") or 0, prev["pid"],
@@ -13095,6 +13174,8 @@ def _spawn_daemon(
         # stubs Popen (no child ever appears) then paid the full 10s — 10% of
         # the whole suite in one case that is only asserting what the spawn
         # PASSES, not that it works.
+        displaced = (prev.get("pid") if isinstance(prev, dict)
+                     and not mark_departing else None)
         for _ in range(int((_SPAWN_WAIT_S if wait_s is None else wait_s) * 10)):
             port = _read_alive_port(certdir)
             if port is not None:
@@ -13103,8 +13184,9 @@ def _spawn_daemon(
                 # a recycle that left the old one alive never accumulates.
                 st = read_daemon_state(certdir)
                 keep = int(st["pid"]) if st else -1
-                _sweep_orphan_daemons(certdir, keep_pid=keep)
-                return port
+                if keep != displaced:   # an unmarked record is still the old one
+                    _sweep_orphan_daemons(certdir, keep_pid=keep)
+                    return port
             time.sleep(0.1)
     except BaseException:
         # A spawn that RAISES (fork() EAGAIN under a post-deploy herd) leaves
@@ -13315,6 +13397,14 @@ _RELOCATE_MODULE_ARG = "--relocate"
 # its next tick, and a tick that ran long must not read as a daemon that will
 # never come, so two intervals.
 _RELOCATE_ASK_WAIT_S = 2 * _CODE_WATCH_INTERVAL_S
+# HOW OLD A RENDEZVOUS MAY BE AND STILL BE CONNECTED TO (`_waiting_caller`): the
+# helper stops accepting at `_RELOCATE_ASK_WAIT_S`, and the ask needs time of its
+# own, so the daemon never connects to a socket nobody is accepting on. Still
+# more than one tick (`_CODE_WATCH_INTERVAL_S`), so a helper is always seen.
+_RENDEZVOUS_FRESH_S = _RELOCATE_ASK_WAIT_S - 10.0
+# STAMPED INTO THE ENVIRONMENT BY THE HELPER, so every process of the lineage it
+# starts carries it (`relocate_main`): ONE MOVE PER LINEAGE (`_relocation_is_due`).
+_RELOCATED_ENV = "CSWAP_PIN_RELOCATED"
 # HOW LONG THE OLD DAEMON AND THE HELPER WAIT FOR THE NEW DAEMON TO SERVE.
 # `_SPAWN_WAIT_S` (10 s) is the wrong bound here: on a loaded Mac a successor
 # took 56-85 s to publish (wmac, load 8.72, T1935), and the old daemon's
@@ -13359,11 +13449,17 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
     THE FAILURE ARM IS NOT THE EXIT-75 ARM. If no successor publishes in time
     (the helper died, its holder could not adopt the descriptor) this daemon
     was never stopped and holds the same socket, so it hands the announcement
-    back, restores its own record if a killed helper left it marked as handed
-    over (`_clear_handover_mark`) and keeps serving: a capped drain here would
-    cut held tunnels for a repair that did not happen. The holder keeps its
-    respawn duty, since its `_handed_off` only matters once ANOTHER daemon is
-    the recorded one.
+    back and keeps serving (its record was never marked: the helper's spawn
+    leaves it alone): a capped drain here would cut held tunnels for a repair
+    that did not happen. The holder keeps its respawn duty, since its
+    `_handed_off` only matters once ANOTHER daemon is the recorded one.
+
+    TAKEN WHATEVER THE CAUSE OF THE TICK: `_watch_own_code` routes here as soon
+    as a rendezvous is waiting, including a tick that wanted to replace stale
+    code or a blind mint, because the holder answers EVERY ask with the socket
+    for the helper (`PortHolder._hand_to_the_caller`) and the ordinary ask's
+    `_SPAWN_WAIT_S` and exit-75 fallback would then cut held tunnels for a
+    successor the helper takes far longer to publish.
 
     THIS DAEMON OUTWAITS THE HELPER (1.25 x `_RELOCATE_WAIT_S`): a successor
     the helper can still see publish is one this daemon sees too, so the
@@ -13387,7 +13483,6 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
         _log_lifecycle(
             f"no successor published within {wait_s:.0f}s -- still serving, "
             "the port stays with this lineage")
-        _clear_handover_mark(certdir)
         done()
         return
     _log_lifecycle("the caller's lineage is serving -- leaving it the port")
@@ -13535,14 +13630,6 @@ def _watch_own_code(
             # your own" must not refuse a direct instruction.
             if os.environ.get(_SELF_HEAL_ENV, "").lower() in ("off", "0", "no"):
                 continue
-            # A CALLER IN THE LOGIN SESSION IS WAITING FOR THE SOCKET, and the
-            # trigger is its rendezvous alone: a daemon refused the Keychain
-            # reports can_pin true while it serves, so it is neither blind nor
-            # stale. Only under a holder that can be asked, never unheld.
-            if (held_by_a_holder() and _holder_pid() is not None
-                    and _waiting_caller(certdir) is not None):
-                _hand_over_to_the_caller(server, certdir)
-                continue
             # ORPHANED IS ALSO A REASON TO RECYCLE, not just stale code. A
             # holder that dies without taking its daemon down leaves the port
             # bound — the daemon already holds the socket — but with NOTHING
@@ -13594,6 +13681,20 @@ def _watch_own_code(
                         "unpinnable mark"
                     )
             replace_for_blind = blind and blind_recycle_due(certdir, now)
+            # A CALLER IN THE LOGIN SESSION IS WAITING FOR THE SOCKET. Its
+            # rendezvous alone is a trigger (a daemon refused the Keychain
+            # reports can_pin true while it serves, so it is neither blind nor
+            # stale), and it OUTRANKS every other cause of this tick: the
+            # holder answers any ask with the socket for the helper, so a
+            # stale-code or blind ask would otherwise wait only `_SPAWN_WAIT_S`
+            # for a successor the helper takes far longer to publish, then exit
+            # 75. READ HERE, AFTER the mint check above (the one slow step), as
+            # late as it can be before the ask. Only under a holder that can be
+            # asked, never unheld.
+            if (held_by_a_holder() and _holder_pid() is not None
+                    and _waiting_caller(certdir) is not None):
+                _hand_over_to_the_caller(server, certdir)
+                continue
             if (daemon_fingerprint() == own and not orphaned
                     and not replace_for_blind):
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is

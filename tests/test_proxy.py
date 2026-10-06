@@ -33990,8 +33990,11 @@ else:
         from cswap_pin import proxy as pp
 
         monkeypatch.setattr(pp, "_RELOCATE_WAIT_S", 6.0)
-        monkeypatch.setenv(pp._RELOCATED_ENV, "0")    # undone with the case
         with self._trio(monkeypatch, denied=True, relocate_wait_s=6) as t:
+            # AFTER the trio is born, or it inherits the mark and is never
+            # moved. The helper below runs in THIS process and stamps it; the
+            # `setenv` is only so that stamp is undone with the case.
+            monkeypatch.setenv(pp._RELOCATED_ENV, "0")
             real_popen = subprocess.Popen
             in_window = threading.Event()
 
@@ -34036,23 +34039,36 @@ else:
 
         from cswap_pin import proxy as pp
 
-        serving = socket.socket()
-        serving.bind(("127.0.0.1", 0))
-        serving.listen(4)
-        port = serving.getsockname()[1]
+        # ACCEPTING, or the poll fills the backlog and reads "dead" for the
+        # wrong reason, which would make the first assertion below vacuous.
+        serving = _HealthStub(lambda n: _health_ok({"can_pin": True}))
+        port = serving.port
         try:
             pp.write_daemon_state(tmp_path, port, os.getpid(), "fp")
-            monkeypatch.setattr(subprocess, "Popen", lambda argv, **k: None)
+            assert pp._read_alive_port(tmp_path) == port, (
+                "premise: the old daemon reads alive, so a wrong wait is "
+                "one that returns at once")
+            real_popen = subprocess.Popen
+            started = []
+
+            def popen(argv, *a, **k):
+                # THE SUCCESSOR'S HOLDER only; `ps` and the rest are real.
+                if pp._HOLDER_MODULE_ARG not in argv:
+                    return real_popen(argv, *a, **k)
+                started.append(argv)
+                if publish:
+                    pp.write_daemon_state(tmp_path, port, os.getppid(), "fp2")
+
+            publish = False
+            monkeypatch.setattr(subprocess, "Popen", popen)
             assert pp._spawn_daemon(
                 "2", "a@b.c", tmp_path, mark_departing=False,
                 wait_s=0.5) is None, (
                 "the daemon being replaced was taken for its successor")
+            assert len(started) == 1, "the successor was never started"
             record = pp.read_daemon_state(tmp_path)
             assert record["pid"] == os.getpid() and not record.get("handover")
-            monkeypatch.setattr(
-                subprocess, "Popen",
-                lambda argv, **k: pp.write_daemon_state(
-                    tmp_path, port, os.getppid(), "fp2"))
+            publish = True
             assert pp._spawn_daemon(
                 "2", "a@b.c", tmp_path, mark_departing=False,
                 wait_s=3) == port, (
