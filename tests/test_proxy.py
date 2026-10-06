@@ -23354,7 +23354,7 @@ class TestHealReWiresAServingDaemon:
         srv, port, cfg = self._fixture(tmp_path, monkeypatch, wired_port=None)
         asked = []
         monkeypatch.setattr(
-            proxy, "_move_into_this_session",
+            proxy, "_move_into_this_lineage",
             lambda *a, **k: asked.append(a) or a[3])
         try:
             proxy.heal(tmp_path)        # unwired: re-wired
@@ -33386,10 +33386,10 @@ else:
             raise OSError("fork: Resource temporarily unavailable")
 
         monkeypatch.setattr(subprocess, "Popen", boom)
-        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
         monkeypatch.setattr(
             subprocess, "Popen", lambda *a, **k: started.append((a, k)))
-        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
         (argv,), kw = started[0]
         assert argv == [sys.executable, "-m", pp._DAEMON_MODULE,
                         pp._RELOCATE_MODULE_ARG, str(tmp_path), "2", "a@b.c"]
@@ -33417,13 +33417,13 @@ else:
         monkeypatch.setattr(
             subprocess, "Popen", lambda *a, **k: started.append(a))
         with pp._spawn_lock(tmp_path):
-            assert pp._move_into_this_session(
+            assert pp._move_into_this_lineage(
                 tmp_path, "2", "a@b.c", 4321) == 4321
             assert started == [], "a held spawn lock still started a helper"
-            assert pp._move_into_this_session(
+            assert pp._move_into_this_lineage(
                 tmp_path, "2", "a@b.c", 4321, locked=True) == 4321
             assert len(started) == 1, "the locked arm never starts its helper"
-        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
         assert len(started) == 2, "the control: a free lock starts the helper"
 
     def case_the_callers_precheck_reads_the_keychain_once_and_the_helpers_twice(
@@ -33457,7 +33457,7 @@ else:
             pp, "_health_body", lambda port, timeout=1.0: health)
         monkeypatch.setattr(
             subprocess, "Popen", lambda *a, **k: started.append(a))
-        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
         assert seen == [False] and len(started) == 1, (
             "the launch's own check must be the unconfirmed one")
 
@@ -33495,11 +33495,11 @@ else:
             lambda port, timeout=1.0: asked.append(port))
         for platform in ("linux", "win32"):
             monkeypatch.setattr(pp.sys, "platform", platform)
-            assert pp._move_into_this_session(
+            assert pp._move_into_this_lineage(
                 tmp_path, "2", "a@b.c", 4321) == 4321
         assert asked == [], f"a launch off macOS asked /health: {asked}"
         monkeypatch.setattr(pp.sys, "platform", "darwin")
-        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
         assert asked == [4321], "the control: on a Mac the daemon is asked"
 
     def case_the_helper_moves_a_denied_daemon_and_yields_to_a_busy_lock(

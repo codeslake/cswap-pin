@@ -2101,9 +2101,9 @@ def heal(backup_root: Path, identity: dict | None = None,
         # `cswap pin --ensure` (every Terminal launch) and `cswap pin --heal`
         # reach this arm and never `ensure_proxy`. It only STARTS the helper
         # and asks nothing off macOS, so this stays the cheap per-launch call;
-        # a dangling pin has no slot. See `_move_into_this_session`.
+        # a dangling pin has no slot. See `_move_into_this_lineage`.
         if account_num:
-            _move_into_this_session(certdir, account_num, email, alive)
+            _move_into_this_lineage(certdir, account_num, email, alive)
         # SERVING IS NOT THE SAME AS WIRED. Returning False here left that
         # state permanent: the proxy served on a port no session was told
         # about, and only a hand-typed `cswap pin <n>` restored it. Re-wiring
@@ -7938,7 +7938,7 @@ def _note_keychain_denial(server) -> None:
 
     A daemon in such a lineage still serves and can report `can_pin` true, so
     nothing else tells a caller in the login session that a relocation
-    (`_move_into_this_session`) would repair it. Once per process, never per
+    (`_move_into_this_lineage`) would repair it. Once per process, never per
     request: the lineage does not change over the life of the process."""
     if _keychain_denied_here():
         setattr(server, "_keychain_denied", True)
@@ -7988,7 +7988,7 @@ def _waiting_caller(certdir: Path) -> "Path | None":
     return None
 
 
-def _move_into_this_session(certdir: Path, account_num: str, email: str,
+def _move_into_this_lineage(certdir: Path, account_num: str, email: str,
                             port: int, locked: bool = False) -> int:
     """Start moving a Keychain-denied daemon's serving lineage into THIS
     process's, and return ``port`` AT ONCE: the old daemon keeps serving, and
@@ -8053,7 +8053,7 @@ def _move_into_this_session(certdir: Path, account_num: str, email: str,
 
 def relocate_main(certdir: Path, account_num: str, email: str) -> None:
     """The detached helper's whole body (``-m cswap_pin.proxy --relocate``,
-    started by `_move_into_this_session`): under the spawn lock, ask the
+    started by `_move_into_this_lineage`): under the spawn lock, ask the
     recorded daemon's `/health` and, only for one that says it is denied, run
     the relocation. A lock it cannot take in `_HEAL_LOCK_WAIT_S` ends it
     quietly: another spawn or relocation is running (or the launching caller,
@@ -8258,8 +8258,8 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     port = _read_alive_port(certdir, fingerprint=fp)
     if port is not None:
         # A DAEMON THE KEYCHAIN REFUSES STILL SERVES, AND CAN SAY can_pin TRUE:
-        # this is the arm it is reused on. See `_move_into_this_session`.
-        port = _move_into_this_session(certdir, account_num, email, port)
+        # this is the arm it is reused on. See `_move_into_this_lineage`.
+        port = _move_into_this_lineage(certdir, account_num, email, port)
         wire_global_config(port, ca)
         return port, ca
 
@@ -8357,7 +8357,7 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                 # ITS OWN WATCHDOG IS THE REPAIR, unless it is blind because
                 # its lineage is refused the Keychain: no successor of that
                 # lineage can mint either, so the socket moves into ours.
-                port = _move_into_this_session(
+                port = _move_into_this_lineage(
                     certdir, account_num, email, stale["port"], locked=True)
                 wire_global_config(port, ca)
                 return port, ca
