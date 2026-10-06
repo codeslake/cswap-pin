@@ -2276,6 +2276,299 @@ class TestLoopbackChainTrust:
             upstream.stop()
 
 
+class _StallingHop:
+    """An egress hop that accepts and then does not answer, or answers late.
+
+    ``delay=None``: after the request head (a CONNECT it answers 200 first) it
+    reads and says nothing until the pin lets go. ``delay=s``: it waits ``s``
+    seconds and then serves, a CONNECT blind-piped to ``target`` and anything
+    else a canned 200. ``reached`` is set when the request head arrived;
+    ``cut`` when the pin's side of that leg ended (EOF or reset), which is how
+    a case sees the hop leg closed."""
+
+    def __init__(self, delay: "float | None" = None, target=None):
+        self._delay, self._target = delay, target
+        self.reached, self.cut = threading.Event(), threading.Event()
+        self._conns: list = []
+        self._srv = socket.socket()
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._thr = threading.Thread(target=self._accept, daemon=True)
+        self._thr.start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            self._conns.append(conn)
+            threading.Thread(target=self._serve, args=(conn,),
+                             daemon=True).start()
+
+    def _serve(self, conn):
+        import select
+
+        try:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            self.reached.set()
+            connect = head.startswith(b"CONNECT")
+            if connect:
+                conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            if self._delay is None:
+                while conn.recv(65536):
+                    pass
+                return
+            time.sleep(self._delay)
+            if not connect:
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                return
+            up = socket.create_connection(self._target, timeout=10)
+            self._conns.append(up)
+            while True:
+                ready, _, _ = select.select([conn, up], [], [], 10)
+                if not ready:
+                    return
+                for s in ready:
+                    data = s.recv(65536)
+                    if not data:
+                        return
+                    (up if s is conn else conn).sendall(data)
+        except OSError:
+            pass
+        finally:
+            self.cut.set()
+
+    def stop(self):
+        self._srv.close()
+        for c in self._conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+class TestAClientThatHangsUpOnASilentHop:
+    """T1894. Once a hop has accepted, the serving thread blocked with no
+    timeout and never looked at its client, so a client that hung up while its
+    request waited on a silent hop left its fd open and its debt in `_owed`
+    for ever. A draining daemon held 38 such closed fds for 3 h.
+
+    The fix watches the client, and only the client: a slow first byte from a
+    LIVE request is legitimate and a live session channel is never cut, so the
+    controls below keep the client connected through a slow hop."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _eventually(pred, bound: float = 5.0) -> bool:
+        deadline = time.monotonic() + bound
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            time.sleep(0.05)
+        return pred()
+
+    def _assert_let_go(self, proxy, client_closed, hop=None):
+        self._eventually(lambda: proxy.inflight_requests() == 0
+                         and client_closed() and (hop is None or hop.cut.is_set()))
+        assert proxy.inflight_requests() == 0, (
+            "the hung-up client's request is still owed after 5s")
+        assert proxy.live_client_count() == 0, (
+            "the hung-up client is still counted open after 5s")
+        assert client_closed(), (
+            "the pin kept its side of the hung-up client's socket open")
+        assert hop is None or hop.cut.is_set(), "the hop leg was never closed"
+
+    @staticmethod
+    def _proxy(certdir, hop, upstream=("127.0.0.1", 9)):
+        from cswap_pin.proxy import PinProxy
+
+        return PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                        upstream=upstream, chain_proxy=("127.0.0.1", hop.port))
+
+    @staticmethod
+    def _served_tls(proxy) -> list:
+        """The TLS socket the pin holds for each client it MITMs: a client's
+        side of the connection is closed when its `fileno()` is -1."""
+        served = []
+        wrap = proxy._server_ctx.wrap_socket
+
+        def _spy(*a, **k):
+            served.append(wrap(*a, **k))
+            return served[-1]
+
+        proxy._server_ctx.wrap_socket = _spy
+        return served
+
+    def case_mitm_hop_answers_connect_then_goes_silent(self, certdir):
+        hop = _StallingHop()
+        proxy = self._proxy(certdir, hop)
+        served = self._served_tls(proxy)
+        proxy.start()
+        try:
+            _post_and_abandon(proxy.port, certdir / "ca.pem", "/v1/messages",
+                              "{}")
+            assert hop.reached.wait(5), "premise: the request never reached the hop"
+            self._assert_let_go(proxy, lambda: served[0].fileno() < 0, hop)
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    def case_mitm_origin_takes_the_request_and_never_answers(self, certdir):
+        """The handshake is done, so this wait is the head read through TLS."""
+        upstream = _StallableBridgeUpstream(certdir)
+        hop = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
+        proxy = self._proxy(certdir, hop, upstream=("127.0.0.1", upstream.port))
+        served = self._served_tls(proxy)
+        proxy.start()
+        try:
+            _post_and_abandon(proxy.port, certdir / "ca.pem", "/v1/messages",
+                              "STALL")
+            assert self._eventually(lambda: upstream.received), (
+                "premise: the request never reached the origin")
+            self._assert_let_go(proxy, lambda: served[0].fileno() < 0)
+        finally:
+            upstream.release.set()
+            hop.stop()
+            proxy.stop()
+            upstream.stop()
+
+    def case_plain_hop_accepts_and_never_answers(self, certdir):
+        hop = _StallingHop()
+        proxy = self._proxy(certdir, hop)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            raw.sendall(b"GET http://example.com/x HTTP/1.1\r\n"
+                        b"Host: example.com\r\n\r\n")
+            assert hop.reached.wait(5), "premise: the request never reached the hop"
+            assert proxy.inflight_requests() == 1, "premise: the request is owed"
+            with proxy._live_lock:
+                (conn,) = proxy._open_conns
+            raw.close()
+            self._assert_let_go(proxy, lambda: conn.fileno() < 0, hop)
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    def case_control_mitm_a_slow_hop_still_answers_a_connected_client(
+            self, certdir):
+        upstream = _FakeUpstream(certdir)
+        hop = _StallingHop(delay=2.0, target=("127.0.0.1", upstream.port))
+        proxy = self._proxy(certdir, hop, upstream=("127.0.0.1", upstream.port))
+        proxy.start()
+        try:
+            t0 = time.monotonic()
+            status = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t")
+            assert time.monotonic() - t0 >= 1.9, "premise: the hop was not slow"
+            assert status == 200, f"a slow hop cut a connected client: {status}"
+            assert upstream.seen_path == "/v1/messages"
+        finally:
+            hop.stop()
+            proxy.stop()
+            upstream.stop()
+
+    def case_control_plain_a_slow_hop_still_answers_a_connected_client(
+            self, certdir):
+        hop = _StallingHop(delay=2.0)
+        proxy = self._proxy(certdir, hop)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            t0 = time.monotonic()
+            raw.sendall(b"GET http://example.com/x HTTP/1.1\r\n"
+                        b"Host: example.com\r\n\r\n")
+            got = b""
+            while not got.endswith(b"hi"):
+                chunk = raw.recv(4096)
+                if not chunk:
+                    break
+                got += chunk
+            raw.close()
+            assert time.monotonic() - t0 >= 1.9, "premise: the hop was not slow"
+            assert got.startswith(b"HTTP/1.1 200") and got.endswith(b"hi"), (
+                f"a slow hop cut a connected client: {got!r}")
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    @staticmethod
+    def _tcp_pair():
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        a = socket.create_connection(srv.getsockname(), timeout=5)
+        b, _ = srv.accept()
+        srv.close()
+        return a, b
+
+    def case_client_gone_reads_a_close_and_a_reset_not_pending_bytes(
+            self, monkeypatch):
+        """A pipelined byte is a client still waiting, not one that left; only
+        EOF or a reset is a hang-up. With POLLRDHUP (Linux) a FIN is seen even
+        with bytes unread behind it (a close_notify ahead of the FIN); without
+        it (macOS) an EOF is read by peeking."""
+        import select
+        import struct
+
+        from cswap_pin.proxy import _client_gone
+
+        def _checks(unread_then_fin: bool):
+            a, b = self._tcp_pair()
+            assert _client_gone(a.fileno()) is False, "an idle client read as gone"
+            b.sendall(b"x")
+            time.sleep(0.05)
+            assert _client_gone(a.fileno()) is False, (
+                "a client with a pipelined byte read as gone")
+            b.close()
+            time.sleep(0.05)
+            assert _client_gone(a.fileno()) is unread_then_fin
+            a.close()
+
+            a, b = self._tcp_pair()
+            b.close()
+            time.sleep(0.05)
+            assert _client_gone(a.fileno()) is True, "a plain FIN was missed"
+            a.close()
+
+            a, b = self._tcp_pair()
+            b.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                         struct.pack("ii", 1, 0))
+            b.close()
+            time.sleep(0.05)
+            assert _client_gone(a.fileno()) is True, "a reset was missed"
+            a.close()
+
+        if hasattr(select, "POLLRDHUP"):
+            _checks(unread_then_fin=True)
+            monkeypatch.delattr(select, "POLLRDHUP")
+        _checks(unread_then_fin=False)
+
+    def case_a_watch_holds_only_for_its_block(self):
+        from cswap_pin.proxy import _ClientWatch
+
+        a, b = self._tcp_pair()
+        c, d = self._tcp_pair()
+        watch = _ClientWatch()
+        with watch.over(a, c):
+            assert len(watch._waits) == 1
+        assert not watch._waits, "a finished wait stayed registered"
+        with watch.over(object(), c):
+            assert not watch._waits, "an unwatchable client was registered"
+        for s in (a, b, c, d):
+            s.close()
+
+
 class TestPinTimeHopTrust:
     """T1612: `cswap pin N` makes ONE CONNECT to the API host through the
     recorded hop, with the trust the daemon will use, and names the fix when

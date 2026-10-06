@@ -5550,6 +5550,109 @@ def _client_hung_up(sock) -> bool:
     return bool(ready)
 
 
+# How often `_CLIENT_WATCH` looks. A hung-up client is noticed within one beat;
+# nothing is ever cut on the clock.
+_CLIENT_WATCH_BEAT_S = 0.5
+
+
+def _client_gone(fd: int) -> bool:
+    """Whether the client behind FD has closed or reset: EOF or an error,
+    never merely unread bytes.
+
+    NOT `_client_hung_up`, which reads "readable" as "gone". That fits a
+    bridge-attach POST held before it is relayed and is wrong for a request
+    already waiting on the hop: a client that sent its next request early is
+    still waiting for this reply, and a false answer here cuts a live one.
+
+    POLLRDHUP (Linux) is a FIN, seen even with bytes unread behind it (a
+    close_notify ahead of the FIN), so a client that half-closes yet still
+    waits reads as gone: the accepted cost of that. Without it (macOS) a
+    readable fd is told apart by a one-byte peek, and only an empty answer is
+    EOF. On the fd and never the SSL object, so nothing it buffered is
+    mistaken for the wire. Any failure to ask answers False: fail open.
+    """
+    dead = select.POLLHUP | select.POLLERR | getattr(select, "POLLRDHUP", 0)
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | dead)
+        events = poller.poll(0)
+        if not events:
+            return False
+        if events[0][1] & dead:
+            return True
+        with socket.socket(fileno=os.dup(fd)) as peek:
+            return peek.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+    except ConnectionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+class _ClientWatch:
+    """One thread that cuts a hop leg whose client has hung up.
+
+    A serving thread waiting on a hop (the TLS handshake to the upstream, the
+    reply head) blocks in the kernel with no timeout, because a slow first
+    byte from a live request is legitimate and a deadline would cut it. So it
+    never looked at its client, and a client that left kept its fd and its
+    `_owed` entry for as long as the hop stayed silent: 38 closed client fds
+    for 3 h on a draining daemon, which a live pinging stream (rightly) keeps
+    open.
+
+    `over(client, hop)` registers the pair for one wait. Every beat this thread
+    asks `_client_gone` of each client and shuts the hop leg down, which wakes
+    the blocked thread with EOF so its ordinary teardown closes the client and
+    pays the debt. A client that is still there is never touched.
+
+    HOLDS A DUP OF THE HOP FD, not the socket: `wrap_socket` detaches the raw
+    object mid-handshake (fileno -1), and a bare fd number could be closed and
+    reused by another connection before the shutdown. The dup pins the number;
+    `shutdown` on it acts on the one connection.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._waits: dict = {}
+        self._thread: "threading.Thread | None" = None
+
+    @contextlib.contextmanager
+    def over(self, client, hop):
+        try:
+            client_fd = client.fileno()
+            tap = socket.socket(fileno=os.dup(hop.fileno()))
+        except (AttributeError, OSError, ValueError):
+            tap = None  # nothing to watch: wait unwatched, as before
+        if tap is None:
+            yield
+            return
+        key = object()
+        with self._lock:
+            self._waits[key] = (client_fd, tap)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+        try:
+            yield
+        finally:
+            with self._lock:
+                del self._waits[key]
+            tap.close()
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(_CLIENT_WATCH_BEAT_S)
+            with self._lock:
+                for client_fd, tap in self._waits.values():
+                    try:
+                        if _client_gone(client_fd):
+                            tap.shutdown(socket.SHUT_RDWR)
+                    except Exception:  # noqa: BLE001 — never take this thread down
+                        pass  # incl. an already-shut hop: its thread is unwinding
+
+
+_CLIENT_WATCH = _ClientWatch()
+
+
 #: Titles this pin has PUT, keyed by bridge id. The one thing that separates
 #: "the server invented a name" from "a person renamed it in the browser":
 #: neither is the local name, and the server record carries no timestamp saying
@@ -19683,6 +19786,7 @@ class PinProxy:
         # the two stay in step.
         self._local.conn = conn
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
+        self._local.tls = tls
         self._local.detached = False
         served_one = False
         try:
@@ -20473,9 +20577,13 @@ class PinProxy:
             # CERT_NONE context to a real internet connection carrying
             # account bearers.
             raw, via_loopback = self._connect_upstream()
-            up = _wrap_upstream(
-                self._upstream_ctx(via_loopback), raw, UPSTREAM_HOST
-            )
+            # THE HANDSHAKE IS A HOP WAIT TOO: a hop that answers CONNECT 200
+            # and goes silent parks this thread in `do_handshake`, before the
+            # head wait that `_relay_response` watches. See `_ClientWatch`.
+            with _CLIENT_WATCH.over(getattr(self._local, "tls", None), raw):
+                up = _wrap_upstream(
+                    self._upstream_ctx(via_loopback), raw, UPSTREAM_HOST
+                )
             self._local.up = up
             self._local.up_idle_since = time.monotonic()
         return up
@@ -22826,14 +22934,20 @@ def _relay_response(
         (send or client.sendall)(payload)
 
     buf = bytearray()
-    while b"\r\n\r\n" not in buf:
-        try:
-            chunk = up.recv(65536)
-        except (ConnectionResetError, ssl.SSLError, OSError):
-            chunk = b""
-        if not chunk:
-            break
-        buf += chunk
+    # THE HEAD WAIT, WATCHED. It has no timeout (a slow first byte from a live
+    # request is legitimate), so a client that hangs up meanwhile is noticed by
+    # `_CLIENT_WATCH`, which shuts `up` and lands here as EOF: no head, False,
+    # and the caller's own teardown closes both legs and pays the debt. Once
+    # the head is in, the relay streams unwatched.
+    with _CLIENT_WATCH.over(client, up):
+        while b"\r\n\r\n" not in buf:
+            try:
+                chunk = up.recv(65536)
+            except (ConnectionResetError, ssl.SSLError, OSError):
+                chunk = b""
+            if not chunk:
+                break
+            buf += chunk
     head, sep, rest = bytes(buf).partition(b"\r\n\r\n")
     if not sep:
         return False
