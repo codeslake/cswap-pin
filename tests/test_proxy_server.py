@@ -21124,6 +21124,54 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
             assert again == self._untouched(auth=old)
         assert not log, f"an old bearer's 403 drew a switch(): {log}"
 
+    def case_a_session_gets_one_401_whatever_bearer_it_sends(
+        self, monkeypatch,
+    ):
+        """Each 401 sends the client to mint a new bearer (`/api/oauth/token`
+        is not pinned), so a memo keyed on the bearer's fingerprint is a new
+        key per retry and the 401 loop reopens, one credential exchange a
+        round. One session, a different unknown bearer on every request: the
+        first draws the 401, every later one the 403 unchanged; another
+        session still gets its own."""
+        log = []
+        self._wire(monkeypatch, log=log)
+        assert self._r403(auth="Bearer unknown-1", session="s1").startswith(
+            b"HTTP/1.1 401")
+        for n in (2, 3):
+            auth = f"Bearer unknown-{n}"
+            got = self._r403(auth=auth, session="s1")
+            assert got.startswith(b"HTTP/1.1 403"), (
+                f"request {n}: a new bearer from the same session drew a "
+                f"second 401: {got[:60]}")
+            assert got == self._untouched(auth=auth, session="s1")
+        assert self._r403(auth="Bearer unknown-4", session="s2").startswith(
+            b"HTTP/1.1 401"), "another session is owed its own 401"
+        assert not log, log
+
+    def case_unknown_session_less_bearers_leave_a_validated_record_in_place(
+        self, monkeypatch,
+    ):
+        """The memo holds 8 entries and drops the oldest. Ten distinct
+        unknown bearers with no session wrote ten `(grant:<fingerprint>,
+        slot)` negatives, and the validated switch off A that a straggler on
+        A's bearer is found by went with the oldest of them. They share one
+        entry per slot now, so the first draws the 401, the other nine the
+        403 unchanged, and A's straggler is still found."""
+        from cswap_pin import proxy as pp
+        log, live = self._moving_fleet(monkeypatch)
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        assert live["num"] == "2" and len(log) == 1, (live, log)
+        assert pp._walled_switch_seen[self._key()][0] is True
+        got = [self._r403(auth=f"Bearer unknown-{n}")[:12] for n in range(10)]
+        assert got == [b"HTTP/1.1 401"] + [b"HTTP/1.1 403"] * 9, got
+        assert pp._walled_switch_seen[self._key()][0] is True, (
+            "ten unknown bearers evicted the validated record: "
+            f"{list(pp._walled_switch_seen)}")
+        pp._refused_slots["1"] = time.time() - 1.0
+        assert self._r403(session="s1").startswith(b"HTTP/1.1 401")
+        assert len(log) == 2 and log[1]["exclude"] == {"1"}, (
+            f"A's straggler was not found, so its slot was not re-marked: {log}")
+
     def case_a_late_403_on_the_bearer_the_pin_switched_off_gets_a_401(
         self, monkeypatch,
     ):

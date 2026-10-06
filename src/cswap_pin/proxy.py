@@ -21657,9 +21657,10 @@ _refused_slots: dict[str, float] = {}
 _REFUSAL_BAR_S = 900.0
 
 # (reset, slot, session) -> the monotonic deadline the bearer branch's OWN
-# 401 is good until. Separate from `_walled_switch_seen`, on purpose: that
-# memo is a SHARED verdict (did `switch()` actually move the account, a fact
-# every session should see alike), while a stale bearer is a PER-CLIENT fact
+# 401 is good until (`b"grant"` stands for `reset` on an access-grant 403).
+# Separate from `_walled_switch_seen`, on purpose: that memo is a SHARED
+# verdict (did `switch()` actually move the account, a fact every session
+# should see alike), while a stale bearer is a PER-CLIENT fact
 # — one session's frozen credential says nothing about another session's.
 # Sharing the key made N stale sessions take N * 30s to all recover (one
 # converts, the other N-1 read its memo and relay raw 429s until it
@@ -22115,7 +22116,9 @@ def _switch_off_walled_account(
     for the live slot's OWN bearer, asking `switch()` to mark and leave that
     slot (`current_refused`, `exclude` = `_refused_slots`, never
     `current_at_limit`), and for any other bearer, which gets the bearer
-    branch's once-per-session 401 and no switch (one with a validated switch
+    branch's once-per-session 401 whatever bearer the session sends (the
+    memo is on `b"grant"` and the slot, not the fingerprint, which changes
+    on every retry) and no switch (one with a validated switch
     on file also has its slot marked again once the pin's bar there has
     lapsed). The pin's bar is written after `switch()` returns, for every
     slot in `exclude` as the host marks them all, never on a raise. It writes
@@ -22284,7 +22287,16 @@ def _switch_off_walled_account(
         # number does not rotate. A `stale` read keys on `(reset, None)`, which
         # no slot's new occupant can inherit, so the storm's waiters (all
         # stale together) still share ONE `switch()` verdict.
-        key = (reset, None if stale else slot)
+        #
+        # A GRANT's `reset` is the bearer's fingerprint, which changes on
+        # every retry, so a session-less bearer that is not the live one
+        # records its 401 on `b"grant"` and the slot: one entry, so ten
+        # fingerprints cannot push a validated record out of the 8-entry
+        # memo. The live bearer keeps `(fingerprint, slot)`, which is what the
+        # straggler lookup above reads. A session's own 401 is in the
+        # per-session memo below, never here.
+        key = (b"grant" if grant and token != live and not session else reset,
+               None if stale else slot)
         # Set by the bearer branch below, ONLY when it finds the live slot
         # already known walled (`walled=True`): that fallthrough's own
         # `reset` belongs to the STALE account, not the live one, so the
@@ -22350,7 +22362,13 @@ def _switch_off_walled_account(
             # relay never reaches this function at all, see the docstring
             # above) falls through unchanged and is recorded into the shared
             # `key` below instead, exactly as before this parameter existed.
-            session_key = ((reset, slot, session)
+            # A GRANT's `reset` is a bearer fingerprint, and the 401 sends the
+            # client to mint a new bearer (`/api/oauth/token` is not pinned):
+            # keyed on it, each retry is a new key, the loop reopens and every
+            # round spends a credential exchange. So a grant keys on
+            # `b"grant"`: one 401 per session per window, whatever bearer it
+            # sends.
+            session_key = (((b"grant" if grant else reset), slot, session)
                            if session and not stale else None)
             now2 = time.monotonic()
             if session_key is not None:
@@ -22372,9 +22390,10 @@ def _switch_off_walled_account(
                 # is not itself inside the refusal bar, which the 401 would
                 # send the client back onto. Once the pin's own bar on the
                 # bearer's slot has lapsed, a straggler is how cswap marks
-                # that slot again: `exclude` names it alone, so cswap marks
-                # it and leaves the live account where it is (no usage
-                # fetch, no probe, no credential write).
+                # that slot again: `exclude` is the straggler's slot plus
+                # every slot still inside the pin's bar, never the live one,
+                # so cswap marks them and leaves the live account where it
+                # is (no usage fetch, no probe, no credential write).
                 if _refused_slots.get(slot, 0.0) > time.time():
                     _log_lifecycle(
                         f"{said} — the live slot is itself refused, relaying "
