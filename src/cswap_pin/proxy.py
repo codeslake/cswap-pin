@@ -7146,8 +7146,10 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         nothing when it fails") must not set one. It still clears: a tick
         that holds a live token is the one thing that clears a stale reason
         on an idle daemon with self-heal off, and `runtime_health` fails
-        `pin-applied` on any."""
-        if not reason or not provider._tls.quiet:
+        `pin-applied` on any. Not while `identity_mismatch` stands: the tick
+        cannot write that reason back, and with self-heal off nothing re-asks."""
+        if not provider._tls.quiet or (
+                not reason and not provider.identity_mismatch):
             provider.blind_reason = reason
 
     def _identity_ok(token: str, mail: str) -> bool:
@@ -7401,7 +7403,10 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # cold-cache case above and this IS the first read — either way
                 # the read happens here, under the lock.
                 creds = switcher.read_account_credentials(num, mail) or creds
-                if freshen and not _live_token(creds):
+                # ONE LOOK AT THE CLOCK PER BLOB: a second one can disagree
+                # with the guard below and overwrite the held copy.
+                token = _live_token(creds) if creds else None
+                if freshen and not token:
                     # THE EARLY REFRESH IS FOR THE LIVE TOKEN IN HAND (`cached`
                     # is live: the early return above). A store older than it
                     # is no rotation to adopt: replacing the held copy would
@@ -7409,6 +7414,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # ON-DEMAND refresh below -- a deferral, an 'unpinned' line
                     # with no request out, and `can_pin_cached` false.
                     creds = cached
+                    token = _live_token(creds)
                 if not creds:
                     # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
                     # empty read and a read of the WRONG slot are indistinguishable
@@ -7417,7 +7423,6 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # place that knows what it asked for.
                     provider.blind_reason = f"no credential for slot {num} ({mail})"
                     return None
-                token = _live_token(creds)
                 if token or not freshen:
                     # THE TICK CLEARS ONLY WITH A LIVE TOKEN IN HAND: the lock
                     # wait can carry the clock past the buffer, and a request

@@ -16089,6 +16089,81 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             assert rig.provider.blind_reason == "", (
                 f"{label}: the tick wrote {rig.provider.blind_reason!r}")
 
+    def case_a_tick_leaves_the_foreign_reason_a_request_wrote(
+            self, certdir, monkeypatch):
+        """A request that meets a foreign bearer writes the reason AND
+        `identity_mismatch`. The tick's clears (the entry one, the store
+        read's) must not erase it: with self-heal off nothing re-asks, and
+        `/health` read `blind_reason` empty beside a standing mismatch, so
+        `pin-applied` passed on a foreign pin. Repaired, the next tick clears."""
+        foreign = {"email": "other@example.com", "uuid": None}
+        for label, minutes, outcome in (("not due", 15, "ok"),
+                                        ("due, refresh fails", 7, "transient")):
+            rig = self._rig(certdir, monkeypatch, minutes=minutes,
+                            outcome=outcome)
+            # `_rig`'s warm mint settled "old" as ok and a settled verdict is
+            # never re-probed, so say it the way the 12h beat does.
+            rig.provider.note_verdict("old", "foreign", foreign)
+            assert rig.provider() is None, label
+            written = rig.provider.blind_reason
+            assert "other@example.com" in written, (label, written)
+            assert rig.provider.identity_mismatch, label
+            self._tick(rig, certdir, monkeypatch, False)
+            assert rig.provider.blind_reason == written, (
+                f"{label}: the tick left {rig.provider.blind_reason!r}")
+            assert rig.provider.identity_mismatch, label
+            rig.provider.note_verdict("old", "ok")
+            self._tick(rig, certdir, monkeypatch, False)
+            assert rig.provider.blind_reason == "", (
+                f"{label}: {rig.provider.blind_reason!r}")
+
+    def case_a_tick_that_repairs_the_identity_does_not_keep_the_reason(
+            self, certdir, monkeypatch):
+        """The guard reads the mismatch, so the one thing that can make the
+        reason sticky is a repair no tick can see. The tick's own
+        `_identity_ok` is one: the refresh hands back a token that answers as
+        the pin, which resets the mismatch (after that tick's entry clear, so
+        the NEXT tick is the one that clears)."""
+        rig = self._rig(certdir, monkeypatch)
+        rig.provider.note_verdict(
+            "old", "foreign", {"email": "other@example.com", "uuid": None})
+        assert rig.provider() is None and rig.provider.blind_reason
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, rig.calls
+        assert rig.provider.identity_mismatch is False
+        self._tick(rig, certdir, monkeypatch, False)
+        assert rig.provider.blind_reason == "", rig.provider.blind_reason
+
+    def case_a_store_blob_that_crosses_the_buffer_is_judged_once(
+            self, certdir, monkeypatch):
+        """The store read's liveness was asked twice (the guard, then the
+        token), so a blob live at the first look and past the buffer at the
+        second was written over the held copy with no token in hand: the tick
+        ended on a dead copy and `can_pin_cached` read false. `is_oauth_token_
+        expired` stands in for the clock crossing between the two looks."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        expires = int((rig.now + 6 * 60) * 1000)
+        rig.stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "edge", "refreshToken": "rt-edge",
+            "expiresAt": expires}})
+        real, looks = pp.oauth.is_oauth_token_expired, []
+
+        def expired(at):
+            if at == expires:
+                looks.append(1)
+                if len(looks) > 1:
+                    return True
+            return real(at)
+
+        monkeypatch.setattr(pp.oauth, "is_oauth_token_expired", expired)
+        self._tick(rig, certdir, monkeypatch, False)
+        assert len(rig.calls) == 1, (
+            f"the tick had no live token in hand ({len(looks)} looks at the "
+            f"store blob, {len(rig.calls)} refreshes)")
+        assert rig.provider.can_pin_cached() is True
+
     def case_a_freshen_with_a_live_token_still_clears_a_stale_blind_reason(
             self, certdir, monkeypatch):
         """With self-heal off nothing else clears a reason an idle daemon
