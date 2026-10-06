@@ -32849,6 +32849,14 @@ else:
                 return st if body and body.get("pid") == st["pid"] else None
 
             st = self._until("the old trio never served", serving, 40)
+            if denied:
+                # `_note_keychain_denial` is a thread started AFTER the record
+                # is written: wait for its answer, or a case that asks the
+                # moment this returns races it by a few milliseconds.
+                self._until(
+                    "the denied daemon does not say so in /health",
+                    lambda: (pp._health_body(int(st["port"])) or {}).get(
+                        "keychain_denied"), 15)
             t = types.SimpleNamespace(
                 base=base, certdir=certdir, echo=echo, port=int(st["port"]),
                 daemon=int(st["pid"]),
@@ -33373,13 +33381,25 @@ else:
         from cswap_pin import proxy as pp
 
         certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        serving = socket.socket()
+        serving.bind(("127.0.0.1", 0))
+        serving.listen(1)
         try:
+            # A CALLER KILLED AFTER IT MARKED THIS DAEMON'S RECORD as handed
+            # over (the spawn's first act) leaves the mark standing, and no
+            # later launch would trust the record: this daemon restores it.
+            pp.write_daemon_state(certdir, serving.getsockname()[1],
+                                  os.getpid(), "fp", handover=True)
             released, exited, signalled = self._watch(
                 pp, monkeypatch, certdir, 0.3, publish=False)
             drains = list(certdir.glob(".draining-*"))
+            record = pp.read_daemon_state(certdir)
         finally:
+            serving.close()
             shutil.rmtree(certdir, ignore_errors=True)
         assert signalled == [os.getppid()]
         assert released == [] and exited == [], (
             f"a failed relocation released={released} exited={exited}")
         assert drains == [], "the drain announcement was not handed back"
+        assert record and record["pid"] == os.getpid() and not record.get(
+            "handover"), f"the handed-over mark was left standing: {record}"

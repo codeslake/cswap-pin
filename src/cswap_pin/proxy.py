@@ -13246,8 +13246,9 @@ _RELOCATE_ASK_WAIT_S = 2 * _CODE_WATCH_INTERVAL_S
 # exit-75 fallback at the bound is a CAPPED drain that cuts held tunnels. The
 # wait costs the old daemon nothing (it serves until the successor has
 # published); at the bound it keeps serving instead of draining. 180 s is more
-# than twice that figure, and a caller that dies sooner is covered by the
-# same bound: the old daemon simply carries on.
+# than twice that figure. The CALLER waits this long, the old daemon 1.25 times
+# it (`_hand_over_to_the_caller`), and a caller that dies sooner is covered by
+# the same bound: the old daemon simply carries on.
 _RELOCATE_WAIT_S = 180.0
 # Consecutive failed handovers before the watchdog stops trying. A ceiling on
 # NEVER-SUCCEEDING, not on total recycles: a daemon that hands over cleanly and
@@ -13279,13 +13280,19 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
     socket instead of spawning, see `PortHolder._hand_to_the_caller`), wait for
     a successor's own record, release, drain UNCAPPED, exit 0.
 
-    THE FAILURE ARM IS NOT THE EXIT-75 ARM. If no successor publishes within
-    `_RELOCATE_WAIT_S` (the caller died, its holder could not adopt the
-    descriptor) this daemon was never stopped and holds the same socket, so it
-    hands the announcement back and keeps serving: a capped drain here would
+    THE FAILURE ARM IS NOT THE EXIT-75 ARM. If no successor publishes in time
+    (the caller died, its holder could not adopt the descriptor) this daemon
+    was never stopped and holds the same socket, so it hands the announcement
+    back, restores its own record if a killed caller left it marked as handed
+    over (`_clear_handover_mark`) and keeps serving: a capped drain here would
     cut held tunnels for a repair that did not happen. The holder keeps its
     respawn duty, since its `_handed_off` only matters once ANOTHER daemon is
-    the recorded one."""
+    the recorded one.
+
+    THIS DAEMON OUTWAITS THE CALLER (1.25 x `_RELOCATE_WAIT_S`): a successor
+    the caller can still see publish is one this daemon sees too, so the
+    caller's `_sweep_orphan_daemons` never finds it un-announced and TERMs it."""
+    wait_s = _RELOCATE_WAIT_S * 1.25
     done = announce_draining(certdir, server=server)
     pre = read_daemon_state(certdir)
     holder = _holder_pid()
@@ -13300,10 +13307,11 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
     if not _await_successor_state(
             certdir, None, os.getpid(),
             pre_ask_pid=int(pre.get("pid") or 0) if pre else None,
-            wait_s=_RELOCATE_WAIT_S):
+            wait_s=wait_s):
         _log_lifecycle(
-            f"no successor published within {_RELOCATE_WAIT_S:.0f}s -- still "
-            "serving, the port stays with this lineage")
+            f"no successor published within {wait_s:.0f}s -- still serving, "
+            "the port stays with this lineage")
+        _clear_handover_mark(certdir)
         done()
         return
     _log_lifecycle("the caller's lineage is serving -- leaving it the port")
