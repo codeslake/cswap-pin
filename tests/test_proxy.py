@@ -11051,6 +11051,25 @@ class TestKeychainDeniedHere:
         assert pin_proxy._keychain_denied_here() is False
         assert calls == []
 
+    def case_an_unconfirmed_read_asks_once_and_never_waits(self, monkeypatch):
+        """A launch's own check (T1936) must not sleep: one refusal reads as a
+        denial, one answer reads as none. THE CONTROL is the default, which
+        still asks twice a second apart."""
+        from cswap_pin import proxy as pin_proxy
+        calls = self._fake_host(monkeypatch, [36, 36])
+        slept = []
+        monkeypatch.setattr(pin_proxy.time, "sleep", slept.append)
+        assert pin_proxy._keychain_denied_here(confirm=False) is True
+        assert len(calls) == 1 and slept == []
+        calls = self._fake_host(monkeypatch, ["{}"])
+        monkeypatch.setattr(pin_proxy.time, "sleep", slept.append)
+        assert pin_proxy._keychain_denied_here(confirm=False) is False
+        assert len(calls) == 1 and slept == []
+        self._fake_host(monkeypatch, [36, 36])
+        monkeypatch.setattr(pin_proxy.time, "sleep", slept.append)
+        assert pin_proxy._keychain_denied_here() is True
+        assert slept == [1.0], "the control: the default waits between reads"
+
 class TestDaemonState:
     """The daemon records port+pid+fingerprint in a JSON state file so a
     launcher can tell a live, current daemon from a stale one (wrong pin
@@ -32649,7 +32668,9 @@ class TestACallerOutsideTheLineageTakesTheSocketOver:
     THE DENIAL IS FAKED BY LINEAGE. `_keychain_denied_here` has no daemon-side
     value on this box (it answers False off darwin), so the old trio runs
     through a shim package, `denied_cswap_pin.proxy`, that patches it to True in
-    the process and re-points `_DAEMON_MODULE` at itself: every daemon and
+    the process (and claims darwin for the one call that starts the thread
+    reading it, which is gated on the platform) and re-points `_DAEMON_MODULE`
+    at itself: every daemon and
     standby the old holder spawns inherits the shim exactly as a real lineage
     inherits its audit session, and the CALLER (this process), which lacks it,
     reads False. The shim's dotted name still contains `cswap_pin.proxy`, so
@@ -32666,9 +32687,19 @@ import functools, os, sys
 from pathlib import Path
 from cswap_pin import proxy as p
 p._keychain_denied_here = lambda: True
+_note = p._start_noting_keychain_denial
+def _start_as_a_mac(server):
+    # THE START IS GATED ON THE PLATFORM: this daemon is a Mac's for that call.
+    real, sys.platform = sys.platform, "darwin"
+    try:
+        _note(server)
+    finally:
+        sys.platform = real
+p._start_noting_keychain_denial = _start_as_a_mac
 p._DAEMON_MODULE = "denied_cswap_pin.proxy"
 # A TICK THAT IS NOT 30 s: the tick is a timer, the sequence it runs is not.
-p._watch_own_code = functools.partial(p._watch_own_code, interval=0.3)
+p._watch_own_code = functools.partial(
+    p._watch_own_code, interval=float(os.environ.get("T1936_TICK_S", "0.3")))
 if os.environ.get("T1936_RELOCATE_WAIT_S"):
     p._RELOCATE_WAIT_S = float(os.environ["T1936_RELOCATE_WAIT_S"])
 a = sys.argv
@@ -32804,7 +32835,7 @@ else:
             return self.counts
 
     @contextlib.contextmanager
-    def _trio(self, monkeypatch, denied, relocate_wait_s=None):
+    def _trio(self, monkeypatch, denied, relocate_wait_s=None, tick_s=None):
         """A REAL holder + daemon + standby under a short scratch dir (an
         AF_UNIX path holds ~104 bytes on macOS), started through a launcher
         that exits, so its lineage is not this process's."""
@@ -32837,6 +32868,8 @@ else:
                     + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
                 if relocate_wait_s is not None:
                     env["T1936_RELOCATE_WAIT_S"] = str(relocate_wait_s)
+                if tick_s is not None:
+                    env["T1936_TICK_S"] = str(tick_s)
                 module = "denied_cswap_pin.proxy"
             subprocess.run(
                 [sys.executable, "-c", self._LAUNCH, str(certdir / "daemon.log"),
@@ -32867,6 +32900,22 @@ else:
             echo.srv.close()
             _reap_pin_processes(certdir)
             shutil.rmtree(base, ignore_errors=True)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _on_a_mac(monkeypatch, caller_denied=False):
+        """THIS process as a macOS one, for the span of the block. The platform
+        is faked the way `TestKeychainDeniedHere._fake_host` fakes it, and the
+        caller's own Keychain answer is stubbed (`caller_denied`): the real
+        read would run `security`, which this box does not have. Everything a
+        helper or a daemon does is a real Linux process and is unaffected."""
+        from cswap_pin import proxy as pp
+
+        with monkeypatch.context() as m:
+            m.setattr(pp.sys, "platform", "darwin")
+            m.setattr(pp, "_keychain_denied_here",
+                      lambda confirm=True: caller_denied)
+            yield
 
     @staticmethod
     def _tracking_popen(monkeypatch):
@@ -32907,12 +32956,13 @@ else:
 
     def case_a_denied_lineage_is_moved_into_the_callers_without_a_cut(
             self, tmp_path, monkeypatch):
-        """THE WHOLE PROPERTY, with real processes: after the caller's ensure
-        the new --hold-port holder is the CALLER's child with LISTEN_FROM the
-        caller's pid, the old daemon left by the gapless handover (exit 0, never
-        the capped 75) and the old holder stood down without respawning; not
-        one request was refused, reset or left unanswered across the switch, and
-        a CONNECT tunnel held across it still echoes."""
+        """THE WHOLE PROPERTY, with real processes: the caller's ensure starts
+        ONE detached helper that is the caller's own child; the new
+        --hold-port holder is the HELPER's child with LISTEN_FROM the helper's
+        pid, the old daemon left by the gapless handover (exit 0, never the
+        capped 75) and the old holder stood down without respawning; not one
+        request was refused, reset or left unanswered across the switch, and a
+        CONNECT tunnel held across it still echoes."""
         import subprocess
 
         from cswap_pin import proxy as pp
@@ -32930,26 +32980,37 @@ else:
             assert hammer.counts["ok"] > 0, "premise: the hammer reached it"
             children.clear()
 
-            got = pp.ensure_proxy(self._Sw(t.base))
-
-            st = pp.read_daemon_state(t.certdir)
+            with self._on_a_mac(monkeypatch):
+                got = pp.ensure_proxy(self._Sw(t.base))
             assert got and got[0] == t.port, f"the port moved: {got}"
-            assert int(st["pid"]) != t.daemon, (
-                "the denied daemon is still the serving one: ensure did not "
-                "move the lineage into the caller's")
-            holders = [c for c in children
-                       if pp._HOLDER_MODULE_ARG in c.args]
-            assert len(holders) == 1, (
-                f"the caller started {len(holders)} holders, not one")
-            new_holder = holders[0].pid
-            assert new_holder != t.holder
-            assert pp._ppid_via_ps(new_holder) == os.getpid(), (
-                "the new holder's parent is not the caller")
+
+            # THE MOVE IS THE HELPER'S, AND IT TAKES A WHILE: wait for it.
+            st = self._until(
+                "the caller's lineage never published a daemon",
+                lambda: (lambda s: s if s and int(s["pid"]) != t.daemon
+                         else None)(pp.read_daemon_state(t.certdir)), 60)
+            helpers = [c for c in children if pp._RELOCATE_MODULE_ARG in c.args]
+            assert len(helpers) == 1, (
+                f"the caller started {len(helpers)} helpers, not one")
+            helper = helpers[0]
+            assert not [c for c in children
+                        if pp._HOLDER_MODULE_ARG in c.args], (
+                "the caller started a holder itself: the helper's is the "
+                "caller's grandchild, not its child")
+            # A ZOMBIE STILL HAS ITS PPID (this process has not waited on it),
+            # so this holds whether the helper has exited by now or not.
+            assert pp._ppid_via_ps(helper.pid) == os.getpid(), (
+                "the helper is not the caller's child, so it does not share "
+                "the caller's audit session")
+            new_holder = pp._wedged_parent_holder(int(st["pid"]), t.certdir)
+            assert new_holder not in (None, t.holder)
+            # The new holder's parent was the helper (`getppid() ==
+            # LISTEN_FROM` is the adoption guard, and the port did not move),
+            # but the helper exits once the daemon publishes and the holder
+            # reparents, so the env it was born with is what can still be read.
             assert pp._daemon_env_value(
-                new_holder, pp._HANDDOWN_FROM_ENV) == str(os.getpid())
-            assert pp._wedged_parent_holder(
-                int(st["pid"]), t.certdir) == new_holder, (
-                "the serving daemon is not the new holder's child")
+                new_holder, pp._HANDDOWN_FROM_ENV) == str(helper.pid)
+            assert helper.wait(timeout=60) == 0, "the helper did not end clean"
             # THE OLD DAEMON STILL ACCEPTS FOR A TICK AFTER THE NEW ONE
             # PUBLISHES (it polls the record every 0.1 s before it releases),
             # and both are on the one socket: wait for the new one's answer.
@@ -32995,33 +33056,49 @@ else:
 
     def case_CONTROL_a_denied_caller_or_another_namespace_moves_nothing(
             self, tmp_path, monkeypatch):
-        """The same denied trio, asked from a process that is itself refused
-        the Keychain (it would only hand the socket to another denied lineage),
-        and again with the recorded pid invisible to this pid namespace
-        (host and container share $HOME, not pids: incident 98d57744)."""
+        """The same denied trio, asked (as a Mac, or every case below is
+        vacuous) from a process that is itself refused the Keychain (it would
+        only hand the socket to another denied lineage), with the recorded pid
+        invisible to this pid namespace (host and container share $HOME, not
+        pids: incident 98d57744), and while the spawn lock is held (a spawn or
+        another relocation is running). None of them starts a helper: the
+        caller decides it, before anything is spawned or bound."""
         from cswap_pin import proxy as pp
 
         children = self._tracking_popen(monkeypatch)
         with self._trio(monkeypatch, denied=True) as t:
             assert pp._health_body(t.port).get("keychain_denied") is True
             children.clear()
-            with monkeypatch.context() as m:
-                m.setattr(pp, "_keychain_denied_here", lambda: True)
+            with self._on_a_mac(monkeypatch, caller_denied=True):
                 assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
-            with monkeypatch.context() as m:
+            with self._on_a_mac(monkeypatch), monkeypatch.context() as m:
                 m.setattr(pp, "_pin_daemon_pids", lambda cd: [])
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            with self._on_a_mac(monkeypatch), pp._spawn_lock(t.certdir):
                 assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
             assert int(pp.read_daemon_state(t.certdir)["pid"]) == t.daemon
             assert not [c for c in children
-                        if pp._HOLDER_MODULE_ARG in c.args], (
-                "a caller that must not relocate started a holder")
+                        if pp._RELOCATE_MODULE_ARG in c.args], (
+                "a caller that must not relocate started a helper")
             assert not list(t.certdir.glob(".successor-*")), (
                 "a caller that must not relocate bound the rendezvous")
+            # THE CONTROL: the same trio and the same Mac, with none of those
+            # three holding, DOES start the helper (it is the thing the main
+            # case measures to the end; here it is only counted).
+            with self._on_a_mac(monkeypatch):
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            helpers = [c for c in children
+                       if pp._RELOCATE_MODULE_ARG in c.args]
+            assert len(helpers) == 1, (
+                "the control did not start a helper: the cases above prove "
+                "nothing")
+            helpers[0].wait(timeout=90)   # let it finish before the teardown
 
     def case_a_daemon_that_is_not_denied_is_left_alone(
             self, tmp_path, monkeypatch):
-        """Nothing denied: today's behaviour, byte for byte. No rendezvous, no
-        new holder, no new file, the same daemon."""
+        """Nothing denied: today's behaviour, byte for byte. No helper, no
+        rendezvous, no new file, the same daemon, even on a Mac (a Mac is what
+        makes the gate pass, or this is vacuous)."""
         from cswap_pin import proxy as pp
 
         children = self._tracking_popen(monkeypatch)
@@ -33029,25 +33106,28 @@ else:
             assert "keychain_denied" not in pp._health_body(t.port)
             # ONE ENSURE TO SETTLE what every ensure already writes (the
             # upstream hint, the CA bundle); the second is the measurement.
-            pp.ensure_proxy(self._Sw(t.base))
-            before = sorted(p.name for p in t.certdir.iterdir())
-            children.clear()
-            got = pp.ensure_proxy(self._Sw(t.base))
+            with self._on_a_mac(monkeypatch):
+                pp.ensure_proxy(self._Sw(t.base))
+                before = sorted(p.name for p in t.certdir.iterdir())
+                children.clear()
+                got = pp.ensure_proxy(self._Sw(t.base))
             assert got[0] == t.port
             assert int(pp.read_daemon_state(t.certdir)["pid"]) == t.daemon
             assert not [c for c in children
-                        if pp._HOLDER_MODULE_ARG in c.args]
+                        if pp._RELOCATE_MODULE_ARG in c.args
+                        or pp._HOLDER_MODULE_ARG in c.args]
             assert not list(t.certdir.glob(".successor-*"))
             new = set(p.name for p in t.certdir.iterdir()) - set(before)
             assert not new, f"ensure left new files behind: {new}"
 
     def case_a_successor_that_never_publishes_cuts_nothing(
             self, tmp_path, monkeypatch):
-        """FAILURE ARM. The caller receives the socket and its spawn never
-        produces a serving daemon (stubbed to return None, as a killed caller
-        or a refused adoption would): the old daemon must keep serving past its
-        bound (no exit 75, no capped drain), tunnels and requests untouched,
-        and the old holder must keep its respawn duty."""
+        """FAILURE ARM. The relocation (`_take_the_socket_over`, which the
+        helper runs, called here in this process so its spawn can be stubbed)
+        receives the socket and its spawn never produces a serving daemon (as
+        a killed helper or a refused adoption would): the old daemon must keep
+        serving past its bound (no exit 75, no capped drain), tunnels and
+        requests untouched, and the old holder must keep its respawn duty."""
         from cswap_pin import proxy as pp
 
         with self._trio(monkeypatch, denied=True, relocate_wait_s=3) as t:
@@ -33060,7 +33140,8 @@ else:
                 return None
 
             monkeypatch.setattr(pp, "_spawn_daemon", never)
-            pp.ensure_proxy(self._Sw(t.base))
+            assert pp._take_the_socket_over(
+                t.certdir, "2", self.EMAIL, pp._health_body(t.port)) is None
             assert fds and fds[0] is not None, (
                 "the holder never handed the caller the listening socket")
             time.sleep(6)   # past the old daemon's 3 s bound
@@ -33199,25 +33280,211 @@ else:
 
     def case_a_relocation_that_raises_never_fails_the_launch(
             self, tmp_path, monkeypatch):
-        """`ensure_proxy`'s fast path runs on every launch and never raised:
-        a relocation that does (a fork EAGAIN in the spawn) hands back the
-        daemon it was asked about, and one that is merely busy does too."""
+        """`ensure_proxy`'s fast path runs on every launch and never raised: a
+        helper that cannot start (a fork EAGAIN) hands back the daemon it was
+        asked about. THE CONTROL records the helper's argv and stdio: the
+        certdir is NOT the last token, or `_pin_daemon_pids` would take the
+        helper for a daemon and the next sweep would TERM it; the caller's own
+        environment goes with it (it is what carries the audit session, with
+        the process itself)."""
+        import subprocess
+        import sys
+
         from cswap_pin import proxy as pp
 
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
         monkeypatch.setattr(
             pp, "_health_body",
             lambda port, timeout=1.0: {"keychain_denied": True, "pid": 1})
+        monkeypatch.setattr(
+            pp, "_relocation_is_due", lambda cd, health, confirm=True: 1)
+        started = []
 
         def boom(*a, **k):
             raise OSError("fork: Resource temporarily unavailable")
 
-        monkeypatch.setattr(pp, "_take_the_socket_over", boom)
+        monkeypatch.setattr(subprocess, "Popen", boom)
         assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
-        monkeypatch.setattr(pp, "_take_the_socket_over", lambda *a: None)
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: started.append((a, k)))
         assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
-        monkeypatch.setattr(pp, "_take_the_socket_over", lambda *a: 9999)
-        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 9999, (
-            "the control: a relocation that happened is the port to wire")
+        (argv,), kw = started[0]
+        assert argv == [sys.executable, "-m", pp._DAEMON_MODULE,
+                        pp._RELOCATE_MODULE_ARG, str(tmp_path), "2", "a@b.c"]
+        assert argv[-1] != str(tmp_path), "`_pin_daemon_pids` would match it"
+        assert kw.get("env") is None, "the helper must inherit the caller's env"
+        assert kw["stdin"] == kw["stdout"] == subprocess.DEVNULL
+
+    def case_a_busy_spawn_lock_starts_no_helper_and_the_locked_arm_skips_the_probe(
+            self, tmp_path, monkeypatch):
+        """One relocation at a time: a caller that finds the spawn lock held
+        starts no helper. The `locked` arm of `ensure_proxy` holds it ITSELF,
+        so the probe would always say busy there: it is skipped, and the helper
+        it starts waits for the lock instead (`_HEAL_LOCK_WAIT_S`)."""
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            pp, "_health_body",
+            lambda port, timeout=1.0: {"keychain_denied": True, "pid": 1})
+        monkeypatch.setattr(
+            pp, "_relocation_is_due", lambda cd, health, confirm=True: 1)
+        started = []
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: started.append(a))
+        with pp._spawn_lock(tmp_path):
+            assert pp._move_into_this_session(
+                tmp_path, "2", "a@b.c", 4321) == 4321
+            assert started == [], "a held spawn lock still started a helper"
+            assert pp._move_into_this_session(
+                tmp_path, "2", "a@b.c", 4321, locked=True) == 4321
+            assert len(started) == 1, "the locked arm never starts its helper"
+        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert len(started) == 2, "the control: a free lock starts the helper"
+
+    def case_the_callers_precheck_reads_the_keychain_once_and_the_helpers_twice(
+            self, tmp_path, monkeypatch):
+        """A launch must not wait on the move, and `_keychain_denied_here`
+        sleeps a second between its two reads when it is refused: the caller's
+        own precheck asks once (`confirm=False`), the helper's, which is in
+        the background, asks as it always did. Every other clause is stubbed to
+        hold, so the keychain answer is the only thing that varies."""
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        seen = []
+        monkeypatch.setattr(pp, "read_daemon_state", lambda cd: {"pid": 5})
+        monkeypatch.setattr(pp, "_wedged_parent_holder", lambda pid, cd: 6)
+        monkeypatch.setattr(
+            pp, "_wedged_daemon_can_be_asked", lambda pid, holder: True)
+        monkeypatch.setattr(pp, "_daemon_env_value", lambda pid, key: None)
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [5])
+        monkeypatch.setattr(
+            pp, "_keychain_denied_here",
+            lambda confirm=True: seen.append(confirm) or False)
+        health = {"pid": 5, "code_watch_age_s": 1, "keychain_denied": True}
+        assert pp._relocation_is_due(tmp_path, health) == 5
+        assert seen == [True], "the helper's own check must confirm"
+        seen.clear()
+        started = []
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            pp, "_health_body", lambda port, timeout=1.0: health)
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: started.append(a))
+        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert seen == [False] and len(started) == 1, (
+            "the launch's own check must be the unconfirmed one")
+
+    def case_a_daemon_off_a_mac_starts_no_keychain_thread(
+            self, tmp_path, monkeypatch):
+        """The daemon-side read is a thread, and off macOS there is nothing to
+        read: today's daemon starts none and does none of its work. THE
+        CONTROL is the same start on a Mac, which starts exactly one."""
+        import types
+
+        from cswap_pin import proxy as pp
+
+        started = []
+        monkeypatch.setattr(
+            pp.threading, "Thread",
+            lambda **k: types.SimpleNamespace(
+                start=lambda: started.append(k["target"])))
+        monkeypatch.setattr(pp.sys, "platform", "linux")
+        pp._start_noting_keychain_denial(object())
+        assert started == [], "a daemon off macOS started a keychain thread"
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        pp._start_noting_keychain_denial(object())
+        assert started == [pp._note_keychain_denial], (
+            "the control: a Mac's daemon starts the read")
+
+    def case_off_a_mac_a_launch_asks_nothing(self, tmp_path, monkeypatch):
+        """THE REFUSAL EXISTS ONLY ON MACOS: elsewhere `ensure_proxy`'s fast
+        path is today's, with not even the one loopback GET to `/health`.
+        THE CONTROL is the same call on a Mac, which does ask."""
+        from cswap_pin import proxy as pp
+
+        asked = []
+        monkeypatch.setattr(
+            pp, "_health_body",
+            lambda port, timeout=1.0: asked.append(port))
+        for platform in ("linux", "win32"):
+            monkeypatch.setattr(pp.sys, "platform", platform)
+            assert pp._move_into_this_session(
+                tmp_path, "2", "a@b.c", 4321) == 4321
+        assert asked == [], f"a launch off macOS asked /health: {asked}"
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        assert pp._move_into_this_session(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert asked == [4321], "the control: on a Mac the daemon is asked"
+
+    def case_the_helper_moves_a_denied_daemon_and_yields_to_a_busy_lock(
+            self, tmp_path, monkeypatch):
+        """`relocate_main` is the helper's whole body: under the spawn lock it
+        reads the recorded daemon's `/health` and, only for one that says it is
+        denied, runs the relocation. A lock it cannot take in
+        `_HEAL_LOCK_WAIT_S` ends it quietly (another spawn or relocation is
+        running), and so does a daemon that is not denied."""
+        from cswap_pin import proxy as pp
+
+        pp.write_daemon_state(tmp_path, 4321, os.getpid(), "fp")
+        moved = []
+        monkeypatch.setattr(
+            pp, "_take_the_socket_over", lambda *a: moved.append(a))
+        monkeypatch.setattr(pp, "_HEAL_LOCK_WAIT_S", 0.2)
+        health = {"keychain_denied": True, "pid": os.getpid()}
+        monkeypatch.setattr(pp, "_health_body", lambda port, timeout=1.0: health)
+
+        with pp._spawn_lock(tmp_path):
+            pp.relocate_main(tmp_path, "2", "a@b.c")
+        assert moved == [], "the helper ran under a lock it did not hold"
+        health = {"pid": os.getpid()}
+        pp.relocate_main(tmp_path, "2", "a@b.c")
+        assert moved == [], "the helper moved a daemon that is not denied"
+        health = {"keychain_denied": True, "pid": os.getpid()}
+        pp.relocate_main(tmp_path, "2", "a@b.c")
+        assert moved == [(tmp_path, "2", "a@b.c", health)], (
+            "the control: a denied daemon under a free lock is moved")
+
+    def case_ensure_returns_at_once_while_the_move_is_in_progress(
+            self, tmp_path, monkeypatch):
+        """NO LAUNCH BLOCKS ON A RELOCATION. The old daemon looks for the
+        rendezvous only on its tick, which is 6 s here, so the move cannot end
+        before then: the caller's ensure must hand back the CURRENT port in
+        well under that, with the old daemon still the recorded one and the
+        helper still running, and a second ensure while the helper waits starts
+        no second one. The move then completes."""
+        from cswap_pin import proxy as pp
+
+        children = self._tracking_popen(monkeypatch)
+        with self._trio(monkeypatch, denied=True, tick_s=6) as t:
+            children.clear()
+            with self._on_a_mac(monkeypatch):
+                started = time.monotonic()
+                got = pp.ensure_proxy(self._Sw(t.base))
+                took = time.monotonic() - started
+                assert got and got[0] == t.port
+                assert took < 3, f"ensure blocked on the relocation: {took:.1f}s"
+                assert int(pp.read_daemon_state(t.certdir)["pid"]) == t.daemon, (
+                    "the move had already finished: nothing was measured")
+                helpers = [c for c in children
+                           if pp._RELOCATE_MODULE_ARG in c.args]
+                assert len(helpers) == 1 and helpers[0].poll() is None
+                self._until("the helper never bound its rendezvous",
+                            lambda: list(t.certdir.glob(".successor-*")), 20)
+                again = time.monotonic()
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+                assert time.monotonic() - again < 3
+                assert len([c for c in children
+                            if pp._RELOCATE_MODULE_ARG in c.args]) == 1, (
+                    "a second ensure started a second helper")
+            self._until(
+                "the move never completed",
+                lambda: int(pp.read_daemon_state(t.certdir)["pid"]) != t.daemon
+                and helpers[0].poll() is not None, 90)
+            assert helpers[0].returncode == 0
 
     def case_a_dead_callers_rendezvous_is_ignored_and_removed(
             self, tmp_path, monkeypatch):

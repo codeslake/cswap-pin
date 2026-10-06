@@ -7893,13 +7893,17 @@ def _pin_stands_down(provider) -> bool:
         return False
 
 
-def _keychain_denied_here() -> bool:
+def _keychain_denied_here(confirm: bool = True) -> bool:
     """macOS only: whether THIS process is refused Claude Code's OAuth
     Keychain item. A process outside the login session is (``security``
     rc=36: the access prompt cannot be shown there), and a daemon it spawns
     inherits the refusal for its whole lineage, successors included. Two
     reads a second apart, so a transient burst is not a denial; an absent
-    item is not one either."""
+    item is not one either.
+
+    ``confirm=False`` is ONE read and no wait, for a caller that must not
+    block (a launch deciding whether to start a relocation, which is wrong at
+    worst once): a single refusal reads as a denial."""
     if sys.platform != "darwin":
         return False
     try:
@@ -7907,7 +7911,7 @@ def _keychain_denied_here() -> bool:
         cred = require("credentials")
     except Exception:  # noqa: BLE001 -- no host, nothing to ask
         return False
-    for attempt in range(2):
+    for attempt in range(2 if confirm else 1):
         try:
             kc.get_password(cred.CLAUDE_CODE_KEYCHAIN_SERVICE,
                             kc.keychain_account_name())
@@ -7915,7 +7919,7 @@ def _keychain_denied_here() -> bool:
         except kc.KEYCHAIN_ERRORS as e:
             if "rc=36" not in str(e):
                 return False
-        if attempt == 0:
+        if attempt == 0 and confirm:
             time.sleep(1.0)
     return True
 
@@ -7937,9 +7941,19 @@ def _note_keychain_denial(server) -> None:
             "the login session moves the socket into its own")
 
 
+def _start_noting_keychain_denial(server) -> None:
+    """Start `_note_keychain_denial` off the serving path, on macOS ONLY: the
+    refusal does not exist elsewhere, so elsewhere a daemon starts no thread
+    and does no work for it (today's daemon, exactly)."""
+    if sys.platform == "darwin":
+        threading.Thread(
+            target=_note_keychain_denial, args=(server,), daemon=True).start()
+
+
 def _waiting_caller(certdir: Path) -> "Path | None":
-    """The rendezvous socket of a LIVE caller waiting to take the listener
-    over (`.successor-<pid>.sock`, see `_take_the_socket_over`), or None.
+    """The rendezvous socket of a LIVE relocation helper waiting to take the
+    listener over (`.successor-<pid>.sock`, see `_take_the_socket_over`), or
+    None.
 
     Liveness is the pid in the name AND the file's age: a caller killed before
     it could unlink leaves a file behind that nothing may act on, and a reused
@@ -7962,36 +7976,84 @@ def _waiting_caller(certdir: Path) -> "Path | None":
 
 def _move_into_this_session(certdir: Path, account_num: str, email: str,
                             port: int, locked: bool = False) -> int:
-    """Move a Keychain-denied daemon's serving lineage into THIS process's,
-    and return the port to wire (``port`` itself when nothing moved).
+    """Start moving a Keychain-denied daemon's serving lineage into THIS
+    process's, and return ``port`` AT ONCE: the old daemon keeps serving, and
+    no launch waits on the move.
 
     A daemon outside the login session reads the Keychain as refused (rc=36)
     and every successor is born of its holder, so it inherits that for ever;
     its 429 wall cannot switch slots. Killing the trio to start another cuts
     the held CONNECT tunnels, so the SOCKET moves instead, and the old daemon
-    leaves by its own gapless handover. ``locked``: the caller already holds
-    the spawn lock (flock is per open file, so a second take would deadlock).
-    Cheapest question first: the daemon's own `/health`."""
-    health = _health_body(port)
-    if not (health and health.get("keychain_denied") is True):
+    leaves by its own gapless handover. The move waits for the old daemon's
+    next tick, then for the new one to serve (`_RELOCATE_ASK_WAIT_S` +
+    `_RELOCATE_WAIT_S`), so it is a DETACHED HELPER's (`relocate_main`) and not
+    this call's. The helper is this process's own CHILD, so it shares its macOS
+    audit session (`start_new_session` does not change that), and every daemon
+    it spawns inherits it.
+
+    OFF macOS NOTHING IS ASKED, not even `/health`: the refusal does not exist
+    there, and this runs on every launch. Cheapest question first: the
+    daemon's own `/health`; then the spawn lock, which a relocation or a spawn
+    in flight holds (one at a time: a busy lock starts nothing), unless
+    ``locked``, the caller holds it itself and its helper waits for it.
+    Never raises: a repair never fails a launch."""
+    if sys.platform != "darwin":
         return port
     try:
-        with (contextlib.nullcontext() if locked
-              else _spawn_lock(certdir, timeout=0)):
-            return _take_the_socket_over(
-                certdir, account_num, email, health) or port
+        health = _health_body(port)
+        if not (health and health.get("keychain_denied") is True):
+            return port
+        if not locked:
+            with _spawn_lock(certdir, timeout=0):
+                pass
+        if _relocation_is_due(certdir, health, confirm=False):
+            import subprocess
+
+            log = _open_daemon_log(certdir)
+            try:
+                # THE CERTDIR IS NOT THE LAST TOKEN, ON PURPOSE: that is what
+                # `_pin_daemon_pids` reads a daemon by, and a helper it took
+                # for one would be TERMed by the next sweep.
+                subprocess.Popen(
+                    [sys.executable, "-m", _DAEMON_MODULE,
+                     _RELOCATE_MODULE_ARG, str(certdir), account_num, email],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=log, start_new_session=True)
+            finally:
+                if hasattr(log, "close"):
+                    log.close()
     except SpawnLockBusy:
-        return port  # someone else is spawning, or relocating, right now
-    except Exception as exc:  # noqa: BLE001 -- a repair never fails a launch
-        _log_lifecycle(f"could not move the denied daemon ({exc!r}) -- "
-                       "using it as it is")
-        return port
+        pass  # someone else is spawning, or relocating, right now
+    except Exception as exc:  # noqa: BLE001
+        _log_lifecycle(f"could not start the move of the denied daemon "
+                       f"({exc!r}) -- using it as it is")
+    return port
 
 
-def _take_the_socket_over(certdir: Path, account_num: str, email: str,
-                          health: dict) -> "int | None":
-    """The relocation itself, under the spawn lock. None when it did not
-    happen: every row that can say no says it BEFORE anything is bound.
+def relocate_main(certdir: Path, account_num: str, email: str) -> None:
+    """The detached helper's whole body (``-m cswap_pin.proxy --relocate``,
+    started by `_move_into_this_session`): under the spawn lock, ask the
+    recorded daemon's `/health` and, only for one that says it is denied, run
+    the relocation. A lock it cannot take in `_HEAL_LOCK_WAIT_S` ends it
+    quietly: another spawn or relocation is running (or the launching caller,
+    in the `locked` arm, has not returned yet)."""
+    certdir = Path(certdir)
+    try:
+        with _spawn_lock(certdir, timeout=_HEAL_LOCK_WAIT_S):
+            st = read_daemon_state(certdir)
+            health = st and _health_body(int(st["port"]))
+            if health and health.get("keychain_denied") is True:
+                _take_the_socket_over(certdir, account_num, email, health)
+    except SpawnLockBusy:
+        _log_lifecycle("another spawn or relocation is running -- the denied "
+                       "daemon is not moved from here")
+
+
+def _relocation_is_due(certdir: Path, health: dict,
+                       confirm: bool = True) -> int:
+    """The denied daemon's pid when it should be moved into THIS process's
+    lineage, else 0. Every clause is a read, and only a confirmed Keychain
+    check (``confirm``, the helper's) can wait: a launch asks it unconfirmed.
 
     The clauses: the recorded daemon answers as itself, its watchdog beats
     (it is what asks the holder), its holder can be asked, and self-heal is
@@ -7999,7 +8061,27 @@ def _take_the_socket_over(certdir: Path, account_num: str, email: str,
     (`_pin_daemon_pids`): host and container share $HOME and not pids, and a
     handover begun across that boundary is what killed the container's pin
     (dotfiles 98d57744). And THIS process is not itself refused, or the socket
-    would only go to another denied lineage (read last: it can take seconds).
+    would only go to another denied lineage (read last: it can take seconds)."""
+    st = read_daemon_state(certdir)
+    pid = int(st["pid"]) if st else 0
+    beat = health.get("code_watch_age_s")
+    holder = _wedged_parent_holder(pid, certdir) if pid else None
+    return pid if (st and not st.get("handover") and health.get("pid") == pid
+                   and isinstance(beat, (int, float))
+                   and beat <= _CODE_WATCH_BEAT_MAX_AGE_S
+                   and holder is not None
+                   and _wedged_daemon_can_be_asked(pid, holder)
+                   and (_daemon_env_value(pid, _SELF_HEAL_ENV) or "").lower()
+                   not in ("off", "0", "no")
+                   and pid in _pin_daemon_pids(certdir)
+                   and not _keychain_denied_here(confirm)) else 0
+
+
+def _take_the_socket_over(certdir: Path, account_num: str, email: str,
+                          health: dict) -> "int | None":
+    """The relocation itself, run by the helper under the spawn lock. None
+    when it did not happen: every clause that can say no
+    (`_relocation_is_due`) says it BEFORE anything is bound.
 
     Then: bind `.successor-<pid>.sock` and wait for the old daemon's next tick
     to see it, ask its holder, and have the holder send the LISTENING socket
@@ -8008,19 +8090,8 @@ def _take_the_socket_over(certdir: Path, account_num: str, email: str,
     sequence does the rest. The wait for the new daemon is `_RELOCATE_WAIT_S`,
     not `_SPAWN_WAIT_S`: this process must stay alive until the new holder has
     adopted the descriptor, which is guarded by `getppid()`."""
-    st = read_daemon_state(certdir)
-    pid = int(st["pid"]) if st else 0
-    beat = health.get("code_watch_age_s")
-    holder = _wedged_parent_holder(pid, certdir) if pid else None
-    if not (st and not st.get("handover") and health.get("pid") == pid
-            and isinstance(beat, (int, float))
-            and beat <= _CODE_WATCH_BEAT_MAX_AGE_S
-            and holder is not None
-            and _wedged_daemon_can_be_asked(pid, holder)
-            and (_daemon_env_value(pid, _SELF_HEAL_ENV) or "").lower()
-            not in ("off", "0", "no")
-            and pid in _pin_daemon_pids(certdir)
-            and not _keychain_denied_here()):
+    pid = _relocation_is_due(certdir, health)
+    if not pid:
         return None
     path = Path(certdir) / f"{_SUCCESSOR_SOCK_PREFIX}{os.getpid()}.sock"
     srv = socket.socket(socket.AF_UNIX)
@@ -13236,18 +13307,22 @@ _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
 # `<certdir>/.successor-<caller pid>.sock`; the pid in the name is the liveness
 # test (`_waiting_caller`).
 _SUCCESSOR_SOCK_PREFIX = ".successor-"
-# HOW LONG THE CALLER WAITS TO BE HANDED THE SOCKET: the old daemon only looks at
+# THE DETACHED HELPER THAT RUNS IT (`relocate_main`): `-m cswap_pin.proxy
+# --relocate <certdir> <account> <email>`, a child of the caller so that no
+# launch waits on the move.
+_RELOCATE_MODULE_ARG = "--relocate"
+# HOW LONG THE HELPER WAITS TO BE HANDED THE SOCKET: the old daemon only looks at
 # its next tick, and a tick that ran long must not read as a daemon that will
 # never come, so two intervals.
 _RELOCATE_ASK_WAIT_S = 2 * _CODE_WATCH_INTERVAL_S
-# HOW LONG THE OLD DAEMON AND THE CALLER WAIT FOR THE NEW DAEMON TO SERVE.
+# HOW LONG THE OLD DAEMON AND THE HELPER WAIT FOR THE NEW DAEMON TO SERVE.
 # `_SPAWN_WAIT_S` (10 s) is the wrong bound here: on a loaded Mac a successor
 # took 56-85 s to publish (wmac, load 8.72, T1935), and the old daemon's
 # exit-75 fallback at the bound is a CAPPED drain that cuts held tunnels. The
 # wait costs the old daemon nothing (it serves until the successor has
 # published); at the bound it keeps serving instead of draining. 180 s is more
-# than twice that figure. The CALLER waits this long, the old daemon 1.25 times
-# it (`_hand_over_to_the_caller`), and a caller that dies sooner is covered by
+# than twice that figure. The HELPER waits this long, the old daemon 1.25 times
+# it (`_hand_over_to_the_caller`), and a helper that dies sooner is covered by
 # the same bound: the old daemon simply carries on.
 _RELOCATE_WAIT_S = 180.0
 # Consecutive failed handovers before the watchdog stops trying. A ceiling on
@@ -13272,26 +13347,27 @@ def _beat_ends_with_the_watchdog(watch):
 
 
 def _hand_over_to_the_caller(server, certdir: Path) -> None:
-    """A caller in the login session is waiting to take the socket over
-    (`_take_the_socket_over`): the held branch of `_watch_own_code`'s gapless
-    sequence, with the successor born in THAT caller instead of the holder.
+    """A relocation helper of a login-session caller is waiting to take the
+    socket over (`_take_the_socket_over`): the held branch of
+    `_watch_own_code`'s gapless sequence, with the successor born in THAT
+    helper instead of the holder.
 
     Announce the drain, ask the holder (which sends the caller the listening
     socket instead of spawning, see `PortHolder._hand_to_the_caller`), wait for
     a successor's own record, release, drain UNCAPPED, exit 0.
 
     THE FAILURE ARM IS NOT THE EXIT-75 ARM. If no successor publishes in time
-    (the caller died, its holder could not adopt the descriptor) this daemon
+    (the helper died, its holder could not adopt the descriptor) this daemon
     was never stopped and holds the same socket, so it hands the announcement
-    back, restores its own record if a killed caller left it marked as handed
+    back, restores its own record if a killed helper left it marked as handed
     over (`_clear_handover_mark`) and keeps serving: a capped drain here would
     cut held tunnels for a repair that did not happen. The holder keeps its
     respawn duty, since its `_handed_off` only matters once ANOTHER daemon is
     the recorded one.
 
-    THIS DAEMON OUTWAITS THE CALLER (1.25 x `_RELOCATE_WAIT_S`): a successor
-    the caller can still see publish is one this daemon sees too, so the
-    caller's `_sweep_orphan_daemons` never finds it un-announced and TERMs it."""
+    THIS DAEMON OUTWAITS THE HELPER (1.25 x `_RELOCATE_WAIT_S`): a successor
+    the helper can still see publish is one this daemon sees too, so the
+    helper's `_sweep_orphan_daemons` never finds it un-announced and TERMs it."""
     wait_s = _RELOCATE_WAIT_S * 1.25
     done = announce_draining(certdir, server=server)
     pre = read_daemon_state(certdir)
@@ -14858,8 +14934,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     _install_signal_teardown(_teardown)
 
     # ONCE, off the serving path: two reads a second apart when denied.
-    threading.Thread(
-        target=_note_keychain_denial, args=(proxy,), daemon=True).start()
+    _start_noting_keychain_denial(proxy)
 
     threading.Thread(
         target=_watch_own_code,
@@ -24045,5 +24120,7 @@ if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
                     port=int(_sys.argv[2]))
     elif _sys.argv[1:2] == [_STANDBY_MODULE_ARG]:
         standby_main(_sys.argv[2], _sys.argv[3], Path(_sys.argv[4]))
+    elif _sys.argv[1:2] == [_RELOCATE_MODULE_ARG]:
+        relocate_main(Path(_sys.argv[2]), _sys.argv[3], _sys.argv[4])
     else:
         daemon_main(_sys.argv[1], _sys.argv[2], Path(_sys.argv[3]))

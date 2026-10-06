@@ -901,19 +901,31 @@ tunnels, so the **socket** moves instead.
   refused, and off macOS.
 - `cswap pin --ensure` (what `wire.zsh` runs on every Terminal launch) finds
   such a daemon, and when the caller is **not** itself refused and sees the
-  daemon's pid (host and container share `$HOME`, not pids), binds
+  daemon's pid (host and container share `$HOME`, not pids), starts a
+  **detached helper** (`python -m cswap_pin.proxy --relocate <certdir>
+  <account> <email>`, stderr to `daemon.log`) and returns the current port **at
+  once**: the old daemon keeps serving and no launch, `cswap run` or TUI repair
+  waits on the move. The helper is the caller's own child, so it shares the
+  caller's macOS audit session. The launch's own checks are reads, and its
+  Keychain check is one read, never the two a second apart the helper makes.
+  Only one runs at a time: a caller that finds the spawn lock held starts
+  none. The helper takes the spawn lock, binds
   `pin-proxy/.successor-<pid>.sock` and waits. The daemon's next watchdog tick
-  (at most 30 s) sees it and asks its holder, which sends the caller the live
-  listening socket over that rendezvous instead of spawning. The caller runs
+  (at most 30 s) sees it and asks its holder, which sends the helper the live
+  listening socket over that rendezvous instead of spawning. The helper runs
   `_spawn_daemon(listen_fd=)` itself, so the new holder is its child and
   `CSWAP_PIN_LISTEN_FROM` its pid, and the old daemon runs the ordinary
   gapless sequence: wait for the successor's record, stop accepting, drain
-  **uncapped**, exit 0. The old holder stands down without respawning.
-- **Nothing is cut and nothing is stranded if it fails.** If the caller dies
+  **uncapped**, exit 0. The old holder stands down without respawning, and the
+  helper exits once the new daemon has published.
+- **Off macOS nothing changes**: the refusal does not exist there, so a launch
+  asks the daemon nothing extra (not even `/health`) and a daemon starts no
+  thread to read it.
+- **Nothing is cut and nothing is stranded if it fails.** If the helper dies
   or the successor never publishes, the old daemon keeps serving past its
   bound (no capped drain, no exit 75) and its holder keeps its respawn duty.
   The bound is `_RELOCATE_WAIT_S` (180 s), not the 10 s `_SPAWN_WAIT_S`: a
-  caller-spawned successor measured 0.54 s to serve on a quiet box and 9 s with
+  helper-spawned successor measured 0.54 s to serve on a quiet box and 9 s with
   16 busy loops sharing its CPU, and 56-85 s on a loaded Mac (T1935).
 - Not verified on a Mac: that a lineage spawned from the login session is read
   as not refused. The new daemon's own `/health` is the measurement.
