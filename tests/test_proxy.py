@@ -4489,10 +4489,10 @@ class TestAHeldDaemonThatStoppedAccepting:
         import math
 
         bound, lap, confirm = 0.4, 0.1 + 0.3, 1.0
-        began = time.monotonic()
         holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4242,
                                   delay=5.0, bound=bound, probe=0.3,
                                   confirm=confirm)
+        began = time.monotonic()
         try:
             self._until(lambda: "terminate 4242" in log, 10)
             took = time.monotonic() - began

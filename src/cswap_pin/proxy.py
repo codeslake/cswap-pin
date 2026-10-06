@@ -13415,9 +13415,10 @@ _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
 # running and four daemons still accepting were retired through a 30 s drain,
 # cutting their held streams. A wedged daemon (accepts nothing, or accepts and
 # never replies) misses every probe whatever its timeout, so the cost of the
-# long waits is only time: replaced after at most
+# long waits is only time: replaced at most
 # (1 + ceil(BEAT_MAX_AGE / (INTERVAL + PROBE))) * (INTERVAL + PROBE) + CONFIRM
-# = 155 s with these values (124 s with the old 1.0 s probe, no confirm).
+# = 155 s after it stops answering with these values (124 s with the old 1.0 s
+# probe and no confirm).
 _PORT_WATCH_PROBE_S = 5.0
 _PORT_WATCH_CONFIRM_S = 15.0
 # THE CALLER-SIDE RELOCATION (`_take_the_socket_over`). The rendezvous is
