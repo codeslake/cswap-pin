@@ -22,6 +22,7 @@ import datetime as _dt
 import errno
 import functools
 import glob
+import hashlib
 import inspect
 import itertools
 import json
@@ -38,6 +39,7 @@ import sys
 import ssl
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
@@ -20245,6 +20247,15 @@ class PinProxy:
             # Truncated: the value is for telling them apart, not for reading.
             _ua = next((v.strip()[:40] for k, v in headers
                         if k.lower() == "user-agent"), "-")
+            # WHICH BEARER, WHICH MODEL, WHICH BETAS, on an inference
+            # response line and only while a trace is armed. See
+            # `_messages_trace_tags` for where in the line they go and why.
+            _tags = (
+                _messages_trace_tags(headers, body)
+                if path.split("?", 1)[0].rstrip("/") == "/v1/messages"
+                and (_TRACE is not None
+                     or trace_target(getattr(self, "_certdir", None)))
+                else "")
             out = [f"{method} {path} HTTP/1.1".encode("latin1")]
             sent_host = False
             # _read_body decoded a chunked body, and the transfer-coding
@@ -20407,7 +20418,7 @@ class PinProxy:
                     self._note_bridge_superseded(method, path, st),
                     self._tunnel_trace(
                         f"    <- {st.decode('latin1', 'replace').strip()}"
-                        f"  {method} {path}  ua={_ua}"),
+                        f"  {method} {path}{_tags}  ua={_ua}"),
                     self._note_slow_request(
                         method, path,
                         (time.monotonic() - getattr(
@@ -21636,6 +21647,15 @@ _walled_switch_seen: dict[tuple[bytes, str | None],
 # still walled.
 _walled_slots: dict[str, float] = {}
 
+# slot -> the epoch until which the API is known to have refused it on an
+# access grant: cswap's `REFUSAL_BAR_S` (usage_store.py), kept here so the
+# pin names them in `exclude` and a fleet where every account refuses gets
+# `switched: false`, not cswap's release-when-empty landing back on a
+# refused slot. `_walled_slots`' shape, and its guard
+# (`_forget_walled_slots_that_changed_hands`).
+_refused_slots: dict[str, float] = {}
+_REFUSAL_BAR_S = 900.0
+
 # (reset, slot, session) -> the monotonic deadline the bearer branch's OWN
 # 401 is good until. Separate from `_walled_switch_seen`, on purpose: that
 # memo is a SHARED verdict (did `switch()` actually move the account, a fact
@@ -21832,7 +21852,8 @@ def _forget_walled_slots_that_changed_hands(slot: str | None) -> tuple | None:
     the number the roster now gives that account, so the next `exclude=` names
     the new number until the epoch and the old one is free. An account the
     roster no longer has takes its wall with it. The three sibling memos are
-    dropped, not moved: `_walled_switch_seen` and
+    dropped, not moved (as is the slot's `_refused_slots` entry, silently):
+    `_walled_switch_seen` and
     `_walled_switch_seen_by_session` answer for the LIVE slot's switch-off and
     a session's one 401 toward it (30 s negatives; the worst a drop costs is
     one extra `switch()` or 401), and `_walled_headroom_seen` is a 5 s reading
@@ -21848,7 +21869,7 @@ def _forget_walled_slots_that_changed_hands(slot: str | None) -> tuple | None:
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None
     now, changed, walls = None, set(), []
-    for num in {slot, *_walled_slots} - {None}:
+    for num in {slot, *_walled_slots, *_refused_slots} - {None}:
         who = _slot_occupant(num, sw)
         if num == slot:
             now = who
@@ -21859,6 +21880,7 @@ def _forget_walled_slots_that_changed_hands(slot: str | None) -> tuple | None:
             continue
         _walled_slot_occupant[num] = who
         changed.add(num)
+        _refused_slots.pop(num, None)
         if num in _walled_slots:
             walls.append((num, was, _walled_slots.pop(num)))
     followed = []
@@ -21886,18 +21908,128 @@ def _forget_walled_slots_that_changed_hands(slot: str | None) -> tuple | None:
     return now
 
 
+def _switch_takes(param: str) -> bool:
+    """Whether this host's `switch()` accepts the kwarg ``param``. False on
+    any exception (an older `switch()`, or the symbol missing outright)."""
+    try:
+        return param in inspect.signature(
+            require("switcher").ClaudeAccountSwitcher.switch).parameters
+    except Exception:  # noqa: BLE001 — never let this break the relay
+        return False
+
+
 def _switch_takes_exclude() -> bool:
     """Whether this host's `switch()` accepts `exclude`, the slot-skip kwarg
     a separate cswap task adds so a switch-off need not hand the account
     straight back onto a slot this daemon already knows is still walled. Not
-    every host has it yet, so the pin must work against both: False on any
-    exception (an older `switch()`, or the symbol missing outright) leaves
+    every host has it yet, so the pin must work against both: False leaves
     the call exactly as it was before this kwarg existed."""
+    return _switch_takes("exclude")
+
+
+def _switch_takes_refused() -> bool:
+    """Whether `switch()` accepts `current_refused`, which marks the slot the
+    API refused a model request on and ranks it at zero headroom. A host
+    without it would raise TypeError on the kwarg, so the access-grant arm
+    of `_relay_response` is not entered at all there, and reads this BEFORE
+    it touches a body."""
+    return _switch_takes("current_refused")
+
+
+def _mark_refused(slot: str) -> frozenset:
+    """Record ``slot`` as refused for `_REFUSAL_BAR_S`, drop the expired, and
+    answer every slot still inside the bar: the `exclude` of a refusal
+    `switch()`. Call under `_walled_switch_lock`."""
+    now = time.time()
+    for expired in [s for s, exp in _refused_slots.items() if exp <= now]:
+        del _refused_slots[expired]
+    _refused_slots[slot] = now + _REFUSAL_BAR_S
+    return frozenset(_refused_slots)
+
+
+def _bearer(auth: str) -> str:
+    """The token of a `Bearer` Authorization value, or "" for any other scheme."""
+    auth = auth.strip()
+    return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+
+
+# The API's error envelope is ~150 bytes; a 403 body past this is not one.
+_GRANT_BODY_CAP = 16384
+
+
+def _grant_refusal(up, lines: list[bytes], rest: bytes) -> tuple[bytes, bool]:
+    """Read a 403's body and say whether it is the access-grant refusal:
+    ``error.message`` contains "requires an access grant". The incident
+    (2026-10-06) captured the rendered text and never `error.type`, so the
+    type is not keyed on.
+
+    Returns ``(rest, matched)``. ``rest`` is every body byte read so far,
+    appended RAW, so whatever the answer the client is sent exactly what the
+    API sent. FAILS OPEN, with nothing read, on a chunked or unframed body or
+    one over `_GRANT_BODY_CAP`, and with the body read but unmatched on an
+    encoding other than gzip/deflate or one that does not parse (a body cut
+    short does not): the 403 is then relayed unchanged.
+    """
+    length, encoding = None, b""
+    for line in lines[1:]:
+        k, _, v = line.partition(b":")
+        k, v = k.strip().lower(), v.strip().lower()
+        if k == b"transfer-encoding" and b"chunked" in v:
+            return rest, False
+        if k == b"content-length":
+            try:
+                length = int(v)
+            except ValueError:
+                return rest, False
+        elif k == b"content-encoding":
+            encoding = v
+    if length is None or not 0 < length <= _GRANT_BODY_CAP:
+        return rest, False
+    while len(rest) < length:
+        try:
+            chunk = up.recv(length - len(rest))
+        except OSError:
+            break
+        if not chunk:
+            break
+        rest += chunk
+    body = rest[:length]
     try:
-        return "exclude" in inspect.signature(
-            require("switcher").ClaudeAccountSwitcher.switch).parameters
-    except Exception:  # noqa: BLE001 — never let this break the relay
-        return False
+        if encoding in (b"gzip", b"deflate"):
+            # wbits 47 takes a gzip or a zlib header; the output is bounded.
+            body = zlib.decompressobj(47).decompress(body, _GRANT_BODY_CAP)
+        elif encoding not in (b"", b"identity"):
+            return rest, False
+        message = json.loads(body)["error"]["message"]
+    except (zlib.error, ValueError, KeyError, TypeError, RecursionError):
+        return rest, False
+    return rest, isinstance(message, str) and "requires an access grant" in message
+
+
+_MODEL_FIELD = re.compile(rb'"model"\s*:\s*"([^"\s]{1,60})"')
+
+
+def _messages_trace_tags(headers, body: bytes) -> str:
+    """` ts= bearer= model= beta=` for a `/v1/messages` response line: when
+    the request reached the pin, a fingerprint of the bearer it carried, the
+    model it asked for and its `anthropic-beta` value. The 2026-10-06
+    incident left only rendered text, so nothing said WHICH bearer drew a
+    refusal or which model it was for.
+
+    Written between the path and ` ua=`: readers take the path as the token
+    after the method and the client as everything after the LAST ` ua=`, so
+    the values carry no whitespace. `model` is read from the head of the body
+    by pattern, not by parsing it whole: this runs on the request thread
+    while a trace is armed, which is when the fleet is already in trouble.
+    """
+    h = {k.lower(): v for k, v in headers}
+    token = _bearer(h.get("authorization", ""))
+    model = _MODEL_FIELD.search(body[:65536])
+    return (
+        f"  ts={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"
+        f" bearer={hashlib.sha256(token.encode()).hexdigest()[:12] if token else '-'}"
+        f" model={model[1].decode('latin1') if model else '-'}"
+        f" beta={''.join(h.get('anthropic-beta', '').split())[:200] or '-'}")
 
 
 _EXHAUSTED_RESET_CAP_S = 300.0
@@ -21966,8 +22098,21 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
 
 def _switch_off_walled_account(
     reset: bytes, retry_after: bytes, auth: str = "", session: str = "",
+    kind: str = "wall",
 ) -> bool:
     """Switch cswap off the account that just 429'd, at most once per wall.
+
+    ``kind="grant"`` is the same guard for an access-grant 403 on a healthy
+    bearer (see `_grant_refusal`), with ``reset`` the memo key
+    ``b"grant:" + <bearer fingerprint>`` and no wall anywhere in it. It acts
+    for the live slot's OWN bearer, asking `switch()` to mark and leave that
+    slot (`current_refused`, `exclude` = `_refused_slots`, never
+    `current_at_limit`), and for a bearer the pin switched off earlier (a
+    validated switch on file for its fingerprint), which gets the bearer
+    branch's once-per-session 401 and no switch. It writes no `_walled_slots`
+    and no `_fleet_exhausted_until`, and answers False, so the 403 is relayed
+    UNCHANGED, on every path that does not end in a validated landing or in
+    that bearer branch's 401.
 
     ``session`` is the request's ``x-claude-code-session-id`` — stable per
     session and never rotated on retry, unlike the bearer. The absolute-form
@@ -22042,6 +22187,12 @@ def _switch_off_walled_account(
     window.
     """
     global _fleet_exhausted_until
+    grant = kind == "grant"
+    # daemon.log's wall readers match "429 on /v1/messages" and "relaying the
+    # 429"; a refusal that is not a wall must not read as one.
+    said = ("403 access-grant refusal" if grant else "429") + " on /v1/messages"
+    relay_no = "the 403 unchanged" if grant else "the 429 with headers stripped"
+    ident = "refusal key" if grant else "wall reset"
     if not reset:
         _log_lifecycle(
             "429 on /v1/messages — no reset header, not an account-level "
@@ -22091,6 +22242,29 @@ def _switch_off_walled_account(
         # occupant and the guard then finds nothing changed for the rest.
         now_who = _forget_walled_slots_that_changed_hands(slot)
         stale = slot is not None and (now_who is None or now_who != seen_who)
+        # ONLY A BEARER SCHEME: keeping a non-bearer payload as the token
+        # would convert unconditionally, since it can never equal the live
+        # token.
+        token = _bearer(auth)
+        straggler = None
+        if grant:
+            # A BEARER THE PIN ALREADY LEFT is owed a 401 only where a
+            # switch off its slot was VALIDATED: the slot it names is the
+            # one that switch recorded, the key's second element. The pin has
+            # no bearer-to-slot lookup (a credential-store read per request
+            # is what cff03cd took off this path), and "whichever slot is
+            # live" is the mark `switch()`'s own docstring warns against, so
+            # a bearer with no such record is relayed unchanged.
+            if token != live:
+                straggler = next((k[1] for k, v in _walled_switch_seen.items()
+                                  if k[0] == reset and v[0]
+                                  and k[1] not in (None, slot)), None)
+            if slot is None or stale or not live or (
+                    token != live and straggler is None):
+                _log_lifecycle(
+                    f"{said} — the bearer is neither the live slot's own nor "
+                    f"one the pin switched off, relaying {relay_no}")
+                return False
         # KEYED ON (WALL, ACCOUNT), because a unified-reset epoch is a CLOCK
         # BOUNDARY and not an identity -- 1788925200, this seam's own event,
         # is 03:40:00Z exactly -- so two accounts reaching their window on the
@@ -22132,13 +22306,13 @@ def _switch_off_walled_account(
                             and _switch_takes_exclude())
                 if not redecide:
                     _log_lifecycle(
-                        "429 on /v1/messages — debounced repeat of wall reset="
+                        f"{said} — debounced repeat of {ident}="
                         f"{reset.decode('latin1', 'replace')}, relaying "
-                        f"{'a 401' if ok else 'the 429 with headers stripped'}"
+                        f"{'a 401' if ok else relay_no}"
                     )
                     return ok
                 _log_lifecycle(
-                    "429 on /v1/messages — wall reset="
+                    f"{said} — {ident}="
                     f"{reset.decode('latin1', 'replace')} is on slot "
                     f"{slot} again after the pin switched off it; "
                     "re-deciding"
@@ -22157,11 +22331,6 @@ def _switch_off_walled_account(
         # `switch()` reports `switched=False` for as long as the wall lasts.
         # Measured 2026-09-09: account 8 went live 97s after the last 429 and
         # the session stayed walled for its whole window.
-        # ONLY A BEARER SCHEME: keeping a non-bearer payload as the token
-        # would convert unconditionally, since it can never equal the live
-        # token.
-        token = auth.strip()
-        token = token[7:].strip() if token[:7].lower() == "bearer " else ""
         if token and live and token != live and slot is not None:
             # PER-SESSION DEBOUNCE FIRST, and cheaper than the headroom read
             # it can skip. Keyed on (reset, slot, session) rather than the
@@ -22183,13 +22352,36 @@ def _switch_off_walled_account(
                     del _walled_switch_seen_by_session[expired]
                 if session_key in _walled_switch_seen_by_session:
                     _log_lifecycle(
-                        "429 on /v1/messages — this session already had its "
-                        "bearer converted for wall reset="
-                        f"{reset.decode('latin1', 'replace')}, relaying the "
-                        "429 with headers stripped rather than repeat the "
-                        "401 with nothing changed"
+                        f"{said} — this session already had its bearer "
+                        f"converted for {ident}="
+                        f"{reset.decode('latin1', 'replace')}, relaying "
+                        f"{relay_no} rather than repeat the 401 with "
+                        "nothing changed"
                     )
                     return False
+            if grant:
+                # A REFUSAL IS NOT A WALL: the 401 is owed while the live slot
+                # is not itself inside the refusal bar, which the 401 would
+                # send the client back onto. Once the pin's own bar on the
+                # bearer's slot has lapsed, a straggler is how cswap marks
+                # that slot again: `exclude` names it alone, so cswap marks
+                # it and leaves the live account where it is (no usage
+                # fetch, no probe, no credential write).
+                if _refused_slots.get(slot, 0.0) > time.time():
+                    _log_lifecycle(
+                        f"{said} — the live slot is itself refused, relaying "
+                        f"{relay_no}")
+                    return False
+                if _refused_slots.get(straggler, 0.0) <= time.time():
+                    try:
+                        require("switcher").ClaudeAccountSwitcher().switch(
+                            strategy="best", json_output=True,
+                            models=("all",), current_refused=True,
+                            exclude=_mark_refused(straggler))
+                    except Exception as exc:  # noqa: BLE001 — never break the relay
+                        _log_lifecycle(
+                            f"{said} — marking slot {straggler} again raised "
+                            f"{exc.__class__.__name__}")
             # NOT KNOWN WALLED, AND ONLY THEN. `_walled_slots` is this
             # daemon's own record of a wall it saw directly; `headroom`
             # below can now also read `0.0` from cswap's OWN persisted wall
@@ -22200,7 +22392,7 @@ def _switch_off_walled_account(
             # later than this record's clear time, so one extra switch() can
             # still run across a pin-recorded clear -- at most 2 per key per
             # `_WALLED_SWITCH_RAISE_TTL`.
-            walled = _walled_slots.get(slot, 0.0) > time.time()
+            walled = not grant and _walled_slots.get(slot, 0.0) > time.time()
             if walled:
                 cap_epoch = _walled_slots.get(slot)
             # UNKNOWN HEADROOM NO LONGER FAILS CLOSED HERE. It used to: a
@@ -22215,7 +22407,7 @@ def _switch_off_walled_account(
             # reading exactly as it would on a good one, and a KNOWN wall
             # (this daemon's own, or cswap's persisted one) still fails
             # closed via `headroom <= 0`.
-            headroom = (None if walled else
+            headroom = (None if walled or grant else
                         _cached_live_account_headroom(reset, slot))
             if not walled and (headroom is None or headroom > 0):
                 # `:.3g`, NOT `:.0f`. The band this branch is least obvious in
@@ -22223,11 +22415,11 @@ def _switch_off_walled_account(
                 # relaying a 401" there -- the only post-hoc evidence
                 # contradicting the decision it was recording.
                 _log_lifecycle(
-                    "429 on /v1/messages — the client's bearer is no longer "
+                    f"{said} — the client's bearer is no longer "
                     "the live account, which has "
                     + (f"{headroom:.3g}% headroom"
                        if headroom is not None else "no reading yet, but is "
-                       "not known walled")
+                       f"not known {'refused' if grant else 'walled'}")
                     + "; relaying a 401 so the client rebuilds onto it, "
                     "without switching"
                 )
@@ -22253,8 +22445,10 @@ def _switch_off_walled_account(
                 # The live slot was just judged able to take a retry (known
                 # headroom, or unknown but not known walled) — a stale
                 # exhausted verdict from an earlier wall must not survive
-                # this, since the fleet is not, in fact, known exhausted.
-                _fleet_exhausted_until = 0.0
+                # this, since the fleet is not, in fact, known exhausted. A
+                # refusal says nothing about the fleet's walls.
+                if not grant:
+                    _fleet_exhausted_until = 0.0
                 return True
         # THE WALL ITSELF, RECORDED — only for a 429 whose bearer is the
         # live slot's OWN token: a bearer-branch 429 (handled above) is
@@ -22270,7 +22464,8 @@ def _switch_off_walled_account(
         # is set ONLY by the walled branch above (`_walled_slots[slot]`, the
         # LIVE slot's own already-known clear time); every other path keeps
         # main's full `_WALLED_SWITCH_RAISE_TTL` negative.
-        if slot is not None and token and live and token == live and not stale:
+        if (not grant and slot is not None and token and live
+                and token == live and not stale):
             try:
                 _walled_slots[slot] = float(reset)
             except ValueError:
@@ -22305,10 +22500,23 @@ def _switch_off_walled_account(
             # `models` parameter, so the TypeError lands in the except below
             # and relays the 429, exactly as a missing symbol did.
             switch_kwargs = dict(
-                strategy="best", json_output=True,
-                current_at_limit=True, models=("all",),
+                strategy="best", json_output=True, models=("all",),
             )
-            if _switch_takes_exclude():
+            if grant:
+                # A REFUSAL, NOT A WALL: the host marks every slot in
+                # `exclude` and ranks the live one, which is among them, at
+                # zero. `current_at_limit` would mark them at-limit, and
+                # `_walled_slots` would bar the walled slots and leave the
+                # refused one unmarked. `exclude` is every slot the pin saw
+                # refused inside the bar, so a fleet where all of them
+                # refuse answers `switched: false` and the 403 stays a 403:
+                # cswap's own bar releases when nothing else is left and
+                # would land back on a refused account.
+                switch_kwargs.update(
+                    current_refused=True, exclude=_mark_refused(slot))
+            else:
+                switch_kwargs["current_at_limit"] = True
+            if not grant and _switch_takes_exclude():
                 now = time.time()
                 for expired in [s for s, exp in _walled_slots.items()
                                  if exp <= now]:
@@ -22317,11 +22525,11 @@ def _switch_off_walled_account(
             result = switcher.ClaudeAccountSwitcher().switch(**switch_kwargs)
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
             _log_lifecycle(
-                f"429 on /v1/messages — the at-limit switch raised "
-                f"{exc.__class__.__name__}, relaying the 429 with headers "
-                f"stripped"
+                f"{said} — the {'refusal' if grant else 'at-limit'} switch raised "
+                f"{exc.__class__.__name__}, relaying {relay_no}"
             )
-            _fleet_exhausted_until = 0.0
+            if not grant:
+                _fleet_exhausted_until = 0.0
             _remember_walled_switch(key, False, cap_epoch)
             return False
         # THE FLEET FACT, decided for every `switch()` verdict on this wall
@@ -22332,7 +22540,9 @@ def _switch_off_walled_account(
         # particular switch failed (see `_fleet_earliest_provable_reset`);
         # any other reason, or a landed switch, means the fact does not
         # hold and the memo clears.
-        if result.get("reason") == "candidates-exhausted":
+        if grant:
+            pass  # a refusal says nothing about the fleet's walls
+        elif result.get("reason") == "candidates-exhausted":
             earliest, all_provable = _fleet_earliest_provable_reset()
             if earliest is None:
                 _fleet_exhausted_until = 0.0
@@ -22372,21 +22582,22 @@ def _switch_off_walled_account(
         ok = landed and validated is True
         if landed and not ok:
             _log_lifecycle(
-                "429 on /v1/messages — switch landed but the host did not "
+                f"{said} — switch landed but the host did not "
                 "validate the landing credential "
                 f"(validated {'absent' if validated is None else validated}), "
-                "relaying the 429 with headers stripped"
+                f"relaying {relay_no}"
             )
         else:
             _log_lifecycle(
-                "429 on /v1/messages — walled account switched off, relaying "
-                "a 401"
+                f"{said} — "
+                f"{'refused account' if grant else 'walled account'} "
+                "switched off, relaying a 401"
                 if ok else
-                f"429 on /v1/messages — switch() reported switched="
+                f"{said} — switch() reported switched="
                 f"{result.get('switched') if result else None} needsLogin="
                 f"{result.get('needsLogin') if result else None} "
                 f"reason={result.get('reason') if result else None}, "
-                f"relaying the 429 with headers stripped"
+                f"relaying {relay_no}"
             )
         _remember_walled_switch(key, ok, cap_epoch)
         return ok
@@ -22649,6 +22860,24 @@ def _relay_response(
             _own_reset = None
     else:
         _own_reset = None
+    # AN ACCESS-GRANT 403 on a healthy bearer (2026-10-06, lmd42: 11 relayed
+    # unchanged over 2m22s, every session drawing "Please run /login"). The
+    # same 401 conversion as the wall above, but nothing is stripped on a
+    # failure: `_wall_relay` stays False and the 403 goes out as it came. The
+    # capability is read BEFORE any body is, and the body is read only to
+    # match it, raw bytes kept in `rest` (see `_grant_refusal`).
+    _grant = False
+    if (status_line.startswith(b"HTTP/1.1 403")
+            and (path or "").split("?", 1)[0].rstrip("/") == "/v1/messages"
+            and not _status_has_no_body(status_line, method)
+            and _switch_takes_refused()):
+        rest, _grant = _grant_refusal(up, lines, rest)
+        _token = _bearer(auth)
+        if _grant and _token:
+            _walled_401 = _switch_off_walled_account(
+                b"grant:"
+                + hashlib.sha256(_token.encode()).hexdigest()[:16].encode(),
+                b"", auth, session, kind="grant")
     # The fleet's own reset for an unconverted wall — read ONCE into a
     # local (a concurrent write of 0.0 between two reads of the module
     # global would relay `anthropic-ratelimit-unified-reset: 0`), then
@@ -22689,8 +22918,12 @@ def _relay_response(
         if _TRACE is not None:
             _TRACE.write(
                 f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
-                " (account walled off — relayed as 401 so the client"
-                " rebuilds its credential instead of sleeping on it)\n"
+                + (" (access grant refused — relayed as 401 so the client"
+                   " rebuilds its credential onto the account cswap moved to)"
+                   if _grant else
+                   " (account walled off — relayed as 401 so the client"
+                   " rebuilds its credential instead of sleeping on it)")
+                + "\n"
             )
             _TRACE.flush()
         status_line = b"HTTP/1.1 401 Unauthorized"
