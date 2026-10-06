@@ -13689,8 +13689,8 @@ class TestDrainReportsWhatItCut:
 
         def landing(src):
             if not landed.is_set():
-                landed.set()
                 _PUMP.release_pairs()
+                landed.set()          # AFTER, or the next `add` beats the release
             return real(src)
 
         monkeypatch.setattr(pp, "_drain_ready", landing)
@@ -13707,6 +13707,11 @@ class TestDrainReportsWhatItCut:
             assert len(ended) == 1, (
                 f"`on_close` ran {len(ended)} times for one pair: {ended!r}")
         finally:
+            # RELEASE BEFORE THE RESET: `reset_for_tests` forgets the pair but
+            # leaves its sockets' selector keys, and a later test whose new
+            # socket reuses a closed fd number then has `add` swallow the
+            # KeyError and close its pair, so the tunnel never opens.
+            _PUMP.release_pairs()
             _PUMP.reset_for_tests()
             for s_ in (feed, a, b, sink, feed2, c, d, sink2):
                 s_.close()
@@ -13749,16 +13754,15 @@ class TestDrainReportsWhatItCut:
             proxy.stop()
             up.stop()
 
-    def case_a_released_pair_with_unread_bytes_still_reads_EOF_to_its_peer(
-            self):
+    def case_a_released_pair_with_unread_bytes_ends_its_peers_read(self):
         """WHAT THE PEER SEES when the released socket held unread inbound
         bytes, measured and not assumed. No pump thread runs, so nothing reads
         what the peer sent and it is unread by construction.
 
-        Asserted: a peer that reads gets EOF, which holds on every platform.
-        NOT asserted: the RST that follows on Linux (see `release_pairs`),
-        because whether macOS reports it as EOF or as a reset is measured
-        there, separately."""
+        Asserted: the peer's read ENDS, as b"" (Linux) or as
+        ConnectionResetError (macOS), the two outcomes `release_pairs` records.
+        NOT asserted which: it is the RST that follows the FIN, and the two
+        platforms report it differently."""
         import select
         from cswap_pin.proxy import _PumpLoop
 
@@ -13783,13 +13787,18 @@ class TestDrainReportsWhatItCut:
             assert loop.release_pairs("bridge") == 1
             assert s.fileno() == -1, "the pair was left open"
             peer.settimeout(5)
-            assert peer.recv(4096) == b"", "the peer did not read EOF"
+            try:
+                assert peer.recv(4096) == b"", "the peer read data"
+            except ConnectionResetError:
+                pass                          # macOS: the RST after the FIN
         finally:
-            for s_ in (s, u, peer, far):
+            for s_ in (s, u, peer, far, loop._wake_r, loop._wake_w):
                 s_.close()
+            loop._sel.close()
 
     def case_a_drain_does_not_cut_the_subscription(self, certdir):
-        """The channel a session cannot reopen for itself must survive a recycle.
+        """A held-open subscription must survive a recycle: the drain does not
+        cut it (only `release_idle_streams` ends a content-free one).
 
         A drain used to close every held-open `/worker/events/stream` on the
         grounds that it never completes, so waiting for it waits for ever. The
@@ -20701,7 +20710,8 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
     in the window where a spurious 404 ends it.
 
     The successor already holds the listener, so a released client reconnects
-    at once -- `handleStreamEnd` backs off 1s and carries `from_sequence_num`.
+    to it: the worker stream's `handleConnectionError` waits about 1 s (+-25%,
+    doubling to a 30 s cap) and carries `from_sequence_num` and `Last-Event-ID`.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -20748,9 +20758,9 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
         assert a.recv(1) == b"x"
 
     def case_the_threshold_is_the_CLIENTS_OWN(self, certdir):
-        """45s is `dn` in the 2.1.245 bundle, the liveness timeout the client
-        re-arms on every frame. If this drifts from what the client does, we
-        are cutting streams it would have kept."""
+        """45s is the client's default liveness window (2.1.290), re-armed on
+        every parsed frame. Here it is the drain's content-free threshold, not
+        a time at which the client drops a stream."""
         from cswap_pin import proxy as pp
         assert pp._CLIENT_LIVENESS_SECONDS == 45.0
 
@@ -20786,6 +20796,7 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
                             upstream=("127.0.0.1", upstream.port))
         proxy.start()
+        raw = tls = None
         try:
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
             raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
@@ -20810,6 +20821,9 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
                 proxy._content_at[conn] = time.monotonic() - age
             yield proxy, upstream, tls
         finally:
+            for s_ in (tls, raw):
+                if s_ is not None:
+                    s_.close()
             proxy.stop()
             upstream.stop()
 
@@ -20825,7 +20839,15 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
         from cswap_pin import proxy as pp
         with self._mitm_stream(
                 certdir, pp._CLIENT_LIVENESS_SECONDS + 5) as (proxy, up, tls):
+            with proxy._live_lock:
+                (served,) = proxy._stream_tls.values()
             assert proxy.release_idle_streams() == 1
+            # `SSLSocket.shutdown` nulls `_sslobj` on the object the serving
+            # thread writes through: a send past its check raises, and one
+            # between the null and the syscall goes out as plaintext.
+            assert served._sslobj is not None, (
+                "the release shut down through the TLS object the serving "
+                "thread is writing to")
             up.release.set()    # a stream NOT shut down delivers its 2nd event
             assert tls.recv(4096) == b"", "the client was not given an EOF"
 
