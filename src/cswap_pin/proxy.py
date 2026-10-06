@@ -22205,6 +22205,8 @@ def _switch_off_walled_account(
     said = ("403 access-grant refusal" if grant else "429") + " on /v1/messages"
     relay_no = "the 403 unchanged" if grant else "the 429 with headers stripped"
     ident = "refusal key" if grant else "wall reset"
+    sess = (" session=" + hashlib.sha256(session.encode()).hexdigest()[:12]
+            if session else " session=-")
     if not reset:
         _log_lifecycle(
             "429 on /v1/messages — no reset header, not an account-level "
@@ -22382,7 +22384,7 @@ def _switch_off_walled_account(
                         f"converted for {ident}="
                         f"{reset.decode('latin1', 'replace')}, relaying "
                         f"{relay_no} rather than repeat the 401 with "
-                        "nothing changed"
+                        f"nothing changed{sess}"
                     )
                     return False
             if grant:
@@ -22451,7 +22453,7 @@ def _switch_off_walled_account(
                        if headroom is not None else "no reading yet, but is "
                        f"not known {'refused' if grant else 'walled'}")
                     + "; relaying a 401 so the client rebuilds onto it, "
-                    "without switching"
+                    f"without switching{sess}"
                 )
                 # RECORD A NEGATIVE, RETURN TRUE: this request gets its 401
                 # and the next 429 on this wall does not, until the entry

@@ -21107,6 +21107,33 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         assert got == self._untouched(auth=other, session="s3")
         assert not log, log
 
+    def case_the_old_bearer_log_lines_name_the_session(self, monkeypatch):
+        """Both texts end in `session=<sha256(session)[:12]>`, the same
+        field `bearer=` uses, so a reader can tell one session's repeat from
+        another's; the substrings trace_fold greps stay."""
+        import hashlib
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        self._wire(monkeypatch)
+        old = "Bearer some-old-account-token"
+
+        def sid(s):
+            return " session=" + hashlib.sha256(s.encode()).hexdigest()[:12]
+
+        def lines():
+            return [x for x in logged if "403 access-grant refusal" in x]
+
+        assert self._r403(auth=old, session="s1").startswith(b"HTTP/1.1 401")
+        assert self._r403(auth=old, session="s1").startswith(b"HTTP/1.1 403")
+        assert self._r403(auth=old, session="s2").startswith(b"HTTP/1.1 401")
+        a1, b1, a2 = lines()
+        assert "relaying a 401" in a1 and a1.endswith(sid("s1")), a1
+        assert "already had its bearer converted for" in b1
+        assert "relaying the 403 unchanged" in b1 and b1.endswith(sid("s1")), b1
+        assert "relaying a 401" in a2 and a2.endswith(sid("s2")), a2
+        assert sid("s1") != sid("s2")
+
     def case_an_old_bearer_with_no_session_shares_one_401_and_then_403s(
         self, monkeypatch,
     ):
