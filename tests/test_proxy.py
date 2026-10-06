@@ -4315,14 +4315,16 @@ class TestAHeldDaemonThatStoppedAccepting:
             self._ev.set()
 
     def _drive(self, tmp_path, monkeypatch, answer_pid=None, bound=0.4,
-               drain=False):
+               drain=False, probe=0.1, confirm=0.1, delay=0.0):
         """A holder over a real socket whose first daemon is `_Proc(4242)`.
         Returns (holder, log): `log` lists every spawn and terminate, in order.
         `answer_pid` makes a thread serve `/health` with that pid, so the
         daemon reads as healthy, or a callable giving the pid of each probe's
         answer (None: an answer that names no pid). `bound` is the silence
         that recycles. `drain` makes the first daemon outlive its
-        `terminate()` until `exit()`, as a real one does through its drain."""
+        `terminate()` until `exit()`, as a real one does through its drain.
+        `probe` and `confirm` are the port watch's two probe timeouts, and
+        `delay` how long each `/health` answer takes (a loaded host)."""
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PortHolder, ensure_ca
 
@@ -4330,9 +4332,8 @@ class TestAHeldDaemonThatStoppedAccepting:
         log = []
         monkeypatch.setattr(pin_proxy, "_CODE_WATCH_INTERVAL_S", 0.1)
         monkeypatch.setattr(pin_proxy, "_CODE_WATCH_BEAT_MAX_AGE_S", bound)
-        real_health_pid = pin_proxy._health_pid
-        monkeypatch.setattr(pin_proxy, "_health_pid",
-                            lambda port: real_health_pid(port, timeout=0.1))
+        monkeypatch.setattr(pin_proxy, "_PORT_WATCH_PROBE_S", probe)
+        monkeypatch.setattr(pin_proxy, "_PORT_WATCH_CONFIRM_S", confirm)
 
         def _spawn(self):
             log.append("spawn")
@@ -4346,6 +4347,20 @@ class TestAHeldDaemonThatStoppedAccepting:
         monkeypatch.setattr(PortHolder, "_reap_standby", lambda self: None)
         holder = PortHolder(tmp_path, "1", "a@b.c")
         if answer_pid is not None:
+            def _answer(conn):
+                # A thread per connection, as the daemon has: a probe that
+                # gave up leaves its connection behind, and a serial server
+                # would answer the next probe late for that reason alone.
+                with conn:
+                    try:
+                        conn.recv(4096)
+                        time.sleep(delay)
+                        pid = answer_pid() if callable(answer_pid) else answer_pid
+                        conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n"
+                                     + json.dumps({"pid": pid}).encode())
+                    except OSError:
+                        pass  # the probe timed out and closed
+
             def _serve():
                 holder._srv.settimeout(0.1)
                 while not holder._stop:
@@ -4353,11 +4368,8 @@ class TestAHeldDaemonThatStoppedAccepting:
                         conn, _ = holder._srv.accept()
                     except OSError:
                         continue
-                    with conn:
-                        conn.recv(4096)
-                        pid = answer_pid() if callable(answer_pid) else answer_pid
-                        conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n"
-                                     + json.dumps({"pid": pid}).encode())
+                    threading.Thread(
+                        target=_answer, args=(conn,), daemon=True).start()
             threading.Thread(target=_serve, daemon=True).start()
         holder._spawn()
         holder._thread = threading.Thread(target=holder._supervise, daemon=True)
@@ -4411,7 +4423,9 @@ class TestAHeldDaemonThatStoppedAccepting:
             self, tmp_path, monkeypatch):
         import itertools
 
-        seq = itertools.cycle([None, 4243])
+        # Three long, not two: the confirming probe before the cut is a call
+        # of its own, and an even cycle would hand it the foreign pid every time.
+        seq = itertools.cycle([None, 4243, None])
         holder, log = self._drive(tmp_path, monkeypatch,
                                   answer_pid=lambda: next(seq))
         try:
@@ -4421,6 +4435,143 @@ class TestAHeldDaemonThatStoppedAccepting:
                 f"silence: {log}")
         finally:
             holder.stop()
+
+    def case_a_slow_health_answer_is_not_silence(self, tmp_path, monkeypatch):
+        """T1935: on a loaded host (wmac, 2026-10-06: one `/health` reply took
+        1007 ms against 1.0 s) a daemon that still accepts and serves answered
+        `/health` late, the port watch's 1.0 s probe read each late answer as
+        silence, and four live daemons were retired through a capped drain.
+        Each answer here takes 1.5 s, past that 1.0 s and well inside the
+        probe's timeout."""
+        holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4242,
+                                  delay=1.5, probe=3.0, confirm=3.0)
+        try:
+            self._until(lambda: "terminate 4242" in log, 4)  # ten bounds
+            assert log == ["spawn"], (
+                f"a daemon answering /health in 1.5 s was replaced as "
+                f"wedged: {log}")
+        finally:
+            holder.stop()
+
+    def case_the_last_long_ask_spares_a_daemon_the_probes_missed(
+            self, tmp_path, monkeypatch):
+        """Every ordinary probe times out before the 1.5 s answer, so the
+        silence bound passes; the one confirming probe, which waits longer, is
+        answered by the daemon itself and that clears the silence."""
+        holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4242,
+                                  delay=1.5, probe=0.5, confirm=3.0)
+        try:
+            self._until(lambda: "terminate 4242" in log, 4)
+            assert log == ["spawn"], (
+                f"a daemon that answered the confirming probe was replaced: "
+                f"{log}")
+        finally:
+            holder.stop()
+
+    def case_CONTROL_an_answer_later_than_both_timeouts_is_replaced(
+            self, tmp_path, monkeypatch):
+        """The two cases above with both timeouts shorter than the answer:
+        the same daemon is replaced, so the timeouts spared it there."""
+        holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4242,
+                                  delay=1.5, probe=0.5, confirm=0.5)
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            assert log == ["spawn", "spawn", "terminate 4242"], log
+        finally:
+            holder.stop()
+
+    def case_CONTROL_a_listener_that_never_replies_is_replaced_in_the_bound(
+            self, tmp_path, monkeypatch):
+        """With the loaded-host timeouts a daemon that accepts and never
+        replies (a stopped one looks the same: the kernel completes the
+        handshake) is still replaced successor first, within the bound
+        `_PORT_WATCH_PROBE_S` documents: the silence bound rounded up to whole
+        (interval + probe) laps, one more lap, then the confirming probe."""
+        import math
+
+        bound, lap, confirm = 0.4, 0.1 + 0.3, 1.0
+        holder, log = self._drive(tmp_path, monkeypatch, answer_pid=4242,
+                                  delay=5.0, bound=bound, probe=0.3,
+                                  confirm=confirm)
+        began = time.monotonic()
+        try:
+            self._until(lambda: "terminate 4242" in log, 10)
+            took = time.monotonic() - began
+            assert log == ["spawn", "spawn", "terminate 4242"], log
+            limit = (1 + math.ceil(bound / lap)) * lap + confirm
+            assert took <= limit + 2.0, (
+                f"replaced after {took:.1f}s, past the stated bound "
+                f"{limit:.1f}s (+2 s of scheduling)")
+        finally:
+            holder.stop()
+
+    def _exit_during_probe(self, tmp_path, monkeypatch, nth, confirm):
+        """An at-bound lap whose `nth` `/health` probe is one nobody accepts
+        on (it hangs for its timeout and reads None, as a held listener does
+        once its daemon is gone) and the daemon EXITS inside that probe.
+        Probe 1 starts the silence; probe 2 is the lap that reaches the bound
+        and probe 3 is the confirming one. Returns (holder, log, calls), with
+        `calls` the timeout of every probe asked."""
+        from cswap_pin import proxy as pin_proxy
+
+        calls = []
+
+        def _hang(port, timeout):
+            calls.append(timeout)
+            if len(calls) == nth:
+                holder._proc.exit()
+            time.sleep(timeout)
+            return None
+
+        monkeypatch.setattr(pin_proxy, "_health_pid", _hang)
+        holder, log = self._drive(tmp_path, monkeypatch, bound=0.3,
+                                  probe=0.3, confirm=confirm)
+        return holder, log, calls
+
+    def case_a_daemon_that_exited_in_the_at_bound_probe_is_not_asked_again(
+            self, tmp_path, monkeypatch):
+        """T1935 review: the exit is read before the confirming probe, which
+        would otherwise run its whole 3.0 s on a listener nobody accepts on,
+        and then replace the already-exited daemon as wedged."""
+        holder, log, calls = self._exit_during_probe(
+            tmp_path, monkeypatch, nth=2, confirm=3.0)
+        try:
+            self._until(lambda: len(log) > 1, 2.0)
+            assert log == ["spawn", "spawn"], (
+                f"an exit during the at-bound probe was not respawned "
+                f"promptly, or the dead daemon was replaced as wedged: {log}")
+            assert calls == [0.3, 0.3], (
+                f"the confirming probe was asked of an exited daemon: {calls}")
+        finally:
+            holder.stop()
+
+    def case_a_daemon_that_exited_in_the_confirming_probe_is_not_replaced(
+            self, tmp_path, monkeypatch):
+        """The same exit, inside the confirming probe: its None is not read as
+        a wedge. CONTROL: the confirming probe WAS asked (`calls`), so the
+        exit landed in it. The exit's own branch (75: a successor was asked
+        for) zeroes `_failures`; a wedge replace leaves it alone."""
+        holder, log, calls = self._exit_during_probe(
+            tmp_path, monkeypatch, nth=3, confirm=0.5)
+        holder._failures = 2
+        try:
+            self._until(lambda: len(log) > 1, 4.0)
+            assert calls[:3] == [0.3, 0.3, 0.5], calls
+            assert log == ["spawn", "spawn"] and holder._failures == 0, (
+                f"a daemon that exited during the confirming probe was "
+                f"replaced as wedged, not read as an exit: {log}, "
+                f"failures {holder._failures}")
+        finally:
+            holder.stop()
+
+    def case_the_shipped_timeouts_outlast_a_loaded_hosts_answer(self):
+        from cswap_pin import proxy as pin_proxy
+
+        probe = pin_proxy._PORT_WATCH_PROBE_S
+        confirm = pin_proxy._PORT_WATCH_CONFIRM_S
+        assert probe >= 3.0 and confirm >= 10.0, (
+            f"probe {probe} s / confirm {confirm} s are not past a loaded "
+            f"host's /health (the 1.0 s that cut four live daemons)")
 
     def case_the_daemons_own_answer_resets_the_silence(
             self, tmp_path, monkeypatch):
