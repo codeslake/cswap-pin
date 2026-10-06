@@ -13761,9 +13761,10 @@ class TestDrainReportsWhatItCut:
 
         Asserted: the peer's read ENDS, as b"" (Linux) or as
         ConnectionResetError (macOS), the two outcomes `release_pairs` records.
-        NOT asserted which: it is the RST that follows the FIN, and the two
-        platforms report it differently."""
+        A reset is accepted on macOS only: on Linux it means the release closed
+        without the SHUT_WR."""
         import select
+        import sys
         from cswap_pin.proxy import _PumpLoop
 
         def tcp_pair():
@@ -13790,7 +13791,11 @@ class TestDrainReportsWhatItCut:
             try:
                 assert peer.recv(4096) == b"", "the peer read data"
             except ConnectionResetError:
-                pass                          # macOS: the RST after the FIN
+                # macOS reports the RST after the FIN; on Linux the same reset
+                # is a bare close with no SHUT_WR.
+                assert sys.platform == "darwin", (
+                    "the peer was reset: the release closed without the "
+                    "SHUT_WR that gives it a FIN first")
         finally:
             for s_ in (s, u, peer, far, loop._wake_r, loop._wake_w):
                 s_.close()
@@ -13877,8 +13882,8 @@ class TestDrainReportsWhatItCut:
                     got = None            # still open — nothing cut it
                 assert got is None, (
                     "the drain closed a held-open subscription. That is the "
-                    "channel claude.ai pushes through, and the session cannot "
-                    "reopen it for itself")
+                    "channel claude.ai pushes through, and only "
+                    "`release_idle_streams` may end a content-free one")
             finally:
                 for s_ in (e, f):
                     try:
@@ -20757,7 +20762,8 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
         b.send(b"x")                              # still a live socket
         assert a.recv(1) == b"x"
 
-    def case_the_threshold_is_the_CLIENTS_OWN(self, certdir):
+    def case_the_content_free_threshold_is_the_clients_liveness_window(
+            self, certdir):
         """45s is the client's default liveness window (2.1.290), re-armed on
         every parsed frame. Here it is the drain's content-free threshold, not
         a time at which the client drops a stream."""
@@ -20840,12 +20846,14 @@ class TestADrainHandsStreamsOverInsteadOfOutlivingThem:
         with self._mitm_stream(
                 certdir, pp._CLIENT_LIVENESS_SECONDS + 5) as (proxy, up, tls):
             with proxy._live_lock:
-                (served,) = proxy._stream_tls.values()
+                # `getattr`: the base has no `_stream_tls`, and this case must
+                # reach the EOF assertion there rather than die on the read.
+                served = list(getattr(proxy, "_stream_tls", {}).values())
             assert proxy.release_idle_streams() == 1
             # `SSLSocket.shutdown` nulls `_sslobj` on the object the serving
             # thread writes through: a send past its check raises, and one
             # between the null and the syscall goes out as plaintext.
-            assert served._sslobj is not None, (
+            assert all(s_._sslobj is not None for s_ in served), (
                 "the release shut down through the TLS object the serving "
                 "thread is writing to")
             up.release.set()    # a stream NOT shut down delivers its 2nd event

@@ -17189,8 +17189,7 @@ class PinProxy:
                 f"draining with {streams} long-lived channel(s) still open at "
                 f"the start — {drain_fate(budget)}. This count is not "
                 f"re-printed; `.draining-{os.getpid()}` carries the live one"
-                + (f"; handed {handed} content-free stream(s) to the successor;"
-                   " each client reconnects to it from its last event"
+                + (f"; handed {handed} content-free stream(s) to the successor"
                    if handed else ""))
         beat_draining(self._certdir, owed=self.inflight_requests(),
                       live=self.live_replies(started),
@@ -17477,11 +17476,13 @@ class PinProxy:
         answer. The wait protects nothing -- the successor already holds the
         listener, so the client lands on it when it reconnects.
 
-        WHAT THE CLIENT DOES WITH THE RELEASE (2.1.290). The worker stream
-        (class `Hpn`) logs "SSETransport: Stream ended, reconnecting" on a
-        clean end and `handleConnectionError` reconnects after 1 s +-25%
-        (doubling to a 30 s cap, no retry limit), carrying `from_sequence_num`
-        and `Last-Event-ID` = the last sequence seen, so no event is lost. It
+        WHAT THE CLIENT DOES WITH THE RELEASE (2.1.290). The release is a bare
+        FIN, with no close_notify and no chunked terminator. The worker stream
+        (class `Hpn`) takes a clean end or a read error alike to
+        `handleConnectionError` (its catch returns early only when the stream
+        was aborted or renewed), which reconnects after 1 s +-25% (doubling to
+        a 30 s cap, no retry limit), carrying `from_sequence_num` and
+        `Last-Event-ID` = the last sequence seen, so no event is lost. It
         closes the session only if that reconnect gets a 401, 403 or 404. The
         release CAUSES that reconnect: a stream carrying pings was not about to
         be dropped, because every parsed frame re-arms the client's liveness
