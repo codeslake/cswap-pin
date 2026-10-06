@@ -7139,6 +7139,17 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 "the pin answers as itself again -- resuming normal "
                 "pin splicing")
 
+    def _blind(reason: str) -> None:
+        """`provider.blind_reason = reason`, except that the tick writes no
+        FAILURE text. The field is shared: a request reads it after its own
+        call returned None, and `/health` shows it, so `freshen` (which "says
+        nothing when it fails") must not set one. It still clears: a tick
+        that holds a live token is the one thing that clears a stale reason
+        on an idle daemon with self-heal off, and `runtime_health` fails
+        `pin-applied` on any."""
+        if not reason or not provider._tls.quiet:
+            provider.blind_reason = reason
+
     def _identity_ok(token: str, mail: str) -> bool:
         """THE INVARIANT: the pin never splices a bearer whose identity is
         not the pin's. Keyed on (token, mail) -- the token cache's OWN key,
@@ -7180,7 +7191,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             _set_identity({"pinned": _ref(mail), "bearer": bearer_ref})
             provider._tls.foreign = True
             who = (bearer_ref or {}).get("email") or (bearer_ref or {}).get("uuid")
-            provider.blind_reason = (
+            _blind(
                 f"the pinned slot's credential answers as {who}, not "
                 f"the pin ({mail})")
             return False
@@ -7239,6 +7250,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # unrelated failure (the store going unreadable) is never masked by
         # a foreign verdict this same provider gave on some earlier call.
         provider._tls.foreign = False
+        provider._tls.quiet = freshen
         target = _current_target()
         if target is None:
             return None
@@ -7290,7 +7302,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return None
         bypass = False
         if cached is not None:
-            provider.blind_reason = ""
+            _blind("")
             token = live
             if token:
                 if f"Bearer {token}" == refused:
@@ -7337,7 +7349,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         # one request instead. See `_MINT_LOCK_BOUND_S`.
         if not refresh_lock.acquire(timeout=_MINT_LOCK_BOUND_S):
             _stalled.flag = True
-            provider.blind_reason = (
+            _blind(
                 f"mint stalled: the refresh lock has been held over "
                 f"{_MINT_LOCK_BOUND_S:.0f}s for slot {num} ({mail}) -- a "
                 "stuck credential read or refresh, not a broken pin")
@@ -7368,7 +7380,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 fresh = None
             token = _live_token(fresh) if fresh is not None else None
             if token:
-                provider.blind_reason = ""
+                _blind("")
             elif fresh is not None and fresh is not cached:
                 # A RACING THREAD ROTATED THIS SLOT WHILE WE QUEUED, but its
                 # rotation carries no live token (no `accessToken`, or an
@@ -7381,7 +7393,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # it now would refresh a second time with the same
                 # already-consumed one-time token.
                 creds = fresh
-                provider.blind_reason = (
+                _blind(
                     f"no usable token after a racing refresh for slot "
                     f"{num} ({mail})")
             else:
@@ -7389,6 +7401,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # cold-cache case above and this IS the first read — either way
                 # the read happens here, under the lock.
                 creds = switcher.read_account_credentials(num, mail) or creds
+                if freshen and not _live_token(creds):
+                    # THE EARLY REFRESH IS FOR THE LIVE TOKEN IN HAND (`cached`
+                    # is live: the early return above). A store older than it
+                    # is no rotation to adopt: replacing the held copy would
+                    # leave the tick with no live token, so it would run the
+                    # ON-DEMAND refresh below -- a deferral, an 'unpinned' line
+                    # with no request out, and `can_pin_cached` false.
+                    creds = cached
                 if not creds:
                     # SAY WHICH SLOT, or "could not be read" is unfalsifiable. An
                     # empty read and a read of the WRONG slot are indistinguishable
@@ -7397,11 +7417,16 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # place that knows what it asked for.
                     provider.blind_reason = f"no credential for slot {num} ({mail})"
                     return None
-                provider.blind_reason = ""
+                token = _live_token(creds)
+                if token or not freshen:
+                    # THE TICK CLEARS ONLY WITH A LIVE TOKEN IN HAND: the lock
+                    # wait can carry the clock past the buffer, and a request
+                    # that took the lock meanwhile may have failed its refresh
+                    # and written its reason. That one is the request's.
+                    _blind("")
                 # REPLACE THE HELD COPY, or the cache keeps handing back the
                 # expired blob and every later request re-enters this lock.
                 _cred_cache[ckey] = creds
-                token = _live_token(creds)
                 if token and freshen and _freshen_due(creds):
                     # THROUGH THE SAME GATE, QUIETLY: no `blind_reason` (the
                     # token in hand is live, and `runtime_health` fails
@@ -7416,7 +7441,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     if rotated:
                         _cred_cache[ckey] = rotated
                         token = _live_token(rotated) or token
-                if not token:
+                if not token and not freshen:
+                    # NEVER THE TICK'S: the lock wait and the store read can
+                    # carry the wall clock past the liveness buffer, so `token`
+                    # can be None here under `freshen`. This refresh is the
+                    # request path's, with its deferral and `blind_reason`.
+                    #
                     # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error`
                     # already classifies this -- `invalid_grant` means the
                     # lineage is dead and only a person can fix it, `transient`

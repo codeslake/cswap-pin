@@ -15751,7 +15751,7 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             lambda token: {"emailAddress": "pin@example.com"})
         rig = types.SimpleNamespace(
             now=1_800_000_000.0, calls=[], during=[], reads=[], lines=[],
-            at_call=[], skew=0.0)
+            at_call=[], skew=0.0, on_read=None)
 
         class _Host(_dt.datetime):
             @classmethod
@@ -15785,6 +15785,8 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             def resolve_account(self, i): return ("2", "pin@example.com", "org")
             def read_account_credentials(self, n, e):
                 rig.reads.append(1)
+                if rig.on_read:
+                    rig.on_read()
                 return rig.stored
             def consume_backup_grant(self, n, e, snap):
                 rig.calls.append(snap)
@@ -16028,6 +16030,132 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         assert rig.provider.pin_is_noop() is False
         assert not [ln for ln in rig.lines if "went out unpinned" in ln]
         assert rig.provider.can_pin_cached() is True
+
+    def case_a_live_due_copy_is_not_replaced_by_a_store_read_that_is_not_live(
+            self, certdir, monkeypatch):
+        """The held copy is live and due and the store is OLDER than it (an
+        expired blob, or one inside the liveness buffer). Adopting that read
+        left the tick with no live token, so it ran the ON-DEMAND refresh: a
+        deferral and an 'unpinned' line with no request out, a `blind_reason`,
+        and `can_pin_cached` false across a window the held token covers. The
+        early refresh runs on the held copy and leaves it in place."""
+        for outcome, stored_minutes in (("transient", -10), ("consume-busy", 2)):
+            label = f"{outcome}, store with {stored_minutes} min"
+            rig = self._rig(certdir, monkeypatch, outcome=outcome)
+            # A blob of its own, so `rig.calls` says which copy was refreshed.
+            rig.stored = json.dumps({"claudeAiOauth": {
+                "accessToken": "stale", "refreshToken": "rt-stale",
+                "expiresAt": int((rig.now + stored_minutes * 60) * 1000)}})
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.calls) == 1, f"{label}: {len(rig.calls)} refreshes"
+            assert "rt-old" in rig.calls[0] and "rt-stale" not in rig.calls[0], (
+                f"{label}: the refresh ran on the store's blob, not the held "
+                f"copy: {rig.calls[0]}")
+            assert rig.provider.can_pin_cached() is True, label
+            assert rig.provider.pin_is_noop() is False, label
+            assert rig.provider.blind_reason == "", (
+                f"{label}: {rig.provider.blind_reason}")
+            assert not [ln for ln in rig.lines if "went out unpinned" in ln], (
+                label, rig.lines)
+            # THE HELD COPY IS STILL THE CACHED ONE: a bare read answers from
+            # it, where a replaced entry would go back to the (dead) store.
+            reads = len(rig.reads)
+            assert rig.provider() == "old", label
+            assert len(rig.reads) == reads, f"{label}: the cache was replaced"
+
+    def case_a_failing_freshen_writes_no_failure_reason(
+            self, certdir, monkeypatch):
+        """`blind_reason` is shared: the request path reads it after its own
+        `provider()` returned None, and `runtime_health` fails `pin-applied`
+        on any. The "rotated token is foreign" row guards the mute: the
+        finding itself still reaches `identity_mismatch`, and the tick writes
+        no reason for it. The two quiet-arm rows (`transient`,
+        `consume-busy`) are retained guards of behavior that already held:
+        the quiet refresh never wrote one."""
+        from cswap_pin import proxy as pp
+
+        for label, outcome, foreign in (
+                ("refresh transient", "transient", False),
+                ("refresh busy", "consume-busy", False),
+                ("rotated token is foreign", "ok", True)):
+            rig = self._rig(certdir, monkeypatch, outcome=outcome)
+            if foreign:
+                monkeypatch.setattr(pp, "pin_profile_for", lambda token: {
+                    "emailAddress": ("other@example.com" if token == "new"
+                                     else "pin@example.com")})
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.calls) == 1, f"{label}: {len(rig.calls)} refreshes"
+            assert bool(rig.provider.identity_mismatch) is foreign, label
+            assert rig.provider.blind_reason == "", (
+                f"{label}: the tick wrote {rig.provider.blind_reason!r}")
+
+    def case_a_freshen_with_a_live_token_still_clears_a_stale_blind_reason(
+            self, certdir, monkeypatch):
+        """With self-heal off nothing else clears a reason an idle daemon
+        holds, and `runtime_health` reads it as a failed `pin-applied`. The
+        tick that holds a live token clears it, due or not."""
+        for minutes in (7, 15):
+            rig = self._rig(certdir, monkeypatch, minutes=minutes)
+            rig.provider.blind_reason = "stale"
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.calls) == (1 if minutes == 7 else 0), (
+                minutes, rig.calls)
+            assert rig.provider.blind_reason == "", (
+                f"{minutes} min left: {rig.provider.blind_reason!r}")
+
+    def case_a_tick_that_cannot_take_the_lock_writes_no_stall_reason(
+            self, certdir, monkeypatch):
+        """A request takes the lock between the tick's peek and its acquire.
+        The stall is the holder's to report (its own call, `/health`'s
+        `mint_stalled`); the tick, which only optimises, writes no reason."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        monkeypatch.setattr(pp, "_MINT_LOCK_BOUND_S", 0.2)
+        release = threading.Event()
+        holder = threading.Thread(
+            target=lambda: (rig.provider.refresh_lock.acquire(),
+                            release.wait(5), rig.provider.refresh_lock.release()),
+            daemon=True)
+        holder.start()
+        while not rig.provider.refresh_lock.locked():
+            time.sleep(0.001)
+        try:
+            assert rig.provider.freshen() is None
+        finally:
+            release.set()
+            holder.join(timeout=2.0)
+        assert rig.provider.mint_stalled() is True, "the stall was not reached"
+        assert rig.calls == [], rig.calls
+        assert rig.provider.blind_reason == "", rig.provider.blind_reason
+
+    def case_a_token_that_dies_while_the_tick_waits_is_left_to_the_request_path(
+            self, certdir, monkeypatch):
+        """The due tick sees a token 5.5 min from expiry (live), then waits
+        on the lock and the store read, and the wall clock crosses into the
+        5-minute buffer meanwhile (the read stands in for that wait, with a
+        store that is not live). The tick returns quietly: no on-demand
+        refresh, so no deferral, no 'unpinned' line, and it leaves the reason
+        a request wrote during that wait (its refresh failed) as it was: a
+        tick with no live token in hand clears nothing."""
+        failure = "refresh transient for slot 2 (pin@example.com)"
+        for label, stored in (("no store", None), ("expired store", "dead")):
+            rig = self._rig(certdir, monkeypatch, outcome="consume-busy",
+                            minutes=5.5)
+            rig.stored = stored and json.dumps({"claudeAiOauth": {
+                "accessToken": "dead", "refreshToken": "rt-dead",
+                "expiresAt": int((rig.now - 600) * 1000)}})
+            rig.on_read = lambda: (
+                rig.advance(60),
+                setattr(rig.provider, "blind_reason", failure))
+            self._tick(rig, certdir, monkeypatch, False)
+            assert len(rig.reads) == 2, f"{label}: the wait did not happen"
+            assert rig.calls == [], f"{label}: a refresh ran: {rig.calls}"
+            assert rig.provider.pin_is_noop() is False, label
+            assert not [ln for ln in rig.lines if "went out unpinned" in ln], (
+                label, rig.lines)
+            assert rig.provider.blind_reason == failure, (
+                f"{label}: {rig.provider.blind_reason!r}")
 
     def case_a_held_refresh_lock_is_not_waited_on(self, certdir, monkeypatch):
         """`/health` and the watchdog never queue behind a stalled store
