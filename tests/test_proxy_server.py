@@ -20078,7 +20078,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         refusal); without it the signature is `exclude` alone, the older
         host. ``kwargs_log``, when given, collects every `switch()` call's
         keyword arguments as a dict, which `calls` (the `exclude` values)
-        cannot say."""
+        cannot say. ``switched`` and ``live_token`` may be callables, a
+        fleet that moves: ``switched(exclude)`` answers whether this call
+        lands, ``live_token()`` which bearer is live now."""
         from claude_swap.exceptions import AccountNotFoundError
         from cswap_pin import proxy as pp
         calls = []
@@ -20086,7 +20088,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         def _read_credentials(self):
             if live_token is None:
                 raise OSError("credential store unreadable")
-            return json.dumps({"claudeAiOauth": {"accessToken": live_token}})
+            return json.dumps({"claudeAiOauth": {"accessToken": (
+                live_token() if callable(live_token) else live_token)}})
 
         def _current_account_number(self):
             return live_num() if callable(live_num) else live_num
@@ -20103,9 +20106,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                         current_refused=current_refused, exclude=exclude))
                 if before is not None:
                     before()
-                return {"switched": switched, "needsLogin": False,
+                did = switched(exclude) if callable(switched) else switched
+                return {"switched": did, "needsLogin": False,
                         "validated": validated,
-                        "reason": None if switched else "candidates-exhausted"}
+                        "reason": None if did else "candidates-exhausted"}
         elif exclude_param:
             def _switch(self, strategy=None, json_output=False, models=None,
                         current_at_limit=False, exclude=None):
@@ -20147,6 +20151,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         monkeypatch.setattr(pp, "require", lambda n: fake_module)
         pp._walled_switch_seen.clear()
         pp._walled_slots.clear()
+        pp._refused_slots.clear()
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
         pp._walled_slot_occupant.clear()
@@ -20820,11 +20825,33 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         "message": "Your organization does not have access to this "
                    "resource"}}).encode()
 
+    B = "second-account-token"
+
     def _wire(self, monkeypatch, log=None, **kw):
         kw.setdefault("switched", True)
         kw.setdefault("refused_param", True)
+        kw.setdefault("live_token", self.LIVE)
         return self._wire_exclude_capable(
-            monkeypatch, live_token=self.LIVE, kwargs_log=log, **kw)
+            monkeypatch, kwargs_log=log, **kw)
+
+    def _moving_fleet(self, monkeypatch, **kw):
+        """Two accounts, slot 1 (bearer `LIVE`) live. A `switch()` lands on a
+        slot that is neither the live one nor in `exclude`, as cswap's
+        candidate search does, and finds `candidates-exhausted` when none is
+        left. Returns the kwargs log and the live-slot cell."""
+        live, tokens = {"num": "1"}, {"1": self.LIVE, "2": self.B}
+
+        def lands(exclude):
+            others = [n for n in tokens
+                      if n != live["num"] and n not in (exclude or ())]
+            if others:
+                live["num"] = others[0]
+            return bool(others)
+
+        log = []
+        self._wire(monkeypatch, log=log, switched=lands, live_num=lambda:
+                   live["num"], live_token=lambda: tokens[live["num"]], **kw)
+        return log, live
 
     def _r403(self, body=None, auth=None, path="/v1/messages", **kw):
         """A 403 as the API sends it: no rate-limit reset, the same
@@ -20880,37 +20907,49 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
             f"the fleet-exhausted memo: {pp._fleet_exhausted_until}")
 
     def case_ten_concurrent_grant_403s_make_one_switch(self, monkeypatch):
-        entered = threading.Event()
-        release = threading.Event()
+        """Run twice: with the live token fixed through the fake switch, and
+        with the switch moving it to B, where a 403 on A's bearer that
+        arrives AFTER the landing must be told from a waiter that read A as
+        live before it, and gets the 401 too."""
+        for moving in (False, True):
+            entered = threading.Event()
+            release = threading.Event()
 
-        def _block():
-            entered.set()
-            assert release.wait(timeout=5), "release never set -- test bug"
+            def _block():
+                entered.set()
+                assert release.wait(timeout=5), "release never set -- test bug"
 
-        log = []
-        self._wire(monkeypatch, log=log, before=_block)
-        results = {}
+            log = []
+            if moving:
+                log, _ = self._moving_fleet(monkeypatch, before=_block)
+            else:
+                self._wire(monkeypatch, log=log, before=_block)
+            results = {}
 
-        def _run(i):
-            results[i] = self._r403()
+            def _run(i):
+                results[i] = self._r403()
 
-        threads = [threading.Thread(target=_run, args=(0,))]
-        threads[0].start()
-        assert entered.wait(timeout=5), "switch() never started"
-        for i in range(1, 10):
-            threads.append(threading.Thread(target=_run, args=(i,)))
-            threads[-1].start()
-        time.sleep(0.3)
-        assert not results, (
-            "a 403 was answered while the one switch() was still landing: "
-            f"{sorted(results)}")
-        release.set()
-        for t in threads:
-            t.join(timeout=5)
-        assert len(results) == 10, sorted(results)
-        assert {r[:12] for r in results.values()} == {b"HTTP/1.1 401"}, [
-            r[:20] for r in results.values()]
-        assert len(log) == 1, f"ten refusals made {len(log)} switch() calls"
+            threads = [threading.Thread(target=_run, args=(0,))]
+            threads[0].start()
+            assert entered.wait(timeout=5), "switch() never started"
+            for i in range(1, 10):
+                threads.append(threading.Thread(target=_run, args=(i,)))
+                threads[-1].start()
+            time.sleep(0.3)
+            assert not results, (
+                "a 403 was answered while the one switch() was still "
+                f"landing: {sorted(results)}")
+            release.set()
+            for t in threads:
+                t.join(timeout=5)
+            assert len(results) == 10, (moving, sorted(results))
+            assert {r[:12] for r in results.values()} == {b"HTTP/1.1 401"}, [
+                r[:20] for r in results.values()]
+            if moving:
+                late = self._r403()
+                assert late.startswith(b"HTTP/1.1 401"), late[:60]
+            assert len(log) == 1, (
+                f"ten refusals made {len(log)} switch() calls (moving={moving})")
 
     def case_a_403_that_is_not_an_access_grant_is_relayed_byte_identical(
         self, monkeypatch,
@@ -21012,6 +21051,114 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         for auth in ("Bearer some-other-account-token", "Basic abc", ""):
             assert self._r403(auth=auth) == self._untouched(auth=auth), auth
         assert not log, f"a stale bearer's 403 drew a switch(): {log}"
+
+    def case_a_late_403_on_the_bearer_the_pin_switched_off_gets_a_401(
+        self, monkeypatch,
+    ):
+        """I-1: a session still holding A's bearer after the switch to B (an
+        in-flight request, a frozen bearer) drew "Please run /login" from the
+        403 relayed unchanged. The validated switch on file for A's
+        fingerprint earns it the 401, once per session like the 429 arm's
+        bearer branch, and no `switch()` call: A is marked already."""
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_fleet_exhausted_until", 777.0)
+        log, live = self._moving_fleet(monkeypatch)
+        assert self._r403(session="s1").startswith(b"HTTP/1.1 401")
+        assert live["num"] == "2" and len(log) == 1, (live, log)
+        late = self._r403(session="s1")
+        assert late.startswith(b"HTTP/1.1 401"), late[:60]
+        again = self._r403(session="s1")
+        assert again.startswith(b"HTTP/1.1 403"), (
+            f"the same session got a second 401 with nothing changed: {again[:60]}")
+        assert again == self._untouched(session="s1")
+        assert self._r403(session="s2").startswith(b"HTTP/1.1 401"), (
+            "another session's frozen bearer is owed its own 401")
+        assert len(log) == 1, f"a late 403 asked switch() again: {log}"
+        assert pp._fleet_exhausted_until == 777.0, pp._fleet_exhausted_until
+        assert pp._walled_slots == {}, pp._walled_slots
+
+    def case_a_late_403_marks_the_bearers_slot_again_once_its_bar_lapsed(
+        self, monkeypatch,
+    ):
+        """I-1, the other half: A's mark at cswap lapses after 900 s, and a
+        straggler on A's bearer is how A is marked again. `exclude` names A
+        alone, so cswap marks it and leaves the healthy live account where it
+        is: one call, no credential write."""
+        from cswap_pin import proxy as pp
+        log, live = self._moving_fleet(monkeypatch)
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        pp._refused_slots["1"] = time.time() - 1.0
+        got = self._r403(session="s1")
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert len(log) == 2, log
+        kw = log[1]
+        assert (kw["current_refused"], kw["exclude"]) == (True, {"1"}), kw
+        assert not kw["current_at_limit"], kw
+        assert pp._refused_slots["1"] > time.time() + 800, pp._refused_slots
+
+    def case_a_re_mark_that_raises_still_gives_the_straggler_its_401(
+        self, monkeypatch,
+    ):
+        def _boom():
+            if len(log) == 2:
+                raise RuntimeError("config lock held")
+
+        from cswap_pin import proxy as pp
+        log, live = self._moving_fleet(monkeypatch, before=_boom)
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        pp._refused_slots["1"] = time.time() - 1.0
+        got = self._r403(session="s1")
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert len(log) == 2, log
+
+    def case_a_fleet_where_every_account_refuses_gets_one_401_and_then_403s(
+        self, monkeypatch,
+    ):
+        """I-2: cswap releases its own refusal bar when nothing else is left
+        and lands back on a refused account, so the pin names the slots it
+        saw refused as `exclude`. A refused at once, B (landed on, 401) too:
+        switch() #1 lands, #2 finds nothing and the 403 goes out unchanged,
+        and no later refusal on either bearer is a 401."""
+        log, live = self._moving_fleet(monkeypatch)
+        b = "Bearer " + self.B
+        assert self._r403().startswith(b"HTTP/1.1 401")
+        assert live["num"] == "2"
+        second = self._r403(auth=b)
+        assert second.startswith(b"HTTP/1.1 403"), (
+            f"a second 401, onto the refused account: {second[:60]}")
+        assert second == self._untouched(auth=b)
+        assert log[1]["exclude"] == {"1", "2"}, log
+        assert live["num"] == "2", live
+        for auth in (b, None):
+            for session in ("s1", "s2"):
+                got = self._r403(auth=auth, session=session)
+                assert got.startswith(b"HTTP/1.1 403"), (auth, session, got[:60])
+        assert len(log) == 2, f"later refusals asked switch() again: {log}"
+
+    def case_a_refused_slot_that_changed_hands_is_forgotten(self, monkeypatch):
+        """`_refused_slots` feeds `exclude`, so it follows the same guard as
+        `_walled_slots`: a slot `cswap move` gave to another account must not
+        bar that account for 900 s."""
+        from cswap_pin import proxy as pp
+        who = {"5": "a@example.com", "6": "c@example.com"}
+        self._wire_exclude_capable(monkeypatch, switched=False, occupant=who)
+        for slot in ("5", "6"):
+            pp._refused_slots[slot] = time.time() + 600
+        pp._forget_walled_slots_that_changed_hands("5")
+        who["5"] = "b@example.com"
+        pp._forget_walled_slots_that_changed_hands("5")
+        assert set(pp._refused_slots) == {"6"}, pp._refused_slots
+
+    def case_a_body_nested_past_the_recursion_limit_fails_open(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        body = b"[" * 16000
+        got = self._r403(body=body)
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert got == self._untouched(body=body)
+        assert not log, log
 
     def case_the_body_is_decoded_per_content_encoding_for_the_match(
         self, monkeypatch,
