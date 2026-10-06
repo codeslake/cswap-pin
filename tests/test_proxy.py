@@ -7,6 +7,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import socket
@@ -11049,6 +11050,25 @@ class TestKeychainDeniedHere:
         monkeypatch.setattr(pin_proxy.sys, "platform", "linux")
         assert pin_proxy._keychain_denied_here() is False
         assert calls == []
+
+    def case_an_unconfirmed_read_asks_once_and_never_waits(self, monkeypatch):
+        """A launch's own check (T1936) must not sleep: one refusal reads as a
+        denial, one answer reads as none. THE CONTROL is the default, which
+        still asks twice a second apart."""
+        from cswap_pin import proxy as pin_proxy
+        calls = self._fake_host(monkeypatch, [36, 36])
+        slept = []
+        monkeypatch.setattr(pin_proxy.time, "sleep", slept.append)
+        assert pin_proxy._keychain_denied_here(confirm=False) is True
+        assert len(calls) == 1 and slept == []
+        calls = self._fake_host(monkeypatch, ["{}"])
+        monkeypatch.setattr(pin_proxy.time, "sleep", slept.append)
+        assert pin_proxy._keychain_denied_here(confirm=False) is False
+        assert len(calls) == 1 and slept == []
+        self._fake_host(monkeypatch, [36, 36])
+        monkeypatch.setattr(pin_proxy.time, "sleep", slept.append)
+        assert pin_proxy._keychain_denied_here() is True
+        assert slept == [1.0], "the control: the default waits between reads"
 
 class TestDaemonState:
     """The daemon records port+pid+fingerprint in a JSON state file so a
@@ -23320,6 +23340,34 @@ class TestHealReWiresAServingDaemon:
         finally:
             srv.close()
 
+    def case_a_serving_daemon_is_offered_to_the_keychain_relocation(
+            self, tmp_path, monkeypatch):
+        """T1936. `cswap pin --ensure` (the rc hook, every Terminal launch)
+        and `cswap pin --heal` reach THIS function, never `ensure_proxy`, and
+        it returns from its serving arm before any spawn: the Keychain-denied
+        daemon is moved from here or never from the command that actually
+        runs. Offered on the unwired return and on the "genuinely nothing to
+        do" return alike; a dangling pin has no slot to spawn for, so
+        nothing is offered."""
+        from cswap_pin import proxy
+
+        srv, port, cfg = self._fixture(tmp_path, monkeypatch, wired_port=None)
+        asked = []
+        monkeypatch.setattr(
+            proxy, "_move_into_this_lineage",
+            lambda *a, **k: asked.append(a) or a[3])
+        try:
+            proxy.heal(tmp_path)        # unwired: re-wired
+            proxy.heal(tmp_path)        # wired now: nothing to do
+            assert asked == [(tmp_path / "pin-proxy", "1", "c@e.com", port)] * 2
+            (tmp_path / "sequence.json").write_text(
+                json.dumps({"accounts": {}}))
+            asked.clear()
+            proxy.heal(tmp_path)
+            assert asked == [], "a dangling pin was offered a relocation"
+        finally:
+            srv.close()
+
 
 class TestSharedBundleGuardMatchesNode:
     """The merged `ca-trust.pem` guard must agree with node's CA loader.
@@ -32634,3 +32682,1478 @@ class TestAClearOnASharedSettingsFileUnpinsOnlyThisMachine:
         assert not (a / "pin-cleared").exists(), (
             "a machine-local settings file needs no marker")
         assert p.load_pin(a) is None
+
+
+class TestACallerOutsideTheLineageTakesTheSocketOver:
+    """T1936: on macOS a daemon whose lineage is outside the login session is
+    refused the Keychain (security rc=36), and every successor is born of its
+    holder, so it inherits the refusal for ever. A caller INSIDE the login
+    session (`cswap pin --ensure` from a Terminal) can move the serving lineage
+    into its own without cutting anything: the live listening socket goes to it
+    over an AF_UNIX rendezvous (SCM_RIGHTS), it runs `_spawn_daemon(listen_fd=)`
+    itself, and the old daemon then runs its ordinary gapless sequence.
+
+    THE DENIAL IS FAKED BY LINEAGE. `_keychain_denied_here` has no daemon-side
+    value on this box (it answers False off darwin), so the old trio runs
+    through a shim package, `denied_cswap_pin.proxy`, that patches it to True in
+    the process (and claims darwin for the one call that starts the thread
+    reading it, which is gated on the platform) and re-points `_DAEMON_MODULE`
+    at itself: every daemon and
+    standby the old holder spawns inherits the shim exactly as a real lineage
+    inherits its audit session, and the CALLER (this process), which lacks it,
+    reads False. The shim's dotted name still contains `cswap_pin.proxy`, so
+    every argv matcher in the product (`_pin_daemon_pids`, the holder and
+    standby finders) selects it. What the cases assert is therefore LINEAGE
+    (who parented the new holder, whose pid is LISTEN_FROM) and the absence of
+    any cut, never a daemon-side keychain value.
+    """
+
+    EMAIL = "pin@example.com"
+
+    _SHIM = '''
+import functools, os, sys
+from pathlib import Path
+from cswap_pin import proxy as p
+p._keychain_denied_here = lambda: True
+_note = p._start_noting_keychain_denial
+def _start_as_a_mac(server):
+    # THE START IS GATED ON THE PLATFORM: this daemon is a Mac's for that call.
+    real, sys.platform = sys.platform, "darwin"
+    try:
+        _note(server)
+    finally:
+        sys.platform = real
+p._start_noting_keychain_denial = _start_as_a_mac
+p._DAEMON_MODULE = "denied_cswap_pin.proxy"
+# A TICK THAT IS NOT 30 s: the tick is a timer, the sequence it runs is not.
+p._watch_own_code = functools.partial(
+    p._watch_own_code, interval=float(os.environ.get("T1936_TICK_S", "0.3")))
+if os.environ.get("T1936_RELOCATE_WAIT_S"):
+    p._RELOCATE_WAIT_S = float(os.environ["T1936_RELOCATE_WAIT_S"])
+a = sys.argv
+if a[1:2] == [p._HOLDER_MODULE_ARG]:
+    p.holder_main(a[3], a[4], Path(a[5]), port=int(a[2]))
+elif a[1:2] == [p._STANDBY_MODULE_ARG]:
+    p.standby_main(a[2], a[3], Path(a[4]))
+else:
+    p.daemon_main(a[1], a[2], Path(a[3]))
+'''
+
+    # A launcher that exits at once, so the old holder is NOT this process's
+    # child (it reparents) and "the new holder's parent is the caller" can be
+    # told apart from "the old holder's parent".
+    _LAUNCH = (
+        "import subprocess, sys\n"
+        "subprocess.Popen(sys.argv[2:], start_new_session=True,\n"
+        "                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+        "                 stderr=open(sys.argv[1], 'ab'))\n")
+
+    class _Sw:
+        def __init__(self, backup_dir):
+            self.backup_dir = backup_dir
+
+        def resolve_account(self, identifier):
+            return ("2", "pin@example.com", "org-1")
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _until(what, fn, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            got = fn()
+            if got:
+                return got
+            time.sleep(0.05)
+        raise AssertionError(f"timed out after {timeout}s: {what}")
+
+    class _Echo:
+        """The host a CONNECT tunnel reaches: accepts and echoes."""
+
+        def __init__(self):
+            self.srv = socket.socket()
+            self.srv.bind(("127.0.0.1", 0))
+            self.srv.listen(64)
+            self.port = self.srv.getsockname()[1]
+            threading.Thread(target=self._accept, daemon=True).start()
+
+        def _accept(self):
+            while True:
+                try:
+                    c, _ = self.srv.accept()
+                except OSError:
+                    return
+                threading.Thread(target=self._echo, args=(c,), daemon=True).start()
+
+        @staticmethod
+        def _echo(c):
+            try:
+                while True:
+                    data = c.recv(4096)
+                    if not data:
+                        return
+                    c.sendall(data)
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    @staticmethod
+    def _tunnel(port, peer, timeout=5):
+        """An established CONNECT tunnel through the daemon on ``port``."""
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        s.settimeout(timeout)
+        s.sendall(f"CONNECT 127.0.0.1:{peer} HTTP/1.1\r\n"
+                  f"Host: 127.0.0.1:{peer}\r\n\r\n".encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = s.recv(4096)
+            assert chunk, f"the daemon closed the CONNECT: {head!r}"
+            head += chunk
+        assert b" 200" in head.split(b"\r\n")[0], head[:80]
+        return s
+
+    class _Hammer:
+        """A REQUEST, never a bare connect: a full tunnel round trip, because
+        a port that stays bound with nobody behind it refuses nothing."""
+
+        def __init__(self, port, peer, tunnel):
+            self.counts = {"ok": 0, "refused": 0, "reset": 0, "no_reply": 0}
+            self._stop = threading.Event()
+            self._port, self._peer, self._tunnel = port, peer, tunnel
+            self._threads = [threading.Thread(target=self._run, daemon=True)
+                             for _ in range(2)]
+
+        def start(self):
+            for t in self._threads:
+                t.start()
+            return self
+
+        def _run(self):
+            while not self._stop.is_set():
+                try:
+                    s = self._tunnel(self._port, self._peer, timeout=5)
+                except ConnectionRefusedError:
+                    self.counts["refused"] += 1
+                    continue
+                except (socket.timeout, AssertionError, OSError):
+                    self.counts["no_reply"] += 1
+                    continue
+                try:
+                    s.sendall(b"x")
+                    if s.recv(1) == b"x":
+                        self.counts["ok"] += 1
+                    else:
+                        self.counts["no_reply"] += 1
+                except socket.timeout:
+                    self.counts["no_reply"] += 1
+                except ConnectionResetError:
+                    self.counts["reset"] += 1
+                except OSError:
+                    self.counts["no_reply"] += 1
+                finally:
+                    s.close()
+                time.sleep(0.01)
+
+        def stop(self):
+            self._stop.set()
+            for t in self._threads:
+                t.join(timeout=10)
+            return self.counts
+
+    @contextlib.contextmanager
+    def _trio(self, monkeypatch, denied, relocate_wait_s=None, tick_s=None):
+        """A REAL holder + daemon + standby under a short scratch dir (an
+        AF_UNIX path holds ~104 bytes on macOS), started through a launcher
+        that exits, so its lineage is not this process's."""
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        import types
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as pp
+
+        base = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = base / "pin-proxy"
+        certdir.mkdir()
+        echo = self._Echo()
+        try:
+            pp.ensure_ca(certdir, "api.anthropic.com")
+            pp.save_pin(base, self.EMAIL, "org-1")
+            monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+            env = dict(os.environ)
+            module = pp._DAEMON_MODULE
+            if denied:
+                pkg = base / "shim" / "denied_cswap_pin"
+                pkg.mkdir(parents=True)
+                (pkg / "__init__.py").write_text("")
+                (pkg / "proxy.py").write_text(self._SHIM)
+                env["PYTHONPATH"] = os.pathsep.join(
+                    [str(base / "shim")]
+                    + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+                if relocate_wait_s is not None:
+                    env["T1936_RELOCATE_WAIT_S"] = str(relocate_wait_s)
+                if tick_s is not None:
+                    env["T1936_TICK_S"] = str(tick_s)
+                module = "denied_cswap_pin.proxy"
+            subprocess.run(
+                [sys.executable, "-c", self._LAUNCH, str(certdir / "daemon.log"),
+                 sys.executable, "-m", module, pp._HOLDER_MODULE_ARG, "0", "2",
+                 self.EMAIL, str(certdir)], env=env, check=True, timeout=30)
+
+            def serving():
+                st = pp.read_daemon_state(certdir)
+                body = st and pp._health_body(int(st["port"]))
+                return st if body and body.get("pid") == st["pid"] else None
+
+            st = self._until("the old trio never served", serving, 40)
+            if denied:
+                # `_note_keychain_denial` is a thread started AFTER the record
+                # is written: wait for its answer, or a case that asks the
+                # moment this returns races it by a few milliseconds.
+                self._until(
+                    "the denied daemon does not say so in /health",
+                    lambda: (pp._health_body(int(st["port"])) or {}).get(
+                        "keychain_denied"), 15)
+            t = types.SimpleNamespace(
+                base=base, certdir=certdir, echo=echo, port=int(st["port"]),
+                daemon=int(st["pid"]),
+                holder=pp._wedged_parent_holder(int(st["pid"]), certdir))
+            assert t.holder is not None, "premise: the old daemon is held"
+            yield t
+        finally:
+            echo.srv.close()
+            _reap_pin_processes(certdir)
+            shutil.rmtree(base, ignore_errors=True)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _on_a_mac(monkeypatch, caller_denied=False):
+        """THIS process as a macOS one, for the span of the block. The platform
+        is faked the way `TestKeychainDeniedHere._fake_host` fakes it, and the
+        caller's own Keychain answer is stubbed (`caller_denied`): the real
+        read would run `security`, which this box does not have. Everything a
+        helper or a daemon does is a real Linux process and is unaffected."""
+        from cswap_pin import proxy as pp
+
+        with monkeypatch.context() as m:
+            m.setattr(pp.sys, "platform", "darwin")
+            m.setattr(pp, "_keychain_denied_here",
+                      lambda confirm=True: caller_denied)
+            yield
+
+    @staticmethod
+    def _tracking_popen(monkeypatch):
+        """Every child THIS process starts, recorded at birth."""
+        import subprocess
+
+        children = []
+        real = subprocess.Popen
+
+        def tracked(*a, **k):
+            proc = real(*a, **k)
+            children.append(proc)
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", tracked)
+        return children
+
+    def case_health_names_a_keychain_denial_only_when_there_is_one(
+            self, tmp_path, monkeypatch):
+        """The daemon reads ITS OWN reading once and publishes it: absent for
+        a daemon that is not denied (its body is today's, key for key), true
+        for one that is."""
+        from cswap_pin import proxy as pp
+
+        pp.ensure_ca(tmp_path, "api.anthropic.com")
+        proxy = pp.PinProxy(certdir=tmp_path, pin_token_provider=lambda: "T")
+        proxy.start()
+        try:
+            monkeypatch.setattr(pp, "_keychain_denied_here", lambda: False)
+            pp._note_keychain_denial(proxy)
+            assert "keychain_denied" not in pp._health_body(proxy.port), (
+                "a daemon that is not denied publishes the key")
+            monkeypatch.setattr(pp, "_keychain_denied_here", lambda: True)
+            pp._note_keychain_denial(proxy)
+            assert pp._health_body(proxy.port).get("keychain_denied") is True
+        finally:
+            proxy.stop(drain=0)
+
+    def case_a_denied_lineage_is_moved_into_the_callers_without_a_cut(
+            self, tmp_path, monkeypatch):
+        """THE WHOLE PROPERTY, with real processes: the caller's ensure starts
+        ONE detached helper that is the caller's own child; the new
+        --hold-port holder is the HELPER's child with LISTEN_FROM the helper's
+        pid, the old daemon left by the gapless handover (exit 0, never the
+        capped 75) and the old holder stood down without respawning; not one
+        request was refused, reset or left unanswered across the switch, and a
+        CONNECT tunnel held across it still echoes."""
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        children = self._tracking_popen(monkeypatch)
+        with self._trio(monkeypatch, denied=True) as t:
+            body = pp._health_body(t.port)
+            assert body.get("keychain_denied") is True, (
+                f"the denied daemon does not say so in /health: {body}")
+            hammer = self._Hammer(t.port, t.echo.port, self._tunnel).start()
+            held = self._tunnel(t.port, t.echo.port)
+            held.sendall(b"before")
+            assert held.recv(16) == b"before", "premise: the tunnel echoes"
+            time.sleep(0.3)
+            assert hammer.counts["ok"] > 0, "premise: the hammer reached it"
+            children.clear()
+            assert pp._daemon_env_value(t.daemon, pp._RELOCATED_ENV) is None, (
+                "premise: the lineage being moved carries no relocation mark")
+            with self._on_a_mac(monkeypatch):
+                assert pp._relocation_is_due(
+                    t.certdir, body, confirm=False) == t.daemon, (
+                    "premise: the denied daemon is due to be moved")
+
+            with self._on_a_mac(monkeypatch):
+                got = pp.ensure_proxy(self._Sw(t.base))
+            assert got and got[0] == t.port, f"the port moved: {got}"
+
+            # THE MOVE IS THE HELPER'S, AND IT TAKES A WHILE: wait for it.
+            st = self._until(
+                "the caller's lineage never published a daemon",
+                lambda: (lambda s: s if s and int(s["pid"]) != t.daemon
+                         else None)(pp.read_daemon_state(t.certdir)), 60)
+            helpers = [c for c in children if pp._RELOCATE_MODULE_ARG in c.args]
+            assert len(helpers) == 1, (
+                f"the caller started {len(helpers)} helpers, not one")
+            helper = helpers[0]
+            assert not [c for c in children
+                        if pp._HOLDER_MODULE_ARG in c.args], (
+                "the caller started a holder itself: the helper's is the "
+                "caller's grandchild, not its child")
+            # A ZOMBIE STILL HAS ITS PPID (this process has not waited on it),
+            # so this holds whether the helper has exited by now or not.
+            assert pp._ppid_via_ps(helper.pid) == os.getpid(), (
+                "the helper is not the caller's child, so it does not share "
+                "the caller's audit session")
+            new_holder = pp._wedged_parent_holder(int(st["pid"]), t.certdir)
+            assert new_holder not in (None, t.holder)
+            # The new holder's parent was the helper (`getppid() ==
+            # LISTEN_FROM` is the adoption guard, and the port did not move),
+            # but the helper exits once the daemon publishes and the holder
+            # reparents, so the env it was born with is what can still be read.
+            assert pp._daemon_env_value(
+                new_holder, pp._HANDDOWN_FROM_ENV) == str(helper.pid)
+            assert helper.wait(timeout=60) == 0, "the helper did not end clean"
+            # THE OLD DAEMON STILL ACCEPTS FOR A TICK AFTER THE NEW ONE
+            # PUBLISHES (it polls the record every 0.1 s before it releases),
+            # and both are on the one socket: wait for the new one's answer.
+            new_body = self._until(
+                "the new daemon never answered /health",
+                lambda: (lambda b: b if b and b["pid"] == int(st["pid"])
+                         else None)(pp._health_body(t.port)), 10)
+            assert "keychain_denied" not in new_body, (
+                "the new lineage is read as denied too")
+            # ONE MOVE PER LINEAGE: the helper stamps the lineage it starts, and
+            # a daemon that carries the stamp is never moved again, whatever its
+            # own /health says (the hypothesis that a login-session lineage is
+            # not refused is unmeasured on a Mac). THE CONTROL is the same call
+            # with the stamp read as absent: only the stamp refuses it.
+            new_pid = int(st["pid"])
+            assert pp._daemon_env_value(new_pid, pp._RELOCATED_ENV) == "1", (
+                "the helper did not stamp the lineage it started")
+            denied_again = {**new_body, "keychain_denied": True}
+            with self._on_a_mac(monkeypatch):
+                assert pp._relocation_is_due(
+                    t.certdir, denied_again, confirm=False) == 0, (
+                    "a lineage that was already moved is due to be moved again")
+                with monkeypatch.context() as m:
+                    real = pp._daemon_env_value
+                    m.setattr(
+                        pp, "_daemon_env_value",
+                        lambda pid, key: None if key == pp._RELOCATED_ENV
+                        else real(pid, key))
+                    assert pp._relocation_is_due(
+                        t.certdir, denied_again, confirm=False) == new_pid, (
+                        "the control: nothing but the stamp refuses the move")
+
+            held.sendall(b"after")
+            assert held.recv(16) == b"after", (
+                "a tunnel held across the switch was cut")
+            held.close()
+            self._until("the old daemon never left",
+                        lambda: not pp._pid_alive(t.daemon), 60)
+            self._until("the old holder never stood down",
+                        lambda: not pp._pid_alive(t.holder), 30)
+            counts = hammer.stop()
+            assert counts["ok"] > 0
+            assert (counts["refused"], counts["reset"], counts["no_reply"]) \
+                == (0, 0, 0), f"the switch cost requests: {counts}"
+            log = (t.certdir / "daemon.log").read_text()
+            assert f"pid={t.holder} " in log and (
+                f"daemon {t.daemon} retired (exit 0)") in log, (
+                "the old holder did not read the old daemon's exit as the "
+                "handover (exit 0)")
+            assert "the slow way" not in log, (
+                "the old daemon took the capped exit-75 fallback")
+            assert "respawning on the held port" not in log
+            assert pp._pin_daemon_pids(t.certdir) == [int(st["pid"])], (
+                "something besides the new daemon is still a pin daemon")
+            ps = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
+                                capture_output=True, text=True).stdout
+            standbys = [ln for ln in ps.splitlines()
+                        if pp._STANDBY_MODULE_ARG in ln
+                        and "cswap_pin.proxy" in ln
+                        and ln.rstrip().endswith(" " + str(t.certdir))]
+            assert len(standbys) == 1, (
+                f"the old lineage's standby was not retired: {standbys}")
+            assert not list(t.certdir.glob(".successor-*")), (
+                "the rendezvous was left behind")
+
+    def case_CONTROL_a_denied_caller_or_another_namespace_moves_nothing(
+            self, tmp_path, monkeypatch):
+        """The same denied trio, asked (as a Mac, or every case below is
+        vacuous) from a process that is itself refused the Keychain (it would
+        only hand the socket to another denied lineage), with the recorded pid
+        invisible to this pid namespace (host and container share $HOME, not
+        pids: incident 98d57744), and while the spawn lock is held (a spawn or
+        another relocation is running). None of them starts a helper: the
+        caller decides it, before anything is spawned or bound."""
+        from cswap_pin import proxy as pp
+
+        children = self._tracking_popen(monkeypatch)
+        with self._trio(monkeypatch, denied=True) as t:
+            assert pp._health_body(t.port).get("keychain_denied") is True
+            children.clear()
+            with self._on_a_mac(monkeypatch, caller_denied=True):
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            with self._on_a_mac(monkeypatch), monkeypatch.context() as m:
+                m.setattr(pp, "_pin_daemon_pids", lambda cd: [])
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            with self._on_a_mac(monkeypatch), pp._spawn_lock(t.certdir):
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            assert int(pp.read_daemon_state(t.certdir)["pid"]) == t.daemon
+            assert not [c for c in children
+                        if pp._RELOCATE_MODULE_ARG in c.args], (
+                "a caller that must not relocate started a helper")
+            assert not list(t.certdir.glob(".successor-*")), (
+                "a caller that must not relocate bound the rendezvous")
+            # THE CONTROL: the same trio and the same Mac, with none of those
+            # three holding, DOES start the helper (it is the thing the main
+            # case measures to the end; here it is only counted).
+            with self._on_a_mac(monkeypatch):
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            helpers = [c for c in children
+                       if pp._RELOCATE_MODULE_ARG in c.args]
+            assert len(helpers) == 1, (
+                "the control did not start a helper: the cases above prove "
+                "nothing")
+            helpers[0].wait(timeout=90)   # let it finish before the teardown
+
+    def case_a_daemon_that_is_not_denied_is_left_alone(
+            self, tmp_path, monkeypatch):
+        """Nothing denied: today's behaviour, byte for byte. No helper, no
+        rendezvous, no new file, the same daemon, even on a Mac (a Mac is what
+        makes the gate pass, or this is vacuous)."""
+        from cswap_pin import proxy as pp
+
+        children = self._tracking_popen(monkeypatch)
+        with self._trio(monkeypatch, denied=False) as t:
+            assert "keychain_denied" not in pp._health_body(t.port)
+            # ONE ENSURE TO SETTLE what every ensure already writes (the
+            # upstream hint, the CA bundle); the second is the measurement.
+            with self._on_a_mac(monkeypatch):
+                pp.ensure_proxy(self._Sw(t.base))
+                before = sorted(p.name for p in t.certdir.iterdir())
+                children.clear()
+                got = pp.ensure_proxy(self._Sw(t.base))
+            assert got[0] == t.port
+            assert int(pp.read_daemon_state(t.certdir)["pid"]) == t.daemon
+            assert not [c for c in children
+                        if pp._RELOCATE_MODULE_ARG in c.args
+                        or pp._HOLDER_MODULE_ARG in c.args]
+            assert not list(t.certdir.glob(".successor-*"))
+            new = set(p.name for p in t.certdir.iterdir()) - set(before)
+            assert not new, f"ensure left new files behind: {new}"
+
+    def case_a_successor_that_never_publishes_cuts_nothing(
+            self, tmp_path, monkeypatch):
+        """FAILURE ARM. The relocation (`_take_the_socket_over`, which the
+        helper runs, called here in this process so its spawn can be stubbed)
+        receives the socket and its spawn never produces a serving daemon (as
+        a killed helper or a refused adoption would): the old daemon must keep
+        serving past its bound (no exit 75, no capped drain), tunnels and
+        requests untouched, and the old holder must keep its respawn duty."""
+        from cswap_pin import proxy as pp
+
+        with self._trio(monkeypatch, denied=True, relocate_wait_s=3) as t:
+            hammer = self._Hammer(t.port, t.echo.port, self._tunnel).start()
+            held = self._tunnel(t.port, t.echo.port)
+            fds = []
+
+            def never(account, email, certdir, listen_fd=None, **kw):
+                fds.append(listen_fd)
+                return None
+
+            monkeypatch.setattr(pp, "_spawn_daemon", never)
+            assert pp._take_the_socket_over(
+                t.certdir, "2", self.EMAIL, pp._health_body(t.port)) is None
+            assert fds and fds[0] is not None, (
+                "the holder never handed the caller the listening socket")
+            time.sleep(6)   # past the old daemon's 3 s bound
+            assert pp._pid_alive(t.daemon) and pp._pid_alive(t.holder)
+            body = pp._health_body(t.port)
+            assert body and body["pid"] == t.daemon, (
+                f"the old daemon stopped serving: {body}")
+            assert int(pp.read_daemon_state(t.certdir)["pid"]) == t.daemon
+            held.sendall(b"still")
+            assert held.recv(16) == b"still"
+            counts = hammer.stop()
+            assert (counts["refused"], counts["reset"], counts["no_reply"]) \
+                == (0, 0, 0), f"a failed relocation cost requests: {counts}"
+            log = (t.certdir / "daemon.log").read_text()
+            assert "the slow way" not in log, "the capped exit-75 arm ran"
+            # THE HOLDER STILL SUPERVISES: a crash of the daemon is replaced.
+            os.kill(t.daemon, 9)
+            new = self._until(
+                "the old holder never respawned its daemon",
+                lambda: (lambda s: s and int(s["pid"]) != t.daemon
+                         and pp._wedged_parent_holder(
+                             int(s["pid"]), t.certdir) == t.holder)(
+                    pp.read_daemon_state(t.certdir)), 40)
+            assert new
+            held.close()
+
+    def case_a_holder_hands_its_socket_only_on_the_daemons_ask(
+            self, tmp_path, monkeypatch):
+        """`_on_replace_request` answers the daemon's SIGUSR1 ask, with a live
+        rendezvous, by sending the listening fd and spawning nothing. THE
+        HOLDER'S OWN replace (`_wait_for_exit`'s wedge repair, which calls it
+        with no signal) never hands off, or the wedged daemon it is about to
+        terminate would be left unreplaced. A rendezvous nobody accepts on is a
+        relocation that FAILED: the daemon that is waiting on it keeps serving,
+        so the holder spawns nothing (an old-lineage successor is the move it
+        was meant to end). None, or one older than any helper listens, spawns
+        exactly as it always did."""
+        import tempfile
+        import shutil
+
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        spawned = []
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(1)
+
+        class _Holder(pp.PortHolder):
+            def __init__(self):
+                self._stop = False
+                self._proc = types.SimpleNamespace(pid=5)
+                self._replace_lock = threading.RLock()
+                self._certdir = certdir
+                self._srv = lsn
+                self.port = lsn.getsockname()[1]
+
+            def _spawn(self):
+                spawned.append("spawn")
+
+        ask = pp._REPLACE_ME_SIGNAL
+        sock_path = certdir / f"{pp._SUCCESSOR_SOCK_PREFIX}{os.getpid()}.sock"
+        try:
+            h = _Holder()
+            h._on_replace_request(ask, None)
+            assert spawned == ["spawn"] and not h._handed_off, (
+                "no rendezvous: the holder must spawn as before")
+            spawned.clear()
+
+            stale = socket.socket(socket.AF_UNIX)
+            stale.bind(str(sock_path))      # a file with nobody listening
+            stale.close()
+            h._on_replace_request(ask, None)
+            assert spawned == [] and not h._handed_off, (
+                "a rendezvous that cannot be reached was answered with a "
+                "spawn on the old lineage")
+            old = time.time() - pp._RELOCATE_ASK_WAIT_S - 60
+            os.utime(sock_path, (old, old))
+            h._on_replace_request(ask, None)
+            assert spawned == ["spawn"] and not h._handed_off, (
+                "a rendezvous older than any helper listens must be ignored")
+            spawned.clear()
+            assert not sock_path.exists(), "the old rendezvous was not removed"
+
+            srv = socket.socket(socket.AF_UNIX)
+            srv.bind(str(sock_path))
+            srv.listen(1)
+            srv.setblocking(False)
+            h._on_replace_request(None, None)
+            assert spawned == ["spawn"] and not h._handed_off, (
+                "the holder's own replace handed the socket off")
+            spawned.clear()
+            with pytest.raises(BlockingIOError):
+                srv.accept()                # nothing was even sent to it
+            srv.setblocking(True)
+
+            got = []
+            t = threading.Thread(
+                target=lambda: got.append(
+                    socket.recv_fds(srv.accept()[0], 16, 1)), daemon=True)
+            t.start()
+            h._on_replace_request(ask, None)
+            t.join(5)
+            srv.close()
+            assert spawned == [] and h._handed_off, (
+                "a live rendezvous: the holder must hand over, not spawn")
+            received = socket.socket(fileno=got[0][1][0])
+            try:
+                assert received.getsockname()[1] == h.port, (
+                    "the received descriptor is not the holder's listener")
+            finally:
+                received.close()
+            sock_path.unlink()
+            h._on_replace_request(ask, None)    # nobody waits any more
+            assert spawned == ["spawn"] and not h._handed_off, (
+                "a later ask still reads the previous hand-off")
+        finally:
+            lsn.close()
+            shutil.rmtree(certdir, ignore_errors=True)
+
+    def case_a_holder_born_of_a_caller_that_died_refuses_instead_of_stranding(
+            self, tmp_path, monkeypatch):
+        """A caller killed between its Popen and the new holder's adoption
+        leaves a holder whose LISTEN_FROM is no longer its parent. It must NOT
+        bind a fresh port (every session is wired to the old one): it was told
+        the old port, so it refuses it while the old lineage still listens and
+        exits, publishing nothing. Reproduced by naming a LISTEN_FROM that is
+        not the parent; the control is the adoption the other cases prove."""
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        old = socket.socket()
+        old.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        old.bind(("127.0.0.1", 0))
+        old.listen(8)
+        port = old.getsockname()[1]
+        try:
+            pp.ensure_ca(certdir, "api.anthropic.com")
+            env = dict(os.environ)
+            env[pp._HANDDOWN_FD_ENV] = str(old.fileno())
+            env[pp._HANDDOWN_FROM_ENV] = "1"      # not the parent: it "died"
+            run = subprocess.run(
+                [sys.executable, "-m", pp._DAEMON_MODULE, pp._HOLDER_MODULE_ARG,
+                 str(port), "2", self.EMAIL, str(certdir)],
+                env=env, pass_fds=(old.fileno(),), capture_output=True,
+                text=True, timeout=60)
+            assert run.returncode == 0, run.stderr[-800:]
+            assert "holder could not take the port" in run.stderr, run.stderr[-800:]
+            assert pp.read_daemon_state(certdir) is None, (
+                "the orphaned holder published a daemon on some other port")
+            assert old.getsockname()[1] == port
+        finally:
+            old.close()
+            _reap_pin_processes(certdir)
+            shutil.rmtree(certdir, ignore_errors=True)
+
+    def case_a_relocation_that_raises_never_fails_the_launch(
+            self, tmp_path, monkeypatch):
+        """`ensure_proxy`'s fast path runs on every launch and never raised: a
+        helper that cannot start (a fork EAGAIN) hands back the daemon it was
+        asked about. THE CONTROL records the helper's argv and stdio: the
+        certdir is NOT the last token, or `_pin_daemon_pids` would take the
+        helper for a daemon and the next sweep would TERM it; the caller's own
+        environment goes with it (it is what carries the audit session, with
+        the process itself)."""
+        import subprocess
+        import sys
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            pp, "_health_body",
+            lambda port, timeout=1.0: {"keychain_denied": True, "pid": 1})
+        monkeypatch.setattr(
+            pp, "_relocation_is_due", lambda cd, health, confirm=True: 1)
+        started = []
+
+        def boom(*a, **k):
+            raise OSError("fork: Resource temporarily unavailable")
+
+        monkeypatch.setattr(subprocess, "Popen", boom)
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: started.append((a, k)))
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
+        (argv,), kw = started[0]
+        assert argv == [sys.executable, "-m", pp._DAEMON_MODULE,
+                        pp._RELOCATE_MODULE_ARG, str(tmp_path), "2", "a@b.c"]
+        assert argv[-1] != str(tmp_path), "`_pin_daemon_pids` would match it"
+        assert kw.get("env") is None, "the helper must inherit the caller's env"
+        assert kw["stdin"] == kw["stdout"] == subprocess.DEVNULL
+
+    def case_a_busy_spawn_lock_starts_no_helper_and_the_locked_arm_skips_the_probe(
+            self, tmp_path, monkeypatch):
+        """One relocation at a time: a caller that finds the spawn lock held
+        starts no helper. The `locked` arm of `ensure_proxy` holds it ITSELF,
+        so the probe would always say busy there: it is skipped, and the helper
+        it starts waits for the lock instead (`_HEAL_LOCK_WAIT_S`)."""
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            pp, "_health_body",
+            lambda port, timeout=1.0: {"keychain_denied": True, "pid": 1})
+        monkeypatch.setattr(
+            pp, "_relocation_is_due", lambda cd, health, confirm=True: 1)
+        started = []
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: started.append(a))
+        with pp._spawn_lock(tmp_path):
+            assert pp._move_into_this_lineage(
+                tmp_path, "2", "a@b.c", 4321) == 4321
+            assert started == [], "a held spawn lock still started a helper"
+            assert pp._move_into_this_lineage(
+                tmp_path, "2", "a@b.c", 4321, locked=True) == 4321
+            assert len(started) == 1, "the locked arm never starts its helper"
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert len(started) == 2, "the control: a free lock starts the helper"
+
+    def case_the_callers_precheck_reads_the_keychain_once_and_the_helpers_twice(
+            self, tmp_path, monkeypatch):
+        """A launch must not wait on the move, and `_keychain_denied_here`
+        sleeps a second between its two reads when it is refused: the caller's
+        own precheck asks once (`confirm=False`), the helper's, which is in
+        the background, asks as it always did. Every other clause is stubbed to
+        hold, so the keychain answer is the only thing that varies."""
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        seen = []
+        monkeypatch.setattr(pp, "read_daemon_state", lambda cd: {"pid": 5})
+        monkeypatch.setattr(pp, "_wedged_parent_holder", lambda pid, cd: 6)
+        monkeypatch.setattr(
+            pp, "_wedged_daemon_can_be_asked", lambda pid, holder: True)
+        monkeypatch.setattr(pp, "_daemon_env_value", lambda pid, key: None)
+        monkeypatch.setattr(pp, "_pin_daemon_pids", lambda cd: [5])
+        monkeypatch.setattr(
+            pp, "_keychain_denied_here",
+            lambda confirm=True: seen.append(confirm) or False)
+        health = {"pid": 5, "code_watch_age_s": 1, "keychain_denied": True}
+        assert pp._relocation_is_due(tmp_path, health) == 5
+        assert seen == [True], "the helper's own check must confirm"
+        seen.clear()
+        started = []
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            pp, "_health_body", lambda port, timeout=1.0: health)
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: started.append(a))
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert seen == [False] and len(started) == 1, (
+            "the launch's own check must be the unconfirmed one")
+
+    def case_a_daemon_off_a_mac_starts_no_keychain_thread(
+            self, tmp_path, monkeypatch):
+        """The daemon-side read is a thread, and off macOS there is nothing to
+        read: today's daemon starts none and does none of its work. THE
+        CONTROL is the same start on a Mac, which starts exactly one."""
+        import types
+
+        from cswap_pin import proxy as pp
+
+        started = []
+        monkeypatch.setattr(
+            pp.threading, "Thread",
+            lambda **k: types.SimpleNamespace(
+                start=lambda: started.append(k["target"])))
+        monkeypatch.setattr(pp.sys, "platform", "linux")
+        pp._start_noting_keychain_denial(object())
+        assert started == [], "a daemon off macOS started a keychain thread"
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        pp._start_noting_keychain_denial(object())
+        assert started == [pp._note_keychain_denial], (
+            "the control: a Mac's daemon starts the read")
+
+    def case_off_a_mac_a_launch_asks_nothing(self, tmp_path, monkeypatch):
+        """THE REFUSAL EXISTS ONLY ON MACOS: elsewhere `ensure_proxy`'s fast
+        path is today's, with not even the one loopback GET to `/health`.
+        THE CONTROL is the same call on a Mac, which does ask."""
+        from cswap_pin import proxy as pp
+
+        asked = []
+        monkeypatch.setattr(
+            pp, "_health_body",
+            lambda port, timeout=1.0: asked.append(port))
+        for platform in ("linux", "win32"):
+            monkeypatch.setattr(pp.sys, "platform", platform)
+            assert pp._move_into_this_lineage(
+                tmp_path, "2", "a@b.c", 4321) == 4321
+        assert asked == [], f"a launch off macOS asked /health: {asked}"
+        monkeypatch.setattr(pp.sys, "platform", "darwin")
+        assert pp._move_into_this_lineage(tmp_path, "2", "a@b.c", 4321) == 4321
+        assert asked == [4321], "the control: on a Mac the daemon is asked"
+
+    def case_the_helper_moves_a_denied_daemon_and_yields_to_a_busy_lock(
+            self, tmp_path, monkeypatch):
+        """`relocate_main` is the helper's whole body: under the spawn lock it
+        reads the recorded daemon's `/health` and, only for one that says it is
+        denied, runs the relocation. A lock it cannot take in
+        `_HEAL_LOCK_WAIT_S` ends it quietly (another spawn or relocation is
+        running), and so does a daemon that is not denied."""
+        from cswap_pin import proxy as pp
+
+        pp.write_daemon_state(tmp_path, 4321, os.getpid(), "fp")
+        moved, stamped = [], []
+        # THE HELPER STAMPS ITS OWN ENVIRONMENT, which every process of the
+        # lineage it starts inherits. `setenv` first only so the stamp is
+        # undone with the case (the value it reads before the move is "0").
+        monkeypatch.setenv(pp._RELOCATED_ENV, "0")
+        monkeypatch.setattr(
+            pp, "_take_the_socket_over",
+            lambda *a: moved.append(a)
+            or stamped.append(os.environ.get(pp._RELOCATED_ENV)))
+        monkeypatch.setattr(pp, "_HEAL_LOCK_WAIT_S", 0.2)
+        health = {"keychain_denied": True, "pid": os.getpid()}
+        monkeypatch.setattr(pp, "_health_body", lambda port, timeout=1.0: health)
+
+        with pp._spawn_lock(tmp_path):
+            pp.relocate_main(tmp_path, "2", "a@b.c")
+        assert moved == [], "the helper ran under a lock it did not hold"
+        health = {"pid": os.getpid()}
+        pp.relocate_main(tmp_path, "2", "a@b.c")
+        assert moved == [], "the helper moved a daemon that is not denied"
+        health = {"keychain_denied": True, "pid": os.getpid()}
+        pp.relocate_main(tmp_path, "2", "a@b.c")
+        assert moved == [(tmp_path, "2", "a@b.c", health)], (
+            "the control: a denied daemon under a free lock is moved")
+        assert stamped == ["1"], (
+            f"the helper moved a lineage without marking it as moved: {stamped}")
+
+    def case_ensure_returns_at_once_while_the_move_is_in_progress(
+            self, tmp_path, monkeypatch):
+        """NO LAUNCH BLOCKS ON A RELOCATION. The old daemon looks for the
+        rendezvous only on its tick, which is 6 s here, so the move cannot end
+        before then: the caller's ensure must hand back the CURRENT port in
+        well under that, with the old daemon still the recorded one and the
+        helper still running, and a second ensure while the helper waits starts
+        no second one. The move then completes."""
+        from cswap_pin import proxy as pp
+
+        children = self._tracking_popen(monkeypatch)
+        with self._trio(monkeypatch, denied=True, tick_s=6) as t:
+            children.clear()
+            with self._on_a_mac(monkeypatch):
+                started = time.monotonic()
+                got = pp.ensure_proxy(self._Sw(t.base))
+                took = time.monotonic() - started
+                assert got and got[0] == t.port
+                assert took < 3, f"ensure blocked on the relocation: {took:.1f}s"
+                assert int(pp.read_daemon_state(t.certdir)["pid"]) == t.daemon, (
+                    "the move had already finished: nothing was measured")
+                helpers = [c for c in children
+                           if pp._RELOCATE_MODULE_ARG in c.args]
+                assert len(helpers) == 1 and helpers[0].poll() is None
+                self._until("the helper never bound its rendezvous",
+                            lambda: list(t.certdir.glob(".successor-*")), 20)
+                again = time.monotonic()
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+                assert time.monotonic() - again < 3
+                assert len([c for c in children
+                            if pp._RELOCATE_MODULE_ARG in c.args]) == 1, (
+                    "a second ensure started a second helper")
+            self._until(
+                "the move never completed",
+                lambda: int(pp.read_daemon_state(t.certdir)["pid"]) != t.daemon
+                and helpers[0].poll() is not None, 90)
+            assert helpers[0].returncode == 0
+
+    def case_a_rendezvous_is_removed_by_age_alone_never_for_an_invisible_pid(
+            self, tmp_path, monkeypatch):
+        """A pid this namespace cannot see is not a dead one: a daemon in
+        another pid namespace sharing the certdir must not delete a live
+        helper's file. Such a file is not ACTED ON (its pid reads dead) and is
+        left; only age removes it, and the age is the helper's own listening
+        window less the margin the ask needs, so a daemon never connects to a
+        socket the helper has stopped (or is about to stop) accepting on."""
+        import subprocess
+        import sys
+        import tempfile
+        import shutil
+
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        try:
+            gone = subprocess.Popen([sys.executable, "-c", "pass"])
+            gone.wait()
+
+            def leave(pid):
+                path = certdir / f"{pp._SUCCESSOR_SOCK_PREFIX}{pid}.sock"
+                s = socket.socket(socket.AF_UNIX)
+                s.bind(str(path))
+                s.close()
+                return path
+
+            def age(path, secs):
+                then = time.time() - secs
+                os.utime(path, (then, then))
+
+            invisible = leave(gone.pid)
+            assert pp._waiting_caller(certdir) is None, (
+                "a pid this namespace cannot see was acted on")
+            assert invisible.exists(), (
+                "a rendezvous was unlinked for an invisible pid: a live "
+                "helper in another namespace loses its file")
+            age(invisible, pp._RELOCATE_ASK_WAIT_S + 60)
+            assert pp._waiting_caller(certdir) is None
+            assert not invisible.exists(), "an old file was left behind"
+
+            live = leave(os.getpid())
+            assert pp._waiting_caller(certdir) == live
+            # A REUSED PID READS ALIVE FOR EVER: only the file's age says no,
+            # and the helper stops listening at `_RELOCATE_ASK_WAIT_S`.
+            for secs in (pp._RELOCATE_ASK_WAIT_S - 1,
+                         pp._RELOCATE_ASK_WAIT_S + 5):
+                live.unlink(missing_ok=True)
+                live = leave(os.getpid())
+                age(live, secs)
+                assert pp._waiting_caller(certdir) is None, (
+                    f"a rendezvous {secs:.0f}s old was acted on, and the "
+                    f"helper stops listening at {pp._RELOCATE_ASK_WAIT_S:.0f}s")
+                assert not live.exists()
+        finally:
+            shutil.rmtree(certdir, ignore_errors=True)
+
+    def case_a_holder_that_handed_its_socket_stands_down_on_every_exit_of_its_daemon(
+            self, tmp_path, monkeypatch):
+        """Once the socket went to a caller's lineage and `proxy.json` names
+        ANOTHER live daemon, the old daemon's exit is a stand-down WHATEVER
+        its code: 0 (it drained), 75 (a TERM during the uncapped drain, which
+        exits 75 because this holder is still its parent) and a crash (-9, an
+        OOM kill). Anything but 0 used to respawn a fresh denied daemon beside
+        the new one: two acceptors, the record overwritten. With nobody else
+        serving, or no hand-off, each code keeps what it always did."""
+        from cswap_pin import proxy as pp
+
+        calls = []
+
+        class _Holder(pp.PortHolder):
+            _stop = False
+            _failures = 0
+            _proc_spawned_at = None
+            _backoff = staticmethod(lambda failures: 0.0)
+
+            def __init__(self, handed_off):
+                self._certdir = tmp_path
+                self.port = 1
+                self.daemon_pid = 5
+                self._handed_off = handed_off
+                self._proc = types.SimpleNamespace(pid=111)
+                self._standby = None
+
+            def _reap_standby(self):
+                pass
+
+            def _self_heal_on(self):
+                return True
+
+            def stop(self):
+                calls.append("stop")
+
+            def _spawn_retrying(self):
+                calls.append("respawn")
+
+        monkeypatch.setattr(pp, "load_pin", lambda root: ("a@b.c", "org"))
+        monkeypatch.setattr(pp, "_standby_port_still_wanted", lambda cd, p: True)
+
+        def run(handed_off, record_pid, code):
+            calls.clear()
+            if record_pid is None:
+                (tmp_path / "proxy.json").unlink(missing_ok=True)
+            else:
+                pp.write_daemon_state(tmp_path, 1, record_pid, "fp")
+            h = _Holder(handed_off)
+            out = h._supervise_locked(h._proc, code)
+            return out, list(calls)
+
+        me = os.getpid()
+        for code in (0, pp._RESTART_ME_CODE, -9):
+            assert run(True, me, code) == ("return", ["stop"]), (
+                f"exit {code} after a hand-off with a live successor on "
+                "record must stand down")
+            assert run(True, 111, code) == ("continue", ["respawn"]), (
+                f"exit {code}: the record still names the exited daemon, so "
+                "nobody else serves")
+            assert run(True, None, code) == ("continue", ["respawn"])
+            assert run(False, me, code) == ("continue", ["respawn"]), (
+                f"exit {code} with no hand-off is the ordinary one")
+
+    def case_a_confirmed_hand_off_retires_the_old_standby_while_the_daemon_drains(
+            self, tmp_path, monkeypatch):
+        """The old daemon may drain for hours, and its holder stays alive
+        beside it. From the moment ANOTHER live daemon is on record the old
+        lineage's standby has nothing left to cover, so the holder releases it
+        then, not at the daemon's exit (a placement that failed, or one that
+        was never made, would leave it armed for the whole drain). Without a
+        hand-off, or with nobody else serving, the standby is untouched."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_CODE_WATCH_INTERVAL_S", 0.05)
+        signalled = []
+
+        class _Standby:
+            returncode = None
+
+            def send_signal(self, sig):
+                signalled.append(sig)
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        class _Holder(pp.PortHolder):
+            _stop = False
+
+            def __init__(self, handed_off):
+                self._certdir = tmp_path
+                self.port = 1
+                self._handed_off = handed_off
+                self._standby = _Standby()
+
+            def _self_heal_on(self):
+                return False        # nothing else in the wait acts
+
+        class _Daemon:
+            pid = 111
+
+            def __init__(self):
+                self._release = threading.Event()
+
+            def wait(self):
+                self._release.wait(10)
+                return 0
+
+        def run(handed_off, record_pid):
+            signalled.clear()
+            if record_pid is None:
+                (tmp_path / "proxy.json").unlink(missing_ok=True)
+            else:
+                pp.write_daemon_state(tmp_path, 1, record_pid, "fp")
+            h, d = _Holder(handed_off), _Daemon()
+            worker = threading.Thread(target=h._wait_for_exit, args=(d,))
+            worker.start()
+            time.sleep(0.4)             # several of the 0.05 s intervals
+            d._release.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            return list(signalled), h._standby
+
+        me = os.getpid()
+        sent, standby = run(True, me)
+        assert sent == [signal.SIGHUP] and standby is None, (
+            f"the standby was not released during the drain: {sent}")
+        assert run(True, 111)[0] == [], "nobody else serves: it still covers"
+        assert run(True, None)[0] == []
+        assert run(False, me)[0] == [], "no hand-off: the ordinary holder"
+
+    def case_a_confirmed_hand_off_is_never_undone_while_the_daemon_drains(
+            self, tmp_path, monkeypatch):
+        """With self-heal ON, a daemon that stopped accepting because it gave
+        the listener away reads as a wedged one: two probe misses a silence
+        bound apart, anywhere in an uncapped drain (hours), used to reset
+        `_handed_off`, spawn a denied-lineage daemon on the shared socket and
+        TERM the draining one (cutting its held tunnels). Once ANOTHER live
+        daemon is on record the holder neither probes nor replaces, and a
+        SIGUSR1 ask is declined too (it reset the flag the same way); it only
+        waits for the exit and stands down. Without that confirmation (no
+        hand-off, or the record still names this daemon) the wedge arm keeps
+        its duty."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_CODE_WATCH_INTERVAL_S", 0.05)
+        monkeypatch.setattr(pp, "_CODE_WATCH_BEAT_MAX_AGE_S", 0.12)
+        log = []
+        monkeypatch.setattr(
+            pp, "_health_pid",
+            lambda port, timeout=1.0: log.append("probe"))   # answers nothing
+
+        class _Holder(pp.PortHolder):
+            _stop = False
+
+            def __init__(self, handed_off):
+                self._certdir = tmp_path
+                self.port = 1
+                self._handed_off = handed_off
+                self._standby = None
+                self._replace_lock = threading.RLock()
+
+            def _self_heal_on(self):
+                return True
+
+            def _spawn(self):
+                log.append("spawn")
+                self._proc = types.SimpleNamespace(pid=222)
+
+            def _terminate_proc(self, proc):
+                log.append(f"terminate {proc.pid}")
+
+        class _Daemon:
+            pid = 111
+
+            def __init__(self):
+                self._release = threading.Event()
+
+            def wait(self):
+                self._release.wait(10)
+                return 0
+
+        def run(handed_off, record_pid, ask=False):
+            log.clear()
+            pp.write_daemon_state(tmp_path, 1, record_pid, "fp")
+            h, d = _Holder(handed_off), _Daemon()
+            h._proc = d
+            worker = threading.Thread(target=h._wait_for_exit, args=(d,))
+            worker.start()
+            time.sleep(0.5)             # four silence bounds of 0.12 s
+            if ask:
+                h._on_replace_request(signal.SIGUSR1, None)
+            d._release.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            return [e for e in log if e != "probe"], "probe" in log, h._handed_off
+
+        me = os.getpid()
+        assert run(True, me) == ([], False, True), (
+            "the port-watch probed or replaced the daemon of a confirmed "
+            "hand-off, or reset its flag")
+        assert run(True, me, ask=True) == ([], False, True), (
+            "a SIGUSR1 ask after a confirmed hand-off respawned or reset "
+            "the flag")
+        for handed_off, record_pid in ((True, 111), (False, me)):
+            assert run(handed_off, record_pid) == (
+                ["spawn", "terminate 111"], True, False), (
+                f"hand_off={handed_off} record={record_pid}: nothing else "
+                "serves, so the wedge arm replaces the silent daemon")
+
+    def _watch(self, pp, monkeypatch, certdir, wait_s, publish, stale=False,
+               bind_in_tick=False):
+        """`_watch_own_code` on a stand-in server with a live rendezvous.
+        ``stale``: the daemon's code is out of date, so the tick itself wants
+        a replacement. ``bind_in_tick``: the rendezvous does not exist when the
+        tick starts and is bound by the helper in the middle of it (the helper
+        races the daemon's own decision)."""
+        released, exited, signalled = [], [], []
+
+        class _Srv:
+            def release_listener(self, hand_down=False):
+                released.append(hand_down)
+
+            def await_inflight(self, budget):
+                released.append(("drain", budget))
+
+        def kill(pid, sig):
+            if sig == pp._REPLACE_ME_SIGNAL:
+                signalled.append(pid)
+                if publish:
+                    pp.write_daemon_state(certdir, 1, os.getpid() + 1, "fp")
+
+        monkeypatch.setattr(os, "kill", kill)
+        monkeypatch.setattr(
+            os, "_exit",
+            lambda code: exited.append(code) or (_ for _ in ()).throw(
+                SystemExit(code)))
+        monkeypatch.setattr(pp, "_RELOCATE_WAIT_S", wait_s)
+        # THE ORDINARY ASK'S OWN BOUND, the same figure: what separates the two
+        # waits is the outcome (a keep-serving arm, or exit 75), not the time.
+        monkeypatch.setattr(pp, "_SPAWN_WAIT_S", wait_s)
+        monkeypatch.setenv(pp._HELD_BY_ENV, str(os.getppid()))
+        monkeypatch.setenv(pp._HOLDER_REPLACE_ENV, "1")
+        monkeypatch.delenv(pp._SELF_HEAL_ENV, raising=False)
+        s = socket.socket(socket.AF_UNIX)
+        rendezvous = certdir / f"{pp._SUCCESSOR_SOCK_PREFIX}{os.getpid()}.sock"
+        if bind_in_tick:
+            # `_can_mint` runs after the tick's first look and before its ask.
+            monkeypatch.setattr(
+                pp, "_can_mint", lambda provider: s.bind(str(rendezvous)) or True)
+        else:
+            s.bind(str(rendezvous))
+        try:
+            # ONE PASS: a real caller unlinks its rendezvous once it has been
+            # handed the socket, so the tick that follows a failure finds none.
+            pp._watch_own_code(
+                _Srv(), "1", "a@b.c", certdir, _Ticks(2), lambda *a: None,
+                interval=0.01,
+                _own_fingerprint="stale" if stale else pp.daemon_fingerprint())
+        except SystemExit:
+            pass
+        finally:
+            s.close()
+        return released, exited, signalled
+
+    def case_a_waiting_caller_makes_the_current_daemon_hand_over_gaplessly(
+            self, tmp_path, monkeypatch):
+        """The trigger does not depend on the daemon being blind or stale: a
+        live rendezvous alone makes the tick run the gapless sequence (ask the
+        holder, wait for the successor's record, release, uncapped drain,
+        exit 0)."""
+        import tempfile
+        import shutil
+
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        try:
+            released, exited, signalled = self._watch(
+                pp, monkeypatch, certdir, 0.5, publish=True)
+        finally:
+            shutil.rmtree(certdir, ignore_errors=True)
+        assert signalled == [os.getppid()], "the holder was not asked"
+        assert released == [False, ("drain", float("inf"))], released
+        assert exited == [0], f"exited {exited}: 75 is the capped arm"
+
+    def case_a_relocation_whose_successor_never_publishes_keeps_serving(
+            self, tmp_path, monkeypatch):
+        """The failure arm at the daemon: past its own bound the daemon does
+        NOT release, drain or exit; it hands the drain announcement back and
+        goes on serving, and its record is the one it had (the helper never
+        marks it: the daemon serves throughout)."""
+        import tempfile
+        import shutil
+
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        serving = socket.socket()
+        serving.bind(("127.0.0.1", 0))
+        serving.listen(1)
+        try:
+            pp.write_daemon_state(certdir, serving.getsockname()[1],
+                                  os.getpid(), "fp")
+            released, exited, signalled = self._watch(
+                pp, monkeypatch, certdir, 0.3, publish=False)
+            drains = list(certdir.glob(".draining-*"))
+            record = pp.read_daemon_state(certdir)
+        finally:
+            serving.close()
+            shutil.rmtree(certdir, ignore_errors=True)
+        assert signalled == [os.getppid()]
+        assert released == [] and exited == [], (
+            f"a failed relocation released={released} exited={exited}")
+        assert drains == [], "the drain announcement was not handed back"
+        assert record and record["pid"] == os.getpid() and not record.get(
+            "handover"), f"the record was not left as it was: {record}"
+
+    def case_a_stale_code_ask_racing_a_helpers_bind_takes_the_relocation_path(
+            self, tmp_path, monkeypatch):
+        """The helper binds its rendezvous in the middle of a tick that has
+        already decided to replace STALE CODE, after the tick's first look and
+        before its ask. The holder then hands the helper the socket instead of
+        spawning, so this daemon must be on the relocation's own wait and its
+        keep-serving failure arm: the ordinary ask waits `_SPAWN_WAIT_S` for a
+        successor the helper takes far longer to publish, and then exits 75
+        (a capped drain that cuts held tunnels, and a holder that respawns on
+        a socket it handed away). THE CONTROL is the same stale tick with no
+        helper: it asks the holder and takes the ordinary exit-75 fallback."""
+        import tempfile
+        import shutil
+
+        from cswap_pin import proxy as pp
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        try:
+            released, exited, signalled = self._watch(
+                pp, monkeypatch, certdir, 0.3, publish=False, stale=True,
+                bind_in_tick=True)
+            drains = list(certdir.glob(".draining-*"))
+        finally:
+            shutil.rmtree(certdir, ignore_errors=True)
+        assert signalled == [os.getppid()], "the holder was not asked"
+        assert released == [] and exited == [], (
+            f"a stale ask that raced the helper released={released} "
+            f"exited={exited}: it took the ordinary exit-75 arm")
+        assert drains == [], "the drain announcement was not handed back"
+
+        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        try:
+            with monkeypatch.context() as m:
+                m.setattr(pp, "_waiting_caller", lambda cd: None)
+                released, exited, signalled = self._watch(
+                    pp, m, certdir, 0.3, publish=False, stale=True,
+                    bind_in_tick=True)
+        finally:
+            shutil.rmtree(certdir, ignore_errors=True)
+        assert exited == [pp._RESTART_ME_CODE], (
+            f"the control did not reach the ordinary arm: {exited}")
+
+    def case_a_killed_draining_daemon_is_not_replaced_by_its_old_holder(
+            self, tmp_path, monkeypatch):
+        """WITH REAL PROCESSES. After the move the old daemon drains (a held
+        tunnel keeps it there) beside a holder that is still its parent. An OOM
+        kill of that daemon used to take the crash arm: the old holder spawned
+        a fresh DENIED daemon on the shared socket beside the new one, two
+        acceptors, and the next sweep TERMs the good one (a cut). It stands
+        down instead: nothing is spawned, the new daemon is the only one, the
+        record is still its own, and the old lineage leaves one standby, not
+        two. (A TERM is the same stand-down with exit 75; every code is covered
+        on the real decision above.)"""
+        import signal
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        children = self._tracking_popen(monkeypatch)
+        with self._trio(monkeypatch, denied=True) as t:
+            held = self._tunnel(t.port, t.echo.port)
+            held.sendall(b"before")
+            assert held.recv(16) == b"before", "premise: the tunnel echoes"
+            with self._on_a_mac(monkeypatch):
+                assert pp.ensure_proxy(self._Sw(t.base))[0] == t.port
+            st = self._until(
+                "the caller's lineage never published a daemon",
+                lambda: (lambda s: s if s and int(s["pid"]) != t.daemon
+                         else None)(pp.read_daemon_state(t.certdir)), 60)
+            new = int(st["pid"])
+            helpers = [c for c in children if pp._RELOCATE_MODULE_ARG in c.args]
+            assert len(helpers) == 1 and helpers[0].wait(timeout=60) == 0
+            self._until("the old daemon is not draining",
+                        lambda: pp.is_draining(t.certdir, t.daemon), 30)
+            assert pp._pid_alive(t.daemon) and pp._pid_alive(t.holder), (
+                "premise: the old daemon drains beside its holder")
+
+            os.kill(t.daemon, signal.SIGKILL)
+            self._until("the old holder never stood down",
+                        lambda: not pp._pid_alive(t.holder), 30)
+            time.sleep(1.0)     # long enough for a respawn to have published
+            assert pp._pin_daemon_pids(t.certdir) == [new], (
+                "a daemon besides the new one is serving the shared socket")
+            assert int(pp.read_daemon_state(t.certdir)["pid"]) == new, (
+                "the record no longer names the new daemon")
+            body = pp._health_body(t.port)
+            assert body and body["pid"] == new
+            log = (t.certdir / "daemon.log").read_text()
+            assert (f"daemon {t.daemon} retired (exit -9) after the socket "
+                    "went to a caller's lineage") in log
+            assert "restarting under the held port" not in log
+            ps = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
+                                capture_output=True, text=True).stdout
+            standbys = [ln for ln in ps.splitlines()
+                        if pp._STANDBY_MODULE_ARG in ln
+                        and "cswap_pin.proxy" in ln
+                        and ln.rstrip().endswith(" " + str(t.certdir))]
+            assert len(standbys) == 1, (
+                f"the old lineage's standby is still armed: {standbys}")
+            held.close()
+
+    def case_a_launch_during_the_helpers_spawn_wait_is_not_held(
+            self, tmp_path, monkeypatch):
+        """THE REAL `_spawn_daemon`, with only the successor's holder withheld
+        so that its wait runs the whole bound. While the helper waits under the
+        spawn lock the old daemon is still serving and its record is still
+        valid: a launch must get the current port at once. The relocation's
+        spawn used to mark that record as handed over, so every launch's fast
+        path read it as "nothing is serving" and blocked on the helper's lock
+        for the whole bound (up to 180 s)."""
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_RELOCATE_WAIT_S", 6.0)
+        with self._trio(monkeypatch, denied=True, relocate_wait_s=6) as t:
+            # AFTER the trio is born, or it inherits the mark and is never
+            # moved. The helper below runs in THIS process and stamps it; the
+            # `setenv` is only so that stamp is undone with the case.
+            monkeypatch.setenv(pp._RELOCATED_ENV, "0")
+            real_popen = subprocess.Popen
+            in_window = threading.Event()
+
+            def popen(argv, *a, **k):
+                if pp._HOLDER_MODULE_ARG in argv:     # the successor's holder
+                    in_window.set()
+                    return types.SimpleNamespace(pid=0)
+                return real_popen(argv, *a, **k)
+
+            monkeypatch.setattr(subprocess, "Popen", popen)
+            helper = threading.Thread(
+                target=pp.relocate_main, args=(t.certdir, "2", self.EMAIL),
+                daemon=True)
+            helper.start()
+            assert in_window.wait(60), "the helper never reached its spawn"
+            started = time.monotonic()
+            with self._on_a_mac(monkeypatch):
+                got = pp.ensure_proxy(self._Sw(t.base))
+            took = time.monotonic() - started
+            assert got and got[0] == t.port, f"the port moved: {got}"
+            assert took < 3, (
+                f"a launch waited {took:.1f}s on the helper's spawn")
+            record = pp.read_daemon_state(t.certdir)
+            assert record and int(record["pid"]) == t.daemon, (
+                f"the old daemon's record was replaced: {record}")
+            assert not record.get("handover"), (
+                "the relocation's spawn marked a serving daemon's record as "
+                f"handed over: {record}")
+            helper.join(60)
+            assert not helper.is_alive()
+            assert pp._pid_alive(t.daemon) and pp._health_body(t.port), (
+                "the failed move cost the old daemon")
+
+    def case_a_non_marking_spawn_waits_for_a_record_that_is_not_the_old_daemons(
+            self, tmp_path, monkeypatch):
+        """`mark_departing=False`: the departing daemon's record stays as it
+        is, so `_read_alive_port` keeps answering with ITS port, and the wait
+        for the successor must not take that for the successor (it would
+        return at once, and the helper would close the descriptor before the
+        new holder adopted it). It waits for a record naming another pid."""
+        import subprocess
+
+        from cswap_pin import proxy as pp
+
+        # ACCEPTING, or the poll fills the backlog and reads "dead" for the
+        # wrong reason, which would make the first assertion below vacuous.
+        serving = _HealthStub(lambda n: _health_ok({"can_pin": True}))
+        port = serving.port
+        try:
+            pp.write_daemon_state(tmp_path, port, os.getpid(), "fp")
+            assert pp._read_alive_port(tmp_path) == port, (
+                "premise: the old daemon reads alive, so a wrong wait is "
+                "one that returns at once")
+            real_popen = subprocess.Popen
+            started = []
+
+            def popen(argv, *a, **k):
+                # THE SUCCESSOR'S HOLDER only; `ps` and the rest are real.
+                if pp._HOLDER_MODULE_ARG not in argv:
+                    return real_popen(argv, *a, **k)
+                started.append(argv)
+                if publish:
+                    pp.write_daemon_state(tmp_path, port, os.getppid(), "fp2")
+
+            publish = False
+            monkeypatch.setattr(subprocess, "Popen", popen)
+            assert pp._spawn_daemon(
+                "2", "a@b.c", tmp_path, mark_departing=False,
+                wait_s=0.5) is None, (
+                "the daemon being replaced was taken for its successor")
+            assert len(started) == 1, "the successor was never started"
+            record = pp.read_daemon_state(tmp_path)
+            assert record["pid"] == os.getpid() and not record.get("handover")
+            publish = True
+            assert pp._spawn_daemon(
+                "2", "a@b.c", tmp_path, mark_departing=False,
+                wait_s=3) == port, (
+                "the control: a record naming another live pid is the "
+                "successor")
+        finally:
+            serving.close()

@@ -887,6 +887,64 @@ measured their graceful path as *more destructive than `kill -9`* for want of
 that distinction. `PortHolder.stop()` — a deliberate release — sends the
 `SIGHUP` itself, so releasing the port really releases it.
 
+### A daemon the macOS Keychain refuses is moved into the caller's session
+
+On macOS a process outside the login session (one started over `ssh`, say) is
+refused Claude Code's OAuth Keychain item (`security` rc=36), and every daemon
+it spawns inherits that, successors included: every successor is born of the
+holder. Such a daemon still serves and can report `can_pin` true, but its 429
+wall cannot switch slots. Killing the trio to start another cuts the held
+tunnels, so the **socket** moves instead.
+
+- The daemon reads its own refusal once, at start, and `/health` says
+  `"keychain_denied": true`. The key is absent for a daemon that is not
+  refused, and off macOS.
+- Exactly these commands trigger it: `cswap pin --ensure` (what `wire.zsh`
+  runs on every Terminal launch) and `cswap pin --heal`, through `heal`'s
+  serving arm (`--ensure` reaches `heal`, never `ensure_proxy`), and `cswap
+  run`, a hand-typed `cswap pin <n>` and the TUI's repair, through
+  `ensure_proxy`. Each finds such a daemon, and when the caller is **not**
+  itself refused and sees the daemon's pid (host and container share `$HOME`,
+  not pids), starts a **detached helper** (`python -m cswap_pin.proxy
+  --relocate <certdir> <account> <email>`, stderr to `daemon.log`) and returns
+  the current port **at once**: the old daemon keeps serving, its record stays
+  valid (the helper's spawn does not mark it as handed over), and no launch
+  waits on the move or on the helper's lock. The helper is the caller's own
+  child, so it shares the caller's macOS audit session. The launch's own
+  checks are reads, and its Keychain check is one read, never the two a second
+  apart the helper makes. Only one runs at a time: a caller that finds the
+  spawn lock held starts none. The helper takes the spawn lock, binds
+  `pin-proxy/.successor-<pid>.sock` and waits 60 s; a daemon acts only on a
+  rendezvous younger than 50 s, so it never connects to a socket nobody
+  accepts on. The daemon's next watchdog tick (at most 30 s) sees it, whatever
+  else that tick wanted (stale code, a blind mint), and asks its holder, which
+  answers the daemon's own ask by sending the helper the live listening socket
+  over that rendezvous instead of spawning (the holder's own replace of a
+  wedged daemon never hands off). The helper runs `_spawn_daemon(listen_fd=)`
+  itself, so the new holder is its child and `CSWAP_PIN_LISTEN_FROM` its pid,
+  and the old daemon runs the ordinary gapless sequence: wait for the
+  successor's record, stop accepting, drain **uncapped**, exit 0. The helper
+  exits once the new daemon has published.
+- **The old holder stands down on every exit of its draining daemon.** Once
+  `proxy.json` names another live daemon, an exit 0 (the drain ended), 75 (a
+  TERM during the drain) or a crash (an OOM kill) respawns nothing, the old
+  lineage's standby is released while the drain still runs, and the socket is
+  closed only after its daemon is gone.
+- **One move per lineage.** The helper stamps `CSWAP_PIN_RELOCATED=1` into the
+  lineage it starts, and a daemon that carries it is never moved again.
+- **Off macOS nothing changes**: the refusal does not exist there, so a launch
+  asks the daemon nothing extra (not even `/health`) and a daemon starts no
+  thread to read it.
+- **Nothing is cut and nothing is stranded if it fails.** If the helper dies
+  or the successor never publishes, the old daemon keeps serving past its
+  bound (no capped drain, no exit 75) and its holder keeps its respawn duty.
+  The bound is `_RELOCATE_WAIT_S` (180 s), not the 10 s `_SPAWN_WAIT_S`: a
+  helper-spawned successor measured 0.54 s to serve on a quiet box and 9 s with
+  16 busy loops sharing its CPU, and 56-85 s on a loaded Mac (T1935).
+- Not verified on a Mac: that a lineage spawned from the login session is read
+  as not refused. The new daemon's own `/health` is the measurement, and a
+  lineage that is read as refused anyway stays where it is (one move).
+
 ## Falling through a dead hop
 
 The pin dials through whatever egress proxy the machine already has, and that
