@@ -2380,7 +2380,9 @@ class TestAClientThatHangsUpOnASilentHop:
         return pred()
 
     def _assert_let_go(self, proxy, client_closed, hop=None):
+        # Waits for all that is asserted below, the open count included.
         self._eventually(lambda: proxy.inflight_requests() == 0
+                         and proxy.live_client_count() == 0
                          and client_closed() and (hop is None or hop.cut.is_set()))
         assert proxy.inflight_requests() == 0, (
             "the hung-up client's request is still owed after 5s")
@@ -2581,6 +2583,18 @@ class TestAClientThatHangsUpOnASilentHop:
             assert not watch._waits, "an unwatchable client was registered"
         for s in (a, b, c, d):
             s.close()
+
+    def case_let_go_waits_for_the_release_not_only_the_close(self):
+        """`_pump` closes the client socket, then its frames unwind to
+        `_release`: a wait that stopped at "closed" read the count in between
+        and failed on the macOS runner without waiting out its 5 s, the pin
+        having let the client go (macOS, poll spinning: 91 of 100 failed, a
+        13 ms median gap, 37 ms worst, never stuck)."""
+        release_at = time.monotonic() + 0.3
+        late = types.SimpleNamespace(
+            inflight_requests=lambda: 0,
+            live_client_count=lambda: int(time.monotonic() < release_at))
+        self._assert_let_go(late, lambda: True)
 
 
 class TestPinTimeHopTrust:
