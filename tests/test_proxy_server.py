@@ -16150,12 +16150,12 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             "expiresAt": expires}})
         real, looks = pp.oauth.is_oauth_token_expired, []
 
-        def expired(at, *a, **k):
+        def expired(at):
             if at == expires:
                 looks.append(1)
                 if len(looks) > 1:
                     return True
-            return real(at, *a, **k)
+            return real(at)
 
         monkeypatch.setattr(pp.oauth, "is_oauth_token_expired", expired)
         self._tick(rig, certdir, monkeypatch, False)

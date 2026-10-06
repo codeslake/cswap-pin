@@ -7146,11 +7146,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
         nothing when it fails") must not set one. It still clears: a tick
         that holds a live token is the one thing that clears a stale reason
         on an idle daemon with self-heal off, and `runtime_health` fails
-        `pin-applied` on any. NOT WHILE `identity_mismatch` STANDS: the reason a
-        request wrote for a foreign bearer is the one thing the tick must not
-        erase (it is muted from writing it back), and with self-heal off no
-        `_can_mint` re-asks, so `/health` would read an empty reason beside a
-        standing mismatch. The next tick after the repair clears it."""
+        `pin-applied` on any. Not while `identity_mismatch` stands: the tick
+        cannot write that reason back, and with self-heal off nothing re-asks."""
         if not provider._tls.quiet or (
                 not reason and not provider.identity_mismatch):
             provider.blind_reason = reason
@@ -7406,10 +7403,8 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 # cold-cache case above and this IS the first read — either way
                 # the read happens here, under the lock.
                 creds = switcher.read_account_credentials(num, mail) or creds
-                # ONE LOOK AT THE CLOCK PER BLOB: a second look can see the
-                # buffer crossed after the guard below judged the blob live,
-                # and the tick would write it over the held copy with no
-                # token in hand.
+                # ONE LOOK AT THE CLOCK PER BLOB: a second one can disagree
+                # with the guard below and overwrite the held copy.
                 token = _live_token(creds) if creds else None
                 if freshen and not token:
                     # THE EARLY REFRESH IS FOR THE LIVE TOKEN IN HAND (`cached`
