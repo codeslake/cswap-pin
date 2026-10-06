@@ -18284,7 +18284,11 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
 
     @classmethod
     def _relay(cls, path="/v1/messages", reset=None, status=b"429 Too Many Requests",
-               auth="", session="", extra_headers=b""):
+               auth="", session="", extra_headers=b"", body=b"no", withhold=0,
+               framed=True, method="POST"):
+        """``withhold`` holds back that many trailing body bytes and sends
+        them from a timer, so the head read ends before the body does.
+        ``framed=False`` omits `Content-Length`."""
         import socket as _s
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
@@ -18295,10 +18299,19 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 head += (reset or cls.RESET_HEADER) + b"\r\n"
             head += (cls.RETRY_AFTER + b"\r\n" + cls.UNIFIED_STATUS + b"\r\n"
                      + cls.SHOULD_RETRY + b"\r\n" + extra_headers
-                     + b"Content-Length: 2\r\n\r\nno")
-            up_b.sendall(head)
-            up_b.shutdown(_s.SHUT_WR)
-            pp._relay_response(up_a, cl_a, 0, method="POST", path=path,
+                     + (b"Content-Length: %d\r\n" % len(body) if framed else b"")
+                     + b"\r\n")
+            early, late = ((body[:-withhold], body[-withhold:]) if withhold
+                           else (body, b""))
+            up_b.sendall(head + early)
+            if late:
+                def _later():
+                    up_b.sendall(late)
+                    up_b.shutdown(_s.SHUT_WR)
+                threading.Timer(0.1, _later).start()
+            else:
+                up_b.shutdown(_s.SHUT_WR)
+            pp._relay_response(up_a, cl_a, 0, method=method, path=path,
                                auth=auth, session=session)
             cl_a.shutdown(_s.SHUT_WR)
             return cl_b.recv(4096)
@@ -20046,7 +20059,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     @staticmethod
     def _wire_exclude_capable(monkeypatch, switched, exclude_param=True,
                                validated=True, live_token=None, live_num="1",
-                               before=None, occupant=None):
+                               before=None, occupant=None,
+                               refused_param=False, kwargs_log=None):
         """`ClaudeAccountSwitcher` as a real CLASS carrying `switch` as an
         ordinary method, so `_switch_takes_exclude`'s
         `inspect.signature(...ClaudeAccountSwitcher.switch)` can actually see
@@ -20059,7 +20073,12 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         case that needs to block inside it. ``occupant`` is a ``{slot:
         email}`` map `resolve_account` answers from, live, so a case can
         change who holds a slot between two relays (`cswap move`); omitted,
-        every slot holds one fixed account of its own."""
+        every slot holds one fixed account of its own. ``refused_param``
+        adds `current_refused` to the signature (a host that can mark a
+        refusal); without it the signature is `exclude` alone, the older
+        host. ``kwargs_log``, when given, collects every `switch()` call's
+        keyword arguments as a dict, which `calls` (the `exclude` values)
+        cannot say."""
         from claude_swap.exceptions import AccountNotFoundError
         from cswap_pin import proxy as pp
         calls = []
@@ -20072,7 +20091,22 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         def _current_account_number(self):
             return live_num() if callable(live_num) else live_num
 
-        if exclude_param:
+        if refused_param:
+            def _switch(self, strategy=None, json_output=False, models=None,
+                        current_at_limit=False, current_refused=False,
+                        exclude=None):
+                calls.append(exclude)
+                if kwargs_log is not None:
+                    kwargs_log.append(dict(
+                        strategy=strategy, json_output=json_output,
+                        models=models, current_at_limit=current_at_limit,
+                        current_refused=current_refused, exclude=exclude))
+                if before is not None:
+                    before()
+                return {"switched": switched, "needsLogin": False,
+                        "validated": validated,
+                        "reason": None if switched else "candidates-exhausted"}
+        elif exclude_param:
             def _switch(self, strategy=None, json_output=False, models=None,
                         current_at_limit=False, exclude=None):
                 calls.append(exclude)
@@ -20751,6 +20785,349 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert len(calls) == 1, (
             f"a reset already in the past zeroed the debounce and let a "
             f"second concurrent 429 call switch() again: {calls}")
+
+
+class TestAnAccessGrant403OnMessagesBecomesA401:
+    """THE DEFECT (lmd42, 2026-10-06 01:56:59Z-01:59:21Z): after an engine
+    switch the API answered `403 Access to this model requires an access
+    grant your request does not have` to every opus request on a healthy
+    bearer for 2m22s. The pin relayed all 11 unchanged and the sessions drew
+    "Please run /login". Only the rendered text was captured, never the JSON
+    `error.type`, so the arm matches the message and nothing else.
+
+    The 429 arm's helpers are reused, not copied: `_wire_exclude_capable` is
+    a real class so `inspect.signature` sees the parameters, and
+    `_relay` is the same socketpair relay with a body.
+    """
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    _T = TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount
+    LIVE = _T.LIVE
+    _wire_exclude_capable = staticmethod(_T._wire_exclude_capable)
+    _relay = _T._relay
+    HEADS = (_T.RETRY_AFTER, _T.UNIFIED_STATUS, _T.SHOULD_RETRY)
+
+    GRANT_BODY = json.dumps({"type": "error", "error": {
+        "type": "permission_error",
+        "message": "Access to this model requires an access grant your "
+                   "request does not have"}}).encode()
+    # The same envelope and `error.type`, a different refusal: only the
+    # message tells them apart.
+    OTHER_BODY = json.dumps({"type": "error", "error": {
+        "type": "permission_error",
+        "message": "Your organization does not have access to this "
+                   "resource"}}).encode()
+
+    def _wire(self, monkeypatch, log=None, **kw):
+        kw.setdefault("switched", True)
+        kw.setdefault("refused_param", True)
+        return self._wire_exclude_capable(
+            monkeypatch, live_token=self.LIVE, kwargs_log=log, **kw)
+
+    def _r403(self, body=None, auth=None, path="/v1/messages", **kw):
+        """A 403 as the API sends it: no rate-limit reset, the same
+        retry-hint headers the 429 helper always carries. ``auth=None`` is the
+        live account's own bearer."""
+        return self._relay(
+            path=path, status=b"403 Forbidden", reset=False,
+            auth="Bearer " + self.LIVE if auth is None else auth,
+            body=self.GRANT_BODY if body is None else body, **kw)
+
+    def _untouched(self, **kw):
+        """The same response on a route no arm looks at: what "relayed
+        byte-identical" is measured against."""
+        return self._r403(path="/v1/other", **kw)
+
+    def _key(self):
+        """The memo key: the grant marker plus the bearer's fingerprint, and
+        the slot."""
+        import hashlib
+        return (b"grant:" + hashlib.sha256(self.LIVE.encode()).hexdigest()[:16]
+                .encode(), "1")
+
+    def case_a_grant_403_becomes_a_401_after_exactly_one_switch(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_fleet_exhausted_until", 777.0)
+        log = []
+        self._wire(monkeypatch, log=log)
+        got = self._r403()
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert len(log) == 1, log
+        kw = log[0]
+        assert kw["current_refused"] is True, kw
+        assert kw["exclude"] == {"1"}, (
+            "the slot whose bearer drew the refusal, and no other, is what "
+            f"switch() must mark and leave: {kw}")
+        assert not kw["current_at_limit"], (
+            f"a refusal is not a wall: {kw}")
+        assert (kw["strategy"], kw["json_output"], kw["models"]) == (
+            "best", True, ("all",)), kw
+        low = got.lower()
+        assert b"retry-after" not in low and b"x-should-retry" not in low, (
+            "a 401 that keeps the 403's retry hints is not the rebuild "
+            f"trigger: {got[:200]!r}")
+        assert got.endswith(self.GRANT_BODY), got[-80:]
+        assert pp._walled_switch_seen[self._key()][0] is True, (
+            pp._walled_switch_seen)
+        assert pp._walled_slots == {}, (
+            f"a refusal walled slot(s) the way a 429 does: {pp._walled_slots}")
+        assert pp._fleet_exhausted_until == 777.0, (
+            "a refusal says nothing about the fleet's walls, but it wrote "
+            f"the fleet-exhausted memo: {pp._fleet_exhausted_until}")
+
+    def case_ten_concurrent_grant_403s_make_one_switch(self, monkeypatch):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _block():
+            entered.set()
+            assert release.wait(timeout=5), "release never set -- test bug"
+
+        log = []
+        self._wire(monkeypatch, log=log, before=_block)
+        results = {}
+
+        def _run(i):
+            results[i] = self._r403()
+
+        threads = [threading.Thread(target=_run, args=(0,))]
+        threads[0].start()
+        assert entered.wait(timeout=5), "switch() never started"
+        for i in range(1, 10):
+            threads.append(threading.Thread(target=_run, args=(i,)))
+            threads[-1].start()
+        time.sleep(0.3)
+        assert not results, (
+            "a 403 was answered while the one switch() was still landing: "
+            f"{sorted(results)}")
+        release.set()
+        for t in threads:
+            t.join(timeout=5)
+        assert len(results) == 10, sorted(results)
+        assert {r[:12] for r in results.values()} == {b"HTTP/1.1 401"}, [
+            r[:20] for r in results.values()]
+        assert len(log) == 1, f"ten refusals made {len(log)} switch() calls"
+
+    def case_a_403_that_is_not_an_access_grant_is_relayed_byte_identical(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        bodies = {
+            "an org refusal in the same envelope and type": self.OTHER_BODY,
+            "the corporate inspector": (
+                b"<html><body>Access restricted by network policy"
+                b"</body></html>"),
+            "a policy rule": b"403 Blocked by policy rule",
+            "not json": b"{not json",
+            "the phrase outside error.message":
+                b'{"error": "requires an access grant"}',
+            "a message that is not text": b'{"error": {"message": 7}}',
+            "an empty body": b"",
+        }
+        for what, body in bodies.items():
+            got = self._r403(body=body)
+            assert got.startswith(b"HTTP/1.1 403"), (what, got[:60])
+            assert got == self._untouched(body=body), (what, got[:200])
+        for path in ("/v1/messages/count_tokens", "/v1/other"):
+            assert self._r403(path=path) == self._untouched(), path
+        assert not log, f"a switch() was asked for a non-grant 403: {log}"
+
+    def case_an_older_cswap_relays_the_grant_403_unchanged_and_reads_no_body(
+        self, monkeypatch,
+    ):
+        """`switch()` there has `exclude` but not `current_refused`, so
+        passing the kwarg raises TypeError. The capability is read from the
+        signature BEFORE any body is read or any switch is attempted: a
+        `calls` list that stays empty would be just as empty if the pin had
+        tried and been refused."""
+        from cswap_pin import proxy as pp
+        attempts = []
+        monkeypatch.setattr(pp, "_grant_refusal",
+                            lambda *a: attempts.append("body") or (b"", True))
+        monkeypatch.setattr(pp, "_switch_off_walled_account",
+                            lambda *a, **k: attempts.append("switch") or True)
+        self._wire(monkeypatch, refused_param=False)
+        got = self._r403()
+        assert got == self._untouched(), got[:200]
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert not attempts, (
+            f"an older host's 403 was read or switched on: {attempts}")
+
+    def case_a_head_response_has_no_body_to_wait_for(self, monkeypatch):
+        """A HEAD 403 announces a `Content-Length` and sends nothing; reading
+        for it would park the relay until the upstream closes."""
+        from cswap_pin import proxy as pp
+        read = []
+        monkeypatch.setattr(pp, "_grant_refusal",
+                            lambda *a: read.append(1) or (b"", False))
+        self._wire(monkeypatch)
+        got = self._r403(body=b"", framed=False, method="HEAD",
+                         extra_headers=b"Content-Length: 115\r\n")
+        assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert not read, "a HEAD response's body was waited for"
+
+    def case_a_switch_that_does_not_land_relays_the_403_unchanged(
+        self, monkeypatch,
+    ):
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_fleet_exhausted_until", 777.0)
+
+        def _boom():
+            raise RuntimeError("config lock held")
+
+        for what, wire in {
+            "no candidate": dict(switched=False),
+            "landed but not validated": dict(validated=False),
+            "validation absent": dict(validated=None),
+            "switch() raised": dict(before=_boom),
+        }.items():
+            log = []
+            self._wire(monkeypatch, log=log, **wire)
+            got = self._r403()
+            assert got == self._untouched(), (what, got[:200])
+            assert got.startswith(b"HTTP/1.1 403"), (what, got[:60])
+            for head in self.HEADS:
+                assert head in got, (
+                    f"{what}: the 403's own header {head!r} was stripped: "
+                    f"{got[:200]!r}")
+            assert len(log) == 1, (what, log)
+            assert pp._walled_switch_seen[self._key()][0] is False, (
+                what, pp._walled_switch_seen)
+            assert pp._fleet_exhausted_until == 777.0, what
+            # A repeat inside the negative's expiry debounces: no second
+            # switch(), the 403 unchanged.
+            assert self._r403() == got, what
+            assert len(log) == 1, (what, "a repeat re-asked switch()", log)
+
+    def case_a_bearer_that_is_not_the_live_account_relays_the_403_unchanged(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        for auth in ("Bearer some-other-account-token", "Basic abc", ""):
+            assert self._r403(auth=auth) == self._untouched(auth=auth), auth
+        assert not log, f"a stale bearer's 403 drew a switch(): {log}"
+
+    def case_the_body_is_decoded_per_content_encoding_for_the_match(
+        self, monkeypatch,
+    ):
+        import gzip
+        import zlib
+        for name, enc, body in (
+            ("gzip", b"gzip", gzip.compress(self.GRANT_BODY)),
+            ("deflate", b"deflate", zlib.compress(self.GRANT_BODY)),
+        ):
+            log = []
+            self._wire(monkeypatch, log=log)
+            got = self._r403(body=body,
+                             extra_headers=b"Content-Encoding: " + enc + b"\r\n")
+            assert got.startswith(b"HTTP/1.1 401"), (name, got[:60])
+            assert got.endswith(body), (
+                f"{name}: the body must go out as the upstream sent it")
+            assert len(log) == 1, (name, log)
+        # Everything it cannot decode fails open: relayed unchanged, no switch.
+        for name, enc, body in (
+            ("brotli", b"br", self.GRANT_BODY),
+            ("corrupt gzip", b"gzip", b"\x1f\x8b not a gzip stream"),
+            ("gzip header on a plain body", b"gzip", self.GRANT_BODY),
+        ):
+            log = []
+            self._wire(monkeypatch, log=log)
+            hdr = b"Content-Encoding: " + enc + b"\r\n"
+            got = self._r403(body=body, extra_headers=hdr)
+            assert got == self._untouched(body=body, extra_headers=hdr), name
+            assert not log, (name, log)
+
+    def case_a_body_it_cannot_frame_or_bound_fails_open(self, monkeypatch):
+        from cswap_pin import proxy as pp
+        monkeypatch.setattr(pp, "_GRANT_BODY_CAP", 200)
+        assert len(self.GRANT_BODY) < 200, "test bug: the control must fit"
+        chunked = b"%x\r\n%s\r\n0\r\n\r\n" % (
+            len(self.GRANT_BODY), self.GRANT_BODY)
+        for what, kw in {
+            "chunked": dict(body=chunked,
+                            extra_headers=b"Transfer-Encoding: chunked\r\n"),
+            "over the cap": dict(body=self.GRANT_BODY[:-2] + b"x" * 300 + b"}"),
+            "no Content-Length": dict(body=self.GRANT_BODY, framed=False),
+        }.items():
+            log = []
+            self._wire(monkeypatch, log=log)
+            got = self._r403(**kw)
+            assert got.startswith(b"HTTP/1.1 403"), (what, got[:60])
+            assert got == self._untouched(**kw), (what, got[:200])
+            assert not log, (what, log)
+
+    def case_a_body_that_arrives_after_the_head_is_matched_and_relayed_whole(
+        self, monkeypatch,
+    ):
+        log = []
+        self._wire(monkeypatch, log=log)
+        got = self._r403(withhold=10)
+        assert got.startswith(b"HTTP/1.1 401"), got[:60]
+        assert got.endswith(self.GRANT_BODY), (
+            f"the body read ahead was not relayed whole: {got[-60:]!r}")
+        assert len(log) == 1, log
+        got = self._r403(body=self.OTHER_BODY, withhold=10)
+        assert got == self._untouched(body=self.OTHER_BODY, withhold=10)
+        assert len(log) == 1, log
+
+    def case_the_response_line_names_bearer_model_and_beta_before_ua(
+        self, certdir,
+    ):
+        """The fields go between the path and ` ua=`, on `/v1/messages`
+        only: readers take the path as the token after the method
+        (cswap's `_message_error_burst`, trace_fold's `_METHOD_PATH_RE`) and
+        the client as everything after the LAST ` ua=` (`_client_ua`), and
+        none of them anchors on the end of the line."""
+        import hashlib
+
+        from cswap_pin import proxy as pp
+        upstream = _FakeUpstream(certdir)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", upstream.port))
+        out = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(out))
+        pp._TRACE_CACHE.clear()
+        proxy.start()
+        try:
+            proxy._trace_tick()
+            for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                assert _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", path, bearer="tok-abc",
+                    ua="claude-code/2.1.290",
+                    body=json.dumps({"model": "claude-opus-4-1",
+                                     "messages": []}),
+                    extra_headers={"anthropic-beta":
+                                   "oauth-2025-04-20,claude-code-20250219"},
+                ) == 200
+        finally:
+            proxy.stop()
+            upstream.stop()
+        lines = [l for l in out.read_text().splitlines()
+                 if "<- HTTP/1.1 200" in l]
+        msg = next(l for l in lines if " POST /v1/messages " in l)
+        m = re.search(r"POST /v1/messages  ts=(\S+) bearer=(\S+) model=(\S+) "
+                      r"beta=(\S+)  ua=(.*)$", msg)
+        assert m, msg
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", m[1]), m[1]
+        assert m.groups()[1:] == (
+            hashlib.sha256(b"tok-abc").hexdigest()[:12], "claude-opus-4-1",
+            "oauth-2025-04-20,claude-code-20250219", "claude-code/2.1.290"), msg
+        # The readers' own parses of the same line.
+        assert msg.split("POST ", 1)[1].split(" ", 1)[0] == "/v1/messages"
+        assert msg.rsplit(" ua=", 1)[1] == "claude-code/2.1.290"
+        assert re.search(r"<- HTTP/[0-9.]+ (\d{3})", msg)[1] == "200"
+        assert re.match(r"\[c\d+\] ", msg), msg
+        # Another route keeps its line exactly.
+        other = next(l for l in lines if "count_tokens" in l)
+        assert re.fullmatch(
+            r"\[c\d+\]     <- HTTP/1.1 200 OK  POST /v1/messages/count_tokens"
+            r"  ua=claude-code/2.1.290", other), other
 
 
 class TestTheEvidenceSurvivesAHandover:
