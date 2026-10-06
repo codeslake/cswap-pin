@@ -5556,34 +5556,35 @@ _CLIENT_WATCH_BEAT_S = 0.5
 
 
 def _client_gone(fd: int) -> bool:
-    """Whether the client behind FD has closed or reset: EOF or an error,
-    never merely unread bytes.
+    """Whether the client behind FD has closed or reset: a FIN or an error on
+    the wire, never merely unread bytes.
 
     NOT `_client_hung_up`, which reads "readable" as "gone". That fits a
     bridge-attach POST held before it is relayed and is wrong for a request
     already waiting on the hop: a client that sent its next request early is
     still waiting for this reply, and a false answer here cuts a live one.
 
-    POLLRDHUP (Linux) is a FIN, seen even with bytes unread behind it (a
-    close_notify ahead of the FIN), so a client that half-closes yet still
-    waits reads as gone: the accepted cost of that. Without it (macOS) a
-    readable fd is told apart by a one-byte peek, and only an empty answer is
-    EOF. On the fd and never the SSL object, so nothing it buffered is
-    mistaken for the wire. Any failure to ask answers False: fail open.
+    MEASURED (T1894, loopback, `poll` on POLLIN|POLLHUP|POLLERR|POLLRDHUP, on
+    Linux 6.8 and on macOS 26.6 arm64, which has no POLLRDHUP):
+
+        peer did                    Linux                        macOS
+        nothing / one unread byte   0 / POLLIN                   0 / POLLIN
+        FIN, or a byte then FIN     POLLIN|POLLRDHUP             POLLIN|POLLHUP
+        shutdown(SHUT_WR) only      POLLIN|POLLRDHUP             POLLIN|POLLHUP
+        RST                         POLLIN|POLLERR|POLLHUP|      POLLIN|POLLHUP
+                                    POLLRDHUP
+
+    So on both a FIN is seen even with bytes unread behind it (a close_notify
+    ahead of the FIN), and POLLIN alone is a client still waiting. A client
+    that half-closes yet still waits reads as gone: the accepted cost. Polled
+    on the fd and never the SSL object, so nothing it buffered is mistaken for
+    the wire. Any failure to ask answers False: fail open.
     """
     dead = select.POLLHUP | select.POLLERR | getattr(select, "POLLRDHUP", 0)
     try:
         poller = select.poll()
         poller.register(fd, select.POLLIN | dead)
-        events = poller.poll(0)
-        if not events:
-            return False
-        if events[0][1] & dead:
-            return True
-        with socket.socket(fileno=os.dup(fd)) as peek:
-            return peek.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
-    except ConnectionError:
-        return True
+        return any(ev & dead for _, ev in poller.poll(0))
     except (OSError, ValueError):
         return False
 
@@ -5592,12 +5593,12 @@ class _ClientWatch:
     """One thread that cuts a hop leg whose client has hung up.
 
     A serving thread waiting on a hop (the TLS handshake to the upstream, the
-    reply head) blocks in the kernel with no timeout, because a slow first
-    byte from a live request is legitimate and a deadline would cut it. So it
-    never looked at its client, and a client that left kept its fd and its
-    `_owed` entry for as long as the hop stayed silent: 38 closed client fds
-    for 3 h on a draining daemon, which a live pinging stream (rightly) keeps
-    open.
+    reply head, an upgrade's handshake or status line) blocks in the kernel
+    with no timeout, because a slow first byte from a live request is
+    legitimate and a deadline would cut it. So it never looked at its client,
+    and a client that left kept its fd and its `_owed` entry for as long as
+    the hop stayed silent: 38 closed client fds for 3 h on a draining daemon,
+    which a live pinging stream (rightly) keeps open.
 
     `over(client, hop)` registers the pair for one wait. Every beat this thread
     asks `_client_gone` of each client and shuts the hop leg down, which wakes
@@ -19716,7 +19717,10 @@ class PinProxy:
                         # `_owe_answer(_c, False)` runs). The take-back
                         # stays gated on `retry` alone: a `_bridge_cse` hold
                         # with no swap never asked for one.
-                        code, seen = _peek_status(up)
+                        # THE STATUS WAIT, WATCHED (see `_ClientWatch`): the
+                        # debt above stays owed until the 101.
+                        with _CLIENT_WATCH.over(conn, up):
+                            code, seen = _peek_status(up)
                         if retry and code in (401, 403, 404):
                             pending_refusal = code
                             continue
@@ -21389,14 +21393,18 @@ def _relay_upgrade(
     case, and no refetch or retry ever ran for an upgrade.
     """
     buf = bytearray()
-    while b"\r\n\r\n" not in buf:
-        try:
-            chunk = up.recv(65536)
-        except (ConnectionResetError, ssl.SSLError, OSError):
-            chunk = b""
-        if not chunk:
-            return False
-        buf += chunk
+    # THE HANDSHAKE WAIT, WATCHED, the same as `_relay_response`'s head wait:
+    # an upgrade stays owed until its 101, so a client that hangs up while the
+    # hop is silent is noticed by `_CLIENT_WATCH`, which lands here as EOF.
+    with _CLIENT_WATCH.over(client, up):
+        while b"\r\n\r\n" not in buf:
+            try:
+                chunk = up.recv(65536)
+            except (ConnectionResetError, ssl.SSLError, OSError):
+                chunk = b""
+            if not chunk:
+                return False
+            buf += chunk
     status_line = bytes(buf).split(b"\r\n", 1)[0]
     if reject_on_auth_error and any(
         status_line.startswith(b"HTTP/1.1 " + c) for c in (b"401", b"403", b"404")

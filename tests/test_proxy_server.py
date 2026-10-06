@@ -291,11 +291,13 @@ def _refetch_switcher(certdir, token_for_read):
     return _Switcher()
 
 
-def _post_and_abandon(proxy_port: int, ca_path: Path, path: str, body: str):
+def _post_and_abandon(proxy_port: int, ca_path: Path, path: str, body: str,
+                      extra: str = ""):
     """Send one POST through the proxy's CONNECT tunnel and close WITHOUT
     reading a response -- the client that aborts its own socket, which is
     what T0955 is about: a request held on the pin whose sender is already
-    gone by the time the hold ends."""
+    gone by the time the hold ends. ``extra`` is more header lines, each
+    ending in CRLF."""
     raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
     raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
                 b"Host: api.anthropic.com:443\r\n\r\n")
@@ -309,8 +311,8 @@ def _post_and_abandon(proxy_port: int, ca_path: Path, path: str, body: str):
     tls = ctx.wrap_socket(raw, server_hostname="api.anthropic.com")
     body_b = body.encode()
     req = (f"POST {path} HTTP/1.1\r\nHost: api.anthropic.com\r\n"
-          f"Authorization: Bearer t\r\nContent-Length: {len(body_b)}\r\n\r\n"
-          ).encode() + body_b
+          f"Authorization: Bearer t\r\n{extra}"
+          f"Content-Length: {len(body_b)}\r\n\r\n").encode() + body_b
     tls.sendall(req)
     tls.close()
 
@@ -2423,8 +2425,9 @@ class TestAClientThatHangsUpOnASilentHop:
             hop.stop()
             proxy.stop()
 
-    def case_mitm_origin_takes_the_request_and_never_answers(self, certdir):
-        """The handshake is done, so this wait is the head read through TLS."""
+    def _mitm_origin_stalls(self, certdir, extra: str = ""):
+        """The handshake is done, so the wait is the reply (or, with an
+        Upgrade in ``extra``, the 101) read through TLS."""
         upstream = _StallableBridgeUpstream(certdir)
         hop = _LoopbackConnectProxy(("127.0.0.1", upstream.port))
         proxy = self._proxy(certdir, hop, upstream=("127.0.0.1", upstream.port))
@@ -2432,7 +2435,7 @@ class TestAClientThatHangsUpOnASilentHop:
         proxy.start()
         try:
             _post_and_abandon(proxy.port, certdir / "ca.pem", "/v1/messages",
-                              "STALL")
+                              "STALL", extra)
             assert self._eventually(lambda: upstream.received), (
                 "premise: the request never reached the origin")
             self._assert_let_go(proxy, lambda: served[0].fileno() < 0)
@@ -2442,14 +2445,14 @@ class TestAClientThatHangsUpOnASilentHop:
             proxy.stop()
             upstream.stop()
 
-    def case_plain_hop_accepts_and_never_answers(self, certdir):
+    def _plain_hop_stalls(self, certdir, extra: bytes = b""):
         hop = _StallingHop()
         proxy = self._proxy(certdir, hop)
         proxy.start()
         try:
             raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
             raw.sendall(b"GET http://example.com/x HTTP/1.1\r\n"
-                        b"Host: example.com\r\n\r\n")
+                        b"Host: example.com\r\n" + extra + b"\r\n")
             assert hop.reached.wait(5), "premise: the request never reached the hop"
             assert proxy.inflight_requests() == 1, "premise: the request is owed"
             with proxy._live_lock:
@@ -2459,6 +2462,24 @@ class TestAClientThatHangsUpOnASilentHop:
         finally:
             hop.stop()
             proxy.stop()
+
+    def case_mitm_origin_takes_the_request_and_never_answers(self, certdir):
+        self._mitm_origin_stalls(certdir)
+
+    def case_plain_hop_accepts_and_never_answers(self, certdir):
+        self._plain_hop_stalls(certdir)
+
+    def case_mitm_upgrade_origin_takes_the_request_and_never_answers(
+            self, certdir):
+        """An upgrade stays owed until its 101, and its handshake read
+        (`_relay_upgrade`) is a hop wait of the same shape as the head read."""
+        self._mitm_origin_stalls(
+            certdir, "Connection: Upgrade\r\nUpgrade: websocket\r\n")
+
+    def case_plain_upgrade_hop_accepts_and_never_answers(self, certdir):
+        """The plain path's `_peek_status` is the same wait."""
+        self._plain_hop_stalls(
+            certdir, b"Connection: Upgrade\r\nUpgrade: websocket\r\n")
 
     def case_control_mitm_a_slow_hop_still_answers_a_connected_client(
             self, certdir):
@@ -2512,47 +2533,40 @@ class TestAClientThatHangsUpOnASilentHop:
         srv.close()
         return a, b
 
-    def case_client_gone_reads_a_close_and_a_reset_not_pending_bytes(
-            self, monkeypatch):
-        """A pipelined byte is a client still waiting, not one that left; only
-        EOF or a reset is a hang-up. With POLLRDHUP (Linux) a FIN is seen even
-        with bytes unread behind it (a close_notify ahead of the FIN); without
-        it (macOS) an EOF is read by peeking."""
-        import select
+    def case_client_gone_reads_a_close_and_a_reset_not_pending_bytes(self):
+        """A pipelined byte is a client still waiting, not one that left; a FIN
+        (with bytes unread behind it or not) and a reset are a hang-up. The
+        same on Linux (POLLRDHUP) and macOS (POLLHUP), measured on both, so
+        this runs natively on each and models neither."""
         import struct
 
         from cswap_pin.proxy import _client_gone
 
-        def _checks(unread_then_fin: bool):
-            a, b = self._tcp_pair()
-            assert _client_gone(a.fileno()) is False, "an idle client read as gone"
-            b.sendall(b"x")
-            time.sleep(0.05)
-            assert _client_gone(a.fileno()) is False, (
-                "a client with a pipelined byte read as gone")
-            b.close()
-            time.sleep(0.05)
-            assert _client_gone(a.fileno()) is unread_then_fin
-            a.close()
+        a, b = self._tcp_pair()
+        assert _client_gone(a.fileno()) is False, "an idle client read as gone"
+        b.sendall(b"x")
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is False, (
+            "a client with a pipelined byte read as gone")
+        b.close()
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is True, (
+            "a FIN behind an unread byte was missed")
+        a.close()
 
-            a, b = self._tcp_pair()
-            b.close()
-            time.sleep(0.05)
-            assert _client_gone(a.fileno()) is True, "a plain FIN was missed"
-            a.close()
+        a, b = self._tcp_pair()
+        b.close()
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is True, "a plain FIN was missed"
+        a.close()
 
-            a, b = self._tcp_pair()
-            b.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                         struct.pack("ii", 1, 0))
-            b.close()
-            time.sleep(0.05)
-            assert _client_gone(a.fileno()) is True, "a reset was missed"
-            a.close()
-
-        if hasattr(select, "POLLRDHUP"):
-            _checks(unread_then_fin=True)
-            monkeypatch.delattr(select, "POLLRDHUP")
-        _checks(unread_then_fin=False)
+        a, b = self._tcp_pair()
+        b.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                     struct.pack("ii", 1, 0))
+        b.close()
+        time.sleep(0.05)
+        assert _client_gone(a.fileno()) is True, "a reset was missed"
+        a.close()
 
     def case_a_watch_holds_only_for_its_block(self):
         from cswap_pin.proxy import _ClientWatch
