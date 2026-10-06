@@ -18454,6 +18454,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     LIVE = "live-account-token"
     HEADROOM = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     NO_HEADROOM = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}}
+    EOF_GRACE = 5  # seconds `_relay` waits for the drain's EOF
 
     @staticmethod
     def _wire(monkeypatch, switched, raises_once=None, needs_login=False,
@@ -18619,8 +18620,15 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         Both ends run from threads over sockets shrunk to macOS's 8 KB
         AF_UNIX buffer (Linux's is ~208 KB): a body past 8 KB written whole
         before the relay ran blocked there on macOS CI (T1891). Returns
-        every byte the client was sent."""
+        every byte the client was sent.
+
+        The drain waits unbounded while the relay runs, but not for the EOF
+        after it (T1961): trunk CI on macOS hung >300 s there, `cl_a`'s
+        `SHUT_WR` never waking the blocked `recv`. Every byte is queued once
+        the relay returns, so after `EOF_GRACE` the drain is woken instead."""
+        import os as _os
         import socket as _s
+        import sys as _sys
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
         cl_a, cl_b = _s.socketpair()
@@ -18650,20 +18658,53 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     pass
 
             def _drain():
-                while chunk := cl_b.recv(65536):
-                    got.append(chunk)
+                try:
+                    while chunk := cl_b.recv(65536):
+                        got.append(chunk)
+                except OSError:  # the SHUT_RD wake below, where it raises
+                    pass
             reader = threading.Thread(target=_drain, daemon=True)
             threading.Thread(target=_feed, daemon=True).start()
             reader.start()
+            st0 = _os.fstat(cl_a.fileno())
             pp._relay_response(up_a, cl_a, 0, method=method, path=path,
                                auth=auth, session=session)
             cl_a.shutdown(_s.SHUT_WR)
-            reader.join()
+            reader.join(cls.EOF_GRACE)
+            if reader.is_alive():
+                # `same_inode` False would mean the fd was reused under us
+                st = _os.fstat(cl_a.fileno())
+                print("_relay: no EOF after SHUT_WR, woke the drain "
+                      f"(cl_a fd={cl_a.fileno()} same_inode="
+                      f"{(st.st_dev, st.st_ino) == (st0.st_dev, st0.st_ino)})",
+                      file=_sys.stderr)
+                cl_b.shutdown(_s.SHUT_RD)
+                reader.join(cls.EOF_GRACE)
+                assert not reader.is_alive(), "SHUT_RD did not wake the drain"
             return b"".join(got)
         finally:
             for x in (up_a, up_b, cl_a, cl_b):
                 try: x.close()
                 except OSError: pass
+
+    def case_a_withheld_eof_is_woken_not_waited_for(self, monkeypatch):
+        """T1961. Trunk CI on macOS hung >300 s in `_relay`'s `reader.join()`:
+        the relay had returned and `cl_a.shutdown(SHUT_WR)` had run, yet the
+        drain never saw EOF. THE INJECTED FAULT is that FIN, swallowed here
+        (no other `SHUT_WR` matters: the response is framed). The helper must
+        wake the drain itself, keep every byte, and say so on stderr."""
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real = socket.socket.shutdown
+        monkeypatch.setattr(socket.socket, "shutdown", lambda s, how: (
+            None if how == socket.SHUT_WR else real(s, how)))
+        body = b"0123456789" * 1000
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = self._relay(status=b"200 OK", reset=False, body=body)
+        assert "_relay: no EOF after SHUT_WR, woke the drain" in err.getvalue(), (
+            "the swallowed FIN never reached the helper's fallback")
+        assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
 
     def case_a_successful_switch_rewrites_429_to_401(self, monkeypatch):
         self._wire(monkeypatch, switched=True)
