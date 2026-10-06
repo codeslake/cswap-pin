@@ -12257,15 +12257,22 @@ class PortHolder:
             if self._stop or served or not self._self_heal_on():
                 silent_since = None
                 continue
+            # A SLOW ANSWER IS NOT SILENCE (T1935): the probe waits
+            # `_PORT_WATCH_PROBE_S`, and the miss that would complete the
+            # bound is asked once more, `_PORT_WATCH_CONFIRM_S`, before the cut.
+            #
             # THREE ANSWERS: its own pid resets the silence, none counts
             # toward it, and another pid (a successor's) neither: the port is
             # served, which says nothing about `proc`.
-            answered = _health_pid(self.port)
+            answered = _health_pid(self.port, _PORT_WATCH_PROBE_S)
+            now = time.monotonic()
+            if (answered is None and silent_since is not None
+                    and now - silent_since >= _CODE_WATCH_BEAT_MAX_AGE_S):
+                answered = _health_pid(self.port, _PORT_WATCH_CONFIRM_S)
             if answered == proc.pid:
                 silent_since = None
             if answered is not None:
                 continue
-            now = time.monotonic()
             silent_since = silent_since or now
             if now - silent_since < _CODE_WATCH_BEAT_MAX_AGE_S:
                 continue
@@ -13401,6 +13408,18 @@ _CODE_WATCH_INTERVAL_S = 30.0
 # beating and repairs nothing. Three intervals: a tick that ran long, or one
 # missed beat, must not read as a dead thread.
 _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
+# HOW LONG THE HOLDER'S PORT WATCH WAITS FOR A `/health` ANSWER (`PortHolder.
+# _wait_for_exit`), and for the one LAST answer it asks for before it cuts a
+# daemon. A slow answer is not silence: on a loaded host (measured, wmac,
+# 2026-10-06: start-to-serving 56-85 s against 1 s) 1.0 s missed four times
+# running and four daemons still accepting were retired through a 30 s drain,
+# cutting their held streams. A wedged daemon (accepts nothing, or accepts and
+# never replies) misses every probe whatever its timeout, so the cost of the
+# long waits is only time: replaced after at most
+# (1 + ceil(BEAT_MAX_AGE / (INTERVAL + PROBE))) * (INTERVAL + PROBE) + CONFIRM
+# = 155 s with these values (124 s with the old 1.0 s probe, no confirm).
+_PORT_WATCH_PROBE_S = 5.0
+_PORT_WATCH_CONFIRM_S = 15.0
 # THE CALLER-SIDE RELOCATION (`_take_the_socket_over`). The rendezvous is
 # `<certdir>/.successor-<caller pid>.sock`; the pid in the name is the liveness
 # test (`_waiting_caller`).
