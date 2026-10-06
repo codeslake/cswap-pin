@@ -7140,11 +7140,14 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                 "pin splicing")
 
     def _blind(reason: str) -> None:
-        """`provider.blind_reason = reason`, except from the tick. The field
-        is shared: a request reads it after its own call returned None, and
-        `/health` shows it, so `freshen` (which "says nothing when it fails")
-        must neither set it nor clear what a request just set."""
-        if not provider._tls.quiet:
+        """`provider.blind_reason = reason`, except that the tick writes no
+        FAILURE text. The field is shared: a request reads it after its own
+        call returned None, and `/health` shows it, so `freshen` (which "says
+        nothing when it fails") must not set one. It still clears: a tick
+        that holds a live token is the one thing that clears a stale reason
+        on an idle daemon with self-heal off, and `runtime_health` fails
+        `pin-applied` on any."""
+        if not reason or not provider._tls.quiet:
             provider.blind_reason = reason
 
     def _identity_ok(token: str, mail: str) -> bool:
@@ -7433,7 +7436,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     if rotated:
                         _cred_cache[ckey] = rotated
                         token = _live_token(rotated) or token
-                if not token:
+                if not token and not freshen:
+                    # NEVER THE TICK'S: the lock wait and the store read can
+                    # carry the wall clock past the liveness buffer, so `token`
+                    # can be None here under `freshen`. This refresh is the
+                    # request path's, with its deferral and `blind_reason`.
+                    #
                     # CARRY THE REFRESH VERDICT OUT. `RefreshOutcome.error`
                     # already classifies this -- `invalid_grant` means the
                     # lineage is dead and only a person can fix it, `transient`
