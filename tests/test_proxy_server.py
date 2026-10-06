@@ -21230,6 +21230,7 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         assert log[2]["exclude"] == {"1", "2", "3"}, (
             f"a refusal on the live account must not be offered A: {log}")
         assert got.startswith(b"HTTP/1.1 403"), got[:60]
+        assert len(log) == 3, log
 
     def case_a_fleet_where_every_account_refuses_gets_one_401_and_then_403s(
         self, monkeypatch,
