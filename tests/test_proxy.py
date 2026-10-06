@@ -33249,7 +33249,7 @@ else:
         class _Holder(pp.PortHolder):
             def __init__(self):
                 self._stop = False
-                self._proc = "predecessor"
+                self._proc = types.SimpleNamespace(pid=5)
                 self._replace_lock = threading.RLock()
                 self._certdir = certdir
                 self._srv = lsn
@@ -33766,6 +33766,87 @@ else:
         assert run(True, 111)[0] == [], "nobody else serves: it still covers"
         assert run(True, None)[0] == []
         assert run(False, me)[0] == [], "no hand-off: the ordinary holder"
+
+    def case_a_confirmed_hand_off_is_never_undone_while_the_daemon_drains(
+            self, tmp_path, monkeypatch):
+        """With self-heal ON, a daemon that stopped accepting because it gave
+        the listener away reads as a wedged one: two probe misses a silence
+        bound apart, anywhere in an uncapped drain (hours), used to reset
+        `_handed_off`, spawn a denied-lineage daemon on the shared socket and
+        TERM the draining one (cutting its held tunnels). Once ANOTHER live
+        daemon is on record the holder neither probes nor replaces, and a
+        SIGUSR1 ask is declined too (it reset the flag the same way); it only
+        waits for the exit and stands down. Without that confirmation (no
+        hand-off, or the record still names this daemon) the wedge arm keeps
+        its duty."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        monkeypatch.setattr(pp, "_CODE_WATCH_INTERVAL_S", 0.05)
+        monkeypatch.setattr(pp, "_CODE_WATCH_BEAT_MAX_AGE_S", 0.12)
+        log = []
+        monkeypatch.setattr(
+            pp, "_health_pid",
+            lambda port, timeout=1.0: log.append("probe"))   # answers nothing
+
+        class _Holder(pp.PortHolder):
+            _stop = False
+
+            def __init__(self, handed_off):
+                self._certdir = tmp_path
+                self.port = 1
+                self._handed_off = handed_off
+                self._standby = None
+                self._replace_lock = threading.RLock()
+
+            def _self_heal_on(self):
+                return True
+
+            def _spawn(self):
+                log.append("spawn")
+                self._proc = types.SimpleNamespace(pid=222)
+
+            def _terminate_proc(self, proc):
+                log.append(f"terminate {proc.pid}")
+
+        class _Daemon:
+            pid = 111
+
+            def __init__(self):
+                self._release = threading.Event()
+
+            def wait(self):
+                self._release.wait(10)
+                return 0
+
+        def run(handed_off, record_pid, ask=False):
+            log.clear()
+            pp.write_daemon_state(tmp_path, 1, record_pid, "fp")
+            h, d = _Holder(handed_off), _Daemon()
+            h._proc = d
+            worker = threading.Thread(target=h._wait_for_exit, args=(d,))
+            worker.start()
+            time.sleep(0.5)             # four silence bounds of 0.12 s
+            if ask:
+                h._on_replace_request(signal.SIGUSR1, None)
+            d._release.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            return [e for e in log if e != "probe"], "probe" in log, h._handed_off
+
+        me = os.getpid()
+        assert run(True, me) == ([], False, True), (
+            "the port-watch probed or replaced the daemon of a confirmed "
+            "hand-off, or reset its flag")
+        assert run(True, me, ask=True) == ([], False, True), (
+            "a SIGUSR1 ask after a confirmed hand-off respawned or reset "
+            "the flag")
+        for handed_off, record_pid in ((True, 111), (False, me)):
+            assert run(handed_off, record_pid) == (
+                ["spawn", "terminate 111"], True, False), (
+                f"hand_off={handed_off} record={record_pid}: nothing else "
+                "serves, so the wedge arm replaces the silent daemon")
 
     def _watch(self, pp, monkeypatch, certdir, wait_s, publish, stale=False,
                bind_in_tick=False):

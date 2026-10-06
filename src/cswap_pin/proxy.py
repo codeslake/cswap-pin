@@ -12030,6 +12030,19 @@ class PortHolder:
             # the port.
             if self._stop:
                 return
+            # A CONFIRMED HAND-OFF IS NOT UNDONE BY ANY ASK: the next lines
+            # reset `_handed_off`, which is what stands this holder down at its
+            # daemon's exit, and spawn a denied-lineage daemon on a socket that
+            # is another lineage's now. A SIGUSR1 reaches here from the
+            # draining daemon's own watchdog, a signal-less call from
+            # `_wait_for_exit`'s wedge arm.
+            if (self._handed_off and self._proc is not None
+                    and self._hand_off_served_by(self._proc)):
+                _log_lifecycle(
+                    f"replace request for port {self.port} ignored — the "
+                    f"socket went to a caller's lineage and another daemon "
+                    f"serves it")
+                return
             # THE DAEMON `_wait_for_exit` IS RETIRING STILL DRAINS (T1743), and
             # its code watchdog ticks until its teardown ends: a deploy in that
             # window makes it send this very signal, which cannot say who
@@ -12231,12 +12244,17 @@ class PortHolder:
             # may drain for hours beside a holder that lives on: released here,
             # not at the exit (`_supervise_locked` stands down on that too).
             # A release replaces nothing, so the self-heal switch is not asked.
+            # THAT DAEMON GAVE THE LISTENER AWAY, so its silence on the port is
+            # the hand-off and no wedge: neither probed nor replaced (a
+            # successor spawned here would be a second acceptor, and the TERM
+            # to it would cut the tunnels it drains). It is waited out and
+            # `_supervise_locked` stands down at its exit.
+            served = self._hand_off_served_by(proc)
             standby = getattr(self, "_standby", None)
-            if (not self._stop and standby is not None
-                    and self._hand_off_served_by(proc)):
+            if not self._stop and standby is not None and served:
                 self._release_standby(standby)
                 self._standby = None
-            if self._stop or not self._self_heal_on():
+            if self._stop or served or not self._self_heal_on():
                 silent_since = None
                 continue
             # THREE ANSWERS: its own pid resets the silence, none counts
