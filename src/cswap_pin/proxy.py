@@ -7417,11 +7417,16 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # place that knows what it asked for.
                     provider.blind_reason = f"no credential for slot {num} ({mail})"
                     return None
-                _blind("")
+                token = _live_token(creds)
+                if token or not freshen:
+                    # THE TICK CLEARS ONLY WITH A LIVE TOKEN IN HAND: the lock
+                    # wait can carry the clock past the buffer, and a request
+                    # that took the lock meanwhile may have failed its refresh
+                    # and written its reason. That one is the request's.
+                    _blind("")
                 # REPLACE THE HELD COPY, or the cache keeps handing back the
                 # expired blob and every later request re-enters this lock.
                 _cred_cache[ckey] = creds
-                token = _live_token(creds)
                 if token and freshen and _freshen_due(creds):
                     # THROUGH THE SAME GATE, QUIETLY: no `blind_reason` (the
                     # token in hand is live, and `runtime_health` fails

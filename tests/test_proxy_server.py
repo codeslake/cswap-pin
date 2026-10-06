@@ -15927,10 +15927,11 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             self, certdir, monkeypatch):
         """`blind_reason` is shared: the request path reads it after its own
         `provider()` returned None, and `runtime_health` fails `pin-applied`
-        on any. The early refresh writes no failure text, whether the quiet
-        refresh fails (`transient`, `consume-busy`) or the rotated token turns
-        out to be a foreign one (the finding itself still reaches
-        `identity_mismatch`)."""
+        on any. The "rotated token is foreign" row guards the mute: the
+        finding itself still reaches `identity_mismatch`, and the tick writes
+        no reason for it. The two quiet-arm rows (`transient`,
+        `consume-busy`) are retained guards of behavior that already held:
+        the quiet refresh never wrote one."""
         from cswap_pin import proxy as pp
 
         for label, outcome, foreign in (
@@ -15994,21 +15995,26 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         on the lock and the store read, and the wall clock crosses into the
         5-minute buffer meanwhile (the read stands in for that wait, with a
         store that is not live). The tick returns quietly: no on-demand
-        refresh, so no deferral, no 'unpinned' line, no `blind_reason`."""
+        refresh, so no deferral, no 'unpinned' line, and it leaves the reason
+        a request wrote during that wait (its refresh failed) as it was: a
+        tick with no live token in hand clears nothing."""
+        failure = "refresh transient for slot 2 (pin@example.com)"
         for label, stored in (("no store", None), ("expired store", "dead")):
             rig = self._rig(certdir, monkeypatch, outcome="consume-busy",
                             minutes=5.5)
             rig.stored = stored and json.dumps({"claudeAiOauth": {
                 "accessToken": "dead", "refreshToken": "rt-dead",
                 "expiresAt": int((rig.now - 600) * 1000)}})
-            rig.on_read = lambda: rig.advance(60)
+            rig.on_read = lambda: (
+                rig.advance(60),
+                setattr(rig.provider, "blind_reason", failure))
             self._tick(rig, certdir, monkeypatch, False)
             assert len(rig.reads) == 2, f"{label}: the wait did not happen"
             assert rig.calls == [], f"{label}: a refresh ran: {rig.calls}"
             assert rig.provider.pin_is_noop() is False, label
             assert not [ln for ln in rig.lines if "went out unpinned" in ln], (
                 label, rig.lines)
-            assert rig.provider.blind_reason == "", (
+            assert rig.provider.blind_reason == failure, (
                 f"{label}: {rig.provider.blind_reason!r}")
 
     def case_a_held_refresh_lock_is_not_waited_on(self, certdir, monkeypatch):
