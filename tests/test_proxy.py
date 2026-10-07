@@ -34625,16 +34625,26 @@ class TestTheDaemonRaisesItsFdLimit:
         import sys
 
         calls = []
+        limits = [(soft, hard)]
 
         def setrlimit(which, pair):
             if refuse:
                 raise refuse
             calls.append(pair)
+            limits[0] = pair
 
         monkeypatch.setitem(sys.modules, "resource", types.SimpleNamespace(
             RLIMIT_NOFILE=7, RLIM_INFINITY=-1, setrlimit=setrlimit,
-            getrlimit=lambda which: (soft, hard)))
+            getrlimit=lambda which: limits[0]))
         return calls
+
+    @staticmethod
+    def _lifecycle_lines(monkeypatch):
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        return lines
 
     @pytest.mark.parametrize("soft, hard, expect", [
         (256, 524288, (1024, 524288)),    # the macOS login default
@@ -34651,12 +34661,35 @@ class TestTheDaemonRaisesItsFdLimit:
         pp._raise_nofile_soft_limit()
         assert calls == ([expect] if expect else [])
 
+    @pytest.mark.parametrize("soft, hard, before, after", [
+        (256, 524288, "soft=256 hard=524288", "soft=1024 hard=524288"),
+        (2048, 524288, "soft=2048 hard=524288", "soft=2048 hard=524288"),
+        (-1, -1, "soft=unlimited hard=unlimited",
+         "soft=unlimited hard=unlimited"),
+    ])
+    def test_every_start_logs_one_line_with_the_limits_before_and_after(
+            self, monkeypatch, soft, hard, before, after):
+        """A rollout cannot read a daemon's limit from outside (no psutil,
+        `launchctl procinfo` needs root), so daemon.log has to say it, also
+        when no raise was needed."""
+        from cswap_pin import proxy as pp
+
+        self._fake_resource(monkeypatch, soft, hard)
+        lines = self._lifecycle_lines(monkeypatch)
+        pp._raise_nofile_soft_limit()
+        assert lines == [f"nofile before {before} after {after}"]
+
     @pytest.mark.parametrize("refuse", [OSError("EPERM"), ValueError("EINVAL")])
-    def test_a_refused_raise_does_not_stop_the_daemon(self, monkeypatch, refuse):
+    def test_a_refused_raise_logs_the_reason_and_does_not_stop_the_daemon(
+            self, monkeypatch, refuse):
         from cswap_pin import proxy as pp
 
         self._fake_resource(monkeypatch, 256, 524288, refuse=refuse)
+        lines = self._lifecycle_lines(monkeypatch)
         pp._raise_nofile_soft_limit()
+        assert lines == [
+            "nofile before soft=256 hard=524288 after soft=256 hard=524288 "
+            f"(raise failed: {type(refuse).__name__}: {refuse})"]
 
     def test_the_daemon_entry_reads_the_raised_limit_back(self):
         """The real `resource` and the real `daemon_main`, in a child so this
@@ -34691,3 +34724,9 @@ class TestTheDaemonRaisesItsFdLimit:
         out = subprocess.run([sys.executable, "-c", code, "."],
                              capture_output=True, text=True, timeout=60)
         assert out.stdout.split() == ["1024", "2048"], out.stderr
+        # And the line reaches the log: `_log_lifecycle` works that early in
+        # `daemon_main`, once per start.
+        lines = [ln for ln in out.stderr.splitlines() if "nofile before" in ln]
+        assert len(lines) == 2, out.stderr
+        assert "before soft=256 " in lines[0] and " after soft=1024 " in lines[0]
+        assert "before soft=2048 " in lines[1] and " after soft=2048 " in lines[1]

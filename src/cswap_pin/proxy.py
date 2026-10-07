@@ -14984,17 +14984,33 @@ def _raise_nofile_soft_limit() -> None:
     of fds with a few hundred connections stranded and answered EMFILE until it
     was replaced. Unlimited is RLIM_INFINITY, which Python spells -1 on Linux,
     so it is compared by name and never by size. A refusal is not fatal: the
-    daemon serves with the limit it has."""
+    daemon serves with the limit it has.
+
+    ONE LOG LINE, ON EVERY START, with the limits before and after (also when
+    no raise was needed, and with the reason when the raise or a read failed).
+    Nothing outside the process can read its limit on a Mac (no psutil,
+    `launchctl procinfo` needs root), so without this a rollout cannot tell a
+    raised daemon from a starved one."""
+    had = now = "unreadable"
+    why = ""
     try:
         import resource  # POSIX only, like `fcntl` and `select.poll` here
 
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         inf = resource.RLIM_INFINITY
+
+        def show(pair):
+            return " ".join(f"{k}={'unlimited' if n == inf else n}"
+                            for k, n in zip(("soft", "hard"), pair))
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        had = now = show((soft, hard))
         want = _DAEMON_NOFILE_SOFT if hard == inf else min(hard, _DAEMON_NOFILE_SOFT)
         if soft != inf and soft < want:
             resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
-    except (OSError, ValueError):
-        pass
+            now = show(resource.getrlimit(resource.RLIMIT_NOFILE))
+    except (OSError, ValueError) as exc:
+        why = f" (raise failed: {type(exc).__name__}: {exc})"
+    _log_lifecycle(f"nofile before {had} after {now}{why}")
 
 
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
@@ -19863,6 +19879,18 @@ class PinProxy:
         # holder of a socket it has never heard of.
         holder_pid = os.getppid() if held_by_a_holder() else None
         code_watch_beat = getattr(self, "_code_watch_beat", None)
+        # READ NOW, never remembered from start: this is how a rollout verifies
+        # the fd limit `_raise_nofile_soft_limit` set (it cannot be read from
+        # outside the process on a Mac). `null` for unlimited or an unreadable
+        # limit, which is not zero. Never raises: this is the liveness probe.
+        try:
+            import resource  # POSIX only
+
+            nofile_soft, nofile_hard = (
+                None if n == resource.RLIM_INFINITY else n
+                for n in resource.getrlimit(resource.RLIMIT_NOFILE))
+        except (ImportError, OSError, ValueError):
+            nofile_soft = nofile_hard = None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
              # THE VERSION THE LIVE PROCESS IS RUNNING, which is not what the
@@ -19906,6 +19934,8 @@ class PinProxy:
              "code_watch_age_s": (
                  None if code_watch_beat is None
                  else round(time.monotonic() - code_watch_beat, 1)),
+             # ADDITIVE: the live fd limits, see `nofile_soft` above.
+             "nofile_soft": nofile_soft, "nofile_hard": nofile_hard,
              # ADDITIVE, PRESENT ONLY WHEN TRUE (see `_note_keychain_denial`):
              # this lineage is refused the Keychain, so a caller in the login
              # session can move the socket into its own.

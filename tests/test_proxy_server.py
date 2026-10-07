@@ -7994,6 +7994,43 @@ class TestHealthEndpoint:
             f"{_os.getpid()}"
         )
 
+    def case_health_carries_the_live_nofile_limits(self, certdir, monkeypatch):
+        """`nofile_soft` / `nofile_hard` are RLIMIT_NOFILE read at REQUEST time:
+        a rollout verifies the daemon's fd limit from outside with it (no
+        psutil, `launchctl procinfo` needs root). Null is unlimited or an
+        unreadable limit, never zero."""
+        import http.client
+        import json as _json
+        import resource
+
+        from cswap_pin.proxy import PinProxy
+
+        def _payload(proxy):
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+            conn.request("GET", "/health")
+            return _json.loads(conn.getresponse().read())
+
+        proxy = PinProxy(
+            certdir=certdir,
+            pin_token_provider=lambda: None,
+            upstream=("127.0.0.1", 1),
+        )
+        proxy.start()
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            got = _payload(proxy)
+            assert got["nofile_soft"] == (
+                None if soft == resource.RLIM_INFINITY else soft)
+            assert got["nofile_hard"] == (
+                None if hard == resource.RLIM_INFINITY else hard)
+            # Read per request, not remembered from start: the control a
+            # cached field fails.
+            monkeypatch.setattr(resource, "getrlimit", lambda w: (777, -1))
+            got = _payload(proxy)
+            assert (got["nofile_soft"], got["nofile_hard"]) == (777, None)
+        finally:
+            proxy.stop()
+
     def case_a_hop_that_self_heals_leaves_a_record(self, certdir):
         """A fall-through to a LATER hop, in a tense a later probe can read.
 
