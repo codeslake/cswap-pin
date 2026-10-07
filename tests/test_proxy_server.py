@@ -8025,7 +8025,8 @@ class TestHealthEndpoint:
                 None if hard == resource.RLIM_INFINITY else hard)
             # Read per request, not remembered from start: the control a
             # cached field fails.
-            monkeypatch.setattr(resource, "getrlimit", lambda w: (777, -1))
+            monkeypatch.setattr(resource, "getrlimit",
+                                lambda w: (777, resource.RLIM_INFINITY))
             got = _payload(proxy)
             assert (got["nofile_soft"], got["nofile_hard"]) == (777, None)
         finally:
