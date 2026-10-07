@@ -2286,10 +2286,12 @@ class _StallingHop:
     seconds and then serves, a CONNECT blind-piped to ``target`` and anything
     else a canned 200. ``reached`` is set when the request head arrived;
     ``cut`` when the pin's side of that leg ended (EOF or reset), which is how
-    a case sees the hop leg closed."""
+    a case sees the hop leg closed. ``reply`` (with ``delay=None``) is sent
+    first and then nothing: a reply head and part of a body, then silence."""
 
-    def __init__(self, delay: "float | None" = None, target=None):
-        self._delay, self._target = delay, target
+    def __init__(self, delay: "float | None" = None, target=None,
+                 reply: bytes = b""):
+        self._delay, self._target, self._reply = delay, target, reply
         self.reached, self.cut = threading.Event(), threading.Event()
         self._conns: list = []
         self._srv = socket.socket()
@@ -2325,6 +2327,8 @@ class _StallingHop:
             if connect:
                 conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if self._delay is None:
+                if self._reply:
+                    conn.sendall(self._reply)
                 while conn.recv(65536):
                     pass
                 return
@@ -2357,6 +2361,57 @@ class _StallingHop:
                 pass
 
 
+class _MidBodyOrigin:
+    """A TLS origin that answers its one request with ``reply`` (a head and
+    part of a body) and then says nothing. ``cut`` is set when the pin's side
+    of the connection ends, which is how a case sees the upstream leg closed."""
+
+    def __init__(self, certdir: Path, reply: bytes):
+        self.cut = threading.Event()
+        self._reply = reply
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"),
+                                  str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        try:
+            conn, _ = self._srv.accept()
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            tls.settimeout(15)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            tls.sendall(self._reply)
+            while tls.recv(4096):
+                pass
+        except (OSError, ssl.SSLError):
+            pass
+        finally:
+            self.cut.set()
+
+    def stop(self):
+        self._srv.close()
+
+
+# What a hop or an origin says before it goes silent, one per way a body is
+# framed: each ends in its own blocking read in `_relay_response`.
+_MID_BODY = {
+    "length": (b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial"),
+    "chunked": (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                b"7\r\npartial\r\n"),
+    "eof": (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+            b"partial"),
+}
+
+
 class TestAClientThatHangsUpOnASilentHop:
     """T1894. Once a hop has accepted, the serving thread blocked with no
     timeout and never looked at its client, so a client that hung up while its
@@ -2365,7 +2420,10 @@ class TestAClientThatHangsUpOnASilentHop:
 
     The fix watches the client, and only the client: a slow first byte from a
     LIVE request is legitimate and a live session channel is never cut, so the
-    controls below keep the client connected through a slow hop."""
+    controls below keep the client connected through a slow hop.
+
+    T1989: the same holds once the reply head is in. An upstream that goes
+    silent mid-body held both fds for ever, so the body relay is watched too."""
 
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
@@ -2524,6 +2582,96 @@ class TestAClientThatHangsUpOnASilentHop:
         finally:
             hop.stop()
             proxy.stop()
+
+    @staticmethod
+    def _read_partial(sock):
+        """Read until the reply's first body bytes are in hand: the client has
+        its head, so what follows is the body relay, not the head wait."""
+        sock.settimeout(5)
+        got = b""
+        while b"partial" not in got:
+            chunk = sock.recv(4096)
+            assert chunk, f"the reply never reached the client: {got!r}"
+            got += chunk
+
+    def _mid_body(self, certdir, framing, *, plain, hang_up):
+        """The reply head and part of the body reach the client, the upstream
+        goes silent, and the client then hangs up (``hang_up``) or stays
+        connected, pipelining a byte as a client waiting for this reply may."""
+        from cswap_pin.proxy import PinProxy
+
+        reply = _MID_BODY[framing]
+        if plain:
+            far = _StallingHop(reply=reply)
+            proxy = self._proxy(certdir, far)
+        else:
+            far = _MidBodyOrigin(certdir, reply)
+            proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                             upstream=("127.0.0.1", far.port))
+            served = self._served_tls(proxy)
+        proxy.start()
+        try:
+            raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            if plain:
+                client = raw
+                client.sendall(b"GET http://example.com/x HTTP/1.1\r\n"
+                               b"Host: example.com\r\n\r\n")
+            else:
+                raw.sendall(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+                            b"Host: api.anthropic.com:443\r\n\r\n")
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    buf += raw.recv(1)
+                client = ssl.create_default_context(
+                    cafile=str(certdir / "ca.pem")).wrap_socket(
+                        raw, server_hostname="api.anthropic.com")
+                client.sendall(b"GET /v1/messages HTTP/1.1\r\n"
+                               b"Host: api.anthropic.com\r\n"
+                               b"Authorization: Bearer t\r\n\r\n")
+            self._read_partial(client)
+            assert proxy.inflight_requests() == 1, "premise: the reply is owed"
+            if plain:
+                with proxy._live_lock:
+                    (conn,) = proxy._open_conns
+            if hang_up:
+                client.close()
+                self._assert_let_go(
+                    proxy, (lambda: conn.fileno() < 0) if plain
+                    else (lambda: served[0].fileno() < 0), far)
+            else:
+                client.sendall(b"G")
+                assert not far.cut.wait(2.0), (
+                    "a connected client's reply was cut mid-body")
+                assert proxy.inflight_requests() == 1
+                assert proxy.live_client_count() == 1
+                client.close()
+        finally:
+            far.stop()
+            proxy.stop()
+
+    def case_mitm_client_hangs_up_mid_body_content_length(self, certdir):
+        self._mid_body(certdir, "length", plain=False, hang_up=True)
+
+    def case_mitm_client_hangs_up_mid_body_chunked(self, certdir):
+        self._mid_body(certdir, "chunked", plain=False, hang_up=True)
+
+    def case_mitm_client_hangs_up_mid_body_unframed(self, certdir):
+        self._mid_body(certdir, "eof", plain=False, hang_up=True)
+
+    def case_plain_client_hangs_up_mid_body_content_length(self, certdir):
+        self._mid_body(certdir, "length", plain=True, hang_up=True)
+
+    def case_plain_client_hangs_up_mid_body_chunked(self, certdir):
+        self._mid_body(certdir, "chunked", plain=True, hang_up=True)
+
+    def case_plain_client_hangs_up_mid_body_unframed(self, certdir):
+        self._mid_body(certdir, "eof", plain=True, hang_up=True)
+
+    def case_control_mitm_a_connected_client_is_not_cut_mid_body(self, certdir):
+        self._mid_body(certdir, "length", plain=False, hang_up=False)
+
+    def case_control_plain_a_connected_client_is_not_cut_mid_body(self, certdir):
+        self._mid_body(certdir, "length", plain=True, hang_up=False)
 
     @staticmethod
     def _tcp_pair():
