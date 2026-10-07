@@ -15009,7 +15009,7 @@ def _raise_nofile_soft_limit() -> None:
             resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
             now = show(resource.getrlimit(resource.RLIMIT_NOFILE))
     except (OSError, ValueError) as exc:
-        why = f" (raise failed: {type(exc).__name__}: {exc})"
+        why = f" (failed: {type(exc).__name__}: {exc})"
     _log_lifecycle(f"nofile before {had} after {now}{why}")
 
 
@@ -19889,7 +19889,7 @@ class PinProxy:
             nofile_soft, nofile_hard = (
                 None if n == resource.RLIM_INFINITY else n
                 for n in resource.getrlimit(resource.RLIMIT_NOFILE))
-        except (ImportError, OSError, ValueError):
+        except (OSError, ValueError):
             nofile_soft = nofile_hard = None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,

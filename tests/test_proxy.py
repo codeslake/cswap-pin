@@ -34689,7 +34689,7 @@ class TestTheDaemonRaisesItsFdLimit:
         pp._raise_nofile_soft_limit()
         assert lines == [
             "nofile before soft=256 hard=524288 after soft=256 hard=524288 "
-            f"(raise failed: {type(refuse).__name__}: {refuse})"]
+            f"(failed: {type(refuse).__name__}: {refuse})"]
 
     def test_the_daemon_entry_reads_the_raised_limit_back(self):
         """The real `resource` and the real `daemon_main`, in a child so this
