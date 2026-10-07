@@ -7974,7 +7974,14 @@ def _waiting_caller(certdir: Path) -> "Path | None":
     daemon in another pid namespace sharing the certdir must not delete a live
     helper's file for it: such a file is left and not acted on."""
     prefix = _SUCCESSOR_SOCK_PREFIX
-    for path in Path(certdir).glob(f"{prefix}*.sock"):
+    try:
+        paths = list(Path(certdir).glob(f"{prefix}*.sock"))
+    except OSError:
+        # Python 3.10 and 3.11 raise EMFILE here when the process is
+        # fd-starved, which ended the code watch before it could ask for a
+        # replacement: no listing is no waiting caller.
+        return None
+    for path in paths:
         try:
             pid = int(path.name[len(prefix):-len(".sock")])
             fresh = time.time() - path.stat().st_mtime <= _RENDEZVOUS_FRESH_S
@@ -13417,6 +13424,18 @@ _CODE_WATCH_INTERVAL_S = 30.0
 # beating and repairs nothing. Three intervals: a tick that ran long, or one
 # missed beat, must not read as a dead thread.
 _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
+# AN FD-STARVED DAEMON IS REPLACED (`_watch_own_code`), WHAT `_accept_loop` DATES
+# AS AN EPISODE: EMFILE errors separated by less than `_FD_STARVED_QUIET_S`,
+# open for `_FD_STARVED_REPLACE_S`. EMFILE only: ENFILE is system-wide, so a
+# successor inherits it and replacing for it would churn every ~90-120 s, each
+# with a drain. An episode and not K consecutive ticks, because the log shows
+# 1,012 streaks over 9.5 h, 34-61 s apart, and a per-tick counter would reset
+# in every gap. What is INFERRED, not measured: that accepts succeeded between
+# the streaks, and that every `/health` probe was answered (so neither the
+# holder's port watch nor a launch's reuse replaced that daemon); a
+# `_pin_daemon_pids` that misses the pid is not ruled out.
+_FD_STARVED_REPLACE_S = _CODE_WATCH_BEAT_MAX_AGE_S
+_FD_STARVED_QUIET_S = 2 * _CODE_WATCH_BEAT_MAX_AGE_S
 # HOW LONG THE HOLDER'S PORT WATCH WAITS FOR A `/health` ANSWER (`PortHolder.
 # _wait_for_exit`), and for the one LAST answer it asks for before it cuts a
 # daemon. A slow answer is not silence: on a loaded host (measured, wmac,
@@ -13536,6 +13555,28 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
     server.release_listener()
     server.await_inflight(_HANDOVER_DRAIN_SECONDS)
     os._exit(0)
+
+
+def _code_is_current(own: str) -> bool:
+    """Whether the code on disk still fingerprints as ``own``.
+
+    ONE MORE READ WHEN THIS PROCESS CANNOT OPEN A FILE. `daemon_fingerprint`
+    turns an OSError into an empty code string by design (UNREADABLE IS NOT
+    UNCHANGED, 93aa63a and ad360ef), so a read that hit EMFILE or ENFILE
+    reads as "the code changed" and recycles a healthy daemon. The cause is
+    not recorded where this can read it, so a mismatch is followed by a
+    descriptor probe, and only a refused one earns the second read. A second
+    unreadable result still reads as changed: that is the only recovery an
+    unheld wedged daemon has.
+    """
+    if daemon_fingerprint() == own:
+        return True
+    try:
+        os.close(os.open(os.devnull, os.O_RDONLY))
+    except OSError as exc:
+        return (exc.errno in (errno.EMFILE, errno.ENFILE)
+                and daemon_fingerprint() == own)
+    return False
 
 
 @_beat_ends_with_the_watchdog
@@ -13742,7 +13783,29 @@ def _watch_own_code(
                     and _waiting_caller(certdir) is not None):
                 _hand_over_to_the_caller(server, certdir)
                 continue
-            if (daemon_fingerprint() == own and not orphaned
+            # A STARVED ACCEPT LOOP, UNDER A HOLDER THAT CAN BE ASKED. Computed
+            # without opening a file, and AHEAD of the fingerprint read: that
+            # read is itself an open, so a starved daemon either failed it
+            # (and recycled by accident, as "unreadable is not unchanged") or
+            # passed it and went back to sleep. The replace ask below is a
+            # signal, which needs no descriptor.
+            #
+            # THE HOLDER MUST BE ONE WE CAN ASK, as the waiting-caller branch
+            # above requires: `held_by_a_holder()` alone is true for a holder
+            # that never claimed the signal, and the branch below then finds no
+            # pid and takes the exit-75 fallback, a capped drain for a daemon
+            # that is still accepting. AND NOT ALREADY STOPPED: `_stop` is set
+            # once the listener is released, and the stamps stay frozen for up
+            # to the quiet bound, so a retiring daemon would otherwise ask
+            # again on the strength of its last EMFILE.
+            _fd_last = getattr(server, "_fd_starved_last", None)
+            starved = (
+                _fd_last is not None
+                and time.monotonic() - _fd_last <= _FD_STARVED_QUIET_S
+                and _fd_last - server._fd_starved_since >= _FD_STARVED_REPLACE_S
+                and not getattr(server, "_stop", False)
+                and held_by_a_holder() and _holder_pid() is not None)
+            if (not starved and _code_is_current(own) and not orphaned
                     and not replace_for_blind):
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
                 # where a machine sat after every deploy: the daemon re-execs
@@ -13771,11 +13834,23 @@ def _watch_own_code(
                     "ship — asked it to stand down so a current one replaces it"
                 )
                 continue
+            # THE REASON THE HELD ASK LINES BELOW NAME, so a starved or blind
+            # replacement is not recorded as "code on disk changed".
+            why = ("accept loop fd-starved" if starved
+                   else "cannot mint the pinned token" if replace_for_blind
+                   else "code on disk changed")
             if replace_for_blind:
                 note_blind_recycle(certdir, now)
                 _log_lifecycle(
                     "cannot mint the pinned token — replacing ourselves so a "
                     "successor can, while this one keeps serving"
+                )
+            if starved:
+                _log_lifecycle(
+                    f"accept loop fd-starved for "
+                    f"{_fd_last - server._fd_starved_since:.0f}s — replacing "
+                    "ourselves so a successor can accept, while this one "
+                    "keeps serving"
                 )
             if orphaned:
                 _log_lifecycle(
@@ -13843,8 +13918,7 @@ def _watch_own_code(
                     # only if it is longer; no daemon at all is worse
                     # than either.
                     _log_lifecycle(
-                        "code on disk changed — exiting for the holder "
-                        "to replace"
+                        f"{why} — exiting for the holder to replace"
                     )
                     server.release_listener()
                     server.await_inflight(_HELD_DRAIN_SECONDS)
@@ -13918,8 +13992,8 @@ def _watch_own_code(
                     server.await_inflight(_HELD_DRAIN_SECONDS)
                     os._exit(_RESTART_ME_CODE)
                 _log_lifecycle(
-                    "code on disk changed — asked the holder to replace "
-                    "us while we keep serving"
+                    f"{why} — asked the holder to replace us while we keep "
+                    "serving"
                 )
                 server.release_listener()
                 # THE SUCCESSOR IS ALREADY SERVING, so this wait is free —
@@ -14910,17 +14984,33 @@ def _raise_nofile_soft_limit() -> None:
     of fds with a few hundred connections stranded and answered EMFILE until it
     was replaced. Unlimited is RLIM_INFINITY, which Python spells -1 on Linux,
     so it is compared by name and never by size. A refusal is not fatal: the
-    daemon serves with the limit it has."""
+    daemon serves with the limit it has.
+
+    ONE LOG LINE, ON EVERY START, with the limits before and after (also when
+    no raise was needed, and with the reason when the raise or a read failed).
+    Nothing outside the process can read its limit on a Mac (no psutil,
+    `launchctl procinfo` needs root), so without this a rollout cannot tell a
+    raised daemon from a starved one."""
+    had = now = "unreadable"
+    why = ""
     try:
         import resource  # POSIX only, like `fcntl` and `select.poll` here
 
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         inf = resource.RLIM_INFINITY
+
+        def show(pair):
+            return " ".join(f"{k}={'unlimited' if n == inf else n}"
+                            for k, n in zip(("soft", "hard"), pair))
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        had = now = show((soft, hard))
         want = _DAEMON_NOFILE_SOFT if hard == inf else min(hard, _DAEMON_NOFILE_SOFT)
         if soft != inf and soft < want:
             resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
-    except (OSError, ValueError):
-        pass
+            now = show(resource.getrlimit(resource.RLIMIT_NOFILE))
+    except (OSError, ValueError) as exc:
+        why = f" (failed: {type(exc).__name__}: {exc})"
+    _log_lifecycle(f"nofile before {had} after {now}{why}")
 
 
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
@@ -15723,6 +15813,10 @@ class PinProxy:
         # a burst; without this each would start its own listing.
         self._bridge_sweeping = False
         self._last_bridge_sweep: float | None = None
+        # The fd-starvation episode `_accept_loop` dates and `_watch_own_code`
+        # reads (monotonic seconds), None until the first EMFILE.
+        self._fd_starved_since: float | None = None
+        self._fd_starved_last: float | None = None
         self._sweep_lock = threading.Lock()
         # EARLIER /bridge POSTS FOR THE SAME cse, in flight (T0955) --
         # `_hold_bridge_attach`/`_release_bridge_attach`. Keyed per cse, so
@@ -18244,6 +18338,16 @@ class PinProxy:
                     # for good. The same retry as `_accept_degraded`.
                     if self._stop or srv.fileno() < 0:
                         return
+                    # THE EPISODE OUTLIVES THE STREAK: a streak ends at the
+                    # next accepted client, which is what made a starved
+                    # daemon look healthy to everything that probes it. This
+                    # is read by `_watch_own_code`, which opens no file.
+                    if exc.errno == errno.EMFILE:
+                        now = time.monotonic()
+                        last = getattr(self, "_fd_starved_last", None)
+                        if last is None or now - last > _FD_STARVED_QUIET_S:
+                            self._fd_starved_since = now
+                        self._fd_starved_last = now
                     # ONE LINE PER STREAK, so a persistent EMFILE is dated in
                     # daemon.log without writing ten lines a second.
                     if not failing:
@@ -19775,6 +19879,18 @@ class PinProxy:
         # holder of a socket it has never heard of.
         holder_pid = os.getppid() if held_by_a_holder() else None
         code_watch_beat = getattr(self, "_code_watch_beat", None)
+        # READ NOW, never remembered from start: this is how a rollout verifies
+        # the fd limit `_raise_nofile_soft_limit` set (it cannot be read from
+        # outside the process on a Mac). `null` for unlimited or an unreadable
+        # limit, which is not zero. Never raises: this is the liveness probe.
+        try:
+            import resource  # POSIX only
+
+            nofile_soft, nofile_hard = (
+                None if n == resource.RLIM_INFINITY else n
+                for n in resource.getrlimit(resource.RLIMIT_NOFILE))
+        except (OSError, ValueError):
+            nofile_soft = nofile_hard = None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
              # THE VERSION THE LIVE PROCESS IS RUNNING, which is not what the
@@ -19818,6 +19934,8 @@ class PinProxy:
              "code_watch_age_s": (
                  None if code_watch_beat is None
                  else round(time.monotonic() - code_watch_beat, 1)),
+             # ADDITIVE: the live fd limits, see `nofile_soft` above.
+             "nofile_soft": nofile_soft, "nofile_hard": nofile_hard,
              # ADDITIVE, PRESENT ONLY WHEN TRUE (see `_note_keychain_denial`):
              # this lineage is refused the Keychain, so a caller in the login
              # session can move the socket into its own.

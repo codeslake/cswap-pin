@@ -8,6 +8,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import socket
@@ -4822,6 +4823,92 @@ def test_an_accept_error_streak_is_logged_once_and_dated(monkeypatch):
     pin_proxy.PinProxy._accept_loop(server)
     assert len(lines) == 2 and all("EMFILE" in line for line in lines), (
         f"expected one line per streak, each naming EMFILE: {lines}")
+
+
+def _run_accept_script(monkeypatch, script):
+    """Drive `_accept_loop` through `script`, a list of (seconds the clock
+    advances first, the error to raise or None for an accepted client). The
+    last entry only ends the loop, unstamped. Returns the server."""
+    from cswap_pin import proxy as pin_proxy
+
+    clock = [1000.0]
+
+    class _Conn:
+        def settimeout(self, _seconds):
+            pass
+
+    class _Srv:
+        def settimeout(self, _seconds):
+            pass
+
+        def fileno(self):
+            return 7
+
+        def accept(self):
+            advance, exc = script.pop(0)
+            clock[0] += advance
+            if not script:
+                server._stop = True
+            if exc is not None:
+                raise exc
+            return _Conn(), ("127.0.0.1", 1)
+
+    server = types.SimpleNamespace(
+        _srv=_Srv(), _stop=False, _live_lock=threading.Lock(),
+        _open_conns=set(), _owe_answer=lambda *_a: None,
+        _serve_client=lambda _conn: None)
+    monkeypatch.setattr(pin_proxy, "_ADOPTED_BACKLOG", [])
+    monkeypatch.setattr(pin_proxy, "_log_lifecycle", lambda _line: None)
+    monkeypatch.setattr(pin_proxy.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(pin_proxy.time, "monotonic", lambda: clock[0])
+    pin_proxy.PinProxy._accept_loop(server)
+    return server
+
+
+def test_an_fd_starvation_episode_spans_streaks_with_accepts_between(
+        monkeypatch):
+    """The reporter's shape: streaks 34-61 s apart, an accept succeeding in
+    between. Each streak ends, but the EPISODE does not: `_fd_starved_since`
+    is the first error and `_fd_starved_last` the latest, so the watchdog can
+    read how long the daemon has been starved without opening a file."""
+    import errno
+
+    full = OSError(errno.EMFILE, "Too many open files")
+    server = _run_accept_script(monkeypatch, [
+        (0, full), (1, full), (34, None), (3, full), (61, None), (2, full),
+        (1, full)])
+    assert (server._fd_starved_since, server._fd_starved_last) == (
+        1000.0, 1000.0 + 1 + 34 + 3 + 61 + 2), (
+        "the episode did not span the accepted clients between the streaks")
+
+
+def test_an_fd_starvation_episode_closes_after_the_quiet_bound(monkeypatch):
+    """A starved daemon that then served quietly is not one long episode: an
+    error after more than the quiet bound opens a new one."""
+    import errno
+
+    from cswap_pin import proxy as pin_proxy
+
+    full = OSError(errno.EMFILE, "Too many open files")
+    quiet = 3 * pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+    server = _run_accept_script(monkeypatch, [
+        (0, full), (quiet, None), (0, full), (1, full)])
+    assert server._fd_starved_since == server._fd_starved_last == 1000.0 + quiet
+
+
+def test_an_accept_error_that_is_not_this_process_fd_exhaustion_is_not_starvation(
+        monkeypatch):
+    """THE CONTROL: only EMFILE dates an episode. ENFILE is system-wide, so a
+    successor inherits it and replacing for it would churn every few minutes
+    with a drain each time."""
+    import errno
+
+    server = _run_accept_script(monkeypatch, [
+        (0, OSError(errno.ECONNABORTED, "aborted")),
+        (1, OSError(errno.ENOBUFS, "no buffers")),
+        (1, OSError(errno.ENFILE, "file table overflow")), (1, None), (1, None)])
+    assert not hasattr(server, "_fd_starved_last") and not hasattr(
+        server, "_fd_starved_since")
 
 
 class TestSuperviseCleanExitGuards:
@@ -31359,6 +31446,207 @@ class TestABlindDaemonRepairsItself:
         assert pin_proxy._can_mint(lambda: None) is False
 
 
+class TestAnFdStarvedDaemonRepairsItself:
+    """A daemon whose accept loop keeps hitting EMFILE is replaced.
+
+    Reported: 1,012 EMFILE streaks over 9.5 hours, 34-61 s apart, a
+    successful accept in between. Every `/health` probe answered, so neither
+    the holder's port watch nor a launch's reuse ever replaced it; it
+    recovered once, by accident, when the watchdog's own fingerprint read hit
+    EMFILE and read as "the code changed".
+
+    The accept loop dates an EPISODE (streaks separated by less than the quiet
+    bound are one), and the watchdog asks the holder for a successor once one
+    has lasted the beat bound, with the code current and the mint working.
+    The scale below is `_CODE_WATCH_BEAT_MAX_AGE_S`, with a 30 s margin each
+    side, so the cases pin the shape and not the exact constants.
+    """
+
+    _Srv = TestABlindDaemonRepairsItself._Srv
+
+    def _drive(self, monkeypatch, tmp_path, *, lasted, ago, held=True,
+               can_ask=True, stopped=False, unreadable_reads=0,
+               read_errno=errno.EMFILE):
+        """Run the watchdog under a server whose episode LASTED `lasted`
+        seconds and whose last EMFILE was `ago` seconds ago. `can_ask` False is
+        a holder that never claimed the replace signal; `stopped` a server
+        already draining. The first `unreadable_reads` reads of the code tree
+        fail with `read_errno`, and while they do a new descriptor is refused
+        too when that errno is EMFILE or ENFILE (`self.reads` counts the reads, and
+        `self.reads_at_ask` the count when the replace ask went out).
+        Returns (signalled, exited, said)."""
+        from cswap_pin import proxy as pin_proxy
+
+        signalled, exited, said = [], [], []
+        own = pin_proxy.daemon_fingerprint()
+        self.reads = self.reads_at_ask = 0
+        own_tree = Path(pin_proxy.__file__).parent
+        real_digest, real_open = pin_proxy._tree_digest_input, os.open
+
+        def _digest(root):
+            if root == own_tree:
+                self.reads += 1
+                if self.reads <= unreadable_reads:
+                    raise OSError(read_errno, "unreadable")
+            return real_digest(root)
+
+        def _open(path, *a, **k):
+            if (path == os.devnull and 0 < self.reads <= unreadable_reads
+                    and read_errno in (errno.EMFILE, errno.ENFILE)):
+                raise OSError(read_errno, "Too many open files")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(pin_proxy, "_tree_digest_input", _digest)
+        monkeypatch.setattr(os, "open", _open)
+
+        def _kill_and_publish(pid, sig):
+            if not signalled:
+                self.reads_at_ask = self.reads
+            signalled.append((pid, sig))
+            pin_proxy.write_daemon_state(
+                tmp_path, 36301, os.getpid() + 1, pin_proxy.daemon_fingerprint())
+
+        srv = self._Srv(lambda: "a-token")
+        srv._fd_starved_last = time.monotonic() - ago
+        srv._fd_starved_since = srv._fd_starved_last - lasted
+        srv._stop = stopped
+        monkeypatch.setattr(os, "kill", _kill_and_publish)
+        monkeypatch.setattr(os, "_exit", lambda code: exited.append(code) or (
+            _ for _ in ()).throw(SystemExit(code)))
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        monkeypatch.setattr(pin_proxy, "_spawn_daemon", lambda *a, **k: 1234)
+        monkeypatch.setattr(pin_proxy, "_ASK_SETTLE_SECONDS", 0)
+        if held:
+            monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+        else:
+            monkeypatch.delenv(pin_proxy._HELD_BY_ENV, raising=False)
+        if can_ask:
+            monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        else:
+            monkeypatch.delenv(pin_proxy._HOLDER_REPLACE_ENV, raising=False)
+        monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
+        try:
+            pin_proxy._watch_own_code(
+                srv, "1", "a@b.c", tmp_path, _Ticks(), lambda *a: None,
+                interval=0.01,
+                # CURRENT, and the mint works: starvation is the only reason.
+                _own_fingerprint=own)
+        except SystemExit:
+            pass
+        return signalled, exited, said
+
+    def test_an_episode_that_lasted_the_bound_asks_the_holder_to_replace(
+            self, monkeypatch, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=beat + 30, ago=5)
+        assert any(sig == pin_proxy._REPLACE_ME_SIGNAL for _p, sig in signalled), (
+            f"an fd-starved daemon kept serving; signals seen: {signalled}")
+        assert exited == [0], (
+            "the successor is already on the socket, so exit 0: 75 would make "
+            "the holder spawn a SECOND daemon")
+        assert any("fd-starved" in line for line in said), (
+            f"the reason was not named in the log: {said}")
+        assert not any("code on disk changed" in line for line in said), (
+            f"the held-ask line named the wrong reason: {said}")
+
+    def test_an_episode_still_shorter_than_the_bound_is_left_alone(
+            self, monkeypatch, tmp_path):
+        """THE CONTROL: one EMFILE streak is routine under load."""
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, _ = self._drive(
+            monkeypatch, tmp_path, lasted=beat - 30, ago=5)
+        assert signalled == [] and exited == []
+
+    def test_a_closed_episode_is_left_alone(self, monkeypatch, tmp_path):
+        """THE CONTROL: no EMFILE for longer than the quiet bound ends the
+        episode, however long it was."""
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, _ = self._drive(
+            monkeypatch, tmp_path, lasted=beat * 10, ago=2 * beat + 30)
+        assert signalled == [] and exited == []
+
+    def test_a_holder_that_cannot_be_asked_is_left_alone(
+            self, monkeypatch, tmp_path):
+        """THE CONTROL: held, but the holder never claimed the replace signal.
+        The held branch would fall back to exit 75, a drain capped at the held
+        budget for a daemon that is still accepting."""
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=beat + 30, ago=5, can_ask=False)
+        assert signalled == [] and exited == [], (
+            f"a daemon nobody can replace left through the slow path: {exited}")
+        assert not any("fd-starved" in line for line in said), said
+
+    def test_a_draining_daemon_does_not_ask_for_a_replacement(
+            self, monkeypatch, tmp_path):
+        """THE CONTROL: `_stop` is set once the listener is released, and the
+        stamps freeze there for up to the quiet bound. A retiring daemon's last
+        EMFILE must not fire a second replacement."""
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=beat + 30, ago=5, stopped=True)
+        assert signalled == [] and exited == [], (
+            f"a stopped daemon asked for a successor: {signalled}")
+        assert not any("fd-starved" in line for line in said), said
+
+    def test_an_unheld_daemon_is_left_alone(self, monkeypatch, tmp_path):
+        """THE CONTROL: unheld behaviour is unchanged. The unheld hand-down
+        needs `_spawn_daemon`, which needs descriptors the starved process
+        lacks, so asking for it would fail at the moment it is wanted."""
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=beat + 30, ago=5, held=False)
+        assert signalled == [] and exited == []
+        assert not any("fd-starved" in line for line in said), (
+            f"an unheld daemon claimed a replacement it cannot ask for: {said}")
+
+    @pytest.mark.parametrize("code", [errno.EMFILE, errno.ENFILE])
+    def test_one_unreadable_fingerprint_read_is_read_again(
+            self, monkeypatch, tmp_path, code):
+        """`daemon_fingerprint` turns an OSError into an empty code string by
+        design, so a read that hit a full descriptor table looked like "the
+        code changed" and recycled a healthy daemon."""
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=0, ago=10 ** 6,
+            unreadable_reads=1, read_errno=code)
+        assert self.reads >= 2, "the unreadable read was taken at its word"
+        assert signalled == [] and exited == [], (
+            f"a transient {errno.errorcode[code]} recycled the daemon: {said}")
+
+    def test_two_unreadable_fingerprint_reads_still_recycle(
+            self, monkeypatch, tmp_path):
+        """Unreadable is not unchanged (93aa63a, ad360ef): a daemon that cannot
+        read its own tree twice running is still recycled, the only recovery an
+        unheld wedged daemon has."""
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=0, ago=10 ** 6, unreadable_reads=2)
+        assert self.reads_at_ask == 2 and exited == [0], (
+            f"reads={self.reads_at_ask}, exited={exited}, said={said}")
+        assert any("code on disk changed" in line for line in said), said
+
+    def test_an_unreadable_read_that_is_not_fd_exhaustion_is_not_repeated(
+            self, monkeypatch, tmp_path):
+        """THE CONTROL, or the repeat could be unconditional: the same failure
+        with an EACCES recycles on the first read."""
+        signalled, exited, _ = self._drive(
+            monkeypatch, tmp_path, lasted=0, ago=10 ** 6,
+            unreadable_reads=1, read_errno=errno.EACCES)
+        assert self.reads_at_ask == 1 and exited == [0]
+
+
 class TestTheUnpinnableMarkComesBackOff:
     """A repaired account must clear the mark, or nothing looks repaired.
 
@@ -33784,6 +34072,22 @@ else:
         finally:
             shutil.rmtree(certdir, ignore_errors=True)
 
+    def case_a_listing_that_hits_fd_exhaustion_is_no_waiting_caller(
+            self, tmp_path, monkeypatch):
+        """On Python 3.10 and 3.11 `Path.glob` raises errno 24 when the
+        process is fd-starved (3.12 returns nothing). Raised out of here it
+        ended the code watch before the replace ask could be made, for the
+        one daemon the ask is for."""
+        import errno
+
+        from cswap_pin import proxy as pp
+
+        def _starved(self, pattern):
+            raise OSError(errno.EMFILE, "Too many open files")
+
+        monkeypatch.setattr(pp.Path, "glob", _starved)
+        assert pp._waiting_caller(tmp_path) is None
+
     def case_a_holder_that_handed_its_socket_stands_down_on_every_exit_of_its_daemon(
             self, tmp_path, monkeypatch):
         """Once the socket went to a caller's lineage and `proxy.json` names
@@ -34321,16 +34625,26 @@ class TestTheDaemonRaisesItsFdLimit:
         import sys
 
         calls = []
+        limits = [(soft, hard)]
 
         def setrlimit(which, pair):
             if refuse:
                 raise refuse
             calls.append(pair)
+            limits[0] = pair
 
         monkeypatch.setitem(sys.modules, "resource", types.SimpleNamespace(
             RLIMIT_NOFILE=7, RLIM_INFINITY=-1, setrlimit=setrlimit,
-            getrlimit=lambda which: (soft, hard)))
+            getrlimit=lambda which: limits[0]))
         return calls
+
+    @staticmethod
+    def _lifecycle_lines(monkeypatch):
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        return lines
 
     @pytest.mark.parametrize("soft, hard, expect", [
         (256, 524288, (1024, 524288)),    # the macOS login default
@@ -34347,12 +34661,35 @@ class TestTheDaemonRaisesItsFdLimit:
         pp._raise_nofile_soft_limit()
         assert calls == ([expect] if expect else [])
 
+    @pytest.mark.parametrize("soft, hard, before, after", [
+        (256, 524288, "soft=256 hard=524288", "soft=1024 hard=524288"),
+        (2048, 524288, "soft=2048 hard=524288", "soft=2048 hard=524288"),
+        (-1, -1, "soft=unlimited hard=unlimited",
+         "soft=unlimited hard=unlimited"),
+    ])
+    def test_every_start_logs_one_line_with_the_limits_before_and_after(
+            self, monkeypatch, soft, hard, before, after):
+        """A rollout cannot read a daemon's limit from outside (no psutil,
+        `launchctl procinfo` needs root), so daemon.log has to say it, also
+        when no raise was needed."""
+        from cswap_pin import proxy as pp
+
+        self._fake_resource(monkeypatch, soft, hard)
+        lines = self._lifecycle_lines(monkeypatch)
+        pp._raise_nofile_soft_limit()
+        assert lines == [f"nofile before {before} after {after}"]
+
     @pytest.mark.parametrize("refuse", [OSError("EPERM"), ValueError("EINVAL")])
-    def test_a_refused_raise_does_not_stop_the_daemon(self, monkeypatch, refuse):
+    def test_a_refused_raise_logs_the_reason_and_does_not_stop_the_daemon(
+            self, monkeypatch, refuse):
         from cswap_pin import proxy as pp
 
         self._fake_resource(monkeypatch, 256, 524288, refuse=refuse)
+        lines = self._lifecycle_lines(monkeypatch)
         pp._raise_nofile_soft_limit()
+        assert lines == [
+            "nofile before soft=256 hard=524288 after soft=256 hard=524288 "
+            f"(failed: {type(refuse).__name__}: {refuse})"]
 
     def test_the_daemon_entry_reads_the_raised_limit_back(self):
         """The real `resource` and the real `daemon_main`, in a child so this
@@ -34387,3 +34724,9 @@ class TestTheDaemonRaisesItsFdLimit:
         out = subprocess.run([sys.executable, "-c", code, "."],
                              capture_output=True, text=True, timeout=60)
         assert out.stdout.split() == ["1024", "2048"], out.stderr
+        # And the line reaches the log: `_log_lifecycle` works that early in
+        # `daemon_main`, once per start.
+        lines = [ln for ln in out.stderr.splitlines() if "nofile before" in ln]
+        assert len(lines) == 2, out.stderr
+        assert "before soft=256 " in lines[0] and " after soft=1024 " in lines[0]
+        assert "before soft=2048 " in lines[1] and " after soft=2048 " in lines[1]
