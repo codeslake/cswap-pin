@@ -18454,6 +18454,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     LIVE = "live-account-token"
     HEADROOM = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     NO_HEADROOM = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}}
+    EOF_GRACE = 5  # seconds `_relay` waits for the drain's EOF
 
     @staticmethod
     def _wire(monkeypatch, switched, raises_once=None, needs_login=False,
@@ -18619,8 +18620,15 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         Both ends run from threads over sockets shrunk to macOS's 8 KB
         AF_UNIX buffer (Linux's is ~208 KB): a body past 8 KB written whole
         before the relay ran blocked there on macOS CI (T1891). Returns
-        every byte the client was sent."""
+        every byte the client was sent.
+
+        The drain waits unbounded while the relay runs, but not for the EOF
+        after it (T1961): trunk CI on macOS hung >300 s there, `cl_a`'s
+        `SHUT_WR` never waking the blocked `recv`. Every byte is queued once
+        the relay returns, so after `EOF_GRACE` the drain is woken instead."""
+        import os as _os
         import socket as _s
+        import warnings
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
         cl_a, cl_b = _s.socketpair()
@@ -18650,20 +18658,101 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     pass
 
             def _drain():
-                while chunk := cl_b.recv(65536):
-                    got.append(chunk)
+                try:
+                    while chunk := cl_b.recv(65536):
+                        got.append(chunk)
+                except OSError:  # the SHUT_RD wake below, where it raises
+                    pass
             reader = threading.Thread(target=_drain, daemon=True)
             threading.Thread(target=_feed, daemon=True).start()
             reader.start()
+            st0 = _os.fstat(cl_a.fileno())
             pp._relay_response(up_a, cl_a, 0, method=method, path=path,
                                auth=auth, session=session)
             cl_a.shutdown(_s.SHUT_WR)
-            reader.join()
+            reader.join(cls.EOF_GRACE)
+            if reader.is_alive():
+                # `same_inode` False would mean the fd was reused under us
+                st = _os.fstat(cl_a.fileno())
+                # a warning, not stderr: pytest keeps it on a PASSING run
+                warnings.warn("_relay: no EOF after SHUT_WR, woke the drain "
+                              f"(cl_a fd={cl_a.fileno()} same_inode="
+                              f"{(st.st_dev, st.st_ino) == (st0.st_dev, st0.st_ino)})")
+                try:  # XNU's SHUT_RD flushes unread data: never wake over some
+                    pending = cl_b.recv(1, _s.MSG_PEEK | _s.MSG_DONTWAIT)
+                except BlockingIOError:
+                    pending = b""
+                assert not pending, ("missed wakeup with data queued: the "
+                                     "drain left bytes unread, SHUT_RD would drop them")
+                try:
+                    cl_b.shutdown(_s.SHUT_RD)
+                except OSError as e:  # XNU, read side already shut
+                    raise AssertionError(
+                        f"EOF arrived but the blocked recv was not woken: "
+                        f"SHUT_RD raised errno {e.errno} ({e.strerror})") from e
+                reader.join(cls.EOF_GRACE)
+                assert not reader.is_alive(), "SHUT_RD did not wake the drain"
             return b"".join(got)
         finally:
             for x in (up_a, up_b, cl_a, cl_b):
                 try: x.close()
                 except OSError: pass
+
+    def case_a_withheld_eof_is_woken_not_waited_for(self, monkeypatch):
+        """T1961. Trunk CI on macOS hung >300 s in `_relay`'s `reader.join()`:
+        the relay had returned and `cl_a.shutdown(SHUT_WR)` had run, yet the
+        drain never saw EOF. THE INJECTED FAULT is that FIN, swallowed here
+        (no other `SHUT_WR` matters: the response is framed). The helper must
+        wake the drain itself, keep every byte, and warn so."""
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real = socket.socket.shutdown
+        monkeypatch.setattr(socket.socket, "shutdown", lambda s, how: (
+            None if how == socket.SHUT_WR else real(s, how)))
+        body = b"0123456789" * 1000
+        with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
+            got = self._relay(status=b"200 OK", reset=False, body=body)
+        assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
+
+    def case_a_wake_that_finds_data_queued_fails_naming_it(self, monkeypatch):
+        """T1961. XNU's `SHUT_RD` flushes unread receive data, so a drain that
+        missed a wakeup with bytes queued must fail the helper rather than
+        have them discarded. THE INJECTED FAULT: the peek reports a byte."""
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real_shut, real_recv = socket.socket.shutdown, socket.socket.recv
+        monkeypatch.setattr(socket.socket, "shutdown", lambda s, how: (
+            None if how == socket.SHUT_WR else real_shut(s, how)))
+
+        def _recv(s, n, flags=0):
+            if not flags & socket.MSG_PEEK:
+                return real_recv(s, n, flags)
+            real_shut(s, socket.SHUT_RD)  # end the blocked drain; not the fault
+            return b"x"
+        monkeypatch.setattr(socket.socket, "recv", _recv)
+        with pytest.raises(AssertionError, match="missed wakeup with data queued"), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
+
+    def case_a_wake_the_platform_refuses_fails_naming_the_errno(self, monkeypatch):
+        """T1961. XNU may refuse `SHUT_RD` on a read side already shut (ENOTCONN).
+        THE INJECTED FAULT: `SHUT_RD` raises that, and the helper must say which
+        errno and what it means instead of a bare traceback."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real = socket.socket.shutdown
+
+        def _shutdown(s, how):
+            if how == socket.SHUT_WR:
+                return
+            real(s, how)  # end the blocked drain; the raise is the fault
+            if how == socket.SHUT_RD:
+                raise OSError(errno.ENOTCONN, "Socket is not connected")
+        monkeypatch.setattr(socket.socket, "shutdown", _shutdown)
+        with pytest.raises(AssertionError, match=r"not woken.*errno %d" % errno.ENOTCONN), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
 
     def case_a_successful_switch_rewrites_429_to_401(self, monkeypatch):
         self._wire(monkeypatch, switched=True)
