@@ -34308,3 +34308,82 @@ else:
                 "successor")
         finally:
             serving.close()
+
+
+class TestTheDaemonRaisesItsFdLimit:
+    """T1989. A daemon started where the soft RLIMIT_NOFILE is 256 (the macOS
+    login default) ran out of fds with a few hundred stranded connections. It
+    raises its own soft limit at start, to `min(hard, 1024)`: 1024 and not more
+    because `select.select` raises for any fd at or past FD_SETSIZE."""
+
+    @staticmethod
+    def _fake_resource(monkeypatch, soft, hard, refuse=None):
+        import sys
+
+        calls = []
+
+        def setrlimit(which, pair):
+            if refuse:
+                raise refuse
+            calls.append(pair)
+
+        monkeypatch.setitem(sys.modules, "resource", types.SimpleNamespace(
+            RLIMIT_NOFILE=7, RLIM_INFINITY=-1, setrlimit=setrlimit,
+            getrlimit=lambda which: (soft, hard)))
+        return calls
+
+    @pytest.mark.parametrize("soft, hard, expect", [
+        (256, 524288, (1024, 524288)),    # the macOS login default
+        (256, -1, (1024, -1)),            # Linux spells "no hard limit" -1
+        (256, 512, (512, 512)),           # never past the hard limit
+        (2048, 524288, None),             # already higher: left alone
+        (-1, -1, None),                   # unlimited is higher than any cap
+    ])
+    def test_the_soft_limit_is_raised_to_the_cap_and_never_lowered(
+            self, monkeypatch, soft, hard, expect):
+        from cswap_pin import proxy as pp
+
+        calls = self._fake_resource(monkeypatch, soft, hard)
+        pp._raise_nofile_soft_limit()
+        assert calls == ([expect] if expect else [])
+
+    @pytest.mark.parametrize("refuse", [OSError("EPERM"), ValueError("EINVAL")])
+    def test_a_refused_raise_does_not_stop_the_daemon(self, monkeypatch, refuse):
+        from cswap_pin import proxy as pp
+
+        self._fake_resource(monkeypatch, 256, 524288, refuse=refuse)
+        pp._raise_nofile_soft_limit()
+
+    def test_the_daemon_entry_reads_the_raised_limit_back(self):
+        """The real `resource` and the real `daemon_main`, in a child so this
+        process's limit is never lowered: started with a soft limit of 256 it
+        has min(hard, 1024) by the time it builds its proxy, and started with
+        one above 1024 it is left there. The proxy is a stub that raises, so
+        nothing is served."""
+        import resource
+        import subprocess
+        import sys
+
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard <= 1024:
+            pytest.skip("the hard limit leaves no room above 1024")
+        code = (
+            "import resource as r, sys, types\n"
+            "from cswap_pin import proxy as p\n"
+            "class Stop(Exception): pass\n"
+            "def stop(*a, **k): raise Stop\n"
+            "p.require = lambda name: types.SimpleNamespace(\n"
+            "    ClaudeAccountSwitcher=lambda: None)\n"
+            "p.make_pin_token_provider = stop\n"
+            "p.PinProxy = stop\n"
+            "_, hard = r.getrlimit(r.RLIMIT_NOFILE)\n"
+            "out = []\n"
+            "for soft in (256, 2048):\n"
+            "    r.setrlimit(r.RLIMIT_NOFILE, (soft, hard))\n"
+            "    try: p.daemon_main('1', 'a@b.c', sys.argv[1])\n"
+            "    except Stop: pass\n"
+            "    out.append(r.getrlimit(r.RLIMIT_NOFILE)[0])\n"
+            "print(*out)\n")
+        out = subprocess.run([sys.executable, "-c", code, "."],
+                             capture_output=True, text=True, timeout=60)
+        assert out.stdout.split() == ["1024", "2048"], out.stderr

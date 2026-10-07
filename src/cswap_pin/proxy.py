@@ -14896,6 +14896,33 @@ def _resume_serving(server) -> bool:
     return True
 
 
+# ponytail: capped at FD_SETSIZE because two `select.select` calls on an
+# upstream socket (`_upstream_reusable` and the first-byte check) raise for any
+# fd at or past it, and macOS answers EINVAL to a soft limit above OPEN_MAX
+# whatever the hard one reads. To go higher, move those two to `select.poll`,
+# as 78083e5 did for `_client_hung_up`.
+_DAEMON_NOFILE_SOFT = 1024
+
+
+def _raise_nofile_soft_limit() -> None:
+    """Raise the soft RLIMIT_NOFILE to `min(hard, _DAEMON_NOFILE_SOFT)`, never
+    lowering it. A daemon born under a launchd-style soft limit of 256 ran out
+    of fds with a few hundred connections stranded and answered EMFILE until it
+    was replaced. Unlimited is RLIM_INFINITY, which Python spells -1 on Linux,
+    so it is compared by name and never by size. A refusal is not fatal: the
+    daemon serves with the limit it has."""
+    try:
+        import resource  # POSIX only, like `fcntl` and `select.poll` here
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        inf = resource.RLIM_INFINITY
+        want = _DAEMON_NOFILE_SOFT if hard == inf else min(hard, _DAEMON_NOFILE_SOFT)
+        if soft != inf and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (OSError, ValueError):
+        pass
+
+
 def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     """Entry point for the detached proxy process (``-m claude_swap.pin_proxy``).
 
@@ -14907,6 +14934,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     probe, and self-terminates when the last refcount holder closes the FIFO
     (idle teardown).
     """
+    _raise_nofile_soft_limit()
     ClaudeAccountSwitcher = require("switcher").ClaudeAccountSwitcher
 
     certdir = Path(certdir)
@@ -23456,8 +23484,8 @@ def _relay_response(
     # THE HEAD WAIT, WATCHED. It has no timeout (a slow first byte from a live
     # request is legitimate), so a client that hangs up meanwhile is noticed by
     # `_CLIENT_WATCH`, which shuts `up` and lands here as EOF: no head, False,
-    # and the caller's own teardown closes both legs and pays the debt. Once
-    # the head is in, the relay streams unwatched.
+    # and the caller's own teardown closes both legs and pays the debt. The
+    # body relay below is watched the same way.
     with _CLIENT_WATCH.over(client, up):
         while b"\r\n\r\n" not in buf:
             try:
@@ -23758,30 +23786,36 @@ def _relay_response(
         return keep
     _send_head(b"\r\n".join(out) + b"\r\n\r\n" + rest)
 
-    if chunked:
-        return _pipe_chunked(up, client, bytearray(rest)) and keep
-    if length is not None:
-        remaining = length - len(rest)
-        while remaining > 0:
+    # THE BODY RELAY, WATCHED TOO. Each loop below blocks in `up.recv` with no
+    # timeout, and a dead client is otherwise noticed only by the next
+    # `client.sendall`: an upstream that goes silent mid-reply (a laptop asleep)
+    # held both fds for ever. The watch shuts `up`, which lands in these loops
+    # as EOF: False, and the caller closes both legs and pays the debt.
+    with _CLIENT_WATCH.over(client, up):
+        if chunked:
+            return _pipe_chunked(up, client, bytearray(rest)) and keep
+        if length is not None:
+            remaining = length - len(rest)
+            while remaining > 0:
+                try:
+                    chunk = up.recv(min(65536, remaining))
+                except (ConnectionResetError, ssl.SSLError, OSError):
+                    return False
+                if not chunk:
+                    return False
+                client.sendall(chunk)
+                remaining -= len(chunk)
+            return keep
+        # No framing: body runs to EOF (SSE and close-delimited replies).
+        while True:
             try:
-                chunk = up.recv(min(65536, remaining))
+                chunk = up.recv(65536)
             except (ConnectionResetError, ssl.SSLError, OSError):
-                return False
+                break
             if not chunk:
-                return False
+                break
             client.sendall(chunk)
-            remaining -= len(chunk)
-        return keep
-    # No framing: body runs to EOF (SSE and close-delimited replies).
-    while True:
-        try:
-            chunk = up.recv(65536)
-        except (ConnectionResetError, ssl.SSLError, OSError):
-            break
-        if not chunk:
-            break
-        client.sendall(chunk)
-    return False
+        return False
 
 
 def _pipe_chunked(up: ssl.SSLSocket, client: ssl.SSLSocket, buf: bytearray) -> bool:
