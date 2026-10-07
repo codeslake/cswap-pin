@@ -31461,10 +31461,12 @@ class TestAnFdStarvedDaemonRepairsItself:
 
     _Srv = TestABlindDaemonRepairsItself._Srv
 
-    def _drive(self, monkeypatch, tmp_path, *, lasted, ago, held=True):
+    def _drive(self, monkeypatch, tmp_path, *, lasted, ago, held=True,
+               can_ask=True, stopped=False):
         """Run the watchdog under a server whose episode LASTED `lasted`
-        seconds and whose last EMFILE was `ago` seconds ago. Returns
-        (signalled, exited, said)."""
+        seconds and whose last EMFILE was `ago` seconds ago. `can_ask` False is
+        a holder that never claimed the replace signal; `stopped` a server
+        already draining. Returns (signalled, exited, said)."""
         from cswap_pin import proxy as pin_proxy
 
         signalled, exited, said = [], [], []
@@ -31477,6 +31479,7 @@ class TestAnFdStarvedDaemonRepairsItself:
         srv = self._Srv(lambda: "a-token")
         srv._fd_starved_last = time.monotonic() - ago
         srv._fd_starved_since = srv._fd_starved_last - lasted
+        srv._stop = stopped
         monkeypatch.setattr(os, "kill", _kill_and_publish)
         monkeypatch.setattr(os, "_exit", lambda code: exited.append(code) or (
             _ for _ in ()).throw(SystemExit(code)))
@@ -31487,7 +31490,10 @@ class TestAnFdStarvedDaemonRepairsItself:
             monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
         else:
             monkeypatch.delenv(pin_proxy._HELD_BY_ENV, raising=False)
-        monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        if can_ask:
+            monkeypatch.setenv(pin_proxy._HOLDER_REPLACE_ENV, "1")
+        else:
+            monkeypatch.delenv(pin_proxy._HOLDER_REPLACE_ENV, raising=False)
         monkeypatch.delenv(pin_proxy._SELF_HEAL_ENV, raising=False)
         try:
             pin_proxy._watch_own_code(
@@ -31533,6 +31539,34 @@ class TestAnFdStarvedDaemonRepairsItself:
         signalled, exited, _ = self._drive(
             monkeypatch, tmp_path, lasted=beat * 10, ago=2 * beat + 30)
         assert signalled == [] and exited == []
+
+    def test_a_holder_that_cannot_be_asked_is_left_alone(
+            self, monkeypatch, tmp_path):
+        """THE CONTROL: held, but the holder never claimed the replace signal.
+        The held branch would fall back to exit 75, a drain capped at the held
+        budget for a daemon that is still accepting."""
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=beat + 30, ago=5, can_ask=False)
+        assert signalled == [] and exited == [], (
+            f"a daemon nobody can replace left through the slow path: {exited}")
+        assert not any("fd-starved" in line for line in said), said
+
+    def test_a_draining_daemon_does_not_ask_for_a_replacement(
+            self, monkeypatch, tmp_path):
+        """THE CONTROL: `_stop` is set once the listener is released, and the
+        stamps freeze there for up to the quiet bound. A retiring daemon's last
+        EMFILE must not fire a second replacement."""
+        from cswap_pin import proxy as pin_proxy
+
+        beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=beat + 30, ago=5, stopped=True)
+        assert signalled == [] and exited == [], (
+            f"a stopped daemon asked for a successor: {signalled}")
+        assert not any("fd-starved" in line for line in said), said
 
     def test_an_unheld_daemon_is_left_alone(self, monkeypatch, tmp_path):
         """THE CONTROL: unheld behaviour is unchanged. Nothing above this

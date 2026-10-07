@@ -13764,12 +13764,22 @@ def _watch_own_code(
             # (and recycled by accident, as "unreadable is not unchanged") or
             # passed it and went back to sleep. The replace ask below is a
             # signal, which needs no descriptor.
+            #
+            # THE HOLDER MUST BE ONE WE CAN ASK, as the waiting-caller branch
+            # above requires: `held_by_a_holder()` alone is true for a holder
+            # that never claimed the signal, and the branch below then finds no
+            # pid and takes the exit-75 fallback, a capped drain for a daemon
+            # that is still accepting. AND NOT ALREADY STOPPED: `_stop` is set
+            # once the listener is released, and the stamps stay frozen for up
+            # to the quiet bound, so a retiring daemon would otherwise ask
+            # again on the strength of its last EMFILE.
             _fd_last = getattr(server, "_fd_starved_last", None)
             starved = (
                 _fd_last is not None
                 and time.monotonic() - _fd_last <= _FD_STARVED_QUIET_S
                 and _fd_last - server._fd_starved_since >= _FD_STARVED_REPLACE_S
-                and held_by_a_holder())
+                and not getattr(server, "_stop", False)
+                and held_by_a_holder() and _holder_pid() is not None)
             if (not starved and daemon_fingerprint() == own and not orphaned
                     and not replace_for_blind):
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
