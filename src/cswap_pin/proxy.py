@@ -7974,7 +7974,14 @@ def _waiting_caller(certdir: Path) -> "Path | None":
     daemon in another pid namespace sharing the certdir must not delete a live
     helper's file for it: such a file is left and not acted on."""
     prefix = _SUCCESSOR_SOCK_PREFIX
-    for path in Path(certdir).glob(f"{prefix}*.sock"):
+    try:
+        paths = list(Path(certdir).glob(f"{prefix}*.sock"))
+    except OSError:
+        # Python 3.10 and 3.11 raise EMFILE here when the process is
+        # fd-starved, which ended the code watch before it could ask for a
+        # replacement: no listing is no waiting caller.
+        return None
+    for path in paths:
         try:
             pid = int(path.name[len(prefix):-len(".sock")])
             fresh = time.time() - path.stat().st_mtime <= _RENDEZVOUS_FRESH_S
@@ -13417,6 +13424,15 @@ _CODE_WATCH_INTERVAL_S = 30.0
 # beating and repairs nothing. Three intervals: a tick that ran long, or one
 # missed beat, must not read as a dead thread.
 _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
+# AN FD-STARVED DAEMON IS REPLACED (`_watch_own_code`), WHAT `_accept_loop` DATES
+# AS AN EPISODE: EMFILE or ENFILE errors separated by less than
+# `_FD_STARVED_QUIET_S`, open for `_FD_STARVED_REPLACE_S`. An episode and not K
+# consecutive ticks, because the shape measured is streaks 34-61 s apart with
+# accepts succeeding between them (1,012 streaks over 9.5 h): every `/health`
+# probe was answered, so neither the holder's port watch nor a launch's reuse
+# ever replaced that daemon, and a per-tick counter would reset in every gap.
+_FD_STARVED_REPLACE_S = _CODE_WATCH_BEAT_MAX_AGE_S
+_FD_STARVED_QUIET_S = 2 * _CODE_WATCH_BEAT_MAX_AGE_S
 # HOW LONG THE HOLDER'S PORT WATCH WAITS FOR A `/health` ANSWER (`PortHolder.
 # _wait_for_exit`), and for the one LAST answer it asks for before it cuts a
 # daemon. A slow answer is not silence: on a loaded host (measured, wmac,
@@ -13742,7 +13758,19 @@ def _watch_own_code(
                     and _waiting_caller(certdir) is not None):
                 _hand_over_to_the_caller(server, certdir)
                 continue
-            if (daemon_fingerprint() == own and not orphaned
+            # A STARVED ACCEPT LOOP, UNDER A HOLDER THAT CAN BE ASKED. Computed
+            # without opening a file, and AHEAD of the fingerprint read: that
+            # read is itself an open, so a starved daemon either failed it
+            # (and recycled by accident, as "unreadable is not unchanged") or
+            # passed it and went back to sleep. The replace ask below is a
+            # signal, which needs no descriptor.
+            _fd_last = getattr(server, "_fd_starved_last", None)
+            starved = (
+                _fd_last is not None
+                and time.monotonic() - _fd_last <= _FD_STARVED_QUIET_S
+                and _fd_last - server._fd_starved_since >= _FD_STARVED_REPLACE_S
+                and held_by_a_holder())
+            if (not starved and daemon_fingerprint() == own and not orphaned
                     and not replace_for_blind):
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
                 # where a machine sat after every deploy: the daemon re-execs
@@ -13776,6 +13804,13 @@ def _watch_own_code(
                 _log_lifecycle(
                     "cannot mint the pinned token — replacing ourselves so a "
                     "successor can, while this one keeps serving"
+                )
+            if starved:
+                _log_lifecycle(
+                    f"accept loop fd-starved for "
+                    f"{_fd_last - server._fd_starved_since:.0f}s — replacing "
+                    "ourselves so a successor can accept, while this one "
+                    "keeps serving"
                 )
             if orphaned:
                 _log_lifecycle(
@@ -15723,6 +15758,10 @@ class PinProxy:
         # a burst; without this each would start its own listing.
         self._bridge_sweeping = False
         self._last_bridge_sweep: float | None = None
+        # The fd-starvation episode `_accept_loop` dates and `_watch_own_code`
+        # reads (monotonic seconds), None until the first EMFILE or ENFILE.
+        self._fd_starved_since: float | None = None
+        self._fd_starved_last: float | None = None
         self._sweep_lock = threading.Lock()
         # EARLIER /bridge POSTS FOR THE SAME cse, in flight (T0955) --
         # `_hold_bridge_attach`/`_release_bridge_attach`. Keyed per cse, so
@@ -18244,6 +18283,16 @@ class PinProxy:
                     # for good. The same retry as `_accept_degraded`.
                     if self._stop or srv.fileno() < 0:
                         return
+                    # THE EPISODE OUTLIVES THE STREAK: a streak ends at the
+                    # next accepted client, which is what made a starved
+                    # daemon look healthy to everything that probes it. This
+                    # is read by `_watch_own_code`, which opens no file.
+                    if exc.errno in (errno.EMFILE, errno.ENFILE):
+                        now = time.monotonic()
+                        last = getattr(self, "_fd_starved_last", None)
+                        if last is None or now - last > _FD_STARVED_QUIET_S:
+                            self._fd_starved_since = now
+                        self._fd_starved_last = now
                     # ONE LINE PER STREAK, so a persistent EMFILE is dated in
                     # daemon.log without writing ten lines a second.
                     if not failing:
