@@ -18628,7 +18628,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         the relay returns, so after `EOF_GRACE` the drain is woken instead."""
         import os as _os
         import socket as _s
-        import sys as _sys
+        import warnings
         from cswap_pin import proxy as pp
         up_a, up_b = _s.socketpair()
         cl_a, cl_b = _s.socketpair()
@@ -18674,11 +18674,22 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             if reader.is_alive():
                 # `same_inode` False would mean the fd was reused under us
                 st = _os.fstat(cl_a.fileno())
-                print("_relay: no EOF after SHUT_WR, woke the drain "
-                      f"(cl_a fd={cl_a.fileno()} same_inode="
-                      f"{(st.st_dev, st.st_ino) == (st0.st_dev, st0.st_ino)})",
-                      file=_sys.stderr)
-                cl_b.shutdown(_s.SHUT_RD)
+                # a warning, not stderr: pytest keeps it on a PASSING run
+                warnings.warn("_relay: no EOF after SHUT_WR, woke the drain "
+                              f"(cl_a fd={cl_a.fileno()} same_inode="
+                              f"{(st.st_dev, st.st_ino) == (st0.st_dev, st0.st_ino)})")
+                try:  # XNU's SHUT_RD flushes unread data: never wake over some
+                    pending = cl_b.recv(1, _s.MSG_PEEK | _s.MSG_DONTWAIT)
+                except BlockingIOError:
+                    pending = b""
+                assert not pending, ("missed wakeup with data queued: the "
+                                     "drain left bytes unread, SHUT_RD would drop them")
+                try:
+                    cl_b.shutdown(_s.SHUT_RD)
+                except OSError as e:  # XNU, read side already shut
+                    raise AssertionError(
+                        f"EOF arrived but the blocked recv was not woken: "
+                        f"SHUT_RD raised errno {e.errno} ({e.strerror})") from e
                 reader.join(cls.EOF_GRACE)
                 assert not reader.is_alive(), "SHUT_RD did not wake the drain"
             return b"".join(got)
@@ -18692,19 +18703,56 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         the relay had returned and `cl_a.shutdown(SHUT_WR)` had run, yet the
         drain never saw EOF. THE INJECTED FAULT is that FIN, swallowed here
         (no other `SHUT_WR` matters: the response is framed). The helper must
-        wake the drain itself, keep every byte, and say so on stderr."""
+        wake the drain itself, keep every byte, and warn so."""
         self._wire(monkeypatch, switched=False)
         monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
         real = socket.socket.shutdown
         monkeypatch.setattr(socket.socket, "shutdown", lambda s, how: (
             None if how == socket.SHUT_WR else real(s, how)))
         body = b"0123456789" * 1000
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
             got = self._relay(status=b"200 OK", reset=False, body=body)
-        assert "_relay: no EOF after SHUT_WR, woke the drain" in err.getvalue(), (
-            "the swallowed FIN never reached the helper's fallback")
         assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
+
+    def case_a_wake_that_finds_data_queued_fails_naming_it(self, monkeypatch):
+        """T1961. XNU's `SHUT_RD` flushes unread receive data, so a drain that
+        missed a wakeup with bytes queued must fail the helper rather than
+        have them discarded. THE INJECTED FAULT: the peek reports a byte."""
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real_shut, real_recv = socket.socket.shutdown, socket.socket.recv
+        monkeypatch.setattr(socket.socket, "shutdown", lambda s, how: (
+            None if how == socket.SHUT_WR else real_shut(s, how)))
+
+        def _recv(s, n, flags=0):
+            if not flags & socket.MSG_PEEK:
+                return real_recv(s, n, flags)
+            real_shut(s, socket.SHUT_RD)  # end the blocked drain; not the fault
+            return b"x"
+        monkeypatch.setattr(socket.socket, "recv", _recv)
+        with pytest.raises(AssertionError, match="missed wakeup with data queued"), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
+
+    def case_a_wake_the_platform_refuses_fails_naming_the_errno(self, monkeypatch):
+        """T1961. XNU may refuse `SHUT_RD` on a read side already shut (ENOTCONN).
+        THE INJECTED FAULT: `SHUT_RD` raises that, and the helper must say which
+        errno and what it means instead of a bare traceback."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        real = socket.socket.shutdown
+
+        def _shutdown(s, how):
+            if how == socket.SHUT_WR:
+                return
+            real(s, how)  # end the blocked drain; the raise is the fault
+            if how == socket.SHUT_RD:
+                raise OSError(errno.ENOTCONN, "Socket is not connected")
+        monkeypatch.setattr(socket.socket, "shutdown", _shutdown)
+        with pytest.raises(AssertionError, match=r"not woken.*errno %d" % errno.ENOTCONN), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
 
     def case_a_successful_switch_rewrites_429_to_401(self, monkeypatch):
         self._wire(monkeypatch, switched=True)
