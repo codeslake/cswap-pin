@@ -8,6 +8,7 @@ inference (/v1/messages) and everything else must pass through untouched.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import socket
@@ -4864,16 +4865,15 @@ def _run_accept_script(monkeypatch, script):
     return server
 
 
-@pytest.mark.parametrize("name", ["EMFILE", "ENFILE"])
 def test_an_fd_starvation_episode_spans_streaks_with_accepts_between(
-        monkeypatch, name):
+        monkeypatch):
     """The reporter's shape: streaks 34-61 s apart, an accept succeeding in
     between. Each streak ends, but the EPISODE does not: `_fd_starved_since`
     is the first error and `_fd_starved_last` the latest, so the watchdog can
     read how long the daemon has been starved without opening a file."""
     import errno
 
-    full = OSError(getattr(errno, name), "Too many open files")
+    full = OSError(errno.EMFILE, "Too many open files")
     server = _run_accept_script(monkeypatch, [
         (0, full), (1, full), (34, None), (3, full), (61, None), (2, full),
         (1, full)])
@@ -4896,14 +4896,17 @@ def test_an_fd_starvation_episode_closes_after_the_quiet_bound(monkeypatch):
     assert server._fd_starved_since == server._fd_starved_last == 1000.0 + quiet
 
 
-def test_an_accept_error_that_is_not_fd_exhaustion_is_not_starvation(
+def test_an_accept_error_that_is_not_this_process_fd_exhaustion_is_not_starvation(
         monkeypatch):
-    """THE CONTROL: only EMFILE and ENFILE date an episode."""
+    """THE CONTROL: only EMFILE dates an episode. ENFILE is system-wide, so a
+    successor inherits it and replacing for it would churn every few minutes
+    with a drain each time."""
     import errno
 
     server = _run_accept_script(monkeypatch, [
         (0, OSError(errno.ECONNABORTED, "aborted")),
-        (1, OSError(errno.ENOBUFS, "no buffers")), (1, None), (1, None)])
+        (1, OSError(errno.ENOBUFS, "no buffers")),
+        (1, OSError(errno.ENFILE, "file table overflow")), (1, None), (1, None)])
     assert not hasattr(server, "_fd_starved_last") and not hasattr(
         server, "_fd_starved_since")
 
@@ -31462,16 +31465,43 @@ class TestAnFdStarvedDaemonRepairsItself:
     _Srv = TestABlindDaemonRepairsItself._Srv
 
     def _drive(self, monkeypatch, tmp_path, *, lasted, ago, held=True,
-               can_ask=True, stopped=False):
+               can_ask=True, stopped=False, unreadable_reads=0,
+               read_errno=errno.EMFILE):
         """Run the watchdog under a server whose episode LASTED `lasted`
         seconds and whose last EMFILE was `ago` seconds ago. `can_ask` False is
         a holder that never claimed the replace signal; `stopped` a server
-        already draining. Returns (signalled, exited, said)."""
+        already draining. The first `unreadable_reads` reads of the code tree
+        fail with `read_errno`, and while they do a new descriptor is refused
+        too when that errno is EMFILE or ENFILE (`self.reads` counts the reads, and
+        `self.reads_at_ask` the count when the replace ask went out).
+        Returns (signalled, exited, said)."""
         from cswap_pin import proxy as pin_proxy
 
         signalled, exited, said = [], [], []
+        own = pin_proxy.daemon_fingerprint()
+        self.reads = self.reads_at_ask = 0
+        own_tree = Path(pin_proxy.__file__).parent
+        real_digest, real_open = pin_proxy._tree_digest_input, os.open
+
+        def _digest(root):
+            if root == own_tree:
+                self.reads += 1
+                if self.reads <= unreadable_reads:
+                    raise OSError(read_errno, "unreadable")
+            return real_digest(root)
+
+        def _open(path, *a, **k):
+            if (path == os.devnull and 0 < self.reads <= unreadable_reads
+                    and read_errno in (errno.EMFILE, errno.ENFILE)):
+                raise OSError(read_errno, "Too many open files")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr(pin_proxy, "_tree_digest_input", _digest)
+        monkeypatch.setattr(os, "open", _open)
 
         def _kill_and_publish(pid, sig):
+            if not signalled:
+                self.reads_at_ask = self.reads
             signalled.append((pid, sig))
             pin_proxy.write_daemon_state(
                 tmp_path, 36301, os.getpid() + 1, pin_proxy.daemon_fingerprint())
@@ -31500,7 +31530,7 @@ class TestAnFdStarvedDaemonRepairsItself:
                 srv, "1", "a@b.c", tmp_path, _Ticks(), lambda *a: None,
                 interval=0.01,
                 # CURRENT, and the mint works: starvation is the only reason.
-                _own_fingerprint=pin_proxy.daemon_fingerprint())
+                _own_fingerprint=own)
         except SystemExit:
             pass
         return signalled, exited, said
@@ -31519,6 +31549,8 @@ class TestAnFdStarvedDaemonRepairsItself:
             "the holder spawn a SECOND daemon")
         assert any("fd-starved" in line for line in said), (
             f"the reason was not named in the log: {said}")
+        assert not any("code on disk changed" in line for line in said), (
+            f"the held-ask line named the wrong reason: {said}")
 
     def test_an_episode_still_shorter_than_the_bound_is_left_alone(
             self, monkeypatch, tmp_path):
@@ -31569,8 +31601,9 @@ class TestAnFdStarvedDaemonRepairsItself:
         assert not any("fd-starved" in line for line in said), said
 
     def test_an_unheld_daemon_is_left_alone(self, monkeypatch, tmp_path):
-        """THE CONTROL: unheld behaviour is unchanged. Nothing above this
-        daemon can put a successor on its socket."""
+        """THE CONTROL: unheld behaviour is unchanged. The unheld hand-down
+        needs `_spawn_daemon`, which needs descriptors the starved process
+        lacks, so asking for it would fail at the moment it is wanted."""
         from cswap_pin import proxy as pin_proxy
 
         beat = pin_proxy._CODE_WATCH_BEAT_MAX_AGE_S
@@ -31579,6 +31612,39 @@ class TestAnFdStarvedDaemonRepairsItself:
         assert signalled == [] and exited == []
         assert not any("fd-starved" in line for line in said), (
             f"an unheld daemon claimed a replacement it cannot ask for: {said}")
+
+    @pytest.mark.parametrize("code", [errno.EMFILE, errno.ENFILE])
+    def test_one_unreadable_fingerprint_read_is_read_again(
+            self, monkeypatch, tmp_path, code):
+        """`daemon_fingerprint` turns an OSError into an empty code string by
+        design, so a read that hit a full descriptor table looked like "the
+        code changed" and recycled a healthy daemon."""
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=0, ago=10 ** 6,
+            unreadable_reads=1, read_errno=code)
+        assert self.reads >= 2, "the unreadable read was taken at its word"
+        assert signalled == [] and exited == [], (
+            f"a transient {errno.errorcode[code]} recycled the daemon: {said}")
+
+    def test_two_unreadable_fingerprint_reads_still_recycle(
+            self, monkeypatch, tmp_path):
+        """Unreadable is not unchanged (93aa63a, ad360ef): a daemon that cannot
+        read its own tree twice running is still recycled, the only recovery an
+        unheld wedged daemon has."""
+        signalled, exited, said = self._drive(
+            monkeypatch, tmp_path, lasted=0, ago=10 ** 6, unreadable_reads=2)
+        assert self.reads_at_ask == 2 and exited == [0], (
+            f"reads={self.reads_at_ask}, exited={exited}, said={said}")
+        assert any("code on disk changed" in line for line in said), said
+
+    def test_an_unreadable_read_that_is_not_fd_exhaustion_is_not_repeated(
+            self, monkeypatch, tmp_path):
+        """THE CONTROL, or the repeat could be unconditional: the same failure
+        with an EACCES recycles on the first read."""
+        signalled, exited, _ = self._drive(
+            monkeypatch, tmp_path, lasted=0, ago=10 ** 6,
+            unreadable_reads=1, read_errno=errno.EACCES)
+        assert self.reads_at_ask == 1 and exited == [0]
 
 
 class TestTheUnpinnableMarkComesBackOff:

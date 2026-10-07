@@ -13425,12 +13425,15 @@ _CODE_WATCH_INTERVAL_S = 30.0
 # missed beat, must not read as a dead thread.
 _CODE_WATCH_BEAT_MAX_AGE_S = 3 * _CODE_WATCH_INTERVAL_S
 # AN FD-STARVED DAEMON IS REPLACED (`_watch_own_code`), WHAT `_accept_loop` DATES
-# AS AN EPISODE: EMFILE or ENFILE errors separated by less than
-# `_FD_STARVED_QUIET_S`, open for `_FD_STARVED_REPLACE_S`. An episode and not K
-# consecutive ticks, because the shape measured is streaks 34-61 s apart with
-# accepts succeeding between them (1,012 streaks over 9.5 h): every `/health`
-# probe was answered, so neither the holder's port watch nor a launch's reuse
-# ever replaced that daemon, and a per-tick counter would reset in every gap.
+# AS AN EPISODE: EMFILE errors separated by less than `_FD_STARVED_QUIET_S`,
+# open for `_FD_STARVED_REPLACE_S`. EMFILE only: ENFILE is system-wide, so a
+# successor inherits it and replacing for it would churn every ~90-120 s, each
+# with a drain. An episode and not K consecutive ticks, because the log shows
+# 1,012 streaks over 9.5 h, 34-61 s apart, and a per-tick counter would reset
+# in every gap. What is INFERRED, not measured: that accepts succeeded between
+# the streaks, and that every `/health` probe was answered (so neither the
+# holder's port watch nor a launch's reuse replaced that daemon); a
+# `_pin_daemon_pids` that misses the pid is not ruled out.
 _FD_STARVED_REPLACE_S = _CODE_WATCH_BEAT_MAX_AGE_S
 _FD_STARVED_QUIET_S = 2 * _CODE_WATCH_BEAT_MAX_AGE_S
 # HOW LONG THE HOLDER'S PORT WATCH WAITS FOR A `/health` ANSWER (`PortHolder.
@@ -13552,6 +13555,28 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
     server.release_listener()
     server.await_inflight(_HANDOVER_DRAIN_SECONDS)
     os._exit(0)
+
+
+def _code_is_current(own: str) -> bool:
+    """Whether the code on disk still fingerprints as ``own``.
+
+    ONE MORE READ WHEN THIS PROCESS CANNOT OPEN A FILE. `daemon_fingerprint`
+    turns an OSError into an empty code string by design (UNREADABLE IS NOT
+    UNCHANGED, 93aa63a and ad360ef), so a read that hit EMFILE or ENFILE
+    reads as "the code changed" and recycles a healthy daemon. The cause is
+    not recorded where this can read it, so a mismatch is followed by a
+    descriptor probe, and only a refused one earns the second read. A second
+    unreadable result still reads as changed: that is the only recovery an
+    unheld wedged daemon has.
+    """
+    if daemon_fingerprint() == own:
+        return True
+    try:
+        os.close(os.open(os.devnull, os.O_RDONLY))
+    except OSError as exc:
+        return (exc.errno in (errno.EMFILE, errno.ENFILE)
+                and daemon_fingerprint() == own)
+    return False
 
 
 @_beat_ends_with_the_watchdog
@@ -13780,7 +13805,7 @@ def _watch_own_code(
                 and _fd_last - server._fd_starved_since >= _FD_STARVED_REPLACE_S
                 and not getattr(server, "_stop", False)
                 and held_by_a_holder() and _holder_pid() is not None)
-            if (not starved and daemon_fingerprint() == own and not orphaned
+            if (not starved and _code_is_current(own) and not orphaned
                     and not replace_for_blind):
                 # OUR CODE IS CURRENT; THE HOLDER'S NEED NOT BE. This branch is
                 # where a machine sat after every deploy: the daemon re-execs
@@ -13809,6 +13834,11 @@ def _watch_own_code(
                     "ship — asked it to stand down so a current one replaces it"
                 )
                 continue
+            # THE REASON THE HELD ASK LINES BELOW NAME, so a starved or blind
+            # replacement is not recorded as "code on disk changed".
+            why = ("accept loop fd-starved" if starved
+                   else "cannot mint the pinned token" if replace_for_blind
+                   else "code on disk changed")
             if replace_for_blind:
                 note_blind_recycle(certdir, now)
                 _log_lifecycle(
@@ -13888,8 +13918,7 @@ def _watch_own_code(
                     # only if it is longer; no daemon at all is worse
                     # than either.
                     _log_lifecycle(
-                        "code on disk changed — exiting for the holder "
-                        "to replace"
+                        f"{why} — exiting for the holder to replace"
                     )
                     server.release_listener()
                     server.await_inflight(_HELD_DRAIN_SECONDS)
@@ -13963,8 +13992,8 @@ def _watch_own_code(
                     server.await_inflight(_HELD_DRAIN_SECONDS)
                     os._exit(_RESTART_ME_CODE)
                 _log_lifecycle(
-                    "code on disk changed — asked the holder to replace "
-                    "us while we keep serving"
+                    f"{why} — asked the holder to replace us while we keep "
+                    "serving"
                 )
                 server.release_listener()
                 # THE SUCCESSOR IS ALREADY SERVING, so this wait is free —
@@ -15769,7 +15798,7 @@ class PinProxy:
         self._bridge_sweeping = False
         self._last_bridge_sweep: float | None = None
         # The fd-starvation episode `_accept_loop` dates and `_watch_own_code`
-        # reads (monotonic seconds), None until the first EMFILE or ENFILE.
+        # reads (monotonic seconds), None until the first EMFILE.
         self._fd_starved_since: float | None = None
         self._fd_starved_last: float | None = None
         self._sweep_lock = threading.Lock()
@@ -18297,7 +18326,7 @@ class PinProxy:
                     # next accepted client, which is what made a starved
                     # daemon look healthy to everything that probes it. This
                     # is read by `_watch_own_code`, which opens no file.
-                    if exc.errno in (errno.EMFILE, errno.ENFILE):
+                    if exc.errno == errno.EMFILE:
                         now = time.monotonic()
                         last = getattr(self, "_fd_starved_last", None)
                         if last is None or now - last > _FD_STARVED_QUIET_S:
