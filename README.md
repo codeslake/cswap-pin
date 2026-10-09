@@ -978,6 +978,17 @@ Connections are multiplexed on one selector instead. Measured with
 A ceiling was tried first and removed: it turns the 257th retry into a
 refused connection and leaves the coupling in place.
 
+One ceiling is back, for a different resource. A fan-out of tunnels to hosts
+that are not Anthropic's (an agent's 48 parallel bulk transfers, measured at
+~500 tunnels) used every fd the egress hop had, and Claude's own `/v1/messages`
+CONNECTs through the same hop got `502`. So at most 256 blind tunnels to other
+hosts are open at once; the 257th waits 2 s for a slot, then gets the same
+`503` with `Retry-After: 2` as a dead hop, and nothing else is counted:
+`anthropic.com`, `claude.ai`, `claude.com` and `claudeusercontent.com` (and
+their subdomains) are never capped. It bounds the hop's fds, not threads, so
+the coupling above stays gone. `thread_probe.py` tunnels to `127.0.0.1`, so its
+300 row now tops out at 256.
+
 ### Asking for a specific port
 
 ```bash

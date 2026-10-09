@@ -15327,6 +15327,12 @@ def wire_env(
 UPSTREAM_HOST = "api.anthropic.com"
 UPSTREAM_PORT = 443
 
+# ~500 parallel bulk tunnels to other hosts took every fd the hop had and
+# /v1/messages got 502; 256 at 2 fds each leaves a 1024-nofile hop room for the API.
+_BLIND_TUNNEL_CAP = 256
+_UNCAPPED_DOMAINS = ("anthropic.com", "claude.ai", "claude.com",
+                     "claudeusercontent.com")
+
 
 def _config_home_for_policy() -> Path:
     """Where Claude Code keeps `policy-limits.json`. A seam, so a test can
@@ -15804,6 +15810,7 @@ class PinProxy:
         # its own thread, so a thread-local keeps one upstream per client.
         self._local = threading.local()
         self._conn_seq = itertools.count(1)
+        self._tunnel_slots = threading.BoundedSemaphore(_BLIND_TUNNEL_CAP)
         # Clients connected right now, in `_open_conns` — the daemon's own
         # record, because the /proc-based probe is Linux-only and its None
         # reads as "idle" on the machines that cannot answer (see
@@ -19519,7 +19526,7 @@ class PinProxy:
                 # auto-updater.
                 host = target.rsplit(":", 1)[0]
                 if host != UPSTREAM_HOST:
-                    return self._blind_tunnel(target, conn)
+                    return self._capped_tunnel(target, conn)
                 return self._mitm(conn)
             if len(parts) >= 2 and parts[1].startswith("/health"):
                 # Local health probe (origin-form GET /health to our own port).
@@ -21732,7 +21739,47 @@ class PinProxy:
             self._debug = _append_capped(
                 debug_path, text, self._debug, cap=_TRACE_MAX_BYTES)
 
-    def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
+    def _capped_tunnel(self, target: str, conn: socket.socket) -> None:
+        host = target.rpartition(":")[0].lower().rstrip(".")
+        if any(host == d or host.endswith("." + d) for d in _UNCAPPED_DOMAINS):
+            return self._blind_tunnel(target, conn, lambda: None)
+        if not self._tunnel_slots.acquire(timeout=2):
+            now = time.monotonic()
+            last = getattr(self, "_tunnel_capped_at", None)
+            if last is None or now - last >= _BUSY_REPORT_COOLDOWN_S:
+                self._tunnel_capped_at = now
+                _log_lifecycle(
+                    f"CONNECT {target} refused (503): {_BLIND_TUNNEL_CAP} "
+                    "tunnels to other hosts are open, the rest of the hop is "
+                    "kept for the API")
+            self._refuse_tunnel(conn)
+            return
+        slot = [self._tunnel_slots]  # popped by whoever gives it back: once
+
+        def give() -> None:
+            with contextlib.suppress(IndexError):
+                slot.pop().release()
+
+        detached = False
+        try:
+            detached = self._blind_tunnel(target, conn, give)
+            return detached
+        finally:
+            if not detached:
+                give()
+
+    @staticmethod
+    def _refuse_tunnel(conn: socket.socket) -> None:
+        try:
+            conn.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
+                b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        except OSError:
+            pass
+        conn.close()
+
+    def _blind_tunnel(self, target: str, conn: socket.socket, give) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
         # Trace the tunnel too. Remote Control receives over a WebSocket to the
@@ -21822,14 +21869,7 @@ class PinProxy:
             # at the CONNECT path Remote Control's WebSocket takes.
             if candidates and not _direct_allowed():
                 self._note_egress_refused()
-                try:
-                    conn.sendall(
-                        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n"
-                        b"Content-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
-                except OSError:
-                    pass
-                conn.close()
+                self._refuse_tunnel(conn)
                 return
             try:
                 up = socket.create_connection((host, port), timeout=15)
@@ -21860,6 +21900,7 @@ class PinProxy:
         def _release_tunnel():
             if release:
                 release()
+            give()
 
         # DETACHED: nothing after the 200 is ours to parse, so the thread that
         # built the tunnel has no work left. It hands the pair to the shared

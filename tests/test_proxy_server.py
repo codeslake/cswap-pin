@@ -2287,11 +2287,17 @@ class _StallingHop:
     else a canned 200. ``reached`` is set when the request head arrived;
     ``cut`` when the pin's side of that leg ended (EOF or reset), which is how
     a case sees the hop leg closed. ``reply`` (with ``delay=None``) is sent
-    first and then nothing: a reply head and part of a body, then silence."""
+    first and then nothing: a reply head and part of a body, then silence.
+    ``max_conns`` makes it a hop out of fds: past that many live connections a
+    request is answered 502. ``hold_rest``: a CONNECT for anything but
+    ``target`` is answered 200 and then held silent."""
 
     def __init__(self, delay: "float | None" = None, target=None,
-                 reply: bytes = b""):
+                 reply: bytes = b"", max_conns: "int | None" = None,
+                 hold_rest: bool = False):
         self._delay, self._target, self._reply = delay, target, reply
+        self._budget = max_conns and threading.BoundedSemaphore(max_conns)
+        self._hold_rest = hold_rest
         self.reached, self.cut = threading.Event(), threading.Event()
         self._conns: list = []
         self._srv = socket.socket()
@@ -2315,6 +2321,7 @@ class _StallingHop:
     def _serve(self, conn):
         import select
 
+        counted = False
         try:
             head = b""
             while b"\r\n\r\n" not in head:
@@ -2323,10 +2330,18 @@ class _StallingHop:
                     return
                 head += chunk
             self.reached.set()
+            if self._budget:
+                counted = self._budget.acquire(blocking=False)
+                if not counted:
+                    conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n"
+                                 b"Content-Length: 0\r\n\r\n")
+                    return
             connect = head.startswith(b"CONNECT")
             if connect:
                 conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            if self._delay is None:
+            held = self._hold_rest and (
+                f"{self._target[0]}:{self._target[1]}".encode() not in head)
+            if self._delay is None or held:
                 if self._reply:
                     conn.sendall(self._reply)
                 while conn.recv(65536):
@@ -2350,6 +2365,8 @@ class _StallingHop:
         except OSError:
             pass
         finally:
+            if counted:
+                self._budget.release()
             self.cut.set()
 
     def stop(self):
@@ -2743,6 +2760,160 @@ class TestAClientThatHangsUpOnASilentHop:
             inflight_requests=lambda: 0,
             live_client_count=lambda: int(time.monotonic() < release_at))
         self._assert_let_go(late, lambda: True)
+
+
+class TestTunnelsToOtherHostsCannotTakeTheWholeHop:
+    """T2031. A tunnel fan-out to hosts that are not Anthropic's (one agent's
+    parallel bulk transfers, measured at ~500 tunnels) used every fd the hop
+    had, and Claude's own /v1/messages CONNECTs through the same hop got 502.
+    The pin caps what the other hosts may hold; Anthropic's domains are never
+    counted. The hop here is out of fds past 5 live connections, the cap is 3."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _pin(certdir, monkeypatch, hop, upstream_port=9, cap=3):
+        from cswap_pin import proxy as pin_proxy
+        from cswap_pin.proxy import PinProxy
+
+        monkeypatch.setattr(pin_proxy, "_BLIND_TUNNEL_CAP", cap)
+        monkeypatch.setattr(pin_proxy, "_CHAIN_HEAL_GRACE_S", 0.2)
+        monkeypatch.setattr(pin_proxy, "_CHAIN_HEAL_POLL_S", 0.05)
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                         upstream=("127.0.0.1", upstream_port),
+                         chain_proxy=("127.0.0.1", hop.port))
+        assert proxy._chain_candidates(), "premise: this host has a chain"
+        proxy.start()
+        return proxy, proxy._tunnel_slots
+
+    @staticmethod
+    def _open(proxy, hosts):
+        """CONNECT to every host through the pin at once. The open sockets and
+        the status code each got, in order."""
+        socks = []
+        for host in hosts:
+            s = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+            s.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n"
+                      .encode())
+            socks.append(s)
+        codes = []
+        for s in socks:
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                head += chunk
+            codes.append(head.split(b"\r\n")[0].decode().split(" ")[1])
+        return socks, codes
+
+    def case_a_flood_to_other_hosts_leaves_the_hop_room_for_the_api(
+            self, certdir, monkeypatch):
+        upstream = _FakeUpstream(certdir)
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", upstream.port),
+                           max_conns=5, hold_rest=True)
+        proxy, _ = self._pin(certdir, monkeypatch, hop, upstream.port)
+        socks = []
+        try:
+            socks, codes = self._open(
+                proxy, [f"bulk{i}.example.test" for i in range(8)])
+            api = _request_through_proxy(
+                proxy.port, certdir / "ca.pem", "/v1/messages", bearer="t")
+            assert api == 200, (
+                f"the hop's fds went to the other hosts' tunnels, so the API "
+                f"request got {api}; the tunnels answered {codes}")
+            assert sorted(codes) == ["200"] * 3 + ["503"] * 5, (
+                f"3 tunnels fit the cap and 5 are refused with a 503: {codes}")
+        finally:
+            for s in socks:
+                s.close()
+            hop.stop()
+            proxy.stop()
+            upstream.stop()
+
+    def case_anthropic_domains_are_never_capped(self, certdir, monkeypatch):
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9), hold_rest=True)
+        proxy, _ = self._pin(certdir, monkeypatch, hop)
+        socks = []
+        try:
+            socks, codes = self._open(
+                proxy, [f"bulk{i}.example.test" for i in range(3)])
+            assert codes == ["200"] * 3, f"premise: the cap is full: {codes}"
+            more, codes = self._open(proxy, [
+                "bridge.claudeusercontent.com", "downloads.claude.ai",
+                "claude.com", "Statsig.Anthropic.COM",
+                # Lookalikes: a suffix match must stop at the dot.
+                "notclaude.ai", "evilanthropic.com"])
+            socks += more
+            assert codes == ["200"] * 4 + ["503"] * 2, codes
+        finally:
+            for s in socks:
+                s.close()
+            hop.stop()
+            proxy.stop()
+
+    def case_slots_come_back_when_tunnels_end_or_are_refused(
+            self, certdir, monkeypatch):
+        # A hop that fits ONE tunnel: the other two are refused by the hop,
+        # which is an exit that never reaches the pump.
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9), max_conns=1,
+                           hold_rest=True)
+        proxy, slots = self._pin(certdir, monkeypatch, hop)
+        socks = []
+        try:
+            socks, codes = self._open(
+                proxy, [f"bulk{i}.example.test" for i in range(3)])
+            assert sorted(codes) == ["200", "503", "503"], codes
+            for s in socks:
+                s.close()
+
+            def free():
+                n = 0
+                while slots.acquire(blocking=False):
+                    n += 1
+                for _ in range(n):
+                    slots.release()
+                return n
+
+            deadline = time.monotonic() + 5
+            while free() < 3 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert free() == 3, "a slot never came back"
+        finally:
+            hop.stop()
+            proxy.stop()
+
+    def case_a_slot_is_given_back_exactly_once(self, certdir, monkeypatch):
+        """BoundedSemaphore raises only past its initial value, so a second
+        give while another tunnel still holds a slot would silently grow the
+        cap. The pump closes a pair once, but nothing here relies on that."""
+        from cswap_pin import proxy as pin_proxy
+
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9))
+        proxy, slots = self._pin(certdir, monkeypatch, hop, cap=2)
+        closed = threading.Event()
+
+        def closes_twice(a, b, on_close=None, kind="bridge"):
+            on_close()
+            on_close()
+            closed.set()
+
+        monkeypatch.setattr(pin_proxy, "_pump_detached", closes_twice)
+        assert slots.acquire(blocking=False), "premise: another tunnel's slot"
+        socks = []
+        try:
+            socks, codes = self._open(proxy, ["bulk.example.test"])
+            assert codes == ["200"] and closed.wait(5), codes
+            assert slots.acquire(blocking=False), "the slot was not given back"
+            assert not slots.acquire(blocking=False), (
+                "a second give grew the cap past the other tunnel's slot")
+        finally:
+            for s in socks:
+                s.close()
+            hop.stop()
+            proxy.stop()
 
 
 class TestPinTimeHopTrust:
@@ -14677,7 +14848,7 @@ class TestDrainReportsWhatItCut:
 
             proxy._local.conn = conn
             proxy._local.release = lambda: None
-            proxy._blind_tunnel(target, conn)
+            proxy._capped_tunnel(target, conn)
             accepted.append(srv.accept()[0])
 
             assert proxy.inflight_requests() == 0, (
