@@ -12128,6 +12128,9 @@ class PortHolder:
                     f"— staying up on the current daemon"
                 )
                 return
+            # ONLY THE DAEMON'S OWN ASK IS WAITING ON A RECORD. `_wait_for_exit`'s
+            # wedge repair (no signal) replaces a daemon that asked nothing and
+            # terminates it next, and the supervisor takes the successor from there.
             if signum is not None and self._proc is not before:
                 threading.Thread(
                     target=self._respawn_until_published,

@@ -34971,7 +34971,7 @@ else:
 
     def case_a_successor_that_dies_once_is_respawned_and_the_reply_completes(
             self, monkeypatch):
-        with self._held_reply_across_a_window(monkeypatch, 0.5) as (t, rest):
+        with self._held_reply_across_a_window(monkeypatch, 1.0) as (t, rest):
             self._a_successor_serves_and_the_reply_completed(t, rest)
 
     def case_a_window_of_several_seconds_takes_several_respawns(
