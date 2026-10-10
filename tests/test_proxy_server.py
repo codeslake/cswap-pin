@@ -2895,7 +2895,7 @@ class TestTunnelsToOtherHostsCannotTakeTheWholeHop:
         proxy, slots = self._pin(certdir, monkeypatch, hop, cap=2)
         closed = threading.Event()
 
-        def closes_twice(a, b, on_close=None, kind="bridge"):
+        def closes_twice(a, b, on_close=None, kind="bridge", loop=None):
             on_close()
             on_close()
             closed.set()
@@ -22870,3 +22870,241 @@ class TestTheVerifyingContextTrustsTheHop:
 
         monkeypatch.setattr(ssl, "create_default_context", strict_like_3_13)
         assert not proxy._verifying_context().verify_flags & ssl.VERIFY_X509_STRICT
+
+
+class TestPumpBackpressure:
+    """One tunnel's backlog is bounded, and a backed-up tunnel stalls no other.
+
+    MEASURED (an `aws s3 sync` through a blind CONNECT tunnel, sent faster than
+    the hop leg drained): `_PumpLoop` kept reading the source while its peer
+    was backed up, rebuilding the backlog as one bytes object on every read and
+    every partial send. Two tunnels reached 4.15 MB of backlog each, the one
+    pump thread ran 99.5% of a core (86% kernel), and holding the GIL it
+    delayed every other thread ~2.4 s: /health took 1-11 s and Remote Control
+    bridges lost their heartbeats and gave up.
+
+    Every tunnel here is a socketpair into a `_PumpLoop` of its own, with a
+    4 KiB send buffer on the slow side so the peer "stops draining" at once.
+    """
+
+    CEILING = 2 * 1024 * 1024        # the pump's cap is ~1 MiB, plus one read
+    PAYLOAD = (bytes(range(251)) * (8 * 1024 * 1024 // 251 + 1))[:8 * 1024 * 1024]
+
+    @staticmethod
+    def _tunnel(loop):
+        """feed -> [pump: src -> dst] -> far, `far` never reading by itself."""
+        feed, src = socket.socketpair()
+        dst, far = socket.socketpair()
+        for s in (dst, far):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        loop.add(src, dst)
+        return feed, src, dst, far
+
+    @staticmethod
+    def _backlog(loop, dst) -> int:
+        with loop._lock:
+            return len(loop._pending.get(dst, b""))
+
+    def _blast(self, feed, data=None):
+        """Send `data` as fast as the pump takes it; `done` is set when ALL of
+        it has been accepted, which a held-back source never reaches."""
+        done = threading.Event()
+
+        def run():
+            try:
+                feed.sendall(self.PAYLOAD if data is None else data)
+            except OSError:
+                return
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        return done
+
+    def _settle(self, loop, dst, done) -> int:
+        """Peak backlog once it stops growing, or once the feeder finished."""
+        peak = last = -1
+        steady, deadline = time.monotonic(), time.monotonic() + 10
+        while not done.is_set() and time.monotonic() < deadline:
+            n = self._backlog(loop, dst)
+            peak = max(peak, n)
+            if n != last:
+                last, steady = n, time.monotonic()
+            elif n and time.monotonic() - steady > 0.3:
+                break
+            time.sleep(0.01)
+        return max(peak, self._backlog(loop, dst))
+
+    @staticmethod
+    def _close(loop, *socks):
+        loop.release_pairs()
+        for s in socks:
+            s.close()
+
+    def test_a_backed_up_tunnel_keeps_its_backlog_bounded_and_the_rest_fast(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        feed2, in2 = socket.socketpair()
+        out2, sink2 = socket.socketpair()
+        loop.add(in2, out2)
+        done = self._blast(feed)
+        try:
+            peak = self._settle(loop, dst, done)
+            started = time.monotonic()
+            feed2.sendall(b"ping")
+            sink2.settimeout(5)
+            got = sink2.recv(16)
+            round_trip = time.monotonic() - started
+            assert peak <= self.CEILING, (
+                f"{peak} bytes sit in the pump for one backed-up tunnel "
+                f"(ceiling {self.CEILING}): it kept reading its source")
+            assert not done.is_set(), "the source was never held back"
+            assert got == b"ping"
+            assert round_trip < 0.5, (
+                f"a light tunnel's round trip took {round_trip:.2f}s while "
+                f"another was backed up")
+        finally:
+            self._close(loop, feed, far, feed2, sink2, in2, out2)
+
+    def test_a_held_back_source_resumes_and_every_byte_arrives_in_order(self):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        done = self._blast(feed)
+        try:
+            self._settle(loop, dst, done)
+            assert not done.is_set(), "precondition: the source was held back"
+            got = bytearray()
+            far.settimeout(10)
+            while len(got) < len(self.PAYLOAD):
+                chunk = far.recv(65536)
+                assert chunk, f"the tunnel ended after {len(got)} bytes"
+                got += chunk
+            assert got == self.PAYLOAD
+            assert done.wait(5), "the source never finished: reading never resumed"
+        finally:
+            self._close(loop, feed, far)
+
+    @pytest.mark.parametrize("how", ["source_eof", "released_while_held_back"])
+    def test_a_closed_pair_leaves_no_pending_entry(self, how):
+        from cswap_pin.proxy import _PumpLoop
+
+        loop = _PumpLoop()
+        feed, src, dst, far = self._tunnel(loop)
+        # Held back needs more than the cap; plain EOF needs a backlog, not a pause.
+        data = None if how == "released_while_held_back" else self.PAYLOAD[:256 * 1024]
+        done = self._blast(feed, data)
+        try:
+            peak = self._settle(loop, dst, done)
+            assert peak > 0, "precondition: the peer is not draining"
+            if how == "source_eof":
+                feed.close()
+            else:
+                assert loop.release_pairs() == 1
+            deadline = time.monotonic() + 5
+            while loop.live_pairs() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert loop.live_pairs() == 0, "precondition: the pair ended"
+            assert not loop._pending, (
+                f"a closed pair left {len(loop._pending)} entr(y/ies) in "
+                f"`_pending`: {[len(v) for v in loop._pending.values()]} bytes")
+        finally:
+            self._close(loop, feed, far)
+
+
+class TestBulkTunnelsHaveTheirOwnPump:
+    """A CONNECT to a host the pin does not serve runs on its own selector.
+
+    MEASURED: one `aws s3 sync` to a non-Anthropic host (every command Claude
+    Code runs inherits HTTPS_PROXY, so aws, curl, pip and git all reach the pin
+    as blind CONNECTs) shared one pump thread with the Remote Control bridges
+    and deafened 12 of 17. The served hosts are the ones `_capped_tunnel`
+    already exempts from the cap. Draining and handover still count both loops:
+    `_PUMP` answers for the bulk one.
+    """
+
+    @staticmethod
+    def _loop_for(certdir, monkeypatch, host):
+        """The `_PumpLoop` a blind CONNECT to `host` is handed to."""
+        import cswap_pin.proxy as pp
+
+        seen = []
+        real_add = pp._PumpLoop.add
+
+        def spy(self, *a, **k):
+            seen.append(self)
+            return real_add(self, *a, **k)
+
+        monkeypatch.setattr(pp._PumpLoop, "add", spy)
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9), hold_rest=True)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", 9),
+                            chain_proxy=("127.0.0.1", hop.port))
+        proxy.start()
+        pp._PUMP.reset_for_tests()
+        raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        try:
+            raw.settimeout(10)
+            raw.sendall(f"CONNECT {host}:443 HTTP/1.1\r\n"
+                        f"Host: {host}:443\r\n\r\n".encode())
+            assert b" 200 " in raw.recv(4096), "the tunnel was not set up"
+            deadline = time.monotonic() + 5
+            while not seen and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert seen, "the pair never reached a pump"
+            return seen[0]
+        finally:
+            raw.close()
+            pp._PUMP.release_pairs()
+            proxy.stop()
+            hop.stop()
+
+    def test_a_served_host_stays_on_the_bridges_pump(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        loop = self._loop_for(certdir, monkeypatch, "bridge.claudeusercontent.com")
+        assert loop is pp._PUMP
+
+    def test_a_host_the_pin_does_not_serve_gets_a_pump_of_its_own(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        loop = self._loop_for(certdir, monkeypatch, "bulk.example.test")
+        assert loop is not pp._PUMP, (
+            "a blind tunnel to a host the pin does not serve runs on the "
+            "selector thread that carries the Remote Control bridges")
+        assert loop is pp._BULK_PUMP
+
+    def test_the_process_counts_a_tunnel_on_the_bulk_pump(self):
+        """What the drain, the reaper's marker and the claim read is `_PUMP`.
+        A tunnel on the other loop must not fall out of any of the four."""
+        import cswap_pin.proxy as pp
+
+        pp._PUMP.reset_for_tests()
+        pairs = [socket.socketpair(), socket.socketpair()]
+        try:
+            pp._BULK_PUMP.add(*pairs[0])
+            assert pp._PUMP.live_pairs() == 1
+            assert pp._PUMP.live_pairs("tunnel") == 1
+            assert pp._PUMP.live_pairs("bridge") == 0
+            time.sleep(0.05)
+            assert pp._PUMP.quiet_for() >= 0.05, (
+                "the drain's silence clock never saw the bulk loop move")
+            assert pp._PUMP.release_pairs("bridge") == 0
+            assert pp._PUMP.release_pairs() == 1
+            assert pairs[0][0].fileno() == -1, "the release left the pair open"
+            assert pp._PUMP.live_pairs() == 0
+
+            pp._BULK_PUMP.add(*pairs[1])
+            pp._PUMP.reset_for_tests()
+            assert pp._PUMP.live_pairs() == 0 and pp._PUMP.quiet_for() == 0.0
+        finally:
+            pp._BULK_PUMP.reset_for_tests()
+            for pair in pairs:
+                for s in pair:
+                    s.close()

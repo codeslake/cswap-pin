@@ -21856,7 +21856,7 @@ class PinProxy:
 
         detached = False
         try:
-            detached = self._blind_tunnel(target, conn, give)
+            detached = self._blind_tunnel(target, conn, give, _BULK_PUMP)
             return detached
         finally:
             if not detached:
@@ -21873,7 +21873,8 @@ class PinProxy:
             pass
         conn.close()
 
-    def _blind_tunnel(self, target: str, conn: socket.socket, give) -> None:
+    def _blind_tunnel(self, target: str, conn: socket.socket, give,
+                      loop=None) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
         # Trace the tunnel too. Remote Control receives over a WebSocket to the
@@ -21999,7 +22000,7 @@ class PinProxy:
         # DETACHED: nothing after the 200 is ours to parse, so the thread that
         # built the tunnel has no work left. It hands the pair to the shared
         # selector along with its own teardown and returns.
-        _pump_detached(conn, up, _release_tunnel)
+        _pump_detached(conn, up, _release_tunnel, loop=loop)
         return True
 
 
@@ -24145,6 +24146,13 @@ def _drain_ready(src) -> bytes:
 #: `closed_by` of a pair `release_pairs` let go: neither of its sockets ended it.
 _RELEASED_BY_DRAIN = object()
 
+#: Bytes the pump holds for one peer that is not draining before it stops
+#: READING the other side. Soft: a read already in flight lands on top, so the
+#: backlog peaks one read (64 KiB) past it. Unbounded, a fast sender into a
+#: slow leg grew each tunnel to 4 MB and kept the one pump thread busy copying
+#: it, which starved every other tunnel's heartbeat.
+_PUMP_BACKLOG_CAP = 1 << 20
+
 
 class _PumpLoop:
     """ONE selector thread for EVERY tunnel, instead of one thread each.
@@ -24177,14 +24185,19 @@ class _PumpLoop:
     connection is not a thread", and that is this class.
     """
 
-    def __init__(self):
+    def __init__(self, siblings=()):
+        # Loops this one answers for (see `_BULK_PUMP`): the four process-wide
+        # reads below cover their tunnels, so no reader of `_PUMP` changes.
+        self._siblings = tuple(siblings)
         # When any tunnel last moved a byte. The drain reads it to tell a
         # tunnel carrying a session from one whose peer has wedged.
         self._last_move = 0.0
         self._kind: dict = {}
         self._sel = selectors.DefaultSelector()
         self._peer: dict = {}
-        # Bytes accepted from one side that the other has not taken yet.
+        # Bytes accepted from one side that the other has not taken yet, a
+        # bytearray per destination so a read or a partial send costs O(chunk),
+        # not O(backlog). Only the run thread mutates one; other threads pop.
         self._pending: dict = {}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -24219,6 +24232,7 @@ class _PumpLoop:
         """Seconds since any tunnel last moved a byte, 0.0 if none ever has."""
         with self._lock:
             last = self._last_move
+        last = max(last, *(o._last_move for o in self._siblings))
         return (time.monotonic() - last) if last else 0.0
 
     def reset_for_tests(self) -> None:
@@ -24234,6 +24248,8 @@ class _PumpLoop:
             self._peer.clear()
             self._pending.clear()
             self._last_move = 0.0
+        for o in self._siblings:
+            o.reset_for_tests()
 
     def live_pairs(self, kind: str | None = None) -> int:
         """How many tunnels this selector is driving, or how many of `kind`.
@@ -24243,10 +24259,10 @@ class _PumpLoop:
         exits while pumping one takes it down.
         """
         with self._lock:
-            if kind is None:
-                return len(self._peer) // 2
-            return sum(1 for s in self._peer
-                       if self._kind.get(s, "tunnel") == kind) // 2
+            own = (len(self._peer) if kind is None else
+                   sum(1 for s in self._peer
+                       if self._kind.get(s, "tunnel") == kind)) // 2
+        return own + sum(o.live_pairs(kind) for o in self._siblings)
 
     def release_pairs(self, kind: str | None = None) -> int:
         """Let the driven tunnels of `kind` go, and say how many.
@@ -24312,7 +24328,8 @@ class _PumpLoop:
                     seen.update((a, b))
                     self._close_pair(a, b, on_close,
                                      closed_by=_RELEASED_BY_DRAIN)
-        return len(socks) // 2
+        return len(socks) // 2 + sum(o.release_pairs(kind)
+                                     for o in self._siblings)
 
     def add(self, a, b, on_close=None, kind: str = "tunnel") -> None:
         """Take over a pair of sockets. Returns AT ONCE.
@@ -24348,15 +24365,41 @@ class _PumpLoop:
         except OSError:
             pass
 
-    def _flush(self, dst, on_close) -> None:
-        """Send what we can, keep the rest, and watch for writability.
+    def _arm(self, s) -> None:
+        """Register `s` for exactly the events it needs. CALLER HOLDS THE LOCK.
 
-        Registering EVENT_WRITE only while there is a backlog: a socket that
-        is always writable would otherwise wake the selector on every pass
-        and turn the loop into a spin.
+        Writable only while bytes wait for it (an always-writable socket would
+        wake the selector on every pass and spin the loop). Readable only while
+        its peer's backlog is under the cap: that is the backpressure. With
+        neither it is unregistered (a selector holds no empty event set).
+
+        shortcut: a held-back source's EOF goes unseen until its peer drains
+        under the cap, so a stalled peer pins the pair like an idle tunnel
+        until `release_pairs`; poll it with MSG_PEEK if that ever matters.
         """
+        peer = self._peer.get(s)
+        if peer is None:  # released or closed: never put it back
+            return
+        ev = 0
+        if len(self._pending.get(peer[0], ())) < _PUMP_BACKLOG_CAP:
+            ev |= selectors.EVENT_READ
+        if self._pending.get(s):
+            ev |= selectors.EVENT_WRITE
+        try:
+            if not ev:
+                self._sel.unregister(s)
+                return
+            try:
+                self._sel.modify(s, ev)
+            except KeyError:
+                self._sel.register(s, ev)
+        except (KeyError, ValueError, OSError):
+            pass
+
+    def _flush(self, dst, on_close) -> None:
+        """Send what we can, keep the rest, and watch for writability."""
         with self._lock:
-            buf = self._pending.get(dst, b"")
+            buf = self._pending.get(dst)
         while buf:
             try:
                 sent = dst.send(buf)
@@ -24369,22 +24412,16 @@ class _PumpLoop:
                     if peer is not None:
                         self._close_pair(dst, peer[0], peer[1])
                 return
-            buf = buf[sent:]
+            del buf[:sent]
         with self._lock:
-            if buf:
-                self._pending[dst] = buf
-                try:
-                    self._sel.modify(
-                        dst, selectors.EVENT_READ | selectors.EVENT_WRITE
-                    )
-                except (KeyError, ValueError, OSError):
-                    pass
-            else:
+            if not buf:
                 self._pending.pop(dst, None)
-                try:
-                    self._sel.modify(dst, selectors.EVENT_READ)
-                except (KeyError, ValueError, OSError):
-                    pass
+            # `dst` for its write interest, and its peer, which this backlog
+            # holds back or lets run again.
+            self._arm(dst)
+            peer = self._peer.get(dst)
+            if peer is not None:
+                self._arm(peer[0])
 
     def _close_pair(self, a, b, on_close, closed_by=None) -> None:
         # CALLER HOLDS THE LOCK. It mutates `_peer`, and the run loop now
@@ -24393,6 +24430,7 @@ class _PumpLoop:
         for s in (a, b):
             self._peer.pop(s, None)
             self._kind.pop(s, None)
+            self._pending.pop(s, None)
             try:
                 self._sel.unregister(s)
             except (KeyError, ValueError):
@@ -24472,11 +24510,17 @@ class _PumpLoop:
                     # this daemon's own bookkeeping, and a stamp there is a
                     # heartbeat the drain would read as traffic.
                     self._last_move = time.monotonic()
-                    self._pending[dst] = self._pending.get(dst, b"") + data
+                    self._pending.setdefault(dst, bytearray()).extend(data)
                 self._flush(dst, on_close)
 
 
-_PUMP = _PumpLoop()
+#: Tunnels to hosts the pin does not serve (`_capped_tunnel`'s population):
+#: every command Claude Code runs inherits HTTPS_PROXY, and on the bridges'
+#: selector one bulk `aws s3 sync` deafened 12 of 17 bridges.
+_BULK_PUMP = _PumpLoop()
+#: The bridges' selector (Anthropic's domains, the 101 path), and the
+#: process's: it answers for `_BULK_PUMP` too.
+_PUMP = _PumpLoop(siblings=(_BULK_PUMP,))
 
 
 def _pump(a: socket.socket, b: socket.socket) -> None:
@@ -24536,7 +24580,7 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
 
 
 def _pump_detached(a: socket.socket, b: socket.socket, on_close=None,
-                   kind: str = "bridge") -> None:
+                   kind: str = "bridge", loop=None) -> None:
     """Hand a tunnel to the shared selector and RETURN.
 
     This is where the thread is given back. A tunnel is opaque from the 200
@@ -24558,7 +24602,7 @@ def _pump_detached(a: socket.socket, b: socket.socket, on_close=None,
                 except Exception:  # noqa: BLE001
                     pass
         return
-    _PUMP.add(a, b, on_close, kind)
+    (loop or _PUMP).add(a, b, on_close, kind)
 
 
 if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess
