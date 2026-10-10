@@ -12132,9 +12132,19 @@ class PortHolder:
             # wedge repair (no signal) replaces a daemon that asked nothing and
             # terminates it next, and the supervisor takes the successor from there.
             if signum is not None and self._proc is not before:
-                threading.Thread(
-                    target=self._respawn_until_published,
-                    args=(self._proc, deadline), daemon=True).start()
+                # RuntimeError IS HOW `Thread.start` REPORTS EAGAIN / RLIMIT_NPROC,
+                # the exhaustion the `_spawn` guard above contains: escaping this
+                # SIGNAL HANDLER it ends the holder with no `stop()`. Unwatched is
+                # what the successor was before T2071, and the daemon's exit-75
+                # path follows.
+                try:
+                    threading.Thread(
+                        target=self._respawn_until_published,
+                        args=(self._proc, deadline), daemon=True).start()
+                except RuntimeError as exc:
+                    _log_lifecycle(
+                        f"could not start the successor watch: {exc!r} "
+                        f"— the successor goes unwatched")
 
     def _respawn_until_published(self, proc, deadline: float) -> None:
         """Watch the successor ``proc`` that `_on_replace_request` just spawned
@@ -12153,7 +12163,7 @@ class PortHolder:
         have. A clean exit is a decision (`_supervise_locked`) and ends the
         watch. A respawn is made under `_replace_lock`, and only while
         `self._proc` is still ``proc``: `stop()`, the supervisor (the daemon
-        left first) or a later ask wins. `self._failures` is not climbed: its
+        left first), a later ask or a hand-off of the socket wins. `self._failures` is not climbed: its
         cap would `degrade_now()` beside a daemon that still serves, and the
         ladder starts at the daemon's exit as it always did. `_backoff` paces
         the respawns (0.5 s, 1 s, 2 s, ...) and none starts that could not
@@ -12183,8 +12193,9 @@ class PortHolder:
                 f"publishing — spawning it again in {wait:.1f}s")
             time.sleep(wait)
             with self._replace_lock:
-                if (self._stop or self._proc is not proc
-                        or getattr(self, "_degraded", False)):
+                if (self._stop or self._proc is not proc or self._handed_off
+                        or getattr(self, "_degraded", False)
+                        or time.monotonic() >= deadline):
                     return
                 try:
                     self._spawn()

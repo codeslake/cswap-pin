@@ -34895,7 +34895,7 @@ else:
             .replace("@WAIT@", str(wait_s)).replace("@CAP@", str(self.CAP_S)))
         away = pkg.with_name("t2071_cswap_pin.gone")
         origin = self._Origin()
-        timer = None
+        timer = client = None
         try:
             pp.ensure_ca(certdir, "api.anthropic.com")
             pp.save_pin(base, self.EMAIL, "org-1")
@@ -34947,10 +34947,20 @@ else:
         finally:
             if timer is not None:
                 timer.cancel()
+            if client is not None:
+                client.close()
             origin.release.set()
             origin.srv.close()
             _reap_pin_processes(certdir)
             shutil.rmtree(base, ignore_errors=True)
+
+    def _one_daemon_is_left(self, t, pid):
+        from cswap_pin import proxy as pp
+
+        self._until(
+            f"exactly daemon {pid} is left for the certdir, not "
+            f"{pp._pin_daemon_pids(t.certdir)}",
+            lambda: pp._pin_daemon_pids(t.certdir) == [pid], 20)
 
     def _a_successor_serves_and_the_reply_completed(self, t, rest):
         log = t.log()
@@ -34968,8 +34978,9 @@ else:
         assert st and int(st["pid"]) != t.daemon, (
             "no successor is serving\n" + log)
         assert int(st["port"]) == t.port, "the port moved"
+        self._one_daemon_is_left(t, int(st["pid"]))
 
-    def case_a_successor_that_dies_once_is_respawned_and_the_reply_completes(
+    def case_a_successor_that_dies_in_a_short_window_is_respawned(
             self, monkeypatch):
         with self._held_reply_across_a_window(monkeypatch, 1.0) as (t, rest):
             self._a_successor_serves_and_the_reply_completed(t, rest)
@@ -35004,6 +35015,7 @@ else:
                 lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
                          else None)(t.serving()), 40)
             assert int(again["port"]) == t.port
+            self._one_daemon_is_left(t, int(again["pid"]))
 
     class _Child:
         """A successor as the watch sees it: dead with ``code``, or alive."""
@@ -35118,3 +35130,57 @@ else:
         assert h._supervise_locked(old, 0) == "continue"
         assert "already exited (1)" in lines[0] and "serving" not in lines[0]
         assert "successor already serving" in lines[1], "the control"
+
+    def case_a_respawn_that_waited_on_the_lock_past_the_deadline_does_not_start(
+            self, tmp_path):
+        """The docstring's promise: none starts after the daemon's wait. A
+        respawn that sat on `_replace_lock` (an ask, `stop()`) until the
+        deadline passed has nobody left to publish to."""
+        kids = [self._Child(10, 1), self._Child(11)]
+        h = self._holder(tmp_path, kids)
+        held = threading.Event()
+
+        def hold():
+            with h._replace_lock:
+                held.set()
+                time.sleep(0.6)
+
+        threading.Thread(target=hold, daemon=True).start()
+        assert held.wait(5)
+        h._respawn_until_published(kids[0], time.monotonic() + 0.3)
+        assert h.spawned == 0 and h._proc is kids[0]
+
+    def case_the_watch_leaves_a_socket_that_went_to_a_callers_lineage(
+            self, tmp_path):
+        """A later ask handed the socket to a caller outside this lineage
+        (`_handed_off`): a successor spawned here would be a denied-lineage
+        daemon on a socket that is another lineage's now."""
+        kids = [self._Child(10, 1), self._Child(11)]
+        h = self._holder(tmp_path, kids)
+        h._handed_off = True
+        h._respawn_until_published(kids[0], time.monotonic() + 0.5)
+        assert h.spawned == 0 and h._proc is kids[0]
+
+    def case_a_watch_that_cannot_start_leaves_the_holder_up(
+            self, tmp_path, monkeypatch):
+        """`Thread.start` raises RuntimeError under EAGAIN / RLIMIT_NPROC, the
+        exhaustion the `_spawn` guard above it already contains. Escaping this
+        SIGNAL HANDLER it would end the holder's main thread with no `stop()`,
+        and the daemon would exit 75 to a dead holder."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        kids = [self._Child(10), self._Child(11)]
+        h = self._holder(tmp_path, kids)
+
+        def no_thread(self):
+            raise RuntimeError("can't start new thread")
+
+        with monkeypatch.context() as m:
+            m.setattr(threading.Thread, "start", no_thread)
+            h._on_replace_request(signal.SIGUSR1, None)
+        assert h.spawned == 1 and h._proc is kids[1] and not h._stop
+        assert any("could not start the successor watch" in ln for ln in lines)
