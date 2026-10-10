@@ -2309,10 +2309,12 @@ def wire_global_config(port: int | None, ca_path: Path | None,
     so this touches nothing new: not ``settings.json`` (Claude Code's own),
     not a shell rc, not a shim on PATH.
 
-    Only keys THIS function wrote are ever modified, tracked by name in
-    ``_WIRE_MARK``. A proxy the user (or their launcher) set themselves is
-    left exactly as found, and clearing the pin restores it rather than
-    deleting it — the ordering matters, because the env block is applied on
+    Only the keys THIS function writes are ever modified, tracked by name in
+    ``_WIRE_MARK``. A value already under one of those names (a proxy the user
+    or their launcher set, or an unmarked ``CSWAP_PIN_PORT`` block) is
+    REPLACED, not left as found: it is displaced into ``_WIRE_MARK``Saved, and
+    clearing the pin restores it rather than deleting it — the ordering
+    matters, because the env block is applied on
     top of the process environment and would otherwise silently displace a
     wrapper's own proxy.
 
@@ -9865,7 +9867,9 @@ def ensure_wired_to(port: int, certdir: Path) -> bool:
     that one. Measured 2026-09-24: a throwaway daemon on a spare certdir
     under the same ``$HOME`` rewired the shared ``.claude.json`` away from
     the live pin four times in one day. A wiring naming a DEAD port (or
-    nothing) is still corrected, exactly as before.
+    nothing) is still corrected, exactly as before, and that includes a
+    ``CSWAP_PIN_PORT`` block the pin never marked: its values are displaced
+    into the receipt's ``Saved`` and an unwire hands them back.
 
     ONLY WHILE A PIN RECORD EXISTS. `cswap pin --clear` drops the record and
     the wiring and leaves this daemon serving the sessions it holds; a
@@ -19888,15 +19892,17 @@ class PinProxy:
         code_watch_beat = getattr(self, "_code_watch_beat", None)
         # READ NOW, never remembered from start: this is how a rollout verifies
         # the fd limit `_raise_nofile_soft_limit` set (it cannot be read from
-        # outside the process on a Mac). `null` for unlimited or an unreadable
-        # limit, which is not zero. Never raises: this is the liveness probe.
+        # outside the process on a Mac). A number for a finite limit,
+        # "unlimited" for RLIM_INFINITY (the word daemon.log's `nofile before`
+        # line uses), `null` ONLY for a limit that could not be read.
+        # Never raises: this is the liveness probe.
         try:
             import resource  # POSIX only
 
             nofile_soft, nofile_hard = (
-                None if n == resource.RLIM_INFINITY else n
+                "unlimited" if n == resource.RLIM_INFINITY else n
                 for n in resource.getrlimit(resource.RLIMIT_NOFILE))
-        except (OSError, ValueError):
+        except (ImportError, OSError, ValueError):
             nofile_soft = nofile_hard = None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,
@@ -22297,7 +22303,13 @@ def _hop_recently_failed() -> bool:
 _STREAM_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker/events/stream")
 _WORKER_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker")
 _worker_alive: dict[str, float] = {}
+#: When each session's stamp was last WRITTEN to the file, apart from when it
+#: was last SEEN above. The throttle needs the former: measured against the
+#: latter, a bridge asking every <=`_ALIVE_WRITE_EVERY` seconds refreshed the
+#: very clock it was throttled by and never reached the file.
+_worker_alive_written: dict[str, float] = {}
 _worker_alive_lock = threading.Lock()
+_alive_file_lock = threading.Lock()
 #: WHERE THE EVIDENCE LIVES, AND IT CANNOT BE THIS PROCESS'S MEMORY. A
 #: long-held stream stays with the DEPARTING daemon for the whole drain while
 #: its session's heartbeats move to the successor, so the process holding the
@@ -22359,7 +22371,6 @@ def _note_worker_status(path: str | None, status_line: bytes,
         return
     sid, now = m.group(1), time.time()
     with _worker_alive_lock:
-        last = _worker_alive.get(sid, 0.0)
         _worker_alive[sid] = now
         if len(_worker_alive) > 256:
             # One entry per session this daemon has ever relayed for, so it
@@ -22368,37 +22379,46 @@ def _note_worker_status(path: str | None, status_line: bytes,
             for k, seen in list(_worker_alive.items()):
                 if now - seen > _STREAM_LIVE_SECONDS:
                     del _worker_alive[k]
-        if now - last < _ALIVE_WRITE_EVERY:
+                    _worker_alive_written.pop(k, None)
+        # `0 <=`: a written stamp from the FUTURE (the wall clock stepped back)
+        # must not throttle, or the file stays still until the clock catches up.
+        if 0 <= now - _worker_alive_written.get(sid, 0.0) < _ALIVE_WRITE_EVERY:
             return
+        _worker_alive_written[sid] = now
     p = _alive_path(certdir)
     if p is None:
         return
-    shared = _alive_load(certdir)
-    # THE WRITER'S OWN PID IS PART OF THE KEY, not the value -- a value has
-    # to stay a bare number or the filter two lines down (every OTHER
-    # writer's read-modify-write, not just this one) drops the entry on its
-    # very next pass. See `_worker_alive_age`, the reader this exists for.
-    #
-    # BOTH SHAPES, DURING THE ROLLOUT HANDOVER. A DEPLOYED release still
-    # reads the bare `shared.get(sid)` -- a draining OLD daemon running that
-    # code cannot see a successor's `sid@pid`-only stamp, and after
-    # `_STREAM_LIVE_SECONDS` a spurious stream 404 passes through and ends
-    # the session. `_stream_404_is_spurious` here already accepts either
-    # shape; the bare key is for the reader this process has not upgraded
-    # past yet.
-    shared[sid] = now
-    shared[f"{sid}@{os.getpid()}"] = now
-    # MERGED, NOT OVERWRITTEN: the departing daemon and its successor both
-    # write here. A lost update costs one entry and fails toward "no
-    # evidence", which is the direction that lets the 404 through.
-    shared = {k: v for k, v in shared.items()
-              if isinstance(v, (int, float)) and now - v <= _STREAM_LIVE_SECONDS}
-    try:
-        tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(shared))
-        os.replace(tmp, p)      # atomic, so a reader never sees a torn file
-    except OSError:
-        pass
+    # ONE READ-MERGE-WRITE AT A TIME PER PROCESS: relay threads shared one temp
+    # name, so two writers tore the file (reads as `{}`, "no evidence") or merged
+    # into a stale read and dropped a stamp. Not `_worker_alive_lock`: this holds
+    # across disk I/O, which must not stall the in-memory check on every route.
+    with _alive_file_lock:
+        shared = _alive_load(certdir)
+        # THE WRITER'S OWN PID IS PART OF THE KEY, not the value -- a value has
+        # to stay a bare number or the filter two lines down (every OTHER
+        # writer's read-modify-write, not just this one) drops the entry on its
+        # very next pass. See `_worker_alive_age`, the reader this exists for.
+        #
+        # BOTH SHAPES, DURING THE ROLLOUT HANDOVER. A DEPLOYED release still
+        # reads the bare `shared.get(sid)` -- a draining OLD daemon running that
+        # code cannot see a successor's `sid@pid`-only stamp, and after
+        # `_STREAM_LIVE_SECONDS` a spurious stream 404 passes through and ends
+        # the session. `_stream_404_is_spurious` here already accepts either
+        # shape; the bare key is for the reader this process has not upgraded
+        # past yet.
+        shared[sid] = now
+        shared[f"{sid}@{os.getpid()}"] = now
+        # MERGED, NOT OVERWRITTEN: the departing daemon and its successor both
+        # write here. A lost update costs one entry and fails toward "no
+        # evidence", which is the direction that lets the 404 through.
+        shared = {k: v for k, v in shared.items()
+                  if isinstance(v, (int, float)) and now - v <= _STREAM_LIVE_SECONDS}
+        try:
+            tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(shared))
+            os.replace(tmp, p)      # atomic, so a reader never sees a torn file
+        except OSError:
+            pass
 
 
 def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:

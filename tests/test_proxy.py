@@ -20608,31 +20608,63 @@ class TestTheDaemonWatchesItsOwnCode:
         finally:
             hold.close()
 
-    def case_CONTROL_a_block_the_pin_did_not_write_is_left_alone(
+    def case_an_UNMARKED_block_naming_a_DEAD_port_is_rewired_and_unwire_hands_its_values_back(
         self, tmp_path, monkeypatch
     ):
-        """The repair is scoped to the pin's own keys, and must stay scoped.
+        """`ensure_wired_to` corrects an `env` block the pin never wrote, and
+        loses nothing doing so (e0d4e44).
 
-        `wire_global_config` modifies only what `_WIRE_MARK` records, so a
-        `CSWAP_PIN_PORT` some launcher or person set is not ours to correct --
-        and a serving daemon calling into it must not become the exception.
-        Found by seeding the case above with an unmarked block by hand, which
-        reported a repair failure over code keeping this promise.
+        `wire_global_config` treats a value under one of its own key names as
+        displaced whoever put it there: it lands in the receipt's `Saved` and
+        an unwire hands it back. So the repair is NOT scoped to a block the
+        pin marked, and this case pins the contract that replaced the old
+        "left alone" one.
+
+        THE DEAD PORT IS HELD, NOT PICKED. This case used to seed a fixed
+        41111 and was green only while the daemon could reclaim it
+        (`wanted_port` falls back to the port the config names): on a box
+        where something already held 41111 the daemon served elsewhere and
+        the rewire ran. A bound, never-listening socket is a port the daemon
+        cannot take and nobody answers on, whatever else the host runs.
         """
+        import socket
+
         import claude_swap.paths as paths
         from cswap_pin import proxy as pin_proxy
 
+        hold = socket.socket()
+        hold.bind(("127.0.0.1", 0))
+        dead = hold.getsockname()[1]
+        seed = {"CSWAP_PIN_PORT": str(dead),
+                "HTTPS_PROXY": "http://launcher.example:3128"}
         # A PIN RECORD: a daemon wires only while one exists.
         pin_proxy.save_pin(tmp_path, "a@b.c", "org")
-        certdir, cfg, _ = self._live_daemon(
-            tmp_path, monkeypatch, paths,
-            cfg_text=json.dumps({"env": {"CSWAP_PIN_PORT": "41111"}}))
         try:
-            assert pin_proxy._wired_port() == 41111, (
-                "a daemon start rewrote an env block the pin never wrote",
-                cfg.read_text())
+            certdir, cfg, _ = self._live_daemon(
+                tmp_path, monkeypatch, paths,
+                cfg_text=json.dumps({"env": seed}))
+            try:
+                st = pin_proxy.read_daemon_state(certdir)
+                assert st["port"] != dead, (
+                    "premise: the daemon bound the held port, so nothing was "
+                    "wrong for it to repair", st)
+                assert pin_proxy._wired_port() == st["port"], (
+                    "an unmarked block naming a dead port was left in place",
+                    cfg.read_text())
+                saved = pin_proxy._read_ledger(
+                    cfg, json.loads(cfg.read_text())
+                )[f"{pin_proxy._WIRE_MARK}Saved"]
+                assert saved == seed, (
+                    "the displaced values were not recorded for the unwire",
+                    saved)
+                assert pin_proxy.wire_global_config(None, None)
+                assert json.loads(cfg.read_text())["env"] == seed, (
+                    "unwire did not hand the unmarked values back",
+                    cfg.read_text())
+            finally:
+                self._stop_live()
         finally:
-            self._stop_live()
+            hold.close()
 
     def _live_daemon(self, tmp_path, monkeypatch, paths, stale_port=None,
                      cfg_text="{}"):
@@ -20651,13 +20683,9 @@ class TestTheDaemonWatchesItsOwnCode:
         cfg = tmp_path / ".claude.json"
         cfg.write_text(cfg_text)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        # THE REAL WRITER, never a hand-built block. `wire_global_config`
-        # only ever modifies keys it recorded in `_WIRE_MARK`, so an
-        # approximation of its output without that mark is a config it is
-        # required to leave alone -- a seed that tests the opposite of what it
-        # was written for. Measured: a hand-built `{"env": {"CSWAP_PIN_PORT":
-        # "41111"}}` made this harness report a repair failure over code doing
-        # exactly what it promises.
+        # THE REAL WRITER for a MARKED stale wiring, so the receipt exists as
+        # a live pin leaves it. An UNMARKED block is rewired too (its values
+        # land in `Saved`); `cfg_text` seeds that case.
         if stale_port is not None:
             pin_proxy.wire_global_config(stale_port, certdir / "ca.pem")
             assert pin_proxy._wired_port() == stale_port, cfg.read_text()
