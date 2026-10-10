@@ -12116,6 +12116,10 @@ class PortHolder:
             if handed is not None:
                 self._handed_off = handed
                 return
+            # THE DAEMON'S WAIT STARTS WITH THIS ASK: it polls `proxy.json` for
+            # `_SPAWN_WAIT_S`, then falls back to exit 75 and a capped drain.
+            deadline = time.monotonic() + _SPAWN_WAIT_S
+            before = getattr(self, "_proc", None)
             try:
                 self._spawn()
             except (OSError, ValueError) as exc:
@@ -12123,6 +12127,83 @@ class PortHolder:
                     f"could not spawn a successor on replace request: {exc!r} "
                     f"— staying up on the current daemon"
                 )
+                return
+            # ONLY THE DAEMON'S OWN ASK IS WAITING ON A RECORD. `_wait_for_exit`'s
+            # wedge repair (no signal) replaces a daemon that asked nothing and
+            # terminates it next, and the supervisor takes the successor from there.
+            if signum is not None and self._proc is not before:
+                # RuntimeError IS HOW `Thread.start` REPORTS EAGAIN / RLIMIT_NPROC,
+                # the exhaustion the `_spawn` guard above contains: escaping this
+                # SIGNAL HANDLER it ends the holder with no `stop()`. Unwatched is
+                # what the successor was before T2071, and the daemon's exit-75
+                # path follows.
+                try:
+                    threading.Thread(
+                        target=self._respawn_until_published,
+                        args=(self._proc, deadline), daemon=True).start()
+                except RuntimeError as exc:
+                    _log_lifecycle(
+                        f"could not start the successor watch: {exc!r} "
+                        f"— the successor goes unwatched")
+
+    def _respawn_until_published(self, proc, deadline: float) -> None:
+        """Watch the successor ``proc`` that `_on_replace_request` just spawned
+        and spawn it again if it dies before `proxy.json` names its pid (T2071).
+
+        NOBODY ELSE WATCHES IT. `_supervise` waits on the daemon that asked,
+        which polls for a record until ``deadline``, then releases the
+        listener, drains capped and exits 75 (4397803 chose that over a
+        keep-serving retry, and it stays). A successor that died at once, on
+        `ModuleNotFoundError` while `uv tool install --force` rebuilt the venv
+        under it, was never retried before that: dkim Mac, 0.1.329 -> 0.1.331,
+        "cut 5 in-flight request(s) after 30.0s".
+
+        ONLY A DEAD CHILD IS REPLACED, never a live one that has yet to
+        publish: two daemons on one socket is the bug this class refuses to
+        have. A clean exit is a decision (`_supervise_locked`) and ends the
+        watch. A respawn is made under `_replace_lock`, and only while
+        `self._proc` is still ``proc``: `stop()`, the supervisor (the daemon
+        left first), a later ask or a hand-off of the socket wins. `self._failures` is not climbed: its
+        cap would `degrade_now()` beside a daemon that still serves, and the
+        ladder starts at the daemon's exit as it always did. `_backoff` paces
+        the respawns (0.5 s, 1 s, 2 s, ...) and none starts that could not
+        begin before ``deadline``, so a window longer than the wait still ends
+        on the daemon's own fallback.
+        """
+        import subprocess
+
+        certdir = getattr(self, "_certdir", None)
+        attempt = 0
+        while certdir is not None and not self._stop:
+            rec = read_daemon_state(certdir)
+            if rec and int(rec.get("pid") or 0) == proc.pid:
+                return
+            try:
+                code = proc.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    return
+                continue
+            attempt += 1
+            wait = self._backoff(attempt)
+            if code == 0 or time.monotonic() + wait >= deadline:
+                return
+            _log_lifecycle(
+                f"successor {proc.pid} exited (code {code}) before "
+                f"publishing — spawning it again in {wait:.1f}s")
+            time.sleep(wait)
+            with self._replace_lock:
+                if (self._stop or self._proc is not proc or self._handed_off
+                        or getattr(self, "_degraded", False)
+                        or time.monotonic() >= deadline):
+                    return
+                try:
+                    self._spawn()
+                except (OSError, ValueError) as exc:
+                    _log_lifecycle(f"could not spawn the successor again: "
+                                   f"{exc!r}")
+                    return
+                proc = self._proc
 
     def _supervise(self) -> None:
         """ONE THREAD, ONE LOOP (T1193): ordinary supervision and the
@@ -12341,10 +12422,15 @@ class PortHolder:
         # return — can move `self._proc` away from what this
         # iteration captured.
         if self._proc is not proc:
+            # THE SUCCESSOR MAY HAVE DIED BEFORE ITS PREDECESSOR LEFT (T2071):
+            # then nothing serves, and the next lap supervises its exit.
+            died = getattr(self._proc, "poll", lambda: None)()
             _log_lifecycle(
                 f"daemon {proc.pid} retired (exit {code}) after "
-                f"handing over — successor already serving on port "
-                f"{self.port}"
+                f"handing over — "
+                + (f"successor {self._proc.pid} already exited ({died}), "
+                   f"supervising that exit from here" if died is not None
+                   else f"successor already serving on port {self.port}")
             )
             return "continue"
         # THE SOCKET WENT TO A CALLER'S LINEAGE AND ANOTHER DAEMON SERVES IT:

@@ -34758,3 +34758,429 @@ class TestTheDaemonRaisesItsFdLimit:
         assert len(lines) == 2, out.stderr
         assert "before soft=256 " in lines[0] and " after soft=1024 " in lines[0]
         assert "before soft=2048 " in lines[1] and " after soft=2048 " in lines[1]
+
+
+class TestAHolderRespawnsASuccessorThatDiesBeforePublishing:
+    """T2071: a deploy's `uv tool install --force` rebuilds the venv in place, a
+    code-watch tick lands inside it, and the successor the HOLDER spawns for the
+    daemon's ask dies on `ModuleNotFoundError` before it serves. Nobody watched
+    it: `_supervise` waits on the OLD daemon, which polls `proxy.json` for
+    `_SPAWN_WAIT_S`, logs "no successor published within the wait", releases
+    the listener, drains capped and cuts what is mid-reply (dkim Mac,
+    0.1.329 -> 0.1.331).
+
+    REAL PROCESSES, on the seam `TestACallerOutsideTheLineageTakesTheSocketOver`
+    uses: a shim package re-points `_DAEMON_MODULE` at itself, so every daemon
+    and standby the holder spawns runs it. THE OUTAGE IS THE FILE SYSTEM'S, as
+    in the incident: the shim directory is renamed away (the interpreter is
+    there, the package is not) and back. A tick is forced by a flag file the
+    shim's `_code_is_current` consumes once, so only the first daemon asks. A
+    reply is held mid-body across all of it, past the capped drain.
+
+    THE LIMIT, and the last case pins it: the holder retries inside the
+    daemon's `_SPAWN_WAIT_S`. A window longer than that still ends on the
+    exit-75 fallback and still cuts. The daemon is not made to wait longer: its
+    listener is released at the bound, and the holder cannot respawn until it
+    exits (4397803).
+    """
+
+    EMAIL = "pin@example.com"
+    CAP_S = 3.0     # the shim's `_HELD_DRAIN_SECONDS`, the fallback's drain cap
+
+    _SHIM = '''
+import functools, sys
+from pathlib import Path
+from cswap_pin import proxy as p
+p._DAEMON_MODULE = "t2071_cswap_pin.proxy"
+p._HELD_DRAIN_SECONDS = @CAP@
+p._SPAWN_WAIT_S = @WAIT@
+p._watch_own_code = functools.partial(p._watch_own_code, interval=0.3)
+_tick = Path("@TICK@")
+_current = p._code_is_current
+def _code_is_current(own):
+    # THE TICK THAT FOUND THE CODE CHANGED (an unreadable tree reads as
+    # changed): once, so a successor does not ask in its turn.
+    if _tick.exists():
+        _tick.unlink()
+        return False
+    return _current(own)
+p._code_is_current = _code_is_current
+a = sys.argv
+if a[1:2] == [p._HOLDER_MODULE_ARG]:
+    p.holder_main(a[3], a[4], Path(a[5]), port=int(a[2]))
+elif a[1:2] == [p._STANDBY_MODULE_ARG]:
+    p.standby_main(a[2], a[3], Path(a[4]))
+else:
+    p.daemon_main(a[1], a[2], Path(a[3]))
+'''
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    class _Origin:
+        """A plain-HTTP origin whose reply is mid-body until ``release``."""
+
+        def __init__(self):
+            self.release = threading.Event()
+            self.srv = socket.socket()
+            self.srv.bind(("127.0.0.1", 0))
+            self.srv.listen(4)
+            self.port = self.srv.getsockname()[1]
+            threading.Thread(target=self._serve, daemon=True).start()
+
+        def _serve(self):
+            try:
+                c, _ = self.srv.accept()
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += c.recv(4096)
+                c.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                          b"\r\n5\r\nfirst\r\n")
+                self.release.wait(60)
+                c.sendall(b"6\r\nsecond\r\n0\r\n\r\n")
+                c.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _until(what, fn, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            got = fn()
+            if got:
+                return got
+            time.sleep(0.05)
+        raise AssertionError(f"timed out after {timeout}s: {what}")
+
+    @staticmethod
+    def _read_reply(client, until, timeout=30):
+        """Everything the client receives until ``until`` is in it, or EOF."""
+        client.settimeout(timeout)
+        got = b""
+        while until not in got:
+            try:
+                chunk = client.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            got += chunk
+        return got
+
+    @contextlib.contextmanager
+    def _held_reply_across_a_window(self, monkeypatch, window_s, wait_s=10.0):
+        """A real holder + daemon + standby under a short scratch dir (started
+        through a launcher that exits), a reply held mid-body, a code-watch
+        tick, and ``window_s`` seconds in which the successor's module cannot
+        be found. Yields ``(t, rest)`` once the old daemon has settled and the
+        held reply was released past its capped drain: ``rest`` is what the
+        client got after that."""
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as pp
+
+        base = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = base / "pin-proxy"
+        certdir.mkdir()
+        pkg = base / "shim" / "t2071_cswap_pin"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        tick = base / "tick"
+        (pkg / "proxy.py").write_text(
+            self._SHIM.replace("@TICK@", str(tick))
+            .replace("@WAIT@", str(wait_s)).replace("@CAP@", str(self.CAP_S)))
+        away = pkg.with_name("t2071_cswap_pin.gone")
+        origin = self._Origin()
+        timer = client = None
+        try:
+            pp.ensure_ca(certdir, "api.anthropic.com")
+            pp.save_pin(base, self.EMAIL, "org-1")
+            monkeypatch.setenv("CSWAP_PIN_ALLOW_DIRECT", "1")
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(base / "shim")]
+                + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+            subprocess.run(
+                [sys.executable, "-c",
+                 TestACallerOutsideTheLineageTakesTheSocketOver._LAUNCH,
+                 str(certdir / "daemon.log"), sys.executable, "-m",
+                 "t2071_cswap_pin.proxy", pp._HOLDER_MODULE_ARG, "0", "2",
+                 self.EMAIL, str(certdir)], env=env, check=True, timeout=30)
+
+            def serving():
+                st = pp.read_daemon_state(certdir)
+                body = st and pp._health_body(int(st["port"]))
+                return st if body and body.get("pid") == st["pid"] else None
+
+            st = self._until("the first daemon never served", serving, 40)
+            log = lambda: (certdir / "daemon.log").read_text(errors="replace")
+            t = types.SimpleNamespace(
+                certdir=certdir, port=int(st["port"]), daemon=int(st["pid"]),
+                log=log, serving=serving)
+
+            client = socket.create_connection(("127.0.0.1", t.port), timeout=20)
+            client.sendall(
+                f"GET http://127.0.0.1:{origin.port}/s HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{origin.port}\r\n\r\n".encode())
+            assert b"first" in self._read_reply(client, b"first"), (
+                "premise: the reply is mid-body")
+            # THE VENV BEING REBUILT: the package is missing, the interpreter
+            # is not. Back when the install finishes.
+            pkg.rename(away)
+            tick.touch()
+            timer = threading.Timer(window_s, lambda: away.rename(pkg))
+            timer.daemon = True
+            timer.start()
+            self._until(
+                "the old daemon neither handed over nor fell back",
+                lambda: ("while we keep serving" in log()
+                         or "no successor published" in log()), wait_s + 20)
+            # HELD PAST THE CAPPED DRAIN, so a fallback that drains capped
+            # cuts it, and a handover that does not is seen not to.
+            time.sleep(self.CAP_S + 1.5)
+            origin.release.set()
+            yield t, self._read_reply(client, b"0\r\n\r\n")
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if client is not None:
+                client.close()
+            origin.release.set()
+            origin.srv.close()
+            _reap_pin_processes(certdir)
+            shutil.rmtree(base, ignore_errors=True)
+
+    def _one_daemon_is_left(self, t, pid):
+        from cswap_pin import proxy as pp
+
+        self._until(
+            f"exactly daemon {pid} is left for the certdir, not "
+            f"{pp._pin_daemon_pids(t.certdir)}",
+            lambda: pp._pin_daemon_pids(t.certdir) == [pid], 20)
+
+    def _a_successor_serves_and_the_reply_completed(self, t, rest):
+        log = t.log()
+        assert "finding module specification" in log, (
+            "premise: the first successor died on the missing module\n" + log)
+        assert "no successor published within the wait" not in log, (
+            "the daemon gave up on a successor the holder could have "
+            "respawned\n" + log)
+        assert not re.search(r"cut \d+ in-flight", log), log
+        assert "asked the holder to replace us while we keep serving" in log, (
+            "the gapless arm did not run\n" + log)
+        assert rest.endswith(b"second\r\n0\r\n\r\n"), (
+            f"the held reply did not complete: {rest!r}\n{log}")
+        st = t.serving()
+        assert st and int(st["pid"]) != t.daemon, (
+            "no successor is serving\n" + log)
+        assert int(st["port"]) == t.port, "the port moved"
+        self._one_daemon_is_left(t, int(st["pid"]))
+
+    def case_a_successor_that_dies_in_a_short_window_is_respawned(
+            self, monkeypatch):
+        with self._held_reply_across_a_window(monkeypatch, 1.0) as (t, rest):
+            self._a_successor_serves_and_the_reply_completed(t, rest)
+
+    def case_a_window_of_several_seconds_takes_several_respawns(
+            self, monkeypatch):
+        """The window is ~3 s: the successor is born into the missing module
+        again and again (backoff 0.5 s, 1 s, 2 s) until one of them finds it."""
+        with self._held_reply_across_a_window(monkeypatch, 3.0) as (t, rest):
+            self._a_successor_serves_and_the_reply_completed(t, rest)
+            died = t.log().count("finding module specification")
+            assert died >= 2, (
+                f"{died} successor(s) died: the window was not several "
+                f"respawns wide\n" + t.log())
+
+    def case_a_window_longer_than_the_wait_still_cuts(self, monkeypatch):
+        """THE LIMIT. The wait is 3 s here and the window 5 s: no respawn can
+        publish in time, the daemon falls back to exit 75 and its capped drain,
+        and the held reply is cut. The holder then restarts a daemon once the
+        module is back, so the port is served again."""
+        with self._held_reply_across_a_window(
+                monkeypatch, 5.0, wait_s=3.0) as (t, rest):
+            log = t.log()
+            at = [log.find(m) for m in (
+                "finding module specification",
+                "no successor published within the wait", "cut 1 in-flight")]
+            assert all(i >= 0 for i in at) and at == sorted(at), (
+                "the daemon did not fall back and cut, in that order\n" + log)
+            assert not rest.endswith(b"second\r\n0\r\n\r\n"), rest
+            again = self._until(
+                "the holder never served the port again",
+                lambda: (lambda st: st if st and int(st["pid"]) != t.daemon
+                         else None)(t.serving()), 40)
+            assert int(again["port"]) == t.port
+            self._one_daemon_is_left(t, int(again["pid"]))
+
+    class _Child:
+        """A successor as the watch sees it: dead with ``code``, or alive."""
+
+        def __init__(self, pid, code=None):
+            self.pid, self.code = pid, code
+
+        def wait(self, timeout=None):
+            import subprocess
+
+            if self.code is None:
+                time.sleep(timeout or 0)
+                raise subprocess.TimeoutExpired("daemon", timeout)
+            return self.code
+
+        def poll(self):
+            return self.code
+
+    def _holder(self, certdir, kids, backoff=0.0):
+        """A holder whose k-th `_spawn` makes ``kids[k]`` the successor."""
+        from cswap_pin import proxy as pp
+
+        class _Holder(pp.PortHolder):
+            _backoff = staticmethod(lambda failures: backoff)
+
+            def __init__(self):
+                self._stop = False
+                self._certdir = certdir
+                self._replace_lock = threading.RLock()
+                self._proc = kids[0]
+                self.spawned = 0
+                self.port = 1
+
+            def _spawn(self):
+                self.spawned += 1
+                self._proc = kids[self.spawned]
+
+        return _Holder()
+
+    def case_the_watch_spawns_a_dead_successor_again_until_one_publishes(
+            self, tmp_path):
+        from cswap_pin import proxy as pp
+
+        kids = [self._Child(10, 1), self._Child(11, 1), self._Child(12)]
+        pp.write_daemon_state(tmp_path, 1, 12, "fp")
+        h = self._holder(tmp_path, kids)
+        h._respawn_until_published(kids[0], time.monotonic() + 10)
+        assert h.spawned == 2 and h._proc is kids[2], h.spawned
+
+    def case_the_watch_never_spawns_over_a_live_successor(self, tmp_path):
+        """A successor that is alive and has not published (a slow boot) is
+        left alone to the deadline: two daemons on one socket."""
+        kids = [self._Child(10), self._Child(11)]
+        h = self._holder(tmp_path, kids)
+        h._respawn_until_published(kids[0], time.monotonic() + 0.4)
+        assert h.spawned == 0 and h._proc is kids[0]
+
+    def case_the_respawns_end_inside_the_daemons_wait(self, tmp_path):
+        """With `_backoff`'s ladder (0.5 s, 1 s, 2 s) a deadline 2 s out takes
+        the first two respawns and not the third, which could not begin in
+        time: the daemon's own fallback follows, as it always did."""
+        from cswap_pin import proxy as pp
+
+        kids = [self._Child(10 + n, 1) for n in range(8)]
+        h = self._holder(tmp_path, kids)
+        h._backoff = pp.PortHolder._backoff
+        started = time.monotonic()
+        h._respawn_until_published(kids[0], started + 2.0)
+        assert h.spawned == 2, h.spawned
+        assert time.monotonic() - started < 2.5
+
+    def case_the_watch_leaves_a_successor_that_is_no_longer_current(
+            self, tmp_path):
+        """The supervisor respawned it (the daemon left first), a later ask
+        moved `self._proc`, or `stop()` ran: this spawns nothing."""
+        kids = [self._Child(10, 1), self._Child(11, 1)]
+        h = self._holder(tmp_path, kids)
+        h._proc = kids[1]
+        h._respawn_until_published(kids[0], time.monotonic() + 5)
+        assert h.spawned == 0
+        h._proc = kids[0]
+        h._stop = True
+        h._respawn_until_published(kids[0], time.monotonic() + 5)
+        assert h.spawned == 0
+
+    def case_the_watch_starts_only_on_the_daemons_own_ask(
+            self, tmp_path, monkeypatch):
+        import signal
+
+        watched = []
+        kids = [self._Child(10), self._Child(11), self._Child(12)]
+        h = self._holder(tmp_path, kids)
+        h._respawn_until_published = lambda proc, deadline: watched.append(proc)
+        h._on_replace_request(None, None)       # the holder's own wedge repair
+        assert h.spawned == 1 and watched == []
+        h._on_replace_request(signal.SIGUSR1, None)
+        self._until("the daemon's ask started no watch",
+                    lambda: watched, 5)
+
+    def case_a_successor_that_died_is_not_logged_as_serving(
+            self, tmp_path, monkeypatch):
+        """The daemon left (exit 75) after a successor that had already died:
+        the line said "successor already serving" while nothing served."""
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        old, dead, alive = self._Child(9, 75), self._Child(10, 1), self._Child(11)
+        h = self._holder(tmp_path, [dead])
+        assert h._supervise_locked(old, 75) == "continue"
+        h = self._holder(tmp_path, [alive])
+        assert h._supervise_locked(old, 0) == "continue"
+        assert "already exited (1)" in lines[0] and "serving" not in lines[0]
+        assert "successor already serving" in lines[1], "the control"
+
+    def case_a_respawn_that_waited_on_the_lock_past_the_deadline_does_not_start(
+            self, tmp_path):
+        """The docstring's promise: none starts after the daemon's wait. A
+        respawn that sat on `_replace_lock` (an ask, `stop()`) until the
+        deadline passed has nobody left to publish to."""
+        kids = [self._Child(10, 1), self._Child(11)]
+        h = self._holder(tmp_path, kids)
+        held = threading.Event()
+
+        def hold():
+            with h._replace_lock:
+                held.set()
+                time.sleep(0.6)
+
+        threading.Thread(target=hold, daemon=True).start()
+        assert held.wait(5)
+        h._respawn_until_published(kids[0], time.monotonic() + 0.3)
+        assert h.spawned == 0 and h._proc is kids[0]
+
+    def case_the_watch_leaves_a_socket_that_went_to_a_callers_lineage(
+            self, tmp_path):
+        """A later ask handed the socket to a caller outside this lineage
+        (`_handed_off`): a successor spawned here would be a denied-lineage
+        daemon on a socket that is another lineage's now."""
+        kids = [self._Child(10, 1), self._Child(11)]
+        h = self._holder(tmp_path, kids)
+        h._handed_off = True
+        h._respawn_until_published(kids[0], time.monotonic() + 0.5)
+        assert h.spawned == 0 and h._proc is kids[0]
+
+    def case_a_watch_that_cannot_start_leaves_the_holder_up(
+            self, tmp_path, monkeypatch):
+        """`Thread.start` raises RuntimeError under EAGAIN / RLIMIT_NPROC, the
+        exhaustion the `_spawn` guard above it already contains. Escaping this
+        SIGNAL HANDLER it would end the holder's main thread with no `stop()`,
+        and the daemon would exit 75 to a dead holder."""
+        import signal
+
+        from cswap_pin import proxy as pp
+
+        lines = []
+        monkeypatch.setattr(pp, "_log_lifecycle", lines.append)
+        kids = [self._Child(10), self._Child(11)]
+        h = self._holder(tmp_path, kids)
+
+        def no_thread(self):
+            raise RuntimeError("can't start new thread")
+
+        with monkeypatch.context() as m:
+            m.setattr(threading.Thread, "start", no_thread)
+            h._on_replace_request(signal.SIGUSR1, None)
+        assert h.spawned == 1 and h._proc is kids[1] and not h._stop
+        assert any("could not start the successor watch" in ln for ln in lines)
