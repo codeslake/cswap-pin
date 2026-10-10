@@ -15751,6 +15751,77 @@ class TestFailOpenIsNotSilent:
             finally:
                 p.stop()
 
+    def _health(self, p):
+        c = http.client.HTTPConnection("127.0.0.1", p.port, timeout=10)
+        try:
+            c.request("GET", "/health")
+            return json.loads(c.getresponse().read())
+        finally:
+            c.close()
+
+    def case_health_identity_verdict_is_per_generation(
+            self, certdir, monkeypatch):
+        """`pin_identity_mismatch` reads `null` until THIS generation has
+        checked its own bearer and `false` after one clean check. A handover
+        successor is a new PinProxy over a new provider (what `daemon_main`
+        builds), so it starts `null` again though its predecessor read
+        `false`: a reader treats `null` as unknown, never as clean.
+
+        Read from the HTTP /health JSON. No process is forked: both
+        generations are built here as `daemon_main` builds them, one after the
+        other over one certdir and one credential store."""
+        from cswap_pin import proxy as pp
+
+        probe = threading.Event()
+        monkeypatch.setattr(
+            pp, "pin_profile_for",
+            lambda token: probe.wait(10) and {"emailAddress": "pin@example.com"})
+        pp.save_pin(certdir, "pin@example.com", "org")
+        for generation in ("predecessor", "successor"):
+            provider = pp.make_pin_token_provider(
+                _refetch_switcher(certdir, lambda n: "pin-tok"),
+                "2", "pin@example.com")
+            probe.clear()
+            p = self._proxy(certdir, provider)
+            p.start()  # its start warm mints, and parks on the probe
+            try:
+                assert self._health(p)["pin_identity_mismatch"] is None, (
+                    f"{generation} before its first check")
+                probe.set()
+                assert provider() == "pin-tok"
+                assert self._health(p)["pin_identity_mismatch"] is False, (
+                    f"{generation} after one clean check")
+            finally:
+                probe.set()
+                p.stop()
+
+    def case_health_identity_verdict_stays_null_for_the_live_login(
+            self, certdir, monkeypatch):
+        """A pin that IS the logged-in account makes `provider()` answer None
+        before any bearer is read or probed: nothing is evaluated, so
+        `/health` says `null` (unknown), not `false` (checked and clean)."""
+        from cswap_pin import proxy as pp
+
+        probed = []
+        monkeypatch.setattr(
+            pp, "pin_profile_for", lambda token: probed.append(token))
+        pp.save_pin(certdir, "pin@example.com", "org")
+        switcher = _refetch_switcher(certdir, lambda n: "pin-tok")
+        switcher.current_account_number = lambda: "2"
+        # The roster agrees, so the live-login answer comes from
+        # `_pin_is_the_live_login`'s agreement branch, not its
+        # unreadable-roster fallback.
+        switcher._get_sequence_data = lambda: {"activeAccountNumber": "2"}
+        p = self._proxy(certdir, pp.make_pin_token_provider(
+            switcher, "2", "pin@example.com"))
+        p.start()
+        try:
+            assert p._pin_token_provider() is None
+            assert probed == [], "the live login's bearer was probed"
+            assert self._health(p)["pin_identity_mismatch"] is None
+        finally:
+            p.stop()
+
     def case_a_noop_pin_does_not_warn(self, certdir, monkeypatch):
         """Nothing-to-swap must not fire the keychain warning.
 

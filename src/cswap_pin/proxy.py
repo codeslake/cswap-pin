@@ -19935,7 +19935,9 @@ class PinProxy:
         # bearer is a daemon that CAN mint and has chosen not to splice, and
         # `_read_alive_port` recycles on a false `can_pin` -- a fresh daemon
         # cannot repair a cross-wired credential store. This field alone
-        # carries the foreign state.
+        # carries the foreign state. `None` is "no conclusive verdict from
+        # this generation" (a fresh process, a successor, a check that ran
+        # and could not decide, a pin that is the live login), never "clean".
         pin_identity_mismatch = getattr(
             self._pin_token_provider, "identity_mismatch", None)
         can_pin = (True if mint_stalled_s is not None
