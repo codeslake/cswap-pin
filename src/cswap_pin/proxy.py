@@ -19888,15 +19888,17 @@ class PinProxy:
         code_watch_beat = getattr(self, "_code_watch_beat", None)
         # READ NOW, never remembered from start: this is how a rollout verifies
         # the fd limit `_raise_nofile_soft_limit` set (it cannot be read from
-        # outside the process on a Mac). `null` for unlimited or an unreadable
-        # limit, which is not zero. Never raises: this is the liveness probe.
+        # outside the process on a Mac). A number for a finite limit,
+        # "unlimited" for RLIM_INFINITY (the word daemon.log's `nofile before`
+        # line uses), `null` ONLY for a limit that could not be read.
+        # Never raises: this is the liveness probe.
         try:
             import resource  # POSIX only
 
             nofile_soft, nofile_hard = (
-                None if n == resource.RLIM_INFINITY else n
+                "unlimited" if n == resource.RLIM_INFINITY else n
                 for n in resource.getrlimit(resource.RLIMIT_NOFILE))
-        except (OSError, ValueError):
+        except (ImportError, OSError, ValueError):
             nofile_soft = nofile_hard = None
         body = json.dumps(
             {"pin_proxy": True, "port": self.port, "chain": chain,

@@ -8168,11 +8168,14 @@ class TestHealthEndpoint:
     def case_health_carries_the_live_nofile_limits(self, certdir, monkeypatch):
         """`nofile_soft` / `nofile_hard` are RLIMIT_NOFILE read at REQUEST time:
         a rollout verifies the daemon's fd limit from outside with it (no
-        psutil, `launchctl procinfo` needs root). Null is unlimited or an
-        unreadable limit, never zero."""
+        psutil, `launchctl procinfo` needs root). A number is a finite limit,
+        "unlimited" is RLIM_INFINITY (the word daemon.log's `nofile before`
+        line uses), and null is ONLY a limit that could not be read: an
+        unlimited hard limit must not read as "could not read"."""
         import http.client
         import json as _json
         import resource
+        import sys
 
         from cswap_pin.proxy import PinProxy
 
@@ -8191,15 +8194,28 @@ class TestHealthEndpoint:
             soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             got = _payload(proxy)
             assert got["nofile_soft"] == (
-                None if soft == resource.RLIM_INFINITY else soft)
+                "unlimited" if soft == resource.RLIM_INFINITY else soft)
             assert got["nofile_hard"] == (
-                None if hard == resource.RLIM_INFINITY else hard)
+                "unlimited" if hard == resource.RLIM_INFINITY else hard)
+
+            def _unreadable(which):
+                raise OSError("getrlimit refused")
+
             # Read per request, not remembered from start: the control a
             # cached field fails.
-            monkeypatch.setattr(resource, "getrlimit",
-                                lambda w: (777, resource.RLIM_INFINITY))
+            for fake, want in (
+                (lambda w: (777, 4096), (777, 4096)),
+                (lambda w: (777, resource.RLIM_INFINITY), (777, "unlimited")),
+                (_unreadable, (None, None)),
+            ):
+                monkeypatch.setattr(resource, "getrlimit", fake)
+                got = _payload(proxy)
+                assert (got["nofile_soft"], got["nofile_hard"]) == want
+            # No `resource` module at all (non-POSIX): null, and /health,
+            # the liveness probe, still answers.
+            monkeypatch.setitem(sys.modules, "resource", None)
             got = _payload(proxy)
-            assert (got["nofile_soft"], got["nofile_hard"]) == (777, None)
+            assert (got["nofile_soft"], got["nofile_hard"]) == (None, None)
         finally:
             proxy.stop()
 
