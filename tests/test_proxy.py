@@ -20683,13 +20683,9 @@ class TestTheDaemonWatchesItsOwnCode:
         cfg = tmp_path / ".claude.json"
         cfg.write_text(cfg_text)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        # THE REAL WRITER, never a hand-built block. `wire_global_config`
-        # only ever modifies keys it recorded in `_WIRE_MARK`, so an
-        # approximation of its output without that mark is a config it is
-        # required to leave alone -- a seed that tests the opposite of what it
-        # was written for. Measured: a hand-built `{"env": {"CSWAP_PIN_PORT":
-        # "41111"}}` made this harness report a repair failure over code doing
-        # exactly what it promises.
+        # THE REAL WRITER for a MARKED stale wiring, so the receipt exists as
+        # a live pin leaves it. An UNMARKED block is rewired too (its values
+        # land in `Saved`); `cfg_text` seeds that case.
         if stale_port is not None:
             pin_proxy.wire_global_config(stale_port, certdir / "ca.pem")
             assert pin_proxy._wired_port() == stale_port, cfg.read_text()
