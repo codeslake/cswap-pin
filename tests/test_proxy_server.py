@@ -2895,7 +2895,7 @@ class TestTunnelsToOtherHostsCannotTakeTheWholeHop:
         proxy, slots = self._pin(certdir, monkeypatch, hop, cap=2)
         closed = threading.Event()
 
-        def closes_twice(a, b, on_close=None, kind="bridge"):
+        def closes_twice(a, b, on_close=None, kind="bridge", loop=None):
             on_close()
             on_close()
             closed.set()
@@ -23013,3 +23013,98 @@ class TestPumpBackpressure:
                 f"`_pending`: {[len(v) for v in loop._pending.values()]} bytes")
         finally:
             self._close(loop, feed, far)
+
+
+class TestBulkTunnelsHaveTheirOwnPump:
+    """A CONNECT to a host the pin does not serve runs on its own selector.
+
+    MEASURED: one `aws s3 sync` to a non-Anthropic host (every command Claude
+    Code runs inherits HTTPS_PROXY, so aws, curl, pip and git all reach the pin
+    as blind CONNECTs) shared one pump thread with the Remote Control bridges
+    and deafened 12 of 17. The served hosts are the ones `_capped_tunnel`
+    already exempts from the cap. Draining and handover still count both loops:
+    `_PUMP` answers for the bulk one.
+    """
+
+    @staticmethod
+    def _loop_for(certdir, monkeypatch, host):
+        """The `_PumpLoop` a blind CONNECT to `host` is handed to."""
+        import cswap_pin.proxy as pp
+
+        seen = []
+        real_add = pp._PumpLoop.add
+
+        def spy(self, *a, **k):
+            seen.append(self)
+            return real_add(self, *a, **k)
+
+        monkeypatch.setattr(pp._PumpLoop, "add", spy)
+        monkeypatch.delenv("CSWAP_PIN_ALLOW_DIRECT", raising=False)
+        hop = _StallingHop(delay=0.0, target=("127.0.0.1", 9), hold_rest=True)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", 9),
+                            chain_proxy=("127.0.0.1", hop.port))
+        proxy.start()
+        pp._PUMP.reset_for_tests()
+        raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        try:
+            raw.settimeout(10)
+            raw.sendall(f"CONNECT {host}:443 HTTP/1.1\r\n"
+                        f"Host: {host}:443\r\n\r\n".encode())
+            assert b" 200 " in raw.recv(4096), "the tunnel was not set up"
+            deadline = time.monotonic() + 5
+            while not seen and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert seen, "the pair never reached a pump"
+            return seen[0]
+        finally:
+            raw.close()
+            pp._PUMP.release_pairs()
+            proxy.stop()
+            hop.stop()
+
+    def test_a_served_host_stays_on_the_bridges_pump(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        loop = self._loop_for(certdir, monkeypatch, "bridge.claudeusercontent.com")
+        assert loop is pp._PUMP
+
+    def test_a_host_the_pin_does_not_serve_gets_a_pump_of_its_own(
+            self, certdir, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        loop = self._loop_for(certdir, monkeypatch, "bulk.example.test")
+        assert loop is not pp._PUMP, (
+            "a blind tunnel to a host the pin does not serve runs on the "
+            "selector thread that carries the Remote Control bridges")
+        assert loop is pp._BULK_PUMP
+
+    def test_the_process_counts_a_tunnel_on_the_bulk_pump(self):
+        """What the drain, the reaper's marker and the claim read is `_PUMP`.
+        A tunnel on the other loop must not fall out of any of the four."""
+        import cswap_pin.proxy as pp
+
+        pp._PUMP.reset_for_tests()
+        pairs = [socket.socketpair(), socket.socketpair()]
+        try:
+            pp._BULK_PUMP.add(*pairs[0])
+            assert pp._PUMP.live_pairs() == 1
+            assert pp._PUMP.live_pairs("tunnel") == 1
+            assert pp._PUMP.live_pairs("bridge") == 0
+            time.sleep(0.05)
+            assert pp._PUMP.quiet_for() >= 0.05, (
+                "the drain's silence clock never saw the bulk loop move")
+            assert pp._PUMP.release_pairs("bridge") == 0
+            assert pp._PUMP.release_pairs() == 1
+            assert pairs[0][0].fileno() == -1, "the release left the pair open"
+            assert pp._PUMP.live_pairs() == 0
+
+            pp._BULK_PUMP.add(*pairs[1])
+            pp._PUMP.reset_for_tests()
+            assert pp._PUMP.live_pairs() == 0 and pp._PUMP.quiet_for() == 0.0
+        finally:
+            pp._BULK_PUMP.reset_for_tests()
+            for pair in pairs:
+                for s in pair:
+                    s.close()

@@ -21856,7 +21856,7 @@ class PinProxy:
 
         detached = False
         try:
-            detached = self._blind_tunnel(target, conn, give)
+            detached = self._blind_tunnel(target, conn, give, _BULK_PUMP)
             return detached
         finally:
             if not detached:
@@ -21873,7 +21873,8 @@ class PinProxy:
             pass
         conn.close()
 
-    def _blind_tunnel(self, target: str, conn: socket.socket, give) -> None:
+    def _blind_tunnel(self, target: str, conn: socket.socket, give,
+                      loop=None) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
         # Trace the tunnel too. Remote Control receives over a WebSocket to the
@@ -21999,7 +22000,7 @@ class PinProxy:
         # DETACHED: nothing after the 200 is ours to parse, so the thread that
         # built the tunnel has no work left. It hands the pair to the shared
         # selector along with its own teardown and returns.
-        _pump_detached(conn, up, _release_tunnel)
+        _pump_detached(conn, up, _release_tunnel, loop=loop)
         return True
 
 
@@ -24182,9 +24183,17 @@ class _PumpLoop:
     every one of them carries a measurement that would have to be re-proved
     against a coroutine rewrite. The property the outage needs is "a
     connection is not a thread", and that is this class.
+
+    TWO INSTANCES RUN, `_PUMP` and `_BULK_PUMP`, so a bulk stream cannot delay
+    a bridge's bytes in the selector; `_PUMP` answers for both.
     """
 
-    def __init__(self):
+    def __init__(self, siblings=()):
+        # Loops this one answers for: `live_pairs`, `quiet_for`,
+        # `release_pairs` and `reset_for_tests` cover their tunnels too, so
+        # every reader of the process-wide pump (the drain, the claim, the
+        # reaper's marker) counts all of them without knowing there are two.
+        self._siblings = tuple(siblings)
         # When any tunnel last moved a byte. The drain reads it to tell a
         # tunnel carrying a session from one whose peer has wedged.
         self._last_move = 0.0
@@ -24228,6 +24237,7 @@ class _PumpLoop:
         """Seconds since any tunnel last moved a byte, 0.0 if none ever has."""
         with self._lock:
             last = self._last_move
+        last = max(last, *(o._last_move for o in self._siblings))
         return (time.monotonic() - last) if last else 0.0
 
     def reset_for_tests(self) -> None:
@@ -24243,6 +24253,8 @@ class _PumpLoop:
             self._peer.clear()
             self._pending.clear()
             self._last_move = 0.0
+        for o in self._siblings:
+            o.reset_for_tests()
 
     def live_pairs(self, kind: str | None = None) -> int:
         """How many tunnels this selector is driving, or how many of `kind`.
@@ -24252,10 +24264,10 @@ class _PumpLoop:
         exits while pumping one takes it down.
         """
         with self._lock:
-            if kind is None:
-                return len(self._peer) // 2
-            return sum(1 for s in self._peer
-                       if self._kind.get(s, "tunnel") == kind) // 2
+            own = (len(self._peer) if kind is None else
+                   sum(1 for s in self._peer
+                       if self._kind.get(s, "tunnel") == kind)) // 2
+        return own + sum(o.live_pairs(kind) for o in self._siblings)
 
     def release_pairs(self, kind: str | None = None) -> int:
         """Let the driven tunnels of `kind` go, and say how many.
@@ -24321,7 +24333,8 @@ class _PumpLoop:
                     seen.update((a, b))
                     self._close_pair(a, b, on_close,
                                      closed_by=_RELEASED_BY_DRAIN)
-        return len(socks) // 2
+        return len(socks) // 2 + sum(o.release_pairs(kind)
+                                     for o in self._siblings)
 
     def add(self, a, b, on_close=None, kind: str = "tunnel") -> None:
         """Take over a pair of sockets. Returns AT ONCE.
@@ -24506,7 +24519,13 @@ class _PumpLoop:
                 self._flush(dst, on_close)
 
 
-_PUMP = _PumpLoop()
+#: Tunnels to hosts the pin does not serve (`_capped_tunnel`'s population):
+#: every command Claude Code runs inherits HTTPS_PROXY, and on the bridges'
+#: selector one bulk `aws s3 sync` deafened 12 of 17 bridges.
+_BULK_PUMP = _PumpLoop()
+#: The bridges' selector (Anthropic's domains, the 101 path), and the
+#: process's: it answers for `_BULK_PUMP` too.
+_PUMP = _PumpLoop(siblings=(_BULK_PUMP,))
 
 
 def _pump(a: socket.socket, b: socket.socket) -> None:
@@ -24566,7 +24585,7 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
 
 
 def _pump_detached(a: socket.socket, b: socket.socket, on_close=None,
-                   kind: str = "bridge") -> None:
+                   kind: str = "bridge", loop=None) -> None:
     """Hand a tunnel to the shared selector and RETURN.
 
     This is where the thread is given back. A tunnel is opaque from the 200
@@ -24588,7 +24607,7 @@ def _pump_detached(a: socket.socket, b: socket.socket, on_close=None,
                 except Exception:  # noqa: BLE001
                     pass
         return
-    _PUMP.add(a, b, on_close, kind)
+    (loop or _PUMP).add(a, b, on_close, kind)
 
 
 if __name__ == "__main__":  # pragma: no cover — exercised as a subprocess

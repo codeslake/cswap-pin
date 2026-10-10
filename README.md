@@ -1001,6 +1001,12 @@ Connections are multiplexed on one selector instead. Measured with
 A ceiling was tried first and removed: it turns the 257th retry into a
 refused connection and leaves the coupling in place.
 
+Tunnels to hosts that are not Anthropic's (the same population as the ceiling
+below) run on a second selector thread of their own. Every command Claude Code
+runs inherits `HTTPS_PROXY`, so one bulk `aws s3 sync` shared the bridges'
+selector and deafened 12 of 17 Remote Control bridges. The cost is one flat
+thread: `thread_probe.py` reads 6 threads idle and 7 from 50 tunnels up to 256.
+
 One ceiling is back, for a different resource. A fan-out of tunnels to hosts
 that are not Anthropic's (an agent's 48 parallel bulk transfers, measured at
 ~500 tunnels) used every fd the egress hop had, and Claude's own `/v1/messages`
