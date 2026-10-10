@@ -4378,6 +4378,34 @@ def _carry_job_record(job_id: str, login: tuple[str, str]) -> bool:
     return True
 
 
+#: ``(projects dir, session id)`` -> ``(its one transcript or None, when we
+#: looked)``. `_last_pointer` ran `projects/*/<id>.jsonl` for every live
+#: session on every `POST /v1/code/sessions`: ~316,000 fs calls on a host with
+#: 15,799 project dirs and 20 live sessions, and 1,027,803 ms for one create
+#: beside a CPU-bound thread. A live session's transcript does not move.
+#:
+#: A MISS is remembered for `_TRANSCRIPT_MISS_S` only, because a transcript
+#: appears once the session speaks (2 of 20 live sessions had none yet). An id
+#: that names TWO files is never remembered, so the decline below stays exact.
+# shortcut: a second file for a remembered id is not seen until the remembered
+# path vanishes; the cost is one restamp appended to the older transcript.
+_TRANSCRIPT_MISS_S = 60.0
+_transcript_seen: "dict[tuple[Path, str], tuple[Path | None, float]]" = {}
+
+
+def _transcript_paths(projects: Path, session_id: str) -> list[Path]:
+    key = (projects, session_id)
+    path, at = _transcript_seen.get(key, (None, -_TRANSCRIPT_MISS_S))  # unseen reads as expired
+    if path is not None and path.exists():
+        return [path]
+    if path is None and time.monotonic() - at < _TRANSCRIPT_MISS_S:
+        return []
+    paths = list(projects.glob(f"*/{session_id}.jsonl"))
+    if len(paths) < 2:
+        _transcript_seen[key] = (paths[0] if paths else None, time.monotonic())
+    return paths
+
+
 def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     """The transcript and its last ``bridge-session`` record, from the tail.
 
@@ -4397,7 +4425,8 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     found: list[tuple[Path, dict]] = []
     # A guard here would also make `_carry_history_pointers`' stated reason for
     # its outer catch-all untrue.
-    for path in (get_claude_config_home() / "projects").glob(f"*/{session_id}.jsonl"):
+    for path in _transcript_paths(get_claude_config_home() / "projects",
+                                  session_id):
         try:
             with path.open("rb") as fh:
                 fh.seek(0, os.SEEK_END)

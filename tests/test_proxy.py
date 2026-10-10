@@ -640,6 +640,89 @@ class TestHistoryCarriesAcrossASwitch:
         for line in path.read_text().splitlines():
             json.loads(line)          # every line still parses on its own
 
+    # --- the live carry on the request path: no directory scan per session --
+
+    def _live_carry(self, home, monkeypatch, sids):
+        """`carry_live_pointers` over `sids` with every project-dir listing
+        counted. Returns ``(carry, scans)``; `scans` grows by one per `glob`
+        or `iterdir` taken on ``projects/``."""
+        import cswap_pin.proxy as pp
+
+        for i in range(30):
+            (home / "projects" / f"p{i}").mkdir()
+        monkeypatch.setattr(pp, "_live_job_ids", lambda: [])
+        monkeypatch.setattr(pp, "_live_session_ids", lambda: list(sids))
+        scans: list[str] = []
+        for name in ("glob", "iterdir"):
+            real = getattr(Path, name)
+
+            def counted(self, *a, _real=real, _name=name, **k):
+                if self == home / "projects":
+                    scans.append(_name)
+                return _real(self, *a, **k)
+            monkeypatch.setattr(Path, name, counted)
+        return pp.carry_live_pointers, scans
+
+    def case_a_second_carry_scans_no_project_dir_for_a_session_it_has_seen(
+            self, tmp_path, monkeypatch):
+        """EVERY CREATE RAN THIS FOR EVERY LIVE SESSION. Measured on a host
+        with 15,799 project dirs and 20 live sessions: ~316,000 fs calls per
+        `POST /v1/code/sessions`, 1.4-2 s on a quiet day and 1,027,803 ms
+        beside a CPU-bound thread. Where a transcript is does not change while
+        its session lives, so the second look is a stat, not a scan."""
+        home = self._fleet(tmp_path, monkeypatch)
+        sids = ["live-a", "live-b", "live-c"]
+        paths = [self._session(home, s, pid=999) for s in sids]
+        carry, scans = self._live_carry(home, monkeypatch, sids)
+
+        assert carry(self.LOGIN) == 3
+        assert len(scans) == 3, "CONTROL: the first look must scan, or the counter is blind"
+        del scans[:]
+        assert carry(("acct-2", "org-2")) == 3, (
+            "found by the remembered path, a changed login still carries")
+        assert scans == [], f"a seen session scanned projects/ again: {scans}"
+        assert self._tail_pointer(paths[0])["ownerAccountUuid"] == "acct-2"
+
+    def case_a_moved_transcript_is_found_again(self, tmp_path, monkeypatch):
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "live-a", pid=999)
+        carry, scans = self._live_carry(home, monkeypatch, ["live-a"])
+        assert carry(self.LOGIN) == 1
+
+        moved = home / "projects" / "p7" / path.name
+        path.rename(moved)
+        del scans[:]
+        assert carry(("acct-2", "org-2")) == 1, "the moved transcript was lost"
+        assert len(scans) == 1
+        assert self._tail_pointer(moved)["ownerAccountUuid"] == "acct-2"
+
+    def case_a_session_with_no_transcript_is_not_rescanned_for_a_minute(
+            self, tmp_path, monkeypatch):
+        """2 of 20 live sessions on the measured host had no transcript yet;
+        remembering only hits left them paying the whole scan on every create."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        carry, scans = self._live_carry(home, monkeypatch, ["late"])
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+        assert carry(self.LOGIN) == 0 and len(scans) == 1, (
+            "a miss inside the window scanned again")
+
+        path = self._session(home, "late", pid=999)
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)
+        assert carry(self.LOGIN) == 1, "the transcript that appeared was never looked for"
+        assert self._tail_pointer(path)["ownerAccountUuid"] == "acct-1"
+
+    def case_an_ambiguous_id_is_never_remembered(self, tmp_path, monkeypatch):
+        """Two files carrying a pointer decline, as before, on every look:
+        the first must not leave the id pinned to either file."""
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dup", pid=999)
+        carry, _ = self._live_carry(home, monkeypatch, ["dup"])
+        twin = home / "projects" / "p3" / path.name
+        twin.write_text(path.read_text())
+        assert carry(self.LOGIN) == 0
+        assert carry(self.LOGIN) == 0, "a declined id was remembered as one file"
 
 _TEST_IDENTITY = hashlib.sha256(b"org:test-org").hexdigest()
 # T0681 ROUND 4: the fixed token/account pair `_seed_trusted_stamp` writes
