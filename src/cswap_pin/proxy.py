@@ -22309,6 +22309,7 @@ _worker_alive: dict[str, float] = {}
 #: very clock it was throttled by and never reached the file.
 _worker_alive_written: dict[str, float] = {}
 _worker_alive_lock = threading.Lock()
+_alive_file_lock = threading.Lock()
 #: WHERE THE EVIDENCE LIVES, AND IT CANNOT BE THIS PROCESS'S MEMORY. A
 #: long-held stream stays with the DEPARTING daemon for the whole drain while
 #: its session's heartbeats move to the successor, so the process holding the
@@ -22387,32 +22388,37 @@ def _note_worker_status(path: str | None, status_line: bytes,
     p = _alive_path(certdir)
     if p is None:
         return
-    shared = _alive_load(certdir)
-    # THE WRITER'S OWN PID IS PART OF THE KEY, not the value -- a value has
-    # to stay a bare number or the filter two lines down (every OTHER
-    # writer's read-modify-write, not just this one) drops the entry on its
-    # very next pass. See `_worker_alive_age`, the reader this exists for.
-    #
-    # BOTH SHAPES, DURING THE ROLLOUT HANDOVER. A DEPLOYED release still
-    # reads the bare `shared.get(sid)` -- a draining OLD daemon running that
-    # code cannot see a successor's `sid@pid`-only stamp, and after
-    # `_STREAM_LIVE_SECONDS` a spurious stream 404 passes through and ends
-    # the session. `_stream_404_is_spurious` here already accepts either
-    # shape; the bare key is for the reader this process has not upgraded
-    # past yet.
-    shared[sid] = now
-    shared[f"{sid}@{os.getpid()}"] = now
-    # MERGED, NOT OVERWRITTEN: the departing daemon and its successor both
-    # write here. A lost update costs one entry and fails toward "no
-    # evidence", which is the direction that lets the 404 through.
-    shared = {k: v for k, v in shared.items()
-              if isinstance(v, (int, float)) and now - v <= _STREAM_LIVE_SECONDS}
-    try:
-        tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(shared))
-        os.replace(tmp, p)      # atomic, so a reader never sees a torn file
-    except OSError:
-        pass
+    # ONE READ-MERGE-WRITE AT A TIME PER PROCESS: relay threads shared one temp
+    # name, so two writers tore the file (reads as `{}`, "no evidence") or merged
+    # into a stale read and dropped a stamp. Not `_worker_alive_lock`: this holds
+    # across disk I/O, which must not stall the in-memory check on every route.
+    with _alive_file_lock:
+        shared = _alive_load(certdir)
+        # THE WRITER'S OWN PID IS PART OF THE KEY, not the value -- a value has
+        # to stay a bare number or the filter two lines down (every OTHER
+        # writer's read-modify-write, not just this one) drops the entry on its
+        # very next pass. See `_worker_alive_age`, the reader this exists for.
+        #
+        # BOTH SHAPES, DURING THE ROLLOUT HANDOVER. A DEPLOYED release still
+        # reads the bare `shared.get(sid)` -- a draining OLD daemon running that
+        # code cannot see a successor's `sid@pid`-only stamp, and after
+        # `_STREAM_LIVE_SECONDS` a spurious stream 404 passes through and ends
+        # the session. `_stream_404_is_spurious` here already accepts either
+        # shape; the bare key is for the reader this process has not upgraded
+        # past yet.
+        shared[sid] = now
+        shared[f"{sid}@{os.getpid()}"] = now
+        # MERGED, NOT OVERWRITTEN: the departing daemon and its successor both
+        # write here. A lost update costs one entry and fails toward "no
+        # evidence", which is the direction that lets the 404 through.
+        shared = {k: v for k, v in shared.items()
+                  if isinstance(v, (int, float)) and now - v <= _STREAM_LIVE_SECONDS}
+        try:
+            tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(shared))
+            os.replace(tmp, p)      # atomic, so a reader never sees a torn file
+        except OSError:
+            pass
 
 
 def _stream_404_is_spurious(path: str | None, certdir=None) -> bool:

@@ -22467,6 +22467,38 @@ class TestTheEvidenceSurvivesAHandover:
             pp._worker_alive), (len(pp._worker_alive_written),
                                 len(pp._worker_alive))
 
+    def case_concurrent_stampers_never_tear_the_file_or_lose_a_stamp(
+            self, certdir):
+        """EVERY RELAY THREAD WRITES THIS FILE. One shared temp name let two
+        writers truncate each other's bytes before `os.replace` (a torn file, or
+        an ENOENT swallowed as "no write"), and the unlocked read-merge-write
+        dropped whichever stamp merged into the staler read. Either one reads
+        back as "no evidence", the answer that lets a real stream 404 through.
+        Fresh sids every round, so a stamp lost in round r is never re-written
+        and stays missing at the end; a barrier makes each round a collision."""
+        import json
+        import threading
+        from cswap_pin import proxy as pp
+        self._cold()
+        threads, rounds = 8, 60
+        gate = threading.Barrier(threads)
+        sids = [f"cse_race{t:02d}r{r:03d}" for t in range(threads)
+                for r in range(rounds)]
+
+        def stamp(t):
+            for r in range(rounds):
+                gate.wait()
+                pp._note_worker_status(
+                    f"/v1/code/sessions/cse_race{t:02d}r{r:03d}/worker/heartbeat",
+                    b"HTTP/1.1 200 OK", certdir)
+
+        ts = [threading.Thread(target=stamp, args=(t,)) for t in range(threads)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        got = json.loads(pp._alive_path(certdir).read_text())
+        missing = [s for s in sids if s not in got]
+        assert not missing, f"{len(missing)}/{len(sids)} stamps lost: {missing[:3]}"
+
     def case_a_fresh_bare_key_from_an_older_writer_still_spares_the_404(
             self, certdir):
         """The `k == sid` branch in `_stream_404_is_spurious`, untested until
