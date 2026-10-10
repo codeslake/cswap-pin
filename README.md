@@ -945,6 +945,18 @@ tunnels, so the **socket** moves instead.
   as not refused. The new daemon's own `/health` is the measurement, and a
   lineage that is read as refused anyway stays where it is (one move).
 
+### `/health`'s `pin_identity_mismatch` is a verdict of one generation
+
+An object means the bearer in the pinned slot answers as another account than
+the pin (`{"pinned": ..., "bearer": ...}`). `false` means this daemon checked
+its own bearer and it is the pinned account. `null` means unknown: a fresh
+process or a handover successor before its first check, or a pin that is the
+live login, where there is no spliced bearer to evaluate. A reader treats
+`null` as unknown, never as clean and never as foreign. The verdict is not
+inherited across a handover: a verdict on the predecessor's bearer does not
+vouch for the one the successor serves, so an upgrade through a handover
+reads `null` again until the successor's first check.
+
 ## Falling through a dead hop
 
 The pin dials through whatever egress proxy the machine already has, and that
