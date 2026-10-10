@@ -3553,7 +3553,11 @@ def _certs_consistent(
         san = leaf.extensions.get_extension_for_class(
             x509.SubjectAlternativeName
         ).value.get_values_for_type(x509.DNSName)
-        if host not in san:
+        # EVERY NAME THE LEAF SERVES, not just `host`: a leaf minted before
+        # the Chrome bridge was MITM'd has one SAN, and keeping it would make
+        # every `CONNECT bridge.claudeusercontent.com` fail its handshake.
+        # Regenerating replaces only the leaf; `ensure_ca` keeps the CA.
+        if any(name not in san for name in _leaf_hosts(host)):
             return False
         ca.public_key().verify(
             leaf.signature,
@@ -3664,6 +3668,15 @@ def _make_ca() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
     return cert, key
 
 
+def _leaf_hosts(host: str) -> list[str]:
+    """The names the MITM leaf must carry: `host`, plus the Chrome bridge.
+
+    One leaf serves both MITM'd hosts, so the server context needs no SNI
+    callback and the client's trust (the CA) does not change.
+    """
+    return [host] + [h for h in (CHROME_BRIDGE_HOST,) if h != host]
+
+
 def _make_leaf(
     host: str, ca_cert: x509.Certificate, ca_priv: rsa.RSAPrivateKey
 ) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
@@ -3678,7 +3691,9 @@ def _make_leaf(
         .not_valid_before(now - _dt.timedelta(days=1))
         .not_valid_after(now + _dt.timedelta(days=_LEAF_DAYS))
         .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False
+            x509.SubjectAlternativeName(
+                [x509.DNSName(name) for name in _leaf_hosts(host)]),
+            critical=False,
         )
         .add_extension(
             x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
@@ -15416,6 +15431,14 @@ def wire_env(
 
 UPSTREAM_HOST = "api.anthropic.com"
 UPSTREAM_PORT = 443
+# Claude in Chrome's relay. Claude Code opens `wss://<this>/chrome/<account
+# uuid>` and authenticates in its FIRST WebSocket message, `{"type":"connect",
+# "oauth_token": ...}` -- with the active account's token. The uuid in the
+# path is already the pin's (it comes from `/api/oauth/validate`, a pinned
+# route), so after a swap the relay sees a pinned path and an active token and
+# closes with "User mismatch". `_chrome_bridge` MITMs this host to put the
+# pinned token in that one message; nothing else on the socket is touched.
+CHROME_BRIDGE_HOST = "bridge.claudeusercontent.com"
 
 # ~500 parallel bulk tunnels to other hosts took every fd the hop had and
 # /v1/messages got 502; 256 at 2 fds each leaves a 1024-nofile hop room for the API.
@@ -19615,6 +19638,8 @@ class PinProxy:
                 # api.anthropic.com takes this path — git, pip, npm, the
                 # auto-updater.
                 host = target.rsplit(":", 1)[0]
+                if host == CHROME_BRIDGE_HOST:
+                    return self._chrome_bridge(target, conn)
                 if host != UPSTREAM_HOST:
                     return self._capped_tunnel(target, conn)
                 return self._mitm(conn)
@@ -21871,17 +21896,82 @@ class PinProxy:
             pass
         conn.close()
 
-    def _blind_tunnel(self, target: str, conn: socket.socket, give) -> None:
+    def _chrome_bridge(self, target: str, conn: socket.socket) -> bool:
+        """Claude in Chrome's relay, with the pinned token in its connect frame.
+
+        WITHOUT A SWAP TO MAKE THIS IS THE BLIND TUNNEL, unchanged: the pin is
+        the active account, or no token can be minted. Otherwise the CONNECT
+        is MITM'd so the one place Claude Code puts a bearer on this socket --
+        `oauth_token` in its first WebSocket message -- can carry the pin's.
+        The handshake and every later frame pass through as they arrived.
+
+        `Sec-WebSocket-Extensions` is dropped from the handshake so no
+        compression is negotiated: a deflated connect frame could not be read
+        here, and this socket carries only small JSON control messages.
+        True when the connection was handed to the pump.
+        """
+        try:
+            token = self._pin_token_provider()
+        except Exception:  # noqa: BLE001 — a failed mint must not cost the tunnel
+            token = None
+        if not token:
+            return self._capped_tunnel(target, conn)
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        tls = up = None
+        handed = False
+        try:
+            tls = self._server_ctx.wrap_socket(conn, server_side=True)
+            tls.settimeout(_CHROME_HANDSHAKE_S)
+            head = _read_head(tls)
+            if head is None:
+                return False
+            dialled = self._dial_tunnel(target, tls)
+            if dialled is None:
+                return False
+            up, via_loopback = dialled  # raw first, so a failed wrap closes it
+            up = _wrap_upstream(
+                self._upstream_ctx(via_loopback), up, CHROME_BRIDGE_HOST)
+            up.settimeout(_CHROME_HANDSHAKE_S)
+            up.sendall(_strip_ws_extensions(head))
+            if not _relay_upgrade(up, tls):
+                return False
+            frame = _read_ws_frame(tls)
+            if frame is None:
+                return False
+            swapped = _swap_connect_token(frame, token)
+            up.sendall(swapped or frame)
+            if swapped:
+                _log_lifecycle(
+                    "a Claude in Chrome bridge connected with the pinned "
+                    "account's token, so the extension signed in to it stays "
+                    "reachable across the account rotation")
+            tls.settimeout(None)
+            up.settimeout(None)
+            _c = getattr(self._local, "conn", None) or conn
+            self._owe_answer(_c, False)
+            _pump_detached(tls, up, getattr(self._local, "release", None))
+            handed = True
+            return True
+        except (OSError, ValueError):
+            return False
+        finally:
+            if not handed:
+                for sock in (tls, up, conn):
+                    if sock is not None:
+                        with contextlib.suppress(OSError):
+                            sock.close()
+
+    def _dial_tunnel(self, target: str, conn: socket.socket
+                     ) -> "tuple[socket.socket, bool] | None":
+        """A raw socket to `target` -- through the chain, else direct -- and
+        whether it went through a LOOPBACK hop (see :meth:`_upstream_ctx`).
+
+        None when nothing could carry it; `conn` has then already been
+        answered or closed. Shared by the blind tunnel and the Chrome bridge
+        MITM, which differ only in what they do with the socket afterwards.
+        """
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
-        # Trace the tunnel too. Remote Control receives over a WebSocket to the
-        # ingress host the /bridge response names — NOT api.anthropic.com — so
-        # it lands here, not in the MITM. Logging only the MITM made an absent
-        # inbound channel look identical to a healthy one: the routes CC sends
-        # (worker/events, heartbeat) were all 200 in the trace while the
-        # channel CC *receives* on left no line at all.
-        self._tunnel_trace(
-            f"CONNECT {target} tunnelled (no pin: bearer never seen)")
         up = None
         # EVERY HOP, not just the first. Remote Control RECEIVES over a
         # WebSocket to the ingress host the /bridge response names, which is
@@ -21954,6 +22044,7 @@ class PinProxy:
             if self._hop_fault and self._hop_fault[0] == chain.address:
                 self._hop_fault = None
             up = carrying  # the peeked byte, pushed back in front of the stream
+            via_loopback = chain.host in _LOOPBACK
         if up is None:
             # Every hop failed (down, or refused this host outright). A host
             # WITH a chain configured must not fall through to a direct dial
@@ -21962,15 +22053,31 @@ class PinProxy:
             if candidates and not _direct_allowed():
                 self._note_egress_refused()
                 self._refuse_tunnel(conn)
-                return
+                return None
             try:
                 up = socket.create_connection((host, port), timeout=15)
             except OSError:
                 conn.close()
-                return
+                return None
+            via_loopback = False
         # Connect budget only — a tunnel is long-lived by definition, and a
         # read timeout left on it would tear down an idle-but-healthy stream.
         up.settimeout(None)
+        return up, via_loopback
+
+    def _blind_tunnel(self, target: str, conn: socket.socket, give) -> None:
+        # Trace the tunnel too. Remote Control receives over a WebSocket to the
+        # ingress host the /bridge response names — NOT api.anthropic.com — so
+        # it lands here, not in the MITM. Logging only the MITM made an absent
+        # inbound channel look identical to a healthy one: the routes CC sends
+        # (worker/events, heartbeat) were all 200 in the trace while the
+        # channel CC *receives* on left no line at all.
+        self._tunnel_trace(
+            f"CONNECT {target} tunnelled (no pin: bearer never seen)")
+        dialled = self._dial_tunnel(target, conn)
+        if dialled is None:
+            return
+        up, _via_loopback = dialled
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         # A TUNNEL OWES NOTHING, AND THIS IS THE PATH THE RC WEBSOCKET TAKES.
         # The connection was marked OWED at accept, and until this line existed
@@ -22159,6 +22266,99 @@ def _peek_status(up) -> "tuple[int | None, bytes]":
     if len(line) < 2 or not line[1].isdigit():
         return None, bytes(buf)
     return int(line[1]), bytes(buf)
+
+
+_CHROME_HANDSHAKE_S = 30.0
+
+
+def _read_head(sock) -> bytes | None:
+    """An HTTP request head, through its blank line; None on EOF or overrun."""
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(1)
+        if not chunk or len(buf) > 65536:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+def _strip_ws_extensions(head: bytes) -> bytes:
+    """`head` without `Sec-WebSocket-Extensions`, so no compression is agreed."""
+    lines = head.split(b"\r\n")
+    return b"\r\n".join(
+        l for l in lines
+        if not l.lower().startswith(b"sec-websocket-extensions:"))
+
+
+def _recv_exact(sock, n: int) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+def _read_ws_frame(sock) -> bytes | None:
+    """One whole WebSocket frame as it arrived on the wire; None on EOF.
+
+    Capped at 64 KiB: the frame this is read for is a short JSON message,
+    and a length past that is not one worth buffering.
+    """
+    hdr = _recv_exact(sock, 2)
+    if hdr is None:
+        return None
+    n = hdr[1] & 0x7F
+    ext = b""
+    if n == 126:
+        ext = _recv_exact(sock, 2)
+        n = int.from_bytes(ext or b"", "big")
+    elif n == 127:
+        ext = _recv_exact(sock, 8)
+        n = int.from_bytes(ext or b"", "big")
+    if ext is None or n > 65536:
+        return None
+    rest = _recv_exact(sock, n + (4 if hdr[1] & 0x80 else 0))
+    if rest is None:
+        return None
+    return hdr + ext + rest
+
+
+def _ws_frame(payload: bytes) -> bytes:
+    """A final, masked text frame -- the shape a client must send."""
+    n = len(payload)
+    if n < 126:
+        head = bytes([0x81, 0x80 | n])
+    elif n < 65536:
+        head = bytes([0x81, 0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        head = bytes([0x81, 0x80 | 127]) + n.to_bytes(8, "big")
+    mask = os.urandom(4)
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def _swap_connect_token(frame: bytes, token: str) -> bytes | None:
+    """`frame` re-encoded with `oauth_token` set to `token`, when it is Claude
+    in Chrome's connect message; None for any other frame.
+
+    Only a final, unfragmented, masked text frame with no RSV bits qualifies
+    -- anything else is passed through untouched rather than guessed at.
+    """
+    if len(frame) < 2 or frame[0] != 0x81 or not frame[1] & 0x80:
+        return None
+    n = frame[1] & 0x7F
+    off = 2 + (2 if n == 126 else 8 if n == 127 else 0)
+    mask, data = frame[off:off + 4], frame[off + 4:]
+    try:
+        msg = json.loads(bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+    except ValueError:
+        return None
+    if not (isinstance(msg, dict) and msg.get("type") == "connect"
+            and "oauth_token" in msg):
+        return None
+    msg["oauth_token"] = token
+    return _ws_frame(json.dumps(msg, separators=(",", ":")).encode())
 
 
 def _relay_upgrade(

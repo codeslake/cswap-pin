@@ -14010,7 +14010,9 @@ class TestDrainReportsWhatItCut:
         # Reaching them needs a real chain, so read it out of the source.
         import inspect
 
-        src = inspect.getsource(pp.PinProxy._blind_tunnel)
+        # The dial lives in `_dial_tunnel`, shared with the Chrome bridge MITM.
+        src = (inspect.getsource(pp.PinProxy._blind_tunnel)
+               + inspect.getsource(pp.PinProxy._dial_tunnel))
         assert "_TRACE.write" not in src, (
             "a tunnel line still writes straight to the import-time global, "
             "so that line is invisible to a trace armed during an incident")
@@ -22799,3 +22801,210 @@ class TestTheVerifyingContextTrustsTheHop:
 
         monkeypatch.setattr(ssl, "create_default_context", strict_like_3_13)
         assert not proxy._verifying_context().verify_flags & ssl.VERIFY_X509_STRICT
+
+
+def _client_ws_frame(payload: bytes) -> bytes:
+    """A masked final text frame, built here rather than with the code under
+    test, so a bug in the proxy's own encoder cannot hide in both ends."""
+    import os as _os
+    mask = _os.urandom(4)
+    n = len(payload)
+    if n < 126:
+        head = bytes([0x81, 0x80 | n])
+    else:
+        head = bytes([0x81, 0x80 | 126]) + n.to_bytes(2, "big")
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def _unmask(frame: bytes) -> bytes:
+    n = frame[1] & 0x7F
+    off = 2 + (2 if n == 126 else 8 if n == 127 else 0)
+    mask, data = frame[off:off + 4], frame[off + 4:]
+    return bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+
+class _FakeChromeBridge:
+    """bridge.claudeusercontent.com for one WebSocket: records the handshake
+    head and the first two client frames, answers 101 and one server frame."""
+
+    def __init__(self, certdir: Path):
+        self.head = ""
+        self.frames: list[bytes] = []
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"),
+                                  str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.settimeout(10)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        self.done = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        from cswap_pin.proxy import _read_head, _read_ws_frame
+        try:
+            conn, _ = self._srv.accept()
+            conn.settimeout(10)
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            self.head = _read_head(tls).decode("latin1")
+            tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            for _ in range(2):
+                self.frames.append(_read_ws_frame(tls))
+                if len(self.frames) == 1:
+                    tls.sendall(b"\x81\x0b" + b'{"ok":true}')
+            tls.close()
+        except Exception:  # noqa: BLE001 — the asserts report what is missing
+            pass
+        finally:
+            self.done.set()
+            self._srv.close()
+
+
+class TestChromeBridgeCarriesThePinnedToken:
+    """Claude in Chrome authenticates in its first WebSocket message, with the
+    ACTIVE account's token, to a path naming the PINNED account. Without the
+    swap the relay answers "User mismatch" after every rotation."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _open(proxy, certdir):
+        raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        raw.sendall(b"CONNECT bridge.claudeusercontent.com:443 HTTP/1.1\r\n"
+                    b"Host: bridge.claudeusercontent.com:443\r\n\r\n")
+        got = b""
+        while b"\r\n\r\n" not in got:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            got += chunk
+        assert got.startswith(b"HTTP/1.1 200"), got
+        ctx = ssl.create_default_context(cafile=str(certdir / "ca.pem"))
+        return ctx.wrap_socket(raw,
+                               server_hostname="bridge.claudeusercontent.com")
+
+    def case_the_connect_frame_reaches_the_relay_with_the_pinned_token(
+        self, certdir
+    ):
+        from cswap_pin.proxy import PinProxy, _read_ws_frame
+
+        bridge = _FakeChromeBridge(certdir)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PINNED")
+        proxy._dial_tunnel = lambda target, conn: (
+            socket.create_connection(("127.0.0.1", bridge.port), timeout=10),
+            False)
+        proxy.start()
+        try:
+            tls = self._open(proxy, certdir)
+            tls.sendall(
+                b"GET /chrome/pin-uuid HTTP/1.1\r\n"
+                b"Host: bridge.claudeusercontent.com\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                b"Sec-WebSocket-Version: 13\r\n"
+                b"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
+            got = b""
+            while b"\r\n\r\n" not in got:
+                got += tls.recv(4096)
+            assert got.startswith(b"HTTP/1.1 101"), got
+            connect = json.dumps({"type": "connect",
+                                  "client_type": "claude-code",
+                                  "oauth_token": "ACTIVE"}).encode()
+            tls.sendall(_client_ws_frame(connect))
+            assert _read_ws_frame(tls) == b"\x81\x0b" + b'{"ok":true}'
+            # Past 125 bytes, so the second frame takes the 16-bit length.
+            later = json.dumps({"type": "tool_result",
+                                "content": "x" * 200}).encode()
+            later_frame = _client_ws_frame(later)
+            tls.sendall(later_frame)
+            assert bridge.done.wait(10)
+            tls.close()
+        finally:
+            proxy.stop()
+
+        assert "/chrome/pin-uuid" in bridge.head
+        assert "sec-websocket-extensions" not in bridge.head.lower(), (
+            "compression was left negotiable, so a later connect frame could "
+            "arrive deflated and unreadable")
+        sent = json.loads(_unmask(bridge.frames[0]))
+        assert sent == {"type": "connect", "client_type": "claude-code",
+                        "oauth_token": "PINNED"}, sent
+        assert bridge.frames[1] == later_frame, (
+            "a frame after the connect message was altered")
+
+    def case_without_a_pinned_token_the_bridge_is_a_blind_tunnel(
+        self, certdir
+    ):
+        from cswap_pin.proxy import PinProxy
+
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        tunnelled = []
+        proxy._capped_tunnel = lambda target, conn: (
+            tunnelled.append(target), conn.close())
+        proxy._chrome_bridge("bridge.claudeusercontent.com:443",
+                             socket.socket())
+        assert tunnelled == ["bridge.claudeusercontent.com:443"]
+
+    def case_only_the_connect_message_is_rewritten(self):
+        from cswap_pin.proxy import _swap_connect_token
+
+        other = _client_ws_frame(b'{"type":"ping"}')
+        assert _swap_connect_token(other, "PINNED") is None
+        assert _swap_connect_token(_client_ws_frame(b"not json"), "P") is None
+        unmasked = b"\x81" + bytes([20]) + b'{"type":"connect"}  '
+        assert _swap_connect_token(unmasked, "PINNED") is None
+        long_tok = "t" * 300  # the re-encoded frame needs the 16-bit length
+        out = _swap_connect_token(_client_ws_frame(
+            b'{"type":"connect","oauth_token":"A"}'), long_tok)
+        assert out[1] & 0x7F == 126
+        assert json.loads(_unmask(out))["oauth_token"] == long_tok
+
+    def case_a_leaf_without_the_bridge_name_is_reissued_under_the_same_ca(
+        self, tmp_path
+    ):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        ca_before = (tmp_path / "ca.pem").read_bytes()
+        ca_cert = x509.load_pem_x509_certificate(ca_before)
+        ca_priv = serialization.load_pem_private_key(
+            (tmp_path / "ca.key").read_bytes(), password=None)
+        old = x509.load_pem_x509_certificate(
+            (tmp_path / "leaf.pem").read_bytes())
+        key = serialization.load_pem_private_key(
+            (tmp_path / "leaf.key").read_bytes(), password=None)
+        # The leaf every install had before this change: one SAN.
+        one_san = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name(
+                [x509.NameAttribute(NameOID.COMMON_NAME, "api.anthropic.com")]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(old.not_valid_before_utc)
+            .not_valid_after(old.not_valid_after_utc)
+            .add_extension(x509.SubjectAlternativeName(
+                [x509.DNSName("api.anthropic.com")]), critical=False)
+            .add_extension(x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                ca_cert.public_key()), critical=False)
+            .sign(ca_priv, hashes.SHA256())
+        )
+        (tmp_path / "leaf.pem").write_bytes(
+            one_san.public_bytes(serialization.Encoding.PEM))
+
+        ensure_ca(tmp_path, "api.anthropic.com")
+        assert (tmp_path / "ca.pem").read_bytes() == ca_before, (
+            "the CA was replaced, which breaks every session wired to it")
+        san = x509.load_pem_x509_certificate(
+            (tmp_path / "leaf.pem").read_bytes()).extensions \
+            .get_extension_for_class(x509.SubjectAlternativeName).value \
+            .get_values_for_type(x509.DNSName)
+        assert set(san) == {"api.anthropic.com",
+                            "bridge.claudeusercontent.com"}
