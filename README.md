@@ -493,6 +493,10 @@ put:
   "ghost" sessions pile up on the old account.
 - **Artifacts** — owned by the publishing bearer. After a swap a republish
   403s and the artifact "disappears" from the account you are logged into.
+- **Claude in Chrome** — the extension pairs with Claude Code through a relay
+  that checks the token Claude Code sends against the account the extension
+  is signed in to. After a swap the relay answers `User mismatch` and the
+  browser tools report "Browser extension is not connected".
 
 Claude Code resolves all of these through one credential accessor and has no
 per-operation token selector, so splitting auth *per operation inside one
@@ -518,6 +522,16 @@ claude session
 
 Inference keeps billing whichever account cswap has swapped onto. Only the
 claude.ai-side assets are pinned.
+
+**Claude in Chrome** goes to a second host, `bridge.claudeusercontent.com`, and
+puts its bearer in the first WebSocket message (`{"type":"connect",
+"oauth_token": ...}`) rather than a header. The pin MITMs that host too and
+rewrites `oauth_token` in that one message to the pinned account's token. The
+handshake and every later frame pass through unchanged, and compression is
+left unnegotiated so the message stays readable. When there is nothing to swap
+(the pin is the active account, or no pinned token can be minted) the host is
+tunnelled blind, as before. The MITM leaf carries both names, so an existing
+install gets a new leaf under the same CA on its next start.
 
 ### Remote Control has two front doors, and they own sessions differently
 
@@ -1094,7 +1108,8 @@ for a companion distribution exposed through an optional extra. See
 
 ## Trust
 
-The proxy generates its own CA to re-sign `api.anthropic.com` and names it in
+The proxy generates its own CA to re-sign `api.anthropic.com` (and
+`bridge.claudeusercontent.com`, for Claude in Chrome) and names it in
 `NODE_EXTRA_CA_CERTS`. Node accepts exactly one file there, so an existing CA
 (a corporate MITM, another local proxy) is **merged**, never replaced —
 otherwise the session silently loses trust in every host the other proxy
