@@ -24183,16 +24183,11 @@ class _PumpLoop:
     every one of them carries a measurement that would have to be re-proved
     against a coroutine rewrite. The property the outage needs is "a
     connection is not a thread", and that is this class.
-
-    TWO INSTANCES RUN, `_PUMP` and `_BULK_PUMP`, so a bulk stream cannot delay
-    a bridge's bytes in the selector; `_PUMP` answers for both.
     """
 
     def __init__(self, siblings=()):
-        # Loops this one answers for: `live_pairs`, `quiet_for`,
-        # `release_pairs` and `reset_for_tests` cover their tunnels too, so
-        # every reader of the process-wide pump (the drain, the claim, the
-        # reaper's marker) counts all of them without knowing there are two.
+        # Loops this one answers for (see `_BULK_PUMP`): the four process-wide
+        # reads below cover their tunnels, so no reader of `_PUMP` changes.
         self._siblings = tuple(siblings)
         # When any tunnel last moved a byte. The drain reads it to tell a
         # tunnel carrying a session from one whose peer has wedged.
