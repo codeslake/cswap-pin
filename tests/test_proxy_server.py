@@ -15808,6 +15808,10 @@ class TestFailOpenIsNotSilent:
         pp.save_pin(certdir, "pin@example.com", "org")
         switcher = _refetch_switcher(certdir, lambda n: "pin-tok")
         switcher.current_account_number = lambda: "2"
+        # The roster agrees, so the live-login answer comes from
+        # `_pin_is_the_live_login`'s agreement branch, not its
+        # unreadable-roster fallback.
+        switcher._get_sequence_data = lambda: {"activeAccountNumber": "2"}
         p = self._proxy(certdir, pp.make_pin_token_provider(
             switcher, "2", "pin@example.com"))
         p.start()
