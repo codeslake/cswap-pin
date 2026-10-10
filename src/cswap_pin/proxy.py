@@ -2309,10 +2309,12 @@ def wire_global_config(port: int | None, ca_path: Path | None,
     so this touches nothing new: not ``settings.json`` (Claude Code's own),
     not a shell rc, not a shim on PATH.
 
-    Only keys THIS function wrote are ever modified, tracked by name in
-    ``_WIRE_MARK``. A proxy the user (or their launcher) set themselves is
-    left exactly as found, and clearing the pin restores it rather than
-    deleting it — the ordering matters, because the env block is applied on
+    Only the keys THIS function writes are ever modified, tracked by name in
+    ``_WIRE_MARK``. A value already under one of those names (a proxy the user
+    or their launcher set, or an unmarked ``CSWAP_PIN_PORT`` block) is
+    REPLACED, not left as found: it is displaced into ``_WIRE_MARK``Saved, and
+    clearing the pin restores it rather than deleting it — the ordering
+    matters, because the env block is applied on
     top of the process environment and would otherwise silently displace a
     wrapper's own proxy.
 
@@ -9865,7 +9867,9 @@ def ensure_wired_to(port: int, certdir: Path) -> bool:
     that one. Measured 2026-09-24: a throwaway daemon on a spare certdir
     under the same ``$HOME`` rewired the shared ``.claude.json`` away from
     the live pin four times in one day. A wiring naming a DEAD port (or
-    nothing) is still corrected, exactly as before.
+    nothing) is still corrected, exactly as before, and that includes a
+    ``CSWAP_PIN_PORT`` block the pin never marked: its values are displaced
+    into the receipt's ``Saved`` and an unwire hands them back.
 
     ONLY WHILE A PIN RECORD EXISTS. `cswap pin --clear` drops the record and
     the wiring and leaves this daemon serving the sessions it holds; a
@@ -22299,6 +22303,11 @@ def _hop_recently_failed() -> bool:
 _STREAM_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker/events/stream")
 _WORKER_ROUTE = re.compile(r"/v1/code/sessions/([^/?]+)/worker")
 _worker_alive: dict[str, float] = {}
+#: When each session's stamp was last WRITTEN to the file, apart from when it
+#: was last SEEN above. The throttle needs the former: measured against the
+#: latter, a bridge asking every <=`_ALIVE_WRITE_EVERY` seconds refreshed the
+#: very clock it was throttled by and never reached the file.
+_worker_alive_written: dict[str, float] = {}
 _worker_alive_lock = threading.Lock()
 #: WHERE THE EVIDENCE LIVES, AND IT CANNOT BE THIS PROCESS'S MEMORY. A
 #: long-held stream stays with the DEPARTING daemon for the whole drain while
@@ -22361,7 +22370,6 @@ def _note_worker_status(path: str | None, status_line: bytes,
         return
     sid, now = m.group(1), time.time()
     with _worker_alive_lock:
-        last = _worker_alive.get(sid, 0.0)
         _worker_alive[sid] = now
         if len(_worker_alive) > 256:
             # One entry per session this daemon has ever relayed for, so it
@@ -22370,8 +22378,12 @@ def _note_worker_status(path: str | None, status_line: bytes,
             for k, seen in list(_worker_alive.items()):
                 if now - seen > _STREAM_LIVE_SECONDS:
                     del _worker_alive[k]
-        if now - last < _ALIVE_WRITE_EVERY:
+                    _worker_alive_written.pop(k, None)
+        # `0 <=`: a written stamp from the FUTURE (the wall clock stepped back)
+        # must not throttle, or the file stays still until the clock catches up.
+        if 0 <= now - _worker_alive_written.get(sid, 0.0) < _ALIVE_WRITE_EVERY:
             return
+        _worker_alive_written[sid] = now
     p = _alive_path(certdir)
     if p is None:
         return

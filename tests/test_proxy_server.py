@@ -22299,6 +22299,7 @@ class TestTheEvidenceSurvivesAHandover:
         from cswap_pin import proxy as pp
         with pp._worker_alive_lock:
             pp._worker_alive.clear()
+            pp._worker_alive_written.clear()
 
     @staticmethod
     def _relay(path, status, certdir):
@@ -22410,6 +22411,61 @@ class TestTheEvidenceSurvivesAHandover:
             "no bare `sid` key -- an old-shape reader's `.get(sid)` sees "
             f"nothing: {pp._alive_load(certdir)!r}")
         assert abs(bare - _t.time()) < 60, f"stale bare stamp: {bare}"
+
+    def _stamp_ages(self, certdir, monkeypatch, times):
+        """One 2xx worker request at each fake wall-clock instant in `times`,
+        returning the age the Rule 0 census reads (`_worker_alive_age`, the
+        FILE's newest stamp for this pid) right after each."""
+        import os
+        import time as _t
+        import types
+        from cswap_pin import proxy as pp
+        self._cold()
+        now = [0.0]
+        monkeypatch.setattr(pp, "time", types.SimpleNamespace(
+            time=lambda: now[0], monotonic=_t.monotonic))
+        ages = []
+        for now[0] in times:
+            pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+            ages.append(pp._worker_alive_age(certdir, os.getpid()))
+        return ages
+
+    def case_a_bridge_requesting_every_5s_keeps_a_fresh_file_stamp(
+            self, certdir, monkeypatch):
+        """THE THROTTLE MEASURED LAST SEEN, NOT LAST WRITTEN. A bridge asking
+        every <=10 s kept refreshing the clock the throttle compared against,
+        so the file stamp aged 0, 25, 85, 145 s while the session was live and
+        the census called a live bridge LOST."""
+        ages = self._stamp_ages(
+            certdir, monkeypatch, [1e6 + t for t in range(0, 61, 5)])
+        assert max(ages) < 15, ages
+
+    def case_CONTROL_a_12s_cadence_writes_every_request(
+            self, certdir, monkeypatch):
+        ages = self._stamp_ages(
+            certdir, monkeypatch, [1e6 + t for t in range(0, 61, 12)])
+        assert set(ages) == {0.0}, ages
+
+    def case_a_wall_clock_stepped_back_does_not_silence_the_file(
+            self, certdir, monkeypatch):
+        """A last-written stamp from the FUTURE must not throttle: unlike the
+        last-seen one it is not rewritten by every request, so one backward
+        step would hold the file still until the clock caught up."""
+        ages = self._stamp_ages(certdir, monkeypatch, [2000.0, 1000.0])
+        assert ages == [0.0, 0.0], ages
+
+    def case_the_written_map_is_evicted_with_the_seen_map(self, certdir):
+        from cswap_pin import proxy as pp
+        self._cold()
+        stale = __import__("time").time() - 3 * pp._STREAM_LIVE_SECONDS
+        with pp._worker_alive_lock:
+            for i in range(300):
+                pp._worker_alive[f"cse_old{i}"] = stale
+                pp._worker_alive_written[f"cse_old{i}"] = stale
+        pp._note_worker_status(self.BEAT, b"HTTP/1.1 200 OK", certdir)
+        assert set(pp._worker_alive_written) == {self.SID} == set(
+            pp._worker_alive), (len(pp._worker_alive_written),
+                                len(pp._worker_alive))
 
     def case_a_fresh_bare_key_from_an_older_writer_still_spares_the_404(
             self, certdir):
