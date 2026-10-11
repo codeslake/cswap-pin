@@ -20,6 +20,7 @@ import functools
 import http.server
 import json
 import os
+import shlex
 import shutil
 import socket
 import stat
@@ -38,8 +39,35 @@ SIX = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
 FLOOR_URL = "http://127.0.0.1:8118"
 
 
+# What CCF 4.4.0 answers on /health when no chain is configured (pmac, measured
+# 2026-10-11): it dials direct, `https_proxy` is null, and the sticky `direct_last`
+# was never stamped. CACHE_FIX_FALLBACK_PROXIES is set there, to an empty value.
+NO_UPSTREAM = {"status": "ok", "forward_proxy": True, "https_proxy": None,
+               "https_proxy_measured": False, "direct_last": None,
+               "gates": {"CACHE_FIX_FORWARD_PROXY": "on",
+                         "CACHE_FIX_FALLBACK_PROXIES": "<redacted>"}}
+
+
 def _pin_url(port=PIN):
     return f"http://127.0.0.1:{port}"
+
+
+def _serve_health(box):
+    """A /health server that answers `box["answer"]` (a dict) with a 200."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(box["answer"]).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 class _Rig:
@@ -75,6 +103,19 @@ class _Rig:
         argv = ([interp] if interp else []) + [str(self.script), command]
         return subprocess.run(argv, env=env, capture_output=True, text=True,
                               timeout=30)
+
+    def bash_tool(self, command, snapshot="zsh"):
+        """The string Claude Code 2.1.296 hands the prefix for a Bash-tool
+        command: it sources a snapshot written for the shell it picked (the file
+        name says which; no `snapshot` is a snapshot that failed), evals the
+        command, and reads the cwd back."""
+        source = (f"source '{self.tmp}/shell-snapshots/snapshot-{snapshot}-"
+                  "1700000000000-ab12cd.sh' 2>/dev/null || true && "
+                  if snapshot else "")
+        return (f"{source}{{ shopt -u extglob || setopt NO_EXTENDED_GLOB "
+                "NO_BARE_GLOB_QUAL; } >/dev/null 2>&1 || true && "
+                "{ \\builtin unalias -- 'unsetenv'; } >/dev/null 2>&1 || true && "
+                f"eval {shlex.quote(command)} && pwd -P >| '{self.tmp}/cwd'")
 
     def seen(self, shell, interp=None, **extra):
         """The proxy variables a command run through the script sees."""
@@ -287,22 +328,56 @@ class TestChildFloorScript:
         assert seen["HTTPS_PROXY"] == FLOOR_URL
 
     def case_the_command_is_run_unchanged(self, tmp_path):
-        """Exit code, both streams and the quoting survive the wrapper."""
+        """Exit code, both streams and the quoting survive the wrapper: a hook
+        as `/bin/sh -c` would have run it, a Bash-tool string as its shell."""
         rig = _Rig(tmp_path)
         rig.floor(FLOOR_URL + "\n")
         command = ("printf '%s\\n' \"a b\" 'c$d' | tr a-z A-Z; "
                    "echo \"line1\nline2\" >&2; echo $((6*7)) '$HOME'; exit 7")
-        for shell in _shells():
-            direct = subprocess.run([shell, "-c", command],
+        for interp in (None, "bash"):
+            if interp and not shutil.which(interp):
+                continue
+            direct = subprocess.run(["/bin/sh", "-c", command],
                                     capture_output=True, text=True,
-                                    env=rig.env(shell))
-            for interp in (None, "bash"):
-                if interp and not shutil.which(interp):
-                    continue
-                wrapped = rig.run(command, rig.env(shell), interp)
-                assert wrapped.returncode == direct.returncode == 7
-                assert wrapped.stdout == direct.stdout, wrapped
-                assert wrapped.stderr == direct.stderr, wrapped
+                                    env=rig.env("/bin/sh"))
+            wrapped = rig.run(command, rig.env("/bin/sh"), interp)
+            assert wrapped.returncode == direct.returncode == 7
+            assert (wrapped.stdout, wrapped.stderr) == (direct.stdout, direct.stderr)
+        for shell in _shells():
+            string = rig.bash_tool(command, os.path.basename(shell))
+            direct = subprocess.run([shell, "-c", string], capture_output=True,
+                                    text=True, env=rig.env(shell))
+            wrapped = rig.run(string, rig.env(shell))
+            assert wrapped.returncode == direct.returncode == 7
+            assert (wrapped.stdout, wrapped.stderr) == (direct.stdout, direct.stderr)
+
+    def case_a_hook_keeps_bin_sh_whatever_shell_the_user_has(self, tmp_path):
+        """A hook is spawned `/bin/sh -c "'prefix' 'cmd'"`: zsh would turn an
+        unmatched glob into an error and stop splitting an unquoted variable."""
+        rig = _Rig(tmp_path)
+        rig.floor(FLOOR_URL + "\n")
+        hooks = ("echo *.no-such-file-here; echo after",
+                 'v="a b"; set -- $v; echo $#',
+                 'echo "${BASH_VERSION:+bash}${ZSH_VERSION:+zsh}"')
+        for shell in _shells():
+            for hook in hooks:
+                direct = subprocess.run(["/bin/sh", "-c", hook], capture_output=True,
+                                        text=True, env=rig.env(shell))
+                for env in (rig.env(shell), rig.env(shell, CLAUDE_CODE_SHELL=shell)):
+                    wrapped = rig.run(hook, env)
+                    assert (wrapped.returncode, wrapped.stdout, wrapped.stderr) == (
+                        direct.returncode, direct.stdout, direct.stderr), (
+                        shell, hook, wrapped, direct)
+
+    def case_a_stdio_mcp_command_line_is_run_as_it_was_quoted(self, tmp_path):
+        """A stdio MCP server arrives as the prefix plus ONE quoted string."""
+        rig = _Rig(tmp_path)
+        rig.floor(FLOOR_URL + "\n")
+        for shell in _shells():
+            done = rig.run("'printf' '%s|%s\\n' 'a b' '$HOME'", rig.env(shell))
+            assert (done.returncode, done.stdout) == (0, "a b|$HOME\n"), done
+            done = rig.run("'sh' '-c' 'exit 3'", rig.env(shell))
+            assert done.returncode == 3, done
 
     def case_a_user_prefix_is_invoked_with_the_command(self, tmp_path):
         log = Path(tmp_path) / "log"
@@ -342,23 +417,41 @@ class TestChildFloorScript:
     def case_the_shell_is_the_one_claude_code_picked(self, tmp_path):
         """`h0s` in the 2.1.296 binary: CLAUDE_CODE_SHELL if it names bash or
         zsh and runs, else SHELL if it names bash or zsh, else a search that
-        tries zsh first (bash first when SHELL names bash). The Bash tool's
-        command string carries a snapshot written for THAT shell."""
+        tries zsh first (bash first when SHELL names bash). Used for a Bash-tool
+        string whose snapshot names no shell Claude Code uses (`sh`) or that has
+        no snapshot at all."""
         rig = _Rig(tmp_path)
         bash = shutil.which("bash")
         probe = 'echo "${BASH_VERSION:+bash}${ZSH_VERSION:+zsh}"'
-        env = rig.env("/bin/sh", CLAUDE_CODE_SHELL=bash)
-        assert rig.run(probe, env).stdout.strip() == "bash"
-        # SHELL naming neither shell, and nothing set: still a shell that runs.
-        for shell in ("/usr/bin/fish", "/nonexistent/zsh", None):
-            done = rig.run("echo ok", rig.env(shell))
-            assert (done.returncode, done.stdout.strip()) == (0, "ok"), (
-                shell, done)
-        # SHELL names bash but is not there: the search tries bash first.
-        done = rig.run(probe, rig.env("/nonexistent/bash"))
-        assert done.stdout.strip() == "bash", done
-        done = rig.run(probe, rig.env(bash))
-        assert done.stdout.strip() == "bash"
+        for snapshot in ("sh", None):
+            string = rig.bash_tool(probe, snapshot)
+            env = rig.env("/bin/sh", CLAUDE_CODE_SHELL=bash)
+            assert rig.run(string, env).stdout.strip() == "bash", snapshot
+            # SHELL naming neither shell, and nothing set: still a shell that runs.
+            for shell in ("/usr/bin/fish", "/nonexistent/zsh", None):
+                done = rig.run(rig.bash_tool("echo ok", snapshot), rig.env(shell))
+                assert (done.returncode, done.stdout.strip()) == (0, "ok"), (
+                    shell, done)
+            # SHELL names bash but is not there: the search tries bash first.
+            done = rig.run(string, rig.env("/nonexistent/bash"))
+            assert done.stdout.strip() == "bash", done
+            done = rig.run(string, rig.env(bash))
+            assert done.stdout.strip() == "bash"
+
+    def case_a_bash_tool_string_runs_under_the_shell_its_snapshot_names(
+        self, tmp_path
+    ):
+        """The snapshot is written for one shell and sourced by that shell
+        only. SHELL says the other one, so the picker alone would be wrong."""
+        rig = _Rig(tmp_path)
+        probe = 'echo "${BASH_VERSION:+bash}${ZSH_VERSION:+zsh}"'
+        shells = {os.path.basename(s): s for s in _shells()}
+        for name, path in shells.items():
+            others = [p for n, p in shells.items() if n != name] or ["/usr/bin/fish"]
+            done = rig.run(rig.bash_tool(probe, name), rig.env(others[0]))
+            assert done.stdout.strip() == name, (name, others, done)
+            assert (tmp_path / "cwd").is_file(), "the cwd read-back did not run"
+            (tmp_path / "cwd").unlink()
 
     def case_it_runs_under_zsh(self, tmp_path):
         zsh = shutil.which("zsh")
@@ -368,7 +461,7 @@ class TestChildFloorScript:
         rig.floor(FLOOR_URL + "\n")
         seen = rig.seen(zsh)
         assert all(seen[n] == FLOOR_URL for n in SIX), seen
-        done = rig.run('echo "${ZSH_VERSION:+zsh}"', rig.env(zsh))
+        done = rig.run(rig.bash_tool('echo "${ZSH_VERSION:+zsh}"'), rig.env(zsh))
         assert done.stdout.strip() == "zsh", done
         rig.floor("")
         assert all(rig.seen(zsh)[n] == "" for n in SIX)
@@ -493,6 +586,100 @@ class TestTheFloorTheDaemonRecords:
             assert (certdir / "child-floor").read_text() == hop + "\n"
         finally:
             srv.shutdown()
+
+    def _ticks(self, tmp_path, monkeypatch, hop):
+        """The daemon's timer against `hop` as the recorded proxy: a callable
+        that asks it, records the floor, and returns what the file says."""
+        import cswap_pin.proxy as pp
+
+        certdir = Path(tmp_path) / "pin-proxy"
+        certdir.mkdir(parents=True)
+        monkeypatch.setattr(pp, "_ASKED_NOHEALTH", set())
+        monkeypatch.setattr(pp, "_ASKED_NOHOP", set(), raising=False)
+        monkeypatch.setattr(pp, "_probe_next_hop", functools.partial(
+            pp._probe_next_hop, timeout=10))
+        pp.write_upstream_hint(certdir, hop)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", 1), rediscover_chain=True)
+        proxy.port = PIN
+
+        def tick():
+            proxy.learn_next_hop()
+            proxy.record_child_floor()
+            path = certdir / "child-floor"
+            return path.read_text() if path.exists() else None
+        return tick
+
+    def case_a_cache_proxy_that_reports_no_upstream_is_direct(
+        self, tmp_path, monkeypatch
+    ):
+        """pmac: CCF dials direct and its /health says nothing is behind it.
+        The pin knows that is a positive statement, so the child dials direct."""
+        box = {"answer": NO_UPSTREAM}
+        srv = _serve_health(box)
+        try:
+            tick = self._ticks(tmp_path, monkeypatch,
+                               f"http://127.0.0.1:{srv.server_address[1]}")
+            assert tick() == ""
+        finally:
+            srv.shutdown()
+
+    def case_a_null_that_is_not_a_report_of_no_upstream_stays_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        """The same null means "the whole chain is down" once `direct_last` is
+        stamped, under CACHE_FIX_REQUIRE_HOP (no direct dial is allowed there),
+        for a proxy that is not forwarding, and for anything that is not a CCF
+        that publishes these fields. Direct there is the corporate 403."""
+        stamped = dict(NO_UPSTREAM, direct_last="2026-10-11T00:00:00.000Z")
+        required = dict(NO_UPSTREAM, gates={"CACHE_FIX_REQUIRE_HOP": "<redacted>"})
+        reverse = dict(NO_UPSTREAM, forward_proxy=False)
+        ungated = {k: v for k, v in NO_UPSTREAM.items() if k != "gates"}
+        unstamped = {k: v for k, v in NO_UPSTREAM.items() if k != "direct_last"}
+        for name, answer in (("direct_last", stamped), ("require_hop", required),
+                             ("not forwarding", reverse), ("no gates", ungated),
+                             ("no direct_last", unstamped),
+                             ("bare ok", {"status": "ok"})):
+            box = {"answer": answer}
+            srv = _serve_health(box)
+            try:
+                tick = self._ticks(tmp_path / name.replace(" ", "-"), monkeypatch,
+                                   f"http://127.0.0.1:{srv.server_address[1]}")
+                assert tick() is None, name
+            finally:
+                srv.shutdown()
+        # ...and a hop that does not answer at all could not be asked.
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        port = dead.getsockname()[1]
+        dead.close()
+        tick = self._ticks(tmp_path / "dead", monkeypatch, f"http://127.0.0.1:{port}")
+        assert tick() is None
+
+    def case_the_direct_report_follows_the_cache_proxy(self, tmp_path, monkeypatch):
+        """Direct is what the proxy last SAID, not a memory of it: a new answer
+        replaces it, and a proxy that stops answering is not a new answer."""
+        box = {"answer": NO_UPSTREAM}
+        srv = _serve_health(box)
+        try:
+            tick = self._ticks(tmp_path, monkeypatch,
+                               f"http://127.0.0.1:{srv.server_address[1]}")
+            assert tick() == ""
+            box["answer"] = dict(NO_UPSTREAM, direct_last="2026-10-11T00:00:00.000Z")
+            assert tick() is None, "its chain went down: direct is no longer known"
+            box["answer"] = dict(NO_UPSTREAM, https_proxy=FLOOR_URL,
+                                 https_proxy_measured=True)
+            assert tick() == FLOOR_URL + "\n"
+        finally:
+            srv.shutdown()
+        box = {"answer": NO_UPSTREAM}
+        srv = _serve_health(box)
+        tick = self._ticks(tmp_path / "gone", monkeypatch,
+                           f"http://127.0.0.1:{srv.server_address[1]}")
+        assert tick() == ""
+        srv.shutdown()
+        srv.server_close()
+        assert tick() == "", "a proxy that is down said nothing new"
 
     def case_the_file_is_replaced_atomically_and_only_on_a_change(
         self, tmp_path, monkeypatch

@@ -482,6 +482,7 @@ command:
 | pin, then a cache proxy (CCF), then your proxy | your proxy, the hop the pin learned from the cache proxy's `/health` |
 | pin, then your proxy | your proxy |
 | pin and nothing else | empty: the pin dials direct, so the child does |
+| pin, then a cache proxy that dials direct and says so on `/health` | empty, the same |
 | the floor is not known yet (a cache proxy whose own upstream is not learned) | unchanged, the pin: direct is never guessed |
 
 The floor is one line in `<data>/pin-proxy/child-floor`, kept by the daemon (a
@@ -496,10 +497,11 @@ the pin's own port, so a launcher's own proxy in a hook is left alone.
   and the script hands every command to it (an unwire gives the `.claude.json`
   one back). Delete that file to stop. One set in a settings file `env` replaces
   the pin's and skips the floor.
-- **The shell**: the script runs the command with the shell Claude Code picked
-  (`CLAUDE_CODE_SHELL`, then `SHELL`, if bash or zsh, else zsh, else bash). A
-  hook therefore runs under that shell instead of `/bin/sh`, and a stdio MCP
-  server is started through it instead of directly.
+- **The shell**: only a Bash-tool command runs under a shell of yours: the one
+  its shell snapshot was written for (the file name says bash or zsh), else the
+  one Claude Code picked (`CLAUDE_CODE_SHELL`, then `SHELL`, if bash or zsh, else
+  zsh, else bash). A hook still runs under `/bin/sh`, and a stdio MCP server's
+  command line is run as it was quoted, so neither changes.
 - **No prefix reaches** `apiKeyHelper`, `otelHeadersHelper`, Claude Code's own
   `git` and `gh`, or LSP servers. They still ride the pin, and the pin sends
   their connections to hosts it does not serve to the floor hop first, CCF only

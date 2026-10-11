@@ -151,6 +151,10 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
 # a saving there, and a hop that is that launch's own exported proxy is kept
 # out of this path entirely by the ``own_proxy`` guard below instead.
 _ASKED_NOHEALTH: set[str] = set()
+# Addresses whose last /health answer positively said "nothing is behind me": a
+# CCF that dials direct (see ``_probe_next_hop``). Process-local for the same
+# reason; read by ``record_child_floor`` only.
+_ASKED_NOHOP: set[str] = set()
 
 
 def _probe_next_hop(
@@ -251,9 +255,19 @@ def _probe_next_hop(
             conn.close()
     except Exception:  # noqa: BLE001 — an absent probe is "no next hop"
         return None
+    _ASKED_NOHOP.discard(address)
     if not isinstance(body, dict):
         return None
     nxt = body.get("https_proxy") or body.get("HTTPS_PROXY")
+    # A null `https_proxy` is also what CCF publishes with every hop of a
+    # configured chain down. It means "no upstream" only when it forwards, has
+    # never fallen through to a direct dial (`direct_last` is sticky, and null,
+    # not absent) and is not under CACHE_FIX_REQUIRE_HOP, which refuses one.
+    if (not nxt and body.get("forward_proxy") is True
+            and "direct_last" in body and body["direct_last"] is None
+            and isinstance(body.get("gates"), dict)
+            and "CACHE_FIX_REQUIRE_HOP" not in body["gates"]):
+        _ASKED_NOHOP.add(address)
     if not isinstance(nxt, str) or not nxt:
         return None
     parsed = parse_upstream_proxy(nxt)
@@ -384,15 +398,24 @@ if [ -r "$_pc" ]; then
   case $_pp in *" -"*) _pw=${_pp%" -"*}; _pa=-${_pp##*" -"} ;; *) _pw=$_pp; _pa= ;; esac
   if [ -n "$_pw" ] && [ -x "$_pw" ]; then exec "$_pw" $_pa "$1"; fi
 fi
-# The shell Claude Code picked (CLAUDE_CODE_SHELL, then SHELL, if bash or zsh,
-# else zsh, or bash first when SHELL names bash): its snapshot is written for it.
+# Only the Bash tool's string needs the user's shell: it sources a snapshot written
+# for it (the file name says which) and ends by reading the cwd back. A hook was
+# spawned `/bin/sh -c` and a stdio MCP server is quoted words, so they keep /bin/sh.
+case $1 in
+  *"/shell-snapshots/snapshot-zsh-"*) _pk=zsh ;;
+  *"/shell-snapshots/snapshot-bash-"*) _pk=bash ;;
+  *"pwd -P >| "*) _pk= ;;
+  *) exec /bin/sh -c "$1" ;;
+esac
+# That shell, else the one Claude Code picked (CLAUDE_CODE_SHELL, then SHELL, if
+# bash or zsh, else zsh, or bash first when SHELL names bash).
 _ps=
 for _px in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do
-  case $_px in *bash* | *zsh*) if [ -x "$_px" ]; then _ps=$_px; break; fi ;; esac
+  case $_px in *"${_pk:-bash}"* | *"${_pk:-zsh}"*) if [ -x "$_px" ]; then _ps=$_px; break; fi ;; esac
 done
 if [ -z "$_ps" ]; then
   case ${SHELL-} in *bash*) _po="bash zsh" ;; *) _po="zsh bash" ;; esac
-  for _px in $_po; do
+  for _px in ${_pk:-$_po}; do
     for _pd in "$(command -v "$_px" 2>/dev/null)" /bin/$_px /usr/bin/$_px /usr/local/bin/$_px /opt/homebrew/bin/$_px; do
       if [ -n "$_pd" ] && [ -x "$_pd" ]; then _ps=$_pd; break 2; fi
     done
@@ -21912,7 +21935,8 @@ class PinProxy:
         one-line file and not an HTTP ask. The outermost recorded hop: `next`
         when there is one (the hop behind CCF), else `proxy` when it is not a
         CCF (a remote or TLS hop, or a loopback one that answered /health with
-        a 4xx), else empty when the pin has no hop at all and dials direct.
+        a 4xx), else empty when the pin has no hop at all and dials direct, or
+        its CCF has just said it has none (`_ASKED_NOHOP`).
         ANYTHING ELSE IS UNKNOWN AND THE FILE GOES: a loopback `proxy` nobody
         has classified may be a CCF whose own upstream is not learned yet, and
         direct is the corporate 403 (dotfiles b28af221) -- the children then
@@ -21935,6 +21959,8 @@ class PinProxy:
             elif (hop.tls or hop.host not in _LOOPBACK
                   or f"{hop.host}:{hop.port}" in _ASKED_NOHEALTH):
                 value = proxy
+            elif f"{hop.host}:{hop.port}" in _ASKED_NOHOP:
+                value = ""
         except (OSError, ValueError, AttributeError):
             pass
         text = f"{value}\n" if value else ""
