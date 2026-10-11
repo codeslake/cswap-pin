@@ -4378,32 +4378,22 @@ def _carry_job_record(job_id: str, login: tuple[str, str]) -> bool:
     return True
 
 
-#: ``(projects dir, session id)`` -> ``(its one transcript or None, when we
-#: looked)``. `_last_pointer` ran `projects/*/<id>.jsonl` for every live
-#: session on every `POST /v1/code/sessions`: ~316,000 fs calls on a host with
-#: 15,799 project dirs and 20 live sessions, and 1,027,803 ms for one create
-#: beside a CPU-bound thread. A live session's transcript does not move.
+#: ``(projects dir, session id)`` -> ``(its transcripts, when we globbed)``.
+#: `_last_pointer` ran `projects/*/<id>.jsonl` for every live session on every
+#: `POST /v1/code/sessions`: ~316,000 fs calls on a host with 15,799 project
+#: dirs and 20 live sessions, and 1,027,803 ms for one create beside a
+#: CPU-bound thread. A live session's transcript does not move.
 #:
-#: A MISS is remembered for `_TRANSCRIPT_MISS_S` only, because a transcript
-#: appears once the session speaks (2 of 20 live sessions had none yet). An id
-#: that names TWO files is never remembered, so the decline below stays exact.
-# shortcut: a second file for a remembered id is not seen until the remembered
-# path vanishes; the cost is one restamp appended to the older transcript.
+#: A look that does not end on exactly ONE pointer is remembered for
+#: `_TRANSCRIPT_MISS_S` only, then globbed again: a transcript appears once the
+#: session speaks (2 of 20 live sessions had none yet), and the pointer-holding
+#: stub of a duplicate is written by Claude Code AFTER the create's first look.
+#: Two files carrying a pointer decline the same way, on every look.
+# shortcut: once a remembered file carries the pointer, a second pointer file
+# for the id is not seen until the remembered path vanishes; the cost is one
+# restamp appended to the older transcript.
 _TRANSCRIPT_MISS_S = 60.0
-_transcript_seen: "dict[tuple[Path, str], tuple[Path | None, float]]" = {}
-
-
-def _transcript_paths(projects: Path, session_id: str) -> list[Path]:
-    key = (projects, session_id)
-    path, at = _transcript_seen.get(key, (None, -_TRANSCRIPT_MISS_S))  # unseen reads as expired
-    if path is not None and path.exists():
-        return [path]
-    if path is None and time.monotonic() - at < _TRANSCRIPT_MISS_S:
-        return []
-    paths = list(projects.glob(f"*/{session_id}.jsonl"))
-    if len(paths) < 2:
-        _transcript_seen[key] = (paths[0] if paths else None, time.monotonic())
-    return paths
+_transcript_seen: "dict[tuple[Path, str], tuple[list[Path], float]]" = {}
 
 
 def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
@@ -4421,12 +4411,24 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     while the transcript is filed under the worktree path, so the derived name
     missed a real session on the first machine it was tried on.
     """
-    get_claude_config_home = require("paths").get_claude_config_home
+    projects = require("paths").get_claude_config_home() / "projects"
+    key = (projects, session_id)
+    paths, at = _transcript_seen.get(key, ([], -_TRANSCRIPT_MISS_S))  # unseen reads as expired
+    moved = not all(p.exists() for p in paths)
+    found = [] if moved else _pointer_records(paths, session_id)
+    if len(found) != 1 and (moved or time.monotonic() - at >= _TRANSCRIPT_MISS_S):
+        # A guard here would also make `_carry_history_pointers`' stated reason
+        # for its outer catch-all untrue.
+        paths = list(projects.glob(f"*/{session_id}.jsonl"))
+        _transcript_seen[key] = (paths, time.monotonic())
+        found = _pointer_records(paths, session_id)
+    return found[0] if len(found) == 1 else None
+
+
+def _pointer_records(paths: list[Path], session_id: str) -> list[tuple[Path, dict]]:
+    """Each of `paths` that holds a ``bridge-session`` record, from the tail."""
     found: list[tuple[Path, dict]] = []
-    # A guard here would also make `_carry_history_pointers`' stated reason for
-    # its outer catch-all untrue.
-    for path in _transcript_paths(get_claude_config_home() / "projects",
-                                  session_id):
+    for path in paths:
         try:
             with path.open("rb") as fh:
                 fh.seek(0, os.SEEK_END)
@@ -4450,7 +4452,7 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
                 continue
             found.append((path, rec))
             break
-    return found[0] if len(found) == 1 else None
+    return found
 
 
 def _pointer_owner(certdir) -> "tuple[str, str] | None":

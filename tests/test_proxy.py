@@ -713,16 +713,49 @@ class TestHistoryCarriesAcrossASwitch:
         assert carry(self.LOGIN) == 1, "the transcript that appeared was never looked for"
         assert self._tail_pointer(path)["ownerAccountUuid"] == "acct-1"
 
-    def case_an_ambiguous_id_is_never_remembered(self, tmp_path, monkeypatch):
-        """Two files carrying a pointer decline, as before, on every look:
-        the first must not leave the id pinned to either file."""
+    def case_a_pointer_stub_that_appears_after_the_first_look_is_found(
+            self, tmp_path, monkeypatch):
+        """THE ONE DUPLICATE EVER MEASURED: a big transcript with NO pointer and
+        a 146-byte stub holding it. The mint-time carry looks BEFORE Claude Code
+        writes the stub, so the first look remembers the pointerless file; a
+        remembered file that yields no pointer must be globbed again, or the
+        pointer is never restamped after a switch."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        big = home / "projects" / "proj" / "late.jsonl"
+        big.write_text(json.dumps({"type": "user", "sessionId": "late"}) + "\n")
+        carry, scans = self._live_carry(home, monkeypatch, ["late"])
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+
+        stub = home / "projects" / "p5" / big.name
+        stub.write_text(json.dumps(self._pointer(sessionId="late")) + "\n")
+        assert carry(self.LOGIN) == 0 and len(scans) == 1, (
+            "inside the window the pointerless file is not globbed again")
+
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)
+        assert carry(("acct-2", "org-2")) == 1, "the stub's pointer was never found"
+        assert self._tail_pointer(stub)["ownerAccountUuid"] == "acct-2"
+        assert self._tail_pointer(big) is None
+
+    def case_a_two_file_id_declines_and_is_not_rescanned_inside_the_window(
+            self, tmp_path, monkeypatch):
+        """Two files carrying a pointer decline, as before, on every look; the
+        result is remembered for the window, not rescanned on every create."""
+        import cswap_pin.proxy as pp
+
         home = self._fleet(tmp_path, monkeypatch)
         path = self._session(home, "dup", pid=999)
-        carry, _ = self._live_carry(home, monkeypatch, ["dup"])
+        carry, scans = self._live_carry(home, monkeypatch, ["dup"])
         twin = home / "projects" / "p3" / path.name
         twin.write_text(path.read_text())
-        assert carry(self.LOGIN) == 0
-        assert carry(self.LOGIN) == 0, "a declined id was remembered as one file"
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+        assert carry(self.LOGIN) == 0, "two pointer files must still decline"
+        assert len(scans) == 1, "a two-file id was globbed again inside the window"
+
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)
+        twin.unlink()
+        assert carry(self.LOGIN) == 1, "the window ended and one file is left"
 
 _TEST_IDENTITY = hashlib.sha256(b"org:test-org").hexdigest()
 # T0681 ROUND 4: the fixed token/account pair `_seed_trusted_stamp` writes
