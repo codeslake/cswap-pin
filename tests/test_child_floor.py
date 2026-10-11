@@ -8,7 +8,8 @@ Code's own traffic should. So the pin also writes CLAUDE_CODE_SHELL_PREFIX, a
 script Claude Code puts in front of every Bash command, command hook and stdio
 MCP server, and the script points those children at the FLOOR: the proxy below
 the pin (the hop `upstream.json` records as `next`, else `proxy`), or nothing
-when the pin knows it dials direct.
+when the pin knows it dials direct. The floor is published where any local proxy
+can publish its own: `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/proxy-floor/<port>`.
 
 The script is the user's last line of defence against a broken shell prefix, so
 every case that runs it runs the real file under a real `sh`, `bash` and `zsh`.
@@ -52,6 +53,21 @@ def _pin_url(port=PIN):
     return f"http://127.0.0.1:{port}"
 
 
+def _floor_file(port=PIN):
+    """Where the proxy on `port` publishes its floor: `proxy-floor/<port>` in the
+    Claude config home the suite redirected."""
+    from claude_swap.paths import get_claude_config_home
+    return get_claude_config_home() / "proxy-floor" / str(port)
+
+
+def _own_home(tmp_path, monkeypatch):
+    """A config home of this case's own, so two daemons in one case do not share
+    a floor directory."""
+    home = Path(tmp_path) / "claude-home"
+    monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+    return home
+
+
 def _serve_health(answer):
     """A /health server that answers `answer` (a dict) with a 200. Change what it
     says through `srv.RequestHandlerClass.answer`."""
@@ -73,23 +89,25 @@ def _serve_health(answer):
 
 
 class _Rig:
-    """The real script in a scratch cert dir, and a way to run it."""
+    """The real script in a scratch wiring dir, and a way to run it."""
 
     def __init__(self, tmp_path, user_prefix=None):
         from cswap_pin import proxy as pp
 
         self.dir = Path(tmp_path) / "rig"
-        self.script = pp._write_child_floor_script(self.dir, self.dir / "child-floor")
+        self.script = pp._write_child_floor_script(self.dir)
         if user_prefix:
             (self.dir / "child-prefix").write_text(user_prefix + "\n")
         self.tmp = Path(tmp_path)
 
-    def floor(self, text):
-        """None removes the floor file (UNKNOWN); "" is DIRECT."""
-        path = self.dir / "child-floor"
+    def floor(self, text, config=None, port=PIN):
+        """None removes the floor file (UNKNOWN); "" is DIRECT. `config` is the
+        Claude config dir the script will resolve (default `$HOME/.claude`)."""
+        path = Path(config or self.tmp / ".claude") / "proxy-floor" / str(port)
         if text is None:
             path.unlink(missing_ok=True)
         else:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
 
     def env(self, shell, **extra):
@@ -186,6 +204,25 @@ class TestChildFloorWiring:
         assert pp.wire_global_config(None, None) is True
         assert json.loads(cfg.read_text())["env"] == {"KEEP": "1"}
         assert script.is_file() and os.access(script, os.X_OK)
+
+    def case_unwire_removes_the_pins_floor_file_and_no_other(
+        self, tmp_path, monkeypatch
+    ):
+        from cswap_pin import proxy as pp
+
+        cfg = self._config(tmp_path, monkeypatch, {})
+        pp.wire_global_config(9955, Path(tmp_path) / "ca.pem")
+        for port, who in ((9955, "pin"), (9901, "another proxy")):
+            _floor_file(port).parent.mkdir(parents=True, exist_ok=True)
+            _floor_file(port).write_text(f"{who}\n")
+        assert pp.wire_global_config(None, None) is True
+        assert not _floor_file(9955).exists(), "the pin left its floor behind"
+        assert _floor_file(9901).read_text() == "another proxy\n"
+        # CONTROL: a block this pin never wrote (no receipt) is not its file.
+        self._config(tmp_path, monkeypatch, {"env": {"CSWAP_PIN_PORT": "9955"}})
+        _floor_file(9955).write_text("not ours\n")
+        pp.wire_global_config(None, None)
+        assert _floor_file(9955).read_text() == "not ours\n"
 
     def case_a_users_own_prefix_is_restored_and_chained(
         self, tmp_path, monkeypatch
@@ -318,6 +355,41 @@ class TestChildFloorScript:
                         ALL_PROXY=gated)
         assert all(seen[n] == FLOOR_URL for n in SIX), (
             "the gated userinfo form of the pin's URL was not recognised", seen)
+
+    def case_a_floor_for_a_port_that_is_not_the_pins_is_ignored(self, tmp_path):
+        """The directory is shared: another local proxy's file is not ours."""
+        rig = _Rig(tmp_path)
+        shell = _shells()[0]
+        rig.floor(FLOOR_URL + "\n", port=9901)
+        seen = rig.seen(shell)
+        assert seen["HTTPS_PROXY"] == _pin_url() and seen["HTTP_PROXY"] == "UNSET", seen
+        other = _pin_url(9901)
+        seen = rig.seen(shell, HTTPS_PROXY=other, https_proxy=other, ALL_PROXY=other)
+        assert seen["HTTPS_PROXY"] == other and seen["HTTP_PROXY"] == "UNSET", seen
+        # CONTROL: the pin's own file in the same directory is read.
+        rig.floor("", port=PIN)
+        assert all(rig.seen(shell)[n] == "" for n in SIX)
+
+    def case_the_floor_is_read_from_the_sessions_config_dir(self, tmp_path):
+        """Resolved when the script RUNS, from the session's own env: one script
+        file serves every config, so a path baked in at wire time would be the
+        last wiring process's."""
+        rig = _Rig(tmp_path)
+        shell = _shells()[0]
+        mine = Path(tmp_path) / "profile"
+        rig.floor(FLOOR_URL + "\n", config=mine)
+        rig.floor("http://127.0.0.1:8119\n")
+        seen = rig.seen(shell, CLAUDE_CONFIG_DIR=str(mine))
+        assert all(seen[n] == FLOOR_URL for n in SIX), seen
+        for unset in (None, ""):
+            seen = rig.seen(shell, CLAUDE_CONFIG_DIR=unset)
+            assert all(seen[n] == "http://127.0.0.1:8119" for n in SIX), (
+                unset, seen)
+        # The pin's file in the other directory is not consulted.
+        rig.floor(None)
+        assert rig.seen(shell)["HTTPS_PROXY"] == _pin_url()
+        seen = rig.seen(shell, CLAUDE_CONFIG_DIR=str(mine))
+        assert all(seen[n] == FLOOR_URL for n in SIX), seen
 
     def case_the_opt_out_changes_nothing(self, tmp_path):
         rig = _Rig(tmp_path)
@@ -492,8 +564,8 @@ class TestChildFloorScript:
 
 
 class TestTheFloorTheDaemonRecords:
-    """`<certdir>/child-floor`: absent is UNKNOWN, empty is DIRECT, a URL is
-    the proxy below the pin. Written by the daemon's timer, after
+    """`proxy-floor/<the pin's port>` in the Claude config home: absent is
+    UNKNOWN, empty is DIRECT, a URL is the proxy below the pin. Written by the daemon's timer, after
     `learn_next_hop` has classified the recorded hop."""
 
     def test_all(self, request, tmp_path_factory):
@@ -506,6 +578,7 @@ class TestTheFloorTheDaemonRecords:
 
         certdir = Path(tmp_path) / "pin-proxy"
         certdir.mkdir(parents=True, exist_ok=True)
+        _own_home(tmp_path, monkeypatch)
         if raw is not None:
             (certdir / "upstream.json").write_text(raw)
         elif proxy is not None or next_hop is not None:
@@ -515,7 +588,7 @@ class TestTheFloorTheDaemonRecords:
                              upstream=("127.0.0.1", 1), rediscover_chain=True)
         proxy_.port = PIN
         proxy_.record_child_floor()
-        path = certdir / "child-floor"
+        path = _floor_file()
         return path.read_text() if path.exists() else None
 
     def case_the_hop_behind_ccf_is_the_floor(self, tmp_path, monkeypatch):
@@ -539,10 +612,11 @@ class TestTheFloorTheDaemonRecords:
         assert self._floor(tmp_path / "a", monkeypatch, "http://127.0.0.1:9901") is None
         # ...and the file goes when the answer goes: a stale floor is a hop
         # nobody chose any more.
-        certdir = tmp_path / "a" / "pin-proxy"
-        (certdir / "child-floor").write_text(FLOOR_URL + "\n")
+        floor = tmp_path / "a" / "claude-home" / "proxy-floor" / str(PIN)
+        floor.parent.mkdir(parents=True, exist_ok=True)
+        floor.write_text(FLOOR_URL + "\n")
         assert self._floor(tmp_path / "a", monkeypatch) is None
-        assert not (certdir / "child-floor").exists()
+        assert not floor.exists()
 
     def case_no_record_or_an_unreadable_one_is_unknown(self, tmp_path, monkeypatch):
         assert self._floor(tmp_path / "a", monkeypatch) is None
@@ -584,6 +658,7 @@ class TestTheFloorTheDaemonRecords:
             hop = f"http://127.0.0.1:{srv.server_address[1]}"
             certdir = Path(tmp_path) / "pin-proxy"
             certdir.mkdir()
+            _own_home(tmp_path, monkeypatch)
             monkeypatch.setattr(pp, "_ASKED_NOHEALTH", set())
             monkeypatch.setattr(pp, "_probe_next_hop", functools.partial(
                 pp._probe_next_hop, timeout=10))
@@ -594,10 +669,10 @@ class TestTheFloorTheDaemonRecords:
                                 rediscover_chain=True)
             proxy.port = PIN
             proxy.record_child_floor()
-            assert not (certdir / "child-floor").exists(), "unclassified yet"
+            assert not _floor_file().exists(), "unclassified yet"
             proxy.learn_next_hop()
             proxy.record_child_floor()
-            assert (certdir / "child-floor").read_text() == hop + "\n"
+            assert _floor_file().read_text() == hop + "\n"
         finally:
             srv.shutdown()
 
@@ -608,6 +683,7 @@ class TestTheFloorTheDaemonRecords:
 
         certdir = Path(tmp_path) / "pin-proxy"
         certdir.mkdir(parents=True)
+        _own_home(tmp_path, monkeypatch)
         monkeypatch.setattr(pp, "_ASKED_NOHEALTH", set())
         monkeypatch.setattr(pp, "_ASKED_NOHOP", set())
         monkeypatch.setattr(pp, "_probe_next_hop", functools.partial(
@@ -620,7 +696,7 @@ class TestTheFloorTheDaemonRecords:
         def tick():
             proxy.learn_next_hop()
             proxy.record_child_floor()
-            path = certdir / "child-floor"
+            path = _floor_file()
             return path.read_text() if path.exists() else None
         return tick
 
@@ -695,10 +771,8 @@ class TestTheFloorTheDaemonRecords:
     def case_the_file_is_replaced_atomically_and_only_on_a_change(
         self, tmp_path, monkeypatch
     ):
-        import cswap_pin.proxy as pp
-
         self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
-        path = Path(tmp_path) / "pin-proxy" / "child-floor"
+        path = _floor_file()
         before = path.stat().st_ino
         self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
         assert path.stat().st_ino == before, "an unchanged floor was rewritten"
@@ -706,6 +780,51 @@ class TestTheFloorTheDaemonRecords:
         assert path.read_text() == "http://127.0.0.1:8119\n"
         assert not list(path.parent.glob("*.cswap-tmp"))
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def case_the_floor_is_the_daemons_one_file_in_the_shared_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """One file, named by the listen port, beside the files other local
+        proxies publish. Another port's file is never read, rewritten or
+        removed, whatever this daemon concludes."""
+        other = tmp_path / "claude-home" / "proxy-floor" / "9901"
+        other.parent.mkdir(parents=True)
+        other.write_text("http://127.0.0.1:3128\n")
+        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
+        assert sorted(p.name for p in other.parent.iterdir()) == ["9901", str(PIN)]
+        assert not (tmp_path / "pin-proxy" / "child-floor").exists(), (
+            "the old file in the cert dir is not written any more")
+        assert self._floor(tmp_path, monkeypatch, raw="{not json") is None
+        assert other.read_text() == "http://127.0.0.1:3128\n"
+        assert [p.name for p in other.parent.iterdir()] == ["9901"]
+
+    def case_claude_config_dir_chooses_the_directory(self, tmp_path, monkeypatch):
+        """Through the host's own resolver, which is the one the pin already
+        wires `.claude.json` with."""
+        import importlib.util
+
+        import claude_swap.paths as paths
+        import cswap_pin.proxy as pp
+
+        spec = importlib.util.spec_from_file_location("_host_paths", paths.__file__)
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+        monkeypatch.setattr(paths, "get_claude_config_home",
+                            real.get_claude_config_home)
+        certdir = Path(tmp_path) / "pin-proxy"
+        certdir.mkdir()
+        pp.write_upstream_hint(certdir, "http://127.0.0.1:9901", next_hop=FLOOR_URL)
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                            upstream=("127.0.0.1", 1), rediscover_chain=True)
+        proxy.port = PIN
+        mine = Path(tmp_path) / "profile"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(mine))
+        proxy.record_child_floor()
+        assert (mine / "proxy-floor" / str(PIN)).read_text() == FLOOR_URL + "\n"
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+        proxy.record_child_floor()
+        default = Path.home() / ".claude" / "proxy-floor" / str(PIN)
+        assert default.read_text() == FLOOR_URL + "\n"
 
     def case_the_daemons_timer_records_it(self):
         """The call that matters is the one the daemon makes: `_watch_own_code`

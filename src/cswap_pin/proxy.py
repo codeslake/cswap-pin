@@ -367,19 +367,22 @@ _REPLACE_CLASS_CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE
 # hooks and stdio MCP servers ride pin -> CCF too. `CLAUDE_CODE_SHELL_PREFIX`
 # stands in front of the Bash tool, every command hook, every stdio MCP server
 # and the status line (measured, 2.1.296); the script below points those at the
-# FLOOR in `<certdir>/child-floor`: absent = unknown = change nothing, empty =
-# the pin dials direct, a URL = the proxy below the pin. What no prefix reaches
-# (Claude Code's own git/gh, helpers, LSP) is carried by `_blind_tunnel`.
+# FLOOR in `proxy-floor/<the pin's port>` of the Claude config home: absent =
+# unknown = change nothing, empty = the pin dials direct, a URL = the proxy
+# below the pin. That directory is shared: every local proxy publishes its own
+# floor there under its own port. What no prefix reaches (Claude Code's own
+# git/gh, helpers, LSP) is carried by `_blind_tunnel`.
 _PREFIX_KEY = "CLAUDE_CODE_SHELL_PREFIX"
-_FLOOR_FILE = "child-floor"
+_FLOOR_DIR = "proxy-floor"
 _CHILD_FLOOR_SH = """#!/bin/sh
 # cswap-pin: Claude Code runs every Bash command, command hook, stdio MCP server
 # and status line through this file (CLAUDE_CODE_SHELL_PREFIX) with the whole
 # command as ONE argument. It points them at the proxy below the pin, then runs
 # the command. Silent, and it adds no failure of its own.
 # Opt out: CSWAP_PIN_CHILD_FLOOR=off in the "env" of your Claude Code settings.
-_pf=@FLOOR@
 _pc=@CHAIN@
+# The session's own config dir, resolved here: this one file serves every config.
+_pf=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/@FLOORDIR@/${CSWAP_PIN_PORT-}
 if [ "${CSWAP_PIN_CHILD_FLOOR-}" != off ] && [ -n "${CSWAP_PIN_PORT-}" ] && [ -r "$_pf" ]; then
   _pv=
   IFS= read -r _pv < "$_pf" || :
@@ -446,11 +449,16 @@ def _replace_text(path: Path, text: str, mode: int) -> None:
         raise
 
 
-def _write_child_floor_script(wiring: Path, floor: Path) -> Path:
+def _floor_path(port) -> Path:
+    """Where the proxy listening on ``port`` publishes its floor."""
+    return require("paths").get_claude_config_home() / _FLOOR_DIR / str(port)
+
+
+def _write_child_floor_script(wiring: Path) -> Path:
     """The prefix script, in ``wiring`` (beside the receipts, which nothing
     deletes). Unchanged when it is already right. Raises OSError."""
     path = Path(wiring) / "child-floor.sh"
-    text = (_CHILD_FLOOR_SH.replace("@FLOOR@", shlex.quote(str(floor)))
+    text = (_CHILD_FLOOR_SH.replace("@FLOORDIR@", _FLOOR_DIR)
             .replace("@CHAIN@", shlex.quote(str(Path(wiring) / "child-prefix"))))
     try:
         if path.read_text(encoding="utf-8") == text and os.access(path, os.X_OK):
@@ -2526,6 +2534,12 @@ def _wire_global_config_locked(
     ledger = {_WIRE_MARK: [], f"{_WIRE_MARK}Saved": {},
               "writtenBy": _own_version()}
     if port is None or ca_path is None:
+        # THE PIN'S OWN FLOOR FILE GOES WITH ITS WIRING, and no other port's:
+        # absent is "unknown", so children stay as they are.
+        old = before.get("CSWAP_PIN_PORT")
+        if "CSWAP_PIN_PORT" in ours and str(old).isdigit():
+            with contextlib.suppress(OSError):
+                _floor_path(old).unlink(missing_ok=True)
         # `ledger` above already records "not wired". Not one naming a file
         # in our own cert dir, by the same rule as the wiring below.
         if not ours:
@@ -2566,8 +2580,7 @@ def _wire_global_config_locked(
         # command to it.
         wiring = _ledger_path(path).parent
         try:
-            script = _write_child_floor_script(
-                wiring, Path(ca_path).parent / _FLOOR_FILE)
+            script = _write_child_floor_script(wiring)
             theirs = env.get(_PREFIX_KEY) or os.environ.get(_PREFIX_KEY)
             if theirs and theirs != str(script):
                 _replace_text(wiring / "child-prefix", theirs + "\n", 0o644)
@@ -21932,7 +21945,8 @@ class PinProxy:
         """Record the proxy below the pin, for the children of a pinned session.
 
         Read by the prefix script (`_CHILD_FLOOR_SH`) once per child, so it is a
-        one-line file and not an HTTP ask. The outermost recorded hop: `next`
+        one-line file, `proxy-floor/<our port>` in the Claude config home, and
+        not an HTTP ask. The outermost recorded hop: `next`
         when there is one (the hop behind CCF), else `proxy` when it is not a
         CCF (a remote or TLS hop, or a loopback one that answered /health with
         a 4xx), else empty when the pin has no hop at all and dials direct, or
@@ -21945,7 +21959,7 @@ class PinProxy:
         Called on the daemon's timer after `learn_next_hop`, which is what
         classifies a hop. Compare-before-write: a settled box writes nothing.
         """
-        path = self._certdir / _FLOOR_FILE
+        path = _floor_path(self.port)
         value = None
         try:
             rec = json.loads((self._certdir / _UPSTREAM_FILE).read_text())
@@ -21968,6 +21982,7 @@ class PinProxy:
             if value is None:
                 path.unlink(missing_ok=True)
             elif not path.exists() or path.read_text() != text:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 _replace_text(path, text, 0o600)
         except OSError:
             pass
