@@ -376,14 +376,17 @@ if [ "${CSWAP_PIN_CHILD_FLOOR-}" != off ]; then
     _ph=${_pn#*://}; _ph=${_ph##*@}; _ph=${_ph%%/*}
     case $_ph in 127.0.0.1:* | localhost:* | "[::1]:"*) _pt=${_ph##*:} ;; *) continue ;; esac
     case $_pt in '' | *[!0-9]*) continue ;; esac
-    _pf=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/@FLOORDIR@/$_pt
-    [ -f "$_pf" ] && [ -r "$_pf" ] || continue
-    # A file gone since the test is unknown, not an empty one (direct).
-    _pv=; _pg=
-    { IFS= read -r _pv || :; _pg=y; } 2>/dev/null < "$_pf"
-    [ -n "$_pg" ] || continue
-    export HTTPS_PROXY="$_pv" https_proxy="$_pv" HTTP_PROXY="$_pv" http_proxy="$_pv" ALL_PROXY="$_pv" all_proxy="$_pv"
-    break
+    # The session's config dir, then the default one: the order CCF's script uses.
+    for _pd in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$HOME/.claude"; do
+      _pf=$_pd/@FLOORDIR@/$_pt
+      [ -f "$_pf" ] && [ -r "$_pf" ] || continue
+      # A file gone since the test is unknown, not an empty one (direct).
+      _pv=; _pg=
+      { IFS= read -r _pv || :; _pg=y; } 2>/dev/null < "$_pf"
+      [ -n "$_pg" ] || continue
+      export HTTPS_PROXY="$_pv" https_proxy="$_pv" HTTP_PROXY="$_pv" http_proxy="$_pv" ALL_PROXY="$_pv" all_proxy="$_pv"
+      break 2
+    done
   done
 fi
 # A prefix of the user's own, split the way Claude Code splits one: at the last " -".
@@ -2804,8 +2807,10 @@ def _ambient_proxy(
     # down, it would drop CCF from the chain for good.
     # By ADDRESS: the floor keeps the credentials its hop published, the record's
     # `next` is the stripped form of the same proxy.
-    nxt = (parse_upstream_proxy(_read_upstream(certdir, "next"))
-           if certdir is not None else None)
+    nxt = None
+    with contextlib.suppress(ValueError):  # an unparseable record names no address
+        nxt = (parse_upstream_proxy(_read_upstream(certdir, "next"))
+               if certdir is not None else None)
     if _self_port(src) is not None and nxt is not None and parsed.address == nxt.address:
         return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
@@ -21984,7 +21989,8 @@ class PinProxy:
           that hop itself;
         - no hop at all: the pin dials direct, so empty;
         - any other loopback hop is a cache proxy, and the floor is what IT
-          publishes in `proxy-floor/<its port>` (empty stays empty). Its /health
+          publishes in `proxy-floor/<its port>`, in the first of our config
+          homes that has it (empty stays empty). Its /health
           upstream is credential-stripped and its chain may be one it cannot
           name, so nothing is guessed from it: no file there is UNKNOWN.
 
@@ -21998,6 +22004,7 @@ class PinProxy:
         (`_floor_homes`), and leaves each of them when it is unknown.
         """
         value = None
+        homes = _floor_homes(self.port)
         try:
             rec = json.loads((self._certdir / _UPSTREAM_FILE).read_text())
             proxy = next((v for v in (rec.get("proxy"), rec.get("next"))
@@ -22009,11 +22016,13 @@ class PinProxy:
                   or f"{hop.host}:{hop.port}" in _ASKED_NOHEALTH):
                 value = proxy
             else:
-                value = _floor_path(hop.port).read_text().strip()
+                # The hop publishes in ITS config home: the first of ours with its file.
+                value = next((p.read_text().strip() for h in homes
+                              if (p := _floor_path(hop.port, h)).is_file()), None)
         except (OSError, ValueError, AttributeError):
             pass
         text = f"{value}\n" if value else ""
-        for home in _floor_homes(self.port):
+        for home in homes:
             path = _floor_path(self.port, home)
             try:
                 if value is None:

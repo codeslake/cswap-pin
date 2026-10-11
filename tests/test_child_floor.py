@@ -444,6 +444,26 @@ class TestChildFloorScript:
         seen = rig.seen(shell, CLAUDE_CONFIG_DIR=str(mine))
         assert all(seen[n] == FLOOR_URL for n in SIX), seen
 
+    def case_a_session_with_a_config_dir_falls_back_to_the_default_one(self, tmp_path):
+        """CCF's script (bin/child-proxy-floor.sh) tries the session's config dir
+        and then `$HOME/.claude`; so does this one, so both products resolve the
+        one file the same way."""
+        rig = _Rig(tmp_path)
+        shell = _shells()[0]
+        mine = Path(tmp_path) / "profile"
+        mine.mkdir()
+        rig.floor(FLOOR_URL + "\n")
+        seen = rig.seen(shell, CLAUDE_CONFIG_DIR=str(mine))
+        assert all(seen[n] == FLOOR_URL for n in SIX), seen
+        # CONTROL: the session's own dir wins when it has the file.
+        rig.floor("http://127.0.0.1:8119\n", config=mine)
+        seen = rig.seen(shell, CLAUDE_CONFIG_DIR=str(mine))
+        assert all(seen[n] == "http://127.0.0.1:8119" for n in SIX), seen
+        # CONTROL: neither has it.
+        rig.floor(None)
+        rig.floor(None, config=mine)
+        assert rig.seen(shell, CLAUDE_CONFIG_DIR=str(mine))["HTTPS_PROXY"] == _pin_url()
+
     def case_the_opt_out_changes_nothing(self, tmp_path):
         rig = _Rig(tmp_path)
         rig.floor(FLOOR_URL + "\n")
@@ -1007,6 +1027,32 @@ class TestTheFloorTheDaemonRecords:
         assert not (a / "proxy-floor" / str(PIN)).exists()
         assert (b / "proxy-floor" / str(PIN)).read_text() == corp + "\n"
 
+    def case_the_hops_file_in_another_wired_home_is_still_the_hops_floor(
+        self, tmp_path, monkeypatch
+    ):
+        """The hop (CCF) publishes into ITS config home, which follows its own
+        CLAUDE_CONFIG_DIR: it may be a wired home other than the daemon's. The
+        first home that has the file decides; none is UNKNOWN."""
+        hop, theirs = "http://127.0.0.1:9901", "http://user:secret@127.0.0.1:3128\n"
+        a = self._wire(tmp_path, monkeypatch, "a")
+        b = self._wire(tmp_path, monkeypatch, "b")
+        mine = tmp_path / "claude-home"
+        (b / "proxy-floor").mkdir()
+        (b / "proxy-floor" / "9901").write_text(theirs)
+        assert self._floor(tmp_path, monkeypatch, hop, FLOOR_URL) == theirs
+        for home in (a, b, mine):
+            assert (home / "proxy-floor" / str(PIN)).read_text() == theirs, home
+        # The daemon's own home is asked first.
+        (mine / "proxy-floor" / "9901").write_text("http://127.0.0.1:3129\n")
+        assert self._floor(tmp_path, monkeypatch, hop, FLOOR_URL
+                           ) == "http://127.0.0.1:3129\n"
+        # CONTROL: in no home at all is UNKNOWN, everywhere.
+        (b / "proxy-floor" / "9901").unlink()
+        (mine / "proxy-floor" / "9901").unlink()
+        assert self._floor(tmp_path, monkeypatch, hop, FLOOR_URL) is None
+        for home in (a, b, mine):
+            assert not (home / "proxy-floor" / str(PIN)).exists(), home
+
     def case_the_daemons_timer_records_it(self):
         """The call that matters is the one the daemon makes: `_watch_own_code`
         asks `learn_next_hop` and then records the floor."""
@@ -1117,6 +1163,20 @@ class TestAFlooredEnvKeepsTheChain:
         record = self._ensure(tmp_path, monkeypatch, {
             "HTTPS_PROXY": other, "CSWAP_PIN_PORT": "51000"})
         assert record["proxy"] == other, record
+
+    def case_an_unparseable_next_in_the_record_matches_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """The record is a file on disk. A `next` whose port is not a number must
+        not stop the launch: it names no address, so it is not the floor."""
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        (certdir / "upstream.json").write_text(json.dumps(
+            {"proxy": "http://127.0.0.1:9", "next": "http://127.0.0.1:notaport"}))
+        record = self._ensure(tmp_path, monkeypatch, {
+            "HTTPS_PROXY": FLOOR_URL, "https_proxy": FLOOR_URL,
+            "ALL_PROXY": FLOOR_URL, "CSWAP_PIN_PORT": "51000"})
+        assert record["proxy"] == FLOOR_URL, record
 
     def case_a_plain_shell_exporting_the_floor_is_still_a_launch_that_chooses(
         self, tmp_path, monkeypatch

@@ -485,19 +485,20 @@ command:
 | pin, then a cache proxy that dials direct | empty, if the cache proxy publishes an empty floor |
 | the cache proxy publishes no floor (its chain has credentials, cannot be reached or is not one it can name) | unchanged, the pin: direct is never guessed |
 
-The floor is one line in `proxy-floor/<the pin's port>` under the config dir of
-every config the pin has wired on that port (`$CLAUDE_CONFIG_DIR`, or `~/.claude`
-when that is unset, in the session that wired it; the receipt records it), kept
-by the daemon: a URL, an empty line for
+The floor is one line in `proxy-floor/<the pin's port>` under the daemon's own
+config dir and the config dir of every config the pin has wired on that port
+(`$CLAUDE_CONFIG_DIR`, or `~/.claude` when that is unset, in the session that
+wired it; the receipt records it), kept by the daemon: a URL, an empty line for
 "direct", and no file for "not known"; any other local proxy can publish its own
 floor to that directory under its own listen port, written by temp file and
 rename. The daemon's own line is the recorded hop's address when that hop is
 remote, TLS or answers `/health` with a 4xx (a proxy that publishes nothing),
 empty when it has no hop, and otherwise a copy of the file the hop itself
-publishes: the pin never reads a floor off the hop's `/health`, which has its
-credentials stripped. The script floors a child when one of the six variables it was handed
-names a loopback port with a file there (the first that does decides), so a
-proxy that publishes no floor is left alone. `NO_PROXY` is never touched and no
+publishes (in the first of those dirs that has it): the pin never reads a floor
+off the hop's `/health`, which has its credentials stripped. The script floors a
+child when one of the six variables it was handed names a loopback port with a
+file there (the first that does decides; the session's config dir is read
+first, then `~/.claude`), so a proxy that publishes no floor is left alone. `NO_PROXY` is never touched and no
 host is named anywhere.
 
 - **Opt out**: put `"CSWAP_PIN_CHILD_FLOOR": "off"` in the `env` of a Claude Code
@@ -538,7 +539,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
 | `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json` that records a pin: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
 | `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO | left in place |
-| `~/.claude/proxy-floor/<the pin's port>` (under `$CLAUDE_CONFIG_DIR` when that is set) | the proxy below the pin, for children ([What a session's children see](#what-a-sessions-children-see)); the pin writes and removes only its own port's file, in each config dir it wired on that port | removed by the unwire, for that config only (a daemon still running writes the daemon's own again) |
+| `~/.claude/proxy-floor/<the pin's port>` (under `$CLAUDE_CONFIG_DIR` when that is set) | the proxy below the pin, for children ([What a session's children see](#what-a-sessions-children-see)); the pin writes and removes only its own port's file, in its own config dir and each one it wired on that port | removed by the unwire, for that config only (a daemon still running writes the daemon's own again) |
 | `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
 | `~/.claude/jobs/<id>/state.json`, and a transcript's `bridge-session` record | the account in the bridge pointer of a session that is not running, restamped (see [Keeping a session's bridge when the account rotates](#keeping-a-sessions-bridge-when-the-account-rotates)) | not touched |
 
