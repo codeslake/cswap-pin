@@ -489,9 +489,10 @@ The floor is one line in `proxy-floor/<the pin's port>` under `$CLAUDE_CONFIG_DI
 (`~/.claude` when that is unset), kept by the daemon: a URL, an empty line for
 "direct", and no file for "not known"; any other local proxy can publish its own
 floor to that directory under its own listen port, written by temp file and
-rename. `NO_PROXY` is never touched and no host is named anywhere. The script
-acts only when one of the six variables it was handed names the pin's own port,
-so a launcher's own proxy in a hook is left alone.
+rename. The script floors a child when one of the six variables it was handed
+names a loopback port with a file there (the first that does decides), so a
+proxy that publishes no floor is left alone. `NO_PROXY` is never touched and no
+host is named anywhere.
 
 - **Opt out**: put `"CSWAP_PIN_CHILD_FLOOR": "off"` in the `env` of a Claude Code
   settings file. Children then keep the pin, as before.

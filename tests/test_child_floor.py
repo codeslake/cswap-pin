@@ -327,21 +327,44 @@ class TestChildFloorScript:
                 assert seen[name] == FLOOR_URL, (name, seen)
             assert seen["NO_PROXY"] == "localhost,example.test"
 
-    def case_an_env_that_does_not_name_the_pin_is_left_alone(self, tmp_path):
-        """A launcher's CCF, a user's own proxy, a prefix port: not ours."""
+    def case_an_env_that_names_no_published_port_is_left_alone(self, tmp_path):
+        """A proxy that publishes nothing (a launcher's, a corporate one), a
+        port that only looks like a published one, a published port on another
+        host: not floored."""
         rig = _Rig(tmp_path)
         rig.floor(FLOOR_URL + "\n")
         shell = _shells()[0]
         for other in (_pin_url(9901), _pin_url(PIN // 10),
-                      _pin_url(int(f"{PIN}1")), f"http://proxy.corp:{PIN}"):
+                      _pin_url(int(f"{PIN}1")), f"http://proxy.corp:{PIN}",
+                      f"http://127.0.0.1:{PIN}x", "http://127.0.0.1:../x",
+                      "http://127.0.0.1", ""):
             seen = rig.seen(shell, HTTPS_PROXY=other, https_proxy=other,
                             ALL_PROXY=other)
             assert seen["HTTPS_PROXY"] == other, (other, seen)
             assert seen["HTTP_PROXY"] == "UNSET", (other, seen)
-        seen = rig.seen(shell, CSWAP_PIN_PORT=None)
-        assert seen["HTTPS_PROXY"] == _pin_url(), (
-            "no CSWAP_PIN_PORT means the script cannot tell the pin's value "
-            "from anyone else's")
+
+    def case_any_loopback_port_with_a_floor_file_is_floored(self, tmp_path):
+        """The contract is the directory's, not the pin's: whichever proxy's
+        port the variables name, and whoever published it. This is what makes
+        either product's prefix script right when a settings file chose the
+        other product's proxy."""
+        rig = _Rig(tmp_path)
+        shell = _shells()[0]
+        rig.floor("http://127.0.0.1:3128\n", port=9901)
+        other = _pin_url(9901)
+        seen = rig.seen(shell, HTTPS_PROXY=other, https_proxy=other,
+                        ALL_PROXY=other, CSWAP_PIN_PORT=None)
+        assert all(seen[n] == "http://127.0.0.1:3128" for n in SIX), seen
+        # The first of the six that names a published port decides.
+        rig.floor(FLOOR_URL + "\n")
+        seen = rig.seen(shell, HTTPS_PROXY=_pin_url(9902), https_proxy=other,
+                        ALL_PROXY=_pin_url())
+        assert all(seen[n] == "http://127.0.0.1:3128" for n in SIX), seen
+        # CONTROL: the same variables with that file gone fall to the next key.
+        rig.floor(None, port=9901)
+        seen = rig.seen(shell, HTTPS_PROXY=_pin_url(9902), https_proxy=other,
+                        ALL_PROXY=_pin_url())
+        assert all(seen[n] == FLOOR_URL for n in SIX), seen
 
     def case_any_one_key_naming_the_pin_is_enough(self, tmp_path):
         rig = _Rig(tmp_path)
@@ -356,17 +379,15 @@ class TestChildFloorScript:
         assert all(seen[n] == FLOOR_URL for n in SIX), (
             "the gated userinfo form of the pin's URL was not recognised", seen)
 
-    def case_a_floor_for_a_port_that_is_not_the_pins_is_ignored(self, tmp_path):
-        """The directory is shared: another local proxy's file is not ours."""
+    def case_a_file_for_a_port_the_variables_do_not_name_is_ignored(self, tmp_path):
+        """The directory is shared: a file for a port none of the six names is
+        another proxy's business."""
         rig = _Rig(tmp_path)
         shell = _shells()[0]
         rig.floor(FLOOR_URL + "\n", port=9901)
         seen = rig.seen(shell)
         assert seen["HTTPS_PROXY"] == _pin_url() and seen["HTTP_PROXY"] == "UNSET", seen
-        other = _pin_url(9901)
-        seen = rig.seen(shell, HTTPS_PROXY=other, https_proxy=other, ALL_PROXY=other)
-        assert seen["HTTPS_PROXY"] == other and seen["HTTP_PROXY"] == "UNSET", seen
-        # CONTROL: the pin's own file in the same directory is read.
+        # CONTROL: the file of the port the variables do name is read.
         rig.floor("", port=PIN)
         assert all(rig.seen(shell)[n] == "" for n in SIX)
 

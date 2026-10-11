@@ -367,32 +367,35 @@ _REPLACE_CLASS_CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE
 # hooks and stdio MCP servers ride pin -> CCF too. `CLAUDE_CODE_SHELL_PREFIX`
 # stands in front of the Bash tool, every command hook, every stdio MCP server
 # and the status line (measured, 2.1.296); the script below points those at the
-# FLOOR in `proxy-floor/<the pin's port>` of the Claude config home: absent =
-# unknown = change nothing, empty = the pin dials direct, a URL = the proxy
-# below the pin. That directory is shared: every local proxy publishes its own
-# floor there under its own port. What no prefix reaches (Claude Code's own
-# git/gh, helpers, LSP) is carried by `_blind_tunnel`.
+# FLOOR in `proxy-floor/<port>` of the Claude config home: absent = unknown =
+# change nothing, empty = the proxy dials direct, a URL = the proxy below it.
+# That directory is shared: every local proxy publishes its own floor there
+# under its own listen port, and a prefix script floors a child whose proxy
+# variables name any loopback port that has a file. What no prefix reaches
+# (Claude Code's own git/gh, helpers, LSP) is carried by `_blind_tunnel`.
 _PREFIX_KEY = "CLAUDE_CODE_SHELL_PREFIX"
 _FLOOR_DIR = "proxy-floor"
 _CHILD_FLOOR_SH = """#!/bin/sh
 # cswap-pin: Claude Code runs every Bash command, command hook, stdio MCP server
 # and status line through this file (CLAUDE_CODE_SHELL_PREFIX) with the whole
-# command as ONE argument. It points them at the proxy below the pin, then runs
-# the command. Silent, and it adds no failure of its own.
+# command as ONE argument. It points them at the floor (the proxy below) of the
+# local proxy their proxy variables name, then runs the command. Silent, and it
+# adds no failure of its own.
 # Opt out: CSWAP_PIN_CHILD_FLOOR=off in the "env" of your Claude Code settings.
 _pc=@CHAIN@
-# The session's own config dir, resolved here: this one file serves every config.
-_pf=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/@FLOORDIR@/${CSWAP_PIN_PORT-}
-if [ "${CSWAP_PIN_CHILD_FLOOR-}" != off ] && [ -n "${CSWAP_PIN_PORT-}" ] && [ -r "$_pf" ]; then
-  _pv=
-  IFS= read -r _pv < "$_pf" || :
+# The first of the six that names a loopback port with a floor file decides. The
+# config dir is the session's own, resolved here: this one file serves every config.
+if [ "${CSWAP_PIN_CHILD_FLOOR-}" != off ]; then
   for _pn in "${HTTPS_PROXY-}" "${https_proxy-}" "${HTTP_PROXY-}" "${http_proxy-}" "${ALL_PROXY-}" "${all_proxy-}"; do
     _ph=${_pn#*://}; _ph=${_ph##*@}; _ph=${_ph%%/*}
-    case $_ph in
-      127.0.0.1:$CSWAP_PIN_PORT | localhost:$CSWAP_PIN_PORT | "[::1]:$CSWAP_PIN_PORT")
-        export HTTPS_PROXY="$_pv" https_proxy="$_pv" HTTP_PROXY="$_pv" http_proxy="$_pv" ALL_PROXY="$_pv" all_proxy="$_pv"
-        break ;;
-    esac
+    case $_ph in 127.0.0.1:* | localhost:* | "[::1]:"*) _pt=${_ph##*:} ;; *) continue ;; esac
+    case $_pt in '' | *[!0-9]*) continue ;; esac
+    _pf=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/@FLOORDIR@/$_pt
+    [ -r "$_pf" ] || continue
+    _pv=
+    IFS= read -r _pv < "$_pf" || :
+    export HTTPS_PROXY="$_pv" https_proxy="$_pv" HTTP_PROXY="$_pv" http_proxy="$_pv" ALL_PROXY="$_pv" all_proxy="$_pv"
+    break
   done
 fi
 # A prefix of the user's own, split the way Claude Code splits one: at the last " -".
