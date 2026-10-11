@@ -25,7 +25,6 @@ import socket
 import stat
 import subprocess
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -393,7 +392,7 @@ class TestTheFloorTheDaemonRecords:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    def _floor(self, tmp_path, proxy=None, next_hop=None, raw=None,
+    def _floor(self, tmp_path, monkeypatch, proxy=None, next_hop=None, raw=None,
                nohealth=()):
         """What the daemon records for this `upstream.json`."""
         import cswap_pin.proxy as pp
@@ -404,8 +403,7 @@ class TestTheFloorTheDaemonRecords:
             (certdir / "upstream.json").write_text(raw)
         elif proxy is not None or next_hop is not None:
             pp.write_upstream_hint(certdir, proxy, next_hop=next_hop or "")
-        pp._ASKED_NOHEALTH.clear()
-        pp._ASKED_NOHEALTH.update(nohealth)
+        monkeypatch.setattr(pp, "_ASKED_NOHEALTH", set(nohealth))
         proxy_ = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
                              upstream=("127.0.0.1", 1), rediscover_chain=True)
         proxy_.port = PIN
@@ -413,47 +411,47 @@ class TestTheFloorTheDaemonRecords:
         path = certdir / "child-floor"
         return path.read_text() if path.exists() else None
 
-    def case_the_hop_behind_ccf_is_the_floor(self, tmp_path):
-        assert self._floor(tmp_path, "http://127.0.0.1:9901", FLOOR_URL) == (
+    def case_the_hop_behind_ccf_is_the_floor(self, tmp_path, monkeypatch):
+        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL) == (
             FLOOR_URL + "\n")
 
-    def case_without_ccf_the_users_own_proxy_is_the_floor(self, tmp_path):
+    def case_without_ccf_the_users_own_proxy_is_the_floor(self, tmp_path, monkeypatch):
         """A remote proxy, a TLS one, and a loopback one that answered /health
         with a 4xx (privoxy) are not CCF."""
         corp = "http://proxy.corp.example:3128"
-        assert self._floor(tmp_path / "a", corp) == corp + "\n"
+        assert self._floor(tmp_path / "a", monkeypatch, corp) == corp + "\n"
         tls = "https://proxy.corp.example:3129"
-        assert self._floor(tmp_path / "b", tls) == tls + "\n"
-        assert self._floor(tmp_path / "c", FLOOR_URL,
+        assert self._floor(tmp_path / "b", monkeypatch, tls) == tls + "\n"
+        assert self._floor(tmp_path / "c", monkeypatch, FLOOR_URL,
                            nohealth={"127.0.0.1:8118"}) == FLOOR_URL + "\n"
 
-    def case_an_unlearned_next_is_unknown_never_direct(self, tmp_path):
+    def case_an_unlearned_next_is_unknown_never_direct(self, tmp_path, monkeypatch):
         """A loopback proxy nobody has classified may be CCF with its own
         upstream not learned yet. Direct there is the corporate 403
         (dotfiles b28af221), so the children stay on the pin."""
-        assert self._floor(tmp_path / "a", "http://127.0.0.1:9901") is None
+        assert self._floor(tmp_path / "a", monkeypatch, "http://127.0.0.1:9901") is None
         # ...and the file goes when the answer goes: a stale floor is a hop
         # nobody chose any more.
         certdir = tmp_path / "a" / "pin-proxy"
         (certdir / "child-floor").write_text(FLOOR_URL + "\n")
-        assert self._floor(tmp_path / "a") is None
+        assert self._floor(tmp_path / "a", monkeypatch) is None
         assert not (certdir / "child-floor").exists()
 
-    def case_no_record_or_an_unreadable_one_is_unknown(self, tmp_path):
-        assert self._floor(tmp_path / "a") is None
-        assert self._floor(tmp_path / "b", raw="{not json") is None
-        assert self._floor(tmp_path / "c", raw="[]") is None
+    def case_no_record_or_an_unreadable_one_is_unknown(self, tmp_path, monkeypatch):
+        assert self._floor(tmp_path / "a", monkeypatch) is None
+        assert self._floor(tmp_path / "b", monkeypatch, raw="{not json") is None
+        assert self._floor(tmp_path / "c", monkeypatch, raw="[]") is None
 
-    def case_a_pin_with_no_hop_at_all_says_direct(self, tmp_path):
+    def case_a_pin_with_no_hop_at_all_says_direct(self, tmp_path, monkeypatch):
         """The one positive statement: it dials direct itself, so a child
         dialling direct takes the same road."""
-        assert self._floor(tmp_path / "a", raw='{"proxy": "", "next": ""}') == ""
+        assert self._floor(tmp_path / "a", monkeypatch, raw='{"proxy": "", "next": ""}') == ""
         # CONTROL: the same record with a hop in it is not DIRECT.
-        assert self._floor(tmp_path / "b", raw='{"proxy": "http://127.0.0.1:9901"}'
+        assert self._floor(tmp_path / "b", monkeypatch, raw='{"proxy": "http://127.0.0.1:9901"}'
                            ) is None
 
-    def case_a_hop_that_names_the_pin_is_not_a_floor(self, tmp_path):
-        assert self._floor(tmp_path / "a", raw=json.dumps(
+    def case_a_hop_that_names_the_pin_is_not_a_floor(self, tmp_path, monkeypatch):
+        assert self._floor(tmp_path / "a", monkeypatch, raw=json.dumps(
             {"proxy": "http://127.0.0.1:9901",
              "next": _pin_url()})) is None
 
@@ -479,7 +477,7 @@ class TestTheFloorTheDaemonRecords:
             hop = f"http://127.0.0.1:{srv.server_address[1]}"
             certdir = Path(tmp_path) / "pin-proxy"
             certdir.mkdir()
-            pp._ASKED_NOHEALTH.clear()
+            monkeypatch.setattr(pp, "_ASKED_NOHEALTH", set())
             monkeypatch.setattr(pp, "_probe_next_hop", functools.partial(
                 pp._probe_next_hop, timeout=10))
             pp.write_upstream_hint(certdir, hop)
@@ -497,16 +495,16 @@ class TestTheFloorTheDaemonRecords:
             srv.shutdown()
 
     def case_the_file_is_replaced_atomically_and_only_on_a_change(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         import cswap_pin.proxy as pp
 
-        self._floor(tmp_path, "http://127.0.0.1:9901", FLOOR_URL)
+        self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
         path = Path(tmp_path) / "pin-proxy" / "child-floor"
         before = path.stat().st_ino
-        self._floor(tmp_path, "http://127.0.0.1:9901", FLOOR_URL)
+        self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
         assert path.stat().st_ino == before, "an unchanged floor was rewritten"
-        self._floor(tmp_path, "http://127.0.0.1:9901", "http://127.0.0.1:8119")
+        self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", "http://127.0.0.1:8119")
         assert path.read_text() == "http://127.0.0.1:8119\n"
         assert not list(path.parent.glob("*.cswap-tmp"))
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -711,7 +709,8 @@ class TestTheBackstopDialsTheFloorFirst:
             assert ccf.seen == [], (
                 "a child's CONNECT still rode CCF before the floor")
         finally:
-            ccf.stop(), floor.stop()
+            ccf.stop()
+            floor.stop()
 
     def case_without_a_learned_next_it_is_ccf_as_before(self, tmp_path):
         ccf = _Hop()
@@ -732,7 +731,8 @@ class TestTheBackstopDialsTheFloorFirst:
             assert floor.seen and ccf.seen == [
                 "CONNECT bulk.example.test:443 HTTP/1.1"], (floor.seen, ccf.seen)
         finally:
-            ccf.stop(), floor.stop()
+            ccf.stop()
+            floor.stop()
 
     def case_a_floor_hop_that_is_down_falls_back_to_ccf(self, tmp_path):
         ccf = _Hop()
@@ -758,4 +758,5 @@ class TestTheBackstopDialsTheFloorFirst:
                 ccf.seen, floor.seen)
             assert floor.seen == []
         finally:
-            ccf.stop(), floor.stop()
+            ccf.stop()
+            floor.stop()

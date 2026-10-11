@@ -349,16 +349,13 @@ _REPLACE_CLASS_CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE
 
 # -- the children of a pinned Claude Code ------------------------------------
 #
-# The env block reaches every process Claude Code starts, not just Claude Code:
-# aws, git, curl, hooks, stdio MCP servers all ride pin -> CCF. Only Claude
-# Code's own traffic should. `CLAUDE_CODE_SHELL_PREFIX` is the one hook that
+# The env block reaches every process Claude Code starts, so aws, git, curl,
+# hooks and stdio MCP servers ride pin -> CCF too. `CLAUDE_CODE_SHELL_PREFIX`
 # stands in front of the Bash tool, every command hook, every stdio MCP server
-# and the status line (measured on 2.1.296; apiKeyHelper, otelHeadersHelper,
-# Claude Code's own git/gh and LSP servers are not reached, and `_blind_tunnel`
-# carries those on the floor hop first instead). The script points those
-# children at the FLOOR: the proxy below the pin, recorded by the daemon in
-# `<certdir>/child-floor`. Absent file = unknown = change nothing; empty =
-# the pin dials direct; a URL = that proxy.
+# and the status line (measured, 2.1.296); the script below points those at the
+# FLOOR in `<certdir>/child-floor`: absent = unknown = change nothing, empty =
+# the pin dials direct, a URL = the proxy below the pin. What no prefix reaches
+# (Claude Code's own git/gh, helpers, LSP) is carried by `_blind_tunnel`.
 _PREFIX_KEY = "CLAUDE_CODE_SHELL_PREFIX"
 _FLOOR_FILE = "child-floor"
 _CHILD_FLOOR_SH = """#!/bin/sh
