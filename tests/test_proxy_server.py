@@ -8,6 +8,7 @@ original on everything else.
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.client
 import io
 import json
@@ -3773,9 +3774,8 @@ class TestChainRediscovery:
             dialled.append(address)
             raise OSError("the direct dial is the thing under test")
 
-        monkeypatch.setattr(
-            pin_proxy.socket, "create_connection", _create_connection
-        )
+        # `_happy_dial` is where every remote dial (hop and direct) goes.
+        monkeypatch.setattr(pin_proxy, "_happy_dial", _create_connection)
         proxy = PinProxy(
             certdir=certdir,
             pin_token_provider=lambda: None,
@@ -5410,9 +5410,8 @@ class TestChainRediscovery:
             dialled.append(address)
             raise OSError("the direct dial is the thing under test")
 
-        monkeypatch.setattr(
-            pin_proxy.socket, "create_connection", _create_connection
-        )
+        # `_happy_dial` is where every remote dial (hop and direct) goes.
+        monkeypatch.setattr(pin_proxy, "_happy_dial", _create_connection)
         proxy = PinProxy(
             certdir=certdir,
             pin_token_provider=lambda: None,
@@ -23108,3 +23107,125 @@ class TestBulkTunnelsHaveTheirOwnPump:
             for pair in pairs:
                 for s in pair:
                     s.close()
+
+
+class _NeverConnects:
+    """An attempt stuck in SYN-SENT: the read end of a pipe never selects
+    writable, which is exactly what a black-holed connect looks like."""
+
+    def __init__(self):
+        import os as _os
+        self._r, self._w = _os.pipe()
+        self.closed = False
+
+    def fileno(self):
+        return self._r
+
+    def close(self):
+        import os as _os
+        if not self.closed:
+            self.closed = True
+            _os.close(self._r)
+            _os.close(self._w)
+
+
+class TestHappyEyeballsDial:
+    """A broken IPv6 route must not stall upstream dials (RFC 8305).
+
+    Measured: a cellular modem kept its global IPv6 addresses after its IPv6
+    stopped carrying traffic. AAAA resolved first, `create_connection` gave
+    each address the whole 15 s, and every pinned session's Remote Control
+    gave up while Claude Code's own direct dials (Node, happy eyeballs) kept
+    working."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    @staticmethod
+    def _listener():
+        srv = socket.socket()
+        srv.settimeout(10)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        return srv
+
+    @staticmethod
+    def _resolve_to(monkeypatch, infos):
+        import cswap_pin.proxy as pp
+        monkeypatch.setattr(pp.socket, "getaddrinfo",
+                            lambda *a, **k: list(infos))
+
+    def case_a_black_holed_first_address_does_not_hold_the_dial(
+        self, monkeypatch
+    ):
+        import cswap_pin.proxy as pp
+
+        srv = self._listener()
+        port = srv.getsockname()[1]
+        dead = _NeverConnects()
+        self._resolve_to(monkeypatch, [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ])
+        real = pp._start_connect
+        monkeypatch.setattr(
+            pp, "_start_connect",
+            lambda fam, addr: (dead, errno.EINPROGRESS)
+            if fam == socket.AF_INET6 else real(fam, addr))
+        t0 = time.monotonic()
+        sock = pp._happy_dial(("example.test", port), timeout=15)
+        took = time.monotonic() - t0
+        try:
+            assert sock.getpeername()[:2] == ("127.0.0.1", port)
+            assert took < 2.0, (
+                f"the dial waited {took:.1f}s on the dead IPv6 attempt instead "
+                "of starting IPv4 after the connection attempt delay")
+            assert dead.closed, "the losing attempt was left open"
+            assert sock.gettimeout() == 15, (
+                "the dial budget was not left on the socket the way "
+                "create_connection leaves it, which callers then clear")
+        finally:
+            sock.close()
+            srv.close()
+
+    def case_a_refused_address_moves_on_at_once(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        srv = self._listener()
+        port = srv.getsockname()[1]
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        refused_port = closed.getsockname()[1]
+        closed.close()  # nothing listens there: an immediate RST
+        self._resolve_to(monkeypatch, [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", refused_port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ])
+        monkeypatch.setattr(pp, "_HAPPY_EYEBALLS_DELAY_S", 5.0)
+        t0 = time.monotonic()
+        sock = pp._happy_dial(("example.test", port), timeout=15)
+        try:
+            assert sock.getpeername()[1] == port
+            assert time.monotonic() - t0 < 2.0, (
+                "a refused attempt waited out the attempt delay instead of "
+                "starting the next address immediately")
+        finally:
+            sock.close()
+            srv.close()
+
+    def case_nothing_reachable_raises_within_the_budget(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        deads = [_NeverConnects(), _NeverConnects()]
+        self._resolve_to(monkeypatch, [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
+        ])
+        monkeypatch.setattr(pp, "_start_connect",
+                            lambda fam, addr: (deads.pop(0), errno.EINPROGRESS))
+        t0 = time.monotonic()
+        with pytest.raises(OSError):
+            pp._happy_dial(("example.test", 443), timeout=0.8)
+        took = time.monotonic() - t0
+        assert took < 2.0, f"the whole-dial budget was not kept: {took:.1f}s"
+        assert not deads, "an address was never attempted"
