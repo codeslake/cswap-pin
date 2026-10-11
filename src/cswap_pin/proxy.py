@@ -4198,9 +4198,11 @@ def _read_json(path: Path):
     return out if isinstance(out, dict) else None
 
 
-def _live_session_ids() -> list[str]:
-    """Session ids of processes that are alive, from the registry."""
-    out: list[str] = []
+def _live_session_ids() -> dict[str, bool]:
+    """Session ids of processes that are alive, from the registry, each mapped
+    to whether it holds a bridge: the registry's ``bridgeSessionId``, else its
+    job record's (the join `live_remote_control_sessions` makes)."""
+    out: dict[str, bool] = {}
     try:
         home = require("paths").get_claude_config_home()
         for path in (home / "sessions").glob("*.json"):
@@ -4214,9 +4216,13 @@ def _live_session_ids() -> list[str]:
                 os.kill(int(pid), 0)
             except Exception:  # noqa: BLE001
                 continue
-            out.append(str(sid))
+            bridge, job = rec.get("bridgeSessionId"), rec.get("jobId")
+            if not bridge and job:
+                bridge = (_read_json(home / "jobs" / str(job) / "state.json")
+                          or {}).get("bridgeSessionId")
+            out[str(sid)] = bool(bridge) or out.get(str(sid), False)
     except Exception:  # noqa: BLE001
-        return []
+        return {}
     return out
 
 
@@ -4389,6 +4395,11 @@ def _carry_job_record(job_id: str, login: tuple[str, str]) -> bool:
 #: session speaks (2 of 20 live sessions had none yet), and the pointer-holding
 #: stub of a duplicate is written by Claude Code AFTER the create's first look.
 #: Two files carrying a pointer decline the same way, on every look.
+#:
+#: ONLY FOR A SESSION THAT HAS A BRIDGE. One without has no pointer to restamp,
+#: and its transcript exists with none (Remote Control off: 2,119 lines before
+#: a first record), so a timed glob for it would put the scan back on every
+#: create. Its first look still globs, and the glob runs again once it has one.
 # shortcut: once a remembered file carries the pointer, a second pointer file
 # for the id is not seen until the remembered path vanishes; the cost is one
 # restamp appended to the older transcript.
@@ -4396,7 +4407,7 @@ _TRANSCRIPT_MISS_S = 60.0
 _transcript_seen: "dict[tuple[Path, str], tuple[list[Path], float]]" = {}
 
 
-def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
+def _last_pointer(session_id: str, bridged: bool = True) -> tuple[Path, dict] | None:
     """The transcript and its last ``bridge-session`` record, from the tail.
 
     ONE SESSION ID CAN NAME TWO FILES, and when it does this declines rather
@@ -4413,10 +4424,12 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     """
     projects = require("paths").get_claude_config_home() / "projects"
     key = (projects, session_id)
-    paths, at = _transcript_seen.get(key, ([], -_TRANSCRIPT_MISS_S))  # unseen reads as expired
-    moved = not all(p.exists() for p in paths)
+    seen = _transcript_seen.get(key)
+    paths, at = seen or ([], 0.0)
+    moved = seen is None or not all(p.exists() for p in paths)  # unseen reads as moved
     found = [] if moved else _pointer_records(paths, session_id)
-    if len(found) != 1 and (moved or time.monotonic() - at >= _TRANSCRIPT_MISS_S):
+    if len(found) != 1 and (
+            moved or (bridged and time.monotonic() - at >= _TRANSCRIPT_MISS_S)):
         # A guard here would also make `_carry_history_pointers`' stated reason
         # for its outer catch-all untrue.
         paths = list(projects.glob(f"*/{session_id}.jsonl"))
@@ -4569,8 +4582,8 @@ def carry_live_pointers(login: "tuple[str, str]") -> int:
     # changed nothing for the session it was written for. `_carry_history_
     # pointers` writes BOTH and says why: an interactive resume has no
     # CLAUDE_JOB_DIR, so Claude Code reads the TRANSCRIPT.
-    for sid in _live_session_ids():
-        found = _last_pointer(sid)
+    for sid, bridged in _live_session_ids().items():
+        found = _last_pointer(sid, bridged)
         if not found:
             continue
         path, rec = found

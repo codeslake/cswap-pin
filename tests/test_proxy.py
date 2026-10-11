@@ -651,7 +651,7 @@ class TestHistoryCarriesAcrossASwitch:
         for i in range(30):
             (home / "projects" / f"p{i}").mkdir()
         monkeypatch.setattr(pp, "_live_job_ids", lambda: [])
-        monkeypatch.setattr(pp, "_live_session_ids", lambda: list(sids))
+        monkeypatch.setattr(pp, "_live_session_ids", lambda: dict.fromkeys(sids, True))
         scans: list[str] = []
         for name in ("glob", "iterdir"):
             real = getattr(Path, name)
@@ -738,6 +738,32 @@ class TestHistoryCarriesAcrossASwitch:
         assert self._tail_pointer(stub)["ownerAccountUuid"] == "acct-2"
         assert self._tail_pointer(big) is None
 
+    def case_a_pointerless_transcript_of_a_session_with_no_bridge_is_not_globbed_again(
+            self, tmp_path, monkeypatch):
+        """A SESSION WITH REMOTE CONTROL OFF HAS A TRANSCRIPT AND NEVER A
+        POINTER (measured: 2,119 lines before its first record), and it has no
+        bridge for a stub to restamp. Re-globbing it each window put the
+        15,799-dir scan back on every create, for each such session."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        big = home / "projects" / "proj" / "rcoff.jsonl"
+        big.write_text(json.dumps({"type": "user", "sessionId": "rcoff"}) + "\n")
+        carry, scans = self._live_carry(home, monkeypatch, ["rcoff"])
+        live = {"rcoff": False}
+        monkeypatch.setattr(pp, "_live_session_ids", lambda: live)
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)  # every window has ended
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+        assert carry(self.LOGIN) == 0
+        assert len(scans) == 1, "a session with no bridge was globbed again"
+
+        live["rcoff"] = True              # CONTROL: the same session once it has one
+        stub = home / "projects" / "p5" / big.name
+        stub.write_text(json.dumps(self._pointer(sessionId="rcoff")) + "\n")
+        assert carry(("acct-2", "org-2")) == 1, "the bridge opened the gate"
+        assert len(scans) == 2
+        assert self._tail_pointer(stub)["ownerAccountUuid"] == "acct-2"
+
     def case_a_two_file_id_declines_and_is_not_rescanned_inside_the_window(
             self, tmp_path, monkeypatch):
         """Two files carrying a pointer decline, as before, on every look; the
@@ -754,8 +780,30 @@ class TestHistoryCarriesAcrossASwitch:
         assert len(scans) == 1, "a two-file id was globbed again inside the window"
 
         monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)
+        assert carry(self.LOGIN) == 0 and len(scans) == 2, (
+            "the window ended: the timed glob ran and still sees two")
         twin.unlink()
-        assert carry(self.LOGIN) == 1, "the window ended and one file is left"
+        assert carry(self.LOGIN) == 1, "one file is left"
+
+    def case_a_live_session_holds_a_bridge_in_its_registry_or_job_record(
+            self, tmp_path, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        me = os.getpid()
+        reg = {"in-reg": {"bridgeSessionId": "b"},
+               "cleared": {"bridgeSessionId": ""},
+               "none": {},
+               "job-has": {"jobId": "j1"},
+               "job-cleared": {"jobId": "j2", "bridgeSessionId": ""}}
+        for sid, extra in reg.items():
+            (home / "sessions" / f"{sid}.json").write_text(
+                json.dumps({"sessionId": sid, "pid": me, **extra}))
+        self._job(home, "j1", "job-has")
+        self._job(home, "j2", "job-cleared", bridge="")
+        assert pp._live_session_ids() == {
+            "in-reg": True, "cleared": False, "none": False,
+            "job-has": True, "job-cleared": False}
 
 _TEST_IDENTITY = hashlib.sha256(b"org:test-org").hexdigest()
 # T0681 ROUND 4: the fixed token/account pair `_seed_trusted_stamp` writes
@@ -30737,7 +30785,7 @@ class TestTheSpliceHoldsTheConfigLock:
              "bridgeSessionGroupingId": "grp_7", "bridgeOutboundOnly": False}))
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
         monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["j1"])
-        monkeypatch.setattr(pin_proxy, "_live_session_ids", lambda: [])
+        monkeypatch.setattr(pin_proxy, "_live_session_ids", lambda: {})
         assert pin_proxy.carry_live_pointers(("PIN", "ORG")) == 1
         rec = json.loads((home / "jobs" / "j1" / "state.json").read_text())
         assert rec["bridgeOwnerAccountUuid"] == "PIN"
