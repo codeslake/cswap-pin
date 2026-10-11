@@ -378,16 +378,23 @@ if [ "${CSWAP_PIN_CHILD_FLOOR-}" != off ]; then
     case $_pt in '' | *[!0-9]*) continue ;; esac
     _pf=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/@FLOORDIR@/$_pt
     [ -f "$_pf" ] && [ -r "$_pf" ] || continue
-    _pv=
-    IFS= read -r _pv < "$_pf" || :
+    # A file gone since the test is unknown, not an empty one (direct).
+    _pv=; _pg=
+    { IFS= read -r _pv || :; _pg=y; } 2>/dev/null < "$_pf"
+    [ -n "$_pg" ] || continue
     export HTTPS_PROXY="$_pv" https_proxy="$_pv" HTTP_PROXY="$_pv" http_proxy="$_pv" ALL_PROXY="$_pv" all_proxy="$_pv"
     break
   done
 fi
 # A prefix of the user's own, split the way Claude Code splits one: at the last " -".
 if [ -r "$_pc" ]; then
-  IFS= read -r _pp < "$_pc" || :
+  _pp=
+  IFS= read -r _pp 2>/dev/null < "$_pc" || :
   case $_pp in *" -"*) _pw=${_pp%" -"*}; _pa=-${_pp##*" -"} ;; *) _pw=$_pp; _pa= ;; esac
+  # A bare name is found on PATH, as the shell Claude Code runs it in would. Never
+  # a floor script: two naming each other would exec for ever.
+  _pw=$(command -v "$_pw" 2>/dev/null)
+  case $_pw in */child-floor.sh) _pw= ;; esac
   if [ -n "$_pw" ] && [ -x "$_pw" ]; then exec "$_pw" $_pa "$1"; fi
 fi
 # Only the Bash tool's string needs the user's shell: it starts by sourcing a
@@ -438,9 +445,31 @@ def _replace_text(path: Path, text: str, mode: int) -> None:
         raise
 
 
-def _floor_path(port) -> Path:
-    """Where the proxy listening on ``port`` publishes its floor."""
-    return require("paths").get_claude_config_home() / _FLOOR_DIR / str(port)
+def _floor_path(port, home=None) -> Path:
+    """Where the proxy listening on ``port`` publishes its floor: in ``home``,
+    else in this process's Claude config home."""
+    return (home or require("paths").get_claude_config_home()) / _FLOOR_DIR / str(port)
+
+
+def _floor_homes(port) -> list[Path]:
+    """The Claude config homes a pin's floor goes to: this process's own, and
+    every other one a pin has wired on ``port`` (the receipts name them). A
+    child reads the floor from its OWN session's config dir, and a box wires two
+    configs (the default one and a CLAUDE_CONFIG_DIR one) on the one pin port."""
+    paths = require("paths")
+    homes = [Path(paths.get_claude_config_home())]
+    for receipt in (Path(paths.get_backup_root()) / "pin-wiring").glob("*.json"):
+        try:
+            led = json.loads(receipt.read_text(encoding="utf-8"))
+            home = Path(led["configHome"])
+            # Only a wired receipt carries these two (an unwire writes neither),
+            # and an existing home only: a deleted profile's receipt must not
+            # make the daemon recreate its directory.
+            if str(led["port"]) == str(port) and home.is_dir():
+                homes.append(home)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return homes
 
 
 def _write_child_floor_script(wiring: Path) -> Path:
@@ -2501,6 +2530,12 @@ def _wire_global_config_locked(
     # Drop what we wrote last time, restoring anything we displaced.
     saved = prev.get(f"{_WIRE_MARK}Saved")
     saved = dict(saved) if isinstance(saved, dict) else {}
+    # A PREFIX ANOTHER PRODUCT WIRED OVER OURS SINCE IS THEIRS: the receipt owns
+    # the key only while the block still holds our script. Left in place, and
+    # nothing of the user's is handed back over it.
+    if env.get(_PREFIX_KEY) not in (None, str(_ledger_path(path).parent / "child-floor.sh")):
+        ours = [k for k in ours if k != _PREFIX_KEY]
+        saved.pop(_PREFIX_KEY, None)
     for key in ours:
         env.pop(key, None)
     # HEAL A MACHINE THAT ALREADY CARRIES A BANNED KEY, whoever wrote it.
@@ -2613,7 +2648,11 @@ def _wire_global_config_locked(
                   # WHO WROTE THIS, so a later launch can tell a
                   # wiring produced by the installed code from one
                   # produced by the version before it.
-                  "writtenBy": _own_version()}
+                  "writtenBy": _own_version(),
+                  # WHERE THE DAEMON PUBLISHES THIS CONFIG'S FLOOR
+                  # (`_floor_homes`): the home a session of this config reads it from.
+                  "port": port,
+                  "configHome": str(require("paths").get_claude_config_home())}
 
     if env == before and _WIRE_MARK not in raw and not ours:
         return False
@@ -2763,8 +2802,11 @@ def _ambient_proxy(
     # hop behind the recorded one, which is where the pin chains to, not a
     # proxy this launch chose. Recorded as `proxy` while the recorded hop is
     # down, it would drop CCF from the chain for good.
-    if (_self_port(src) is not None and certdir is not None
-            and value == _read_upstream(certdir, "next")):
+    # By ADDRESS: the floor keeps the credentials its hop published, the record's
+    # `next` is the stripped form of the same proxy.
+    nxt = (parse_upstream_proxy(_read_upstream(certdir, "next"))
+           if certdir is not None else None)
+    if _self_port(src) is not None and nxt is not None and parsed.address == nxt.address:
         return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
     # behind. A launcher may start a per-session cache proxy and points
@@ -21952,8 +21994,9 @@ class PinProxy:
 
         Called on the daemon's timer after `learn_next_hop`, which is what
         classifies a hop. Compare-before-write: a settled box writes nothing.
+        The same line goes to every config home a pin has wired on this port
+        (`_floor_homes`), and leaves each of them when it is unknown.
         """
-        path = _floor_path(self.port)
         value = None
         try:
             rec = json.loads((self._certdir / _UPSTREAM_FILE).read_text())
@@ -21970,14 +22013,16 @@ class PinProxy:
         except (OSError, ValueError, AttributeError):
             pass
         text = f"{value}\n" if value else ""
-        try:
-            if value is None:
-                path.unlink(missing_ok=True)
-            elif not path.exists() or path.read_text() != text:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                _replace_text(path, text, 0o600)
-        except OSError:
-            pass
+        for home in _floor_homes(self.port):
+            path = _floor_path(self.port, home)
+            try:
+                if value is None:
+                    path.unlink(missing_ok=True)
+                elif not path.exists() or path.read_text() != text:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    _replace_text(path, text, 0o600)
+            except OSError:
+                pass
 
     def _is_me(self, value) -> bool:
         """Whether ``value`` names this daemon's own address.

@@ -485,8 +485,10 @@ command:
 | pin, then a cache proxy that dials direct | empty, if the cache proxy publishes an empty floor |
 | the cache proxy publishes no floor (its chain has credentials, cannot be reached or is not one it can name) | unchanged, the pin: direct is never guessed |
 
-The floor is one line in `proxy-floor/<the pin's port>` under `$CLAUDE_CONFIG_DIR`
-(`~/.claude` when that is unset), kept by the daemon: a URL, an empty line for
+The floor is one line in `proxy-floor/<the pin's port>` under the config dir of
+every config the pin has wired on that port (`$CLAUDE_CONFIG_DIR`, or `~/.claude`
+when that is unset, in the session that wired it; the receipt records it), kept
+by the daemon: a URL, an empty line for
 "direct", and no file for "not known"; any other local proxy can publish its own
 floor to that directory under its own listen port, written by temp file and
 rename. The daemon's own line is the recorded hop's address when that hop is
@@ -503,7 +505,9 @@ host is named anywhere.
 - **Your own `CLAUDE_CODE_SHELL_PREFIX`**, in `.claude.json` or in the
   environment `cswap pin` runs in, is kept in `<data>/pin-wiring/child-prefix`
   and the script hands every command to it (an unwire gives the `.claude.json`
-  one back). Delete that file to stop. One set in a settings file `env` replaces
+  one back, unless another tool has set its own there since). It is a path or a
+  command name found on `PATH`, and never another `child-floor.sh`. Delete that
+  file to stop. One set in a settings file `env` replaces
   the pin's and skips the floor.
 - **The shell**: only a Bash-tool command runs under a shell of yours: the one
   its shell snapshot was written for (the file name says bash or zsh), else the
@@ -529,12 +533,12 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | :-- | :-- | :-- |
 | `~/.claude.json` `env` (`$CLAUDE_CONFIG_DIR/.claude.json` when that is set) | sets `HTTPS_PROXY`, `https_proxy` and `ALL_PROXY` to the pin's loopback address, `NODE_EXTRA_CA_CERTS` to the pin's CA (or to `ca-bundle.pem` when a hop's CA is merged in), `CSWAP_PIN_PORT` to its port and `CLAUDE_CODE_SHELL_PREFIX` to the pin's script ([What a session's children see](#what-a-sessions-children-see)); deletes `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` | the six removed and whatever they replaced restored; the three deleted stay deleted |
 | `~/.claude.json` `oauthAccount` | the pinned account's identity, re-asserted by every `--ensure` | the account you are logged in as |
-| `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
+| `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy`, `port` and `configHome` (where the daemon publishes the floor) | emptied |
 | `<data>/pin-wiring/child-floor.sh`, `child-prefix` | the prefix script, and the `CLAUDE_CODE_SHELL_PREFIX` of your own it hands commands to (written only if you had one) | left in place |
 | `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
 | `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json` that records a pin: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
 | `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO | left in place |
-| `~/.claude/proxy-floor/<the pin's port>` (under `$CLAUDE_CONFIG_DIR` when that is set) | the proxy below the pin, for children ([What a session's children see](#what-a-sessions-children-see)); the pin writes and removes only its own port's file | removed by the unwire (a daemon still running writes it again) |
+| `~/.claude/proxy-floor/<the pin's port>` (under `$CLAUDE_CONFIG_DIR` when that is set) | the proxy below the pin, for children ([What a session's children see](#what-a-sessions-children-see)); the pin writes and removes only its own port's file, in each config dir it wired on that port | removed by the unwire, for that config only (a daemon still running writes the daemon's own again) |
 | `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
 | `~/.claude/jobs/<id>/state.json`, and a transcript's `bridge-session` record | the account in the bridge pointer of a session that is not running, restamped (see [Keeping a session's bridge when the account rotates](#keeping-a-sessions-bridge-when-the-account-rotates)) | not touched |
 

@@ -80,6 +80,17 @@ def _serve_health(answer):
     return srv
 
 
+def _vanish_after_test(tmp_path, suffix):
+    """The env that makes bash's `[ -r FILE ]` delete FILE (a path ending in
+    `suffix`) as it answers: the file the script just found is gone when it
+    opens it. Run the script with bash as its interpreter."""
+    hook = Path(tmp_path) / "vanish.bash"
+    hook.write_text('[() {\n  builtin "[" "$@"; local rc=$?\n'
+                    '  case "$1:$2" in -r:*"$VANISH") command rm -f -- "$2" ;; esac\n'
+                    '  return $rc\n}\n')
+    return {"BASH_ENV": str(hook), "VANISH": suffix}
+
+
 class _Rig:
     """The real script in a scratch wiring dir, and a way to run it."""
 
@@ -111,10 +122,10 @@ class _Rig:
         env.update(extra)
         return {k: v for k, v in env.items() if v is not None}
 
-    def run(self, command, env, interp=None):
+    def run(self, command, env, interp=None, timeout=30):
         argv = ([interp] if interp else []) + [str(self.script), command]
         return subprocess.run(argv, env=env, capture_output=True, text=True,
-                              timeout=30)
+                              timeout=timeout)
 
     def bash_tool(self, command, snapshot="zsh"):
         """The string Claude Code 2.1.296 hands the prefix for a Bash-tool
@@ -215,6 +226,25 @@ class TestChildFloorWiring:
         _floor_file(9955).write_text("not ours\n")
         pp.wire_global_config(None, None)
         assert _floor_file(9955).read_text() == "not ours\n"
+
+    def case_an_unwire_leaves_a_prefix_another_product_wired_since(
+        self, tmp_path, monkeypatch
+    ):
+        """The receipt owns the key only while the block still holds OUR script.
+        Another product's prefix written over it later is theirs, and the
+        user's displaced one (receipt) is not handed back over it."""
+        from cswap_pin import proxy as pp
+
+        mine = Path(tmp_path) / "my-prefix.sh"
+        cfg = self._config(tmp_path, monkeypatch, {"env": {KEY: str(mine)}})
+        pp.wire_global_config(9955, Path(tmp_path) / "ca.pem")
+        raw = json.loads(cfg.read_text())
+        theirs = Path(tmp_path) / "their-prefix.sh"
+        raw["env"][KEY] = str(theirs)
+        cfg.write_text(json.dumps(raw))
+        assert pp.wire_global_config(None, None) is True
+        env = json.loads(cfg.read_text())["env"]
+        assert env == {KEY: str(theirs)}, env
 
     def case_a_users_own_prefix_is_restored_and_chained(
         self, tmp_path, monkeypatch
@@ -510,6 +540,80 @@ class TestChildFloorScript:
         rig = _Rig(tmp_path, str(Path(tmp_path) / "deleted.sh"))
         done = rig.run("echo still-runs", rig.env(_shells()[0]))
         assert (done.returncode, done.stdout.strip()) == (0, "still-runs"), done
+
+    def case_a_user_prefix_that_is_a_command_name_is_found_on_the_path(
+        self, tmp_path
+    ):
+        """Claude Code runs the prefix through a shell, so a bare name resolves
+        through PATH. `[ -x name ]` looks in the cwd and skipped it."""
+        log = Path(tmp_path) / "log"
+        bindir = Path(tmp_path) / "bin"
+        bindir.mkdir()
+        mine = bindir / "audit-prefix"
+        mine.write_text(f'#!/bin/sh\necho "$#|$1" >> {log}\nexec "$SHELL" -c "$1"\n')
+        mine.chmod(0o755)
+        rig = _Rig(tmp_path, "audit-prefix")
+        shell = _shells()[0]
+        env = rig.env(shell, PATH=f"{bindir}:{os.getenv('PATH')}")
+        done = rig.run("echo ran", env)
+        assert (done.returncode, done.stdout.strip()) == (0, "ran"), done
+        assert log.read_text().strip() == "1|echo ran", (
+            "a prefix named by a bare command was not called")
+        # CONTROL: a name nothing on PATH answers to falls through to the shell.
+        rig = _Rig(tmp_path / "b", "no-such-prefix-anywhere")
+        done = rig.run("echo ran", rig.env(shell))
+        assert (done.returncode, done.stdout.strip()) == (0, "ran"), done
+
+    def case_two_floor_scripts_naming_each_other_do_not_loop(self, tmp_path):
+        """A prefix that is a floor script (ours from another wiring dir, or a
+        copy) is never chained to: A -> B -> A would exec for ever."""
+        a = _Rig(tmp_path / "a")
+        b = _Rig(tmp_path / "b")
+        (a.dir / "child-prefix").write_text(f"{b.script}\n")
+        (b.dir / "child-prefix").write_text(f"{a.script}\n")
+        done = a.run("echo ran", a.env(_shells()[0]), timeout=5)
+        assert (done.returncode, done.stdout.strip()) == (0, "ran"), done
+
+    def case_a_floor_file_that_vanishes_after_the_test_is_unknown(self, tmp_path):
+        """The file is there for `[ -f ]` and gone for the `read`. That is not
+        an empty file (DIRECT): the children stay as they are, and the command
+        says nothing about it."""
+        bash = shutil.which("bash")
+        rig = _Rig(tmp_path)
+        rig.floor(FLOOR_URL + "\n")
+        report = 'echo "$HTTPS_PROXY|${HTTP_PROXY-UNSET}|${all_proxy-UNSET}"'
+        env = rig.env(bash, **_vanish_after_test(tmp_path, f"/proxy-floor/{PIN}"))
+        done = rig.run(report, env, interp=bash)
+        assert (done.returncode, done.stdout.strip(), done.stderr) == (
+            0, f"{_pin_url()}|UNSET|UNSET", ""), done
+        assert not (rig.tmp / ".claude" / "proxy-floor" / str(PIN)).exists(), (
+            "the injection did not fire")
+        # CONTROL: the same run with the file left alone is floored.
+        rig.floor(FLOOR_URL + "\n")
+        done = rig.run(report, rig.env(bash), interp=bash)
+        assert done.stdout.strip() == f"{FLOOR_URL}|{FLOOR_URL}|{FLOOR_URL}", done
+
+    def case_only_the_first_line_of_a_floor_file_is_read(self, tmp_path):
+        rig = _Rig(tmp_path)
+        rig.floor(FLOOR_URL + "\nhttp://127.0.0.1:1\n")
+        for shell in _shells():
+            assert all(rig.seen(shell)[n] == FLOOR_URL for n in SIX)
+
+    def case_an_inherited_pp_is_not_the_users_prefix(self, tmp_path):
+        """`_pp` is the script's own variable: when the read fails it must not
+        be whatever the environment happened to hold."""
+        bash = shutil.which("bash")
+        log = Path(tmp_path) / "log"
+        evil = Path(tmp_path) / "evil.sh"
+        evil.write_text(f'#!/bin/sh\necho ran >> {log}\nexec "$SHELL" -c "$1"\n')
+        evil.chmod(0o755)
+        rig = _Rig(tmp_path, "unused")
+        env = rig.env(bash, _pp=str(evil),
+                      **_vanish_after_test(tmp_path, "/child-prefix"))
+        done = rig.run("echo ok", env, interp=bash)
+        assert (done.returncode, done.stdout.strip(), done.stderr) == (0, "ok", ""), done
+        assert not (rig.dir / "child-prefix").exists(), "the injection did not fire"
+        assert not log.exists(), "the environment's _pp was run as the prefix"
 
     def case_the_shell_is_the_one_claude_code_picked(self, tmp_path):
         """`h0s` in the 2.1.296 binary: CLAUDE_CODE_SHELL if it names bash or
@@ -844,6 +948,65 @@ class TestTheFloorTheDaemonRecords:
         default = Path.home() / ".claude" / "proxy-floor" / str(PIN)
         assert default.read_text() == corp + "\n"
 
+    def _wire(self, tmp_path, monkeypatch, name, port=PIN, wire=True):
+        """Be a session whose config is `<name>/.claude.json` and whose config
+        home is `<name>` (a CLAUDE_CONFIG_DIR), and wire it on `port`."""
+        import cswap_pin.proxy as pp
+
+        home = Path(tmp_path) / name
+        home.mkdir(parents=True, exist_ok=True)
+        cfg = home / ".claude.json"
+        if not cfg.exists():
+            cfg.write_text("{}")
+        monkeypatch.setattr("claude_swap.paths.get_global_config_path", lambda: cfg)
+        monkeypatch.setattr("claude_swap.paths.get_claude_config_home", lambda: home)
+        if wire:
+            assert pp.wire_global_config(port, Path(tmp_path) / "ca.pem")
+        return home
+
+    def case_every_config_home_the_pin_wired_on_this_port_gets_the_floor(
+        self, tmp_path, monkeypatch
+    ):
+        """A box wires two configs (`~/.claude.json` and a CLAUDE_CONFIG_DIR one)
+        on the one pin port, and a child reads the floor from ITS session's
+        config dir: publishing into the daemon's own env's home alone leaves the
+        other config's children with no floor."""
+        import cswap_pin.proxy as pp
+
+        corp = "http://proxy.corp.example:3128"
+        a = self._wire(tmp_path, monkeypatch, "a")
+        b = self._wire(tmp_path, monkeypatch, "b")
+        elsewhere = self._wire(tmp_path, monkeypatch, "elsewhere", port=PIN + 1)
+        gone = self._wire(tmp_path, monkeypatch, "gone")
+        assert pp.wire_global_config(None, None)
+        ghost = self._wire(tmp_path, monkeypatch, "ghost")
+        shutil.rmtree(ghost)
+        mine = tmp_path / "claude-home"      # the daemon's own env's home
+        assert self._floor(tmp_path, monkeypatch, corp) == corp + "\n"
+        for home in (a, b, mine):
+            assert (home / "proxy-floor" / str(PIN)).read_text() == corp + "\n", home
+        # Another port's wiring, and an unwired one, are not this daemon's homes.
+        assert not (elsewhere / "proxy-floor").exists()
+        assert not (gone / "proxy-floor").exists()
+        assert not ghost.exists(), "a deleted profile's directory was recreated"
+        # UNKNOWN removes every file the daemon published, and only those.
+        other = b / "proxy-floor" / "9902"
+        other.write_text("http://127.0.0.1:3128\n")
+        assert self._floor(tmp_path, monkeypatch, raw="{not json") is None
+        for home in (a, b, mine):
+            assert not (home / "proxy-floor" / str(PIN)).exists(), home
+        assert other.read_text() == "http://127.0.0.1:3128\n"
+        # Unwiring one config takes its file and no other config's.
+        assert self._floor(tmp_path, monkeypatch, corp) == corp + "\n"
+        self._wire(tmp_path, monkeypatch, "a", wire=False)
+        assert pp.wire_global_config(None, None)
+        assert not (a / "proxy-floor" / str(PIN)).exists()
+        assert (b / "proxy-floor" / str(PIN)).read_text() == corp + "\n"
+        # ...and the daemon's next tick no longer writes there.
+        assert self._floor(tmp_path, monkeypatch, corp) == corp + "\n"
+        assert not (a / "proxy-floor" / str(PIN)).exists()
+        assert (b / "proxy-floor" / str(PIN)).read_text() == corp + "\n"
+
     def case_the_daemons_timer_records_it(self):
         """The call that matters is the one the daemon makes: `_watch_own_code`
         asks `learn_next_hop` and then records the floor."""
@@ -927,6 +1090,33 @@ class TestAFlooredEnvKeepsTheChain:
             "ALL_PROXY": FLOOR_URL, "CSWAP_PIN_PORT": "51000"})
         assert record["proxy"] == ccf_url, record
         assert record["next"] == FLOOR_URL, record
+
+    def case_a_floor_with_userinfo_is_still_the_floor_when_ccf_is_down(
+        self, tmp_path, monkeypatch
+    ):
+        """The hop's published floor carries its credentials; the recorded
+        `next` is the stripped form of the same address. Compared as strings
+        they differ, and the child's floor is recorded as the chain."""
+        import cswap_pin.proxy as pp
+
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        ccf_url = f"http://127.0.0.1:{dead.getsockname()[1]}"
+        dead.close()
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        pp.write_upstream_hint(certdir, ccf_url, next_hop=FLOOR_URL)
+        gated = "http://user:secret@127.0.0.1:8118"
+        record = self._ensure(tmp_path, monkeypatch, {
+            "HTTPS_PROXY": gated, "https_proxy": gated, "ALL_PROXY": gated,
+            "CSWAP_PIN_PORT": "51000"})
+        assert record["proxy"] == ccf_url, record
+        assert record["next"] == FLOOR_URL, record
+        # CONTROL: another proxy on the same host is a launch that chooses.
+        other = "http://user:secret@127.0.0.1:8119"
+        record = self._ensure(tmp_path, monkeypatch, {
+            "HTTPS_PROXY": other, "CSWAP_PIN_PORT": "51000"})
+        assert record["proxy"] == other, record
 
     def case_a_plain_shell_exporting_the_floor_is_still_a_launch_that_chooses(
         self, tmp_path, monkeypatch
