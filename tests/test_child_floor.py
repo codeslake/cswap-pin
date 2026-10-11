@@ -39,9 +39,9 @@ SIX = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
 FLOOR_URL = "http://127.0.0.1:8118"
 
 
-# What CCF 4.4.0 answers on /health when no chain is configured (pmac, measured
-# 2026-10-11): it dials direct, `https_proxy` is null, and the sticky `direct_last`
-# was never stamped. CACHE_FIX_FALLBACK_PROXIES is set there, to an empty value.
+# What CCF 4.4.0 answers on /health on a host whose cache proxy dials direct
+# (measured 2026-10-11): `https_proxy` is null and the sticky `direct_last` was
+# never stamped. CACHE_FIX_FALLBACK_PROXIES is listed in its `gates`.
 NO_UPSTREAM = {"status": "ok", "forward_proxy": True, "https_proxy": None,
                "https_proxy_measured": False, "direct_last": None,
                "gates": {"CACHE_FIX_FORWARD_PROXY": "on",
@@ -52,11 +52,12 @@ def _pin_url(port=PIN):
     return f"http://127.0.0.1:{port}"
 
 
-def _serve_health(box):
-    """A /health server that answers `box["answer"]` (a dict) with a 200."""
+def _serve_health(answer):
+    """A /health server that answers `answer` (a dict) with a 200. Change what it
+    says through `srv.RequestHandlerClass.answer`."""
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            body = json.dumps(box["answer"]).encode()
+            body = json.dumps(self.answer).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -65,6 +66,7 @@ def _serve_health(box):
         def log_message(self, *a):
             pass
 
+    H.answer = answer
     srv = http.server.HTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -613,10 +615,9 @@ class TestTheFloorTheDaemonRecords:
     def case_a_cache_proxy_that_reports_no_upstream_is_direct(
         self, tmp_path, monkeypatch
     ):
-        """pmac: CCF dials direct and its /health says nothing is behind it.
-        The pin knows that is a positive statement, so the child dials direct."""
-        box = {"answer": NO_UPSTREAM}
-        srv = _serve_health(box)
+        """CCF dials direct and its /health says nothing is behind it. The pin
+        knows that is a positive statement, so the child dials direct."""
+        srv = _serve_health(NO_UPSTREAM)
         try:
             tick = self._ticks(tmp_path, monkeypatch,
                                f"http://127.0.0.1:{srv.server_address[1]}")
@@ -640,8 +641,7 @@ class TestTheFloorTheDaemonRecords:
                              ("not forwarding", reverse), ("no gates", ungated),
                              ("no direct_last", unstamped),
                              ("bare ok", {"status": "ok"})):
-            box = {"answer": answer}
-            srv = _serve_health(box)
+            srv = _serve_health(answer)
             try:
                 tick = self._ticks(tmp_path / name.replace(" ", "-"), monkeypatch,
                                    f"http://127.0.0.1:{srv.server_address[1]}")
@@ -659,21 +659,20 @@ class TestTheFloorTheDaemonRecords:
     def case_the_direct_report_follows_the_cache_proxy(self, tmp_path, monkeypatch):
         """Direct is what the proxy last SAID, not a memory of it: a new answer
         replaces it, and a proxy that stops answering is not a new answer."""
-        box = {"answer": NO_UPSTREAM}
-        srv = _serve_health(box)
+        srv = _serve_health(NO_UPSTREAM)
         try:
             tick = self._ticks(tmp_path, monkeypatch,
                                f"http://127.0.0.1:{srv.server_address[1]}")
             assert tick() == ""
-            box["answer"] = dict(NO_UPSTREAM, direct_last="2026-10-11T00:00:00.000Z")
+            srv.RequestHandlerClass.answer = dict(
+                NO_UPSTREAM, direct_last="2026-10-11T00:00:00.000Z")
             assert tick() is None, "its chain went down: direct is no longer known"
-            box["answer"] = dict(NO_UPSTREAM, https_proxy=FLOOR_URL,
-                                 https_proxy_measured=True)
+            srv.RequestHandlerClass.answer = dict(
+                NO_UPSTREAM, https_proxy=FLOOR_URL, https_proxy_measured=True)
             assert tick() == FLOOR_URL + "\n"
         finally:
             srv.shutdown()
-        box = {"answer": NO_UPSTREAM}
-        srv = _serve_health(box)
+        srv = _serve_health(NO_UPSTREAM)
         tick = self._ticks(tmp_path / "gone", monkeypatch,
                            f"http://127.0.0.1:{srv.server_address[1]}")
         assert tick() == ""
@@ -718,25 +717,6 @@ class TestAFlooredEnvKeepsTheChain:
     def test_all(self, request, tmp_path_factory):
         run_cases(self, request, tmp_path_factory)
 
-    class _Health(http.server.BaseHTTPRequestHandler):
-        answer: dict = {}
-
-        def do_GET(self):
-            body = json.dumps(self.answer).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a):
-            pass
-
-    def _ccf(self, answer):
-        handler = type("H", (self._Health,), {"answer": answer})
-        srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        return srv
-
     def _ensure(self, tmp_path, monkeypatch, env):
         import cswap_pin.proxy as pp
 
@@ -763,7 +743,7 @@ class TestAFlooredEnvKeepsTheChain:
     ):
         import cswap_pin.proxy as pp
 
-        ccf = self._ccf({"https_proxy": FLOOR_URL})
+        ccf = _serve_health({"https_proxy": FLOOR_URL})
         try:
             ccf_url = f"http://127.0.0.1:{ccf.server_address[1]}"
             certdir = tmp_path / "pin-proxy"
