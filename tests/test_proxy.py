@@ -788,6 +788,30 @@ class TestHistoryCarriesAcrossASwitch:
         assert carry(self.LOGIN) == 0
         assert len(scans) == 1, "a job-backed session was globbed again"
 
+    def case_a_job_backed_session_with_no_transcript_yet_is_globbed_until_it_has_one(
+            self, tmp_path, monkeypatch):
+        """AN EMPTY LOOK IS NOT A SETTLED ONE: `all()` over no paths reads as
+        'nothing moved', so a job-backed session whose transcript did not exist
+        at the first look was never globbed again for the daemon's life."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        (home / "sessions" / "bg.json").write_text(json.dumps(
+            {"sessionId": "bg", "pid": os.getpid(), "jobId": "j1",
+             "bridgeSessionId": ""}))
+        real = pp._live_session_ids
+        carry, scans = self._live_carry(home, monkeypatch, [])
+        monkeypatch.setattr(pp, "_live_session_ids", real)
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)  # every window has ended
+        assert real() == {"bg": False}, "CONTROL: live, job-backed, no bridge"
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+
+        path = home / "projects" / "proj" / "bg.jsonl"
+        path.write_text(json.dumps({"type": "user", "sessionId": "bg"}) + "\n"
+                        + json.dumps(self._pointer(sessionId="bg")) + "\n")
+        assert carry(self.LOGIN) == 1, "the transcript that appeared was never looked for"
+        assert self._tail_pointer(path)["ownerAccountUuid"] == "acct-1"
+
     def case_a_session_seen_bridged_keeps_its_timed_glob_after_the_registry_clears_the_id(
             self, tmp_path, monkeypatch):
         """CLAUDE CODE CLEARS THE REGISTRY'S `bridgeSessionId` ON RC TEARDOWN AND

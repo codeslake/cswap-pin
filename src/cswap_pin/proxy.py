@@ -4401,10 +4401,11 @@ def _carry_job_record(job_id: str, login: tuple[str, str]) -> bool:
 #: transcript exists with none (Remote Control off: 2,119 lines before a first
 #: record); a background session's pointer is in its job record, which the job
 #: loop carries. A timed glob for either would put the scan back on every
-#: create. Their first look still globs. STICKY, because Claude Code clears the
-#: registry's id on RC teardown and does not write it back when the bridge
-#: returns: the current read alone would stop looking for the stub of a session
-#: that had one.
+#: create. Their first look still globs, and so does every window until a
+#: transcript exists (an empty look is not a settled one). STICKY, because
+#: Claude Code clears the registry's id on RC teardown and does not write it
+#: back when the bridge returns: the current read alone would stop looking for
+#: the stub of a session that had one.
 # shortcut: once a remembered file carries the pointer, a second pointer file
 # for the id is not seen until the remembered path vanishes; the cost is one
 # restamp appended to the older transcript.
@@ -4435,7 +4436,8 @@ def _last_pointer(session_id: str, bridged: bool = True) -> tuple[Path, dict] | 
     moved = seen is None or not all(p.exists() for p in paths)  # unseen reads as moved
     found = [] if moved else _pointer_records(paths, session_id)
     if len(found) != 1 and (
-            moved or (bridged and time.monotonic() - at >= _TRANSCRIPT_MISS_S)):
+            moved or ((bridged or not paths)
+                      and time.monotonic() - at >= _TRANSCRIPT_MISS_S)):
         # A guard here would also make `_carry_history_pointers`' stated reason
         # for its outer catch-all untrue.
         paths, at = list(projects.glob(f"*/{session_id}.jsonl")), time.monotonic()
