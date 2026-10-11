@@ -31,7 +31,7 @@ import pytest
 
 from conftest import run_cases
 
-PIN = 36301
+PIN = 9955
 KEY = "CLAUDE_CODE_SHELL_PREFIX"
 SIX = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
        "ALL_PROXY", "all_proxy")
@@ -252,8 +252,8 @@ class TestChildFloorScript:
         rig = _Rig(tmp_path)
         rig.floor(FLOOR_URL + "\n")
         shell = _shells()[0]
-        for other in (_pin_url(9901), _pin_url(PIN % 10000),
-                      _pin_url(int(f"{PIN}1")), "http://proxy.corp:36301"):
+        for other in (_pin_url(9901), _pin_url(PIN // 10),
+                      _pin_url(int(f"{PIN}1")), f"http://proxy.corp:{PIN}"):
             seen = rig.seen(shell, HTTPS_PROXY=other, https_proxy=other,
                             ALL_PROXY=other)
             assert seen["HTTPS_PROXY"] == other, (other, seen)
