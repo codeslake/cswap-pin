@@ -440,6 +440,18 @@ class TestChildFloorScript:
             done = rig.run(string, rig.env(bash))
             assert done.stdout.strip() == "bash"
 
+    def case_a_command_that_mentions_a_snapshot_does_not_choose_the_shell(
+        self, tmp_path
+    ):
+        rig = _Rig(tmp_path)
+        shells = {os.path.basename(s): s for s in _shells()}
+        if len(shells) < 2:
+            pytest.skip("needs both bash and zsh")
+        probe = ('echo "${BASH_VERSION:+bash}${ZSH_VERSION:+zsh}" '
+                 '# /shell-snapshots/snapshot-zsh-1-x.sh 2>/dev/null')
+        done = rig.run(rig.bash_tool(probe, "bash"), rig.env(shells["zsh"]))
+        assert done.stdout.strip() == "bash", done
+
     def case_a_bash_tool_string_runs_under_the_shell_its_snapshot_names(
         self, tmp_path
     ):
@@ -597,7 +609,7 @@ class TestTheFloorTheDaemonRecords:
         certdir = Path(tmp_path) / "pin-proxy"
         certdir.mkdir(parents=True)
         monkeypatch.setattr(pp, "_ASKED_NOHEALTH", set())
-        monkeypatch.setattr(pp, "_ASKED_NOHOP", set(), raising=False)
+        monkeypatch.setattr(pp, "_ASKED_NOHOP", set())
         monkeypatch.setattr(pp, "_probe_next_hop", functools.partial(
             pp._probe_next_hop, timeout=10))
         pp.write_upstream_hint(certdir, hop)

@@ -398,17 +398,17 @@ if [ -r "$_pc" ]; then
   case $_pp in *" -"*) _pw=${_pp%" -"*}; _pa=-${_pp##*" -"} ;; *) _pw=$_pp; _pa= ;; esac
   if [ -n "$_pw" ] && [ -x "$_pw" ]; then exec "$_pw" $_pa "$1"; fi
 fi
-# Only the Bash tool's string needs the user's shell: it sources a snapshot written
-# for it (the file name says which) and ends by reading the cwd back. A hook was
-# spawned `/bin/sh -c` and a stdio MCP server is quoted words, so they keep /bin/sh.
-case $1 in
+# Only the Bash tool's string needs the user's shell: it starts by sourcing a
+# snapshot written for it (the file name says which) and ends by reading the cwd
+# back. A hook was spawned `/bin/sh -c` and a stdio MCP server is quoted words, so
+# they keep /bin/sh.
+case ${1%% 2>/dev/null*} in
   *"/shell-snapshots/snapshot-zsh-"*) _pk=zsh ;;
   *"/shell-snapshots/snapshot-bash-"*) _pk=bash ;;
-  *"pwd -P >| "*) _pk= ;;
-  *) exec /bin/sh -c "$1" ;;
+  *) case $1 in *"pwd -P >| "*) _pk= ;; *) exec /bin/sh -c "$1" ;; esac ;;
 esac
-# That shell, else the one Claude Code picked (CLAUDE_CODE_SHELL, then SHELL, if
-# bash or zsh, else zsh, or bash first when SHELL names bash).
+# That shell (_pk empty: either), else the one Claude Code picked (CLAUDE_CODE_SHELL,
+# then SHELL, if bash or zsh, else zsh, or bash first when SHELL names bash).
 _ps=
 for _px in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do
   case $_px in *"${_pk:-bash}"* | *"${_pk:-zsh}"*) if [ -x "$_px" ]; then _ps=$_px; break; fi ;; esac
