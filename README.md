@@ -500,8 +500,9 @@ the pin's own port, so a launcher's own proxy in a hook is left alone.
 - **The shell**: only a Bash-tool command runs under a shell of yours: the one
   its shell snapshot was written for (the file name says bash or zsh), else the
   one Claude Code picked (`CLAUDE_CODE_SHELL`, then `SHELL`, if bash or zsh, else
-  zsh, else bash). A hook still runs under `/bin/sh`, and a stdio MCP server's
-  command line is run as it was quoted, so neither changes.
+  zsh, else bash). Everything else runs under `/bin/sh -c`, as Claude Code
+  quoted it: a hook keeps the shell it had, and a stdio MCP server gains only the
+  `sh` a hook already gets.
 - **No prefix reaches** `apiKeyHelper`, `otelHeadersHelper`, Claude Code's own
   `git` and `gh`, or LSP servers. They still ride the pin, and the pin sends
   their connections to hosts it does not serve to the floor hop first, CCF only
