@@ -151,10 +151,6 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
 # a saving there, and a hop that is that launch's own exported proxy is kept
 # out of this path entirely by the ``own_proxy`` guard below instead.
 _ASKED_NOHEALTH: set[str] = set()
-# Addresses whose last /health answer positively said "nothing is behind me": a
-# CCF that dials direct (see ``_probe_next_hop``). Process-local for the same
-# reason; read by ``record_child_floor`` only.
-_ASKED_NOHOP: set[str] = set()
 
 
 def _probe_next_hop(
@@ -255,19 +251,9 @@ def _probe_next_hop(
             conn.close()
     except Exception:  # noqa: BLE001 — an absent probe is "no next hop"
         return None
-    _ASKED_NOHOP.discard(address)
     if not isinstance(body, dict):
         return None
     nxt = body.get("https_proxy") or body.get("HTTPS_PROXY")
-    # A null `https_proxy` is also what CCF publishes with every hop of a
-    # configured chain down. It means "no upstream" only when it forwards, has
-    # never fallen through to a direct dial (`direct_last` is sticky, and null,
-    # not absent) and is not under CACHE_FIX_REQUIRE_HOP, which refuses one.
-    if (not nxt and body.get("forward_proxy") is True
-            and "direct_last" in body and body["direct_last"] is None
-            and isinstance(body.get("gates"), dict)
-            and "CACHE_FIX_REQUIRE_HOP" not in body["gates"]):
-        _ASKED_NOHOP.add(address)
     if not isinstance(nxt, str) or not nxt:
         return None
     parsed = parse_upstream_proxy(nxt)
@@ -391,7 +377,7 @@ if [ "${CSWAP_PIN_CHILD_FLOOR-}" != off ]; then
     case $_ph in 127.0.0.1:* | localhost:* | "[::1]:"*) _pt=${_ph##*:} ;; *) continue ;; esac
     case $_pt in '' | *[!0-9]*) continue ;; esac
     _pf=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/@FLOORDIR@/$_pt
-    [ -r "$_pf" ] || continue
+    [ -f "$_pf" ] && [ -r "$_pf" ] || continue
     _pv=
     IFS= read -r _pv < "$_pf" || :
     export HTTPS_PROXY="$_pv" https_proxy="$_pv" HTTP_PROXY="$_pv" http_proxy="$_pv" ALL_PROXY="$_pv" all_proxy="$_pv"
@@ -21949,15 +21935,20 @@ class PinProxy:
 
         Read by the prefix script (`_CHILD_FLOOR_SH`) once per child, so it is a
         one-line file, `proxy-floor/<our port>` in the Claude config home, and
-        not an HTTP ask. The outermost recorded hop: `next`
-        when there is one (the hop behind CCF), else `proxy` when it is not a
-        CCF (a remote or TLS hop, or a loopback one that answered /health with
-        a 4xx), else empty when the pin has no hop at all and dials direct, or
-        its CCF has just said it has none (`_ASKED_NOHOP`).
-        ANYTHING ELSE IS UNKNOWN AND THE FILE GOES: a loopback `proxy` nobody
-        has classified may be a CCF whose own upstream is not learned yet, and
-        direct is the corporate 403 (dotfiles b28af221) -- the children then
-        stay on the pin, which is what they do without this file.
+        not an HTTP ask. The first usable hop of the record decides:
+
+        - a remote or TLS hop, or a loopback one that answered /health with a
+          4xx (privoxy), is not a proxy that publishes anything: the floor is
+          that hop itself;
+        - no hop at all: the pin dials direct, so empty;
+        - any other loopback hop is a cache proxy, and the floor is what IT
+          publishes in `proxy-floor/<its port>` (empty stays empty). Its /health
+          upstream is credential-stripped and its chain may be one it cannot
+          name, so nothing is guessed from it: no file there is UNKNOWN.
+
+        UNKNOWN REMOVES OUR FILE: the children then stay on the pin, which is
+        what they do without it, and direct is the corporate 403 (dotfiles
+        b28af221).
 
         Called on the daemon's timer after `learn_next_hop`, which is what
         classifies a hop. Compare-before-write: a settled box writes nothing.
@@ -21966,18 +21957,16 @@ class PinProxy:
         value = None
         try:
             rec = json.loads((self._certdir / _UPSTREAM_FILE).read_text())
-            nxt, proxy = rec.get("next") or "", rec.get("proxy") or ""
-            nxt, proxy = ("" if self._is_me(v) else v for v in (nxt, proxy))
+            proxy = next((v for v in (rec.get("proxy"), rec.get("next"))
+                          if v and not self._is_me(v)), "")
             hop = parse_upstream_proxy(proxy)
-            if nxt:
-                value = nxt
-            elif hop is None:
+            if hop is None:
                 value = "" if not proxy else None
             elif (hop.tls or hop.host not in _LOOPBACK
                   or f"{hop.host}:{hop.port}" in _ASKED_NOHEALTH):
                 value = proxy
-            elif f"{hop.host}:{hop.port}" in _ASKED_NOHOP:
-                value = ""
+            else:
+                value = _floor_path(hop.port).read_text().strip()
         except (OSError, ValueError, AttributeError):
             pass
         text = f"{value}\n" if value else ""

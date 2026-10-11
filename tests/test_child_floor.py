@@ -7,9 +7,10 @@ stdio MCP servers and the status line then ride pin -> CCF too. Only Claude
 Code's own traffic should. So the pin also writes CLAUDE_CODE_SHELL_PREFIX, a
 script Claude Code puts in front of every Bash command, command hook and stdio
 MCP server, and the script points those children at the FLOOR: the proxy below
-the pin (the hop `upstream.json` records as `next`, else `proxy`), or nothing
-when the pin knows it dials direct. The floor is published where any local proxy
-can publish its own: `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/proxy-floor/<port>`.
+the pin (what the recorded cache proxy publishes as its own floor, or the
+recorded hop itself when that is not a cache proxy), or nothing when the pin
+dials direct. The floor is published where any local proxy can publish its own:
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/proxy-floor/<port>`.
 
 The script is the user's last line of defence against a broken shell prefix, so
 every case that runs it runs the real file under a real `sh`, `bash` and `zsh`.
@@ -38,15 +39,6 @@ KEY = "CLAUDE_CODE_SHELL_PREFIX"
 SIX = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
        "ALL_PROXY", "all_proxy")
 FLOOR_URL = "http://127.0.0.1:8118"
-
-
-# What CCF 4.4.0 answers on /health on a host whose cache proxy dials direct
-# (measured 2026-10-11): `https_proxy` is null and the sticky `direct_last` was
-# never stamped. CACHE_FIX_FALLBACK_PROXIES is listed in its `gates`.
-NO_UPSTREAM = {"status": "ok", "forward_proxy": True, "https_proxy": None,
-               "https_proxy_measured": False, "direct_last": None,
-               "gates": {"CACHE_FIX_FORWARD_PROXY": "on",
-                         "CACHE_FIX_FALLBACK_PROXIES": "<redacted>"}}
 
 
 def _pin_url(port=PIN):
@@ -309,6 +301,16 @@ class TestChildFloorScript:
             seen = rig.seen(shell)
             assert seen["HTTPS_PROXY"] == _pin_url()
             assert seen["HTTP_PROXY"] == "UNSET"
+
+    def case_a_directory_where_the_floor_file_would_be_is_unknown(self, tmp_path):
+        """`[ -r dir ]` is true, and reading a directory gives an empty line,
+        which is DIRECT. Only a regular file is a floor."""
+        rig = _Rig(tmp_path)
+        (tmp_path / ".claude" / "proxy-floor" / str(PIN)).mkdir(parents=True)
+        for shell in _shells():
+            seen = rig.seen(shell)
+            assert seen["HTTPS_PROXY"] == _pin_url(), seen
+            assert seen["HTTP_PROXY"] == "UNSET", seen
 
     def case_direct_floor_sets_all_six_to_empty_never_unset(self, tmp_path):
         rig = _Rig(tmp_path)
@@ -593,13 +595,18 @@ class TestTheFloorTheDaemonRecords:
         run_cases(self, request, tmp_path_factory)
 
     def _floor(self, tmp_path, monkeypatch, proxy=None, next_hop=None, raw=None,
-               nohealth=()):
-        """What the daemon records for this `upstream.json`."""
+               nohealth=(), hop_floor=None):
+        """What the daemon records for this `upstream.json`. `hop_floor` is what
+        the recorded proxy itself publishes in `proxy-floor/<its port>`."""
         import cswap_pin.proxy as pp
 
         certdir = Path(tmp_path) / "pin-proxy"
         certdir.mkdir(parents=True, exist_ok=True)
-        _own_home(tmp_path, monkeypatch)
+        home = _own_home(tmp_path, monkeypatch)
+        if hop_floor is not None:
+            theirs = home / "proxy-floor" / str(pp.parse_upstream_proxy(proxy).port)
+            theirs.parent.mkdir(parents=True, exist_ok=True)
+            theirs.write_text(hop_floor)
         if raw is not None:
             (certdir / "upstream.json").write_text(raw)
         elif proxy is not None or next_hop is not None:
@@ -612,24 +619,55 @@ class TestTheFloorTheDaemonRecords:
         path = _floor_file()
         return path.read_text() if path.exists() else None
 
-    def case_the_hop_behind_ccf_is_the_floor(self, tmp_path, monkeypatch):
-        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL) == (
-            FLOOR_URL + "\n")
+    def case_the_hops_own_published_floor_is_the_floor(self, tmp_path, monkeypatch):
+        """The hop below the pin says what is below it, in its own file. What
+        its /health reports (`next`) is credential-stripped, so the pin never
+        publishes that: it publishes the hop's line, credentials and all."""
+        theirs = "http://user:secret@127.0.0.1:3128\n"
+        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL,
+                           hop_floor=theirs) == theirs
+
+    def case_a_hop_that_publishes_an_empty_floor_is_direct(self, tmp_path, monkeypatch):
+        """A cache proxy with no chain configured publishes an empty file."""
+        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901",
+                           hop_floor="") == ""
+
+    def case_a_hop_that_publishes_nothing_is_unknown_even_with_next_learned(
+        self, tmp_path, monkeypatch
+    ):
+        """Absent is the hop saying "I do not know" (a chain with credentials, an
+        unreachable one, a value it could not parse). Not a guess from `next`,
+        and the pin's own file goes when the hop's does."""
+        hop = "http://127.0.0.1:9901"
+        assert self._floor(tmp_path, monkeypatch, hop, FLOOR_URL,
+                           hop_floor=FLOOR_URL + "\n") == FLOOR_URL + "\n"
+        (tmp_path / "claude-home" / "proxy-floor" / "9901").unlink()
+        assert self._floor(tmp_path, monkeypatch, hop, FLOOR_URL) is None
+        assert not _floor_file().exists()
+
+    def case_a_directory_where_the_hops_file_would_be_is_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "claude-home" / "proxy-floor" / "9901").mkdir(parents=True)
+        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901",
+                           FLOOR_URL) is None
 
     def case_without_ccf_the_users_own_proxy_is_the_floor(self, tmp_path, monkeypatch):
         """A remote proxy, a TLS one, and a loopback one that answered /health
-        with a 4xx (privoxy) are not CCF."""
+        with a 4xx (privoxy) are not CCF: the floor is the proxy itself, and a
+        file at that port is not asked."""
         corp = "http://proxy.corp.example:3128"
         assert self._floor(tmp_path / "a", monkeypatch, corp) == corp + "\n"
         tls = "https://proxy.corp.example:3129"
         assert self._floor(tmp_path / "b", monkeypatch, tls) == tls + "\n"
         assert self._floor(tmp_path / "c", monkeypatch, FLOOR_URL,
-                           nohealth={"127.0.0.1:8118"}) == FLOOR_URL + "\n"
+                           nohealth={"127.0.0.1:8118"},
+                           hop_floor="http://127.0.0.1:3128\n") == FLOOR_URL + "\n"
 
     def case_an_unlearned_next_is_unknown_never_direct(self, tmp_path, monkeypatch):
-        """A loopback proxy nobody has classified may be CCF with its own
-        upstream not learned yet. Direct there is the corporate 403
-        (dotfiles b28af221), so the children stay on the pin."""
+        """A loopback proxy nobody has classified, that publishes nothing, may be
+        CCF with its own upstream not known yet. Direct there is the corporate
+        403 (dotfiles b28af221), so the children stay on the pin."""
         assert self._floor(tmp_path / "a", monkeypatch, "http://127.0.0.1:9901") is None
         # ...and the file goes when the answer goes: a stale floor is a hop
         # nobody chose any more.
@@ -656,6 +694,10 @@ class TestTheFloorTheDaemonRecords:
         assert self._floor(tmp_path / "a", monkeypatch, raw=json.dumps(
             {"proxy": "http://127.0.0.1:9901",
              "next": _pin_url()})) is None
+        # ...and the hop the pin does dial is the next one the record names.
+        corp = "http://proxy.corp.example:3128"
+        assert self._floor(tmp_path / "b", monkeypatch, raw=json.dumps(
+            {"proxy": _pin_url(), "next": corp})) == corp + "\n"
 
     def case_a_hop_that_4xxs_health_is_classified_by_the_daemons_own_tick(
         self, tmp_path, monkeypatch
@@ -706,7 +748,6 @@ class TestTheFloorTheDaemonRecords:
         certdir.mkdir(parents=True)
         _own_home(tmp_path, monkeypatch)
         monkeypatch.setattr(pp, "_ASKED_NOHEALTH", set())
-        monkeypatch.setattr(pp, "_ASKED_NOHOP", set())
         monkeypatch.setattr(pp, "_probe_next_hop", functools.partial(
             pp._probe_next_hop, timeout=10))
         pp.write_upstream_hint(certdir, hop)
@@ -721,83 +762,36 @@ class TestTheFloorTheDaemonRecords:
             return path.read_text() if path.exists() else None
         return tick
 
-    def case_a_cache_proxy_that_reports_no_upstream_is_direct(
-        self, tmp_path, monkeypatch
-    ):
-        """CCF dials direct and its /health says nothing is behind it. The pin
-        knows that is a positive statement, so the child dials direct."""
-        srv = _serve_health(NO_UPSTREAM)
+    def case_the_floor_follows_the_hops_file_on_each_tick(self, tmp_path, monkeypatch):
+        """Through the real `learn_next_hop`: the hop's /health reports a
+        credential-stripped upstream, and the pin still publishes only what the
+        hop's own file says, as that file changes and goes."""
+        srv = _serve_health({"https_proxy": FLOOR_URL})
         try:
             tick = self._ticks(tmp_path, monkeypatch,
                                f"http://127.0.0.1:{srv.server_address[1]}")
+            theirs = _floor_file(srv.server_address[1])
+            assert tick() is None, "the hop publishes nothing yet"
+            theirs.parent.mkdir(parents=True, exist_ok=True)
+            theirs.write_text("http://user:secret@127.0.0.1:8118\n")
+            assert tick() == "http://user:secret@127.0.0.1:8118\n"
+            theirs.write_text("")
             assert tick() == ""
+            theirs.unlink()
+            assert tick() is None
         finally:
             srv.shutdown()
-
-    def case_a_null_that_is_not_a_report_of_no_upstream_stays_unknown(
-        self, tmp_path, monkeypatch
-    ):
-        """The same null means "the whole chain is down" once `direct_last` is
-        stamped, under CACHE_FIX_REQUIRE_HOP (no direct dial is allowed there),
-        for a proxy that is not forwarding, and for anything that is not a CCF
-        that publishes these fields. Direct there is the corporate 403."""
-        stamped = dict(NO_UPSTREAM, direct_last="2026-10-11T00:00:00.000Z")
-        required = dict(NO_UPSTREAM, gates={"CACHE_FIX_REQUIRE_HOP": "<redacted>"})
-        reverse = dict(NO_UPSTREAM, forward_proxy=False)
-        ungated = {k: v for k, v in NO_UPSTREAM.items() if k != "gates"}
-        unstamped = {k: v for k, v in NO_UPSTREAM.items() if k != "direct_last"}
-        for name, answer in (("direct_last", stamped), ("require_hop", required),
-                             ("not forwarding", reverse), ("no gates", ungated),
-                             ("no direct_last", unstamped),
-                             ("bare ok", {"status": "ok"})):
-            srv = _serve_health(answer)
-            try:
-                tick = self._ticks(tmp_path / name.replace(" ", "-"), monkeypatch,
-                                   f"http://127.0.0.1:{srv.server_address[1]}")
-                assert tick() is None, name
-            finally:
-                srv.shutdown()
-        # ...and a hop that does not answer at all could not be asked.
-        dead = socket.socket()
-        dead.bind(("127.0.0.1", 0))
-        port = dead.getsockname()[1]
-        dead.close()
-        tick = self._ticks(tmp_path / "dead", monkeypatch, f"http://127.0.0.1:{port}")
-        assert tick() is None
-
-    def case_the_direct_report_follows_the_cache_proxy(self, tmp_path, monkeypatch):
-        """Direct is what the proxy last SAID, not a memory of it: a new answer
-        replaces it, and a proxy that stops answering is not a new answer."""
-        srv = _serve_health(NO_UPSTREAM)
-        try:
-            tick = self._ticks(tmp_path, monkeypatch,
-                               f"http://127.0.0.1:{srv.server_address[1]}")
-            assert tick() == ""
-            srv.RequestHandlerClass.answer = dict(
-                NO_UPSTREAM, direct_last="2026-10-11T00:00:00.000Z")
-            assert tick() is None, "its chain went down: direct is no longer known"
-            srv.RequestHandlerClass.answer = dict(
-                NO_UPSTREAM, https_proxy=FLOOR_URL, https_proxy_measured=True)
-            assert tick() == FLOOR_URL + "\n"
-        finally:
-            srv.shutdown()
-        srv = _serve_health(NO_UPSTREAM)
-        tick = self._ticks(tmp_path / "gone", monkeypatch,
-                           f"http://127.0.0.1:{srv.server_address[1]}")
-        assert tick() == ""
-        srv.shutdown()
-        srv.server_close()
-        assert tick() == "", "a proxy that is down said nothing new"
 
     def case_the_file_is_replaced_atomically_and_only_on_a_change(
         self, tmp_path, monkeypatch
     ):
-        self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
+        hop = "http://127.0.0.1:9901"
+        self._floor(tmp_path, monkeypatch, hop, hop_floor=FLOOR_URL + "\n")
         path = _floor_file()
         before = path.stat().st_ino
-        self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
+        self._floor(tmp_path, monkeypatch, hop, hop_floor=FLOOR_URL + "\n")
         assert path.stat().st_ino == before, "an unchanged floor was rewritten"
-        self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", "http://127.0.0.1:8119")
+        self._floor(tmp_path, monkeypatch, hop, hop_floor="http://127.0.0.1:8119\n")
         assert path.read_text() == "http://127.0.0.1:8119\n"
         assert not list(path.parent.glob("*.cswap-tmp"))
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -808,16 +802,18 @@ class TestTheFloorTheDaemonRecords:
         """One file, named by the listen port, beside the files other local
         proxies publish. Another port's file is never read, rewritten or
         removed, whatever this daemon concludes."""
-        other = tmp_path / "claude-home" / "proxy-floor" / "9901"
+        other = tmp_path / "claude-home" / "proxy-floor" / "9902"
         other.parent.mkdir(parents=True)
         other.write_text("http://127.0.0.1:3128\n")
-        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL)
-        assert sorted(p.name for p in other.parent.iterdir()) == ["9901", str(PIN)]
+        assert self._floor(tmp_path, monkeypatch, "http://127.0.0.1:9901", FLOOR_URL,
+                           hop_floor=FLOOR_URL + "\n")
+        assert sorted(p.name for p in other.parent.iterdir()) == [
+            "9901", "9902", str(PIN)]
         assert not (tmp_path / "pin-proxy" / "child-floor").exists(), (
             "the old file in the cert dir is not written any more")
         assert self._floor(tmp_path, monkeypatch, raw="{not json") is None
         assert other.read_text() == "http://127.0.0.1:3128\n"
-        assert [p.name for p in other.parent.iterdir()] == ["9901"]
+        assert sorted(p.name for p in other.parent.iterdir()) == ["9901", "9902"]
 
     def case_claude_config_dir_chooses_the_directory(self, tmp_path, monkeypatch):
         """Through the host's own resolver, which is the one the pin already
@@ -834,18 +830,19 @@ class TestTheFloorTheDaemonRecords:
                             real.get_claude_config_home)
         certdir = Path(tmp_path) / "pin-proxy"
         certdir.mkdir()
-        pp.write_upstream_hint(certdir, "http://127.0.0.1:9901", next_hop=FLOOR_URL)
+        corp = "http://proxy.corp.example:3128"
+        pp.write_upstream_hint(certdir, corp)
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
                             upstream=("127.0.0.1", 1), rediscover_chain=True)
         proxy.port = PIN
         mine = Path(tmp_path) / "profile"
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(mine))
         proxy.record_child_floor()
-        assert (mine / "proxy-floor" / str(PIN)).read_text() == FLOOR_URL + "\n"
+        assert (mine / "proxy-floor" / str(PIN)).read_text() == corp + "\n"
         monkeypatch.delenv("CLAUDE_CONFIG_DIR")
         proxy.record_child_floor()
         default = Path.home() / ".claude" / "proxy-floor" / str(PIN)
-        assert default.read_text() == FLOOR_URL + "\n"
+        assert default.read_text() == corp + "\n"
 
     def case_the_daemons_timer_records_it(self):
         """The call that matters is the one the daemon makes: `_watch_own_code`
