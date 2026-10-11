@@ -263,6 +263,9 @@ def _redirect_everything_to(tmp_path, monkeypatch):
                  # adopt a descriptor that is not the one under test.
                  "CSWAP_PIN_STANDBY_FROM"):
         monkeypatch.delenv(name, raising=False)
+    # A pinned developer session carries the pin's OWN prefix script here, and
+    # the wiring reads this name to find a prefix of the user's to chain to.
+    monkeypatch.delenv("CLAUDE_CODE_SHELL_PREFIX", raising=False)
 
     store = tmp_path / "data-home"
     store.mkdir(exist_ok=True)

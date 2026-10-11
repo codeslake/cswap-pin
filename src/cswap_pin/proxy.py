@@ -32,6 +32,7 @@ import warnings
 import re
 import selectors
 import select
+import shlex
 import signal
 import socket
 import stat
@@ -345,6 +346,100 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 # NODE_EXTRA_CA_CERTS is deliberately absent: node ADDS it to its built-in
 # roots, so it can never narrow trust, and the pin does need it.
 _REPLACE_CLASS_CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
+# -- the children of a pinned Claude Code ------------------------------------
+#
+# The env block reaches every process Claude Code starts, not just Claude Code:
+# aws, git, curl, hooks, stdio MCP servers all ride pin -> CCF. Only Claude
+# Code's own traffic should. `CLAUDE_CODE_SHELL_PREFIX` is the one hook that
+# stands in front of the Bash tool, every command hook, every stdio MCP server
+# and the status line (measured on 2.1.296; apiKeyHelper, otelHeadersHelper,
+# Claude Code's own git/gh and LSP servers are not reached, and `_blind_tunnel`
+# carries those on the floor hop first instead). The script points those
+# children at the FLOOR: the proxy below the pin, recorded by the daemon in
+# `<certdir>/child-floor`. Absent file = unknown = change nothing; empty =
+# the pin dials direct; a URL = that proxy.
+_PREFIX_KEY = "CLAUDE_CODE_SHELL_PREFIX"
+_FLOOR_FILE = "child-floor"
+_CHILD_FLOOR_SH = """#!/bin/sh
+# cswap-pin: Claude Code runs every Bash command, command hook, stdio MCP server
+# and status line through this file (CLAUDE_CODE_SHELL_PREFIX) with the whole
+# command as ONE argument. It points them at the proxy below the pin, then runs
+# the command. Silent, and it adds no failure of its own.
+# Opt out: CSWAP_PIN_CHILD_FLOOR=off in the "env" of your Claude Code settings.
+_pf=@FLOOR@
+_pc=@CHAIN@
+if [ "${CSWAP_PIN_CHILD_FLOOR-}" != off ] && [ -n "${CSWAP_PIN_PORT-}" ] && [ -r "$_pf" ]; then
+  _pv=
+  IFS= read -r _pv < "$_pf" || :
+  for _pn in "${HTTPS_PROXY-}" "${https_proxy-}" "${HTTP_PROXY-}" "${http_proxy-}" "${ALL_PROXY-}" "${all_proxy-}"; do
+    _ph=${_pn#*://}; _ph=${_ph##*@}; _ph=${_ph%%/*}
+    case $_ph in
+      127.0.0.1:$CSWAP_PIN_PORT | localhost:$CSWAP_PIN_PORT | "[::1]:$CSWAP_PIN_PORT")
+        export HTTPS_PROXY="$_pv" https_proxy="$_pv" HTTP_PROXY="$_pv" http_proxy="$_pv" ALL_PROXY="$_pv" all_proxy="$_pv"
+        break ;;
+    esac
+  done
+fi
+# A prefix of the user's own, split the way Claude Code splits one: at the last " -".
+if [ -r "$_pc" ]; then
+  IFS= read -r _pp < "$_pc" || :
+  case $_pp in *" -"*) _pw=${_pp%" -"*}; _pa=-${_pp##*" -"} ;; *) _pw=$_pp; _pa= ;; esac
+  if [ -n "$_pw" ] && [ -x "$_pw" ]; then exec "$_pw" $_pa "$1"; fi
+fi
+# The shell Claude Code picked (CLAUDE_CODE_SHELL, then SHELL, if bash or zsh,
+# else zsh, or bash first when SHELL names bash): its snapshot is written for it.
+_ps=
+for _px in "${CLAUDE_CODE_SHELL-}" "${SHELL-}"; do
+  case $_px in *bash* | *zsh*) if [ -x "$_px" ]; then _ps=$_px; break; fi ;; esac
+done
+if [ -z "$_ps" ]; then
+  case ${SHELL-} in *bash*) _po="bash zsh" ;; *) _po="zsh bash" ;; esac
+  for _px in $_po; do
+    for _pd in "$(command -v "$_px" 2>/dev/null)" /bin/$_px /usr/bin/$_px /usr/local/bin/$_px /opt/homebrew/bin/$_px; do
+      if [ -n "$_pd" ] && [ -x "$_pd" ]; then _ps=$_pd; break 2; fi
+    done
+  done
+fi
+exec "${_ps:-/bin/sh}" -c "$1"
+"""
+
+
+def _replace_text(path: Path, text: str, mode: int) -> None:
+    """Write ``path`` whole, atomically, with ``mode`` set before the rename.
+
+    The mode is set on the TEMP file: a rename carries the mode of the file it
+    renames, so an exec bit has to exist before it, never after.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            os.fchmod(fd, mode)
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def _write_child_floor_script(wiring: Path, floor: Path) -> Path:
+    """The prefix script, in ``wiring`` (beside the receipts, which nothing
+    deletes). Unchanged when it is already right. Raises OSError."""
+    path = Path(wiring) / "child-floor.sh"
+    text = (_CHILD_FLOOR_SH.replace("@FLOOR@", shlex.quote(str(floor)))
+            .replace("@CHAIN@", shlex.quote(str(Path(wiring) / "child-prefix"))))
+    try:
+        if path.read_text(encoding="utf-8") == text and os.access(path, os.X_OK):
+            return path
+    except OSError:
+        pass
+    Path(wiring).mkdir(parents=True, exist_ok=True)
+    _replace_text(path, text, 0o755)
+    return path
 
 # -- where the receipt lives -------------------------------------------------
 #
@@ -2443,6 +2538,24 @@ def _wire_global_config_locked(
             # and the daemon starts CONNECTing to itself.
             "CSWAP_PIN_PORT": str(port),
         }
+        # CHILDREN GET THE FLOOR, NOT THE PIN (see `_CHILD_FLOOR_SH`). The key
+        # is left out when the script cannot be written: a prefix naming a
+        # missing file fails every command in every new session. A prefix of
+        # the user's own (displaced into the receipt below, or exported where
+        # this runs) is kept in `child-prefix` and the script hands the
+        # command to it.
+        wiring = _ledger_path(path).parent
+        try:
+            script = _write_child_floor_script(
+                wiring, Path(ca_path).parent / _FLOOR_FILE)
+            theirs = env.get(_PREFIX_KEY) or os.environ.get(_PREFIX_KEY)
+            if theirs and theirs != str(script):
+                _replace_text(wiring / "child-prefix", theirs + "\n", 0o644)
+            # Claude Code splits a prefix at its last " -": no flags in OUR path.
+            if " -" not in str(script):
+                wanted[_PREFIX_KEY] = str(script)
+        except OSError:
+            pass
         # NO SSL_CERT_FILE. NOT "gated better" — NOT WRITTEN AT ALL. The gate
         # was correct and still the wrong shape, for two reasons that only
         # appeared once two independent implementations were compared:  A PROOF
@@ -2623,6 +2736,13 @@ def _ambient_proxy(
         # what the last session was actually told to use.
         return _wired_over_proxy()
     if parsed.host in _LOOPBACK and parsed.port == _self_port(src):
+        return _wired_over_proxy()
+    # A CHILD OF A PINNED SESSION carries the FLOOR (`_CHILD_FLOOR_SH`): the
+    # hop behind the recorded one, which is where the pin chains to, not a
+    # proxy this launch chose. Recorded as `proxy` while the recorded hop is
+    # down, it would drop CCF from the chain for good.
+    if (_self_port(src) is not None and certdir is not None
+            and value == _read_upstream(certdir, "next")):
         return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
     # behind. A launcher may start a per-session cache proxy and points
@@ -13822,6 +13942,7 @@ def _watch_own_code(
             # not take the code watch down with it.
             try:
                 server.learn_next_hop()
+                server.record_child_floor()
             except (AttributeError, OSError):
                 pass  # a stand-in server in tests, or a hop that went away
             # READ `can_pin_cached` BEFORE REFRESHING, so a window that reaches
@@ -21787,6 +21908,47 @@ class PinProxy:
         )
         _log_lifecycle(f"learned the hop behind {recorded}: {nxt}")
 
+    def record_child_floor(self) -> None:
+        """Record the proxy below the pin, for the children of a pinned session.
+
+        Read by the prefix script (`_CHILD_FLOOR_SH`) once per child, so it is a
+        one-line file and not an HTTP ask. The outermost recorded hop: `next`
+        when there is one (the hop behind CCF), else `proxy` when it is not a
+        CCF (a remote or TLS hop, or a loopback one that answered /health with
+        a 4xx), else empty when the pin has no hop at all and dials direct.
+        ANYTHING ELSE IS UNKNOWN AND THE FILE GOES: a loopback `proxy` nobody
+        has classified may be a CCF whose own upstream is not learned yet, and
+        direct is the corporate 403 (dotfiles b28af221) -- the children then
+        stay on the pin, which is what they do without this file.
+
+        Called on the daemon's timer after `learn_next_hop`, which is what
+        classifies a hop. Compare-before-write: a settled box writes nothing.
+        """
+        path = self._certdir / _FLOOR_FILE
+        value = None
+        try:
+            rec = json.loads((self._certdir / _UPSTREAM_FILE).read_text())
+            nxt, proxy = rec.get("next") or "", rec.get("proxy") or ""
+            nxt, proxy = ("" if self._is_me(v) else v for v in (nxt, proxy))
+            hop = parse_upstream_proxy(proxy)
+            if nxt:
+                value = nxt
+            elif hop is None:
+                value = "" if not proxy else None
+            elif (hop.tls or hop.host not in _LOOPBACK
+                  or f"{hop.host}:{hop.port}" in _ASKED_NOHEALTH):
+                value = proxy
+        except (OSError, ValueError, AttributeError):
+            pass
+        text = f"{value}\n" if value else ""
+        try:
+            if value is None:
+                path.unlink(missing_ok=True)
+            elif not path.exists() or path.read_text() != text:
+                _replace_text(path, text, 0o600)
+        except OSError:
+            pass
+
     def _is_me(self, value) -> bool:
         """Whether ``value`` names this daemon's own address.
 
@@ -21908,7 +22070,8 @@ class PinProxy:
 
         detached = False
         try:
-            detached = self._blind_tunnel(target, conn, give, _BULK_PUMP)
+            detached = self._blind_tunnel(
+                target, conn, give, _BULK_PUMP, floor_first=True)
             return detached
         finally:
             if not detached:
@@ -21926,7 +22089,7 @@ class PinProxy:
         conn.close()
 
     def _blind_tunnel(self, target: str, conn: socket.socket, give,
-                      loop=None) -> None:
+                      loop=None, floor_first: bool = False) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
         # Trace the tunnel too. Remote Control receives over a WebSocket to the
@@ -21947,6 +22110,15 @@ class PinProxy:
         # forwards, a corporate MITM) may refuse the ingress host outright, and
         # closing here made that refusal invisible.
         candidates = self._chain_candidates()
+        if floor_first:
+            # A CONNECT to a host the pin does not serve is some child's (the
+            # children a prefix script cannot reach: Claude Code's own git/gh,
+            # a helper, an LSP server). It has no business at CCF, so the hop
+            # behind CCF goes first; CCF stays the fallback, and the set of
+            # hops tried, and the refusal when none carries, are unchanged.
+            floor = parse_upstream_proxy(_read_upstream(self._certdir, "next"))
+            candidates.sort(
+                key=lambda hop: floor is None or hop.address != floor.address)
         for chain in candidates:
             try:
                 up = _dial_chain(chain, extra_ca=self._chain_ca())
