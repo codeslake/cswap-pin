@@ -640,6 +640,242 @@ class TestHistoryCarriesAcrossASwitch:
         for line in path.read_text().splitlines():
             json.loads(line)          # every line still parses on its own
 
+    # --- the live carry on the request path: no directory scan per session --
+
+    def _live_carry(self, home, monkeypatch, sids):
+        """`carry_live_pointers` over `sids` with every project-dir listing
+        counted. Returns ``(carry, scans)``; `scans` grows by one per `glob`
+        or `iterdir` taken on ``projects/``."""
+        import cswap_pin.proxy as pp
+
+        for i in range(30):
+            (home / "projects" / f"p{i}").mkdir()
+        monkeypatch.setattr(pp, "_live_job_ids", lambda: [])
+        monkeypatch.setattr(pp, "_live_session_ids", lambda: dict.fromkeys(sids, True))
+        scans: list[str] = []
+        for name in ("glob", "iterdir"):
+            real = getattr(Path, name)
+
+            def counted(self, *a, _real=real, _name=name, **k):
+                if self == home / "projects":
+                    scans.append(_name)
+                return _real(self, *a, **k)
+            monkeypatch.setattr(Path, name, counted)
+        return pp.carry_live_pointers, scans
+
+    def case_a_second_carry_scans_no_project_dir_for_a_session_it_has_seen(
+            self, tmp_path, monkeypatch):
+        """EVERY CREATE RAN THIS FOR EVERY LIVE SESSION. Measured on a host
+        with 15,799 project dirs and 20 live sessions: ~316,000 fs calls per
+        `POST /v1/code/sessions`, 1.4-2 s on a quiet day and 1,027,803 ms
+        beside a CPU-bound thread. Where a transcript is does not change while
+        its session lives, so the second look is a stat, not a scan."""
+        home = self._fleet(tmp_path, monkeypatch)
+        sids = ["live-a", "live-b", "live-c"]
+        paths = [self._session(home, s, pid=999) for s in sids]
+        carry, scans = self._live_carry(home, monkeypatch, sids)
+
+        assert carry(self.LOGIN) == 3
+        assert len(scans) == 3, "CONTROL: the first look must scan, or the counter is blind"
+        del scans[:]
+        assert carry(("acct-2", "org-2")) == 3, (
+            "found by the remembered path, a changed login still carries")
+        assert scans == [], f"a seen session scanned projects/ again: {scans}"
+        assert self._tail_pointer(paths[0])["ownerAccountUuid"] == "acct-2"
+
+    def case_a_moved_transcript_is_found_again(self, tmp_path, monkeypatch):
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "live-a", pid=999)
+        carry, scans = self._live_carry(home, monkeypatch, ["live-a"])
+        assert carry(self.LOGIN) == 1
+
+        moved = home / "projects" / "p7" / path.name
+        path.rename(moved)
+        del scans[:]
+        assert carry(("acct-2", "org-2")) == 1, "the moved transcript was lost"
+        assert len(scans) == 1
+        assert self._tail_pointer(moved)["ownerAccountUuid"] == "acct-2"
+
+    def case_a_session_with_no_transcript_is_not_rescanned_for_a_minute(
+            self, tmp_path, monkeypatch):
+        """2 of 20 live sessions on the measured host had no transcript yet;
+        remembering only hits left them paying the whole scan on every create."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        carry, scans = self._live_carry(home, monkeypatch, ["late"])
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+        assert carry(self.LOGIN) == 0 and len(scans) == 1, (
+            "a miss inside the window scanned again")
+
+        path = self._session(home, "late", pid=999)
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)
+        assert carry(self.LOGIN) == 1, "the transcript that appeared was never looked for"
+        assert self._tail_pointer(path)["ownerAccountUuid"] == "acct-1"
+
+    def case_a_pointer_stub_that_appears_after_the_first_look_is_found(
+            self, tmp_path, monkeypatch):
+        """THE ONE DUPLICATE EVER MEASURED: a big transcript with NO pointer and
+        a 146-byte stub holding it. The mint-time carry looks BEFORE Claude Code
+        writes the stub, so the first look remembers the pointerless file; a
+        remembered file that yields no pointer must be globbed again, or the
+        pointer is never restamped after a switch."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        big = home / "projects" / "proj" / "late.jsonl"
+        big.write_text(json.dumps({"type": "user", "sessionId": "late"}) + "\n")
+        carry, scans = self._live_carry(home, monkeypatch, ["late"])
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+
+        stub = home / "projects" / "p5" / big.name
+        stub.write_text(json.dumps(self._pointer(sessionId="late")) + "\n")
+        assert carry(self.LOGIN) == 0 and len(scans) == 1, (
+            "inside the window the pointerless file is not globbed again")
+
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)
+        assert carry(("acct-2", "org-2")) == 1, "the stub's pointer was never found"
+        assert self._tail_pointer(stub)["ownerAccountUuid"] == "acct-2"
+        assert self._tail_pointer(big) is None
+
+    def case_a_pointerless_transcript_of_a_session_with_no_bridge_is_not_globbed_again(
+            self, tmp_path, monkeypatch):
+        """A SESSION WITH REMOTE CONTROL OFF HAS A TRANSCRIPT AND NEVER A
+        POINTER (measured: 2,119 lines before its first record), and it has no
+        bridge for a stub to restamp. Re-globbing it each window put the
+        15,799-dir scan back on every create, for each such session."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        big = home / "projects" / "proj" / "rcoff.jsonl"
+        big.write_text(json.dumps({"type": "user", "sessionId": "rcoff"}) + "\n")
+        carry, scans = self._live_carry(home, monkeypatch, ["rcoff"])
+        live = {"rcoff": False}
+        monkeypatch.setattr(pp, "_live_session_ids", lambda: live)
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)  # every window has ended
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+        assert carry(self.LOGIN) == 0
+        assert len(scans) == 1, "a session with no bridge was globbed again"
+
+        live["rcoff"] = True              # CONTROL: the same session once it has one
+        stub = home / "projects" / "p5" / big.name
+        stub.write_text(json.dumps(self._pointer(sessionId="rcoff")) + "\n")
+        assert carry(("acct-2", "org-2")) == 1, "the bridge opened the gate"
+        assert len(scans) == 2
+        assert self._tail_pointer(stub)["ownerAccountUuid"] == "acct-2"
+
+    def case_a_job_backed_bridged_session_with_a_pointerless_transcript_is_scanned_once(
+            self, tmp_path, monkeypatch):
+        """A BACKGROUND SESSION'S BRIDGE IS IN ITS JOB RECORD, which the job loop
+        carries. No stub is looked for in its transcript, so the timed glob that
+        finds a stub would re-run the 15,799-dir scan for it every window,
+        times ~12 such sessions, on each create."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        big = home / "projects" / "proj" / "bg.jsonl"
+        big.write_text(json.dumps({"type": "user", "sessionId": "bg"}) + "\n")
+        self._job(home, "j1", "bg")
+        (home / "sessions" / "bg.json").write_text(json.dumps(
+            {"sessionId": "bg", "pid": os.getpid(), "jobId": "j1",
+             "bridgeSessionId": ""}))
+        real = pp._live_session_ids
+        carry, scans = self._live_carry(home, monkeypatch, [])
+        monkeypatch.setattr(pp, "_live_session_ids", real)  # the registry read is under test
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)  # every window has ended
+        assert "bg" in real(), "CONTROL: it reads live, so the carry looks at it"
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+        assert carry(self.LOGIN) == 0
+        assert len(scans) == 1, "a job-backed session was globbed again"
+
+    def case_a_job_backed_session_with_no_transcript_yet_is_globbed_until_it_has_one(
+            self, tmp_path, monkeypatch):
+        """AN EMPTY LOOK IS NOT A SETTLED ONE: `all()` over no paths reads as
+        'nothing moved', so a job-backed session whose transcript did not exist
+        at the first look was never globbed again for the daemon's life."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        (home / "sessions" / "bg.json").write_text(json.dumps(
+            {"sessionId": "bg", "pid": os.getpid(), "jobId": "j1",
+             "bridgeSessionId": ""}))
+        real = pp._live_session_ids
+        carry, scans = self._live_carry(home, monkeypatch, [])
+        monkeypatch.setattr(pp, "_live_session_ids", real)
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)  # every window has ended
+        assert real() == {"bg": False}, "CONTROL: live, job-backed, no bridge"
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+
+        path = home / "projects" / "proj" / "bg.jsonl"
+        path.write_text(json.dumps({"type": "user", "sessionId": "bg"}) + "\n"
+                        + json.dumps(self._pointer(sessionId="bg")) + "\n")
+        assert carry(self.LOGIN) == 1, "the transcript that appeared was never looked for"
+        assert self._tail_pointer(path)["ownerAccountUuid"] == "acct-1"
+
+    def case_a_session_seen_bridged_keeps_its_timed_glob_after_the_registry_clears_the_id(
+            self, tmp_path, monkeypatch):
+        """CLAUDE CODE CLEARS THE REGISTRY'S `bridgeSessionId` ON RC TEARDOWN AND
+        DOES NOT WRITE IT BACK when the bridge returns, so a session that held
+        one can read unbridged for good. Deciding the timed glob on the current
+        read alone stopped looking for its stub, which the carry did before the
+        cache."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        big = home / "projects" / "proj" / "torn.jsonl"
+        big.write_text(json.dumps({"type": "user", "sessionId": "torn"}) + "\n")
+        carry, scans = self._live_carry(home, monkeypatch, ["torn"])
+        live = {"torn": True}
+        monkeypatch.setattr(pp, "_live_session_ids", lambda: live)
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)  # every window has ended
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+
+        live["torn"] = False              # teardown cleared the id; nothing wrote it back
+        stub = home / "projects" / "p5" / big.name
+        stub.write_text(json.dumps(self._pointer(sessionId="torn")) + "\n")
+        assert carry(("acct-2", "org-2")) == 1, "a session seen bridged lost its timed glob"
+        assert self._tail_pointer(stub)["ownerAccountUuid"] == "acct-2"
+
+    def case_a_two_file_id_declines_and_is_not_rescanned_inside_the_window(
+            self, tmp_path, monkeypatch):
+        """Two files carrying a pointer decline, as before, on every look; the
+        result is remembered for the window, not rescanned on every create."""
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        path = self._session(home, "dup", pid=999)
+        carry, scans = self._live_carry(home, monkeypatch, ["dup"])
+        twin = home / "projects" / "p3" / path.name
+        twin.write_text(path.read_text())
+        assert carry(self.LOGIN) == 0 and len(scans) == 1
+        assert carry(self.LOGIN) == 0, "two pointer files must still decline"
+        assert len(scans) == 1, "a two-file id was globbed again inside the window"
+
+        monkeypatch.setattr(pp, "_TRANSCRIPT_MISS_S", 0.0)
+        assert carry(self.LOGIN) == 0 and len(scans) == 2, (
+            "the window ended: the timed glob ran and still sees two")
+        twin.unlink()
+        assert carry(self.LOGIN) == 1, "one file is left"
+
+    def case_only_a_registry_bridge_with_no_job_is_worth_a_timed_glob(
+            self, tmp_path, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        home = self._fleet(tmp_path, monkeypatch)
+        me = os.getpid()
+        reg = {"in-reg": {"bridgeSessionId": "b"},
+               "cleared": {"bridgeSessionId": ""},
+               "none": {},
+               "job-has": {"jobId": "j1"},
+               "job-cleared": {"jobId": "j2", "bridgeSessionId": ""}}
+        for sid, extra in reg.items():
+            (home / "sessions" / f"{sid}.json").write_text(
+                json.dumps({"sessionId": sid, "pid": me, **extra}))
+        self._job(home, "j1", "job-has")
+        self._job(home, "j2", "job-cleared", bridge="")
+        assert pp._live_session_ids() == {
+            "in-reg": True, "cleared": False, "none": False,
+            "job-has": False, "job-cleared": False}
 
 _TEST_IDENTITY = hashlib.sha256(b"org:test-org").hexdigest()
 # T0681 ROUND 4: the fixed token/account pair `_seed_trusted_stamp` writes
@@ -30621,7 +30857,7 @@ class TestTheSpliceHoldsTheConfigLock:
              "bridgeSessionGroupingId": "grp_7", "bridgeOutboundOnly": False}))
         monkeypatch.setattr(pin_proxy, "_config_home_for_policy", lambda: home)
         monkeypatch.setattr(pin_proxy, "_live_job_ids", lambda: ["j1"])
-        monkeypatch.setattr(pin_proxy, "_live_session_ids", lambda: [])
+        monkeypatch.setattr(pin_proxy, "_live_session_ids", lambda: {})
         assert pin_proxy.carry_live_pointers(("PIN", "ORG")) == 1
         rec = json.loads((home / "jobs" / "j1" / "state.json").read_text())
         assert rec["bridgeOwnerAccountUuid"] == "PIN"

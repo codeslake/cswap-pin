@@ -4198,9 +4198,13 @@ def _read_json(path: Path):
     return out if isinstance(out, dict) else None
 
 
-def _live_session_ids() -> list[str]:
-    """Session ids of processes that are alive, from the registry."""
-    out: list[str] = []
+def _live_session_ids() -> dict[str, bool]:
+    """Session ids of processes that are alive, from the registry, each mapped
+    to whether a pointer stub may still appear in its transcript: it holds a
+    registry ``bridgeSessionId`` and has NO ``jobId``. A background session's
+    pointer is in its job record, which the job loop carries, so it is never
+    worth the timed glob (`_transcript_seen`)."""
+    out: dict[str, bool] = {}
     try:
         home = require("paths").get_claude_config_home()
         for path in (home / "sessions").glob("*.json"):
@@ -4214,9 +4218,10 @@ def _live_session_ids() -> list[str]:
                 os.kill(int(pid), 0)
             except Exception:  # noqa: BLE001
                 continue
-            out.append(str(sid))
+            bridged = bool(rec.get("bridgeSessionId")) and not rec.get("jobId")
+            out[str(sid)] = bridged or out.get(str(sid), False)
     except Exception:  # noqa: BLE001
-        return []
+        return {}
     return out
 
 
@@ -4378,7 +4383,37 @@ def _carry_job_record(job_id: str, login: tuple[str, str]) -> bool:
     return True
 
 
-def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
+#: ``(projects dir, session id)`` -> ``(its transcripts, when we globbed, was it
+#: ever seen bridged)``.
+#: `_last_pointer` ran `projects/*/<id>.jsonl` for every live session on every
+#: `POST /v1/code/sessions`: ~316,000 fs calls on a host with 15,799 project
+#: dirs and 20 live sessions, and 1,027,803 ms for one create beside a
+#: CPU-bound thread. A live session's transcript does not move.
+#:
+#: A look that does not end on exactly ONE pointer is remembered for
+#: `_TRANSCRIPT_MISS_S` only, then globbed again: a transcript appears once the
+#: session speaks (2 of 20 live sessions had none yet), and the pointer-holding
+#: stub of a duplicate is written by Claude Code AFTER the create's first look.
+#: Two files carrying a pointer decline the same way, on every look.
+#:
+#: ONLY FOR A SESSION SEEN WITH A REGISTRY BRIDGE AND NO JOB RECORD
+#: (`_live_session_ids`). One that never had has no pointer to restamp, and its
+#: transcript exists with none (Remote Control off: 2,119 lines before a first
+#: record); a background session's pointer is in its job record, which the job
+#: loop carries. A timed glob for either would put the scan back on every
+#: create. Their first look still globs, and so does every window until a
+#: transcript exists (an empty look is not a settled one). STICKY, because
+#: Claude Code clears the registry's id on RC teardown and does not write it
+#: back when the bridge returns: the current read alone would stop looking for
+#: the stub of a session that had one.
+# shortcut: once a remembered file carries the pointer, a second pointer file
+# for the id is not seen until the remembered path vanishes; the cost is one
+# restamp appended to the older transcript.
+_TRANSCRIPT_MISS_S = 60.0
+_transcript_seen: "dict[tuple[Path, str], tuple[list[Path], float, bool]]" = {}
+
+
+def _last_pointer(session_id: str, bridged: bool = True) -> tuple[Path, dict] | None:
     """The transcript and its last ``bridge-session`` record, from the tail.
 
     ONE SESSION ID CAN NAME TWO FILES, and when it does this declines rather
@@ -4393,11 +4428,28 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
     while the transcript is filed under the worktree path, so the derived name
     missed a real session on the first machine it was tried on.
     """
-    get_claude_config_home = require("paths").get_claude_config_home
+    projects = require("paths").get_claude_config_home() / "projects"
+    key = (projects, session_id)
+    seen = _transcript_seen.get(key)
+    paths, at, was = seen or ([], 0.0, False)
+    bridged = bridged or was
+    moved = seen is None or not all(p.exists() for p in paths)  # unseen reads as moved
+    found = [] if moved else _pointer_records(paths, session_id)
+    if len(found) != 1 and (
+            moved or ((bridged or not paths)
+                      and time.monotonic() - at >= _TRANSCRIPT_MISS_S)):
+        # A guard here would also make `_carry_history_pointers`' stated reason
+        # for its outer catch-all untrue.
+        paths, at = list(projects.glob(f"*/{session_id}.jsonl")), time.monotonic()
+        found = _pointer_records(paths, session_id)
+    _transcript_seen[key] = (paths, at, bridged)
+    return found[0] if len(found) == 1 else None
+
+
+def _pointer_records(paths: list[Path], session_id: str) -> list[tuple[Path, dict]]:
+    """Each of `paths` that holds a ``bridge-session`` record, from the tail."""
     found: list[tuple[Path, dict]] = []
-    # A guard here would also make `_carry_history_pointers`' stated reason for
-    # its outer catch-all untrue.
-    for path in (get_claude_config_home() / "projects").glob(f"*/{session_id}.jsonl"):
+    for path in paths:
         try:
             with path.open("rb") as fh:
                 fh.seek(0, os.SEEK_END)
@@ -4421,7 +4473,7 @@ def _last_pointer(session_id: str) -> tuple[Path, dict] | None:
                 continue
             found.append((path, rec))
             break
-    return found[0] if len(found) == 1 else None
+    return found
 
 
 def _pointer_owner(certdir) -> "tuple[str, str] | None":
@@ -4538,8 +4590,8 @@ def carry_live_pointers(login: "tuple[str, str]") -> int:
     # changed nothing for the session it was written for. `_carry_history_
     # pointers` writes BOTH and says why: an interactive resume has no
     # CLAUDE_JOB_DIR, so Claude Code reads the TRANSCRIPT.
-    for sid in _live_session_ids():
-        found = _last_pointer(sid)
+    for sid, bridged in _live_session_ids().items():
+        found = _last_pointer(sid, bridged)
         if not found:
             continue
         path, rec = found
