@@ -150,6 +150,10 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
 # a saving there, and a hop that is that launch's own exported proxy is kept
 # out of this path entirely by the ``own_proxy`` guard below instead.
 _ASKED_NOHEALTH: set[str] = set()
+# The mirror: addresses that answered /health as a cache proxy at least once
+# THIS PROCESS, whether or not they named an upstream. Process-local for the
+# same reason; what outlives the process is `write_upstream_hint`'s "cache" key.
+_ANSWERED_HEALTH: set[str] = set()
 
 
 def _probe_next_hop(
@@ -244,6 +248,7 @@ def _probe_next_hop(
                 # server.
                 if 400 <= resp.status < 500:
                     _ASKED_NOHEALTH.add(address)
+                    _ANSWERED_HEALTH.discard(address)
                 return None
             body = json.loads(resp.read())
         finally:
@@ -251,7 +256,9 @@ def _probe_next_hop(
     except Exception:  # noqa: BLE001 — an absent probe is "no next hop"
         return None
     if not isinstance(body, dict):
+        _ANSWERED_HEALTH.discard(address)
         return None
+    _ANSWERED_HEALTH.add(address)
     nxt = body.get("https_proxy") or body.get("HTTPS_PROXY")
     if not isinstance(nxt, str) or not nxt:
         return None
@@ -276,6 +283,12 @@ def _chain_hops(certdir: Path) -> list[_Chain]:
         if hop is not None and hop not in hops:
             hops.append(hop)
     return hops
+
+
+def _hop_address(value: str | None) -> str:
+    """``host:port`` of a recorded hop, the form `_ASKED_NOHEALTH` keys on; "" for none."""
+    hop = parse_upstream_proxy(value)
+    return f"{hop.host}:{hop.port}" if hop else ""
 
 
 def write_upstream_hint(
@@ -321,13 +334,92 @@ def write_upstream_hint(
         # so an authenticated or TLS corporate proxy survived exactly until the
         # next re-pin, then every pinned request 407'd.
         keep_proxy = _read_upstream(certdir, "proxy") or ""
+    # WHETHER THE HOP IS A CACHE PROXY, kept only as a positive: a stale "yes"
+    # hands the programs Claude Code starts no proxy, a stale "no" would hand
+    # them the cache proxy's own port. What this process saw wins; else the
+    # earlier record, while it names the same address; else nothing.
+    seen = _hop_address(keep_proxy)
+    keep_cache = seen if seen in _ANSWERED_HEALTH or (
+        seen not in _ASKED_NOHEALTH and _read_upstream(certdir, "cache") == seen) else ""
+    record = {"proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next}
+    if keep_cache:
+        record["cache"] = keep_cache
     try:
-        tmp.write_text(json.dumps({
-            "proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next,
-        }))
+        tmp.write_text(json.dumps(record))
         tmp.replace(path)
     except OSError:
-        pass
+        return
+    _write_child_proxy(certdir)
+
+
+def _names_the_pin(certdir: Path, value: str | None) -> bool:
+    """Whether ``value`` is a loopback URL on any port the pin has: the one
+    configured, the one the last daemon recorded, the hint a respawn left, the
+    one wired into the global config. Not `wanted_port`, which names only the
+    first of them that exists: a ``--set_port`` made after the daemon started
+    ranks ahead of the port it serves on, and a first daemon has no hint."""
+    hop = parse_upstream_proxy(value)
+    if hop is None or hop.host not in _LOOPBACK:
+        return False
+    state = read_daemon_state(certdir)
+    return hop.port in (
+        configured_port(certdir), state.get("port") if state else None,
+        read_port_hint(certdir), _wired_port(),
+    )
+
+
+def _write_child_proxy(certdir: Path) -> None:
+    """Write, beside ``upstream.json``, the proxy the programs Claude Code starts get.
+
+    Read by the opt-in shell prefix (``SHELL_PREFIX_SH``), which parses nothing:
+    one line, a URL kept as recorded (a credential stays), or empty.
+
+    It is the proxy the user had BEFORE the pin wired itself in, derived from
+    what the record already holds and never from a name or a port. The
+    recorded hop (``proxy``) gives:
+
+    - no hop recorded, or a hop that is not on loopback (the only kind the pin
+      asks, so ``next`` behind it is what an earlier hop left): the hop itself;
+    - a loopback hop that answered /health as a cache proxy (``cache``): the hop
+      behind it (``next``), or nothing. Its own address is not theirs to use;
+    - a loopback hop this process saw answer no /health, or one with no ``next``
+      recorded (a first launch the daemon has not asked yet): the hop itself;
+    - a loopback hop with a ``next`` and nothing known about it: nothing. It may
+      be a cache proxy, and the daemon settles it within a tick.
+
+    Whatever that gives is dropped when it is the pin itself (`_names_the_pin`),
+    which a cache proxy started from a pinned shell reports (`learn_next_hop`).
+    """
+    proxy = _read_upstream(certdir, "proxy")
+    nxt = _read_upstream(certdir, "next")
+    hop = parse_upstream_proxy(proxy)
+    seen = _hop_address(proxy)
+    if hop is None:
+        child = ""
+    elif hop.host not in _LOOPBACK:
+        child = proxy
+    elif _read_upstream(certdir, "cache") == seen:
+        child = nxt
+    elif seen in _ASKED_NOHEALTH or not nxt:
+        child = proxy
+    else:
+        child = ""
+    if not child or _names_the_pin(certdir, child):
+        child = ""
+    path = Path(certdir) / "shell-prefix.proxy"
+    text = child + "\n" if child else ""
+    # a temp name of its own pid, as `write_shell_prefix`: the timer, a launch
+    # and `heal` overlap, and one fixed name lets a truncate land after a rename
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with contextlib.suppress(OSError):
+            if path.read_text() == text:  # the daemon's timer asks every tick
+                return
+        tmp.write_text(text)
+        tmp.replace(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def read_upstream_ca(certdir: Path) -> str | None:
@@ -1750,6 +1842,7 @@ def heal(backup_root: Path, identity: dict | None = None,
     try:
         if (certdir / "shell-prefix").exists():
             write_shell_prefix(certdir)
+            _write_child_proxy(certdir)  # the file it reads, from the record as it stands: no probe
     except Exception:  # noqa: BLE001 — a launch must never fail on the pin
         pass
     # AN UPGRADE MUST NOT WAIT FOR A LAUNCH. `ensure_proxy` recycles a stale
@@ -6536,19 +6629,23 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
 # keeps an existing copy current across an upgrade (`heal`). Measured on Claude
 # Code 2.1.296; README "Keeping the programs Claude Code starts off the pin".
 SHELL_PREFIX_SH = """#!/bin/sh
-u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy'; eval "$u"
+# the proxy the user had before the pin wired itself in: the pin writes it next to this file, or leaves it empty
+p=${0%/*}/shell-prefix.proxy; CSWAP_PIN_CHILD_PROXY=; [ -r "$p" ] && IFS= read -r CSWAP_PIN_CHILD_PROXY < "$p"; export CSWAP_PIN_CHILD_PROXY
+u='for k in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do if [ -n "$CSWAP_PIN_CHILD_PROXY" ]; then export "$k=$CSWAP_PIN_CHILD_PROXY"; else unset "$k"; fi; done; unset k'; eval "$u"
 # Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && export SHELL_PREFIX_CLAUDE_PID="${CLAUDE_PID-}"
+# the shells below run $u again after their startup files, and take the holder with them
+u="$u; unset CSWAP_PIN_CHILD_PROXY"
 # the user's own earlier prefix gets the command exactly as Claude gave it; the variable is
 # dropped first, so a chain that comes back to this file ends here; a missing file or a relative name is skipped
 p=${CSWAP_PIN_PREV_SHELL_PREFIX-}; unset CSWAP_PIN_PREV_SHELL_PREFIX
-case $p in /*) [ -f "$p" ] && [ -x "$p" ] && exec "$p" "$1" ;; esac
-# Bash tool: the shell Claude chose (it sets SHELL); unset again after its startup files
+case $p in /*) [ -f "$p" ] && [ -x "$p" ] && { unset CSWAP_PIN_CHILD_PROXY; exec "$p" "$1"; } ;; esac
+# Bash tool: the shell Claude chose (it sets SHELL); set again after its startup files
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && exec "${SHELL:-/bin/sh}" -c "$u; $1"
 # hook or statusLine: Claude stamped its own pid on it; run it under /bin/sh, as without a prefix
 [ -n "${CLAUDE_PID+x}" ] && [ "$CLAUDE_PID" != "${SHELL_PREFIX_CLAUDE_PID-}" ] && exec /bin/sh -c "$u; $1"
 # stdio MCP server: one quoted command; become it, so Claude's signals reach the server
-eval "exec $1"
+unset CSWAP_PIN_CHILD_PROXY; eval "exec $1"
 """
 
 
@@ -6587,10 +6684,12 @@ def write_shell_prefix(certdir) -> Path:
 
 
 def shell_prefix_main() -> int:
-    """`cswap pin --print-shell-prefix-path`: write the script, print its path and
-    nothing else on stdout; one line on stderr and exit 1 when it cannot."""
+    """`cswap pin --print-shell-prefix-path`: write the script and the file it
+    reads, print the script's path and nothing else on stdout; one line on stderr
+    and exit 1 when it cannot."""
     try:
         path = write_shell_prefix(Path(require("paths").get_backup_root()) / "pin-proxy")
+        _write_child_proxy(path.parent)
     except Exception as exc:  # noqa: BLE001 — the message is the whole answer
         print(f"cswap-pin: could not write the shell prefix: {exc}", file=sys.stderr)
         return 1
@@ -8341,6 +8440,23 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     # is what lets a dead hop fall through to the next one instead of to a
     # direct dial (see ``_probe_next_hop``).
     ambient, observed_next = _ambient_chain(certdir=certdir)
+    # A CHILD OF A PINNED SESSION carries the hop BEHIND the recorded one (the
+    # shell prefix hands it over, see `_write_child_proxy`): where the pin
+    # chains to, not a proxy this launch chose. Recorded as `proxy` while the
+    # recorded hop is down, it would drop that hop from the chain for good.
+    # ONLY WHILE THE RECORDED HOP IS A LOOPBACK ONE THAT IS DOWN: serving, it
+    # outranks the shell's export in `_ambient_proxy` and nothing is adopted;
+    # and a record the wrong way round (outer first, `next` the inner hop that
+    # this shell exports) is the very record the swap below repairs.
+    # HERE AND NOT IN `_ambient_proxy`: the degraded holder's relay goes through
+    # `_ambient_chain` too, and has to dial what it inherited (T2171).
+    first = parse_upstream_proxy(_read_upstream(certdir, "proxy"))
+    if (
+        (own := _shell_proxy()) and own == _read_upstream(certdir, "next")
+        and first is not None and first.host in _LOOPBACK
+        and not _port_is_serving(*first.address)
+    ):
+        ambient, observed_next = _wired_over_proxy(), None
     # Two independent sources for the hop BEHIND this one, and they fail in
     # different conditions: the probe needs the inner hop to be answering,
     # while the shell's own proxy is visible whether or not it is. Prefer the
@@ -21855,6 +21971,7 @@ class PinProxy:
         # would erase a next hop learned while it was up, at the moment it
         # matters most.
         if not nxt or nxt == _read_upstream(self._certdir, "next"):
+            self._note_probe(recorded)
             return
         # A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP. A looped proxy neither
         # answers nor exits — it appears here as "accepted but did not tunnel
@@ -21864,11 +21981,25 @@ class PinProxy:
                 f"{recorded} names this daemon as its upstream — refusing to "
                 f"record a loop"
             )
+            self._note_probe(recorded)
             return
         write_upstream_hint(
             self._certdir, recorded, read_upstream_ca(self._certdir), next_hop=nxt,
         )
         _log_lifecycle(f"learned the hop behind {recorded}: {nxt}")
+
+    def _note_probe(self, recorded: str) -> None:
+        """Settle what the children get when the probe gave no new hop to chain
+        through (none, this daemon, or the one already recorded): a launch from
+        the shell that runs the hop never asks it (see `_probe_next_hop`'s
+        `own_proxy`), and a record from before the `cache` key has none, so this
+        timer is where the hop is learned to be a cache proxy, or a plain one
+        (`_write_child_proxy`)."""
+        seen = _hop_address(recorded)
+        if seen in _ANSWERED_HEALTH and _read_upstream(self._certdir, "cache") != seen:
+            write_upstream_hint(self._certdir, recorded, read_upstream_ca(self._certdir))
+        elif seen in _ASKED_NOHEALTH:
+            _write_child_proxy(self._certdir)
 
     def _is_me(self, value) -> bool:
         """Whether ``value`` names this daemon's own address.

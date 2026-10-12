@@ -2,7 +2,9 @@
 
 The pin never sets that variable. A user who wants the programs a pinned Claude
 Code starts (Bash tool, hooks, stdio MCP servers, status line) off the pin sets
-it themselves, to a file this package writes on request.
+it themselves, to a file this package writes on request. Those programs get the
+proxy the user had before the pin wired itself in, or none: the pin writes that
+value to a file beside the script, and the script hands it over.
 
 Two halves, kept apart. The first is the writer: exact text, mode 0755, atomic,
 compare-before-write, refreshed by `heal` only once it exists. The second runs
@@ -74,9 +76,9 @@ def test_writes_the_exact_text_at_mode_0755_under_the_state_dir(state):
     assert path == state.absolute() / "shell-prefix" and path.is_absolute()
     assert path.read_text(encoding="utf-8") == pin_proxy.SHELL_PREFIX_SH
     assert stat.S_IMODE(path.stat().st_mode) == 0o755
-    # VERBATIM, against a digest taken from the file the analysis measured, not from this code.
+    # VERBATIM, against a digest of the text as reviewed (T2171), not computed from this code.
     assert hashlib.sha256(path.read_bytes()).hexdigest() == (
-        "338b45a83a0f530c65e84a16d38151f803eedf0c2d5ba08bbd93eaecd5d05bf0")
+        "3874db683982711eac73f40702be82b7da2b9679990e3e11dfbece75ce6126b8")
 
 
 def test_an_unchanged_file_is_not_rewritten(state):
@@ -357,6 +359,483 @@ def test_a_prev_prefix_that_cannot_chain_is_skipped_and_the_command_still_runs(p
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "out").read_text() == "ran\n", "the command did not run exactly once"
     assert not (tmp_path / "log").exists(), "a prefix that cannot chain was run"
+
+
+# -- the proxy the children get: what the pin writes, and what the script does with it ----
+
+SIDECAR = "shell-prefix.proxy"
+BEFORE = "http://user:pw@proxy.example:3128"  # the proxy the user had before the pin, credentialed
+OTHER = "http://other.example:8080"
+TRICKY = "http://us$er:p'w\"d`x@proxy.example:3128/?a=b&c;d"  # every character a shell would act on
+VALUES = " ".join('"$%s"' % v for v in SIX)
+
+
+@pytest.fixture
+def certdir(state, monkeypatch):
+    """The pin's directory as a launch leaves it, with no probe memory from another test."""
+    pin_proxy = _proxy()
+    monkeypatch.setattr(pin_proxy, "_ASKED_NOHEALTH", set())
+    monkeypatch.setattr(pin_proxy, "_ANSWERED_HEALTH", set())
+    state.mkdir(parents=True)
+    return state
+
+
+class _Health:
+    """A local proxy answering /health with `answer`, or with 400 when `answer` is None."""
+
+    def __init__(self, answer):
+        import http.server
+        import threading
+
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(outer.answer).encode()
+                self.send_response(200 if outer.answer is not None else 400)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.answer = answer
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def _launch(certdir, proxy, **kw):
+    """What `ensure_proxy` does with a hop: ask it, then record what it said."""
+    pin_proxy = _proxy()
+    pin_proxy.write_upstream_hint(certdir, proxy, next_hop=pin_proxy._probe_next_hop(proxy, timeout=10), **kw)
+
+
+def _child_proxy(certdir):
+    return (certdir / SIDECAR).read_text()
+
+
+def _tick(certdir, port=None):
+    """One run of the daemon's timer job, asking a local hop with the time a server thread needs."""
+    import functools
+
+    pin_proxy = _proxy()
+    daemon = pin_proxy.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                                upstream=("127.0.0.1", 1), rediscover_chain=True)
+    daemon.port = port
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(pin_proxy, "_probe_next_hop", functools.partial(pin_proxy._probe_next_hop, timeout=10))
+        daemon.learn_next_hop()
+
+
+# The four cases the children's proxy comes from.
+def test_pin_only_the_children_get_the_proxy_the_user_had(certdir):
+    _launch(certdir, BEFORE)
+    assert _child_proxy(certdir) == BEFORE + "\n", "a credentialed proxy is kept as recorded"
+
+
+def test_pin_only_a_local_proxy_that_is_not_a_cache_proxy_is_the_proxy_the_user_had(certdir):
+    with _Health(None) as hop:  # answers every /health with a 400
+        _launch(certdir, hop.url)
+        assert _child_proxy(certdir) == hop.url + "\n"
+    with _Health({"status": "ok"}) as down:
+        gone = down.url
+    _launch(certdir, gone)  # and one that gives no answer at all and has no hop behind it: the first-launch window
+    assert _child_proxy(certdir) == gone + "\n"
+
+
+def test_pin_and_a_cache_proxy_the_children_get_the_hop_behind_it(certdir):
+    with _Health({"https_proxy": BEFORE}) as cache:
+        _launch(certdir, cache.url)
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def test_pin_and_a_cache_proxy_that_names_no_upstream_the_children_get_none(certdir):
+    with _Health({"status": "ok"}) as cache:
+        _launch(certdir, cache.url)
+        assert json.loads((certdir / "upstream.json").read_text())["cache"] == cache.url.removeprefix("http://")
+    assert _child_proxy(certdir) == "", "the cache proxy's own address reached the children"
+
+
+def test_a_local_proxy_known_to_answer_no_health_is_the_proxy_the_user_had_whatever_next_an_earlier_hop_left(certdir):
+    pin_proxy = _proxy()
+    with _Health(None) as hop:
+        pin_proxy._probe_next_hop(hop.url, timeout=10)  # this process asked: a 400
+        pin_proxy.write_upstream_hint(certdir, hop.url, next_hop=OTHER)
+        assert json.loads((certdir / "upstream.json").read_text())["next"] == OTHER, "the control"
+        assert _child_proxy(certdir) == hop.url + "\n"
+
+
+def test_a_local_proxy_nothing_is_known_about_gives_the_children_none_while_a_next_is_recorded(certdir):
+    """Unknown could be a cache proxy, whose own address is not theirs to use."""
+    with _Health({"status": "ok"}) as down:
+        gone = down.url
+    _proxy().write_upstream_hint(certdir, gone, next_hop=BEFORE)  # a launch that never asked it
+    assert _child_proxy(certdir) == ""
+
+
+@pytest.mark.parametrize("record", ["configured", "proxy.json", "port.hint", "wired"])
+def test_a_hop_behind_the_cache_proxy_that_names_the_pin_itself_is_not_handed_over(certdir, monkeypatch, record):
+    """Any of the four records of the pin's port names it, not only the one `wanted_port` ranks first:
+    a `--set_port` made after the daemon started puts the configured port ahead of the one it serves on."""
+    pin_proxy = _proxy()
+    monkeypatch.setattr(pin_proxy, "_wired_port", lambda: 40123 if record == "wired" else None)
+    # `configured_port` ranks first: it names another port unless it is the record under test
+    (certdir / "settings.json").write_text(json.dumps({"port": 40123 if record == "configured" else 40999}))
+    if record == "proxy.json":
+        pin_proxy.write_daemon_state(certdir, 40123, os.getpid(), "FP")
+    elif record == "port.hint":
+        pin_proxy._write_port_hint(certdir, 40123)
+    with _Health({"https_proxy": "http://127.0.0.1:40123"}) as cache:  # started from a pinned shell
+        _launch(certdir, cache.url)
+    assert json.loads((certdir / "upstream.json").read_text())["next"] == "http://127.0.0.1:40123", "the control"
+    assert _child_proxy(certdir) == ""
+
+
+def test_a_first_hop_that_is_the_pin_itself_is_not_handed_over(certdir):
+    pin_proxy = _proxy()
+    pin_proxy.write_daemon_state(certdir, 40123, os.getpid(), "FP")
+    pin_proxy.write_upstream_hint(certdir, "http://127.0.0.1:40123")
+    assert _child_proxy(certdir) == ""
+
+
+def test_a_cache_proxy_that_names_the_pin_to_the_daemon_is_recorded_as_one_and_the_children_get_none(certdir):
+    """The daemon's timer refuses to record the pin as a next hop, but it still learned
+    that the hop is a cache proxy: the children must not get the cache proxy's own address."""
+    pin_proxy = _proxy()
+    with _Health({"https_proxy": "http://127.0.0.1:40123"}) as cache:
+        pin_proxy.write_upstream_hint(certdir, cache.url)
+        assert _child_proxy(certdir) == cache.url + "\n", "the control: nothing has asked the hop yet"
+        _tick(certdir, port=40123)
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["next"], record["cache"]) == ("", cache.url.removeprefix("http://")), record
+    assert _child_proxy(certdir) == ""
+
+
+def test_a_stale_next_is_not_handed_over_once_the_first_hop_is_not_a_local_proxy(certdir):
+    """`write_upstream_hint` keeps an earlier `next` when the first hop changes. Only a loopback
+    first hop is ever asked, so only there can `next` be what stands behind it."""
+    with _Health({"https_proxy": BEFORE}) as cache:
+        _launch(certdir, cache.url)
+    _proxy().write_upstream_hint(certdir, OTHER)  # a re-pin from a shell exporting a corporate proxy
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["proxy"], record["next"]) == (OTHER, BEFORE), "the control"
+    assert _child_proxy(certdir) == OTHER + "\n"
+
+
+def test_no_proxy_at_all_the_children_get_none(certdir):
+    _launch(certdir, None)
+    assert _child_proxy(certdir) == ""
+
+
+# What a launch that cannot ask does with what an earlier one learned.
+def test_a_launch_that_cannot_ask_keeps_that_the_hop_is_a_cache_proxy(certdir):
+    pin_proxy = _proxy()
+    with _Health({"status": "ok"}) as cache:
+        _launch(certdir, cache.url)
+        pin_proxy._ANSWERED_HEALTH.clear()  # a new process: it never asked this hop
+        pin_proxy.write_upstream_hint(certdir, cache.url)
+        pin_proxy.write_upstream_hint(certdir, None)  # and one from a shell that sees no proxy
+    assert _child_proxy(certdir) == ""
+
+
+def test_a_hop_that_now_answers_a_4xx_is_not_kept_as_a_cache_proxy(certdir):
+    pin_proxy = _proxy()
+    with _Health({"status": "ok"}) as cache:
+        _launch(certdir, cache.url)
+        cache.answer = None  # something else holds the port now
+        pin_proxy._ANSWERED_HEALTH.clear()
+        _launch(certdir, cache.url)
+    assert _child_proxy(certdir) == cache.url + "\n"
+    assert "cache" not in json.loads((certdir / "upstream.json").read_text())
+
+
+def test_a_hop_answering_a_4xx_after_a_200_in_the_same_process_is_not_a_cache_proxy(certdir):
+    pin_proxy = _proxy()
+    with _Health({"status": "ok"}) as hop:
+        _launch(certdir, hop.url)
+        hop.answer = None
+        pin_proxy._probe_next_hop(hop.url, timeout=10)
+        pin_proxy.write_upstream_hint(certdir, hop.url)
+    assert _child_proxy(certdir) == hop.url + "\n"
+
+
+def test_a_different_hop_does_not_inherit_the_cache_proxy_record(certdir):
+    pin_proxy = _proxy()
+    with _Health({"status": "ok"}) as cache:
+        _launch(certdir, cache.url)
+    pin_proxy._ANSWERED_HEALTH.clear()
+    pin_proxy.write_upstream_hint(certdir, OTHER)
+    assert _child_proxy(certdir) == OTHER + "\n"
+
+
+def test_a_launch_that_cannot_ask_keeps_the_hop_behind_the_cache_proxy(certdir):
+    with _Health({"https_proxy": BEFORE}) as cache:
+        _launch(certdir, cache.url)
+        _proxy().write_upstream_hint(certdir, None)
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def test_the_child_proxy_file_has_the_mode_of_upstream_json_and_leaves_no_temp(certdir):
+    old = os.umask(0o027)
+    try:
+        _proxy().write_upstream_hint(certdir, BEFORE)
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((certdir / SIDECAR).stat().st_mode) == stat.S_IMODE((certdir / "upstream.json").stat().st_mode)
+    assert sorted(p.name for p in certdir.iterdir()) == [SIDECAR, "upstream.json"]
+
+
+def test_the_child_proxy_is_written_through_a_temp_name_of_its_own_pid(certdir, monkeypatch):
+    """The timer, a launch and `heal` can overlap: through one fixed temp name, one writer's truncate
+    can land after another's rename, and a command started then reads an empty file."""
+    renamed = []
+    replace = Path.replace
+
+    def spy(self, target):
+        if Path(target).name == SIDECAR:
+            renamed.append(self.name)
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy)
+    _proxy().write_upstream_hint(certdir, BEFORE)
+    assert renamed and all(str(os.getpid()) in name for name in renamed), renamed
+
+
+@pytest.mark.parametrize("answer,expected", [({"https_proxy": BEFORE}, BEFORE + "\n"), ({"status": "ok"}, "")],
+                         ids=["names-an-upstream", "names-none"])
+def test_the_daemon_asking_a_cache_proxy_refreshes_the_file(certdir, answer, expected):
+    """`learn_next_hop` is the other writer. The launch that recorded the hop did not ask it,
+    the way a launch from the shell that runs the hop does not (`own_proxy`)."""
+    with _Health(answer) as cache:
+        _proxy().write_upstream_hint(certdir, cache.url)
+        assert _child_proxy(certdir) == cache.url + "\n", "the control: nothing has asked the hop yet"
+        _tick(certdir)
+    assert _child_proxy(certdir) == expected
+
+
+def test_an_upgraded_host_with_a_settled_record_converges_at_the_first_daemon_tick(certdir):
+    """`upstream.json` from before the `cache` key: its `next` is settled, so the timer's
+    `nxt == next` return used to write nothing, and nothing else ever would."""
+    with _Health({"https_proxy": BEFORE}) as cache:
+        (certdir / "upstream.json").write_text(json.dumps({"proxy": cache.url, "ca": "", "next": BEFORE}))
+        _proxy()._write_child_proxy(certdir)
+        assert _child_proxy(certdir) == "", "the control: a hop not yet known to be a cache proxy gives no `next`"
+        _tick(certdir)
+        assert json.loads((certdir / "upstream.json").read_text())["cache"] == cache.url.removeprefix("http://")
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def test_the_daemon_asking_a_plain_local_proxy_that_has_a_stale_next_gives_the_children_that_proxy(certdir):
+    """The launch that recorded it was run from the shell that exports it, so it never asked."""
+    with _Health(None) as hop:
+        (certdir / "upstream.json").write_text(json.dumps({"proxy": hop.url, "ca": "", "next": BEFORE}))
+        _proxy()._write_child_proxy(certdir)
+        assert _child_proxy(certdir) == "", "the control: a hop nothing is known about, with a `next` behind it"
+        _tick(certdir)
+        assert _child_proxy(certdir) == hop.url + "\n"
+
+
+def _ensure_proxy(tmp_path, monkeypatch):
+    """`ensure_proxy`, the writer every launch goes through, with all but the record stubbed.
+
+    Returns the pin's directory under `tmp_path / "backup"`."""
+    pin_proxy = _proxy()
+
+    class Switcher:
+        backup_dir = tmp_path / "backup"
+
+        def resolve_account(self, email):
+            return "1", email, None
+
+    monkeypatch.setattr(pin_proxy, "load_pin", lambda _b: ("a@example.com", ""))
+    monkeypatch.setattr(pin_proxy, "_carry_history_pointers", lambda _c: None)
+    monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *_a: "FP")
+    monkeypatch.setattr(pin_proxy, "ensure_ca", lambda *_a: None)
+    monkeypatch.setattr(pin_proxy, "publish_ca", lambda _p: None)
+    monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *_a: None)
+    monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *_a, **_k: 1234)
+    monkeypatch.setattr(pin_proxy, "_move_into_this_lineage", lambda _c, _n, _e, port: port)
+    assert pin_proxy.ensure_proxy(Switcher()) is not None
+    return Switcher.backup_dir / "pin-proxy"
+
+
+def test_a_launch_writes_the_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(_proxy(), "_ambient_chain", lambda **_k: (BEFORE, None))
+    assert _child_proxy(_ensure_proxy(tmp_path, monkeypatch)) == BEFORE + "\n"
+
+
+@pytest.mark.parametrize("script", ["stale", "current"])
+def test_ensure_leaves_the_file_on_a_host_whose_record_is_already_stable(tmp_path, monkeypatch, script):
+    """An upgraded host: `upstream.json` is settled, so no launch or timer will write the file."""
+    pin_proxy = _proxy()
+    root = _pinned_root(tmp_path, monkeypatch)
+    certdir = root / "pin-proxy"
+    (certdir / "upstream.json").write_text(json.dumps({"proxy": BEFORE, "ca": "", "next": ""}))
+    if script == "current":
+        pin_proxy.write_shell_prefix(certdir)
+    else:
+        (certdir / "shell-prefix").write_text("#!/bin/sh\necho stale\n")
+    assert not (certdir / SIDECAR).exists(), "the control"
+    pin_proxy.heal(root)
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def test_the_command_leaves_the_file_beside_the_script_on_a_host_whose_record_is_already_stable(capsys):
+    pin_proxy = _proxy()
+    assert pin_proxy.shell_prefix_main() == 0
+    certdir = Path(capsys.readouterr().out.rstrip("\n")).parent
+    (certdir / SIDECAR).unlink(missing_ok=True)
+    (certdir / "upstream.json").write_text(json.dumps({"proxy": BEFORE, "ca": "", "next": ""}))
+    assert pin_proxy.shell_prefix_main() == 0  # the script is current: only the file is owed
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def _launch_from(tmp_path, monkeypatch, shell_proxy, pin_port):
+    """A `cswap pin` run from a shell exporting `shell_proxy`, over a record whose first hop is
+    a cache proxy that is down and whose second is BEFORE. Returns the pin's directory and the first hop."""
+    certdir = tmp_path / "backup" / "pin-proxy"
+    certdir.mkdir(parents=True)
+    with _Health({"status": "ok"}) as down:
+        gone = down.url
+    (certdir / "upstream.json").write_text(json.dumps(
+        {"proxy": gone, "ca": "", "next": BEFORE, "cache": gone.removeprefix("http://")}))
+    for k in (*SIX, "CSWAP_PIN_PORT", "NODE_EXTRA_CA_CERTS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", shell_proxy)
+    if pin_port:
+        monkeypatch.setenv("CSWAP_PIN_PORT", pin_port)
+    assert _ensure_proxy(tmp_path, monkeypatch) == certdir
+    return certdir, gone
+
+
+@pytest.mark.parametrize("pin_port", [None, "51000"], ids=["pin-port-unset", "pin-port-set"])
+def test_a_pin_run_from_a_child_keeps_the_hop_in_front_while_it_is_down(tmp_path, monkeypatch, pin_port):
+    """A child carries the hop behind the recorded one. Adopted as the FIRST hop while the recorded
+    one is down, it drops that hop for good (28dad1d, 7acfec1: the same pollution by the pin's own URL)."""
+    certdir, gone = _launch_from(tmp_path, monkeypatch, BEFORE, pin_port)
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["proxy"], record["next"]) == (gone, BEFORE), record
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def test_a_pin_run_from_a_shell_with_another_proxy_still_records_it(tmp_path, monkeypatch):
+    """The control: only the hop behind the recorded one is refused, any other proxy is a choice."""
+    certdir, _ = _launch_from(tmp_path, monkeypatch, OTHER, "51000")
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["proxy"], record["next"]) == (OTHER, BEFORE), record
+
+
+def test_a_degraded_holder_still_relays_through_the_hop_it_inherited_when_that_is_the_recorded_next(
+        certdir, monkeypatch):
+    """The holder's blind relay is the only thing holding the machine up. An ssh shell exports the
+    machine egress, which the record also holds as `next`; the recorded first hop is down."""
+    import socket
+    import threading
+
+    pin_proxy = _proxy()
+    hop = socket.create_server(("127.0.0.1", 0))
+    hop.settimeout(10)
+    asked = []
+
+    def serve():
+        conn, _ = hop.accept()
+        asked.append(conn.recv(4096))
+        conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    egress = f"http://127.0.0.1:{hop.getsockname()[1]}"
+    with _Health({"status": "ok"}) as down:
+        gone = down.url
+    pin_proxy.write_upstream_hint(certdir, gone, next_hop=egress)
+    for k in (*SIX, "CSWAP_PIN_PORT"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", egress)
+    holder = pin_proxy.PortHolder.__new__(pin_proxy.PortHolder)
+    holder._certdir = certdir
+    client, conn = socket.socketpair()
+    client.settimeout(10)
+    relay = threading.Thread(target=holder._relay_one, args=(conn,), daemon=True)
+    relay.start()
+    client.sendall(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+    reply = client.recv(64)
+    client.close()
+    relay.join(10)
+    hop.close()
+    assert asked and asked[0].startswith(b"CONNECT example.test:443"), "the relay never reached the inherited hop"
+    assert reply.startswith(b"HTTP/1.1 200"), reply
+
+
+def _put(prefix, value):
+    (prefix.parent / SIDECAR).write_text("" if value is None else value + "\n")
+
+
+@pytest.mark.parametrize("shell", _shells())
+@pytest.mark.parametrize("value", [BEFORE, TRICKY], ids=["credentialed", "every-shell-character"])
+def test_the_bash_tool_gets_the_recorded_proxy_in_all_six_and_not_the_holder(prefix, tmp_path, shell, value):
+    _put(prefix, value)
+    cmd = f"printf '%s\\n' {VALUES}; echo \"holder=${{CSWAP_PIN_CHILD_PROXY+S}}\"; echo \"np=$NO_PROXY\""
+    r = _run(prefix, cmd, _env(tmp_path, SHELL=shutil.which(shell), CLAUDE_PID="4242"))
+    assert r.stdout.splitlines() == [value] * 6 + ["holder=", f"np={NO_PROXY}"], r.stderr
+
+
+@pytest.mark.parametrize("shell", _shells())
+def test_a_startup_file_that_exports_another_proxy_does_not_win_over_the_recorded_one(prefix, tmp_path, shell):
+    _put(prefix, BEFORE)
+    rc = tmp_path / "re-export"
+    rc.write_text("export HTTPS_PROXY=http://zenv.test https_proxy=http://zenv.test\n")
+    (tmp_path / ".zshenv").write_text(rc.read_text())
+    env = _env(tmp_path, SHELL=shutil.which(shell), CLAUDE_PID="4242", BASH_ENV=str(rc))
+    r = _run(prefix, f"printf '%s\\n' {VALUES}", env)
+    assert r.stdout.splitlines() == [BEFORE] * 6, r.stderr
+
+
+@pytest.mark.parametrize("shell", _shells())
+@pytest.mark.parametrize("kind", ["empty-file", "no-file"])
+def test_an_empty_or_missing_file_unsets_the_six_as_before(prefix, tmp_path, kind, shell):
+    if kind == "empty-file":
+        _put(prefix, None)
+    r = _run(prefix, f'echo "six=[{SIX_SET}] holder=[${{CSWAP_PIN_CHILD_PROXY+S}}]"',
+             _env(tmp_path, SHELL=shutil.which(shell), CLAUDE_PID="4242", CSWAP_PIN_CHILD_PROXY="inherited"))
+    assert r.stdout == "six=[] holder=[]\n", r.stderr
+
+
+def test_the_hook_shape_gets_the_recorded_proxy(prefix, tmp_path):
+    _put(prefix, BEFORE)
+    env = _env(tmp_path, CLAUDE_PROJECT_DIR="/p", CLAUDE_PID="4242")
+    r = _run(prefix, f"printf '%s\\n' {VALUES}; echo \"holder=${{CSWAP_PIN_CHILD_PROXY+S}}\"", env)
+    assert r.stdout.splitlines() == [BEFORE] * 6 + ["holder="], r.stderr
+
+
+def test_an_mcp_server_is_started_with_the_recorded_proxy_and_without_the_holder(prefix, tmp_path):
+    _put(prefix, BEFORE)
+    server = tmp_path / "server.py"
+    server.write_text("import json, os\nprint(json.dumps({k: os.environ.get(k) for k in "
+                      "%r + ('CSWAP_PIN_CHILD_PROXY',)}))\n" % (SIX,))
+    r = _run(prefix, f"{shlex.quote(sys.executable)} {shlex.quote(str(server))}",
+             _env(tmp_path, CLAUDE_PROJECT_DIR="/p"))
+    got = json.loads(r.stdout)
+    assert [got[v] for v in SIX] == [BEFORE] * 6 and got["CSWAP_PIN_CHILD_PROXY"] is None, r.stderr
+
+
+def test_a_chained_prefix_is_run_with_the_recorded_proxy_and_without_the_holder(prefix, tmp_path):
+    _put(prefix, BEFORE)
+    prev = tmp_path / "prev.sh"
+    prev.write_text("#!/bin/sh\nprintf '%s\\n' " + VALUES + ' "holder=${CSWAP_PIN_CHILD_PROXY+S}" >> "$LOG"\n'
+                    'exec /bin/sh -c "$1"\n')
+    prev.chmod(0o755)
+    r = _run(prefix, "true", _chain_env(tmp_path, prev))
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "log").read_text().splitlines() == [BEFORE] * 6 + ["holder="]
 
 
 # -- the owner's order: the wiring is untouched ----------------------------------
