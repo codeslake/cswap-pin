@@ -35471,7 +35471,7 @@ def test_daemon_main_gives_the_code_watch_thread_the_knobs_tick_and_says_so():
 # -- T2310: the stand-down ask is followed by a look, not by a whole tick -------
 
 
-class _Ticks(threading.Event):
+class _StandDownTicks(threading.Event):
     """The watcher's `done`, recording every wait it is asked for. The first
     (the interval before the first tick) returns at once. A wait as long as the
     interval, after that, ends the watcher instead of sleeping it out, and a
@@ -35496,7 +35496,7 @@ def _stand_down(monkeypatch, tmp_path, holder_goes):
 
     from cswap_pin import proxy as pin_proxy
 
-    events, hups, done = [], [], _Ticks(30.0)
+    events, hups, done = [], [], _StandDownTicks(30.0)
     real_kill = os.kill
     monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *a, **k: "fp-same")
     monkeypatch.setattr(pin_proxy, "_spawn_daemon",
