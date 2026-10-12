@@ -15128,7 +15128,7 @@ class TestTunnelIsOpen:
     The integration case above proves the FALLBACK happens; this proves the
     DETECTOR that is supposed to trigger it, and it can do so without a
     scheduler in the loop — a socket whose peer has already closed is EOF now,
-    not in 0.35 s.
+    not after a wait.
     """
 
     def test_all(self, request, tmp_path_factory):
@@ -15179,6 +15179,51 @@ class TestTunnelIsOpen:
             assert got == b"XY", got
         finally:
             a.close(); b.close()
+
+
+    def case_an_idle_tunnel_is_reported_open_without_waiting(self):
+        """The healthy path costs nothing. Every chained blind tunnel (claude.ai,
+        the Remote Control websocket, a capped bulk tunnel) runs this probe once
+        before it carries a byte, and a wait inside it is paid by all of them
+        (T2157: a 0.35 s `select` timeout, 350.4 ms of a 351.7 ms open). Best
+        of five, so one descheduled run on a loaded box cannot fail it, while
+        the old wait made every run take >= 0.35 s."""
+        import cswap_pin.proxy as pp
+        a, b = socket.socketpair()
+        try:
+            runs = []
+            for _ in range(5):
+                t0 = time.monotonic()
+                assert pp.PinProxy._tunnel_is_open(a) is a
+                runs.append(time.monotonic() - t0)
+            best = min(runs)
+            assert best < 0.1, (
+                f"an idle tunnel took {best * 1000:.0f} ms to read as open — "
+                "the probe is waiting on the healthy path")
+        finally:
+            a.close(); b.close()
+
+    def case_an_idle_tunnel_past_fd_1024_is_reported_open(self):
+        """`select.select` raises ValueError for an fd >= FD_SETSIZE (1024), and
+        this probe reads ValueError as EOF, so a healthy tunnel dialled while
+        the pin held more than 1024 fds was refused as dead. The pin caps no
+        RLIMIT_NOFILE, so this is the state a hop stall's fd pile-up reaches."""
+        import fcntl
+        import cswap_pin.proxy as pp
+        a, b = socket.socketpair()
+        try:
+            high = socket.socket(
+                fileno=fcntl.fcntl(a.fileno(), fcntl.F_DUPFD, 1100))
+        except OSError as exc:
+            a.close(); b.close()
+            pytest.skip(f"RLIMIT_NOFILE forbids an fd past 1024: {exc}")
+        try:
+            assert high.fileno() >= 1024, high.fileno()
+            assert pp.PinProxy._tunnel_is_open(high) is high, (
+                "an idle tunnel on an fd past 1024 read as EOF — the readiness "
+                "check cannot take that fd")
+        finally:
+            high.close(); a.close(); b.close()
 
 
 class TestOptimisticConnectIsDetected:
