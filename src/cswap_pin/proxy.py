@@ -1744,6 +1744,14 @@ def heal(backup_root: Path, identity: dict | None = None,
         rewire_if_version_changed(certdir)
     except Exception:  # noqa: BLE001 — a launch must never fail on the pin
         pass
+    # A USER WHO OPTED IN TO THE SHELL PREFIX GETS THE CURRENT TEXT AFTER AN
+    # UPGRADE; one who did not never gets a file. Nothing but its existence is
+    # read on a machine without it, and a failed write never reaches the launch.
+    try:
+        if (certdir / "shell-prefix").exists():
+            write_shell_prefix(certdir)
+    except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+        pass
     # AN UPGRADE MUST NOT WAIT FOR A LAUNCH. `ensure_proxy` recycles a stale
     # daemon, but it only runs when a NEW session starts — so installing a fix
     # left every running daemon on the old code until someone happened to open
@@ -6517,6 +6525,77 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
                        f"{str(was)[:12]} -> "
                        f"{str(identity.get('accountUuid'))[:12]}")
     return True
+
+
+# -- the opt-in shell prefix ---------------------------------------------------
+#
+# The env block reaches every program a pinned Claude Code starts (Bash tool,
+# hooks, stdio MCP servers, the status line). A user who wants those off the pin
+# sets `CLAUDE_CODE_SHELL_PREFIX` THEMSELVES to this file. The pin never writes
+# that variable: it only writes the file, on request (`write_shell_prefix`), and
+# keeps an existing copy current across an upgrade (`heal`). Measured on Claude
+# Code 2.1.296; README "Keeping the programs Claude Code starts off the pin".
+SHELL_PREFIX_SH = """#!/bin/sh
+u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy'; eval "$u"
+# Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
+[ -z "${CLAUDE_PROJECT_DIR+x}" ] && export SHELL_PREFIX_CLAUDE_PID="${CLAUDE_PID-}"
+# the user's own earlier prefix gets the command exactly as Claude gave it; the variable is
+# dropped first, so a chain that comes back to this file ends here; a missing file or a relative name is skipped
+p=${CSWAP_PIN_PREV_SHELL_PREFIX-}; unset CSWAP_PIN_PREV_SHELL_PREFIX
+case $p in /*) [ -f "$p" ] && [ -x "$p" ] && exec "$p" "$1" ;; esac
+# Bash tool: the shell Claude chose (it sets SHELL); unset again after its startup files
+[ -z "${CLAUDE_PROJECT_DIR+x}" ] && exec "${SHELL:-/bin/sh}" -c "$u; $1"
+# hook or statusLine: Claude stamped its own pid on it; run it under /bin/sh, as without a prefix
+[ -n "${CLAUDE_PID+x}" ] && [ "$CLAUDE_PID" != "${SHELL_PREFIX_CLAUDE_PID-}" ] && exec /bin/sh -c "$u; $1"
+# stdio MCP server: one quoted command; become it, so Claude's signals reach the server
+eval "exec $1"
+"""
+
+
+def write_shell_prefix(certdir) -> Path:
+    """Write the prefix script into ``certdir`` and return its absolute path.
+
+    Compare-before-write: a file that already holds this text and can be run is
+    left alone, inode and mtime included. Otherwise it is replaced whole: the
+    mode is set on the TEMP file, because a rename keeps the mode of the file
+    it renames, and the bytes are on disk before the rename, because an empty
+    prefix runs every command as nothing at all and exits 0.
+
+    Raises OSError. The ``heal`` caller swallows it; the command reports it.
+    """
+    path = Path(certdir).absolute() / "shell-prefix"
+    try:
+        if path.read_text(encoding="utf-8") == SHELL_PREFIX_SH and os.access(path, os.X_OK):
+            return path
+    except (OSError, ValueError):  # absent, unreadable, or not text: write it
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.cswap-tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+        with os.fdopen(fd, "wb") as fh:
+            os.fchmod(fh.fileno(), 0o755)  # the umask trimmed the open's mode
+            fh.write(SHELL_PREFIX_SH.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return path
+
+
+def shell_prefix_main() -> int:
+    """`cswap pin --shell-prefix`: write the script, print its path and nothing
+    else on stdout; one line on stderr and exit 1 when it cannot."""
+    try:
+        path = write_shell_prefix(Path(require("paths").get_backup_root()) / "pin-proxy")
+    except Exception as exc:  # noqa: BLE001 — the message is the whole answer
+        print(f"cswap-pin: could not write the shell prefix: {exc}", file=sys.stderr)
+        return 1
+    print(path)
+    return 0
 
 
 # -- set, show and re-pin ------------------------------------------------------

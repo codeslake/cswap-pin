@@ -6,18 +6,24 @@ account swap.
 
 ## Quick start
 
-1. Install (the commit is tagged `pin-install-85764e7`):
+1. Install (the commit is tagged `pin-install-85764e7`). This command is the
+   one place the verified pair of versions is stated: the host commit and the
+   `cswap-pin` release it was checked with.
 
    ```bash
    uv tool install --force --python 3.12 \
      "claude-swap[pin] @ git+https://github.com/codeslake/claude-swap@85764e77dc63c02f35caffdf64ddcc5cc61ea0dd" \
-     --with cswap-pin==0.1.311
+     --with cswap-pin==0.1.338
    ```
 
-2. `cswap pin N`, N being an account from `cswap list`. If you reach the
-   internet through a proxy, pin with it exported:
+2. Log in with `claude`, then add that account to cswap with `cswap add`.
+   `cswap list` shows the number N it was given.
+3. `cswap pin N`, from a plain shell, never from inside a pinned Claude Code
+   session (that shell already carries the pin as its `HTTPS_PROXY`, and the
+   pin would record itself as its own upstream). If you reach the internet
+   through a proxy, pin with it exported:
    `HTTPS_PROXY=http://127.0.0.1:<port> cswap pin N`.
-3. Run `cswap pin --ensure >/dev/null 2>&1 &` on every `claude` launch: as this
+4. Run `cswap pin --ensure >/dev/null 2>&1 &` on every `claude` launch: as this
    one line in `~/.bashrc` or `~/.zshrc` for hand launches, and in your
    `CLAUDE_CODE_PROCESS_WRAPPER` script too if you use one.
 
@@ -115,8 +121,10 @@ afterwards is a daemon running without a holder; `kill` it.
 you and the pin added around it:
 
 1. Take out the `cswap pin --ensure` line (the rc `claude()` function, a
-   launcher or `CLAUDE_CODE_PROCESS_WRAPPER` script), and the `~/.zshenv` block
-   or `BASH_ENV` file from [Trust](#trust) if you added one.
+   launcher or `CLAUDE_CODE_PROCESS_WRAPPER` script), and the
+   `CLAUDE_CODE_SHELL_PREFIX` setting or rc line from [Keeping the programs
+   Claude Code starts off the pin](#keeping-the-programs-claude-code-starts-off-the-pin)
+   if you added one.
 2. Run `cswap pin --clear`. With `CLAUDE_CONFIG_DIR` set there are two
    configs, `~/.claude.json` and `$CLAUDE_CONFIG_DIR/.claude.json`, each with
    its own receipt; `--clear` clears both when `CLAUDE_CONFIG_DIR` is exported
@@ -167,13 +175,9 @@ does nothing useful.
 **The extra is not on PyPI.** `claude-swap` 0.26.0 publishes only the
 `menubar` extra, so `uv tool install 'claude-swap[pin]'` installs a host with
 no pin in it and exits 0 with a warning. Install the host from the fork that
-carries the extra, at a fixed commit, with this package beside it:
-
-```bash
-uv tool install --force --python 3.12 \
-  "claude-swap[pin] @ git+https://github.com/codeslake/claude-swap@85764e77dc63c02f35caffdf64ddcc5cc61ea0dd" \
-  --with cswap-pin==0.1.311
-```
+carries the extra, at a fixed commit, with this package beside it: the
+command in [Quick start](#quick-start) step 1, which is the one place the
+verified versions are stated.
 
 ```console
 $ cswap --version
@@ -186,9 +190,9 @@ No cloud account pinned
   so a branch name installs whatever it points at that day. The commit above
   is tagged `pin-install-85764e7`, so it stays fetchable after `integration`
   is force-pushed; the URL keeps the full SHA because a tag can move. When you
-  upgrade, change the commit and the `cswap-pin` version together; the pair
-  above is the one this README was checked against, and the next verified
-  pair is announced here.
+  upgrade, change the commit and the `cswap-pin` version together; the pair in
+  Quick start is the one this README was checked against, and the next
+  verified pair is announced there.
 - **`--python 3.12`**, because claude-swap needs 3.12 or newer and without the
   flag uv takes whichever interpreter it finds first. Under a narrowed `PATH`
   that was a 3.11, and the install failed. With the flag uv uses a 3.12 it
@@ -220,8 +224,8 @@ commit (measured: `Nothing to upgrade`).
 
 **Do not run a plain `uv tool install claude-swap` over it either**, the line
 a bootstrap script usually carries. Measured with uv 0.12.18 over the install
-line above: it exits 0, keeps the fork's code (`cswap 0.27.0b1`), rewrites the
-tool's record to PyPI's `claude-swap`, and uninstalls `cswap-pin` and
+line in Quick start: it exits 0, keeps the fork's code (`cswap 0.27.0b1`),
+rewrites the tool's record to PyPI's `claude-swap`, and uninstalls `cswap-pin` and
 `cryptography` from the tool. The pin can then no longer respawn its daemon,
 and the first `cswap pin --ensure` that finds the daemon dead removes the
 wiring. Re-install only with the `git+...@<sha>` line, and make a bootstrap
@@ -248,9 +252,9 @@ uv tool install --force --python 3.12 --editable '.[pin]'     # from the checkou
 
 ### Upgrading a machine that is already serving
 
-Nothing to do beyond the install line with the new commit and version; the
-running daemon notices its own code changed and replaces itself, on the same
-port, without dropping anything.
+Nothing to do beyond the Quick start install line with the new commit and
+version; the running daemon notices its own code changed and replaces itself,
+on the same port, without dropping anything.
 Measured across a real code change on a live daemon: **68,168 requests, 0
 refused, 0 reset, 0 unanswered**, same port, new pid.
 
@@ -281,7 +285,10 @@ claude ──► pin (127.0.0.1:<port>) ──► first hop ──► next hop �
 ```
 
 It learns the chain from the environment of the command that pins, `cswap pin
-N` (and `cswap run`). Export these there:
+N` (and `cswap run`). Run that command from a plain shell, never from inside a
+pinned Claude Code session: the shell there already carries the pin as its
+`HTTPS_PROXY`, and the pin would record itself as its own upstream. Export these
+in that plain shell:
 
 - `HTTPS_PROXY` (or `https_proxy`): the **first** hop, as a URL. `http://`,
   `https://` and `http://user:password@host:port` all work.
@@ -355,6 +362,24 @@ own environment, which it inherits from whatever started it: `cswap pin N`,
 is not in the system store, export `NODE_EXTRA_CA_CERTS` in all three places,
 the launch hooks in [Launching `claude`](#launching-claude) included.
 
+### Using cswap-pin and cache-fix together
+
+1. Run cache-fix in forward-proxy mode as a service:
+   `CACHE_FIX_FORWARD_PROXY=on cache-fix-proxy install-service`. It listens on
+   `127.0.0.1:9801` unless `CACHE_FIX_PROXY_PORT` says otherwise.
+2. From a plain shell, not from inside a pinned session (there the shell
+   already carries the pin as `HTTPS_PROXY` and the pin would record itself as
+   its own upstream), pin through it:
+   `HTTPS_PROXY=http://127.0.0.1:9801 NODE_EXTRA_CA_CERTS=<a file holding cache-fix's ca.pem and, behind a TLS-inspecting proxy, your corporate root> cswap pin <N>`.
+3. Add only the pin's `claude()` line to your shell rc (the one in [Launching
+   `claude`](#interactive-shells)). The pin writes its proxy and CA into the
+   `env` block of `~/.claude.json`, which overrides cache-fix's client recipe
+   for those keys, so do not also add cache-fix's client recipe or use
+   `--remote-control`.
+4. To keep the programs Claude Code starts (hooks, MCP servers, Bash commands)
+   off the pin, see [Keeping the programs Claude Code starts off the
+   pin](#keeping-the-programs-claude-code-starts-off-the-pin).
+
 ## Use
 
 **An account has to exist first.** The pin points at one of cswap's managed
@@ -370,8 +395,8 @@ No active Claude account found. Please log in first.
 ```
 
 Log in with `claude`, add that account with `cswap add` (`cswap list` shows
-the numbers), then, in a shell that exports your chain (see [Proxy
-chains](#proxy-chains)):
+the numbers), then, in a plain shell (never inside a pinned Claude Code
+session) that exports your chain (see [Proxy chains](#proxy-chains)):
 
 ```bash
 cswap pin 2          # RC / artifacts / ultrareview → account 2
@@ -400,8 +425,7 @@ pin is set.
 **The trigger is every `claude` launch**, in whatever every launch passes
 through: a shell function for hand launches, and the script
 `CLAUDE_CODE_PROCESS_WRAPPER` names, so the daemon and background sessions
-Claude Code spawns itself are covered too. That is what the maintainers' own
-hosts run.
+Claude Code spawns itself are covered too.
 
 **Run it in the background, never in front of the launch.** It returns in
 about 70 ms when nothing is pinned (measured; that is interpreter start-up) and
@@ -465,6 +489,157 @@ pin's CA and every pinned request fails TLS. Keep proxy and CA variables out of
 settings files. Export them where you pin instead; the pin chains through the
 proxy and merges the CA for you.
 
+## Keeping the programs Claude Code starts off the pin
+
+**What the pin wires, and who inherits it.** `cswap pin N` writes
+`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `NODE_EXTRA_CA_CERTS` and
+`CSWAP_PIN_PORT` into the `env` block of `~/.claude.json`. Claude Code puts that
+block into its own environment at start, and every program it starts inherits
+its environment: the Bash tool's shells, command hooks, stdio MCP servers, the
+status line, and everything those run (`aws`, `git`, `curl`). Their HTTPS then
+goes through the pin, which tunnels every host except `api.anthropic.com`
+unopened. If you want those programs off the pin (say one of them fails through
+it), and Claude Code itself still on it, this section is the way. It is opt-in:
+the pin never sets `CLAUDE_CODE_SHELL_PREFIX` for you.
+
+**What it is.** Claude Code runs the Bash tool, every command hook, every stdio
+MCP server and the status line through the executable that
+`CLAUDE_CODE_SHELL_PREFIX` names, handing it the whole command as one argument
+(measured on Claude Code 2.1.296). The pin ships such an executable that
+unsets the six proxy variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`,
+`http_proxy`, `ALL_PROXY`, `all_proxy`) and then runs the command. `NO_PROXY`
+and `no_proxy` are left alone. `NODE_EXTRA_CA_CERTS` and `CSWAP_PIN_PORT` stay,
+so a Node child still trusts the pin's CA (see [Trust](#trust)).
+
+**1. Write it.** If `cswap pin --help` lists `--shell-prefix`, run
+
+```bash
+cswap pin --shell-prefix
+```
+
+and otherwise run the same thing with the Python that `cswap` runs in (for a uv
+tool install, `$(uv --color never tool dir)/claude-swap/bin/python`):
+
+```bash
+"$(uv --color never tool dir)/claude-swap/bin/python" -m cswap_pin shell-prefix
+```
+
+Either prints one absolute path and nothing else, for example
+`/home/you/.local/share/claude-swap/pin-proxy/shell-prefix` (`<data>/pin-proxy/shell-prefix`,
+where `<data>` is cswap's data directory, see [Before you
+start](#before-you-start-and-if-it-breaks)). Running it again changes nothing
+while the file is current. The file is mode 755 and holds exactly this:
+
+```sh
+#!/bin/sh
+u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy'; eval "$u"
+# Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
+[ -z "${CLAUDE_PROJECT_DIR+x}" ] && export SHELL_PREFIX_CLAUDE_PID="${CLAUDE_PID-}"
+# the user's own earlier prefix gets the command exactly as Claude gave it; the variable is
+# dropped first, so a chain that comes back to this file ends here; a missing file or a relative name is skipped
+p=${CSWAP_PIN_PREV_SHELL_PREFIX-}; unset CSWAP_PIN_PREV_SHELL_PREFIX
+case $p in /*) [ -f "$p" ] && [ -x "$p" ] && exec "$p" "$1" ;; esac
+# Bash tool: the shell Claude chose (it sets SHELL); unset again after its startup files
+[ -z "${CLAUDE_PROJECT_DIR+x}" ] && exec "${SHELL:-/bin/sh}" -c "$u; $1"
+# hook or statusLine: Claude stamped its own pid on it; run it under /bin/sh, as without a prefix
+[ -n "${CLAUDE_PID+x}" ] && [ "$CLAUDE_PID" != "${SHELL_PREFIX_CLAUDE_PID-}" ] && exec /bin/sh -c "$u; $1"
+# stdio MCP server: one quoted command; become it, so Claude's signals reach the server
+eval "exec $1"
+```
+
+**2. Set it**, in one of two places.
+
+- In `settings.json` (`~/.claude/settings.json`), with the path the command
+  printed:
+
+  ```json
+  { "env": { "CLAUDE_CODE_SHELL_PREFIX": "/home/you/.local/share/claude-swap/pin-proxy/shell-prefix" } }
+  ```
+
+  Claude Code expands no `~`, `$HOME` or `${HOME}` in this value (measured on
+  2.1.296), so a `settings.json` needs the absolute path.
+- Or as a line in your shell rc, which expands the `~` for you. Use this when
+  one `settings.json` is shared by machines whose home directories differ:
+
+  ```bash
+  export CLAUDE_CODE_SHELL_PREFIX=~/.local/share/claude-swap/pin-proxy/shell-prefix
+  ```
+
+Set it in one place. It applies to Claude Code sessions started afterwards;
+sessions already open keep what they started with.
+
+**What it runs under.** The Bash tool: the shell Claude Code chose, with the six
+unset again after that shell's startup files, so a `.zshenv` that exports a
+proxy does not undo it. Hooks and the status line: `/bin/sh`, as without a
+prefix. A stdio MCP server: the server itself, started in place of the script,
+so Claude Code's signals reach it.
+
+**Check it.** Start a new session and ask Claude to run this with the Bash tool:
+
+```bash
+echo "shell=$0 https=${HTTPS_PROXY+SET}${https_proxy+SET} all=${ALL_PROXY+SET}${all_proxy+SET} http=${HTTP_PROXY+SET}${http_proxy+SET}"
+```
+
+It should print your shell and nothing after the `=` signs, for example
+`shell=/usr/bin/zsh https= all= http=`. A `SET` means the prefix is not applied.
+Then ask Claude to show that Claude itself is still on the pin:
+
+```bash
+lsof -a -p "$CLAUDE_PID" -iTCP -n -P
+```
+
+Its connections should land on the pin's port (`cswap pin --get_port`).
+
+**What it does not cover.** The prefix does not reach these:
+
+- exec-form hooks (a hook written as `command` plus an `args` list is run
+  without a shell, so without the prefix; it keeps the pin's proxy variables);
+- Claude Code's own `git` and `gh`, its helpers and LSP servers, which it
+  starts without a shell, and WebFetch. They stay on the pin, which passes
+  everything except `api.anthropic.com` through as an unopened tunnel;
+- Claude Code's Bash sandbox mode. Its sandbox has its own proxy variables,
+  and the unset would remove them and leave a sandboxed command no way out. This
+  is read from the code, not measured.
+
+A program the prefix reaches now has no proxy at all, not a different one. On a
+network where only a proxy reaches the internet, a hook, an MCP server or a Bash
+command that needs the network loses it. Give that program its proxy yourself:
+in an MCP server's own `env` block, in the hook's command, or in the Bash
+command.
+
+**You already have a prefix.** Claude Code runs one prefix. Move yours to
+`CSWAP_PIN_PREV_SHELL_PREFIX`, as an absolute path to an executable file with
+no arguments, in the same place you would set the other (`settings.json` `env`
+or an rc `export`), and set `CLAUDE_CODE_SHELL_PREFIX` to the pin's file. The
+pin's script unsets the proxies and then hands your prefix the command exactly
+as Claude Code gave it. A relative name, a missing file or one that is not
+executable is skipped and the command still runs. With a prefix chained, hooks
+run under that prefix's shell instead of `/bin/sh`, and a `.zshenv` that
+re-exports a proxy wins, as it does with your prefix alone.
+
+**With cache-fix too.** Set one prefix, not both.
+
+**Turning it off.** Remove the setting (and the rc line). New sessions only. The
+file stays until you delete `<data>/pin-proxy/shell-prefix`; `cswap pin --clear`
+does not touch it, since the pin never wrote the setting.
+
+**If it breaks.** Everything below means `CLAUDE_CODE_SHELL_PREFIX` names a file
+that is missing or not executable (a wrong path, a deleted `<data>/pin-proxy/`):
+
+| where | what you see |
+| :-- | :-- |
+| Bash tool | every command fails, `no such file or directory: <path>` with exit 127, or `permission denied: <path>` with exit 126 |
+| a hook | `hook error`, `not found` or `Permission denied` |
+| a stdio MCP server | status `failed`, `ENOENT` or `EACCES` in Claude Code's debug log |
+| the status line | blank |
+
+Run the write command again, which recreates the file at mode 755, or remove the
+setting. After an upgrade of the pin, `cswap pin --ensure` rewrites the file by
+itself when it exists and differs; it never creates one you did not ask for. If
+the Bash tool prints `shell=/bin/sh`, Claude Code itself was most likely started
+with `CLAUDE_PROJECT_DIR` already in its environment (from a hook or another
+tool): start it without.
+
 ## What the pin writes
 
 `<data>` is cswap's data directory (see [Before you
@@ -478,7 +653,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
 | `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
 | `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json` that records a pin: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
-| `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO | left in place |
+| `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO, and `shell-prefix` only if you ran the command that writes it | left in place |
 | `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
 | `~/.claude/jobs/<id>/state.json`, and a transcript's `bridge-session` record | the account in the bridge pointer of a session that is not running, restamped (see [Keeping a session's bridge when the account rotates](#keeping-a-sessions-bridge-when-the-account-rotates)) | not touched |
 
@@ -899,8 +1074,8 @@ tunnels, so the **socket** moves instead.
 - The daemon reads its own refusal once, at start, and `/health` says
   `"keychain_denied": true`. The key is absent for a daemon that is not
   refused, and off macOS.
-- Exactly these commands trigger it: `cswap pin --ensure` (what `wire.zsh`
-  runs on every Terminal launch) and `cswap pin --heal`, through `heal`'s
+- Exactly these commands trigger it: `cswap pin --ensure` (what the rc hook
+  runs on every launch) and `cswap pin --heal`, through `heal`'s
   serving arm (`--ensure` reaches `heal`, never `ensure_proxy`), and `cswap
   run`, a hand-typed `cswap pin <n>` and the TUI's repair, through
   `ensure_proxy`. Each finds such a daemon, and when the caller is **not**
@@ -1170,34 +1345,8 @@ untouched. The trust it hands the child is wider than that: the CA is a full CA
 settings file's `env` is applied after that block and wins over it; see [A
 settings `env` overrides the pin](#a-settings-env-overrides-the-pin).
 
-To take a session's Bash-tool shells off the pin, put this in `~/.zshenv`,
-which zsh reads for every shell, the Bash tool's non-interactive `zsh -c`
-included:
-
-```bash
-if [[ -n ${CLAUDECODE-} && ${HTTPS_PROXY-} == *[/@]127.0.0.1:${CSWAP_PIN_PORT-} ]]; then
-  [[ ${all_proxy-} == *[/@]127.0.0.1:$CSWAP_PIN_PORT ]] && unset all_proxy
-  unset HTTPS_PROXY https_proxy ALL_PROXY NODE_EXTRA_CA_CERTS
-fi
-```
-
-It fires only in a Claude Code child whose proxy is this pin's own loopback
-port, so a corporate `HTTPS_PROXY` in any other shell is left alone, and Claude
-Code itself stays pinned, since the `unset` runs in the child only. A lowercase
-`all_proxy` is the pin's only when a `cswap` launch pointed one you already had
-at it, hence its own test. A child Claude Code starts without zsh, such as a
-stdio MCP server, keeps all of it. The `unset` also removes what the pin was
-carrying for the child: the upstream proxy the pin chains through and, when
-`NODE_EXTRA_CA_CERTS` is a merged bundle, the CA merged into it. On a network
-that needs its own proxy or CA, export your own `HTTPS_PROXY` and
-`NODE_EXTRA_CA_CERTS` after the `unset`.
-
-The lines themselves are valid bash too; what differs is where they go. Claude
-Code runs a Bash-tool command as `<your shell> -c`, without `-l` once it has a
-shell snapshot (read in 2.1.287), and a `bash -c` reads no startup file except
-the one `$BASH_ENV` names. So with bash, save the lines to a file and export
-`BASH_ENV` pointing at it in the environment you start `claude` from. Measured
-for zsh only.
+To take those programs off the pin, see [Keeping the programs Claude Code starts
+off the pin](#keeping-the-programs-claude-code-starts-off-the-pin).
 
 **Accept Claude Code's trust dialog in your home directory by hand.** Trust
 accepted in your home directory does not persist (Claude Code keeps it per
