@@ -14011,8 +14011,11 @@ def _watch_own_code(
     # A thread that returned or died stops stamping.
     setattr(server, "_code_watch_beat", time.monotonic())
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
-    # thread at once instead of after a full interval.
-    while not done.wait(interval):
+    # thread at once instead of after a full interval. `next_wait` is the
+    # interval on every pass but the one that saw its holder go (below).
+    next_wait = interval
+    while not done.wait(next_wait):
+        next_wait = interval
         setattr(server, "_code_watch_beat", time.monotonic())
         # ONE EXIT, TAKEN ON EVERY PATH. 0.1.27 had three exits and one of them
         # took neither: `_spawn_daemon` RAISING (fork() EAGAIN under a post-
@@ -14180,6 +14183,11 @@ def _watch_own_code(
                 # to a successor that lands under a fresh holder. That is the
                 # one path here that keeps the port bound throughout, and it is
                 # already the tested one.
+                #
+                # THAT TICK IS 30 s WITH NOTHING ABOVE THIS DAEMON, so the pass
+                # looks for the reparent for up to 5 s and, once it sees it,
+                # takes the next pass at once. Still not on THIS pass, and
+                # still once: a reparent not seen costs the whole interval.
                 if stand_down_asked or not _retire_stale_holder(own):
                     continue
                 stand_down_asked = True
@@ -14187,6 +14195,12 @@ def _watch_own_code(
                     "the holder above this daemon is running code we no longer "
                     "ship — asked it to stand down so a current one replaces it"
                 )
+                for _ in range(50):
+                    if done.wait(0.1):
+                        break
+                    if _orphaned_from_its_holder():
+                        next_wait = 0
+                        break
                 continue
             # THE REASON THE HELD ASK LINES BELOW NAME, so a starved or blind
             # replacement is not recorded as "code on disk changed".

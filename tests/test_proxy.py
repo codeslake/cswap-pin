@@ -35466,3 +35466,76 @@ def test_daemon_main_gives_the_code_watch_thread_the_knobs_tick_and_says_so():
              if isinstance(t, ast.Subscript) and getattr(t.value, "id", None) == kwargs.id]
     assert fills, "a non-default tick never reaches the thread's kwargs"
     assert "_log_lifecycle" in names(branch), "a non-default tick leaves no line in daemon.log"
+
+
+# -- T2310: the stand-down ask is followed by a look, not by a whole tick -------
+
+
+class _Ticks(threading.Event):
+    """The watcher's `done`, recording every wait it is asked for. The first
+    (the interval before the first tick) returns at once. A wait as long as the
+    interval, after that, ends the watcher instead of sleeping it out, and a
+    shorter one returns at once: the cases measure what was ASKED for, not the
+    scheduler."""
+
+    def __init__(self, interval):
+        super().__init__()
+        self.interval, self.waits = interval, []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if len(self.waits) > 1 and timeout >= self.interval:
+            self.set()
+        return len(self.waits) > 1 and self.is_set()
+
+
+def _stand_down(monkeypatch, tmp_path, holder_goes):
+    """A current daemon under a holder that runs old code; the HUP is stubbed
+    and, when `holder_goes`, reparents the daemon the way the real one does."""
+    import signal
+
+    from cswap_pin import proxy as pin_proxy
+
+    events, hups, done = [], [], _Ticks(30.0)
+    real_kill = os.kill
+    monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *a, **k: "fp-same")
+    monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                        lambda n, e, c, **k: events.append(("spawn", n)) or 1)
+    monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+    monkeypatch.setenv(pin_proxy._HOLDER_SHA_ENV, "a-release-we-no-longer-ship")
+
+    def hup(pid, sig):
+        if sig != signal.SIGHUP:
+            return real_kill(pid, sig)
+        hups.append(pid)
+        if holder_goes:
+            monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getpid() + 1_000_000))
+
+    monkeypatch.setattr(os, "kill", hup)
+    certdir = tmp_path / "pin-proxy"
+    certdir.mkdir()
+    pin_proxy._watch_own_code(
+        _recording_server(events)(), "1", "a@example.com", certdir, done,
+        teardown=lambda reason: events.append(("teardown", reason)),
+        interval=30.0, _own_fingerprint="fp-same")
+    return done.waits, events, hups
+
+
+def test_a_daemon_that_sees_its_holder_go_hands_over_at_once_not_a_tick_later(monkeypatch, tmp_path):
+    """56cffc3 waits a tick after the ask because the reparent is not instant.
+    That tick is 30 s of a daemon with nothing above it. The ask is now
+    followed by a look at the reparent, and the handover pass runs as soon as
+    it is seen: well inside the ~5 s the look lasts, where waiting a tick
+    asks for 30 s."""
+    waits, events, hups = _stand_down(monkeypatch, tmp_path, holder_goes=True)
+    assert len(hups) == 1
+    assert waits[0] == 30.0, "the first leg (the successor's own ask) is the whole interval"
+    assert ("spawn", "1") in events, f"no handover pass after the holder went: waits={waits}"
+    assert sum(waits[1:]) < 5.0 and 30.0 not in waits[1:], waits
+
+
+def test_a_holder_that_does_not_go_costs_the_whole_tick_as_before(monkeypatch, tmp_path):
+    waits, events, hups = _stand_down(monkeypatch, tmp_path, holder_goes=False)
+    assert len(hups) == 1, "asked once"
+    assert ("spawn", "1") not in events, "handed over under a holder that is still there"
+    assert waits[-1] == 30.0 and 0 not in waits, waits
