@@ -303,7 +303,7 @@ What it learned goes into `upstream.json`, in the directory `cswap pin
 | `proxy` | the first hop | `HTTPS_PROXY` / `https_proxy` when you pinned |
 | `ca` | that hop's CA | `NODE_EXTRA_CA_CERTS` when you pinned |
 | `next` | the hop behind the first one | the first hop's own `GET /health`, asked when you pin and again later by the running daemon. Only a loopback `http://` hop is asked, and only a JSON answer naming its `https_proxy` counts |
-| `cache` | the first hop's `host:port`, only when it answered `/health` with JSON but named no upstream | the same `GET /health`. Absent otherwise. Read only by the [opt-in shell prefix](#keeping-the-programs-claude-code-starts-off-the-pin) |
+| `cache` | the first hop's `host:port`, when it answered `/health` with JSON | the same `GET /health`. Absent otherwise. Read only by the [opt-in shell prefix](#keeping-the-programs-claude-code-starts-off-the-pin), and only when `next` is empty |
 
 The daemon re-reads this file on every connection, so an edit takes effect
 without a restart. The `ca` is merged with the pin's own CA into
@@ -560,10 +560,13 @@ unset CSWAP_PIN_CHILD_PROXY; eval "exec $1"
 
 **Which proxy.** The one you had before the pin wired itself in, so a program
 that needs a proxy to reach the network keeps its way out. The pin records it
-when a session starts and next to the script, in
-`<data>/pin-proxy/shell-prefix.proxy`: one line, a URL as you gave it (a
-credential in it stays; the file is as readable as `upstream.json` beside it),
-or empty. The script reads that file for every command and parses nothing.
+next to the script, in `<data>/pin-proxy/shell-prefix.proxy`, when a session
+starts and when it refreshes the script or you run the command above: one line,
+a URL as you gave it (a credential in it stays; the file is as readable as
+`upstream.json` beside it), or empty. The script reads that file, from its own directory, for every command
+and parses nothing; so `CLAUDE_CODE_SHELL_PREFIX` has to be the absolute path
+(see step 2): a relative name looks for the file in the wrong directory, and the
+six are then unset. The one value goes into all six, also those you had not set.
 There are four cases:
 
 - Only the pin: the proxy your shell exported when the session started.
@@ -620,7 +623,7 @@ so Claude Code's signals reach it.
 **Check it.** Start a new session and ask Claude to run this with the Bash tool:
 
 ```bash
-echo "shell=$0"; env | grep -i '_proxy=' | sed 's|//[^@/]*@|//|'
+echo "shell=$0"; env | grep -iE '^(https?|all)_proxy=' | sed 's|//[^@/]*@|//|'
 ```
 
 It should print your shell and then the six variables, each with the proxy you

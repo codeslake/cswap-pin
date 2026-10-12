@@ -452,13 +452,49 @@ def test_pin_and_a_cache_proxy_that_names_no_upstream_the_children_get_none(cert
     assert _child_proxy(certdir) == "", "the cache proxy's own address reached the children"
 
 
-def test_a_hop_behind_the_cache_proxy_that_names_the_pin_itself_is_not_handed_over(certdir):
+@pytest.mark.parametrize("record", ["proxy.json", "port.hint"])
+def test_a_hop_behind_the_cache_proxy_that_names_the_pin_itself_is_not_handed_over(certdir, record):
+    """A first daemon has `proxy.json` and no `port.hint`; the hint is only left by a teardown."""
     pin_proxy = _proxy()
-    pin_proxy._write_port_hint(certdir, 40123)
+    if record == "proxy.json":
+        pin_proxy.write_daemon_state(certdir, 40123, os.getpid(), "FP")
+    else:
+        pin_proxy._write_port_hint(certdir, 40123)
     with _Health({"https_proxy": "http://127.0.0.1:40123"}) as cache:  # started from a pinned shell
         _launch(certdir, cache.url)
     assert json.loads((certdir / "upstream.json").read_text())["next"] == "http://127.0.0.1:40123", "the control"
     assert _child_proxy(certdir) == ""
+
+
+def test_a_cache_proxy_that_names_the_pin_to_the_daemon_is_recorded_as_one_and_the_children_get_none(certdir):
+    """The daemon's timer refuses to record the pin as a next hop, but it still learned
+    that the hop is a cache proxy: the children must not get the cache proxy's own address."""
+    import functools
+
+    pin_proxy = _proxy()
+    with _Health({"https_proxy": "http://127.0.0.1:40123"}) as cache:
+        pin_proxy.write_upstream_hint(certdir, cache.url)
+        assert _child_proxy(certdir) == cache.url + "\n", "the control: nothing has asked the hop yet"
+        daemon = pin_proxy.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
+                                    upstream=("127.0.0.1", 1), rediscover_chain=True)
+        daemon.port = 40123
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(pin_proxy, "_probe_next_hop", functools.partial(pin_proxy._probe_next_hop, timeout=10))
+            daemon.learn_next_hop()
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["next"], record["cache"]) == ("", cache.url.removeprefix("http://")), record
+    assert _child_proxy(certdir) == ""
+
+
+def test_a_stale_next_is_not_handed_over_once_the_first_hop_is_not_a_local_proxy(certdir):
+    """`write_upstream_hint` keeps an earlier `next` when the first hop changes. Only a loopback
+    first hop is ever asked, so only there can `next` be what stands behind it."""
+    with _Health({"https_proxy": BEFORE}) as cache:
+        _launch(certdir, cache.url)
+    _proxy().write_upstream_hint(certdir, OTHER)  # a re-pin from a shell exporting a corporate proxy
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["proxy"], record["next"]) == (OTHER, BEFORE), "the control"
+    assert _child_proxy(certdir) == OTHER + "\n"
 
 
 def test_no_proxy_at_all_the_children_get_none(certdir):
@@ -572,6 +608,32 @@ def test_a_launch_writes_the_file(tmp_path, monkeypatch):
     assert _child_proxy(_ensure_proxy(tmp_path, monkeypatch)) == BEFORE + "\n"
 
 
+@pytest.mark.parametrize("script", ["stale", "current"])
+def test_ensure_leaves_the_file_on_a_host_whose_record_is_already_stable(tmp_path, monkeypatch, script):
+    """An upgraded host: `upstream.json` is settled, so no launch or timer will write the file."""
+    pin_proxy = _proxy()
+    root = _pinned_root(tmp_path, monkeypatch)
+    certdir = root / "pin-proxy"
+    (certdir / "upstream.json").write_text(json.dumps({"proxy": BEFORE, "ca": "", "next": ""}))
+    if script == "current":
+        pin_proxy.write_shell_prefix(certdir)
+    else:
+        (certdir / "shell-prefix").write_text("#!/bin/sh\necho stale\n")
+    assert not (certdir / SIDECAR).exists(), "the control"
+    pin_proxy.heal(root)
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def test_the_command_leaves_the_file_beside_the_script_on_a_host_whose_record_is_already_stable(capsys):
+    pin_proxy = _proxy()
+    assert pin_proxy.shell_prefix_main() == 0
+    certdir = Path(capsys.readouterr().out.rstrip("\n")).parent
+    (certdir / SIDECAR).unlink(missing_ok=True)
+    (certdir / "upstream.json").write_text(json.dumps({"proxy": BEFORE, "ca": "", "next": ""}))
+    assert pin_proxy.shell_prefix_main() == 0  # the script is current: only the file is owed
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
 def _launch_from(tmp_path, monkeypatch, shell_proxy, pin_port):
     """A `cswap pin` run from a shell exporting `shell_proxy`, over a record whose first hop is
     down and whose second is BEFORE. Returns the pin's directory."""
@@ -604,6 +666,47 @@ def test_a_pin_run_from_a_shell_with_another_proxy_still_records_it(tmp_path, mo
     certdir, _ = _launch_from(tmp_path, monkeypatch, OTHER, "51000")
     record = json.loads((certdir / "upstream.json").read_text())
     assert (record["proxy"], record["next"]) == (OTHER, BEFORE), record
+
+
+def test_a_degraded_holder_still_relays_through_the_hop_it_inherited_when_that_is_the_recorded_next(
+        certdir, monkeypatch):
+    """The holder's blind relay is the only thing holding the machine up. An ssh shell exports the
+    machine egress, which the record also holds as `next`; the recorded first hop is down."""
+    import socket
+    import threading
+
+    pin_proxy = _proxy()
+    hop = socket.create_server(("127.0.0.1", 0))
+    hop.settimeout(10)
+    asked = []
+
+    def serve():
+        conn, _ = hop.accept()
+        asked.append(conn.recv(4096))
+        conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    egress = f"http://127.0.0.1:{hop.getsockname()[1]}"
+    with _Health({"status": "ok"}) as down:
+        gone = down.url
+    pin_proxy.write_upstream_hint(certdir, gone, next_hop=egress)
+    for k in (*SIX, "CSWAP_PIN_PORT"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", egress)
+    holder = pin_proxy.PortHolder.__new__(pin_proxy.PortHolder)
+    holder._certdir = certdir
+    client, conn = socket.socketpair()
+    client.settimeout(10)
+    relay = threading.Thread(target=holder._relay_one, args=(conn,), daemon=True)
+    relay.start()
+    client.sendall(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+    reply = client.recv(64)
+    client.close()
+    relay.join(10)
+    hop.close()
+    assert asked and asked[0].startswith(b"CONNECT example.test:443"), "the relay never reached the inherited hop"
+    assert reply.startswith(b"HTTP/1.1 200"), reply
 
 
 def _put(prefix, value):
