@@ -15472,6 +15472,10 @@ UPSTREAM_PORT = 443
 # ~500 parallel bulk tunnels to other hosts took every fd the hop had and
 # /v1/messages got 502; 256 at 2 fds each leaves a 1024-nofile hop room for the API.
 _BLIND_TUNNEL_CAP = 256
+# How long `_tunnel_is_open` looks for an EOF already queued after a hop's 200:
+# one GIL switch interval, so the thread that wrote the 200 and closes next has
+# been scheduled. 0 flaked on the immediate-close tests under CPU load (T2157).
+_TUNNEL_EOF_WINDOW_MS = 5
 _UNCAPPED_DOMAINS = ("anthropic.com", "claude.ai", "claude.com",
                      "claudeusercontent.com")
 
@@ -21836,8 +21840,11 @@ class PinProxy:
         the host: a filtering proxy answers optimistically and dials afterwards, closing
         the socket when that dial fails. Look for a closed read end — no client
         byte has been sent yet, so a readable socket here can only mean EOF.
-        Never blocks: a healthy idle tunnel has nothing to read and reports not
-        ready, which is exactly the "open" answer.
+        Waits at most `_TUNNEL_EOF_WINDOW_MS`, not the 350 ms it used to: a
+        healthy idle tunnel has nothing to read and reports not ready, which is
+        exactly the "open" answer. `select.poll`, not `select.select`: that raises
+        ValueError for an fd >= 1024, which the except below reads as EOF, so
+        a healthy tunnel dialled under many open fds was refused as dead.
 
         Reads rather than peeks, because ``MSG_PEEK`` is not available on
         every socket this receives: ``ssl.SSLSocket.recv`` rejects ANY non-zero
@@ -21850,8 +21857,13 @@ class PinProxy:
         than a bool for exactly that reason.
         """
         try:
-            ready, _, _ = select.select([up], [], [], 0.35)
-            if not ready:
+            # shortcut: a hop that closes a moment after its 200, before the
+            # client sends, is no longer caught here; upgrade to detecting EOF
+            # before the first upstream byte and redialling if a real hop is
+            # ever measured doing it (T2157: none does)
+            poller = select.poll()
+            poller.register(up, select.POLLIN)
+            if not poller.poll(_TUNNEL_EOF_WINDOW_MS):
                 return up  # nothing to read == still open, the normal case
             first = up.recv(1)
             return _Prefixed(up, first) if first else None
