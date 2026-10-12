@@ -13922,6 +13922,17 @@ def _code_is_current(own: str) -> bool:
     return False
 
 
+def _code_watch_interval_s(env=None) -> float:
+    # Only the Rule 0 sandbox's throwaway pin sets CSWAP_PIN_CODE_WATCH_S, to
+    # shorten its rehearsal; never the fleet. Read at call time; a bad value is the default.
+    env = os.environ if env is None else env
+    try:
+        v = float(env.get("CSWAP_PIN_CODE_WATCH_S", ""))
+    except ValueError:
+        return _CODE_WATCH_INTERVAL_S
+    return v if 1.0 <= v <= _CODE_WATCH_INTERVAL_S else _CODE_WATCH_INTERVAL_S
+
+
 @_beat_ends_with_the_watchdog
 def _watch_own_code(
     server,
@@ -15545,9 +15556,19 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # ONCE, off the serving path: two reads a second apart when denied.
     _start_noting_keychain_denial(proxy)
 
+    # PASSED ONLY WHEN SET, so a wrapper that fixed its own tick (the tests'
+    # shims partial it) keeps it: a call-time keyword would override theirs.
+    watch_kwargs: dict = {}
+    interval = _code_watch_interval_s()
+    if interval != _CODE_WATCH_INTERVAL_S:
+        watch_kwargs["interval"] = interval
+        _log_lifecycle(
+            f"code watch ticks every {interval:g}s (CSWAP_PIN_CODE_WATCH_S), "
+            f"not the default {_CODE_WATCH_INTERVAL_S:g}s")
     threading.Thread(
         target=_watch_own_code,
         args=(proxy, account_num, email, certdir, done, _teardown),
+        kwargs=watch_kwargs,
         daemon=True,
     ).start()
 

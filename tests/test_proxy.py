@@ -35420,3 +35420,49 @@ else:
             h._on_replace_request(signal.SIGUSR1, None)
         assert h.spawned == 1 and h._proc is kids[1] and not h._stop
         assert any("could not start the successor watch" in ln for ln in lines)
+
+
+# -- T2310: the code watch's tick, for the Rule 0 sandbox's throwaway pin -------
+
+
+@pytest.mark.parametrize("raw, want", [
+    (None, 30.0), ("", 30.0), ("abc", 30.0), ("nan", 30.0), ("inf", 30.0),
+    ("0", 30.0), ("0.5", 30.0), ("-1", 30.0), ("45", 30.0),
+    ("2", 2.0), ("1", 1.0), ("30", 30.0),
+])
+def test_the_code_watch_tick_knob_takes_1_to_30_seconds_and_nothing_else(raw, want):
+    from cswap_pin import proxy as pin_proxy
+
+    env = {} if raw is None else {"CSWAP_PIN_CODE_WATCH_S": raw}
+    assert pin_proxy._code_watch_interval_s(env) == want
+
+
+def test_daemon_main_gives_the_code_watch_thread_the_knobs_tick_and_says_so():
+    """The knob only counts if the thread START carries it, and the sandbox's
+    proof that it took effect is a lifecycle line. A non-default tick is passed
+    only when set: the tests' shims wrap `_watch_own_code` in a partial with a
+    tick of their own, and a call-time keyword would override it."""
+    import ast
+    import inspect
+    import textwrap
+
+    from cswap_pin import proxy as pin_proxy
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+    names = lambda n: [getattr(c.func, "id", None) for c in ast.walk(n)  # noqa: E731
+                       if isinstance(c, ast.Call)]
+    assert "_code_watch_interval_s" in names(tree), "daemon_main never reads the knob"
+    thread = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and any(
+            kw.arg == "target" and getattr(kw.value, "id", None) == "_watch_own_code"
+            for kw in n.keywords))
+    kwargs = next(kw.value for kw in thread.keywords if kw.arg == "kwargs")
+    assert isinstance(kwargs, ast.Name), "the thread's kwargs are not a name the knob fills"
+    branch = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.If) and "_CODE_WATCH_INTERVAL_S" in ast.dump(n.test))
+    fills = [t for s in branch.body if isinstance(s, ast.Assign) for t in s.targets
+             if isinstance(t, ast.Subscript) and getattr(t.value, "id", None) == kwargs.id]
+    assert fills, "a non-default tick never reaches the thread's kwargs"
+    assert "_log_lifecycle" in names(branch), "a non-default tick leaves no line in daemon.log"
