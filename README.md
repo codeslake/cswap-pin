@@ -511,17 +511,17 @@ unsets the six proxy variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`,
 and `no_proxy` are left alone. `NODE_EXTRA_CA_CERTS` and `CSWAP_PIN_PORT` stay,
 so a Node child still trusts the pin's CA (see [Trust](#trust)).
 
-**1. Write it.** If `cswap pin --help` lists `--shell-prefix`, run
+**1. Write it.** If `cswap pin --help` lists `--print-shell-prefix-path`, run
 
 ```bash
-cswap pin --shell-prefix
+cswap pin --print-shell-prefix-path
 ```
 
 and otherwise run the same thing with the Python that `cswap` runs in (for a uv
 tool install, `$(uv --color never tool dir)/claude-swap/bin/python`):
 
 ```bash
-"$(uv --color never tool dir)/claude-swap/bin/python" -m cswap_pin shell-prefix
+"$(uv --color never tool dir)/claude-swap/bin/python" -m cswap_pin print-shell-prefix-path
 ```
 
 Either prints one absolute path and nothing else: `<data>/pin-proxy/shell-prefix`,

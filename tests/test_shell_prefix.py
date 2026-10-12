@@ -144,21 +144,39 @@ def test_the_command_prints_the_bare_path_or_one_line_on_stderr(state, capsys, m
     assert out == "" and err.count("\n") == 1 and "denied" in err
 
 
-def test_python_dash_m_cswap_pin_shell_prefix_runs_without_a_cswap_change(tmp_path):
+def _run_dash_m(tmp_path, *args):
     root = Path(__file__).resolve().parent.parent
     env = {"HOME": str(tmp_path), "XDG_DATA_HOME": str(tmp_path / "data"),
            "PATH": os.environ["PATH"], "PYTHONPATH": str(root / "src")}
-    r = subprocess.run([sys.executable, "-m", "cswap_pin", "shell-prefix"], env=env,
-                       text=True, capture_output=True, timeout=60)
+    return subprocess.run([sys.executable, "-m", "cswap_pin", *args], env=env,
+                          text=True, capture_output=True, timeout=60)
+
+
+def test_python_dash_m_cswap_pin_print_shell_prefix_path_runs_without_a_cswap_change(tmp_path):
+    r = _run_dash_m(tmp_path, "print-shell-prefix-path")
     assert r.returncode == 0, r.stderr
     path = Path(r.stdout.rstrip("\n"))
     assert path.is_absolute() and tmp_path in path.parents
     assert path.name == "shell-prefix" and path.parent.name == "pin-proxy"
     assert stat.S_IMODE(path.stat().st_mode) == 0o755
     assert path.read_text(encoding="utf-8") == _proxy().SHELL_PREFIX_SH
-    bad = subprocess.run([sys.executable, "-m", "cswap_pin", "nonsense"], env=env,
-                         text=True, capture_output=True, timeout=60)
+    bad = _run_dash_m(tmp_path, "nonsense")
     assert bad.returncode == 2 and bad.stdout == "" and bad.stderr.count("\n") == 1
+
+
+def test_the_old_name_shell_prefix_is_a_hidden_alias_printing_the_same_path(tmp_path):
+    new = _run_dash_m(tmp_path, "print-shell-prefix-path")
+    old = _run_dash_m(tmp_path, "shell-prefix")
+    assert new.returncode == old.returncode == 0, old.stderr
+    assert old.stdout == new.stdout and Path(old.stdout.rstrip("\n")).is_absolute()
+    assert old.stderr == ""
+
+
+def test_the_usage_line_names_only_print_shell_prefix_path(tmp_path):
+    r = _run_dash_m(tmp_path)
+    assert r.returncode == 2 and r.stdout == ""
+    tokens = r.stderr.split()  # whole tokens: the new name contains the old one as a substring
+    assert "print-shell-prefix-path" in tokens and "shell-prefix" not in tokens
 
 
 # -- the `--ensure` path: refresh only a file that is already there -------------
