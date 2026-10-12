@@ -7642,6 +7642,36 @@ class TestChainRediscovery:
             outer_srv.close()
             inner_srv.close()
 
+    def case_ensure_proxy_re_records_a_chain_recorded_outer_first_over_a_learned_next(
+        self, tmp_path, monkeypatch
+    ):
+        """The same record, with the inner hop already in `next` (the shape a
+        launch from the inner shell leaves it in, one launch later). That
+        shell's export IS the recorded `next`, which the guard against a
+        child's inherited proxy must not mistake for a child's: the recorded
+        hop serves, so the shell's value cannot displace it, and the swap
+        must still run. Left outer-first, every pinned request skips the
+        cache proxy, and the programs Claude Code starts are handed its
+        address."""
+        import cswap_pin.proxy as pp
+
+        outer_srv, outer, _ = _http_hop(b"400 Bad Request")
+        body = json.dumps({"status": "ok", "https_proxy": outer}).encode()
+        inner_srv, inner, _ = _http_hop(b"200 OK", body)
+        try:
+            launch, certdir = _launch_from(inner, tmp_path, monkeypatch)
+            pp.write_upstream_hint(certdir, outer, next_hop=inner)
+
+            launch()
+            assert [h.address for h in pp._chain_hops(certdir)] == [
+                pp.parse_upstream_proxy(inner).address,
+                pp.parse_upstream_proxy(outer).address,
+            ]
+            assert (certdir / "shell-prefix.proxy").read_text() == outer + "\n"
+        finally:
+            outer_srv.close()
+            inner_srv.close()
+
     def case_ensure_proxy_never_asks_the_shells_hop_while_the_recorded_one_answers(
         self, tmp_path, monkeypatch
     ):

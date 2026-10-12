@@ -303,7 +303,7 @@ What it learned goes into `upstream.json`, in the directory `cswap pin
 | `proxy` | the first hop | `HTTPS_PROXY` / `https_proxy` when you pinned |
 | `ca` | that hop's CA | `NODE_EXTRA_CA_CERTS` when you pinned |
 | `next` | the hop behind the first one | the first hop's own `GET /health`, asked when you pin and again later by the running daemon. Only a loopback `http://` hop is asked, and only a JSON answer naming its `https_proxy` counts |
-| `cache` | the first hop's `host:port`, when it answered `/health` with JSON | the same `GET /health`. Absent otherwise. Read only by the [opt-in shell prefix](#keeping-the-programs-claude-code-starts-off-the-pin), and only when `next` is empty |
+| `cache` | the first hop's `host:port`, when it answered `/health` with JSON | the same `GET /health`. Absent otherwise. Read only by the [opt-in shell prefix](#keeping-the-programs-claude-code-starts-off-the-pin), which then hands over `next` (or nothing), never the first hop |
 
 The daemon re-reads this file on every connection, so an edit takes effect
 without a restart. The `ca` is merged with the pin's own CA into
@@ -567,23 +567,33 @@ a URL as you gave it (a credential in it stays; the file is as readable as
 and parses nothing; so `CLAUDE_CODE_SHELL_PREFIX` has to be the absolute path
 (see step 2): a relative name looks for the file in the wrong directory, and the
 six are then unset. The one value goes into all six, also those you had not set.
-There are four cases:
+It is chosen by the first hop in `upstream.json` (`proxy`):
 
-- Only the pin: the proxy your shell exported when the session started.
-- The pin behind a local cache proxy that chains to a proxy: that proxy, never
-  the cache proxy's own address or the pin's.
-- The pin behind a local cache proxy that chains to nothing: none. The six are
-  unset.
-- No proxy at all, or none recorded yet: none. The six are unset.
+- No proxy recorded: none. The six are unset.
+- A first hop that is not on this machine (only a local hop is asked what it
+  chains to, so a `next` behind any other is one an earlier hop left): that
+  proxy, as you exported it.
+- A local first hop that answered `/health` (a cache proxy, `cache` is set): the
+  proxy it chains to, never its own address; none when it chains to nothing.
+- A local first hop that answered `/health` with an error, or has no `next`
+  recorded yet: that proxy.
+- A local first hop with a `next` recorded and nothing known about it yet: none,
+  since it may be a cache proxy.
 
-The pin learns what a cache proxy chains to by asking its `/health`, at a
-session start or on the daemon's half-minute timer. Until it has asked a cache
-proxy once, it cannot tell it from a plain proxy and passes its address.
+Whatever the rule gives is dropped when it is the pin itself, by any port the
+pin has (`--set_port`, `proxy.json`, `port.hint`, the global config).
+
+The pin learns what a local hop is by asking its `/health`, at a session start
+or on the daemon's half-minute timer, which rewrites the file as it learns. Until
+then a cache proxy that chains to something passes none, and one that chains to
+nothing passes its own address.
 
 A `cswap pin` you run from such a program (a Bash command) has the hop behind
-the recorded one in its environment. The pin never takes it for the hop in
-front, whether or not that one is serving at that moment: the record keeps its
-first hop.
+the recorded one in its environment. While the recorded local hop is down, the
+pin does not take it for the hop in front: the record keeps its first hop.
+While that hop serves, it is preferred anyway, so a record written the wrong
+way round (the outer proxy first) is still put right from the shell that
+exports the inner one.
 
 **2. Set it**, in one of two places.
 
