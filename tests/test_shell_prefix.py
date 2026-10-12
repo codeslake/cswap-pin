@@ -423,16 +423,25 @@ def _child_proxy(certdir):
     return (certdir / SIDECAR).read_text()
 
 
-def _tick(certdir, port=None):
-    """One run of the daemon's timer job, asking a local hop with the time a server thread needs."""
+def _tick(certdir, port=None, after_probe=lambda: None):
+    """One run of the daemon's timer job, asking a local hop with the time a server thread needs.
+
+    `after_probe` runs once the hop has answered, before the tick writes: a launch landing in that window."""
     import functools
 
     pin_proxy = _proxy()
     daemon = pin_proxy.PinProxy(certdir=certdir, pin_token_provider=lambda: None,
                                 upstream=("127.0.0.1", 1), rediscover_chain=True)
     daemon.port = port
+    ask = functools.partial(pin_proxy._probe_next_hop, timeout=10)
+
+    def probe(value):
+        answer = ask(value)
+        after_probe()
+        return answer
+
     with pytest.MonkeyPatch.context() as m:
-        m.setattr(pin_proxy, "_probe_next_hop", functools.partial(pin_proxy._probe_next_hop, timeout=10))
+        m.setattr(pin_proxy, "_probe_next_hop", probe)
         daemon.learn_next_hop()
 
 
@@ -642,6 +651,41 @@ def test_the_daemon_asking_a_plain_local_proxy_that_has_a_stale_next_gives_the_c
         assert _child_proxy(certdir) == "", "the control: a hop nothing is known about, with a `next` behind it"
         _tick(certdir)
         assert _child_proxy(certdir) == hop.url + "\n"
+
+
+def test_a_heal_a_daemon_tick_and_another_heal_leave_the_file_as_the_daemon_wrote_it(tmp_path, monkeypatch):
+    """`heal` runs before every `claude`, in a process that has asked no hop: a local hop with a `next`
+    behind it is unknown to it. The daemon asked and wrote the hop itself (it answers /health with a 4xx),
+    so each heal turned the file to empty until the next tick turned it back."""
+    pin_proxy = _proxy()
+    for memo in ("_ASKED_NOHEALTH", "_ANSWERED_HEALTH"):
+        monkeypatch.setattr(pin_proxy, memo, set())
+    root = _pinned_root(tmp_path, monkeypatch)
+    certdir = root / "pin-proxy"
+    pin_proxy.write_shell_prefix(certdir)  # opted in: `heal` keeps the file beside it
+    with _Health(None) as hop:
+        (certdir / "upstream.json").write_text(json.dumps({"proxy": hop.url, "ca": "", "next": BEFORE}))
+        pin_proxy.heal(root)
+        assert _child_proxy(certdir) == "", "the control: a fresh process knows nothing of the hop"
+        _tick(certdir)
+        assert _child_proxy(certdir) == hop.url + "\n", "the control: the daemon asked it"
+        pin_proxy._ASKED_NOHEALTH.clear()  # the next `claude` starts a process
+        pin_proxy.heal(root)
+        assert _child_proxy(certdir) == hop.url + "\n"
+
+
+@pytest.mark.parametrize("settled", [False, True], ids=["learns-a-next", "next-already-recorded"])
+def test_a_hop_a_launch_re_records_while_the_daemon_asks_the_old_one_is_not_reverted(certdir, settled):
+    """The timer reads the hop, asks it for about a second, then writes: both writes (a next learned,
+    a cache proxy settled) went back with the hop it had read."""
+    pin_proxy = _proxy()
+    with _Health({"https_proxy": BEFORE}) as cache:
+        (certdir / "upstream.json").write_text(json.dumps(
+            {"proxy": cache.url, "ca": "", "next": BEFORE if settled else ""}))
+        _tick(certdir, after_probe=lambda: pin_proxy.write_upstream_hint(certdir, OTHER))
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert record["proxy"] == OTHER, record
+    assert _child_proxy(certdir) == OTHER + "\n"
 
 
 def _ensure_proxy(tmp_path, monkeypatch):
