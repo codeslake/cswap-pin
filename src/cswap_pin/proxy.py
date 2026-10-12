@@ -150,6 +150,10 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
 # a saving there, and a hop that is that launch's own exported proxy is kept
 # out of this path entirely by the ``own_proxy`` guard below instead.
 _ASKED_NOHEALTH: set[str] = set()
+# The mirror: addresses that answered /health as a cache proxy at least once
+# THIS PROCESS, whether or not they named an upstream. Process-local for the
+# same reason; what outlives the process is `write_upstream_hint`'s "cache" key.
+_ANSWERED_HEALTH: set[str] = set()
 
 
 def _probe_next_hop(
@@ -244,6 +248,7 @@ def _probe_next_hop(
                 # server.
                 if 400 <= resp.status < 500:
                     _ASKED_NOHEALTH.add(address)
+                    _ANSWERED_HEALTH.discard(address)
                 return None
             body = json.loads(resp.read())
         finally:
@@ -251,7 +256,9 @@ def _probe_next_hop(
     except Exception:  # noqa: BLE001 — an absent probe is "no next hop"
         return None
     if not isinstance(body, dict):
+        _ANSWERED_HEALTH.discard(address)
         return None
+    _ANSWERED_HEALTH.add(address)
     nxt = body.get("https_proxy") or body.get("HTTPS_PROXY")
     if not isinstance(nxt, str) or not nxt:
         return None
@@ -276,6 +283,12 @@ def _chain_hops(certdir: Path) -> list[_Chain]:
         if hop is not None and hop not in hops:
             hops.append(hop)
     return hops
+
+
+def _hop_address(value: str | None) -> str:
+    """``host:port`` of a recorded hop, the form `_ASKED_NOHEALTH` keys on; "" for none."""
+    hop = parse_upstream_proxy(value)
+    return f"{hop.host}:{hop.port}" if hop else ""
 
 
 def write_upstream_hint(
@@ -321,10 +334,58 @@ def write_upstream_hint(
         # so an authenticated or TLS corporate proxy survived exactly until the
         # next re-pin, then every pinned request 407'd.
         keep_proxy = _read_upstream(certdir, "proxy") or ""
+    # WHETHER THE HOP IS A CACHE PROXY, kept only as a positive: a stale "yes"
+    # hands the programs Claude Code starts no proxy, a stale "no" would hand
+    # them the cache proxy's own port. What this process saw wins; else the
+    # earlier record, while it names the same address; else nothing.
+    seen = _hop_address(keep_proxy)
+    keep_cache = seen if seen in _ANSWERED_HEALTH or (
+        seen not in _ASKED_NOHEALTH and _read_upstream(certdir, "cache") == seen) else ""
+    record = {"proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next}
+    if keep_cache:
+        record["cache"] = keep_cache
     try:
-        tmp.write_text(json.dumps({
-            "proxy": keep_proxy, "ca": keep_ca or "", "next": keep_next,
-        }))
+        tmp.write_text(json.dumps(record))
+        tmp.replace(path)
+    except OSError:
+        return
+    _write_child_proxy(certdir)
+
+
+def _write_child_proxy(certdir: Path) -> None:
+    """Write, beside ``upstream.json``, the proxy the programs Claude Code starts get.
+
+    Read by the opt-in shell prefix (``SHELL_PREFIX_SH``), which parses nothing:
+    one line, a URL kept as recorded (a credential stays), or empty.
+
+    It is the proxy the user had BEFORE the pin wired itself in, derived from
+    what the record already holds and never from a name or a port:
+
+    - the hop behind the recorded hop, when one was learned (the recorded hop is
+      a cache proxy in front of it): ``next``. Not when it names the pin itself,
+      which a cache proxy started from a pinned shell reports (see
+      `learn_next_hop`): then nothing;
+    - nothing, when the recorded hop answered /health as a cache proxy and named
+      no upstream (``cache``): its own address is not theirs to use;
+    - the recorded hop itself, when nothing sits in front of it;
+    - nothing, when no hop is recorded.
+    """
+    proxy = _read_upstream(certdir, "proxy")
+    nxt = _read_upstream(certdir, "next")
+    address = _hop_address(proxy)
+    behind = parse_upstream_proxy(nxt)
+    if not address:
+        child = ""
+    elif behind is not None:
+        child = "" if behind.host in _LOOPBACK and behind.port == read_port_hint(certdir) else nxt
+    elif _read_upstream(certdir, "cache") == address:
+        child = ""
+    else:
+        child = proxy
+    path = Path(certdir) / "shell-prefix.proxy"
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(child + "\n" if child else "")
         tmp.replace(path)
     except OSError:
         pass
@@ -6536,19 +6597,23 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
 # keeps an existing copy current across an upgrade (`heal`). Measured on Claude
 # Code 2.1.296; README "Keeping the programs Claude Code starts off the pin".
 SHELL_PREFIX_SH = """#!/bin/sh
-u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy'; eval "$u"
+# the proxy the user had before the pin wired itself in: the pin writes it next to this file, or leaves it empty
+p=${0%/*}/shell-prefix.proxy; CSWAP_PIN_CHILD_PROXY=; [ -r "$p" ] && IFS= read -r CSWAP_PIN_CHILD_PROXY < "$p"; export CSWAP_PIN_CHILD_PROXY
+u='for k in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do if [ -n "$CSWAP_PIN_CHILD_PROXY" ]; then export "$k=$CSWAP_PIN_CHILD_PROXY"; else unset "$k"; fi; done; unset k'; eval "$u"
 # Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && export SHELL_PREFIX_CLAUDE_PID="${CLAUDE_PID-}"
+# the shells below run $u again after their startup files, and take the holder with them
+u="$u; unset CSWAP_PIN_CHILD_PROXY"
 # the user's own earlier prefix gets the command exactly as Claude gave it; the variable is
 # dropped first, so a chain that comes back to this file ends here; a missing file or a relative name is skipped
 p=${CSWAP_PIN_PREV_SHELL_PREFIX-}; unset CSWAP_PIN_PREV_SHELL_PREFIX
-case $p in /*) [ -f "$p" ] && [ -x "$p" ] && exec "$p" "$1" ;; esac
-# Bash tool: the shell Claude chose (it sets SHELL); unset again after its startup files
+case $p in /*) [ -f "$p" ] && [ -x "$p" ] && { unset CSWAP_PIN_CHILD_PROXY; exec "$p" "$1"; } ;; esac
+# Bash tool: the shell Claude chose (it sets SHELL); set again after its startup files
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && exec "${SHELL:-/bin/sh}" -c "$u; $1"
 # hook or statusLine: Claude stamped its own pid on it; run it under /bin/sh, as without a prefix
 [ -n "${CLAUDE_PID+x}" ] && [ "$CLAUDE_PID" != "${SHELL_PREFIX_CLAUDE_PID-}" ] && exec /bin/sh -c "$u; $1"
 # stdio MCP server: one quoted command; become it, so Claude's signals reach the server
-eval "exec $1"
+unset CSWAP_PIN_CHILD_PROXY; eval "exec $1"
 """
 
 
@@ -21850,11 +21915,19 @@ class PinProxy:
         # this process is the daemon, not a launch, and passing it would
         # refuse the very probe this method exists to make.
         nxt = _probe_next_hop(recorded)
+        # A cache proxy that names no upstream is recorded as one, once: a
+        # launch from the shell that runs it never asks it (see
+        # `_probe_next_hop`'s `own_proxy`), so this timer is where it is learned.
+        if not nxt:
+            seen = _hop_address(recorded)
+            if seen in _ANSWERED_HEALTH and _read_upstream(self._certdir, "cache") != seen:
+                write_upstream_hint(self._certdir, recorded, read_upstream_ca(self._certdir))
+            return
         # A PROBE THAT COULD NOT ASK IS NOT AN ANSWER OF "NONE" — the same
         # rule `write_upstream_hint` states. Writing "" on a hop that is down
         # would erase a next hop learned while it was up, at the moment it
         # matters most.
-        if not nxt or nxt == _read_upstream(self._certdir, "next"):
+        if nxt == _read_upstream(self._certdir, "next"):
             return
         # A HOP THAT NAMES US IS A LOOP, NOT A NEXT HOP. A looped proxy neither
         # answers nor exits — it appears here as "accepted but did not tunnel

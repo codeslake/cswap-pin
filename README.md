@@ -303,6 +303,7 @@ What it learned goes into `upstream.json`, in the directory `cswap pin
 | `proxy` | the first hop | `HTTPS_PROXY` / `https_proxy` when you pinned |
 | `ca` | that hop's CA | `NODE_EXTRA_CA_CERTS` when you pinned |
 | `next` | the hop behind the first one | the first hop's own `GET /health`, asked when you pin and again later by the running daemon. Only a loopback `http://` hop is asked, and only a JSON answer naming its `https_proxy` counts |
+| `cache` | the first hop's `host:port`, only when it answered `/health` with JSON but named no upstream | the same `GET /health`. Absent otherwise. Read only by the [opt-in shell prefix](#keeping-the-programs-claude-code-starts-off-the-pin) |
 
 The daemon re-reads this file on every connection, so an edit takes effect
 without a restart. The `ca` is merged with the pin's own CA into
@@ -506,10 +507,12 @@ the pin never sets `CLAUDE_CODE_SHELL_PREFIX` for you.
 MCP server and the status line through the executable that
 `CLAUDE_CODE_SHELL_PREFIX` names, handing it the whole command as one argument
 (measured on Claude Code 2.1.296). The pin ships such an executable that
-unsets the six proxy variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`,
-`http_proxy`, `ALL_PROXY`, `all_proxy`) and then runs the command. `NO_PROXY`
-and `no_proxy` are left alone. `NODE_EXTRA_CA_CERTS` and `CSWAP_PIN_PORT` stay,
-so a Node child still trusts the pin's CA (see [Trust](#trust)).
+sets the six proxy variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`,
+`http_proxy`, `ALL_PROXY`, `all_proxy`) to the proxy you had before the pin wired
+itself in, or unsets them when you had none, and then runs the command.
+`NO_PROXY` and `no_proxy` are left alone. `NODE_EXTRA_CA_CERTS` and
+`CSWAP_PIN_PORT` stay, so a Node child still trusts the pin's CA (see
+[Trust](#trust)).
 
 **1. Write it.** If `cswap pin --help` lists `--print-shell-prefix-path`, run
 
@@ -536,20 +539,43 @@ exactly this:
 
 ```sh
 #!/bin/sh
-u='unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy'; eval "$u"
+# the proxy the user had before the pin wired itself in: the pin writes it next to this file, or leaves it empty
+p=${0%/*}/shell-prefix.proxy; CSWAP_PIN_CHILD_PROXY=; [ -r "$p" ] && IFS= read -r CSWAP_PIN_CHILD_PROXY < "$p"; export CSWAP_PIN_CHILD_PROXY
+u='for k in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do if [ -n "$CSWAP_PIN_CHILD_PROXY" ]; then export "$k=$CSWAP_PIN_CHILD_PROXY"; else unset "$k"; fi; done; unset k'; eval "$u"
 # Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && export SHELL_PREFIX_CLAUDE_PID="${CLAUDE_PID-}"
+# the shells below run $u again after their startup files, and take the holder with them
+u="$u; unset CSWAP_PIN_CHILD_PROXY"
 # the user's own earlier prefix gets the command exactly as Claude gave it; the variable is
 # dropped first, so a chain that comes back to this file ends here; a missing file or a relative name is skipped
 p=${CSWAP_PIN_PREV_SHELL_PREFIX-}; unset CSWAP_PIN_PREV_SHELL_PREFIX
-case $p in /*) [ -f "$p" ] && [ -x "$p" ] && exec "$p" "$1" ;; esac
-# Bash tool: the shell Claude chose (it sets SHELL); unset again after its startup files
+case $p in /*) [ -f "$p" ] && [ -x "$p" ] && { unset CSWAP_PIN_CHILD_PROXY; exec "$p" "$1"; } ;; esac
+# Bash tool: the shell Claude chose (it sets SHELL); set again after its startup files
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && exec "${SHELL:-/bin/sh}" -c "$u; $1"
 # hook or statusLine: Claude stamped its own pid on it; run it under /bin/sh, as without a prefix
 [ -n "${CLAUDE_PID+x}" ] && [ "$CLAUDE_PID" != "${SHELL_PREFIX_CLAUDE_PID-}" ] && exec /bin/sh -c "$u; $1"
 # stdio MCP server: one quoted command; become it, so Claude's signals reach the server
-eval "exec $1"
+unset CSWAP_PIN_CHILD_PROXY; eval "exec $1"
 ```
+
+**Which proxy.** The one you had before the pin wired itself in, so a program
+that needs a proxy to reach the network keeps its way out. The pin records it
+when a session starts and next to the script, in
+`<data>/pin-proxy/shell-prefix.proxy`: one line, a URL as you gave it (a
+credential in it stays; the file is as readable as `upstream.json` beside it),
+or empty. The script reads that file for every command and parses nothing.
+There are four cases:
+
+- Only the pin: the proxy your shell exported when the session started.
+- The pin behind a local cache proxy that chains to a proxy: that proxy, never
+  the cache proxy's own address or the pin's.
+- The pin behind a local cache proxy that chains to nothing: none. The six are
+  unset.
+- No proxy at all, or none recorded yet: none. The six are unset.
+
+The pin learns what a cache proxy chains to by asking its `/health`, at a
+session start or on the daemon's half-minute timer. Until it has asked a cache
+proxy once, it cannot tell it from a plain proxy and passes its address.
 
 **2. Set it**, in one of two places.
 
@@ -581,7 +607,7 @@ Set it in one place. It applies to Claude Code sessions started afterwards;
 sessions already open keep what they started with.
 
 **What it runs under.** The Bash tool: the shell Claude Code chose, with the six
-unset again after that shell's startup files, so a `.zshenv` that exports a
+set again after that shell's startup files, so a `.zshenv` that exports a
 proxy does not undo it. Hooks and the status line: `/bin/sh`, as without a
 prefix. A stdio MCP server: the server itself, started in place of the script,
 so Claude Code's signals reach it.
@@ -589,12 +615,14 @@ so Claude Code's signals reach it.
 **Check it.** Start a new session and ask Claude to run this with the Bash tool:
 
 ```bash
-echo "shell=$0 https=${HTTPS_PROXY+SET}${https_proxy+SET} all=${ALL_PROXY+SET}${all_proxy+SET} http=${HTTP_PROXY+SET}${http_proxy+SET}"
+echo "shell=$0"; env | grep -i '_proxy=' | sed 's|//[^@/]*@|//|'
 ```
 
-It should print your shell and nothing after the `=` signs, for example
-`shell=/usr/bin/zsh https= all= http=`. A `SET` means the prefix is not applied.
-Then ask Claude to show that Claude itself is still on the pin:
+It should print your shell and then the six variables, each with the proxy you
+had before the pin (the sed hides a credential), or nothing after the shell when
+you had none. A line with the pin's port (`cswap pin --get_port`) means the
+prefix is not applied. Then ask Claude to show that Claude itself is still on
+the pin:
 
 ```bash
 lsof -a -p "$CLAUDE_PID" -iTCP -n -P
@@ -613,26 +641,24 @@ Its connections should land on the pin's port (`cswap pin --get_port`).
   and the unset would remove them and leave a sandboxed command no way out. This
   is read from the code, not measured.
 
-A program the prefix reaches now has no proxy at all, not a different one. On a
-network where only a proxy reaches the internet, a hook, an MCP server or a Bash
-command that needs the network loses it. Give that program its proxy yourself:
-in an MCP server's own `env` block, in the hook's command, or in the Bash
-command.
+A program the prefix reaches gets the proxy you had before the pin, or none when
+you had none (see "Which proxy"). A program that needs a different proxy gets it
+from you: in an MCP server's own `env` block, in the hook's command, or in the
+Bash command.
 
 **You already have a prefix.** Claude Code runs one prefix. Move yours to
 `CSWAP_PIN_PREV_SHELL_PREFIX`, as an absolute path to an executable file with
 no arguments, in the same place you would set the other (`settings.json` `env`
 or an rc `export`), and set `CLAUDE_CODE_SHELL_PREFIX` to the pin's file. The
-pin's script unsets the proxies and then hands your prefix the command exactly
-as Claude Code gave it. A relative name, a missing file or one that is not
+pin's script sets the proxies as above and then hands your prefix the command
+exactly as Claude Code gave it. A relative name, a missing file or one that is not
 executable is skipped and the command still runs. With a prefix chained, hooks
 run under that prefix's shell instead of `/bin/sh`, and a `.zshenv` that
 re-exports a proxy wins, as it does with your prefix alone.
 
-**With cache-fix too.** cache-fix ships its own copy of this same script, with
-its own variable for a previous prefix. Both do the same thing, so set one of
-them as `CLAUDE_CODE_SHELL_PREFIX`. Chaining one product's script through the
-other gains nothing.
+**With cache-fix too.** cache-fix ships its own script of this kind, with its own
+variable for a previous prefix. Set one of them as `CLAUDE_CODE_SHELL_PREFIX`.
+Chaining one product's script through the other gains nothing.
 
 **Turning it off.** Remove the setting (and the rc line). New sessions only. The
 file stays until you delete `<data>/pin-proxy/shell-prefix`; `cswap pin --clear`
@@ -676,7 +702,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
 | `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
 | `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json` that records a pin: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
-| `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO, and `shell-prefix` only if you ran the command that writes it | left in place |
+| `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `shell-prefix.proxy` (the proxy the opt-in shell prefix hands the programs Claude Code starts), `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO, and `shell-prefix` only if you ran the command that writes it | left in place |
 | `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
 | `~/.claude/jobs/<id>/state.json`, and a transcript's `bridge-session` record | the account in the bridge pointer of a session that is not running, restamped (see [Keeping a session's bridge when the account rotates](#keeping-a-sessions-bridge-when-the-account-rotates)) | not touched |
 
