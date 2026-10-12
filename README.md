@@ -524,11 +524,15 @@ tool install, `$(uv --color never tool dir)/claude-swap/bin/python`):
 "$(uv --color never tool dir)/claude-swap/bin/python" -m cswap_pin shell-prefix
 ```
 
-Either prints one absolute path and nothing else, for example
-`/home/you/.local/share/claude-swap/pin-proxy/shell-prefix` (`<data>/pin-proxy/shell-prefix`,
-where `<data>` is cswap's data directory, see [Before you
-start](#before-you-start-and-if-it-breaks)). Running it again changes nothing
-while the file is current. The file is mode 755 and holds exactly this:
+Either prints one absolute path and nothing else: `<data>/pin-proxy/shell-prefix`,
+where `<data>` is cswap's data directory (see [Before you
+start](#before-you-start-and-if-it-breaks)). By default that is
+`~/.local/share/claude-swap/pin-proxy/shell-prefix` on Linux and
+`~/.claude-swap-backup/pin-proxy/shell-prefix` on macOS, printed with your home
+directory spelled out; on Linux `$XDG_DATA_HOME`, when set, moves it to
+`$XDG_DATA_HOME/claude-swap/pin-proxy/shell-prefix`. Running the command again
+changes nothing while the file is current. The file is mode 755 and holds
+exactly this:
 
 ```sh
 #!/bin/sh
@@ -550,7 +554,7 @@ eval "exec $1"
 **2. Set it**, in one of two places.
 
 - In `settings.json` (`~/.claude/settings.json`), with the path the command
-  printed:
+  printed (the Linux default, here):
 
   ```json
   { "env": { "CLAUDE_CODE_SHELL_PREFIX": "/home/you/.local/share/claude-swap/pin-proxy/shell-prefix" } }
@@ -559,11 +563,19 @@ eval "exec $1"
   Claude Code expands no `~`, `$HOME` or `${HOME}` in this value (measured on
   2.1.296), so a `settings.json` needs the absolute path.
 - Or as a line in your shell rc, which expands the `~` for you. Use this when
-  one `settings.json` is shared by machines whose home directories differ:
+  one `settings.json` is shared by machines whose home directories differ. Take
+  the printed path and write your home directory as `~`:
+  `/home/you/.local/share/claude-swap/pin-proxy/shell-prefix` becomes
 
   ```bash
   export CLAUDE_CODE_SHELL_PREFIX=~/.local/share/claude-swap/pin-proxy/shell-prefix
   ```
+
+  and on macOS `/Users/you/.claude-swap-backup/pin-proxy/shell-prefix` becomes
+  `~/.claude-swap-backup/pin-proxy/shell-prefix`. A path outside your home
+  directory (an `XDG_DATA_HOME` elsewhere) has no `~` form: use it as printed.
+  The Linux line on a Mac names a missing file, and every Bash command then
+  fails with exit 127 (see "If it breaks" below).
 
 Set it in one place. It applies to Claude Code sessions started afterwards;
 sessions already open keep what they started with.
@@ -617,7 +629,10 @@ executable is skipped and the command still runs. With a prefix chained, hooks
 run under that prefix's shell instead of `/bin/sh`, and a `.zshenv` that
 re-exports a proxy wins, as it does with your prefix alone.
 
-**With cache-fix too.** Set one prefix, not both.
+**With cache-fix too.** cache-fix ships its own copy of this same script, with
+its own variable for a previous prefix. Both do the same thing, so set one of
+them as `CLAUDE_CODE_SHELL_PREFIX`. Chaining one product's script through the
+other gains nothing.
 
 **Turning it off.** Remove the setting (and the rc line). New sessions only. The
 file stays until you delete `<data>/pin-proxy/shell-prefix`; `cswap pin --clear`
@@ -640,7 +655,10 @@ cswap-pin==<version>` takes the latest.
 
 Run the write command again, which recreates the file at mode 755, or remove the
 setting. After an upgrade of the pin, `cswap pin --ensure` rewrites the file by
-itself when it exists and differs; it never creates one you did not ask for. If
+itself when it exists and differs, but only while a pin is wired; it never
+creates one you did not ask for. The file is the pin's: a symlink you put at
+that path is replaced by a regular file, so keep your own script or symlink at
+another path and name that one in the setting. If
 the Bash tool prints `shell=/bin/sh`, Claude Code itself was most likely started
 with `CLAUDE_PROJECT_DIR` already in its environment (from a hook or another
 tool): start it without.
