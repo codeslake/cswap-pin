@@ -6587,8 +6587,8 @@ def write_shell_prefix(certdir) -> Path:
 
 
 def shell_prefix_main() -> int:
-    """`cswap pin --shell-prefix`: write the script, print its path and nothing
-    else on stdout; one line on stderr and exit 1 when it cannot."""
+    """`cswap pin --print-shell-prefix-path`: write the script, print its path and
+    nothing else on stdout; one line on stderr and exit 1 when it cannot."""
     try:
         path = write_shell_prefix(Path(require("paths").get_backup_root()) / "pin-proxy")
     except Exception as exc:  # noqa: BLE001 — the message is the whole answer
