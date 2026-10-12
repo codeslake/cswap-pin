@@ -577,6 +577,11 @@ The pin learns what a cache proxy chains to by asking its `/health`, at a
 session start or on the daemon's half-minute timer. Until it has asked a cache
 proxy once, it cannot tell it from a plain proxy and passes its address.
 
+A `cswap pin` you run from such a program (a Bash command) has the hop behind
+the recorded one in its environment. The pin never takes it for the hop in
+front, whether or not that one is serving at that moment: the record keeps its
+first hop.
+
 **2. Set it**, in one of two places.
 
 - In `settings.json` (`~/.claude/settings.json`), with the path the command

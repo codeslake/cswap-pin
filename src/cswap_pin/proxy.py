@@ -2693,6 +2693,12 @@ def _ambient_proxy(
         return _wired_over_proxy()
     if parsed.host in _LOOPBACK and parsed.port == _self_port(src):
         return _wired_over_proxy()
+    # A CHILD OF A PINNED SESSION carries the hop BEHIND the recorded one (the
+    # shell prefix hands it over, see `_write_child_proxy`): where the pin
+    # chains to, not a proxy this launch chose. Recorded as `proxy` while the
+    # recorded hop is down, it would drop that hop from the chain for good.
+    if certdir is not None and value == _read_upstream(certdir, "next"):
+        return _wired_over_proxy()
     # This shell has A proxy — but not necessarily the one Claude Code runs
     # behind. A launcher may start a per-session cache proxy and points
     # HTTPS_PROXY at THAT; an ordinary shell, and every ssh shell, only has the

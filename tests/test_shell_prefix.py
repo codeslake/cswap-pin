@@ -543,8 +543,10 @@ def test_the_daemon_asking_a_cache_proxy_refreshes_the_file(certdir, answer, exp
     assert _child_proxy(certdir) == expected
 
 
-def test_a_launch_writes_the_file(tmp_path, monkeypatch):
-    """`ensure_proxy` is the writer every launch goes through."""
+def _ensure_proxy(tmp_path, monkeypatch):
+    """`ensure_proxy`, the writer every launch goes through, with all but the record stubbed.
+
+    Returns the pin's directory under `tmp_path / "backup"`."""
     pin_proxy = _proxy()
 
     class Switcher:
@@ -561,9 +563,47 @@ def test_a_launch_writes_the_file(tmp_path, monkeypatch):
     monkeypatch.setattr(pin_proxy, "wire_global_config", lambda *_a: None)
     monkeypatch.setattr(pin_proxy, "_read_alive_port", lambda *_a, **_k: 1234)
     monkeypatch.setattr(pin_proxy, "_move_into_this_lineage", lambda _c, _n, _e, port: port)
-    monkeypatch.setattr(pin_proxy, "_ambient_chain", lambda **_k: (BEFORE, None))
     assert pin_proxy.ensure_proxy(Switcher()) is not None
-    assert _child_proxy(Switcher.backup_dir / "pin-proxy") == BEFORE + "\n"
+    return Switcher.backup_dir / "pin-proxy"
+
+
+def test_a_launch_writes_the_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(_proxy(), "_ambient_chain", lambda **_k: (BEFORE, None))
+    assert _child_proxy(_ensure_proxy(tmp_path, monkeypatch)) == BEFORE + "\n"
+
+
+def _launch_from(tmp_path, monkeypatch, shell_proxy, pin_port):
+    """A `cswap pin` run from a shell exporting `shell_proxy`, over a record whose first hop is
+    down and whose second is BEFORE. Returns the pin's directory."""
+    certdir = tmp_path / "backup" / "pin-proxy"
+    certdir.mkdir(parents=True)
+    with _Health({"status": "ok"}) as down:
+        gone = down.url
+    _proxy().write_upstream_hint(certdir, gone, next_hop=BEFORE)
+    for k in (*SIX, "CSWAP_PIN_PORT", "NODE_EXTRA_CA_CERTS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", shell_proxy)
+    if pin_port:
+        monkeypatch.setenv("CSWAP_PIN_PORT", pin_port)
+    assert _ensure_proxy(tmp_path, monkeypatch) == certdir
+    return certdir, gone
+
+
+@pytest.mark.parametrize("pin_port", [None, "51000"], ids=["pin-port-unset", "pin-port-set"])
+def test_a_pin_run_from_a_child_keeps_the_hop_in_front_while_it_is_down(tmp_path, monkeypatch, pin_port):
+    """A child carries the hop behind the recorded one. Adopted as the FIRST hop while the recorded
+    one is down, it drops that hop for good (28dad1d, 7acfec1: the same pollution by the pin's own URL)."""
+    certdir, gone = _launch_from(tmp_path, monkeypatch, BEFORE, pin_port)
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["proxy"], record["next"]) == (gone, BEFORE), record
+    assert _child_proxy(certdir) == BEFORE + "\n"
+
+
+def test_a_pin_run_from_a_shell_with_another_proxy_still_records_it(tmp_path, monkeypatch):
+    """The control: only the hop behind the recorded one is refused, any other proxy is a choice."""
+    certdir, _ = _launch_from(tmp_path, monkeypatch, OTHER, "51000")
+    record = json.loads((certdir / "upstream.json").read_text())
+    assert (record["proxy"], record["next"]) == (OTHER, BEFORE), record
 
 
 def _put(prefix, value):
