@@ -6637,6 +6637,8 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
 SHELL_PREFIX_SH = """#!/bin/sh
 # the proxy the user had before the pin wired itself in: the pin writes it next to this file, or leaves it empty
 p=${0%/*}/shell-prefix.proxy; CSWAP_PIN_CHILD_PROXY=; [ -r "$p" ] && IFS= read -r CSWAP_PIN_CHILD_PROXY < "$p"; export CSWAP_PIN_CHILD_PROXY
+# the route this Claude was started with, taken once per Claude before the rewrite below (a chain that comes back here, or a Claude inside a Bash command, is told by CLAUDE_PID); the status line reads it
+[ "${CSWAP_PIN_SESSION_ROUTE_PID-?}" = "${CLAUDE_PID-}" ] || export CSWAP_PIN_SESSION_ROUTE="$(r=; for k in https_proxy HTTPS_PROXY all_proxy ALL_PROXY; do eval "v=\\${$k-}"; [ -z "$v" ] || r="$r $k=$v"; done; printf %s "${r# }")" CSWAP_PIN_SESSION_ROUTE_PID="${CLAUDE_PID-}"
 u='for k in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do if [ -n "$CSWAP_PIN_CHILD_PROXY" ]; then export "$k=$CSWAP_PIN_CHILD_PROXY"; else unset "$k"; fi; done; unset k'; eval "$u"
 # Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && export SHELL_PREFIX_CLAUDE_PID="${CLAUDE_PID-}"
