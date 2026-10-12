@@ -385,7 +385,10 @@ def _write_child_proxy(certdir: Path) -> None:
     - a loopback hop this process saw answer no /health, or one with no ``next``
       recorded (a first launch the daemon has not asked yet): the hop itself;
     - a loopback hop with a ``next`` and nothing known about it: nothing. It may
-      be a cache proxy, and the daemon settles it within a tick.
+      be a cache proxy, and the daemon settles it within a tick. Except the file
+      as it stands when it already holds the hop: the daemon, which asked, put it
+      there, and `heal` and a launch, in a process that has asked nobody, would
+      empty it until the next tick. (No answer is persisted: 0e0a716.)
 
     Whatever that gives is dropped when it is the pin itself (`_names_the_pin`),
     which a cache proxy started from a pinned shell reports (`learn_next_hop`).
@@ -394,6 +397,11 @@ def _write_child_proxy(certdir: Path) -> None:
     nxt = _read_upstream(certdir, "next")
     hop = parse_upstream_proxy(proxy)
     seen = _hop_address(proxy)
+    path = Path(certdir) / "shell-prefix.proxy"
+    try:
+        old = path.read_text()
+    except OSError:
+        old = None
     if hop is None:
         child = ""
     elif hop.host not in _LOOPBACK:
@@ -403,18 +411,16 @@ def _write_child_proxy(certdir: Path) -> None:
     elif seen in _ASKED_NOHEALTH or not nxt:
         child = proxy
     else:
-        child = ""
+        child = proxy if old == proxy + "\n" else ""
     if not child or _names_the_pin(certdir, child):
         child = ""
-    path = Path(certdir) / "shell-prefix.proxy"
     text = child + "\n" if child else ""
     # a temp name of its own pid, as `write_shell_prefix`: the timer, a launch
     # and `heal` overlap, and one fixed name lets a truncate land after a rename
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        with contextlib.suppress(OSError):
-            if path.read_text() == text:  # the daemon's timer asks every tick
-                return
+        if old == text:  # the daemon's timer asks every tick
+            return
         tmp.write_text(text)
         tmp.replace(path)
     except OSError:
@@ -21983,6 +21989,8 @@ class PinProxy:
             )
             self._note_probe(recorded)
             return
+        if _read_upstream(self._certdir, "proxy") != recorded:
+            return  # a launch re-recorded the hop while it was asked: its record stands
         write_upstream_hint(
             self._certdir, recorded, read_upstream_ca(self._certdir), next_hop=nxt,
         )
@@ -21997,7 +22005,8 @@ class PinProxy:
         (`_write_child_proxy`)."""
         seen = _hop_address(recorded)
         if seen in _ANSWERED_HEALTH and _read_upstream(self._certdir, "cache") != seen:
-            write_upstream_hint(self._certdir, recorded, read_upstream_ca(self._certdir))
+            if _read_upstream(self._certdir, "proxy") == recorded:  # else a launch re-recorded it
+                write_upstream_hint(self._certdir, recorded, read_upstream_ca(self._certdir))
         elif seen in _ASKED_NOHEALTH:
             _write_child_proxy(self._certdir)
 

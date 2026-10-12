@@ -578,7 +578,8 @@ It is chosen by the first hop in `upstream.json` (`proxy`):
 - A local first hop that answered `/health` with an error, or has no `next`
   recorded yet: that proxy.
 - A local first hop with a `next` recorded and nothing known about it yet: none,
-  since it may be a cache proxy.
+  since it may be a cache proxy; unless the file already holds that hop, which
+  the daemon, having asked it, wrote, and a session start does not undo.
 
 Whatever the rule gives is dropped when it is the pin itself, by any port the
 pin has (`--set_port`, `proxy.json`, `port.hint`, the global config).

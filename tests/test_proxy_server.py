@@ -3367,6 +3367,7 @@ def _launch_from(shell_proxy, tmp_path, monkeypatch):
         ("wire_global_config", lambda *_a: None),
         ("_read_alive_port", lambda *_a, **_k: 41000),
         ("_ASKED_NOHEALTH", set()),
+        ("_ANSWERED_HEALTH", set()),
         # timeout=10: a server-thread reply, not the network (T1076).
         ("_probe_next_hop", functools.partial(pp._probe_next_hop, timeout=10)),
     ):
