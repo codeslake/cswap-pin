@@ -633,6 +633,11 @@ that is missing or not executable (a wrong path, a deleted `<data>/pin-proxy/`):
 | a stdio MCP server | status `failed`, `ENOENT` or `EACCES` in Claude Code's debug log |
 | the status line | blank |
 
+`No module named cswap_pin.__main__` from the write command means the installed
+cswap-pin predates it (0.1.339 and earlier have no such command). Install a newer
+one: the Quick start line with `--with cswap-pin` in place of `--with
+cswap-pin==<version>` takes the latest.
+
 Run the write command again, which recreates the file at mode 755, or remove the
 setting. After an upgrade of the pin, `cswap pin --ensure` rewrites the file by
 itself when it exists and differs; it never creates one you did not ask for. If
