@@ -999,6 +999,13 @@ runner: a `SIGKILL`ed pytest otherwise leaves holders behind (151 of them,
 9.17 GiB, measured), and the suite sets it for the one case that asserts that
 cleanup.
 
+`CSWAP_PIN_CODE_WATCH_S=<seconds>` sets how often the daemon checks whether
+the code on disk changed, from 1 to 30 seconds; the default is 30, and any
+other value is the default. **Do not set this on a fleet.** Only the throwaway
+pin of the Rule 0 sandbox sets it, to shorten its rehearsal of a deploy. The
+daemon reads it once, at start, and writes a `code watch ticks every` line to
+`daemon.log` when it is not 30.
+
 Two opt-in traces, both off unless you name a file:
 
 ```bash

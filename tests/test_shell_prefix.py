@@ -398,6 +398,13 @@ def test_the_session_route_is_what_the_session_had_not_what_the_prefix_rewrote_i
     assert r.stdout == f"route=[HTTPS_PROXY=http://pin:9901] set=S https={CHILD}", r.stderr
 
 
+def test_the_helper_variables_of_the_session_route_do_not_leak_into_the_commands_shell(prefix, tmp_path):
+    """Only the MCP shape runs `$1` in this script's own shell (`eval "exec $1"`), so a `k`, `v` or `r` left behind by the export shows there."""
+    env = _routed(tmp_path, {"HTTPS_PROXY": "http://pin:9901"}, CLAUDE_PROJECT_DIR="/p", SHELL_PREFIX_CLAUDE_PID="4242")
+    r = _run(prefix, 'printf "[%s]" "${k+K}${v+V}${r+R}"', env)
+    assert r.stdout == "[]", r.stderr
+
+
 @pytest.mark.parametrize("shape", ["hook", "mcp"])
 def test_the_hook_and_mcp_shapes_carry_the_session_route_too(prefix, tmp_path, shape):
     """The status line is a hook: it is the reader."""
