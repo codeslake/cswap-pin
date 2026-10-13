@@ -78,7 +78,7 @@ def test_writes_the_exact_text_at_mode_0755_under_the_state_dir(state):
     assert stat.S_IMODE(path.stat().st_mode) == 0o755
     # VERBATIM, against a digest of the text as reviewed (T2171), not computed from this code.
     assert hashlib.sha256(path.read_bytes()).hexdigest() == (
-        "3874db683982711eac73f40702be82b7da2b9679990e3e11dfbece75ce6126b8")
+        "9fa54d67dbe249fb589f7d2653ce754436c8714370bca34e5c1600db8b5fbc66")
 
 
 def test_an_unchanged_file_is_not_rewritten(state):
@@ -359,6 +359,83 @@ def test_a_prev_prefix_that_cannot_chain_is_skipped_and_the_command_still_runs(p
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "out").read_text() == "ran\n", "the command did not run exactly once"
     assert not (tmp_path / "log").exists(), "a prefix that cannot chain was run"
+
+
+# -- the route the session was started with: what the status line reads (T2312) ----------
+
+ROUTE = 'printf "route=[%s] set=%s" "$CSWAP_PIN_SESSION_ROUTE" "${CSWAP_PIN_SESSION_ROUTE+S}"'
+CHILD = "http://child.example:8118"
+
+
+def _routed(tmp_path, only=None, **extra):
+    """An environment with exactly the proxy variables in `only` set."""
+    env = _env(tmp_path, **{"CLAUDE_PID": "4242", **extra})
+    for v in SIX:
+        env.pop(v)
+    env.update(only or {})
+    return env
+
+
+def test_the_session_route_is_the_empty_string_when_no_route_variable_is_set(prefix, tmp_path):
+    r = _run(prefix, ROUTE, _routed(tmp_path, {"HTTP_PROXY": "http://h:9", "https_proxy": ""}))
+    assert r.stdout == "route=[] set=S", r.stderr
+
+
+def test_the_session_route_names_the_set_variables_in_one_fixed_order(prefix, tmp_path):
+    """HTTP_PROXY is not a route variable and an empty one is not set; the order is the reader's."""
+    only = {"ALL_PROXY": "http://c:3", "HTTP_PROXY": "http://h:9", "https_proxy": "http://a:1", "all_proxy": ""}
+    r = _run(prefix, ROUTE, _routed(tmp_path, only))
+    assert r.stdout == "route=[https_proxy=http://a:1 ALL_PROXY=http://c:3] set=S", r.stderr
+    every = {v: f"http://{v}.test:1" for v in SIX}
+    r = _run(prefix, ROUTE, _routed(tmp_path, every))
+    assert r.stdout == "route=[%s] set=S" % " ".join(
+        f"{v}=http://{v}.test:1" for v in ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")), r.stderr
+
+
+def test_the_session_route_is_what_the_session_had_not_what_the_prefix_rewrote_it_to(prefix, tmp_path):
+    (prefix.parent / SIDECAR).write_text(CHILD + "\n")
+    r = _run(prefix, ROUTE + '; printf " https=%s" "$HTTPS_PROXY"', _routed(tmp_path, {"HTTPS_PROXY": "http://pin:9901"}))
+    assert r.stdout == f"route=[HTTPS_PROXY=http://pin:9901] set=S https={CHILD}", r.stderr
+
+
+def test_the_helper_variables_of_the_session_route_do_not_leak_into_the_commands_shell(prefix, tmp_path):
+    """Only the MCP shape runs `$1` in this script's own shell (`eval "exec $1"`), so a `k`, `v` or `r` left behind by the export shows there."""
+    env = _routed(tmp_path, {"HTTPS_PROXY": "http://pin:9901"}, CLAUDE_PROJECT_DIR="/p", SHELL_PREFIX_CLAUDE_PID="4242")
+    r = _run(prefix, 'printf "[%s]" "${k+K}${v+V}${r+R}"', env)
+    assert r.stdout == "[]", r.stderr
+
+
+@pytest.mark.parametrize("shape", ["hook", "mcp"])
+def test_the_hook_and_mcp_shapes_carry_the_session_route_too(prefix, tmp_path, shape):
+    """The status line is a hook: it is the reader."""
+    mark = "999" if shape == "hook" else "4242"
+    env = _routed(tmp_path, {"HTTPS_PROXY": "http://pin:9901"}, CLAUDE_PROJECT_DIR="/p", SHELL_PREFIX_CLAUDE_PID=mark)
+    assert _run(prefix, ROUTE, env).stdout == "route=[HTTPS_PROXY=http://pin:9901] set=S"
+
+
+def test_a_user_prefix_that_chains_back_into_the_script_keeps_the_first_runs_route(prefix, tmp_path):
+    """The second run sees the variables the first run rewrote; recording them would name the child proxy."""
+    (prefix.parent / SIDECAR).write_text(CHILD + "\n")
+    user = tmp_path / "user-prefix.sh"
+    user.write_text(f'#!/bin/sh\nexec "{prefix}" "$1"\n')
+    user.chmod(0o755)
+    env = _routed(tmp_path, {"HTTPS_PROXY": "http://pin:9901"}, CSWAP_PIN_PREV_SHELL_PREFIX=str(user))
+    r = _run(prefix, ROUTE + '; printf " https=%s" "$HTTPS_PROXY"', env)
+    assert r.stdout == f"route=[HTTPS_PROXY=http://pin:9901] set=S https={CHILD}", r.stderr
+
+
+def test_a_claude_started_from_a_bash_command_records_its_own_route(prefix, tmp_path):
+    """It inherits the outer session's marker and the pid it was taken for; its children carry its own pid."""
+    outer = dict(CSWAP_PIN_SESSION_ROUTE="HTTPS_PROXY=http://outer:1", CSWAP_PIN_SESSION_ROUTE_PID="100")
+    inner = {"HTTPS_PROXY": "http://inner:2"}
+    r = _run(prefix, ROUTE, _routed(tmp_path, inner, **{**outer, "CLAUDE_PID": "200"}))
+    assert r.stdout == "route=[HTTPS_PROXY=http://inner:2] set=S", r.stderr
+    # the control: the same environment from the SAME Claude keeps the marker it has
+    r = _run(prefix, ROUTE, _routed(tmp_path, inner, **{**outer, "CLAUDE_PID": "100"}))
+    assert r.stdout == "route=[HTTPS_PROXY=http://outer:1] set=S", r.stderr
+    # a marker nobody stamped a pid on is not trusted
+    r = _run(prefix, ROUTE, _routed(tmp_path, inner, CSWAP_PIN_SESSION_ROUTE="HTTPS_PROXY=http://outer:1"))
+    assert r.stdout == "route=[HTTPS_PROXY=http://inner:2] set=S", r.stderr
 
 
 # -- the proxy the children get: what the pin writes, and what the script does with it ----

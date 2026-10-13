@@ -6637,6 +6637,8 @@ def _splice_config_identity_locked(cfg, identity: dict) -> bool:
 SHELL_PREFIX_SH = """#!/bin/sh
 # the proxy the user had before the pin wired itself in: the pin writes it next to this file, or leaves it empty
 p=${0%/*}/shell-prefix.proxy; CSWAP_PIN_CHILD_PROXY=; [ -r "$p" ] && IFS= read -r CSWAP_PIN_CHILD_PROXY < "$p"; export CSWAP_PIN_CHILD_PROXY
+# the route this Claude was started with, taken once per Claude before the rewrite below (a chain that comes back here, or a Claude inside a Bash command, is told by CLAUDE_PID); the status line reads it
+[ "${CSWAP_PIN_SESSION_ROUTE_PID-?}" = "${CLAUDE_PID-}" ] || export CSWAP_PIN_SESSION_ROUTE="$(r=; for k in https_proxy HTTPS_PROXY all_proxy ALL_PROXY; do eval "v=\\${$k-}"; [ -z "$v" ] || r="$r $k=$v"; done; printf %s "${r# }")" CSWAP_PIN_SESSION_ROUTE_PID="${CLAUDE_PID-}"
 u='for k in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do if [ -n "$CSWAP_PIN_CHILD_PROXY" ]; then export "$k=$CSWAP_PIN_CHILD_PROXY"; else unset "$k"; fi; done; unset k'; eval "$u"
 # Bash tool (Claude puts no CLAUDE_PROJECT_DIR there): remember which Claude this is
 [ -z "${CLAUDE_PROJECT_DIR+x}" ] && export SHELL_PREFIX_CLAUDE_PID="${CLAUDE_PID-}"
@@ -13922,6 +13924,17 @@ def _code_is_current(own: str) -> bool:
     return False
 
 
+def _code_watch_interval_s(env=None) -> float:
+    # Only the Rule 0 sandbox's throwaway pin sets CSWAP_PIN_CODE_WATCH_S, to
+    # shorten its rehearsal; never the fleet. Read at call time; a bad value is the default.
+    env = os.environ if env is None else env
+    try:
+        v = float(env.get("CSWAP_PIN_CODE_WATCH_S", ""))
+    except ValueError:
+        return _CODE_WATCH_INTERVAL_S
+    return v if 1.0 <= v <= _CODE_WATCH_INTERVAL_S else _CODE_WATCH_INTERVAL_S
+
+
 @_beat_ends_with_the_watchdog
 def _watch_own_code(
     server,
@@ -14000,8 +14013,11 @@ def _watch_own_code(
     # A thread that returned or died stops stamping.
     setattr(server, "_code_watch_beat", time.monotonic())
     # Waiting on `done` rather than sleeping, so a normal teardown ends this
-    # thread at once instead of after a full interval.
-    while not done.wait(interval):
+    # thread at once instead of after a full interval. `next_wait` is the
+    # interval on every pass but the one that saw its holder go (below).
+    next_wait = interval
+    while not done.wait(next_wait):
+        next_wait = interval
         setattr(server, "_code_watch_beat", time.monotonic())
         # ONE EXIT, TAKEN ON EVERY PATH. 0.1.27 had three exits and one of them
         # took neither: `_spawn_daemon` RAISING (fork() EAGAIN under a post-
@@ -14169,6 +14185,11 @@ def _watch_own_code(
                 # to a successor that lands under a fresh holder. That is the
                 # one path here that keeps the port bound throughout, and it is
                 # already the tested one.
+                #
+                # THAT TICK IS 30 s WITH NOTHING ABOVE THIS DAEMON, so the pass
+                # looks for the reparent for up to 5 s and, once it sees it,
+                # takes the next pass at once. Still not on THIS pass, and
+                # still once: a reparent not seen costs the whole interval.
                 if stand_down_asked or not _retire_stale_holder(own):
                     continue
                 stand_down_asked = True
@@ -14176,6 +14197,12 @@ def _watch_own_code(
                     "the holder above this daemon is running code we no longer "
                     "ship — asked it to stand down so a current one replaces it"
                 )
+                for _ in range(50):
+                    if done.wait(0.1):
+                        break
+                    if _orphaned_from_its_holder():
+                        next_wait = 0
+                        break
                 continue
             # THE REASON THE HELD ASK LINES BELOW NAME, so a starved or blind
             # replacement is not recorded as "code on disk changed".
@@ -15545,9 +15572,19 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # ONCE, off the serving path: two reads a second apart when denied.
     _start_noting_keychain_denial(proxy)
 
+    # PASSED ONLY WHEN SET, so a wrapper that fixed its own tick (the tests'
+    # shims partial it) keeps it: a call-time keyword would override theirs.
+    watch_kwargs: dict = {}
+    interval = _code_watch_interval_s()
+    if interval != _CODE_WATCH_INTERVAL_S:
+        watch_kwargs["interval"] = interval
+        _log_lifecycle(
+            f"code watch ticks every {interval:g}s (CSWAP_PIN_CODE_WATCH_S), "
+            f"not the default {_CODE_WATCH_INTERVAL_S:g}s")
     threading.Thread(
         target=_watch_own_code,
         args=(proxy, account_num, email, certdir, done, _teardown),
+        kwargs=watch_kwargs,
         daemon=True,
     ).start()
 

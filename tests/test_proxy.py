@@ -16955,7 +16955,7 @@ print("OK", port)
             f"it, so every later deploy stays on the slow path"
         )
 
-    def case_the_stand_down_is_asked_once_not_every_tick(self, tmp_path):
+    def case_the_stand_down_is_asked_once_not_every_tick(self, monkeypatch, tmp_path):
         """A HOLDER THAT DOES NOT GO IS NOT A HOLDER TO ASK AGAIN.
 
         A holder is expected to die on the HUP — no version installs a handler
@@ -16965,44 +16965,22 @@ print("OK", port)
         interval, forever. This file already records where that ends: 5 ticks,
         5 kills, no convergence, each one costing live sessions their in-flight
         requests.
+
+        THE TICKS ARE COUNTED, NOT TIMED. The ask is followed by a ~5 s look at
+        the reparent, which a real `done` and a 1.5 s watchdog swallow whole:
+        the second tick never came, and the case passed without the guard.
+        `_StandDownTicks` lets the ticks through and records each wait, so the
+        assertion on the waits says a second and third tick reached the branch.
         """
-        import threading
+        waits, _, hups = _stand_down(monkeypatch, tmp_path, holder_goes=False, ticks=2)
 
-        from cswap_pin import proxy as pin_proxy
-
-        sent = []
-        stop = threading.Event()
-        real_kill = os.kill
-
-        def _count(pid, sig):
-            sent.append((pid, sig))
-            if len(sent) >= 2:      # a second ask is the defect — stop and fail
-                stop.set()
-
-        os.kill = _count
-        os.environ[pin_proxy._HELD_BY_ENV] = str(os.getppid())
-        os.environ[pin_proxy._HOLDER_SHA_ENV] = "a-release-we-no-longer-ship"
-        # The holder never goes away in this case: `held_by_a_holder` keeps
-        # answering yes, which is exactly the situation an unguarded ask repeats
-        # in. Bounded by the watchdog thread below rather than by the signal.
-        threading.Timer(1.5, stop.set).start()
-        try:
-            pin_proxy._watch_own_code(
-                types.SimpleNamespace(), "1", "a@b.c", tmp_path, stop,
-                lambda *a: None, interval=0.01,
-                _own_fingerprint=pin_proxy.daemon_fingerprint(),
-            )
-        except SystemExit:
-            pass
-        finally:
-            os.kill = real_kill
-            os.environ.pop(pin_proxy._HELD_BY_ENV, None)
-            os.environ.pop(pin_proxy._HOLDER_SHA_ENV, None)
-
-        assert len(sent) == 1, (
-            f"asked the holder to stand down {len(sent)} times in 1.5 s at a "
-            f"10 ms interval ({sent[:4]}) — a holder that stays alive turns "
-            f"this into a signal storm"
+        assert waits.count(30.0) == 4, (
+            f"the watcher did not run the ticks after the ask ({waits.count(30.0)} "
+            f"interval waits), so a second ask was never in reach: {waits[:3]}"
+        )
+        assert len(hups) == 1, (
+            f"asked the holder to stand down {len(hups)} times in 3 ticks "
+            f"({hups}) — a holder that stays alive turns this into a signal storm"
         )
 
     def case_neither_mechanism_fires_where_its_signal_is_absent(self, tmp_path):
@@ -35420,3 +35398,139 @@ else:
             h._on_replace_request(signal.SIGUSR1, None)
         assert h.spawned == 1 and h._proc is kids[1] and not h._stop
         assert any("could not start the successor watch" in ln for ln in lines)
+
+
+# -- T2310: the code watch's tick, for the Rule 0 sandbox's throwaway pin -------
+
+
+@pytest.mark.parametrize("raw, want", [
+    (None, 30.0), ("", 30.0), ("abc", 30.0), ("nan", 30.0), ("inf", 30.0),
+    ("0", 30.0), ("0.5", 30.0), ("-1", 30.0), ("45", 30.0),
+    ("2", 2.0), ("1", 1.0), ("30", 30.0),
+])
+def test_the_code_watch_tick_knob_takes_1_to_30_seconds_and_nothing_else(raw, want):
+    from cswap_pin import proxy as pin_proxy
+
+    env = {} if raw is None else {"CSWAP_PIN_CODE_WATCH_S": raw}
+    assert pin_proxy._code_watch_interval_s(env) == want
+
+
+def test_daemon_main_gives_the_code_watch_thread_the_knobs_tick_and_says_so():
+    """The knob only counts if the thread START carries it, and the sandbox's
+    proof that it took effect is a lifecycle line. A non-default tick is passed
+    only when set: the tests' shims wrap `_watch_own_code` in a partial with a
+    tick of their own, and a call-time keyword would override it."""
+    import ast
+    import inspect
+    import textwrap
+
+    from cswap_pin import proxy as pin_proxy
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+    names = lambda n: [getattr(c.func, "id", None) for c in ast.walk(n)  # noqa: E731
+                       if isinstance(c, ast.Call)]
+    assert "_code_watch_interval_s" in names(tree), "daemon_main never reads the knob"
+    thread = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and any(
+            kw.arg == "target" and getattr(kw.value, "id", None) == "_watch_own_code"
+            for kw in n.keywords))
+    kwargs = next(kw.value for kw in thread.keywords if kw.arg == "kwargs")
+    assert isinstance(kwargs, ast.Name), "the thread's kwargs are not a name the knob fills"
+    branch = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.If) and "_CODE_WATCH_INTERVAL_S" in ast.dump(n.test))
+    fills = [t for s in branch.body if isinstance(s, ast.Assign) for t in s.targets
+             if isinstance(t, ast.Subscript) and getattr(t.value, "id", None) == kwargs.id]
+    assert fills, "a non-default tick never reaches the thread's kwargs"
+    assert "_log_lifecycle" in names(branch), "a non-default tick leaves no line in daemon.log"
+
+
+# -- T2310: the stand-down ask is followed by a look, not by a whole tick -------
+
+
+class _StandDownTicks(threading.Event):
+    """The watcher's `done`, recording every wait it is asked for. The first
+    (the interval before the first tick) returns at once, and so do `ticks`
+    more as long as the interval. The next wait that long ends the watcher
+    instead of sleeping it out, and a shorter one returns at once: the cases
+    measure what was ASKED for, not the scheduler. A watcher that spins on
+    short waits is ended after 200 of them, so that fails an assertion rather
+    than hanging the suite."""
+
+    def __init__(self, interval, ticks=0):
+        super().__init__()
+        self.interval, self.ticks, self.waits = interval, ticks, []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.waits.count(self.interval) > self.ticks + 1 or len(self.waits) > 200:
+            self.set()
+        return len(self.waits) > 1 and self.is_set()
+
+
+def _stand_down(monkeypatch, tmp_path, holder_goes, ticks=0, idle_after=False):
+    """A current daemon under a holder that runs old code; the HUP is stubbed
+    and, when `holder_goes`, reparents the daemon the way the real one does.
+    `ticks` ticks more than the first are let through before the watcher is
+    ended; `idle_after` switches self-heal off at the HUP, so the pass after it
+    does nothing and the loop goes back to waiting."""
+    import signal
+
+    from cswap_pin import proxy as pin_proxy
+
+    events, hups, done = [], [], _StandDownTicks(30.0, ticks)
+    real_kill = os.kill
+    monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *a, **k: "fp-same")
+    monkeypatch.setattr(pin_proxy, "_spawn_daemon",
+                        lambda n, e, c, **k: events.append(("spawn", n)) or 1)
+    monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getppid()))
+    monkeypatch.setenv(pin_proxy._HOLDER_SHA_ENV, "a-release-we-no-longer-ship")
+
+    def hup(pid, sig):
+        if sig != signal.SIGHUP:
+            return real_kill(pid, sig)
+        hups.append(pid)
+        if holder_goes:
+            monkeypatch.setenv(pin_proxy._HELD_BY_ENV, str(os.getpid() + 1_000_000))
+        if idle_after:
+            monkeypatch.setenv(pin_proxy._SELF_HEAL_ENV, "off")
+
+    monkeypatch.setattr(os, "kill", hup)
+    certdir = tmp_path / "pin-proxy"
+    certdir.mkdir()
+    pin_proxy._watch_own_code(
+        _recording_server(events)(), "1", "a@example.com", certdir, done,
+        teardown=lambda reason: events.append(("teardown", reason)),
+        interval=30.0, _own_fingerprint="fp-same")
+    return done.waits, events, hups
+
+
+def test_a_daemon_that_sees_its_holder_go_hands_over_at_once_not_a_tick_later(monkeypatch, tmp_path):
+    """56cffc3 waits a tick after the ask because the reparent is not instant.
+    That tick is 30 s of a daemon with nothing above it. The ask is now
+    followed by a look at the reparent, and the handover pass runs as soon as
+    it is seen: well inside the ~5 s the look lasts, where waiting a tick
+    asks for 30 s."""
+    waits, events, hups = _stand_down(monkeypatch, tmp_path, holder_goes=True)
+    assert len(hups) == 1
+    assert waits[0] == 30.0, "the first leg (the successor's own ask) is the whole interval"
+    assert ("spawn", "1") in events, f"no handover pass after the holder went: waits={waits}"
+    assert sum(waits[1:]) < 5.0 and 30.0 not in waits[1:], waits
+
+
+def test_a_holder_that_does_not_go_costs_the_whole_tick_as_before(monkeypatch, tmp_path):
+    waits, events, hups = _stand_down(monkeypatch, tmp_path, holder_goes=False)
+    assert len(hups) == 1, "asked once"
+    assert ("spawn", "1") not in events, "handed over under a holder that is still there"
+    assert waits[-1] == 30.0 and 0 not in waits, waits
+
+
+def test_the_pass_that_follows_the_handover_pass_waits_a_whole_tick_again(monkeypatch, tmp_path):
+    """`next_wait` is 0 for the ONE pass that saw its holder go. A loop that kept
+    it would spin: every later pass would ask for no wait at all. Self-heal is
+    switched off at the HUP, so the handover pass does nothing and the loop goes
+    back to waiting, which is where the reset shows."""
+    waits, events, hups = _stand_down(monkeypatch, tmp_path, holder_goes=True, idle_after=True)
+    assert len(hups) == 1 and ("spawn", "1") not in events
+    assert waits.count(0) == 1 and waits[-1] == 30.0, f"{len(waits)} waits, tail {waits[-3:]}"
