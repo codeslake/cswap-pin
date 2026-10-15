@@ -7657,9 +7657,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return None
         bypass = False
         if cached is not None:
-            _blind("")
             token = live
             if token:
+                # ONLY A LIVE TOKEN CLEARS: an expired one meets the refresh
+                # below, and a reason cleared first reads empty on `/health`
+                # for all of it.
+                _blind("")
                 if f"Bearer {token}" == refused:
                     # THE VERY TOKEN THAT WAS JUST REFUSED: comparing first
                     # means never spending an `_identity_ok` probe on a
@@ -7776,11 +7779,12 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # place that knows what it asked for.
                     provider.blind_reason = f"no credential for slot {num} ({mail})"
                     return None
-                if token or not freshen:
-                    # THE TICK CLEARS ONLY WITH A LIVE TOKEN IN HAND: the lock
-                    # wait can carry the clock past the buffer, and a request
-                    # that took the lock meanwhile may have failed its refresh
-                    # and written its reason. That one is the request's.
+                if token:
+                    # CLEARS ONLY WITH A LIVE TOKEN IN HAND: the lock wait can
+                    # carry the clock past the buffer, and a request that took
+                    # the lock meanwhile may have failed its refresh and
+                    # written its reason. That one is the request's. The
+                    # request's own refresh clears after it works, below.
                     _blind("")
                 # REPLACE THE HELD COPY, or the cache keeps handing back the
                 # expired blob and every later request re-enters this lock.
@@ -7809,16 +7813,23 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
                     # already classifies this -- `invalid_grant` means the
                     # lineage is dead and only a person can fix it, `transient`
                     # means try again -- and it was being dropped on the floor.
+                    errors = []
+
                     def _consume_recording(c):
                         out = _consume(c, num, mail)
                         err = getattr(out, "error", None)
                         if err:
+                            errors.append(err)
                             provider.blind_reason = (
                                 f"refresh {err} for slot {num} ({mail})")
                         return out
 
                     token, rotated = resolve_pin_token(creds, _consume_recording)
-                    if token is None and not getattr(provider, "blind_reason", ""):
+                    if token:
+                        # THE REFRESH WORKED: the reason a failure left stood
+                        # all through it, so `/health` never read a clear one.
+                        _blind("")
+                    elif not errors:
                         # The refresh reported no error and still produced
                         # nothing. Say that rather than nothing.
                         provider.blind_reason = (
