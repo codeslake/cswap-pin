@@ -7611,6 +7611,9 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
             return None
         num, mail = target
         if _pin_is_the_live_login(num):
+            # NOTHING TO MINT, SO NO REASON: one carried over a handover (see
+            # `_carry_in_blind_reason`) would otherwise stand for good.
+            _blind("")
             return None
         # THE READ IS NOT FREE ON EVERY PLATFORM. It costs 0.02ms on linux and
         # 19.77ms on a mac, where it shells out to the keychain — and a Remote
@@ -8008,6 +8011,7 @@ def make_pin_token_provider(switcher, account_num: str, email: str):
     provider.refetch = refetch
     provider.pin_is_noop = pin_is_noop
     provider.pin_stands_down = pin_stands_down
+    provider.current_target = _current_target
     provider.mint_stalled = mint_stalled
     provider.refresh_lock = refresh_lock
     provider.can_pin_cached = can_pin_cached
@@ -10956,6 +10960,34 @@ def clear_blind_recycle(certdir: Path) -> None:
         _blind_recycle_path(certdir).unlink()
     except OSError:
         pass
+
+
+# THE REASON A DAEMON CANNOT MINT, CARRIED ACROSS A HANDOVER. A fresh process
+# starts with `blind_reason` empty, and its warm refresh then holds the mint
+# lock, which is when `/health` forces `can_pin` true: for that window nothing
+# in the answer said the slot's lineage was dead. NOT `blind-recycle.json`
+# (its presence alone is `runtime_health`'s "this daemon recycled itself" FAIL,
+# and the watchdog unlinks it whenever a mint works or a foreign bearer is only
+# declined) and NOT `proxy.json` (rebuilt by every successor). It names the
+# slot and the identity it was recorded for, so a re-pin does not inherit it,
+# and `_carry_blind_tick` removes it the moment the reason is gone.
+_BLIND_REASON_FILE = "blind-reason.json"
+
+
+def write_blind_reason(certdir: Path, rec: dict | None) -> None:
+    """Record ``rec`` atomically, or remove the record when it is None."""
+    import json
+
+    path = Path(certdir) / _BLIND_REASON_FILE
+    try:
+        if rec is None:
+            path.unlink(missing_ok=True)
+            return
+        tmp = path.with_name(f"{_BLIND_REASON_FILE}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(rec))
+        os.replace(tmp, path)
+    except OSError:
+        pass  # advisory; a successor that finds no record derives it itself
 
 
 def clear_daemon_unpinnable(certdir: Path) -> bool:
@@ -16345,6 +16377,7 @@ class PinProxy:
         # swallows its own errors by design, so a missing dict is a silent
         # no-op rather than a failure anyone would see.
         self._reset_bridge_traffic()
+        self._carry_in_blind_reason()
         # THE OBJECT THAT OWNS THE DESCRIPTOR. `wrap_socket` detaches the
         # socket it wraps, so the raw `conn` every other structure here keys
         # on has `fileno() == -1` and cannot be shut down or closed. Anything
@@ -16640,7 +16673,57 @@ class PinProxy:
                 self._trace_tick()
             except Exception:  # noqa: BLE001 — never take this thread down
                 pass
+            try:
+                self._carry_blind_tick()
+            except Exception:  # noqa: BLE001 — never take this thread down
+                pass
             self._trace_tick_stop.wait(0.5)
+
+    def _carry_in_blind_reason(self) -> None:
+        """Give the provider the reason the previous generation left, BEFORE
+        anything can ask `/health`: a fresh process holds none, and its warm
+        refresh then holds the mint lock, the window in which `can_pin` is
+        forced true and this field is the only sign the slot cannot mint.
+
+        Taken only for the slot and identity it was recorded for, else the
+        record is removed. Reads settings and the roster and nothing else: a
+        start must not wait on a credential store, and never raises. The warm
+        refresh then re-derives the reason, or clears it (a live token, or a
+        pin that has become the live login), as for a reason set in this
+        process."""
+        import json
+
+        self._blind_carried = ""
+        p = self._pin_token_provider
+        target_of = getattr(p, "current_target", None)
+        if target_of is None:
+            return
+        try:
+            rec = json.loads((self._certdir / _BLIND_REASON_FILE).read_text())
+            if ((rec["slot"], rec["mail"]) == target_of()
+                    and not getattr(p, "blind_reason", "")):
+                p.blind_reason = self._blind_carried = rec["reason"]
+                return
+        except Exception:  # noqa: BLE001 — no record, or a memo not worth a start
+            pass
+        write_blind_reason(self._certdir, None)
+
+    def _carry_blind_tick(self) -> None:
+        """Write the provider's reason where a successor reads it, when it
+        CHANGED. Sampled on the trace tick's own thread, never on a request:
+        the reason is set inside the mint lock and a disk write there is one
+        more thing a stalled disk could hold it for. A reason cleared (a live
+        token, a refresh that worked) removes the record. A generation that
+        has handed its socket over no longer speaks for the slot."""
+        p = self._pin_token_provider
+        target_of = getattr(p, "current_target", None)
+        reason = getattr(p, "blind_reason", "") or ""
+        if target_of is None or self._stop or reason == self._blind_carried:
+            return
+        self._blind_carried = reason
+        target = target_of() if reason else None
+        write_blind_reason(self._certdir, target and {
+            "slot": target[0], "mail": target[1], "reason": reason})
 
     def _warm_mint_cache(self) -> None:
         """Populate the mint cache ONCE, off the request path and off
