@@ -16597,7 +16597,8 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             lambda token: {"emailAddress": "pin@example.com"})
         rig = types.SimpleNamespace(
             now=1_800_000_000.0, calls=[], during=[], reads=[], lines=[],
-            at_call=[], skew=0.0, on_read=None)
+            at_call=[], skew=0.0, on_read=None, on_consume=None,
+            account=("2", "pin@example.com"), live="1")
 
         class _Host(_dt.datetime):
             @classmethod
@@ -16627,8 +16628,8 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
 
         class _Switcher:
             backup_dir = certdir
-            def current_account_number(self): return "1"
-            def resolve_account(self, i): return ("2", "pin@example.com", "org")
+            def current_account_number(self): return rig.live
+            def resolve_account(self, i): return (*rig.account, "org")
             def read_account_credentials(self, n, e):
                 rig.reads.append(1)
                 if rig.on_read:
@@ -16636,6 +16637,8 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
                 return rig.stored
             def consume_backup_grant(self, n, e, snap):
                 rig.calls.append(snap)
+                if rig.on_consume:
+                    rig.on_consume()
                 rig.at_call.append(
                     [ln for ln in rig.lines if ln.startswith("can_pin ")])
                 rig.during.append(rig.provider.can_pin_cached())
@@ -16645,8 +16648,11 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
                 return RefreshOutcome(None, outcome)
 
         pp.save_pin(certdir, "pin@example.com", "org")
-        rig.provider = pp.make_pin_token_provider(_Switcher(), "2",
-                                                  "pin@example.com")
+        switcher = _Switcher()
+        # `successor()`: a new daemon's provider over the SAME store and clock.
+        rig.successor = lambda: pp.make_pin_token_provider(
+            switcher, "2", "pin@example.com")
+        rig.provider = rig.successor()
         assert rig.provider() == "old", "the fixture's warm read did not mint"
         assert rig.provider.can_pin_cached() is True
         return rig
@@ -16962,6 +16968,219 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
             self._tick(rig, certdir, monkeypatch, False)
             assert rig.provider.blind_reason == "", (
                 f"{label}: {rig.provider.blind_reason!r}")
+
+    def _health(self, proxy):
+        c = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=10)
+        try:
+            c.request("GET", "/health")
+            return json.loads(c.getresponse().read())
+        finally:
+            c.close()
+
+    def _bridge_post(self, proxy):
+        """The status line a bridge create gets: the absolute-form POST a
+        `claude remote-control` sends, whose refusal is the 503 the field saw."""
+        c = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+        try:
+            c.sendall(b"POST https://api.anthropic.com/v1/environments/bridge"
+                      b" HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                      b"Authorization: Bearer ACTIVE\r\n\r\n")
+            return c.recv(4096).split(b"\r\n")[0]
+        finally:
+            c.close()
+
+    def case_health_keeps_the_reason_across_a_doomed_refresh(
+            self, certdir, monkeypatch):
+        """FIELD, 2026-10-15: bridge POSTs got `503 refresh invalid_grant`
+        while `/health` read `blind_reason: null`. The request path cleared the
+        reason on an EXPIRED held token, then ran a refresh that fails again,
+        so the field flapped on every pinned request: empty for the whole
+        refresh (the window a `/health` probe sees, `can_pin` forced true by
+        the held lock), set again when it failed. The reason is cleared by a
+        live token in hand or a refresh that works, and by nothing else."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="invalid_grant")
+        rig.advance(600)                       # the held token is dead
+        hold, entered, release = (threading.Event() for _ in range(3))
+
+        def on_consume():
+            if hold.is_set():
+                entered.set()
+                release.wait(10)
+
+        rig.on_consume = on_consume
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                            upstream=("127.0.0.1", 1))
+        proxy.start()                          # its warm is the first doomed refresh
+        try:
+            deadline = time.monotonic() + 10
+            while (rig.provider.refresh_lock.locked()
+                   or not rig.provider.blind_reason):
+                assert time.monotonic() < deadline, "the start warm never settled"
+                time.sleep(0.01)
+            first = self._health(proxy)
+            reason = first["blind_reason"]
+            assert first["can_pin"] is False and "invalid_grant" in reason, first
+            # A BRIDGE CREATE's refresh, held open.
+            hold.set()
+            posted = []
+            request = threading.Thread(
+                target=lambda: posted.append(self._bridge_post(proxy)),
+                daemon=True)
+            request.start()
+            assert entered.wait(10), "the request never began its refresh"
+            during = self._health(proxy)
+            release.set()
+            request.join(10)
+            assert posted == [b"HTTP/1.1 503 Service Unavailable"], posted
+            assert during["mint_stalled"] is True, during   # the window was real
+            assert during["can_pin"] is True, during        # by design: not a dead daemon
+            assert during["blind_reason"] == reason, (
+                f"/health lost the reason while the refresh ran: {during}")
+            after = self._health(proxy)
+            assert after["can_pin"] is False and after["blind_reason"] == reason, after
+        finally:
+            release.set()
+            proxy.stop()
+
+    def case_a_refresh_that_works_or_a_live_store_read_clears_the_reason(
+            self, certdir, monkeypatch):
+        """The other half: a reason left by a failure goes when the request
+        path ends up with a live token, whether it refreshed one or the store
+        already held a rotation made elsewhere."""
+        for label, elsewhere in (("refresh", False), ("store rotation", True)):
+            rig = self._rig(certdir, monkeypatch)
+            rig.advance(600)                   # the held token is dead
+            if elsewhere:
+                rig.stored = json.dumps({"claudeAiOauth": {
+                    "accessToken": "elsewhere", "refreshToken": "rt-elsewhere",
+                    "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+            rig.provider.blind_reason = "refresh invalid_grant for slot 2 (x)"
+            assert rig.provider() == ("elsewhere" if elsewhere else "new"), label
+            assert len(rig.calls) == (0 if elsewhere else 1), (label, rig.calls)
+            assert rig.provider.blind_reason == "", (
+                f"{label}: {rig.provider.blind_reason!r}")
+
+    def _predecessor_leaves_a_reason(self, rig, certdir):
+        """A daemon whose refresh meets `invalid_grant`, run until the tick has
+        recorded the reason it holds, then ended: the generation a handover
+        replaces. Returns the reason."""
+        from cswap_pin import proxy as pp
+
+        rig.advance(600)                       # the held token is dead
+        daemon = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                             upstream=("127.0.0.1", 1))
+        daemon.start()                         # its warm is the doomed refresh
+        try:
+            deadline = time.monotonic() + 10
+            while (rig.provider.refresh_lock.locked()
+                   or not rig.provider.blind_reason):
+                assert time.monotonic() < deadline, "the warm never settled"
+                time.sleep(0.01)
+            # The tick that records it is the daemon's own; a miss shows as the
+            # successor's reading below, not here.
+            deadline = time.monotonic() + 3
+            while (not (certdir / "blind-reason.json").exists()
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
+        finally:
+            daemon.stop()
+        return rig.provider.blind_reason
+
+    def case_a_successor_reads_the_predecessors_reason_from_its_first_health(
+            self, certdir, monkeypatch):
+        """A handover's activation probe looks while the successor's warm holds
+        the mint lock: `can_pin` is forced true there (by design: a stall is not
+        a dead daemon), so `blind_reason` is the only field that can still say
+        the slot's lineage is dead, and a fresh process starts with it empty.
+        The reason crosses the handover, scoped to the slot it names, and the
+        warm refresh then re-derives it."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="invalid_grant")
+        reason = self._predecessor_leaves_a_reason(rig, certdir)
+        assert "invalid_grant" in reason and "slot 2" in reason, reason
+        entered, release = threading.Event(), threading.Event()
+
+        def on_consume():
+            entered.set()
+            release.wait(10)
+
+        rig.on_consume = on_consume
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.successor(),
+                            upstream=("127.0.0.1", 1))
+        proxy.start()
+        try:
+            first = self._health(proxy)        # the very first answer
+            assert first["blind_reason"] == reason, first
+            assert entered.wait(10), "the successor's warm never began its refresh"
+            during = self._health(proxy)
+            assert during["mint_stalled"] is True, during   # the window was real
+            assert during["can_pin"] is True, during
+            assert during["blind_reason"] == reason, during
+            release.set()
+            deadline = time.monotonic() + 10
+            while proxy._pin_token_provider.refresh_lock.locked():
+                assert time.monotonic() < deadline, "the warm never settled"
+                time.sleep(0.01)
+            after = self._health(proxy)
+            assert after["can_pin"] is False and after["blind_reason"] == reason, after
+        finally:
+            release.set()
+            proxy.stop()
+
+    def case_a_carried_reason_goes_with_its_slot_or_a_live_token(
+            self, certdir, monkeypatch):
+        """The record is a memo of a failure, so it must not outlive what it
+        describes: another slot pinned now, or a live token for this one (a
+        re-login while no daemon ran), and the successor says nothing, and the
+        file is gone."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch, outcome="invalid_grant")
+        reason = self._predecessor_leaves_a_reason(rig, certdir)
+        carry = certdir / "blind-reason.json"
+        assert carry.exists(), "the predecessor recorded nothing"
+        # ANOTHER SLOT IS PINNED NOW. The seed happens at construction, so
+        # nothing has to be served to see it refuse.
+        rig.account = ("3", "other@example.com")
+        other = rig.successor()
+        pp.PinProxy(certdir=certdir, pin_token_provider=other,
+                    upstream=("127.0.0.1", 1))
+        assert getattr(other, "blind_reason", "") == "", other.blind_reason
+        assert not carry.exists(), "a reason for slot 2 outlived the pin on slot 3"
+        # NOTHING LEFT TO MINT: the pin became the login (`provider()` returns
+        # before any read, so it must clear too), or a re-login left a live
+        # token. Both are met by the warm; the record goes with the reason.
+        record = json.dumps(
+            {"slot": "2", "mail": "pin@example.com", "reason": reason})
+        relogin = json.dumps({"claudeAiOauth": {
+            "accessToken": "relogin", "refreshToken": "rt-relogin",
+            "expiresAt": int((rig.now + 480 * 60) * 1000)}})
+        rig.account = ("2", "pin@example.com")
+        for label, live, stored in (("the pin is the login", "2", rig.stored),
+                                    ("a live token", "1", relogin)):
+            rig.live, rig.stored = live, stored
+            carry.write_text(record)
+            proxy = pp.PinProxy(certdir=certdir,
+                                pin_token_provider=rig.successor(),
+                                upstream=("127.0.0.1", 1))
+            held = proxy._pin_token_provider
+            assert getattr(held, "blind_reason", "") == reason, label
+            proxy.start()
+            try:
+                deadline = time.monotonic() + 10
+                while carry.exists() or held.refresh_lock.locked():
+                    assert time.monotonic() < deadline, (
+                        f"{label}: the record outlived the reason: "
+                        f"{carry.exists()}")
+                    time.sleep(0.05)
+                health = self._health(proxy)
+                assert health["blind_reason"] is None, (label, health)
+                assert health["can_pin"] is True, (label, health)
+            finally:
+                proxy.stop()
 
     def case_a_tick_that_repairs_the_identity_does_not_keep_the_reason(
             self, certdir, monkeypatch):
