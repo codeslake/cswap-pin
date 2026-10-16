@@ -1067,13 +1067,17 @@ headroom) is rebuilt on a thread of its own, at most every 30 s and one at a
 time, by whichever armed request finds it that old; the request only reads
 it. With no snapshot yet, one older than two minutes (a rebuild that failed or
 is stuck), or a client token the snapshot has not seen yet (a token that
-rotated, for which one rebuild starts at once), that one request goes out on
-the client's own token and the session keeps its account: it is not rebound to
-that token, and its clock is not renewed, so the cache time still ends it. A
-rebuild that has not returned after two minutes is abandoned, a `daemon.log`
-line says so, a new one starts, and the abandoned one's late answer is thrown
-away (at most three abandoned ones are left waiting; a read stuck for good
-costs those three threads and nothing else).
+rotated: the next rebuild resolves it), the request goes out on the client's
+own token and the session keeps its account: it is not rebound to that token,
+and its clock is not renewed, so the cache time still ends it. So with a stale
+snapshot a session can go A, then B for the requests that find it stale, then A
+again, and thinking blocks made on B are later sent to A. A rebuild that has
+not returned after two minutes is abandoned, a `daemon.log` line says so, a new
+one starts, and the abandoned one's late answer is thrown away. At most three
+abandoned ones are left waiting: a store stuck for good costs four threads
+(the three and the rebuild now running), and once the third is abandoned
+`daemon.log` says affinity stays off until one of them returns or the daemon
+restarts.
 
 Real scope: under the `dynamic` strategy the proactive and at-limit moves
 leave an account at 97% or more, so the 90 gate never keeps a session through

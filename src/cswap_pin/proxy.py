@@ -3228,10 +3228,10 @@ _AFFINITY_CACHE: dict = {}
 _AFFINITY_MAX = 512  # entries per table below
 # THE SNAPSHOT (see `_affinity_rebuild`) is rebuilt at most this often, started
 # by whichever armed request finds it this old, and not ruled on past the
-# second figure: a request that finds it older goes out on the client's own
-# token (the session keeps its account for the rebuild that request starts),
-# and a rebuild that has run that long is abandoned and replaced, at most
-# `_AFFINITY_STUCK_MAX` of them still hung at once. The request path never
+# second figure: a request that finds it older, or finds a client token it has
+# not seen (a rotation since), goes out on the client's own token and the
+# session keeps its account, and a rebuild that has run that long is abandoned
+# and replaced, at most `_AFFINITY_STUCK_MAX` of them still hung at once. The request path never
 # reads the store, so it must already have a snapshot when a switch happens:
 # that is why traffic keeps it fresh.
 _AFFINITY_REFRESH_S = 30.0
@@ -3253,8 +3253,6 @@ _affinity_kept: dict[tuple, tuple] = {}
 # (slot, email) -> monotonic time a reply showed the slot at its bar: it is not
 # kept again by a snapshot that started before that
 _affinity_dropped: dict[tuple, float] = {}
-# client tokens a rebuild has already been started for, unresolved
-_affinity_unseen: dict[str, float] = {}
 # (slot, email) -> monotonic time until which a slot that refused is not kept
 _affinity_rest: dict[tuple, float] = {}
 # when the current rebuild started (`tried`: its identity), when the landed
@@ -3374,38 +3372,38 @@ def _affinity_rebuild(threshold: float, started: float) -> None:
                 _affinity_snap["stuck"] -= 1
 
 
-def _affinity_kick(threshold: float, unseen: str = "") -> None:
+def _affinity_kick(threshold: float) -> None:
     """Start `_affinity_rebuild` on a thread of its own when the last one
-    started `_AFFINITY_REFRESH_S` ago, or at once for a client token
-    (``unseen``) no rebuild has been started for yet, and none is running (one
-    at a time, a failed one is not retried per request).
+    started `_AFFINITY_REFRESH_S` ago and none is running (one at a time, a
+    failed one is not retried per request).
 
     A rebuild that has run `_AFFINITY_STALE_S` is ABANDONED: a hung Keychain
-    or store read must not end affinity for the life of the daemon. Its thread
-    is left to return whenever it does and its verdict is dropped; at most
+    or store read must not end affinity while it hangs. Its thread is left to
+    return whenever it does and its verdict is dropped; at most
     `_AFFINITY_STUCK_MAX` of them are left at once, so a store that hangs for
-    days costs three threads, not one an interval. One lifecycle line per
-    abandonment, which `tried` already holds to one per `_AFFINITY_STALE_S`."""
+    days costs four threads (those and the rebuild running), not one an
+    interval, and affinity is off until one of them returns or the daemon
+    restarts. One lifecycle line per abandonment, which `tried` already holds
+    to one per `_AFFINITY_STALE_S`; the last one allowed says so."""
     now = time.monotonic()
     snap = _affinity_snap
     with _affinity_lock:
         age = now - snap["tried"]
         abandon = (snap["busy"] and age >= _AFFINITY_STALE_S
                    and snap["stuck"] < _AFFINITY_STUCK_MAX)
-        due = abandon or (not snap["busy"] and (
-            age >= _AFFINITY_REFRESH_S
-            or (unseen and unseen not in _affinity_unseen)))
+        due = abandon or (not snap["busy"] and age >= _AFFINITY_REFRESH_S)
         if due:
             if abandon:
                 snap["stuck"] += 1
             snap.update(busy=True, tried=now)
-            if unseen:
-                _bounded_put(_affinity_unseen, unseen, now)
     if abandon:
         _log_lifecycle(
             f"session affinity: a snapshot rebuild started {age:.0f}s ago has "
             f"not returned (a store or Keychain read stuck?), abandoned and "
-            f"started again; {snap['stuck']} abandoned still out")
+            f"started again; {snap['stuck']} abandoned still out"
+            + (", the most allowed: if this one hangs too, affinity stays off "
+               "until one returns or the daemon restarts"
+               if snap["stuck"] >= _AFFINITY_STUCK_MAX else ""))
     if due:
         try:
             _spawn_usage_header_recorder(
@@ -3415,29 +3413,33 @@ def _affinity_kick(threshold: float, unseen: str = "") -> None:
                 snap["busy"] = False
 
 
-def _affinity_note_usage(token: str, headers: dict) -> None:
+def _affinity_note_usage(token: str, headers: dict) -> "tuple | None":
     """A reply's own 5h/7d utilization is the freshest reading there is of the
     account it came from, and the snapshot is up to `_AFFINITY_REFRESH_S`
     older: when it puts a kept slot at or over that slot's bar, the slot is
     not kept any more, and no snapshot that started before the reply keeps it
     again. In memory, on the relay's thread: no store read. ``token`` is the
-    bearer the request went out on; empty `_affinity_idents` (affinity never
-    armed) makes this a no-op."""
+    bearer the request went out on. Returns the (slot, email) it dropped, else
+    None: that reading is what a rebuild started after the drop must find in
+    the store, so the caller records it to that slot past the throttles.
+    Nothing kept (affinity never armed) returns before the lock."""
+    if not _affinity_kept:
+        return None
+    used = -math.inf
+    for w in ("5h", "7d"):  # each on its own: a malformed one skips only itself
+        try:
+            used = max(used, 100.0 * float(
+                headers[f"anthropic-ratelimit-unified-{w}-utilization"]))
+        except (KeyError, ValueError):
+            pass
     with _affinity_lock:
         ident = _affinity_idents.get(token)
         stored = _affinity_kept.get(ident)
-        if stored is None:
-            return
-        try:
-            used = 100.0 * max(
-                float(headers[f"anthropic-ratelimit-unified-{w}-utilization"])
-                for w in ("5h", "7d")
-                if f"anthropic-ratelimit-unified-{w}-utilization" in headers)
-        except ValueError:
-            return
-        if used >= stored[2]:
-            del _affinity_kept[ident]
-            _bounded_put(_affinity_dropped, ident, time.monotonic())
+        if stored is None or used < stored[2]:
+            return None
+        del _affinity_kept[ident]
+        _bounded_put(_affinity_dropped, ident, time.monotonic())
+        return ident
 
 
 def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
@@ -3476,9 +3478,9 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
 
     NEVER READS THE STORE: it reads the snapshot `_affinity_rebuild` made on
     its own thread. With no snapshot yet, one older than `_AFFINITY_STALE_S`,
-    or a client token it has not seen, the client's bearer goes out THIS ONCE
-    and the session is left as it was (see the comment below); the latter
-    starts a rebuild at once, once per token.
+    or a client token it has not seen, the client's bearer goes out and the
+    session is left as it was (see the comment below), until the refresh that
+    is due anyway has run.
     """
     cfg = session_affinity_config(certdir)
     if cfg is None:
@@ -3495,7 +3497,7 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         return None
     now = time.monotonic()
     _affinity_kick(threshold)
-    token, unseen = None, ""
+    token = None
     with _affinity_lock:
         prior = _affinity.get(session)
         if prior is None or now - prior[1] > ttl or prior[0] == client:
@@ -3504,14 +3506,12 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         held = _affinity_idents.get(prior[0])
         mine = _affinity_idents.get(client)
         fresh = now - _affinity_snap["at"] < _AFFINITY_STALE_S
-        if not (fresh and mine):
-            # NOTHING TO RULE ON YET: no snapshot, one too old, or a client
-            # token it has not seen (a rotation since). This request goes out
-            # on the client's token and the session is left as it was, its
-            # clock too, so the real TTL still ends it: rebinding it here
-            # would end its affinity for good after every idle gap.
-            unseen = client if fresh else ""
-        else:
+        # NOTHING TO RULE ON when there is no snapshot, one too old, or a client
+        # token it has not seen (a rotation since): the request goes out on the
+        # client's token and the session is left as it was, its clock too, so
+        # the real TTL still ends it. Rebinding it here would end its affinity
+        # for good after every idle gap.
+        if fresh and mine:
             stored = (held and mine and held != mine
                       and _affinity_rest.get(held, 0.0) <= now
                       and _affinity_kept.get(held))
@@ -3519,8 +3519,6 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
                      and stored[0])
             _bounded_put(_affinity, session,
                          (prior[0] if token else client, now))
-    if unseen:
-        _affinity_kick(threshold, unseen)
     return (token, held, session) if token else None
 
 
@@ -24410,10 +24408,14 @@ def _note_usage_headers(
     token = token[7:].strip() if token[:7].lower() == "bearer " else ""
     if not token:
         return
-    _affinity_note_usage(token, headers)
     # A WALL READING IS NEVER DROPPED: a kept account's 429 passes both
-    # throttles (a 200 inside the window must not eat it).
-    wall = bool(kept) and status_line.startswith(b"HTTP/1.1 429")
+    # throttles (a 200 inside the window must not eat it), and so does the
+    # reading that took a kept slot out, which a rebuild after the drop reads:
+    # it is recorded to that slot, whichever bearer the request went out on.
+    dropped = _affinity_note_usage(token, headers)
+    kept = kept or dropped
+    wall = bool(dropped) or (
+        bool(kept) and status_line.startswith(b"HTTP/1.1 429"))
     now = time.monotonic()
     with _usage_header_lock:
         last_spawn = _usage_header_spawn_seen.get(token)

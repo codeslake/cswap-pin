@@ -23483,9 +23483,9 @@ class TestSessionAffinityOnMessages:
 
         seen = types.SimpleNamespace(
             reads=[], fetches=[], consumed=[], switched=[], walled=[],
-            recorded=[], logs=[], fetch_times=[], wall1=walled)
-        usage1 = None if pct is None else {
-            "five_hour": {"pct": pct}, "seven_day": {"pct": pct}}
+            recorded=[], logs=[], fetch_times=[], wall1=walled,
+            usage1=None if pct is None else {
+                "five_hour": {"pct": pct}, "seven_day": {"pct": pct}})
 
         def _creds(num, mail):
             seen.reads.append(num)
@@ -23503,17 +23503,30 @@ class TestSessionAffinityOnMessages:
             low = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
             return {
                 "1": types.SimpleNamespace(
-                    walled=seen.wall1, decision_value=lambda models=(): usage1),
+                    walled=seen.wall1,
+                    decision_value=lambda models=(): seen.usage1),
                 "2": types.SimpleNamespace(
                     walled=False, decision_value=lambda models=(): low),
             }
+
+        def _record(num, headers):  # the store keeps what a reply said
+            seen.recorded.append(num)
+            try:
+                pct = 100.0 * float(
+                    headers["anthropic-ratelimit-unified-5h-utilization"])
+            except (KeyError, ValueError):
+                return True
+            if num == "1":
+                seen.usage1 = {"five_hour": {"pct": pct},
+                               "seven_day": {"pct": pct}}
+            return True
 
         sw = types.SimpleNamespace(
             _get_sequence_data=lambda: {"accounts": {
                 n: {"email": cls.EMAIL.format(n)} for n in cls.TOKENS}},
             read_account_credentials=_creds,
             usage_entries_by_account=_entries,
-            record_usage_headers=lambda n, h: seen.recorded.append(n) or True,
+            record_usage_headers=_record,
             consume_backup_grant=lambda *a, **k: seen.consumed.append(a),
             switch=lambda *a, **k: seen.switched.append(k),
             current_account_number=lambda: "2",
@@ -23536,9 +23549,8 @@ class TestSessionAffinityOnMessages:
         monkeypatch.setattr(pp, "_log_lifecycle", seen.logs.append)
         for state in (pp._affinity, pp._affinity_idents, pp._affinity_kept,
                       pp._affinity_rest, pp._affinity_logged,
-                      pp._affinity_dropped, pp._affinity_unseen,
-                      pp._AFFINITY_CACHE, pp._usage_header_seen,
-                      pp._usage_header_spawn_seen):
+                      pp._affinity_dropped, pp._AFFINITY_CACHE,
+                      pp._usage_header_seen, pp._usage_header_spawn_seen):
             state.clear()
         pp._affinity_snap.update(
             tried=float("-inf"), at=float("-inf"), busy=False, stuck=0)
@@ -23588,12 +23600,24 @@ class TestSessionAffinityOnMessages:
         return statuses, upstream.auths_seen
 
     def case_off_forwards_each_requests_own_bearer(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
         seen = self._wire(monkeypatch, certdir, armed=False)
+        taken = []
+
+        class _Lock:
+            def __enter__(self):
+                taken.append(1)
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(pp, "_affinity_lock", _Lock())
         statuses, auths = self._send(
-            certdir, [("tok-A", "S"), ("tok-B", "S")])
+            certdir, [("tok-A", "S"), ("tok-B", "S")], reply=self._util(0.42))
         assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
         assert not (seen.reads or seen.fetches), (
             "a switch that is off ran affinity code", seen)
+        assert not taken, "a reply under a switch that is off took the lock"
 
     def case_a_warm_session_keeps_its_account(self, monkeypatch, certdir):
         seen = self._wire(monkeypatch, certdir)
@@ -23823,33 +23847,22 @@ class TestSessionAffinityOnMessages:
     def case_a_client_token_the_snapshot_has_not_seen_keeps_the_session(
             self, monkeypatch, certdir):
         """A token that rotated since the last snapshot resolves to no slot:
-        that request goes out on it once, the session is not rebound, and one
-        rebuild starts at once, so the next request is kept."""
+        its requests go out on it and the session is not rebound; no rebuild
+        starts for it, the refresh that is due anyway resolves it."""
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, certdir)
         started = []
         monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
                             lambda fn: (started.append(1), fn()))
         self._send(certdir, [("tok-A", "S0")])
-        assert len(started) == 1
         self._seed("S", "tok-A")
         monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A", "2": "tok-B2"})
         _, auths = self._send(certdir, [("tok-B2", "S"), ("tok-B2", "S")])
-        assert auths == ["Bearer tok-B2", "Bearer tok-A"], auths
-        assert len(started) == 2, started
-
-    def case_an_unknown_token_starts_one_rebuild_not_one_per_request(
-            self, monkeypatch, certdir):
-        from cswap_pin import proxy as pp
-        self._wire(monkeypatch, certdir)
-        started = []
-        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
-                            lambda fn: (started.append(1), fn()))
-        self._send(certdir, [("tok-A", "S0")])
-        self._seed("S", "tok-A")
-        _, auths = self._send(certdir, [("tok-X", "S")] * 4)
-        assert auths == ["Bearer tok-X"] * 4, auths
-        assert len(started) == 2, started
+        assert auths == ["Bearer tok-B2"] * 2, auths
+        assert len(started) == 1 and pp._affinity["S"][0] == "tok-A", started
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        _, auths = self._send(certdir, [("tok-B2", "S")])
+        assert auths == ["Bearer tok-A"], auths
 
     def case_a_rebuild_that_hangs_is_abandoned_and_the_next_one_runs(
             self, monkeypatch, certdir):
@@ -23895,13 +23908,18 @@ class TestSessionAffinityOnMessages:
     def case_hung_rebuilds_pile_up_no_further_than_a_cap(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
-        self._wire(monkeypatch, certdir)
+        seen = self._wire(monkeypatch, certdir)
         queued = []
         monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
         for _ in range(pp._AFFINITY_STUCK_MAX + 3):
             self._send(certdir, [("tok-A", "S0")])
             pp._affinity_snap["tried"] -= pp._AFFINITY_STALE_S + 1
         assert len(queued) == pp._AFFINITY_STUCK_MAX + 1, len(queued)
+        lines = [l for l in seen.logs if "session affinity" in l]
+        assert len(lines) == pp._AFFINITY_STUCK_MAX, seen.logs
+        assert "stays off" in lines[-1] and not any(
+            "stays off" in l for l in lines[:-1]), (
+            "the cap is reached with the last abandonment, once", lines)
 
     def case_the_snapshot_is_dated_before_its_usage_read(
             self, monkeypatch, certdir):
@@ -23913,10 +23931,13 @@ class TestSessionAffinityOnMessages:
             pp._affinity_snap["at"], seen.fetch_times)
 
     @staticmethod
-    def _util(fraction, status=b"200 OK"):
+    def _util(fraction, status=b"200 OK", seven=None):
         return (b"HTTP/1.1 " + status + b"\r\n"
-                b"anthropic-ratelimit-unified-5h-utilization: %s\r\n"
-                b"Content-Length: 2\r\n\r\n{}" % str(fraction).encode())
+                b"anthropic-ratelimit-unified-5h-utilization: %s\r\n%s"
+                b"Content-Length: 2\r\n\r\n{}" % (
+                    str(fraction).encode(), b"" if seven is None else
+                    b"anthropic-ratelimit-unified-7d-utilization: %s\r\n"
+                    % str(seven).encode()))
 
     def case_a_slot_whose_reply_reads_its_bar_is_dropped_at_once(
             self, monkeypatch, certdir):
@@ -23948,9 +23969,49 @@ class TestSessionAffinityOnMessages:
         self._send(certdir, [("tok-A", "S0")])  # rebuild 1 starts and waits
         self._seed("S", "tok-A")
         self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
-        queued.pop()()  # it read the store before that reply
+        queued.pop(0)()  # it read the store before that reply
         _, auths = self._send(certdir, [("tok-B", "S")])
         assert auths == ["Bearer tok-B"], auths
+
+    def case_a_rebuild_started_after_a_drop_does_not_keep_the_slot_again(
+            self, monkeypatch, certdir):
+        """The reply that crossed the bar is a 200 inside the 30 s record
+        window: unless the drop carries it past both throttles into the store,
+        a rebuild that starts AFTER the drop reads the old figure and keeps
+        the slot, and the next kept reply drops it again."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        for util in (0.42, 0.95):
+            _, auths = self._send(
+                certdir, [("tok-B", "S")], reply=self._util(util))
+            assert auths == ["Bearer tok-A"], (util, auths)
+        assert seen.recorded == ["1", "1"], (
+            "the crossing reading was throttled away", seen.recorded)
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert len(seen.fetches) == 2, "no rebuild started after the drop"
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_drop_on_the_slots_own_bearer_records_to_that_slot(
+            self, monkeypatch, certdir):
+        """The crossing reply came back to a client still on the old bearer,
+        whose slot is not the live one: it is the slot's reading all the same."""
+        seen = self._wire(monkeypatch, certdir)
+        _, auths = self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
+        assert auths == ["Bearer tok-A"] and seen.recorded == ["1"], (
+            auths, seen.recorded)
+
+    def case_each_utilization_header_is_read_on_its_own(
+            self, monkeypatch, certdir):
+        for five, seven in (("n/a", 0.95), (0.95, "n/a")):
+            self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                reply=self._util(five, seven=seven))
+            assert auths == ["Bearer tok-A", "Bearer tok-B"], (
+                five, seven, auths)
 
     def case_a_stored_credential_with_no_expiry_is_not_kept(
             self, monkeypatch, certdir):
