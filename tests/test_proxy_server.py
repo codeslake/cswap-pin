@@ -19365,6 +19365,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         after it (T1961): trunk CI on macOS hung >300 s there, `cl_a`'s
         `SHUT_WR` never waking the blocked `recv`. Every byte is queued once
         the relay returns, so after `EOF_GRACE` the drain is woken instead."""
+        import errno as _errno
         import os as _os
         import socket as _s
         import warnings
@@ -19423,14 +19424,17 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     pending = b""
                 assert not pending, ("missed wakeup with data queued: the "
                                      "drain left bytes unread, SHUT_RD would drop them")
+                why = "SHUT_RD did not wake the drain"
                 try:
                     cl_b.shutdown(_s.SHUT_RD)
-                except OSError as e:  # XNU, read side already shut
-                    raise AssertionError(
-                        f"EOF arrived but the blocked recv was not woken: "
-                        f"SHUT_RD raised errno {e.errno} ({e.strerror})") from e
+                except OSError as e:
+                    why = (f"EOF arrived but the blocked recv was not woken: "
+                           f"SHUT_RD raised errno {e.errno} ({e.strerror})")
+                    # ENOTCONN: the peer's EOF landed after the join timeout (XNU, T2534)
+                    if e.errno != _errno.ENOTCONN:
+                        raise AssertionError(why) from e
                 reader.join(cls.EOF_GRACE)
-                assert not reader.is_alive(), "SHUT_RD did not wake the drain"
+                assert not reader.is_alive(), why
             return b"".join(got)
         finally:
             for x in (up_a, up_b, cl_a, cl_b):
@@ -19473,23 +19477,56 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 pytest.warns(UserWarning):
             self._relay(status=b"200 OK", reset=False)
 
-    def case_a_wake_the_platform_refuses_fails_naming_the_errno(self, monkeypatch):
-        """T1961. XNU may refuse `SHUT_RD` on a read side already shut (ENOTCONN).
-        THE INJECTED FAULT: `SHUT_RD` raises that, and the helper must say which
-        errno and what it means instead of a bare traceback."""
-        import errno
-        self._wire(monkeypatch, switched=False)
-        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+    @staticmethod
+    def _refuse_the_wake(monkeypatch, err, wakes):
+        """Swallow `SHUT_WR`, and make `SHUT_RD` raise `err` after (`wakes`)
+        or instead of the real shutdown that ends the blocked drain."""
         real = socket.socket.shutdown
 
         def _shutdown(s, how):
             if how == socket.SHUT_WR:
                 return
-            real(s, how)  # end the blocked drain; the raise is the fault
             if how == socket.SHUT_RD:
-                raise OSError(errno.ENOTCONN, "Socket is not connected")
+                if wakes:
+                    real(s, how)
+                raise OSError(err, "refused")
+            real(s, how)
         monkeypatch.setattr(socket.socket, "shutdown", _shutdown)
+
+    def case_an_enotconn_wake_after_the_eof_arrived_returns_every_byte(self, monkeypatch):
+        """T2534. macOS CI flaked: the peer's EOF landed between the join timeout
+        and `SHUT_RD`, which XNU refuses with ENOTCONN because the socket had
+        already ended. THE INJECTED FAULT: `SHUT_RD` raises ENOTCONN after the
+        drain was ended. That is an EOF, not a missed wakeup."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.ENOTCONN, wakes=True)
+        body = b"0123456789" * 1000
+        with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
+            got = self._relay(status=b"200 OK", reset=False, body=body)
+        assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
+
+    def case_an_enotconn_wake_that_ended_nothing_fails_naming_the_errno(self, monkeypatch):
+        """T2534. ENOTCONN is only an EOF that already arrived when the drain then
+        ends. THE INJECTED FAULT: `SHUT_RD` raises it and ends nothing, so the
+        drain stays blocked and the helper must say which errno, not hang."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.ENOTCONN, wakes=False)
         with pytest.raises(AssertionError, match=r"not woken.*errno %d" % errno.ENOTCONN), \
+                pytest.warns(UserWarning):
+            self._relay(status=b"200 OK", reset=False)
+
+    def case_any_other_refused_wake_fails_naming_the_errno(self, monkeypatch):
+        """T2534. Only ENOTCONN reads as an EOF: EINVAL after the drain ended
+        still fails, naming its errno."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.EINVAL, wakes=True)
+        with pytest.raises(AssertionError, match=r"not woken.*errno %d" % errno.EINVAL), \
                 pytest.warns(UserWarning):
             self._relay(status=b"200 OK", reset=False)
 
