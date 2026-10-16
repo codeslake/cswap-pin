@@ -23408,9 +23408,13 @@ _EXHAUSTED_RESET_CAP_S = 300.0
 # proved its own reset (see `_fleet_earliest_provable_reset`), and each
 # relay bounds it at relay time by that one request's own wall.
 _fleet_exhausted_until: float = 0.0
+# The `unified-representative-claim` that goes with `_fleet_exhausted_until`,
+# written beside it: `five_hour` ("Session limit") or `seven_day` ("Weekly
+# limit"), the window limiting the account that sets the fleet's reset.
+_fleet_exhausted_claim: str = "five_hour"
 
 
-def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
+def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
     """The fleet's earliest provable recovery and whether every blocked slot
     could prove one — mirrors `_earliest_recovery`'s (claude_swap/autoswitch.py)
     SHAPE: per account, the latest reset among its >=100% relevant windows,
@@ -23422,10 +23426,14 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
     slot the user disabled is never a `switch()` candidate, so folding it in
     here would announce a reset the fleet cannot actually reach.
 
-    Returns ``(earliest, all_provable)``. ``earliest`` is the minimum reset
-    among the blocked slots that DID prove one, or ``None`` if none did.
-    ``all_provable`` is False as soon as some blocked slot's own reset is
-    unprovable (absent, or already past — it could recover at any moment) —
+    Returns ``(earliest, all_provable, claim)``. ``earliest`` is the minimum
+    reset among the blocked slots that DID prove one, or ``None`` if none did.
+    ``claim`` names the window that sets it: the account's limiting window is
+    the one `limiting_reset_ts` picked (the latest reset among its >=100%
+    windows), "5h" is `five_hour` and every other, "7d" and a per-model
+    weekly one alike, is `seven_day`. ``all_provable`` is False as soon as
+    some blocked slot's own reset is unprovable (absent, or already past — it
+    could recover at any moment) —
     that slot is skipped from the minimum rather than voiding it, exactly
     like `_earliest_recovery`: what the others proved still stands. On any
     exception (an older host without these symbols, a fake that lacks them)
@@ -23441,14 +23449,18 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
         now = time.time()
         earliest: float | None = None
         all_provable = True
+        claim = "five_hour"
         for num, entry in sw.usage_entries_by_account(fetch=set()).items():
             if sw.is_account_disabled(num):
                 continue
             usage = entry.decision_value(("all",))
             if not isinstance(usage, dict):
                 continue
-            if not any(pct >= 100.0 for _, pct, _ in
-                       oauth.relevant_windows(usage, ("all",))):
+            walled = [(label, poll_policy.parse_reset_ts(resets_at))
+                      for label, pct, resets_at
+                      in oauth.relevant_windows(usage, ("all",))
+                      if pct >= 100.0]
+            if not walled:
                 continue
             reset = poll_policy.limiting_reset_ts(usage, ("all",))
             if reset is None or reset <= now:
@@ -23456,9 +23468,16 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
                 continue
             if earliest is None or reset < earliest:
                 earliest = reset
-        return earliest, all_provable
+                # `relevant_windows` lists 5h first, so a tie stays five_hour:
+                # cswap's `_walled_decision_value` gives a slot walled with no
+                # stored reading both windows at one deadline and records no
+                # claim, so nothing says better. A scoped window is weekly
+                # (oauth.py `relevant_windows`: "per-model weekly `scoped`").
+                label = next((l for l, ts in walled if ts == reset), "5h")
+                claim = "five_hour" if label == "5h" else "seven_day"
+        return earliest, all_provable, claim
     except Exception:  # noqa: BLE001 — never let this break the relay
-        return None, True
+        return None, True, "five_hour"
 
 
 def _switch_off_walled_account(
@@ -23555,7 +23574,7 @@ def _switch_off_walled_account(
     still debounces a storm without silencing the wall for its whole
     window.
     """
-    global _fleet_exhausted_until
+    global _fleet_exhausted_until, _fleet_exhausted_claim
     grant = kind == "grant"
     # daemon.log's wall readers match "429 on /v1/messages" and "relaying the
     # 429"; a refusal that is not a wall must not read as one.
@@ -23934,7 +23953,8 @@ def _switch_off_walled_account(
         if grant:
             pass  # a refusal says nothing about the fleet's walls
         elif result.get("reason") == "candidates-exhausted":
-            earliest, all_provable = _fleet_earliest_provable_reset()
+            earliest, all_provable, _fleet_exhausted_claim = (
+                _fleet_earliest_provable_reset())
             if earliest is None:
                 _fleet_exhausted_until = 0.0
             else:
@@ -23962,6 +23982,8 @@ def _switch_off_walled_account(
                     # provable moment, with a bounded re-check rather than a
                     # sleep toward a reset an unprovable peer may beat (the
                     # same trade `_earliest_recovery`'s own caller makes).
+                    # shortcut: no window produced the capped value, so the
+                    # claim stays the earliest account's.
                     _fleet_exhausted_until = min(
                         earliest, time.time() + _EXHAUSTED_RESET_CAP_S)
         else:
@@ -24292,6 +24314,8 @@ def _relay_response(
     # bound leaks into another wall's debounced repeat. `None` unless the
     # fleet is provably exhausted right now.
     _exhausted_until = _fleet_exhausted_until
+    # Read beside it; a torn pair costs only the label, both names retry alike.
+    _claim = _fleet_exhausted_claim
     _fleet_reset = None
     if _wall_relay and _exhausted_until > time.time():
         _fleet_reset = _exhausted_until
@@ -24302,13 +24326,26 @@ def _relay_response(
         # up `int()` when it reached the header further down.
         if _own_reset is not None and math.isfinite(_own_reset):
             if _own_reset > time.time():
-                _fleet_reset = min(_fleet_reset, _own_reset)
+                if _own_reset < _fleet_reset:
+                    _fleet_reset = _own_reset
+                    # The reset relayed is now this 429's own, so the claim
+                    # that comes with it is the upstream's, when it is one
+                    # Claude Code retries on (any other name is `other_claim`).
+                    _up = next(
+                        (l.split(b":", 1)[1].strip().decode("latin1") for l in
+                         lines[1:] if l.lower().startswith(
+                             b"anthropic-ratelimit-unified-representative-claim:")),
+                        "")
+                    if _up in ("five_hour", "seven_day"):
+                        _claim = _up
             else:
                 # A PAST own reset is the same case
                 # `_fleet_earliest_provable_reset` treats as unprovable:
                 # this request's own account could recover at any moment,
                 # so the far fleet value is bounded at the cap rather than
                 # relayed as-is.
+                # shortcut: no window produced the capped value, so the claim
+                # stays the fleet's; fine while Claude Code retries on either.
                 _fleet_reset = min(
                     _fleet_reset, time.time() + _EXHAUSTED_RESET_CAP_S)
     if _walled_401:
@@ -24412,13 +24449,16 @@ def _relay_response(
         # EARLIER, since a frozen bearer's own reset can belong to another
         # walled account whose reset is days away, and telling the client
         # to sleep until then would be worse than the wall it already
-        # backs off from.
+        # backs off from. The claim names the window behind the relayed
+        # reset (`five_hour` draws as "Session limit", `seven_day` as
+        # "Weekly limit"), never a scoped name.
         out.append(b"anthropic-ratelimit-unified-status: rejected")
         out.append(
             b"anthropic-ratelimit-unified-reset: "
             + str(int(_fleet_reset)).encode())
         out.append(
-            b"anthropic-ratelimit-unified-representative-claim: five_hour")
+            b"anthropic-ratelimit-unified-representative-claim: "
+            + _claim.encode())
     if chunked:
         # Transfer-Encoding is hop-by-hop, so the loop above drops it — but
         # _pipe_chunked relays the chunk-size lines VERBATIM. Announcing no
