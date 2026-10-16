@@ -23468,35 +23468,42 @@ class TestSessionAffinityOnMessages:
 
     @classmethod
     def _wire(cls, monkeypatch, certdir, armed=True, pct=10.0, walled=False,
-              expires=None, thresholds=None, disabled=None, fail=False):
+              expires=None, thresholds=None, disabled=None, fail=False,
+              no_expiry=False):
         """A fake switcher over two slots; returns what it was asked.
         ``pct`` is slot 1's usage on both windows (None: no reading).
         ``thresholds`` / ``disabled`` give the switcher the per-slot threshold
         and disabled-slot methods; left None it has neither, as an older
-        claude-swap host. ``fail``: the usage read raises. Every snapshot
-        rebuild runs inline unless a case swaps `_spawn_usage_header_recorder`."""
+        claude-swap host. ``fail``: the usage read raises. ``no_expiry``:
+        slot 1's stored credential carries no `expiresAt`. A case moves
+        ``seen.wall1`` to change what the next usage read says of slot 1.
+        Every snapshot rebuild runs inline unless a case swaps
+        `_spawn_usage_header_recorder`."""
         from cswap_pin import proxy as pp
 
         seen = types.SimpleNamespace(
             reads=[], fetches=[], consumed=[], switched=[], walled=[],
-            recorded=[], logs=[])
+            recorded=[], logs=[], fetch_times=[], wall1=walled)
         usage1 = None if pct is None else {
             "five_hour": {"pct": pct}, "seven_day": {"pct": pct}}
 
         def _creds(num, mail):
             seen.reads.append(num)
             exp = expires if (num == "1" and expires is not None) else cls.FAR
-            return json.dumps({"claudeAiOauth": {
-                "accessToken": cls.TOKENS[num], "expiresAt": exp}})
+            cred = {"accessToken": cls.TOKENS[num], "expiresAt": exp}
+            if num == "1" and no_expiry:
+                del cred["expiresAt"]
+            return json.dumps({"claudeAiOauth": cred})
 
         def _entries(fetch=None):
             seen.fetches.append(fetch)
+            seen.fetch_times.append(time.monotonic())
             if fail:
                 raise OSError("keychain")
             low = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
             return {
                 "1": types.SimpleNamespace(
-                    walled=walled, decision_value=lambda models=(): usage1),
+                    walled=seen.wall1, decision_value=lambda models=(): usage1),
                 "2": types.SimpleNamespace(
                     walled=False, decision_value=lambda models=(): low),
             }
@@ -23529,11 +23536,12 @@ class TestSessionAffinityOnMessages:
         monkeypatch.setattr(pp, "_log_lifecycle", seen.logs.append)
         for state in (pp._affinity, pp._affinity_idents, pp._affinity_kept,
                       pp._affinity_rest, pp._affinity_logged,
+                      pp._affinity_dropped, pp._affinity_unseen,
                       pp._AFFINITY_CACHE, pp._usage_header_seen,
                       pp._usage_header_spawn_seen):
             state.clear()
         pp._affinity_snap.update(
-            tried=float("-inf"), at=float("-inf"), busy=False)
+            tried=float("-inf"), at=float("-inf"), busy=False, stuck=0)
         marker = certdir / "session-affinity"
         marker.unlink(missing_ok=True)
         if armed:
@@ -23787,14 +23795,203 @@ class TestSessionAffinityOnMessages:
 
     def case_a_snapshot_past_the_stale_bound_is_not_used(
             self, monkeypatch, certdir):
+        """A snapshot older than the bound decides nothing: that request goes
+        out on the client's token, ONCE, and the session keeps its account
+        (a session idle for minutes while a switch happened is the common
+        case), and the request does not renew the session's clock either, so
+        the real TTL still ends it. The rebuild it started serves the next."""
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, certdir)
-        self._send(certdir, [("tok-A", "S0")])  # builds the snapshot
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])
+        queued.pop()()  # the first snapshot
         pp._affinity_snap["at"] -= pp._AFFINITY_STALE_S + 1
-        pp._affinity_snap["tried"] = time.monotonic()  # and no rebuild is due
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        self._seed("S", "tok-A", age=100)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert len(queued) == 1, "the stale request starts a rebuild"
+        token, at = pp._affinity["S"]
+        assert token == "tok-A" and time.monotonic() - at >= 100, (token, at)
+        queued.pop()()
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], (
+            "one stale request rebound the session to the client's token",
+            auths)
+
+    def case_a_client_token_the_snapshot_has_not_seen_keeps_the_session(
+            self, monkeypatch, certdir):
+        """A token that rotated since the last snapshot resolves to no slot:
+        that request goes out on it once, the session is not rebound, and one
+        rebuild starts at once, so the next request is kept."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        started = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: (started.append(1), fn()))
+        self._send(certdir, [("tok-A", "S0")])
+        assert len(started) == 1
+        self._seed("S", "tok-A")
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A", "2": "tok-B2"})
+        _, auths = self._send(certdir, [("tok-B2", "S"), ("tok-B2", "S")])
+        assert auths == ["Bearer tok-B2", "Bearer tok-A"], auths
+        assert len(started) == 2, started
+
+    def case_an_unknown_token_starts_one_rebuild_not_one_per_request(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        started = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: (started.append(1), fn()))
+        self._send(certdir, [("tok-A", "S0")])
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-X", "S")] * 4)
+        assert auths == ["Bearer tok-X"] * 4, auths
+        assert len(started) == 2, started
+
+    def case_a_rebuild_that_hangs_is_abandoned_and_the_next_one_runs(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+
+        def said():
+            return [l for l in seen.logs if "session affinity" in l]
+
+        self._send(certdir, [("tok-A", "S0")])  # starts rebuild 0, which hangs
+        self._send(certdir, [("tok-A", "S0")])
+        assert len(queued) == 1 and not said(), "one at a time while it is young"
+        pp._affinity_snap["tried"] -= pp._AFFINITY_STALE_S + 1
+        self._send(certdir, [("tok-A", "S0")] * 3)
+        assert len(queued) == 2, "a rebuild past the stale bound is abandoned"
+        assert len(said()) == 1 and "abandoned" in said()[0], seen.logs
+        queued[0]()  # the hung one returns while rebuild 1 is running
+        assert pp._affinity_snap["busy"], "it cleared the newer rebuild's flag"
+        assert not pp._affinity_kept and pp._affinity_snap["stuck"] == 0
+        queued[1]()
+        assert not pp._affinity_snap["busy"] and pp._affinity_kept
+
+    def case_an_abandoned_rebuilds_late_result_is_dropped(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])
+        pp._affinity_snap["tried"] -= pp._AFFINITY_STALE_S + 1
+        self._send(certdir, [("tok-A", "S0")])
+        seen.wall1 = True  # the store says slot 1 is walled now
+        queued[1]()
+        seen.wall1 = False  # and the hung rebuild, reading it as it was
+        queued[0]()
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], (
+            "a late result overwrote a newer snapshot", auths)
+
+    def case_hung_rebuilds_pile_up_no_further_than_a_cap(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        for _ in range(pp._AFFINITY_STUCK_MAX + 3):
+            self._send(certdir, [("tok-A", "S0")])
+            pp._affinity_snap["tried"] -= pp._AFFINITY_STALE_S + 1
+        assert len(queued) == pp._AFFINITY_STUCK_MAX + 1, len(queued)
+
+    def case_the_snapshot_is_dated_before_its_usage_read(
+            self, monkeypatch, certdir):
+        """A rebuild that hung part-way must not land old usage marked fresh."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._send(certdir, [("tok-A", "S0")])
+        assert pp._affinity_snap["at"] <= seen.fetch_times[0], (
+            pp._affinity_snap["at"], seen.fetch_times)
+
+    @staticmethod
+    def _util(fraction, status=b"200 OK"):
+        return (b"HTTP/1.1 " + status + b"\r\n"
+                b"anthropic-ratelimit-unified-5h-utilization: %s\r\n"
+                b"Content-Length: 2\r\n\r\n{}" % str(fraction).encode())
+
+    def case_a_slot_whose_reply_reads_its_bar_is_dropped_at_once(
+            self, monkeypatch, certdir):
+        """The snapshot lags a crossing by up to a rebuild cycle. A reply's own
+        utilization header, already in hand, is read in memory: no store
+        read, no wait for the next snapshot."""
+        for thresholds, util, want in (
+                (None, 0.95, "tok-B"), (None, 0.90, "tok-B"),
+                (None, 0.89, "tok-A"), ({"1": 60.0}, 0.65, "tok-B"),
+                ({"1": 60.0}, 0.55, "tok-A"), ({"2": 60.0}, 0.65, "tok-A")):
+            seen = self._wire(monkeypatch, certdir, thresholds=thresholds)
+            self._seed("S", "tok-A")
+            _, auths = self._send(
+                certdir, [("tok-A", "S"), ("tok-B", "S")],
+                reply=self._util(util))
+            assert auths == ["Bearer tok-A", f"Bearer {want}"], (
+                thresholds, util, auths)
+            assert len(seen.fetches) == 1, "the drop read the store"
+
+    def case_a_snapshot_started_before_a_drop_does_not_undo_it(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        self._send(certdir, [("tok-A", "S0")])  # rebuild 0 is under way
+        queued.pop()()
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        self._send(certdir, [("tok-A", "S0")])  # rebuild 1 starts and waits
+        self._seed("S", "tok-A")
+        self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
+        queued.pop()()  # it read the store before that reply
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+
+    def case_a_stored_credential_with_no_expiry_is_not_kept(
+            self, monkeypatch, certdir):
+        self._wire(monkeypatch, certdir, no_expiry=True)
         self._seed("S", "tok-A")
         _, auths = self._send(certdir, [("tok-B", "S")])
         assert auths == ["Bearer tok-B"], auths
+
+    def case_a_kept_accounts_429_headers_pass_the_spawn_gate(
+            self, monkeypatch, certdir):
+        """A wall reading must never be dropped: the 30 s throttle (per token
+        and per slot) is for the 200s that carry nothing new."""
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        self._send(certdir, [("tok-B", "S")], reply=self._util(0.42))
+        assert seen.recorded == ["1"], seen.recorded
+        _, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A",
+            reject_status=429, reject_headers=(
+                b"anthropic-ratelimit-unified-5h-utilization: 1.0\r\n"))
+        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+        assert seen.recorded == ["1", "1"], seen.recorded
+
+    def case_folded_take_backs_reach_the_log_with_the_next_snapshot(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        ident = ("1", self.EMAIL.format("1"))
+        for _ in range(3):
+            pp._affinity_take_back("S", ident, 429, None)
+        assert len(seen.logs) == 1, seen.logs
+        last, n = pp._affinity_logged[("1", 429)]
+        pp._affinity_logged[("1", 429)] = (last - 61, n)
+        self._send(certdir, [("tok-A", "S0")])  # a rebuild lands
+        lines = [l for l in seen.logs if "session affinity" in l]
+        assert len(lines) == 2 and "2 more" in lines[1], seen.logs
+        assert "slot 1" in lines[1] and "429" in lines[1], lines
+        pp._affinity_snap["tried"] = float("-inf")
+        self._send(certdir, [("tok-A", "S0")])
+        assert len([l for l in seen.logs if "session affinity" in l]) == 2, (
+            "said twice")
 
     def case_a_failing_rebuild_is_not_retried_per_request(
             self, monkeypatch, certdir):

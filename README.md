@@ -1043,27 +1043,37 @@ Claude Code's next request goes out on the new account's token and the prompt
 cache the session built on the old one is lost. With session affinity armed, a session (`x-claude-code-session-id`)
 whose last `/v1/messages` was within `autoswitch.cacheTtlSeconds` keeps the
 account it was on: the pin sends that request with the kept slot's *stored*
-access token. It sends it only while that token is unexpired (it never
-refreshes one and never spends a grant), the slot is not walled or disabled
-and every window reads under `autoswitch.threshold` (or under the slot's own
-switch threshold, when that is lower), and the client's token and the kept
-one both belong to a slot in your roster and to different ones. A new or
-cold session, a Console API key, an unknown token or an expired one is
-forwarded exactly as without it. If the kept account answers 401, 403, 404 or
+access token. It sends it only while that token has an `expiresAt` and is
+unexpired (it never refreshes one and never spends a grant), the slot is not
+walled or disabled and every window reads under `autoswitch.threshold` (or
+under the slot's own switch threshold, when that is lower), and the client's
+token and the kept one both belong to a slot in your roster and to different
+ones. A new or cold session, a Console API key or an expired one is forwarded
+exactly as without it. A reply that shows a kept slot at or over its own
+limit takes the slot out at once, without waiting for the next snapshot. If the kept account answers 401, 403, 404 or
 429, the pin takes that answer back before the client sees any of it, rests
 the account (until the 429's reset, else 60 s) and resends on the client's own
 token, so the client only ever hears from the live account. Each take-back
 writes a line to `daemon.log` (the slot, the status code, the rest in
-seconds, at most one a minute per slot and code), the account's usage headers
-on that reply still reach cswap's usage store, and a request sent on a kept
-token shows `kept=<slot>` in the `trace-to` log.
+seconds, at most one a minute per slot and code; the take-backs it folded into
+"; N more" are written by the next snapshot rebuild once the minute is up), the
+account's usage headers on that reply always reach cswap's usage store (a 429
+is never held back by the 30 s throttle), and a request sent on a kept token
+shows `kept=<slot>` in the `trace-to` log.
 
 A request never waits on the store or the Keychain for any of this. A
 snapshot of the roster (which slot stores which token, which slots have
 headroom) is rebuilt on a thread of its own, at most every 30 s and one at a
 time, by whichever armed request finds it that old; the request only reads
-it. With no snapshot yet, or one older than two minutes (a rebuild that failed
-or is stuck), a request goes out on the client's own token.
+it. With no snapshot yet, one older than two minutes (a rebuild that failed or
+is stuck), or a client token the snapshot has not seen yet (a token that
+rotated, for which one rebuild starts at once), that one request goes out on
+the client's own token and the session keeps its account: it is not rebound to
+that token, and its clock is not renewed, so the cache time still ends it. A
+rebuild that has not returned after two minutes is abandoned, a `daemon.log`
+line says so, a new one starts, and the abandoned one's late answer is thrown
+away (at most three abandoned ones are left waiting; a read stuck for good
+costs those three threads and nothing else).
 
 Real scope: under the `dynamic` strategy the proactive and at-limit moves
 leave an account at 97% or more, so the 90 gate never keeps a session through
