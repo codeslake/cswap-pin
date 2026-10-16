@@ -24580,7 +24580,12 @@ class TestTheDaemonRepairsItsOwnWiring:
     ):
         """A connect that times out is no answer yet, never proof of a dead
         port: only a REFUSED connect is. On a loaded runner a live listener's
-        connect can outlast the probe's 1 s (macOS CI, T2534)."""
+        connect can outlast the probe's 1 s (macOS CI, T2534).
+
+        AND THE DAEMON STAYS CLAIMED. `_is_claimed` False, with no live client
+        and no channel, is the first step of the teardown, whose own 0.5 s
+        `_port_answers` probe times out under the same load and then unwires
+        the peer: no pin at all. So: claimed, nothing written, ask next tick."""
         from cswap_pin import proxy
 
         certdir = self._ours(tmp_path, monkeypatch, 36301)
@@ -24591,12 +24596,14 @@ class TestTheDaemonRepairsItsOwnWiring:
             raise TimeoutError("timed out")
 
         monkeypatch.setattr(proxy.socket, "create_connection", _times_out)
+        monkeypatch.setattr(proxy, "clients_that_arming_would_cut_off", lambda p: 0)
         monkeypatch.setattr(
             proxy,
             "wire_global_config",
-            lambda p, ca: pytest.fail("stole a wiring whose probe only timed out"),
+            lambda p, ca: pytest.fail("wrote the wiring on a probe that only timed out"),
         )
-        assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+        assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is True
+        assert proxy._is_claimed(certdir, live_clients=lambda: 0) is True
 
     def case_a_wiring_on_a_FULL_BACKLOG_listener_is_never_stolen(
         self, tmp_path, monkeypatch
@@ -24623,9 +24630,9 @@ class TestTheDaemonRepairsItsOwnWiring:
             except TimeoutError:
                 pass
             except OSError:
-                return  # this host's stack does not time out here, so the premise is absent
+                pytest.skip("this host's stack does not time out here, so the premise is absent")
             else:
-                return
+                pytest.skip("the full backlog still accepted, so the premise is absent")
             certdir = self._ours(tmp_path, monkeypatch, 36301)
             proxy._mark_wired_once(certdir, 36301)
             monkeypatch.setattr(proxy, "_wired_port", lambda: addr[1])
@@ -24634,7 +24641,7 @@ class TestTheDaemonRepairsItsOwnWiring:
                 "wire_global_config",
                 lambda p, ca: pytest.fail("stole a wiring from a listener that only timed out"),
             )
-            assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+            assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is True
         finally:
             for c in fillers:
                 c.close()
