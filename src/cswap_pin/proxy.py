@@ -3351,7 +3351,11 @@ def _affinity_kick(threshold: float) -> None:
         if due:
             _affinity_snap.update(busy=True, tried=now)
     if due:
-        _spawn_usage_header_recorder(lambda: _affinity_rebuild(threshold))
+        try:
+            _spawn_usage_header_recorder(lambda: _affinity_rebuild(threshold))
+        except Exception:  # noqa: BLE001 — no thread to start is no snapshot
+            with _affinity_lock:
+                _affinity_snap["busy"] = False
 
 
 def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:

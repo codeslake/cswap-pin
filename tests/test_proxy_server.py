@@ -23769,6 +23769,22 @@ class TestSessionAffinityOnMessages:
         _, auths = self._send(certdir, [("tok-B", "S")])
         assert auths == ["Bearer tok-A"], auths
 
+    def case_a_thread_that_cannot_start_does_not_cost_the_request(
+            self, monkeypatch, certdir):
+        """`threading.Thread.start` can raise (no threads left): the request
+        goes out on its own bearer, and the next one may try again."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+
+        def _no_thread(fn):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", _no_thread)
+        self._seed("S", "tok-A")
+        statuses, auths = self._send(certdir, [("tok-B", "S")])
+        assert (statuses, auths) == ([200], ["Bearer tok-B"]), (statuses, auths)
+        assert not pp._affinity_snap["busy"], "a rebuild that never started"
+
     def case_a_snapshot_past_the_stale_bound_is_not_used(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
