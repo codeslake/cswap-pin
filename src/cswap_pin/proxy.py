@@ -23398,8 +23398,13 @@ def _messages_trace_tags(headers, body: bytes) -> str:
 
 
 _EXHAUSTED_RESET_CAP_S = 300.0
-# Epoch seconds the fleet is provably exhausted until, or 0.0 when it is
-# not (or nothing about its return could be proved). Written ONLY inside
+# ``(until, claim)``: epoch seconds the fleet is provably exhausted until, or
+# 0.0 when it is not (or nothing about its return could be proved), and the
+# `unified-representative-claim` that goes with it, `five_hour` ("Session
+# limit") or `seven_day` ("Weekly limit"), the window limiting the account
+# that sets the reset. ONE tuple, assigned once at each write and loaded once
+# at the read, so a relay never pairs one decision's reset with another's
+# claim. Written ONLY inside
 # `_switch_off_walled_account`, under `_walled_switch_lock`, after the
 # `switch()` call whose verdict this is about — a debounced repeat and the
 # per-session stale-bearer early return read whatever the last decision
@@ -23407,11 +23412,8 @@ _EXHAUSTED_RESET_CAP_S = 300.0
 # the only reader; this value is stored uncapped when every blocked slot
 # proved its own reset (see `_fleet_earliest_provable_reset`), and each
 # relay bounds it at relay time by that one request's own wall.
-_fleet_exhausted_until: float = 0.0
-# The `unified-representative-claim` that goes with `_fleet_exhausted_until`,
-# written beside it: `five_hour` ("Session limit") or `seven_day` ("Weekly
-# limit"), the window limiting the account that sets the fleet's reset.
-_fleet_exhausted_claim: str = "five_hour"
+_FLEET_OPEN = (0.0, "five_hour")
+_fleet_exhausted: tuple[float, str] = _FLEET_OPEN
 
 
 def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
@@ -23431,14 +23433,17 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
     ``claim`` names the window that sets it: the account's limiting window is
     the one `limiting_reset_ts` picked (the latest reset among its >=100%
     windows), "5h" is `five_hour` and every other, "7d" and a per-model
-    weekly one alike, is `seven_day`. ``all_provable`` is False as soon as
+    weekly one alike, is `seven_day`. A tie between "5h" and a weekly window
+    is `seven_day` when the entry's stored reading (``last_good``, not the
+    walled override) has a weekly window at >=100%, else `five_hour`.
+    ``all_provable`` is False as soon as
     some blocked slot's own reset is unprovable (absent, or already past — it
     could recover at any moment) —
     that slot is skipped from the minimum rather than voiding it, exactly
     like `_earliest_recovery`: what the others proved still stands. On any
     exception (an older host without these symbols, a fake that lacks them)
-    this returns ``(None, True)``, which the caller reads as "nothing
-    proven" the same as an empty fleet.
+    this returns ``(None, True, "five_hour")``, which the caller reads as
+    "nothing proven" the same as an empty fleet.
 
     Call under `_walled_switch_lock`, exactly like `_live_account_headroom`
     — `fetch=set()` forbids a network fetch, so this reads store rows only.
@@ -23468,13 +23473,22 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
                 continue
             if earliest is None or reset < earliest:
                 earliest = reset
-                # `relevant_windows` lists 5h first, so a tie stays five_hour:
-                # cswap's `_walled_decision_value` gives a slot walled with no
-                # stored reading both windows at one deadline and records no
-                # claim, so nothing says better. A scoped window is weekly
-                # (oauth.py `relevant_windows`: "per-model weekly `scoped`").
-                label = next((l for l, ts in walled if ts == reset), "5h")
-                claim = "five_hour" if label == "5h" else "seven_day"
+                # A scoped window is weekly (oauth.py `relevant_windows`:
+                # "per-model weekly `scoped`"). cswap walls a slot until its
+                # earliest stored reset and `_walled_decision_value` forces
+                # 5h to 100% there, so a real weekly wall ending first ties
+                # with the forced 5h at one second, and a slot walled with no
+                # stored 7d gets a synthesized 7d at that deadline too. The
+                # entry's own `last_good` tells them apart: a weekly window
+                # at 100% there is the wall; without one nothing says the
+                # week is walled, so the tie is the session claim.
+                labels = {l for l, ts in walled if ts == reset}
+                stored_weekly = any(
+                    l != "5h" and pct >= 100.0 for l, pct, _ in
+                    oauth.relevant_windows(
+                        getattr(entry, "last_good", None), ("all",)))
+                claim = ("five_hour" if labels <= {"5h"} or (
+                    "5h" in labels and not stored_weekly) else "seven_day")
         return earliest, all_provable, claim
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None, True, "five_hour"
@@ -23498,7 +23512,7 @@ def _switch_off_walled_account(
     on file also has its slot marked again once the pin's bar there has
     lapsed). The pin's bar is written after `switch()` returns, for every
     slot in `exclude` as the host marks them all, never on a raise. It writes
-    no `_walled_slots` and no `_fleet_exhausted_until`, and answers False, so
+    no `_walled_slots` and no `_fleet_exhausted`, and answers False, so
     the 403 is relayed UNCHANGED, on every path that does not end in a
     validated landing or in that bearer branch's 401.
 
@@ -23574,7 +23588,7 @@ def _switch_off_walled_account(
     still debounces a storm without silencing the wall for its whole
     window.
     """
-    global _fleet_exhausted_until, _fleet_exhausted_claim
+    global _fleet_exhausted
     grant = kind == "grant"
     # daemon.log's wall readers match "429 on /v1/messages" and "relaying the
     # 429"; a refusal that is not a wall must not read as one.
@@ -23856,7 +23870,7 @@ def _switch_off_walled_account(
                 # this, since the fleet is not, in fact, known exhausted. A
                 # refusal says nothing about the fleet's walls.
                 if not grant:
-                    _fleet_exhausted_until = 0.0
+                    _fleet_exhausted = _FLEET_OPEN
                 return True
         # THE WALL ITSELF, RECORDED — only for a 429 whose bearer is the
         # live slot's OWN token: a bearer-branch 429 (handled above) is
@@ -23939,7 +23953,7 @@ def _switch_off_walled_account(
                 f"{exc.__class__.__name__}, relaying {relay_no}"
             )
             if not grant:
-                _fleet_exhausted_until = 0.0
+                _fleet_exhausted = _FLEET_OPEN
             _remember_walled_switch(key, False, cap_epoch)
             return False
         # THE FLEET FACT, decided for every `switch()` verdict on this wall
@@ -23953,10 +23967,9 @@ def _switch_off_walled_account(
         if grant:
             pass  # a refusal says nothing about the fleet's walls
         elif result.get("reason") == "candidates-exhausted":
-            earliest, all_provable, _fleet_exhausted_claim = (
-                _fleet_earliest_provable_reset())
+            earliest, all_provable, claim = _fleet_earliest_provable_reset()
             if earliest is None:
-                _fleet_exhausted_until = 0.0
+                _fleet_exhausted = _FLEET_OPEN
             else:
                 if all_provable:
                     # Every blocked slot proved its own reset: store the
@@ -23973,7 +23986,7 @@ def _switch_off_walled_account(
                     # visible in the client and interruptible, and while every
                     # blocked slot's own reset is provable no switch could
                     # have freed it any sooner anyway.
-                    _fleet_exhausted_until = earliest
+                    _fleet_exhausted = (earliest, claim)
                 else:
                     # NOT every blocked slot proved a reset: the one(s) that
                     # did not could beat `earliest`, so relaying it unbounded
@@ -23982,10 +23995,11 @@ def _switch_off_walled_account(
                     # provable moment, with a bounded re-check rather than a
                     # sleep toward a reset an unprovable peer may beat (the
                     # same trade `_earliest_recovery`'s own caller makes).
-                    _fleet_exhausted_until = min(
-                        earliest, time.time() + _EXHAUSTED_RESET_CAP_S)
+                    _fleet_exhausted = (
+                        min(earliest, time.time() + _EXHAUSTED_RESET_CAP_S),
+                        claim)
         else:
-            _fleet_exhausted_until = 0.0
+            _fleet_exhausted = _FLEET_OPEN
         landed = bool(
             result and result.get("switched") and not result.get("needsLogin")
         )
@@ -24311,9 +24325,7 @@ def _relay_response(
     # fleet value, and each request is bounded by its own wall — no wall's
     # bound leaks into another wall's debounced repeat. `None` unless the
     # fleet is provably exhausted right now.
-    _exhausted_until = _fleet_exhausted_until
-    # Read beside it; a torn pair costs only the label, both names retry alike.
-    _claim = _fleet_exhausted_claim
+    _exhausted_until, _claim = _fleet_exhausted
     _fleet_reset = None
     if _wall_relay and _exhausted_until > time.time():
         _fleet_reset = _exhausted_until
@@ -24328,14 +24340,16 @@ def _relay_response(
                     _fleet_reset = _own_reset
                     # The reset relayed is now this 429's own, so the claim
                     # that comes with it is the upstream's, when it is one
-                    # Claude Code retries on (any other name is `other_claim`).
+                    # Claude Code retries on (any other name is `other_claim`),
+                    # else `five_hour`: the fleet's claim came from another
+                    # account's window.
                     _up = next(
                         (l.split(b":", 1)[1].strip().decode("latin1") for l in
                          lines[1:] if l.lower().startswith(
                              b"anthropic-ratelimit-unified-representative-claim:")),
                         "")
-                    if _up in ("five_hour", "seven_day"):
-                        _claim = _up
+                    _claim = (_up if _up in ("five_hour", "seven_day")
+                              else "five_hour")
             else:
                 # A PAST own reset is the same case
                 # `_fleet_earliest_provable_reset` treats as unprovable:
@@ -24441,7 +24455,7 @@ def _relay_response(
         # stated reset and quota-auto-resuming. These three headers give
         # it that reset instead — the fleet's own value, capped at
         # `_EXHAUSTED_RESET_CAP_S` only when some blocked slot's own return
-        # could not be proved (see where `_fleet_exhausted_until` is
+        # could not be proved (see where `_fleet_exhausted` is
         # written). The reset relayed is NEVER LATER than the fleet's
         # value: this 429's own `reset` is folded in only when it is
         # EARLIER, since a frozen bearer's own reset can belong to another
