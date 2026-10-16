@@ -23485,8 +23485,7 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool, str]:
                 labels = {l for l, ts in walled if ts == reset}
                 stored_weekly = any(
                     l != "5h" and pct >= 100.0 for l, pct, _ in
-                    oauth.relevant_windows(
-                        getattr(entry, "last_good", None), ("all",)))
+                    oauth.relevant_windows(entry.last_good, ("all",)))
                 claim = ("five_hour" if labels <= {"5h"} or (
                     "5h" in labels and not stored_weekly) else "seven_day")
         return earliest, all_provable, claim

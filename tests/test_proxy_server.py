@@ -19298,7 +19298,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                         "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
                 "1": types.SimpleNamespace(
                     decision_value=lambda models=(): usage,
-                    walled=entry_walled),
+                    walled=entry_walled, last_good=usage),
             }
             for num, fusage in (fleet or {}).items():
                 entries[num] = types.SimpleNamespace(
