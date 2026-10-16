@@ -3215,6 +3215,313 @@ def slow_report_ms(certdir) -> "float | None":
     return value
 
 
+# SESSION AFFINITY ON /v1/messages. OFF UNLESS ARMED. A warm session (its last
+# /v1/messages inside `autoswitch.cacheTtlSeconds`) keeps the account it was on
+# after cswap switches the live one, so the switch does not throw away its
+# prompt cache: the request goes out with that slot's STORED token. Armed by
+# `remoteControl.sessionAffinity: true` in settings.json (every host, that file
+# is shared) or by a `session-affinity` file in the certdir (this host alone,
+# like `trace-to`); both re-read on a short cache, like `slow_report_ms`.
+_AFFINITY_SWITCH_FILE = "session-affinity"
+_AFFINITY_RECHECK_S = 5.0
+_AFFINITY_CACHE: dict = {}
+_AFFINITY_MAX = 512  # entries per table below
+# THE SNAPSHOT (see `_affinity_rebuild`) is rebuilt at most this often, started
+# by whichever armed request finds it this old, and not ruled on past the
+# second figure: a request that finds it older, or finds a client token it has
+# not seen (a rotation since), goes out on the client's own token and the
+# session keeps its account, and a rebuild that has run that long is abandoned
+# and replaced, at most `_AFFINITY_STUCK_MAX` of them still hung at once. The request path never
+# reads the store, so it must already have a snapshot when a switch happens:
+# that is why traffic keeps it fresh.
+_AFFINITY_REFRESH_S = 30.0
+_AFFINITY_STALE_S = 120.0
+_AFFINITY_STUCK_MAX = 3
+_AFFINITY_BACKOFF_S = 60.0  # a refusing account's rest when its 429 names no reset
+# IN MEMORY, ONE LOCK, AND GONE ON A DAEMON HANDOVER BY DESIGN: a successor
+# starts every session cold, which is today's behaviour.
+_affinity_lock = threading.Lock()
+# session -> (bearer it last went out on, monotonic time of that request)
+_affinity: dict[str, tuple[str, float]] = {}
+# bearer -> (slot, email) whose stored credential held it. Grows with every
+# rebuild and is never pruned by one: a session may still hold the token a
+# slot has since moved off.
+_affinity_idents: dict[str, tuple] = {}
+# (slot, email) -> (stored token, its expiresAt, the slot's bar in percent) for
+# the slots that had headroom at the last rebuild.
+_affinity_kept: dict[tuple, tuple] = {}
+# (slot, email) -> monotonic time a reply showed the slot at its bar: it is not
+# kept again by a snapshot that started before that
+_affinity_dropped: dict[tuple, float] = {}
+# (slot, email) -> monotonic time until which a slot that refused is not kept
+_affinity_rest: dict[tuple, float] = {}
+# when the current rebuild started (`tried`: its identity), when the landed
+# snapshot's read started (`at`), whether one is running, and how many
+# abandoned ones have still not returned
+_affinity_snap = {"tried": -math.inf, "at": -math.inf, "busy": False,
+                  "stuck": 0}
+# (slot, code) -> (monotonic time of its last lifecycle line, take-backs
+# folded into the next one)
+_affinity_logged: dict[tuple, tuple] = {}
+
+
+def session_affinity_config(certdir) -> "tuple[float, float] | None":
+    """(cache TTL in seconds, threshold in percent) when session affinity is
+    armed, else None. Unreadable or absent is OFF, never an error: a switch
+    that can break a request is worse than none."""
+    if certdir is None:
+        return None
+    key = str(certdir)
+    seen, cfg = _AFFINITY_CACHE.get(key, (0.0, None))
+    now = time.time()
+    if now - seen < _AFFINITY_RECHECK_S:
+        return cfg
+    cfg = None
+    try:
+        _settings = require("settings")
+        root = Path(certdir).parent
+        section = _settings._read_raw(_settings.settings_path(root)).get(
+            "remoteControl")
+        if (isinstance(section, dict) and section.get("sessionAffinity") is True
+                ) or (Path(certdir) / _AFFINITY_SWITCH_FILE).exists():
+            loaded = _settings.load_settings(root)
+            cfg = (float(getattr(loaded, "cache_ttl_seconds", 3600.0)),
+                   float(loaded.threshold))
+    except Exception:  # noqa: BLE001 — a switch must not cost a request
+        cfg = None
+    _AFFINITY_CACHE[key] = (now, cfg)
+    return cfg
+
+
+def _bounded_put(table: dict, key, value) -> None:
+    """Insert ``key`` as the newest entry; the oldest goes past the cap."""
+    table.pop(key, None)
+    table[key] = value
+    if len(table) > _AFFINITY_MAX:
+        del table[next(iter(table))]
+
+
+def _affinity_rebuild(threshold: float, started: float) -> None:
+    """Rebuild the snapshot from the store: which slot stores which token, and
+    which slots may be kept (a token with an `expiresAt` that is unexpired at
+    pick time, not walled, not disabled, every window under the lower of
+    ``threshold`` and the slot's own `switchThreshold`, kept with that bar).
+    Runs on a daemon thread, never a request's: a store or Keychain read can
+    hang, and then only this thread does.
+
+    ``started`` is the `tried` stamp `_affinity_kick` took before this read:
+    the age the snapshot is judged by, and this rebuild's identity. One that
+    was abandoned meanwhile lands its token facts and nothing else.
+
+    NO refresh and NO consume: the read is `fetch=set()`, which forbids every
+    fetch, so it can consume nothing. Not `_live_account_headroom`, whose
+    `fetch={num}` can fetch (and for an inactive slot consume). A failure
+    leaves the old snapshot to age out."""
+    try:
+        sw = require("switcher").ClaudeAccountSwitcher()
+        own = getattr(sw, "account_switch_thresholds", dict)()
+        disabled = getattr(sw, "is_account_disabled", lambda _n: False)
+        entries = sw.usage_entries_by_account(fetch=set())
+        idents, kept, owed = {}, {}, []
+        for num, info in sw._get_sequence_data()["accounts"].items():
+            slot, ident = str(num), (str(num), info["email"])
+            try:  # one unreadable slot must not end affinity for the rest
+                data = oauth.extract_oauth_data(
+                    sw.read_account_credentials(num, info["email"]))
+                if not (data and data.get("accessToken")):
+                    continue
+                idents[data["accessToken"]] = ident
+                entry = entries[slot]
+                usage = entry.decision_value(("all",))
+                windows = {w for w, _, _ in oauth.relevant_windows(
+                    usage, ("all",))}
+                bar = min(threshold, own.get(slot, threshold))
+                if not (getattr(entry, "walled", False) or disabled(slot)
+                        or not {"5h", "7d"} <= windows
+                        or not isinstance(data.get("expiresAt"), (int, float))
+                        or oauth.account_headroom(usage, ("all",))
+                        <= 100.0 - bar):
+                    kept[ident] = (data["accessToken"], data["expiresAt"], bar)
+            except Exception:  # noqa: BLE001
+                pass
+        with _affinity_lock:
+            for token, ident in idents.items():
+                _bounded_put(_affinity_idents, token, ident)
+            if _affinity_snap["tried"] == started:
+                _affinity_kept.clear()
+                _affinity_kept.update(
+                    (i, v) for i, v in kept.items()
+                    if _affinity_dropped.get(i, -math.inf) < started)
+                _affinity_snap["at"] = started
+                now = time.monotonic()
+                owed = [(k, n) for k, (t, n) in _affinity_logged.items()
+                        if n and now - t >= _BUSY_REPORT_COOLDOWN_S]
+                for k, _ in owed:
+                    _affinity_logged[k] = (now, 0)
+        for (slot, code), n in owed:  # take-backs `_affinity_take_back` folded
+            _log_lifecycle(
+                f"session affinity: slot {slot} answered {code} to kept "
+                f"sessions; {n} more since the last line")
+    except Exception:  # noqa: BLE001 — never let this break a request
+        pass
+    finally:
+        with _affinity_lock:
+            if _affinity_snap["tried"] == started:
+                _affinity_snap["busy"] = False
+            else:
+                _affinity_snap["stuck"] -= 1
+
+
+def _affinity_kick(threshold: float) -> None:
+    """Start `_affinity_rebuild` on a thread of its own when the last one
+    started `_AFFINITY_REFRESH_S` ago and none is running (one at a time, a
+    failed one is not retried per request).
+
+    A rebuild that has run `_AFFINITY_STALE_S` is ABANDONED: a hung Keychain
+    or store read must not end affinity while it hangs. Its thread is left to
+    return whenever it does and its verdict is dropped; at most
+    `_AFFINITY_STUCK_MAX` of them are left at once, so a store that hangs for
+    days costs four threads (those and the rebuild running), not one an
+    interval, and affinity is off until one of them returns or the daemon
+    restarts. One lifecycle line per abandonment, which `tried` already holds
+    to one per `_AFFINITY_STALE_S`; the last one allowed says so."""
+    now = time.monotonic()
+    snap = _affinity_snap
+    with _affinity_lock:
+        age = now - snap["tried"]
+        abandon = (snap["busy"] and age >= _AFFINITY_STALE_S
+                   and snap["stuck"] < _AFFINITY_STUCK_MAX)
+        due = abandon or (not snap["busy"] and age >= _AFFINITY_REFRESH_S)
+        if due:
+            if abandon:
+                snap["stuck"] += 1
+            snap.update(busy=True, tried=now)
+    if abandon:
+        _log_lifecycle(
+            f"session affinity: a snapshot rebuild started {age:.0f}s ago has "
+            f"not returned (a store or Keychain read stuck?), abandoned and "
+            f"started again; {snap['stuck']} abandoned still out"
+            + (", the most allowed: if this one hangs too, affinity stays off "
+               "until one returns or the daemon restarts"
+               if snap["stuck"] >= _AFFINITY_STUCK_MAX else ""))
+    if due:
+        try:
+            _spawn_usage_header_recorder(
+                lambda: _affinity_rebuild(threshold, now))
+        except Exception:  # noqa: BLE001 — no thread to start is no snapshot
+            with _affinity_lock:
+                snap["busy"] = False
+
+
+def _affinity_note_usage(token: str, headers: dict) -> "tuple | None":
+    """A reply's own 5h/7d utilization is the freshest reading there is of the
+    account it came from, and the snapshot is up to `_AFFINITY_REFRESH_S`
+    older: when it puts a kept slot at or over that slot's bar, the slot is
+    not kept any more, and no snapshot that started before the reply keeps it
+    again. In memory, on the relay's thread: no store read. ``token`` is the
+    bearer the request went out on. Returns the (slot, email) it dropped, else
+    None: that reading is what a rebuild started after the drop must find in
+    the store, so the caller records it to that slot past the throttles.
+    Nothing kept (affinity never armed) returns before the lock."""
+    if not _affinity_kept:
+        return None
+    used = -math.inf
+    for w in ("5h", "7d"):  # each on its own: a malformed one skips only itself
+        try:
+            used = max(used, 100.0 * float(
+                headers[f"anthropic-ratelimit-unified-{w}-utilization"]))
+        except (KeyError, ValueError):
+            pass
+    with _affinity_lock:
+        ident = _affinity_idents.get(token)
+        stored = _affinity_kept.get(ident)
+        if stored is None or used < stored[2]:
+            return None
+        del _affinity_kept[ident]
+        _bounded_put(_affinity_dropped, ident, time.monotonic())
+        return ident
+
+
+def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
+    """The kept account refused a request: end the session's affinity and rest
+    the account until its 429's ``reset`` (epoch seconds), or for
+    `_AFFINITY_BACKOFF_S` when there is none. One lifecycle line per (slot,
+    code) per `_BUSY_REPORT_COOLDOWN_S`, folding the rest into "; N more":
+    the slot, the code and the rest, never a bearer."""
+    wait = _AFFINITY_BACKOFF_S
+    if reset is not None and math.isfinite(reset) and reset > time.time():
+        wait = reset - time.time()
+    now, key = time.monotonic(), (ident[0], code)
+    with _affinity_lock:
+        _affinity.pop(session, None)
+        _bounded_put(_affinity_rest, ident, now + wait)
+        last, more = _affinity_logged.get(key, (None, 0))
+        say = last is None or now - last >= _BUSY_REPORT_COOLDOWN_S
+        _affinity_logged[key] = (now, 0) if say else (last, more + 1)
+    if say:
+        _log_lifecycle(
+            f"session affinity: slot {ident[0]} answered {code} to a kept "
+            f"session, resent on the live account, slot rested {wait:.0f}s"
+            + (f"; {more} more" if more else ""))
+
+
+def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
+    """(token, (slot, email), session) to send in place of the client's
+    bearer, or None to forward the client's own.
+
+    Only a warm session whose bearer CHANGED is looked into, and it keeps its
+    account only when BOTH its kept bearer and the client's resolve to a slot
+    and the slots differ: a client token in no slot may be a login the pin
+    must not override. A non-Bearer credential or no session header is not
+    looked at; a new, cold, no-headroom, no-expiry or expired one rebinds the
+    session to the client's bearer and forwards it as it always did.
+
+    NEVER READS THE STORE: it reads the snapshot `_affinity_rebuild` made on
+    its own thread. With no snapshot yet, one older than `_AFFINITY_STALE_S`,
+    or a client token it has not seen, the client's bearer goes out and the
+    session is left as it was (see the comment below), until the refresh that
+    is due anyway has run.
+    """
+    cfg = session_affinity_config(certdir)
+    if cfg is None:
+        return None
+    ttl, threshold = cfg
+    client = session = ""
+    for k, v in headers:
+        kl = k.lower()
+        if kl == "authorization":
+            client = _bearer(v)
+        elif kl == "x-claude-code-session-id":
+            session = v
+    if not (client and session):
+        return None
+    now = time.monotonic()
+    _affinity_kick(threshold)
+    token = None
+    with _affinity_lock:
+        prior = _affinity.get(session)
+        if prior is None or now - prior[1] > ttl or prior[0] == client:
+            _bounded_put(_affinity, session, (client, now))
+            return None
+        held = _affinity_idents.get(prior[0])
+        mine = _affinity_idents.get(client)
+        fresh = now - _affinity_snap["at"] < _AFFINITY_STALE_S
+        # NOTHING TO RULE ON when there is no snapshot, one too old, or a client
+        # token it has not seen (a rotation since): the request goes out on the
+        # client's token and the session is left as it was, its clock too, so
+        # the real TTL still ends it. Rebinding it here would end its affinity
+        # for good after every idle gap.
+        if fresh and mine:
+            stored = (held and mine and held != mine
+                      and _affinity_rest.get(held, 0.0) <= now
+                      and _affinity_kept.get(held))
+            token = (stored and not oauth.is_oauth_token_expired(stored[1])
+                     and stored[0])
+            _bounded_put(_affinity, session,
+                         (prior[0] if token else client, now))
+    return (token, held, session) if token else None
+
+
 # THE TWO LINES `_report_deaf_bridges` writes, as symbols rather than prose.
 # A peer watcher greps the daemon log for these; exported so it can assert at
 # runtime that the substrings it looks for are actually present HERE, in the
@@ -3314,7 +3621,9 @@ def is_pinned_route(path: str, ua: str = "") -> bool:
     bearer — Remote-Control session lifecycle, Artifact ("frame") deploys,
     and Ultrareview (a claude.ai capability gated on the same bearer).
     False for everything else, most importantly ``/v1/messages`` (which must
-    keep billing the currently-swapped inference account).
+    keep billing the currently-swapped inference account, unless session
+    affinity keeps a warm session on its account: see `_affinity_pick`, a
+    separate bearer source that is off unless armed).
 
     ``/v1/sessions/<id>/...`` is the RC session-lifecycle sibling of
     ``/v1/code/sessions`` — reconnect unarchives via ``/v1/sessions/{id}/
@@ -21200,6 +21509,18 @@ class PinProxy:
                 # ``pin_is_noop``).
                 if not _pin_is_noop(self._pin_token_provider):
                     self._warn_unpinnable()
+        # SESSION AFFINITY (off unless armed, see `session_affinity_config`): a
+        # warm session may keep the account it was on, so this request goes out
+        # with that slot's stored token. `original_headers` is the client's own
+        # copy, for the take-back below.
+        inject = None
+        if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
+            inject = _affinity_pick(getattr(self, "_certdir", None), headers)
+        if inject:
+            headers = [
+                (k, f"Bearer {inject[0]}") if k.lower() == "authorization"
+                else (k, v) for k, v in headers
+            ]
         # ON THE THREAD-LOCAL, because the only place the round trip ENDS is
         # inside `_forward`'s status hook, and it takes no arguments from
         # here. One MITM connection is one thread, so there is no sharing.
@@ -21229,7 +21550,8 @@ class PinProxy:
             self._debug = _write_capped_line(
                 self._debug,
                 f"[c{getattr(self._local, 'cid', 0)}] "
-                f"{method} {path} pinned={pinned} swapped={swapped} :: {hdrs}\n",
+                f"{method} {path} pinned={pinned} swapped={swapped}"
+                f"{f' kept={inject[1][0]}' if inject else ''} :: {hdrs}\n",
                 cap=_TRACE_MAX_BYTES,
             )
 
@@ -21286,7 +21608,18 @@ class PinProxy:
 
         try:
             keep = self._forward(method, path, headers, body, tls,
-                                 swapped=swapped, bridge_hold=_bridge_hold)
+                                 swapped=swapped, bridge_hold=_bridge_hold,
+                                 affinity=inject[1] if inject else None)
+            if inject and isinstance(keep, _AuthRejected):
+                # THE KEPT ACCOUNT REFUSED (401/403/404/429), and nothing has
+                # reached the client: its answer is not the client's. Resend
+                # as it arrived, so `_switch_off_walled_account`, `switch()`,
+                # the wall memos and the grant-403 paths never see a wall or
+                # a refusal that is not the live account's. The body is
+                # buffered whole (`_read_body`), so it replays.
+                _affinity_take_back(inject[2], inject[1], keep.code, keep.reset)
+                self._drop_upstream()
+                keep = self._forward(method, path, original_headers, body, tls)
             if isinstance(keep, _AuthRejected):
                 # THE SWAP ITSELF WAS REFUSED. Send it again as it arrived. A
                 # 401/403/404 is terminal to the client — SSETransport treats
@@ -21460,7 +21793,8 @@ class PinProxy:
 
     def _forward(self, method, path, headers, body, client: ssl.SSLSocket,
                  swapped: bool = False,
-                 bridge_hold: "tuple[str, threading.Event] | None" = None
+                 bridge_hold: "tuple[str, threading.Event] | None" = None,
+                 affinity: "tuple[str, str] | None" = None
                  ) -> bool:
         """Relay one request upstream and stream the response back.
 
@@ -21645,6 +21979,7 @@ class PinProxy:
             keep = _relay_response(
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
+                affinity=affinity,
                 # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
                 # a spurious stream 404 needs both to be recognised.
                 path=path,
@@ -22456,10 +22791,13 @@ class _AuthRejected:
     bare "swap refused".
     """
 
-    __slots__ = ("code",)
+    __slots__ = ("code", "reset")
 
-    def __init__(self, code: int) -> None:
+    def __init__(self, code: int, reset: "float | None" = None) -> None:
         self.code = code
+        # The refusal's own `anthropic-ratelimit-unified-reset` (epoch s), read
+        # only for a kept-account refusal (`_relay_response`'s `affinity`).
+        self.reset = reset
 
     def __bool__(self) -> bool:  # never mistaken for "keep the connection"
         return False
@@ -23734,7 +24072,9 @@ def _switch_off_walled_account(
         # answers "did I just switch?"; what decides whether a 401 helps is
         # "is the client's bearer still the live account?". The pin forwards
         # `Authorization` verbatim on `/v1/messages` (never a pinned route,
-        # so billing follows the swapped inference account), so this bearer
+        # so billing follows the swapped inference account, unless session
+        # affinity keeps a warm session on its account, whose refusals are
+        # taken back before they get here), so this bearer
         # IS the account Claude Code believes it is on — and a 429 never
         # rebuilds its client, so a bearer frozen on an account somebody else
         # switched away from re-walls on every retry, forever, while
@@ -24056,6 +24396,7 @@ _usage_header_spawn_seen: dict[str, float] = {}
 
 def _note_usage_headers(
     status_line: bytes, lines: list[bytes], path: str | None, auth: str,
+    kept: "tuple[str, str] | None" = None,
 ) -> None:
     """Feed a `/v1/messages` reply's own 5h/7d usage headers to cswap's
     usage store — free evidence a fetch would otherwise pay for, and the
@@ -24077,6 +24418,10 @@ def _note_usage_headers(
     still makes the throttle mean what `record_usage_headers` promises:
     once per `_USAGE_HEADER_THROTTLE_S` per SLOT, not per bearer, when a
     token rotates mid-window.
+
+    ``kept`` is the (slot, email) a session-affinity request was sent as: the
+    headers are that account's, so they go to ITS slot (and `record_usage_
+    headers` writes only that slot's row) with no live-token comparison.
     """
     if (path or "").split("?", 1)[0].rstrip("/") != "/v1/messages":
         return
@@ -24096,10 +24441,19 @@ def _note_usage_headers(
     token = token[7:].strip() if token[:7].lower() == "bearer " else ""
     if not token:
         return
+    # A WALL READING IS NEVER DROPPED: a kept account's 429 passes both
+    # throttles (a 200 inside the window must not eat it), and so does the
+    # reading that took a kept slot out, which a rebuild after the drop reads:
+    # it is recorded to that slot, whichever bearer the request went out on.
+    dropped = _affinity_note_usage(token, headers)
+    kept = kept or dropped
+    wall = bool(dropped) or (
+        bool(kept) and status_line.startswith(b"HTTP/1.1 429"))
     now = time.monotonic()
     with _usage_header_lock:
         last_spawn = _usage_header_spawn_seen.get(token)
-        if last_spawn is not None and now - last_spawn < _USAGE_HEADER_THROTTLE_S:
+        if (last_spawn is not None and now - last_spawn < _USAGE_HEADER_THROTTLE_S
+                and not wall):
             return
         _usage_header_spawn_seen.pop(token, None)
         _usage_header_spawn_seen[token] = now
@@ -24108,13 +24462,13 @@ def _note_usage_headers(
 
     def _run() -> None:
         try:
-            slot = _live_account_slot()
-            live = _active_oauth_token()
+            slot = kept[0] if kept else _live_account_slot()
+            live = None if kept else _active_oauth_token()
             # ONLY WHEN THE REQUEST'S OWN TOKEN IS STILL THE LIVE ONE —
             # otherwise a stale session's headers, read off an account it
             # is no longer even talking to, would land on the slot cswap
             # actually has live now.
-            if slot is None or live is None or token != live:
+            if slot is None or not kept and (live is None or token != live):
                 return
             # THE SAME `now` THE SPAWN GATE ABOVE STAMPED — not a fresh
             # `time.monotonic()` read here, which dated the slot memo from
@@ -24125,7 +24479,8 @@ def _note_usage_headers(
             # apart to ~60s on a busy single-token loop.
             with _usage_header_lock:
                 last = _usage_header_seen.get(slot)
-                if last is not None and now - last < _USAGE_HEADER_THROTTLE_S:
+                if (last is not None and now - last < _USAGE_HEADER_THROTTLE_S
+                        and not wall):
                     return
                 _usage_header_seen.pop(slot, None)
                 _usage_header_seen[slot] = now
@@ -24145,10 +24500,21 @@ def _note_usage_headers(
 
 
 def _spawn_usage_header_recorder(fn) -> None:
-    """Where `_note_usage_headers` starts its detached thread — a seam so a
-    test can run ``fn`` synchronously instead of racing a real one, same
-    idea as `_config_home_for_policy`."""
+    """Where `_note_usage_headers` (and `_affinity_kick`) start their detached
+    thread — a seam so a test can run ``fn`` synchronously instead of racing a
+    real one, same idea as `_config_home_for_policy`."""
     threading.Thread(target=fn, daemon=True).start()
+
+
+def _unified_reset(lines: list[bytes]) -> "float | None":
+    """A response head's ``anthropic-ratelimit-unified-reset`` (epoch
+    seconds), or None when absent or unparsable."""
+    try:
+        return float(next(
+            l.split(b":", 1)[1] for l in lines[1:]
+            if l.lower().startswith(b"anthropic-ratelimit-unified-reset:")))
+    except (StopIteration, ValueError):
+        return None
 
 
 def _relay_response(
@@ -24165,9 +24531,15 @@ def _relay_response(
     session: str = "",
     note_hop: bool = True,
     on_hop_trouble=None,
+    affinity: "tuple[str, str] | None" = None,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
+
+    ``affinity`` is the (slot, email) a session-affinity request was sent as
+    (`_affinity_pick`): a 401/403/404/429 from that account is returned as
+    `_AuthRejected` before a byte reaches the client, and an answer's usage
+    headers are recorded to that slot rather than the live one.
 
     ``on_hop_trouble`` is called at the status line when `note_hop` stamped
     the upstream's own 5xx; the caller retires its kept upstream once the body
@@ -24244,27 +24616,41 @@ def _relay_response(
     # Nothing has reached the client yet, so a swap the upstream refused can
     # still be taken back. 401/403/404 are the three the client treats as
     # permanent; anything else is the origin's own answer and belongs to it.
-    if reject_on_auth_error and any(
-        status_line.startswith(b"HTTP/1.1 " + c) for c in (b"401", b"403", b"404")
+    if (reject_on_auth_error or affinity) and any(
+        status_line.startswith(b"HTTP/1.1 " + c)
+        for c in (b"401", b"403", b"404") + ((b"429",) if affinity else ())
     ):
         if _TRACE is not None:
             _TRACE.write(
                 f"[c{cid}]     <- {status_line.decode('latin1', 'replace')}"
-                " (swap refused — retrying unswapped)\n"
+                + (" (kept account refused — resending on the live account)"
+                   if affinity else " (swap refused — retrying unswapped)")
+                + "\n"
             )
             _TRACE.flush()
+        if affinity:
+            # A refusal is still the KEPT account's own reading (a 429 carries
+            # the wall), and it returns before the usual call below.
+            try:
+                _note_usage_headers(status_line, lines, path, auth,
+                                    kept=affinity)
+            except Exception:  # noqa: BLE001 — never let a statistic break a reply
+                pass
         # ONLY BYTES [9:12] ARE GUARANTEED: the `startswith` above matched
         # "HTTP/1.1 " + one of the three `c` values at that exact offset,
         # and nothing else -- what follows could be a space, a reason
         # phrase, or (a malformed "HTTP/1.1 401x") more digits, which
         # `status_line.split(b" ", 2)[1]` picked up and `int()` then raised
         # on.
-        return _AuthRejected(int(status_line[9:12]))
+        return _AuthRejected(int(status_line[9:12]),
+                             _unified_reset(lines) if affinity else None)
     _note_worker_status(path, status_line, certdir)
     if note_hop and _note_hop_trouble(status_line) and on_hop_trouble:
         on_hop_trouble()
     # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
-    # above cannot see it; 401 is a rebuild trigger, 429 is not.
+    # above cannot see it (a session-affinity refusal it does, and returns
+    # above, so this only reads the client's own account's answer); 401 is a
+    # rebuild trigger, 429 is not.
     _walled_401 = False
     # True for a wall 429 the pin could not convert: the client still sees a
     # 429, but its rate-limit headers are stripped below so it backs off
@@ -24409,7 +24795,8 @@ def _relay_response(
         except Exception:  # noqa: BLE001 — never let a statistic break a reply
             pass
     try:
-        _note_usage_headers(_upstream_status_line, lines, path, auth)
+        _note_usage_headers(_upstream_status_line, lines, path, auth,
+                            kept=affinity)
     except Exception:  # noqa: BLE001 — never let a statistic break a reply
         pass
     out = [status_line]
@@ -24522,14 +24909,14 @@ def _relay_response(
                 reject_on_auth_error=reject_on_auth_error, method=method,
                 on_headers=None, on_status=on_status, path=path,
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
-                on_hop_trouble=on_hop_trouble,
+                on_hop_trouble=on_hop_trouble, affinity=affinity,
             )
         return _relay_response(
             up, client, cid,
             reject_on_auth_error=reject_on_auth_error, method=method,
             on_headers=None, on_status=on_status, path=path,
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
-            on_hop_trouble=on_hop_trouble,
+            on_hop_trouble=on_hop_trouble, affinity=affinity,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
