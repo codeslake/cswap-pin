@@ -23625,6 +23625,19 @@ class TestSessionAffinityOnMessages:
         assert auths == ["Bearer tok-A"], auths
         assert not (seen.reads or seen.fetches), seen
 
+    def case_two_tokens_of_one_slot_are_not_a_switch(self, monkeypatch, certdir):
+        """CC's own refresh, persisted by the collector: the kept bearer still
+        resolves to slot 1 (cached), and the client's new token scans to slot
+        1 as well, so the slots do not differ and nothing is injected."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        pp._affinity_idents["tok-A-old"] = (
+            ("1", self.EMAIL.format("1")), float("inf"))
+        self._seed("S", "tok-A-old")
+        _, auths = self._send(certdir, [("tok-A", "S")])
+        assert auths == ["Bearer tok-A"], auths
+        assert not seen.fetches, "a same-slot token paid for a headroom read"
+
     def case_a_refusal_from_the_kept_account_is_taken_back(
             self, monkeypatch, certdir):
         """The client sees B's 200 and nothing of A's refusal; the wall and

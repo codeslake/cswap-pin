@@ -24474,7 +24474,9 @@ def _relay_response(
     if note_hop and _note_hop_trouble(status_line) and on_hop_trouble:
         on_hop_trouble()
     # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
-    # above cannot see it; 401 is a rebuild trigger, 429 is not.
+    # above cannot see it (a session-affinity refusal it does, and returns
+    # above, so this only reads the client's own account's answer); 401 is a
+    # rebuild trigger, 429 is not.
     _walled_401 = False
     # True for a wall 429 the pin could not convert: the client still sees a
     # 429, but its rate-limit headers are stripped below so it backs off
