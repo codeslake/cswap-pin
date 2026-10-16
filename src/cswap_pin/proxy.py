@@ -10409,8 +10409,12 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
             # STAY CLAIMED, WRITE NOTHING. False here is the first step of the
             # teardown, whose own 0.5 s probe (`_port_answers`) times out under
             # the same load and unwires the peer's wiring. The watcher asks
-            # again next tick; `unwire_if_dead`'s 3-probe policy, run at launch
-            # and by heal, is what clears a wiring that never answers.
+            # again next tick. NOT BOUNDED IN THIS DAEMON: a wiring that never
+            # answers is ended from outside, by the next launch or heal, which
+            # re-point it at the serving daemon (`wire_global_config(port)`),
+            # or by the wedged peer's own replacement. Until then it costs one
+            # idle daemon and a 1 s probe per tick. (`unwire_if_dead` does not
+            # clear it: our own live record and port answer first.)
             return True
         wire_global_config(port, certdir / "ca.pem")
         _log_lifecycle(f"repaired a wiring that named dead port {wired} -> {port}")
