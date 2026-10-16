@@ -1044,14 +1044,26 @@ cache the session built on the old one is lost. With session affinity armed, a s
 whose last `/v1/messages` was within `autoswitch.cacheTtlSeconds` keeps the
 account it was on: the pin sends that request with the kept slot's *stored*
 access token. It sends it only while that token is unexpired (it never
-refreshes one and never spends a grant), the slot is not walled and every
-window reads under `autoswitch.threshold`, and the client's token and the
-kept one both belong to a slot in your roster and to different ones. A new or
+refreshes one and never spends a grant), the slot is not walled or disabled
+and every window reads under `autoswitch.threshold` (or under the slot's own
+switch threshold, when that is lower), and the client's token and the kept
+one both belong to a slot in your roster and to different ones. A new or
 cold session, a Console API key, an unknown token or an expired one is
 forwarded exactly as without it. If the kept account answers 401, 403, 404 or
 429, the pin takes that answer back before the client sees any of it, rests
 the account (until the 429's reset, else 60 s) and resends on the client's own
-token, so the client only ever hears from the live account.
+token, so the client only ever hears from the live account. Each take-back
+writes a line to `daemon.log` (the slot, the status code, the rest in
+seconds, at most one a minute per slot and code), the account's usage headers
+on that reply still reach cswap's usage store, and a request sent on a kept
+token shows `kept=<slot>` in the `trace-to` log.
+
+A request never waits on the store or the Keychain for any of this. A
+snapshot of the roster (which slot stores which token, which slots have
+headroom) is rebuilt on a thread of its own, at most every 30 s and one at a
+time, by whichever armed request finds it that old; the request only reads
+it. With no snapshot yet, or one older than two minutes (a rebuild that failed
+or is stuck), a request goes out on the client's own token.
 
 Real scope: under the `dynamic` strategy the proactive and at-limit moves
 leave an account at 97% or more, so the 90 gate never keeps a session through
