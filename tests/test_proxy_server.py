@@ -19348,6 +19348,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_headroom_seen.clear()
         pp._walled_slot_occupant.clear()
         pp._fleet_exhausted_until = 0.0
+        pp._fleet_exhausted_claim = "five_hour"
         # THE `_note_usage_headers` THROTTLES are memos of the SAME shape
         # and outlive this case exactly like the three above: cases run
         # alphabetically (`run_cases`'s `sorted(dir(cls))`), so a case that

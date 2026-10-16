@@ -23982,8 +23982,6 @@ def _switch_off_walled_account(
                     # provable moment, with a bounded re-check rather than a
                     # sleep toward a reset an unprovable peer may beat (the
                     # same trade `_earliest_recovery`'s own caller makes).
-                    # shortcut: no window produced the capped value, so the
-                    # claim stays the earliest account's.
                     _fleet_exhausted_until = min(
                         earliest, time.time() + _EXHAUSTED_RESET_CAP_S)
         else:
