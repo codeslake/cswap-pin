@@ -24566,12 +24566,15 @@ class TestTheDaemonRepairsItsOwnWiring:
             # left this test green.
             proxy._mark_wired_once(certdir, 36301)
             monkeypatch.setattr(proxy, "_wired_port", lambda: other_port)
+            wrote = []
             monkeypatch.setattr(
-                proxy,
-                "wire_global_config",
-                lambda p, ca: pytest.fail("stole a LIVE wiring from another daemon"),
+                proxy, "wire_global_config", lambda p, ca: wrote.append(p) or True
             )
-            assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+            # The return value is not asserted: a loaded runner's probe can
+            # time out (True, stay claimed) where an idle one answers (False).
+            # Never stolen means no write, whichever way the probe went.
+            proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0)
+            assert wrote == [], "stole a LIVE wiring from another daemon"
         finally:
             srv.close()
 
@@ -24612,8 +24615,12 @@ class TestTheDaemonRepairsItsOwnWiring:
         queue filled, so the probe's connect really times out (~1 s)."""
         from cswap_pin import proxy
 
-        srv = socket.socket()
-        srv.bind(("127.0.0.1", 0))
+        while True:  # not 36301, the daemon's port (see `_dead_port`)
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            if srv.getsockname()[1] != 36301:
+                break
+            srv.close()
         srv.listen(0)
         addr = srv.getsockname()
         fillers = []

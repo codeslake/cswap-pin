@@ -10350,8 +10350,9 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
       * nothing is wired      -> the pin was cleared. Leave it cleared.
       * wired, and DEAD       -> the wiring is broken and we are the daemon it
                                  should name. Repair it.
-      * wired, and TIMED OUT  -> no answer yet, which is not "dead". Stay
-                                 claimed (True), write nothing, ask next tick.
+      * wired, probe neither   -> no answer yet (a timeout, or any OSError but
+        answered nor refused     a refusal), which is not "dead". Stay claimed
+                                 (True), write nothing, ask next tick.
 
     Measured, and this is the state that motivated it: a config rewritten to
     port 52000 while this daemon served 36301. Every running session was fine
@@ -10414,7 +10415,8 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
             # re-point it at the serving daemon (`wire_global_config(port)`),
             # or by the wedged peer's own replacement. Until then it costs one
             # idle daemon and a 1 s probe per tick. (`unwire_if_dead` does not
-            # clear it: our own live record and port answer first.)
+            # clear it while our own port answers: its first probe returns
+            # before the wiring is read.)
             return True
         wire_global_config(port, certdir / "ca.pem")
         _log_lifecycle(f"repaired a wiring that named dead port {wired} -> {port}")
