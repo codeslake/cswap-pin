@@ -1243,6 +1243,17 @@ that hop's own `/health` had been naming the next one the entire time, because
 the question was only ever asked at launch. When the inner hop died, a chain
 that could have stepped one hop out went direct instead.
 
+## IPv6 that resolves but does not route
+
+Every upstream dial (direct, through a hop, and the blind tunnel) races the
+resolved addresses the way RFC 8305 describes: IPv6 and IPv4 interleaved, the
+next attempt started 250 ms after the previous one or at once when one fails,
+the first to connect kept. A plain `socket.create_connection` gives each
+address the whole 15 s in turn. On a machine whose IPv6 stops carrying traffic
+while it keeps a global address (measured on a cellular modem), AAAA still
+resolves first, so every pinned request hung while Claude Code's own direct
+dials, which race the same way, kept working.
+
 ## A connection is not a thread
 
 An upstream that accepts and never answers used to cost one OS thread per

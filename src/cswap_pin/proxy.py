@@ -2997,7 +2997,7 @@ def _dial_chain(
     # not a test pointing the walk at a hop that never answers.
     if timeout is None:
         timeout = _HOP_CONNECT_BUDGET_S
-    sock = socket.create_connection(chain.address, timeout=timeout)
+    sock = _happy_dial(chain.address, timeout=timeout)
     # create_connection leaves the DIAL budget on the socket, where it would
     # then bound every read. Reaching a hop and waiting for its answer are
     # different legs: the dial is loopback or LAN, the answer waits on the
@@ -3013,6 +3013,108 @@ def _dial_chain(
         raise
 
 
+# RFC 8305 calls 250 ms the recommended "Connection Attempt Delay".
+_HAPPY_EYEBALLS_DELAY_S = 0.25
+
+
+def _start_connect(family, sockaddr):
+    """A non-blocking connect to one address: ``(socket, errno)``. A seam, so
+    a test can stand in an attempt that never completes."""
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setblocking(False)
+    return sock, sock.connect_ex(sockaddr)
+
+
+def _happy_dial(address: tuple[str, int], timeout: float = 15):
+    """`socket.create_connection` that races IPv6 and IPv4 (RFC 8305).
+
+    `create_connection` tries each resolved address in turn and gives every
+    one the WHOLE timeout. A host with a global IPv6 address but no working
+    IPv6 route -- a cellular modem whose IPv6 stops carrying traffic is the
+    measured case -- resolves AAAA first, so every dial sat 15 s in SYN-SENT
+    before IPv4 was tried. Claude Code (Node) falls back in milliseconds, so
+    the sessions saw a pin that hung while every direct check looked fine,
+    and Remote Control gave up after 30 minutes of it.
+
+    Here the families are interleaved and the next address starts
+    `_HAPPY_EYEBALLS_DELAY_S` after the previous one, or at once when one
+    fails. The first to connect wins and the rest are closed. `timeout` is
+    the budget for the whole dial and is left on the returned socket, as
+    `create_connection` leaves its own.
+    """
+    host, port = address[0], address[1]
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"getaddrinfo returned nothing for {host}")
+    # Interleave by family, keeping the resolver's preference for the first.
+    first = infos[0][0]
+    a = [i for i in infos if i[0] == first]
+    b = [i for i in infos if i[0] != first]
+    order = [x for pair in zip(a, b) for x in pair] + a[len(b):] + b[len(a):]
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    pending: list = []
+    last_err: "OSError | None" = None
+    next_start = time.monotonic()
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise socket.timeout(f"timed out connecting to {host}:{port}")
+            if order and (not pending or now >= next_start):
+                family, _, _, _, sockaddr = order.pop(0)
+                try:
+                    sock, err = _start_connect(family, sockaddr)
+                except OSError as exc:
+                    last_err = exc
+                    continue
+                if err == 0:
+                    pending.append(sock)
+                    winner = sock
+                    break
+                if err in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN):
+                    pending.append(sock)
+                    sel.register(sock, selectors.EVENT_WRITE)
+                    next_start = now + _HAPPY_EYEBALLS_DELAY_S
+                else:
+                    last_err = OSError(err, os.strerror(err))
+                    sock.close()
+                continue
+            if not pending:
+                raise last_err or OSError(f"could not connect to {host}:{port}")
+            wait = deadline - now
+            if order:
+                wait = min(wait, max(0.0, next_start - now))
+            winner = None
+            for key, _ in sel.select(wait):
+                sock = key.fileobj
+                err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err == 0:
+                    winner = sock
+                    break
+                sel.unregister(sock)
+                pending.remove(sock)
+                sock.close()
+                last_err = OSError(err, os.strerror(err))
+                next_start = time.monotonic()  # a failure starts the next now
+            if winner is not None:
+                break
+    except BaseException:
+        for sock in pending:
+            with contextlib.suppress(OSError):
+                sock.close()
+        raise
+    finally:
+        sel.close()
+    for sock in pending:
+        if sock is not winner:
+            with contextlib.suppress(OSError):
+                sock.close()
+    winner.setblocking(True)
+    winner.settimeout(timeout)
+    return winner
+
+
 def _dial_with_no_chain(upstream: tuple[str, int], timeout: float = 15):
     """What to do when NO hop is usable and none is recorded behind them.
 
@@ -3026,7 +3128,7 @@ def _dial_with_no_chain(upstream: tuple[str, int], timeout: float = 15):
 
     Dials. Changing it to refuse is this function's body and nothing else.
     """
-    return socket.create_connection(upstream, timeout=timeout)
+    return _happy_dial(upstream, timeout=timeout)
 
 
 _ALLOW_DIRECT_ENV = "CSWAP_PIN_ALLOW_DIRECT"
@@ -11988,7 +12090,7 @@ class PortHolder:
                 or _read_upstream(self._certdir, "proxy")
             )
             upstream = _dial_chain(chain) if chain else \
-                socket.create_connection((host, int(port_s)), timeout=15)
+                _happy_dial((host, int(port_s)), timeout=15)
             if chain:
                 upstream.sendall(
                     f"CONNECT {parts[1]} HTTP/1.1\r\nHost: {parts[1]}\r\n\r\n"
@@ -20711,7 +20813,7 @@ class PinProxy:
                     f"this host ({_ALLOW_DIRECT_ENV}=1 allows it)"
                 )
             try:
-                sock = socket.create_connection((host, port), timeout=15)
+                sock = _happy_dial((host, port), timeout=15)
                 if secure:
                     # An https:// origin dialled direct needs the handshake,
                     # verified. Without it we sent cleartext HTTP at a TLS
@@ -22403,7 +22505,7 @@ class PinProxy:
                 self._refuse_tunnel(conn)
                 return
             try:
-                up = socket.create_connection((host, port), timeout=15)
+                up = _happy_dial((host, port), timeout=15)
             except OSError:
                 conn.close()
                 return
