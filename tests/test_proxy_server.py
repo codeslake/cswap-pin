@@ -19188,6 +19188,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
     RESET_HEADER = b"anthropic-ratelimit-unified-reset: 9999999999"
     RESET_HEADER_2 = b"anthropic-ratelimit-unified-reset: 8888888888"
     RETRY_AFTER = b"retry-after: 3600"
+    CLAIM = b"anthropic-ratelimit-unified-representative-claim: "
     UNIFIED_STATUS = b"anthropic-ratelimit-unified-status: allowed_warning"
     SHOULD_RETRY = b"x-should-retry: true"
     LIVE = "live-account-token"
@@ -19200,7 +19201,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
               validated=True, before=None, live_token=None, usage=None,
               snap=None, live_num="1", entry_walled=False,
               record_usage_headers=None, fleet=None, disabled=None,
-              reason="candidates-exhausted"):
+              reason="candidates-exhausted", stored=None):
         """Stub claude_swap's switcher so no real account store is touched.
 
         ``validated=None`` omits the key entirely (an older cswap that never
@@ -19240,9 +19241,15 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         parameter existed, which is what keeps every case that does not pass
         it exercising the plain strip. A ``fleet`` usage dict may carry
         ``_reset_ts`` directly (the fake ``poll_policy.limiting_reset_ts``
-        reads that key rather than parsing an ISO string). ``disabled``
+        reads that key), or each window its own ``resets_at`` as an epoch
+        float (the fake then takes the latest >=100% one, as the real rule
+        does, and ``parse_reset_ts`` is the identity). ``disabled``
         names which of ``fleet``'s accounts ``is_account_disabled`` answers
-        True for. ``reason`` overrides the default ``switched=False``
+        True for. ``stored`` maps an account to the ``last_good`` its entry
+        carries when that differs from its decision value (a slot cswap
+        walled: the decision value is the synthetic one, ``last_good`` the
+        reading actually measured; ``None`` is no reading); every other
+        account's ``last_good`` is its decision value. ``reason`` overrides the default ``switched=False``
         reason string."""
         from cswap_pin import proxy as pp
 
@@ -19291,12 +19298,13 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                         "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}),
                 "1": types.SimpleNamespace(
                     decision_value=lambda models=(): usage,
-                    walled=entry_walled),
+                    walled=entry_walled, last_good=usage),
             }
             for num, fusage in (fleet or {}).items():
                 entries[num] = types.SimpleNamespace(
                     decision_value=(lambda u: (lambda models=(): u))(fusage),
-                    walled=False)
+                    walled=False,
+                    last_good=(stored or {}).get(num, fusage))
             return entries
 
         _attrs = dict(
@@ -19318,10 +19326,19 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             "ClaudeAccountSwitcher": staticmethod(
                 lambda: types.SimpleNamespace(**_attrs)),
         })()
+        def _limiting_reset_ts(u, models=()):
+            # a dict-level `_reset_ts` wins; otherwise the real rule: the
+            # latest `resets_at` among the >=100% windows (epoch floats here)
+            if not isinstance(u, dict):
+                return None
+            if "_reset_ts" in u:
+                return u["_reset_ts"]
+            return max((ra for _, pct, ra in pp.oauth.relevant_windows(u, models)
+                        if pct >= 100.0 and ra is not None), default=None)
+
         fake_poll_policy = type("PP", (), {
-            "limiting_reset_ts": staticmethod(
-                lambda u, models=(): (
-                    u.get("_reset_ts") if isinstance(u, dict) else None)),
+            "limiting_reset_ts": staticmethod(_limiting_reset_ts),
+            "parse_reset_ts": staticmethod(lambda r: r),
         })()
 
         def _require(name):
@@ -19335,7 +19352,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         pp._walled_switch_seen_by_session.clear()
         pp._walled_headroom_seen.clear()
         pp._walled_slot_occupant.clear()
-        pp._fleet_exhausted_until = 0.0
+        pp._fleet_exhausted = (0.0, "five_hour")
         # THE `_note_usage_headers` THROTTLES are memos of the SAME shape
         # and outlive this case exactly like the three above: cases run
         # alphabetically (`run_cases`'s `sorted(dir(cls))`), so a case that
@@ -19594,8 +19611,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         earliest = now + 120
         self._wire(
             monkeypatch, switched=False,
-            fleet={"6": {"five_hour": {"pct": 100.0},
-                         "seven_day": {"pct": 0.0}, "_reset_ts": earliest}},
+            fleet={"6": {"five_hour": {"pct": 100.0, "resets_at": earliest},
+                         "seven_day": {"pct": 0.0}}},
         )
         upstream_reset = int(now) + 86400 * 3
         got = self._relay(
@@ -19607,11 +19624,143 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                 .encode() in got), got
         assert (f"anthropic-ratelimit-unified-reset: {upstream_reset}"
                 .encode() not in got), got
-        assert (b"anthropic-ratelimit-unified-representative-claim: "
-                b"five_hour" in got), got
+        assert self.CLAIM + b"five_hour\r\n" in got, got
         assert self.RETRY_AFTER not in got, got
         assert self.SHOULD_RETRY not in got, got
         assert self.UNIFIED_STATUS not in got, got
+
+    def case_a_fleet_walled_on_the_weekly_window_relays_the_weekly_claim(
+        self, monkeypatch,
+    ):
+        """Claude Code labels `five_hour` "Session limit" and `seven_day`
+        "Weekly limit": a fleet whose every enabled account is at 100% on
+        the 7d window must not be announced as a session limit. cswap reads a
+        walled slot's 5h at 100% too (`_walled_decision_value`), but with the
+        earlier reset, so the 7d reset is the limiting one. The relayed reset
+        is the earliest of the accounts' 7d resets."""
+        now = time.time()
+        near, far = now + 86400 * 2, now + 86400 * 4
+
+        def acct(week):
+            return {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                    "seven_day": {"pct": 100.0, "resets_at": week}}
+
+        self._wire(monkeypatch, switched=False,
+                   fleet={"6": acct(far), "7": acct(near)})
+        got = self._relay()
+        assert (f"anthropic-ratelimit-unified-reset: {int(near)}".encode()
+                in got), got
+        assert self.CLAIM + b"seven_day" in got, got
+        assert self.CLAIM + b"five_hour" not in got, got
+
+    def case_the_account_that_sets_the_fleet_reset_decides_the_claim(
+        self, monkeypatch,
+    ):
+        """One account is walled on 5h for an hour, another on 7d for days:
+        the fleet recovers when the 5h one does, so the claim is the 5h one."""
+        now = time.time()
+        self._wire(monkeypatch, switched=False, fleet={
+            "6": {"five_hour": {"pct": 100.0, "resets_at": now + 3600},
+                  "seven_day": {"pct": 10.0, "resets_at": now + 86400 * 5}},
+            "7": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                  "seven_day": {"pct": 100.0, "resets_at": now + 86400 * 3}},
+        })
+        got = self._relay()
+        assert (f"anthropic-ratelimit-unified-reset: {int(now + 3600)}"
+                .encode() in got), got
+        assert self.CLAIM + b"five_hour" in got, got
+        assert self.CLAIM + b"seven_day" not in got, got
+
+    def case_a_scoped_weekly_window_relays_the_weekly_claim(self, monkeypatch):
+        """A per-model window (`oauth.relevant_windows`: "per-model weekly
+        `scoped`") is weekly, and a scoped claim name would be an
+        `other_claim` to Claude Code, so it goes out as `seven_day`."""
+        now = time.time()
+        self._wire(monkeypatch, switched=False, fleet={"6": {
+            "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 100.0,
+                        "resets_at": now + 86400 * 2}]}})
+        got = self._relay()
+        assert self.CLAIM + b"seven_day" in got, got
+        assert b"seven_day_" not in got, got
+
+    def case_a_tie_with_a_real_weekly_reading_at_full_relays_the_weekly_claim(
+        self, monkeypatch,
+    ):
+        """THE INCIDENT'S SHAPE. cswap walls a slot until its earliest stored
+        reset, and when that is the 7d reset the forced 5h reading and the
+        real 7d one carry the same second (`_walled_decision_value`): an
+        exact tie, but the stored reading says the 7d window IS at 100%, so
+        the wall is a weekly one and Claude Code must say "Weekly limit"."""
+        at = time.time() + 3600
+        self._wire(monkeypatch, switched=False, fleet={"6": {
+            "five_hour": {"pct": 100.0, "resets_at": at},
+            "seven_day": {"pct": 100.0, "resets_at": at}}},
+            stored={"6": {"five_hour": {"pct": 60.0, "resets_at": at + 600},
+                          "seven_day": {"pct": 100.0, "resets_at": at}}})
+        got = self._relay()
+        assert (f"anthropic-ratelimit-unified-reset: {int(at)}".encode()
+                in got), got
+        assert self.CLAIM + b"seven_day\r\n" in got, got
+        assert self.CLAIM + b"five_hour" not in got, got
+
+    def case_a_tie_with_no_stored_weekly_reading_keeps_the_session_claim(
+        self, monkeypatch,
+    ):
+        """A slot walled with no stored 7d reading reads BOTH windows at the
+        wall's one deadline, the 7d one synthesized (`_walled_decision_value`),
+        and cswap records no claim: nothing says the week is walled, so the
+        status quo `five_hour` stands, for no stored reading at all and for a
+        stored one without a 7d window alike."""
+        at = time.time() + 3600
+        for what, stored in (("no reading", None),
+                             ("5h only", {"five_hour": {
+                                 "pct": 100.0, "resets_at": at}})):
+            self._wire(monkeypatch, switched=False, fleet={"6": {
+                "five_hour": {"pct": 100.0, "resets_at": at},
+                "seven_day": {"pct": 100.0, "resets_at": at}}},
+                stored={"6": stored})
+            got = self._relay()
+            assert (f"anthropic-ratelimit-unified-reset: {int(at)}".encode()
+                    in got), (what, got)
+            assert self.CLAIM + b"five_hour\r\n" in got, (what, got)
+
+    def case_the_decision_time_cap_keeps_the_fleet_claim(self, monkeypatch):
+        """Not every blocked slot proved a reset, so the announced reset is
+        the cap, not any window's: the claim stays the fleet's weekly one."""
+        far = time.time() + 86400 * 3
+        self._wire(monkeypatch, switched=False, fleet={
+            "6": {"five_hour": {"pct": 0.0}, "seven_day": {
+                "pct": 100.0, "resets_at": far}},
+            "7": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0}},
+        })
+        got = self._relay()
+        assert (f"anthropic-ratelimit-unified-reset: {int(far)}".encode()
+                not in got), got
+        assert self.CLAIM + b"seven_day" in got, got
+
+    def case_the_walls_own_reset_winning_relays_its_upstream_claim(
+        self, monkeypatch,
+    ):
+        """This 429's own reset, when earlier than the fleet's, is the relayed
+        reset, so the claim that goes with it is the upstream's own, accepted
+        only as `five_hour` or `seven_day`: any other name is an
+        `other_claim` to Claude Code. Missing or foreign, it is `five_hour`
+        and never the fleet's claim, which came from another account."""
+        now = time.time()
+        fleet = {"6": {"five_hour": {"pct": 100.0, "resets_at": now + 1800},
+                       "seven_day": {"pct": 100.0, "resets_at": now + 86400 * 4}}}
+        own = f"anthropic-ratelimit-unified-reset: {int(now) + 600}".encode()
+        for upstream, relayed in ((b"seven_day", b"seven_day"),
+                                  (b"five_hour", b"five_hour"),
+                                  (b"seven_day_opus", b"five_hour"),
+                                  (b"", b"five_hour")):
+            self._wire(monkeypatch, switched=False, fleet=fleet)
+            got = self._relay(reset=own, extra_headers=(
+                self.CLAIM + upstream + b"\r\n" if upstream else b""))
+            assert own in got, got
+            assert self.CLAIM + relayed + b"\r\n" in got, (upstream, got)
+            assert got.count(self.CLAIM) == 1, got
 
     def case_an_all_provable_fleet_reset_relays_uncapped_even_days_out(
         self, monkeypatch,
@@ -19921,10 +20070,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         reason — the memo has to clear, not just fail to refresh."""
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, switched=False, reason="some-other-reason")
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_exhausted = (time.time() + 500, "seven_day")
         got = self._relay()
         assert b"anthropic-ratelimit-unified-status: rejected" not in got, got
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert pp._fleet_exhausted == (0.0, "five_hour"), pp._fleet_exhausted
 
     def case_the_fleet_fact_clears_on_a_landed_switch(self, monkeypatch):
         """A switch that actually lands says the fleet is not exhausted —
@@ -19932,9 +20081,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         sitting in the fact."""
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, switched=True)
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_exhausted = (time.time() + 500, "seven_day")
         self._relay()
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert pp._fleet_exhausted == (0.0, "five_hour"), pp._fleet_exhausted
 
     def case_the_fleet_fact_clears_when_switch_raises(self, monkeypatch):
         """A raising `switch()` proves nothing about the fleet — a stale
@@ -19942,9 +20091,9 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         from cswap_pin import proxy as pp
         monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
         self._wire(monkeypatch, switched=True, raises_once=OSError("locked"))
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_exhausted = (time.time() + 500, "seven_day")
         self._relay()
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert pp._fleet_exhausted == (0.0, "five_hour"), pp._fleet_exhausted
 
     def case_the_fleet_fact_clears_on_a_stale_bearer_conversion(
         self, monkeypatch,
@@ -19955,10 +20104,10 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         from cswap_pin import proxy as pp
         self._wire(monkeypatch, switched=False,
                    live_token=self.LIVE, usage=self.HEADROOM)
-        pp._fleet_exhausted_until = time.time() + 500
+        pp._fleet_exhausted = (time.time() + 500, "seven_day")
         got = self._relay(auth="Bearer stale-account-token")
         assert got.startswith(b"HTTP/1.1 401"), got[:40]
-        assert pp._fleet_exhausted_until == 0.0, pp._fleet_exhausted_until
+        assert pp._fleet_exhausted == (0.0, "five_hour"), pp._fleet_exhausted
 
     def case_a_debounced_repeat_of_an_exhausted_wall_still_carries_the_headers(
         self, monkeypatch,
@@ -22090,7 +22239,7 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         self, monkeypatch,
     ):
         from cswap_pin import proxy as pp
-        monkeypatch.setattr(pp, "_fleet_exhausted_until", 777.0)
+        monkeypatch.setattr(pp, "_fleet_exhausted", (777.0, "seven_day"))
         log = []
         self._wire(monkeypatch, log=log)
         got = self._r403()
@@ -22114,9 +22263,9 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
             pp._walled_switch_seen)
         assert pp._walled_slots == {}, (
             f"a refusal walled slot(s) the way a 429 does: {pp._walled_slots}")
-        assert pp._fleet_exhausted_until == 777.0, (
+        assert pp._fleet_exhausted == (777.0, "seven_day"), (
             "a refusal says nothing about the fleet's walls, but it wrote "
-            f"the fleet-exhausted memo: {pp._fleet_exhausted_until}")
+            f"the fleet-exhausted memo: {pp._fleet_exhausted}")
 
     def case_ten_concurrent_grant_403s_make_one_switch(self, monkeypatch):
         """Run twice: with the live token fixed through the fake switch, and
@@ -22226,7 +22375,7 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         self, monkeypatch,
     ):
         from cswap_pin import proxy as pp
-        monkeypatch.setattr(pp, "_fleet_exhausted_until", 777.0)
+        monkeypatch.setattr(pp, "_fleet_exhausted", (777.0, "seven_day"))
 
         def _boom():
             raise RuntimeError("config lock held")
@@ -22249,7 +22398,7 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
             assert len(log) == 1, (what, log)
             assert pp._walled_switch_seen[self._key()][0] is False, (
                 what, pp._walled_switch_seen)
-            assert pp._fleet_exhausted_until == 777.0, what
+            assert pp._fleet_exhausted == (777.0, "seven_day"), what
             # A repeat inside the negative's expiry debounces: no second
             # switch(), the 403 unchanged.
             assert self._r403() == got, what
@@ -22399,7 +22548,7 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         fingerprint earns it the 401, once per session like the 429 arm's
         bearer branch, and no `switch()` call: A is marked already."""
         from cswap_pin import proxy as pp
-        monkeypatch.setattr(pp, "_fleet_exhausted_until", 777.0)
+        monkeypatch.setattr(pp, "_fleet_exhausted", (777.0, "seven_day"))
         log, live = self._moving_fleet(monkeypatch)
         assert self._r403(session="s1").startswith(b"HTTP/1.1 401")
         assert live["num"] == "2" and len(log) == 1, (live, log)
@@ -22412,7 +22561,7 @@ class TestAnAccessGrant403OnMessagesBecomesA401:
         assert self._r403(session="s2").startswith(b"HTTP/1.1 401"), (
             "another session's frozen bearer is owed its own 401")
         assert len(log) == 1, f"a late 403 asked switch() again: {log}"
-        assert pp._fleet_exhausted_until == 777.0, pp._fleet_exhausted_until
+        assert pp._fleet_exhausted == (777.0, "seven_day"), pp._fleet_exhausted
         assert pp._walled_slots == {}, pp._walled_slots
 
     def case_a_late_403_marks_the_bearers_slot_again_once_its_bar_lapsed(
