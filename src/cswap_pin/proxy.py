@@ -10388,8 +10388,13 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
         try:
             with socket.create_connection(("127.0.0.1", wired), timeout=1):
                 return False
-        except OSError:
+        except ConnectionRefusedError:
             pass  # dead, as expected for the broken case
+        except OSError:
+            # A timeout is no answer yet, not a dead port (a live listener's
+            # connect can outlast 1 s under load; only a refusal means nothing
+            # listens, as `_connect_probe` reads it). The next tick asks again.
+            return False
         # And the record must still be OURS — checked by the caller, but the
         # connect above took time, so re-read rather than trust the gap.
         st = read_daemon_state(certdir)
