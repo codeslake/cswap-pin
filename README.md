@@ -730,7 +730,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | `~/.claude.json` `env` (`$CLAUDE_CONFIG_DIR/.claude.json` when that is set) | sets `HTTPS_PROXY`, `https_proxy` and `ALL_PROXY` to the pin's loopback address, `NODE_EXTRA_CA_CERTS` to the pin's CA (or to `ca-bundle.pem` when a hop's CA is merged in) and `CSWAP_PIN_PORT` to its port; deletes `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` | the five removed and whatever they replaced restored; the three deleted stay deleted |
 | `~/.claude.json` `oauthAccount` | the pinned account's identity, re-asserted by every `--ensure` | the account you are logged in as |
 | `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
-| `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
+| `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` or `sessionAffinity` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
 | `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json` that records a pin: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
 | `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `shell-prefix.proxy` (the proxy the opt-in shell prefix hands the programs Claude Code starts), `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO, and `shell-prefix` only if you ran the command that writes it | left in place |
 | `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
@@ -756,7 +756,8 @@ session* means intercepting the requests.
 
 A local MITM forward proxy that swaps the `Authorization` bearer on exactly
 the routes whose server-side ownership is decided by it, and passes everything
-else — `/v1/messages` above all — through untouched.
+else — `/v1/messages` above all — through untouched (unless you arm
+session affinity, which is off: see beside `debugSlowMs` below).
 
 ```
 claude session
@@ -1036,6 +1037,33 @@ Each line splits the round trip three ways — inside the pin, waiting for the
 server, and getting the request out through the chain — because the total
 alone cannot say whose problem a stall is. The route is logged without its
 query string or session id.
+
+**Session affinity (off by default).** When cswap switches the live account,
+Claude Code's next request goes out on the new account's token and the prompt
+cache the session built on the old one is lost. With session affinity armed, a session (`x-claude-code-session-id`)
+whose last `/v1/messages` was within `autoswitch.cacheTtlSeconds` keeps the
+account it was on: the pin sends that request with the kept slot's *stored*
+access token. It sends it only while that token is unexpired (it never
+refreshes one and never spends a grant), the slot is not walled and every
+window reads under `autoswitch.threshold`, and the client's token and the
+kept one both belong to a slot in your roster and to different ones. A new or
+cold session, a Console API key, an unknown token or an expired one is
+forwarded exactly as without it. If the kept account answers 401, 403, 404 or
+429, the pin takes that answer back before the client sees any of it, rests
+the account (until the 429's reset, else 60 s) and resends on the client's own
+token, so the client only ever hears from the live account.
+
+Real scope: under the `dynamic` strategy the proactive and at-limit moves
+leave an account at 97% or more, so the 90 gate never keeps a session through
+one. In practice it stops *alternation* and *manual* switches from moving
+warm sessions, and little else.
+
+Arm it for the whole fleet with `"sessionAffinity": true` in the same
+`remoteControl` section as `debugSlowMs` (that file is shared by every host
+that links it), or on one host alone by creating an empty file named
+`session-affinity` in `<data>/pin-proxy/` (the way `trace-to` works). Both are
+re-read within seconds; remove the file or the key to turn it off. The state
+is in memory and bounded, and a daemon handover starts every session cold.
 
 `CSWAP_PIN_LISTEN_FD` and `CSWAP_PIN_LISTEN_FROM` also appear in a daemon's
 environment. They are how a process hands its listening socket to the next
