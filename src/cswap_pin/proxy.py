@@ -10350,6 +10350,9 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
       * nothing is wired      -> the pin was cleared. Leave it cleared.
       * wired, and DEAD       -> the wiring is broken and we are the daemon it
                                  should name. Repair it.
+      * wired, probe neither   -> no answer yet (a timeout, or any OSError but
+        answered nor refused     a refusal), which is not "dead". Stay claimed
+                                 (True), write nothing, ask next tick.
 
     Measured, and this is the state that motivated it: a config rewritten to
     port 52000 while this daemon served 36301. Every running session was fine
@@ -10385,11 +10388,17 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
             return False  # unpinned, or already correct — not our business
         # Does the port the config names actually answer? If it does, someone
         # else legitimately owns the pin and rewriting would steal it.
+        inconclusive = False
         try:
             with socket.create_connection(("127.0.0.1", wired), timeout=1):
                 return False
-        except OSError:
+        except ConnectionRefusedError:
             pass  # dead, as expected for the broken case
+        except OSError:
+            # A timeout is no answer yet, not a dead port (a live listener's
+            # connect can outlast 1 s under load; only a refusal means nothing
+            # listens, as `_connect_probe` reads it).
+            inconclusive = True
         # And the record must still be OURS — checked by the caller, but the
         # connect above took time, so re-read rather than trust the gap.
         st = read_daemon_state(certdir)
@@ -10397,6 +10406,18 @@ def _repair_wiring_if_ours(certdir: Path, port: int, live_clients=None) -> bool:
             return False
         if int(st.get("port") or 0) != port:
             return False
+        if inconclusive:
+            # STAY CLAIMED, WRITE NOTHING. False here is the first step of the
+            # teardown, whose own 0.5 s probe (`_port_answers`) times out under
+            # the same load and unwires the peer's wiring. The watcher asks
+            # again next tick. NOT BOUNDED IN THIS DAEMON: a wiring that never
+            # answers is ended from outside, by the next launch or heal, which
+            # re-point it at the serving daemon (`wire_global_config(port)`),
+            # or by the wedged peer's own replacement. Until then it costs one
+            # idle daemon and a 1 s probe per tick. (`unwire_if_dead` does not
+            # clear it while our own port answers: its first probe returns
+            # before the wiring is read.)
+            return True
         wire_global_config(port, certdir / "ca.pem")
         _log_lifecycle(f"repaired a wiring that named dead port {wired} -> {port}")
         return True
@@ -10476,7 +10497,8 @@ def _is_claimed(certdir: Path, live_clients=None, republish=None) -> bool:
             # the pin's daemon rather than an orphan. See _repair_wiring_if_ours.
             _mark_wired_once(certdir, port)
             return True
-        # A SUCCESSFUL REPAIR IS ITSELF A CLAIM. Discarding this return value
+        # A SUCCESSFUL REPAIR IS ITSELF A CLAIM (so is an inconclusive probe,
+        # which writes nothing). Discarding this return value
         # meant the daemon re-pointed the wiring at itself and then, in the
         # same call, reported "nobody references me" — and `watch_refcount`
         # answers that by tearing the daemon down, running

@@ -24566,13 +24566,92 @@ class TestTheDaemonRepairsItsOwnWiring:
             # left this test green.
             proxy._mark_wired_once(certdir, 36301)
             monkeypatch.setattr(proxy, "_wired_port", lambda: other_port)
+            wrote = []
+            monkeypatch.setattr(
+                proxy, "wire_global_config", lambda p, ca: wrote.append(p) or True
+            )
+            # The return value is not asserted: a loaded runner's probe can
+            # time out (True, stay claimed) where an idle one answers (False).
+            # Never stolen means no write, whichever way the probe went.
+            proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0)
+            assert wrote == [], "stole a LIVE wiring from another daemon"
+        finally:
+            srv.close()
+
+    def case_a_wiring_whose_probe_TIMES_OUT_is_never_stolen(
+        self, tmp_path, monkeypatch
+    ):
+        """A connect that times out is no answer yet, never proof of a dead
+        port: only a REFUSED connect is. On a loaded runner a live listener's
+        connect can outlast the probe's 1 s (macOS CI, T2534).
+
+        AND THE DAEMON STAYS CLAIMED. `_is_claimed` False, with no live client
+        and no channel, is the first step of the teardown, whose own 0.5 s
+        `_port_answers` probe times out under the same load and then unwires
+        the peer: no pin at all. So: claimed, nothing written, ask next tick."""
+        from cswap_pin import proxy
+
+        certdir = self._ours(tmp_path, monkeypatch, 36301)
+        proxy._mark_wired_once(certdir, 36301)
+        monkeypatch.setattr(proxy, "_wired_port", lambda: 52000)
+
+        def _times_out(*a, **kw):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(proxy.socket, "create_connection", _times_out)
+        monkeypatch.setattr(proxy, "clients_that_arming_would_cut_off", lambda p: 0)
+        monkeypatch.setattr(
+            proxy,
+            "wire_global_config",
+            lambda p, ca: pytest.fail("wrote the wiring on a probe that only timed out"),
+        )
+        assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is True
+        assert proxy._is_claimed(certdir, live_clients=lambda: 0) is True
+
+    def case_a_wiring_on_a_FULL_BACKLOG_listener_is_never_stolen(
+        self, tmp_path, monkeypatch
+    ):
+        """The same, through a real stack: a listener that never accepts, its
+        queue filled, so the probe's connect really times out (~1 s)."""
+        from cswap_pin import proxy
+
+        while True:  # not 36301, the daemon's port (see `_dead_port`)
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            if srv.getsockname()[1] != 36301:
+                break
+            srv.close()
+        srv.listen(0)
+        addr = srv.getsockname()
+        fillers = []
+        try:
+            for _ in range(4):
+                c = socket.socket()
+                c.setblocking(False)
+                with contextlib.suppress(BlockingIOError):
+                    c.connect(addr)
+                fillers.append(c)
+            time.sleep(0.2)
+            try:
+                socket.create_connection(addr, timeout=0.3).close()
+            except TimeoutError:
+                pass
+            except OSError:
+                pytest.skip("this host's stack does not time out here, so the premise is absent")
+            else:
+                pytest.skip("the full backlog still accepted, so the premise is absent")
+            certdir = self._ours(tmp_path, monkeypatch, 36301)
+            proxy._mark_wired_once(certdir, 36301)
+            monkeypatch.setattr(proxy, "_wired_port", lambda: addr[1])
             monkeypatch.setattr(
                 proxy,
                 "wire_global_config",
-                lambda p, ca: pytest.fail("stole a LIVE wiring from another daemon"),
+                lambda p, ca: pytest.fail("stole a wiring from a listener that only timed out"),
             )
-            assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is False
+            assert proxy._repair_wiring_if_ours(certdir, 36301, lambda: 0) is True
         finally:
+            for c in fillers:
+                c.close()
             srv.close()
 
     def case_an_UNPINNED_config_is_left_unpinned(self, tmp_path, monkeypatch):
