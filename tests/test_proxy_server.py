@@ -17203,6 +17203,71 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         self._tick(rig, certdir, monkeypatch, False)
         assert rig.provider.blind_reason == "", rig.provider.blind_reason
 
+    def case_a_reason_whose_record_was_not_written_is_written_by_a_later_tick(
+            self, certdir, monkeypatch):
+        """The tick skips a reason it has already carried, so it may call a
+        reason carried only once the record is on disk: a failed target
+        lookup or a failed write must leave the next tick to retry, and a
+        failed write must not leave its temp file behind."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        reason = rig.provider.blind_reason = "refresh invalid_grant for slot 2 (x)"
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                            upstream=("127.0.0.1", 1))
+        carry = certdir / "blind-reason.json"
+        real_target, real_replace = rig.provider.current_target, pp.os.replace
+
+        def no_target():
+            monkeypatch.setattr(rig.provider, "current_target", real_target)
+            raise RuntimeError("the roster is unreadable")
+
+        def no_replace(*args, **kwargs):
+            monkeypatch.setattr(pp.os, "replace", real_replace)
+            raise OSError("no space left")
+
+        monkeypatch.setattr(rig.provider, "current_target", no_target)
+        monkeypatch.setattr(pp.os, "replace", no_replace)
+        try:
+            with pytest.raises(RuntimeError):
+                proxy._carry_blind_tick()
+            assert not carry.exists()
+            proxy._carry_blind_tick()          # the write fails; no raise
+            assert pp.os.replace is real_replace, "the write fault never fired"
+            assert not carry.exists()
+            assert list(certdir.glob("blind-reason.json.*.tmp")) == []
+            proxy._carry_blind_tick()          # both faults spent; it lands
+            assert json.loads(carry.read_text()) == {
+                "slot": "2", "mail": "pin@example.com", "reason": reason}
+            assert list(certdir.glob("blind-reason.json.*.tmp")) == []
+        finally:
+            proxy.stop()
+
+    def case_a_temp_file_left_by_a_dead_writer_is_removed_by_the_next_write(
+            self, certdir, monkeypatch):
+        """A death between the temp write and the rename never runs the
+        except, and the temp's name carries the dead pid, so only a later
+        write, to set the record or to remove it, can sweep it."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        reason = rig.provider.blind_reason = "refresh invalid_grant for slot 2 (x)"
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                            upstream=("127.0.0.1", 1))
+        carry, stale = certdir / "blind-reason.json", certdir / "blind-reason.json.99999.tmp"
+        try:
+            stale.write_text("{")
+            proxy._carry_blind_tick()
+            assert json.loads(carry.read_text())["reason"] == reason
+            assert not stale.exists()
+            stale.write_text("{")
+            rig.provider.blind_reason = ""
+            proxy._carry_blind_tick()
+            assert not carry.exists()
+            assert not stale.exists()
+        finally:
+            proxy.stop()
+
     def case_a_store_blob_that_crosses_the_buffer_is_judged_once(
             self, certdir, monkeypatch):
         """The store read's liveness was asked twice (the guard, then the
