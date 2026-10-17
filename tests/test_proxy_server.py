@@ -24920,8 +24920,7 @@ class TestSessionAffinityOnMessages:
         a fresh snapshot. The session is idle 3400 s afterwards."""
         from cswap_pin import proxy as pp
         seen = self._wire(monkeypatch, certdir, **wire)
-        if forms is not None:  # None: the gate as shipped
-            monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset(forms))
+        monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset(forms))
         extra = {"anthropic-beta": beta} if beta else {}
         self._send(certdir, [self._call("S", **{
             "anthropic-version": "2023-06-01", "accept-encoding": "gzip",
@@ -25285,11 +25284,12 @@ class TestSessionAffinityOnMessages:
         assert up.bodies_seen == [], "a ping wrote a cache that had expired"
         assert pp._affinity_pings["refused"] == {"past its cache ttl": 1}
 
-    def case_the_shipped_gate_is_closed_and_costs_no_rebuild(
+    def case_the_shipped_gate_holds_the_measured_forms_and_a_closed_one_costs_no_rebuild(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
-        assert pp._KEEPALIVE_FORMS == frozenset(), "the gate ships closed"
-        seen = self._armed(monkeypatch, certdir, forms=None)
+        assert pp._KEEPALIVE_FORMS == frozenset({"full", "held"}), (
+            "the two forms the sandbox measured")
+        seen = self._armed(monkeypatch, certdir, forms=())
         pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
         fetches = len(seen.fetches)
         with self._pair(certdir) as (proxy, up):

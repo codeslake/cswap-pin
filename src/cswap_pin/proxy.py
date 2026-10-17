@@ -3289,9 +3289,12 @@ _affinity_pings = {"sent": 0, "refused": {}, "hit": 0}
 # kept, and those it did not (and so dropped the one before), by reason.
 _affinity_captures = {"kept": 0, "dropped": {}}
 # The body forms the sandbox measured safe to ping ("full": the whole history;
-# "held": a `message-threads-` request whose history the server holds). None
-# yet: the sender refuses every session until a follow-up sets it.
-_KEEPALIVE_FORMS: frozenset = frozenset()
+# "held": a `message-threads-` request whose history the server holds). Step 0,
+# client 2.1.302, P ~= 30.3k: a ping of either form answered 200 with
+# cache_read = P and no cache_creation, and the next real turn went out in the
+# same form with no 404. Not shown: a `thinking_drop` (no thinking block was
+# produced) and the TTL extension after a real idle (`/health` pings `hit` says).
+_KEEPALIVE_FORMS: frozenset = frozenset({"full", "held"})
 _KEEPALIVE_MAX_TOKENS = 0
 _KEEPALIVE_TICK_S = 60.0
 _KEEPALIVE_IO_S = 30.0  # one connect, handshake, send or read of a ping

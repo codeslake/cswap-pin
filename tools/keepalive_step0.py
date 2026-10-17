@@ -5,10 +5,10 @@
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> --no-ping
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> --self-check
 
-WHY THIS EXISTS AS A SCRIPT. `_KEEPALIVE_FORMS` ships empty: the sender replays
-a session's last body (`max_tokens: 0`, `stream: false`) and nothing has shown
-that the API accepts it, reads the cache instead of writing it, or leaves the
-session's NEXT real request alone (no `thread_not_found` 404, no dropped
+WHY THIS EXISTS AS A SCRIPT. `_KEEPALIVE_FORMS` was empty until it ran: the sender
+replays a session's last body (`max_tokens: 0`, `stream: false`) and nothing had
+shown that the API accepts it, reads the cache instead of writing it, or leaves
+the session's NEXT real request alone (no `thread_not_found` 404, no dropped
 thinking). The ping has no trigger from outside the process, so the pin runs
 in-process here and `_keepalive_ping(session, force_form=True)` is called
 directly. Per body form (`full`: the whole history; `held`: a
@@ -246,6 +246,7 @@ def verdict(rec):
         return "NOT MEASURED"
     if rec["ping"] is None:
         return "CONTROL"
+    # shortcut: the 0.9 P rule counts the full form's own tail re-creation as a miss; compare with --no-ping, and make the verdict control-relative when step 0 re-runs.
     p, ping, nxt = rec["P"], rec["ping"], rec["next"]
     pu, nu = ping["usage"], nxt["usage"]
     a = (ping["status"] is not None and 200 <= ping["status"] < 300 and p > 0
