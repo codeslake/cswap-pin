@@ -15,6 +15,9 @@ This module IS that shape. Eight symbols, eight modules, listed once:
     exceptions.ConfigError            ...
     switcher.ClaudeAccountSwitcher    the account store
     switcher.switch_off_at_limit_account   walls the account a 429 just hit
+    autoswitch.proactive_switch_bar_pct    the used-% cswap's engine switches
+                                      at (session affinity keeps a slot under
+                                      it; a host without it uses the threshold)
     oauth                             token extraction and refresh
     claude_locks.claude_config_lock   serialize config rewrites
     pin                               cswap's identity readers over its own

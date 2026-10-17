@@ -3247,12 +3247,19 @@ _affinity: dict[str, tuple[str, float]] = {}
 # rebuild and is never pruned by one: a session may still hold the token a
 # slot has since moved off.
 _affinity_idents: dict[str, tuple] = {}
-# (slot, email) -> (stored token, its expiresAt, the slot's bar in percent) for
-# the slots that had headroom at the last rebuild.
+# (slot, email) -> (stored token, its expiresAt, the slot's bar in percent, the
+# store row's `fetched_at`) for the slots that had headroom at the last rebuild.
 _affinity_kept: dict[tuple, tuple] = {}
-# (slot, email) -> monotonic time a reply showed the slot at its bar: it is not
-# kept again by a snapshot that started before that
-_affinity_dropped: dict[tuple, float] = {}
+# (slot, email) -> (wall time, monotonic time) a reply showed the slot at its
+# bar: it is not kept again by a snapshot that started before that, nor by one
+# whose store row was fetched before it (a row with no `fetched_at` never
+# qualifies: the slot stays out for the life of the process)
+_affinity_dropped: dict[tuple, tuple[float, float]] = {}
+# (slot, email) -> why the last snapshot did not keep it (None: it did)
+_affinity_why: dict[tuple, "str | None"] = {}
+# reason -> (monotonic time of its last lifecycle line, declines folded into
+# the next one): `_affinity_pick` saying why a warm session was not kept
+_affinity_declined: dict[str, tuple] = {}
 # (slot, email) -> monotonic time until which a slot that refused is not kept
 _affinity_rest: dict[tuple, float] = {}
 # when the current rebuild started (`tried`: its identity), when the landed
@@ -3265,9 +3272,9 @@ _affinity_snap = {"tried": -math.inf, "at": -math.inf, "busy": False,
 _affinity_logged: dict[tuple, tuple] = {}
 
 
-def session_affinity_config(certdir) -> "tuple[float, float] | None":
-    """(cache TTL in seconds, threshold in percent) when session affinity is
-    armed, else None. Unreadable or absent is OFF, never an error: a switch
+def session_affinity_config(certdir) -> "tuple[float, float, str] | None":
+    """(cache TTL in seconds, threshold in percent, autoswitch strategy) when
+    session affinity is armed, else None. Unreadable or absent is OFF, never an error: a switch
     that can break a request is worse than none."""
     if certdir is None:
         return None
@@ -3286,7 +3293,7 @@ def session_affinity_config(certdir) -> "tuple[float, float] | None":
                 ) or (Path(certdir) / _AFFINITY_SWITCH_FILE).exists():
             loaded = _settings.load_settings(root)
             cfg = (float(getattr(loaded, "cache_ttl_seconds", 3600.0)),
-                   float(loaded.threshold))
+                   float(loaded.threshold), str(loaded.strategy))
     except Exception:  # noqa: BLE001 — a switch must not cost a request
         cfg = None
     _AFFINITY_CACHE[key] = (now, cfg)
@@ -3301,11 +3308,14 @@ def _bounded_put(table: dict, key, value) -> None:
         del table[next(iter(table))]
 
 
-def _affinity_rebuild(threshold: float, started: float) -> None:
+def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
     """Rebuild the snapshot from the store: which slot stores which token, and
     which slots may be kept (a token with an `expiresAt` that is unexpired at
-    pick time, not walled, not disabled, every window under the lower of
-    ``threshold`` and the slot's own `switchThreshold`, kept with that bar).
+    pick time, not walled, not disabled, every window under the slot's bar,
+    kept with that bar). The bar is the slot's own `switchThreshold` when it
+    has one, else the one cswap's engine switches at for ``strategy`` and
+    ``threshold`` (`proactive_switch_bar_pct`: `dynamic` is not the threshold).
+    A slot not kept is recorded with the reason, for `_affinity_pick` to say.
     Runs on a daemon thread, never a request's: a store or Keychain read can
     hang, and then only this thread does.
 
@@ -3321,27 +3331,39 @@ def _affinity_rebuild(threshold: float, started: float) -> None:
         sw = require("switcher").ClaudeAccountSwitcher()
         own = getattr(sw, "account_switch_thresholds", dict)()
         disabled = getattr(sw, "is_account_disabled", lambda _n: False)
+        # an older host has no such function: its bar is the threshold
+        base = getattr(require("autoswitch"), "proactive_switch_bar_pct",
+                       lambda _strategy, t: t)(strategy, threshold)
         entries = sw.usage_entries_by_account(fetch=set())
-        idents, kept, owed = {}, {}, []
+        idents, kept, why, owed = {}, {}, {}, []
         for num, info in sw._get_sequence_data()["accounts"].items():
             slot, ident = str(num), (str(num), info["email"])
+            why[ident] = "its credentials could not be read"
             try:  # one unreadable slot must not end affinity for the rest
                 data = oauth.extract_oauth_data(
                     sw.read_account_credentials(num, info["email"]))
                 if not (data and data.get("accessToken")):
+                    why[ident] = "no stored token"
                     continue
                 idents[data["accessToken"]] = ident
                 entry = entries[slot]
                 usage = entry.decision_value(("all",))
                 windows = {w for w, _, _ in oauth.relevant_windows(
                     usage, ("all",))}
-                bar = min(threshold, own.get(slot, threshold))
-                if not (getattr(entry, "walled", False) or disabled(slot)
-                        or not {"5h", "7d"} <= windows
-                        or not isinstance(data.get("expiresAt"), (int, float))
-                        or oauth.account_headroom(usage, ("all",))
-                        <= 100.0 - bar):
-                    kept[ident] = (data["accessToken"], data["expiresAt"], bar)
+                bar = own.get(slot, base)
+                why[ident] = (
+                    "walled" if getattr(entry, "walled", False) else
+                    "disabled" if disabled(slot) else
+                    "a usage window has no reading"
+                    if not {"5h", "7d"} <= windows else
+                    "its stored token has no expiry"
+                    if not isinstance(data.get("expiresAt"), (int, float))
+                    else "at its bar"
+                    if oauth.account_headroom(usage, ("all",)) <= 100.0 - bar
+                    else None)
+                if why[ident] is None:
+                    kept[ident] = (data["accessToken"], data["expiresAt"], bar,
+                                   getattr(entry, "fetched_at", None))
             except Exception:  # noqa: BLE001
                 pass
         with _affinity_lock:
@@ -3349,9 +3371,18 @@ def _affinity_rebuild(threshold: float, started: float) -> None:
                 _bounded_put(_affinity_idents, token, ident)
             if _affinity_snap["tried"] == started:
                 _affinity_kept.clear()
-                _affinity_kept.update(
-                    (i, v) for i, v in kept.items()
-                    if _affinity_dropped.get(i, -math.inf) < started)
+                for i, v in kept.items():
+                    d = _affinity_dropped.get(i)
+                    # a drop is undone only by a snapshot that began after it
+                    # AND read a store row fetched after it (wall to wall,
+                    # monotonic to monotonic)
+                    if d is None or (v[3] is not None and v[3] > d[0]
+                                     and started > d[1]):
+                        _affinity_kept[i] = v
+                    else:
+                        why[i] = "dropped at its bar, no newer reading since"
+                _affinity_why.clear()
+                _affinity_why.update(why)
                 _affinity_snap["at"] = started
                 now = time.monotonic()
                 owed = [(k, n) for k, (t, n) in _affinity_logged.items()
@@ -3372,7 +3403,7 @@ def _affinity_rebuild(threshold: float, started: float) -> None:
                 _affinity_snap["stuck"] -= 1
 
 
-def _affinity_kick(threshold: float) -> None:
+def _affinity_kick(threshold: float, strategy: str) -> None:
     """Start `_affinity_rebuild` on a thread of its own when the last one
     started `_AFFINITY_REFRESH_S` ago and none is running (one at a time, a
     failed one is not retried per request).
@@ -3407,7 +3438,7 @@ def _affinity_kick(threshold: float) -> None:
     if due:
         try:
             _spawn_usage_header_recorder(
-                lambda: _affinity_rebuild(threshold, now))
+                lambda: _affinity_rebuild(threshold, strategy, now))
         except Exception:  # noqa: BLE001 — no thread to start is no snapshot
             with _affinity_lock:
                 snap["busy"] = False
@@ -3418,7 +3449,8 @@ def _affinity_note_usage(token: str, headers: dict) -> "tuple | None":
     account it came from, and the snapshot is up to `_AFFINITY_REFRESH_S`
     older: when it puts a kept slot at or over that slot's bar, the slot is
     not kept any more, and no snapshot that started before the reply keeps it
-    again. In memory, on the relay's thread: no store read. ``token`` is the
+    again (nor one that read a store row fetched before the reply). In memory,
+    on the relay's thread: no store read. ``token`` is the
     bearer the request went out on. Returns the (slot, email) it dropped, else
     None: that reading is what a rebuild started after the drop must find in
     the store, so the caller records it to that slot past the throttles.
@@ -3438,30 +3470,45 @@ def _affinity_note_usage(token: str, headers: dict) -> "tuple | None":
         if stored is None or used < stored[2]:
             return None
         del _affinity_kept[ident]
-        _bounded_put(_affinity_dropped, ident, time.monotonic())
+        _bounded_put(_affinity_dropped, ident, (time.time(), time.monotonic()))
         return ident
 
 
+def _affinity_due(table: dict, key, now: float) -> "int | None":
+    """Under `_affinity_lock`: whether a lifecycle line for ``key`` is due,
+    one per `_BUSY_REPORT_COOLDOWN_S`. It is (the count of lines folded into
+    it) or it is not (None, and this one is counted into the next)."""
+    last, more = table.get(key, (None, 0))
+    if last is None or now - last >= _BUSY_REPORT_COOLDOWN_S:
+        table[key] = (now, 0)
+        return more
+    table[key] = (last, more + 1)
+    return None
+
+
 def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
-    """The kept account refused a request: end the session's affinity and rest
-    the account until its 429's ``reset`` (epoch seconds), or for
-    `_AFFINITY_BACKOFF_S` when there is none. One lifecycle line per (slot,
-    code) per `_BUSY_REPORT_COOLDOWN_S`, folding the rest into "; N more":
-    the slot, the code and the rest, never a bearer."""
+    """The kept account refused a request, which goes out again on the
+    client's bearer. A 401/403/429 also ends the session's affinity and rests
+    the account until the 429's ``reset`` (epoch seconds), or for
+    `_AFFINITY_BACKOFF_S` when there is none. A 404 does neither: it names the
+    request (a model or route the account lacks), not the account, so the
+    session stays on it. One lifecycle line per (slot, code) per
+    `_BUSY_REPORT_COOLDOWN_S`, folding the rest into "; N more": the slot, the
+    code and the rest, never a bearer."""
     wait = _AFFINITY_BACKOFF_S
     if reset is not None and math.isfinite(reset) and reset > time.time():
         wait = reset - time.time()
-    now, key = time.monotonic(), (ident[0], code)
+    now = time.monotonic()
     with _affinity_lock:
-        _affinity.pop(session, None)
-        _bounded_put(_affinity_rest, ident, now + wait)
-        last, more = _affinity_logged.get(key, (None, 0))
-        say = last is None or now - last >= _BUSY_REPORT_COOLDOWN_S
-        _affinity_logged[key] = (now, 0) if say else (last, more + 1)
-    if say:
+        if code != 404:
+            _affinity.pop(session, None)
+            _bounded_put(_affinity_rest, ident, now + wait)
+        more = _affinity_due(_affinity_logged, (ident[0], code), now)
+    if more is not None:
         _log_lifecycle(
             f"session affinity: slot {ident[0]} answered {code} to a kept "
-            f"session, resent on the live account, slot rested {wait:.0f}s"
+            f"session, resent on the live account"
+            + (f", slot rested {wait:.0f}s" if code != 404 else "")
             + (f"; {more} more" if more else ""))
 
 
@@ -3481,11 +3528,17 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     or a client token it has not seen, the client's bearer goes out and the
     session is left as it was (see the comment below), until the refresh that
     is due anyway has run.
+
+    A warm session whose slot is passed over leaves one lifecycle line naming
+    why (`_affinity_due`: one per reason per `_BUSY_REPORT_COOLDOWN_S`).
     """
     cfg = session_affinity_config(certdir)
     if cfg is None:
+        if _affinity_kept:  # switched off: no kept slot may outlive it
+            with _affinity_lock:
+                _affinity_kept.clear()
         return None
-    ttl, threshold = cfg
+    ttl, threshold, strategy = cfg
     client = session = ""
     for k, v in headers:
         kl = k.lower()
@@ -3496,8 +3549,8 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     if not (client and session):
         return None
     now = time.monotonic()
-    _affinity_kick(threshold)
-    token = None
+    _affinity_kick(threshold, strategy)
+    token = line = stored = None
     with _affinity_lock:
         prior = _affinity.get(session)
         if prior is None or now - prior[1] > ttl or prior[0] == client:
@@ -3519,6 +3572,20 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
                      and stored[0])
             _bounded_put(_affinity, session,
                          (prior[0] if token else client, now))
+        if held and held != mine and not token:  # a slot was passed over
+            why = ("the snapshot is too old to rule" if not fresh
+                   else "the client's token is in no snapshot yet" if not mine
+                   else "resting after a refusal"
+                   if _affinity_rest.get(held, 0.0) > now
+                   else "its stored token has expired" if stored
+                   else _affinity_why.get(held, "it is in no snapshot"))
+            more = _affinity_due(_affinity_declined, why, now)
+            if more is not None:
+                line = (f"session affinity: a warm session was not kept on "
+                        f"slot {held[0]} ({why})"
+                        + (f"; {more} more" if more else ""))
+    if line:
+        _log_lifecycle(line)
     return (token, held, session) if token else None
 
 
