@@ -1102,13 +1102,12 @@ request for any other tier drops it). A thread of its own looks once a minute
 for a session whose body is about 55 minutes old (the body's own clock: a
 subagent's request does not reset it, a 2xx ping does) and whose slot the pin
 would keep, and it ends when the switch goes off or the process hands its
-listener to a successor. It sends
-that body once more with `max_tokens` 0 and `stream` false, on the kept slot's
-stored token, so the API's cache is renewed before it expires: at most two per
-real request, and none for a prefix under 20,000 tokens (a held body's is
-unknown, so its first ping goes out and the reply measures it; cswap's
-`autoswitch.keepalive_due` has the rule; the pin has a copy for a cswap
-without it). A ping replays exactly the form of the session's last real body (a
+listener to a successor. It sends that body once more with `max_tokens` 0 and
+`stream` false, on the kept slot's stored token, so the API's cache is renewed
+before it expires: at most two per real request, and none for a prefix under
+20,000 tokens (a held body's is unknown, so its first ping goes out and the
+reply measures it; cswap's `autoswitch.keepalive_due` has the rule; the pin has
+a copy for a cswap without it). A ping replays exactly the form of the session's last real body (a
 full history, or a `message-threads-` request whose history the server holds)
 and never converts one into the other. It never refreshes, consumes or probes
 a token: an expired stored token is refused. Any answer but a 2xx, a 429 or a
