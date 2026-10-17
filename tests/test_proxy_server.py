@@ -19484,11 +19484,17 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     pass
 
             def _drain():
-                try:
-                    while chunk := cl_b.recv(65536):
-                        got.append(chunk)
-                except OSError:  # the SHUT_RD wake below, where it raises
-                    pass
+                while True:
+                    try:
+                        chunk = cl_b.recv(65536)
+                    except TimeoutError:  # re-poll: XNU left an untimed recv asleep (T2609)
+                        continue
+                    except OSError:  # the SHUT_RD wake below, where it raises
+                        return
+                    if not chunk:
+                        return
+                    got.append(chunk)
+            cl_b.settimeout(0.25)
             reader = threading.Thread(target=_drain, daemon=True)
             threading.Thread(target=_feed, daemon=True).start()
             reader.start()
@@ -19506,7 +19512,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                               f"{(st.st_dev, st.st_ino) == (st0.st_dev, st0.st_ino)})")
                 try:  # XNU's SHUT_RD flushes unread data: never wake over some
                     pending = cl_b.recv(1, _s.MSG_PEEK | _s.MSG_DONTWAIT)
-                except BlockingIOError:
+                except (BlockingIOError, TimeoutError):  # a timed socket polls first
                     pending = b""
                 assert not pending, ("missed wakeup with data queued: the "
                                      "drain left bytes unread, SHUT_RD would drop them")
@@ -19588,6 +19594,30 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         self._wire(monkeypatch, switched=False)
         monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
         self._refuse_the_wake(monkeypatch, errno.ENOTCONN, wakes=True)
+        body = b"0123456789" * 1000
+        with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
+            got = self._relay(status=b"200 OK", reset=False, body=body)
+        assert got.startswith(b"HTTP/1.1 200") and got.endswith(body), got[:40]
+
+    def case_a_drain_asleep_in_an_untimed_recv_is_not_left_blocked(self, monkeypatch):
+        """T2609. macOS CI: the EOF reached `cl_b` (`SHUT_RD` raised ENOTCONN) yet
+        the recv already asleep was never woken. THE INJECTED FAULT is that recv:
+        an untimed one in the drain thread delivers data but sleeps past the
+        join instead of returning EOF. The drain must poll with a timeout."""
+        import errno
+        self._wire(monkeypatch, switched=False)
+        monkeypatch.setattr(type(self), "EOF_GRACE", 0.2)
+        self._refuse_the_wake(monkeypatch, errno.ENOTCONN, wakes=True)
+        real_recv, main = socket.socket.recv, threading.main_thread()
+
+        def _recv(s, n, flags=0):
+            data = real_recv(s, n, flags)
+            # only the drain recvs off the main thread; bounded so a red run ends
+            if (not data and flags == 0 and s.gettimeout() is None
+                    and threading.current_thread() is not main):
+                threading.Event().wait(3)
+            return data
+        monkeypatch.setattr(socket.socket, "recv", _recv)
         body = b"0123456789" * 1000
         with pytest.warns(UserWarning, match="no EOF after SHUT_WR, woke the drain"):
             got = self._relay(status=b"200 OK", reset=False, body=body)
