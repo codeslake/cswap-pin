@@ -21682,6 +21682,39 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert "6" not in calls[0], (
             f"an expired wall must not exclude its slot forever: {calls}")
 
+    def case_switch_caps_each_excluded_slot_at_its_own_reset(self, monkeypatch):
+        """cswap's `switch(wall_until=)` (cswap PR #199) caps each at-limit
+        mark at that slot's own reset: the pin sends the walls it bars with
+        `exclude`, the live slot's own, from this 429, included."""
+        from cswap_pin import proxy as pp
+        seen = []
+
+        def _switch(self, strategy=None, json_output=False, models=None,
+                    current_at_limit=False, exclude=None, wall_until=None):
+            seen.append((exclude, wall_until))
+            return {"switched": True, "needsLogin": False, "validated": True}
+
+        self._wire_exclude_capable(
+            monkeypatch, switched=True, live_token=self.LIVE, live_num="4")
+        monkeypatch.setattr(pp.require("switcher").ClaudeAccountSwitcher,
+                            "switch", _switch)
+        pp._walled_slots["6"] = other = time.time() + 3600
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        (exclude, wall_until), = seen
+        assert wall_until == {"4": 9999999999.0, "6": other}, wall_until
+        assert set(wall_until) == set(exclude), (wall_until, exclude)
+
+    def case_a_host_without_wall_until_is_sent_exclude_alone(self, monkeypatch):
+        """THE CONTROL: the kwarg is gated on the signature. An exclude-capable
+        host without it would raise TypeError into the except and relay the
+        429; here `switch()` runs and the walled 401 is answered."""
+        calls = self._wire_exclude_capable(
+            monkeypatch, switched=True, live_token=self.LIVE, live_num="4")
+        got = self._relay(auth="Bearer " + self.LIVE)
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert calls == [frozenset({"4"})], calls
+
     def case_a_bearer_branch_conversion_records_no_walled_slot(
         self, monkeypatch,
     ):

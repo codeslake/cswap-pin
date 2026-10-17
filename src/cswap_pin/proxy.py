@@ -24314,6 +24314,9 @@ def _switch_off_walled_account(
                                  if exp <= now]:
                     del _walled_slots[expired]
                 switch_kwargs["exclude"] = frozenset(_walled_slots)
+                # cswap PR #199: caps each at-limit mark at that 429's own reset
+                if _switch_takes("wall_until"):
+                    switch_kwargs["wall_until"] = dict(_walled_slots)
             result = switcher.ClaudeAccountSwitcher().switch(**switch_kwargs)
             if grant:
                 _mark_refused(switch_kwargs["exclude"])  # whatever it returned
