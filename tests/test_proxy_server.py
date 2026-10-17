@@ -24779,8 +24779,9 @@ class TestSessionAffinityOnMessages:
             self._send(certdir, [("tok-B", "S")], body=body,
                        reject_bearer="tok-A", reject_status=status)
             assert ("S" not in pp._affinity) is goes, (status, pp._affinity)
-            assert ("S" not in pp._affinity_last) is goes, (
+            assert "S" not in pp._affinity_last, (
                 status, list(pp._affinity_last))
+            assert bool(pp._affinity_rest) is goes, (status, pp._affinity_rest)
         seen = self._wire(monkeypatch, certdir)
         self._send(certdir, [self._call("S")], body=body)
         assert "S" in pp._affinity_last
@@ -24788,6 +24789,25 @@ class TestSessionAffinityOnMessages:
         pp._AFFINITY_CACHE.clear()
         self._send(certdir, [self._call("S")], body=body)
         assert not pp._affinity_last, "switching off kept the conversation"
+
+    def case_a_body_that_is_not_json_is_unreadable_not_a_5_min_tier(
+            self, monkeypatch, certdir):
+        """Only a body that parses can say its final breakpoint is the 5 min
+        one; the label must not come from the bytes alone."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        junk = '{"cache_control": not json'
+        five = json.dumps({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "x",
+             "cache_control": {"type": "ephemeral"}}]}]})
+        assert b'"1h"' not in junk.encode() + five.encode()
+        assert pp._final_cache_ttl_s(junk.encode()) is None
+        assert pp._final_cache_ttl_s(five.encode()) == 300.0
+        for body in (junk, five):
+            self._send(certdir, [self._call("S")], body=body)
+        assert self._health(certdir)["captures"] == {
+            "kept": 0, "dropped": {"unreadable": 1, "5 min tier": 1}}, (
+            pp._affinity_captures)
 
     def _health(self, certdir):
         from cswap_pin.proxy import PinProxy
@@ -24900,8 +24920,7 @@ class TestSessionAffinityOnMessages:
         a fresh snapshot. The session is idle 3400 s afterwards."""
         from cswap_pin import proxy as pp
         seen = self._wire(monkeypatch, certdir, **wire)
-        if forms is not None:  # None: the gate as shipped
-            monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset(forms))
+        monkeypatch.setattr(pp, "_KEEPALIVE_FORMS", frozenset(forms))
         extra = {"anthropic-beta": beta} if beta else {}
         self._send(certdir, [self._call("S", **{
             "anthropic-version": "2023-06-01", "accept-encoding": "gzip",
@@ -25265,11 +25284,12 @@ class TestSessionAffinityOnMessages:
         assert up.bodies_seen == [], "a ping wrote a cache that had expired"
         assert pp._affinity_pings["refused"] == {"past its cache ttl": 1}
 
-    def case_the_shipped_gate_is_closed_and_costs_no_rebuild(
+    def case_the_shipped_gate_holds_the_measured_forms_and_a_closed_one_costs_no_rebuild(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
-        assert pp._KEEPALIVE_FORMS == frozenset(), "the gate ships closed"
-        seen = self._armed(monkeypatch, certdir, forms=None)
+        assert pp._KEEPALIVE_FORMS == frozenset({"full", "held"}), (
+            "the two forms the sandbox measured")
+        seen = self._armed(monkeypatch, certdir, forms=())
         pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
         fetches = len(seen.fetches)
         with self._pair(certdir) as (proxy, up):
