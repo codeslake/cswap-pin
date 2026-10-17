@@ -16189,6 +16189,12 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
     # nothing to do. Never raises: a wiring failure must not stop a daemon that
     # is otherwise serving, and the next launch or heal still repairs it.
     ensure_wired_to(proxy.port, certdir)
+    # A HANDOVER KEEPS THE PORT, so the line above returns at `wired == port`
+    # having written nothing, and a pin-only deploy never reaches `heal`: a
+    # release that adds an env key would never reach the config. Refuses
+    # unless the receipt is ours, written by another version, and names this
+    # port (a cleared host's receipt is empty). Never raises.
+    rewire_if_version_changed(certdir)
 
     fifo = refcount_fifo_path(certdir)
     if not fifo.exists():

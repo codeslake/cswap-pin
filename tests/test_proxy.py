@@ -32695,12 +32695,17 @@ class TestTheServingDaemonOwnsTheWiring:
             f"a daemon rewired .claude.json with no pin record: "
             f"rc={rc} wrote={wrote}")
 
-    def _successor_wiring(self, tmp_path, monkeypatch, pinned):
+    def _successor_wiring(self, tmp_path, monkeypatch, pinned, seed=None,
+                          settled=None):
         """(CSWAP_PIN_PORT the successor left in `.claude.json`, its port).
 
         A REAL handed-down successor, because that is what both a
         self-upgrade and a holder's handover start: `_spawn_daemon` with the
         predecessor's listening socket, then `daemon_main` in a new process.
+
+        `seed(cfg, port)` runs once the port is known, before the spawn.
+        `settled(cfg)` replaces the log-marker wait, for a branch that logs
+        nothing (the successor finding the config already naming its port).
         """
         import subprocess as _sp
 
@@ -32724,6 +32729,8 @@ class TestTheServingDaemonOwnsTheWiring:
         lsn.bind(("127.0.0.1", 0))
         lsn.listen(5)
         port = lsn.getsockname()[1]
+        if seed:
+            seed(cfg, port)
         monkeypatch.setattr(p, "_SPAWN_WAIT_S", 5.0)
         children = []
         real_popen = _sp.Popen
@@ -32750,7 +32757,9 @@ class TestTheServingDaemonOwnsTheWiring:
             deadline = time.time() + 15
             while time.time() < deadline:
                 text = log.read_text() if log.exists() else ""
-                if "rewired .claude.json" in text or "no pin record" in text:
+                if (settled(cfg) if settled else
+                        "rewired .claude.json" in text
+                        or "no pin record" in text):
                     break
                 time.sleep(0.1)
             else:
@@ -32791,6 +32800,39 @@ class TestTheServingDaemonOwnsTheWiring:
         wired, port = self._successor_wiring(tmp_path, monkeypatch,
                                              pinned=True)
         assert wired == str(port), (wired, port)
+
+    def test_a_handed_down_successor_on_the_SAME_port_refreshes_an_older_wiring(
+            self, tmp_path, monkeypatch):
+        """A handover keeps the port, so `ensure_wired_to` returns at
+        `wired == port` and a release that ADDS an env key never reached the
+        config: the successor wrote nothing and the receipt kept the old
+        `writtenBy`. `heal` is the only other caller of
+        `rewire_if_version_changed` and a pin-only deploy never reaches it.
+        The config here is exactly an older release's: this port, the key
+        the current one adds missing, the receipt naming that older release."""
+        import cswap_pin.proxy as p
+
+        def seed(cfg, port):
+            monkeypatch.setattr("claude_swap.paths.get_global_config_path",
+                                lambda: cfg)
+            assert p.wire_global_config(port, tmp_path / "pin-proxy" / "ca.pem")
+            raw = json.loads(cfg.read_text())
+            raw["env"].pop("all_proxy")
+            cfg.write_text(json.dumps(raw))
+            led = p._read_ledger(cfg, raw)
+            led[p._WIRE_MARK] = [k for k in led[p._WIRE_MARK]
+                                 if k != "all_proxy"]
+            led["writtenBy"] = "0.0.1"
+            p._ledger_path(cfg).write_text(json.dumps(led))
+
+        def settled(cfg):
+            raw = json.loads(cfg.read_text())
+            return ("all_proxy" in raw["env"] and p._read_ledger(cfg, raw)
+                    .get("writtenBy") == p._own_version())
+
+        wired, port = self._successor_wiring(
+            tmp_path, monkeypatch, pinned=True, seed=seed, settled=settled)
+        assert p._own_version() and wired == str(port), (wired, port)
 
     def test_a_config_naming_a_LIVE_PINS_port_is_left_alone(
             self, tmp_path, monkeypatch):
