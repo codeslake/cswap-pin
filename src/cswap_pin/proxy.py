@@ -3624,6 +3624,8 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
                      and stored[0])
             _bounded_put(_affinity, session,
                          (prior[0] if token else client, now))
+            if not token and held != mine:  # its cache is on the old slot
+                _affinity_last.pop(session, None)
         if held and held != mine and not token:  # a slot was passed over
             why = ("the snapshot is too old to rule" if not fresh
                    else "the client's token is in no snapshot yet" if not mine

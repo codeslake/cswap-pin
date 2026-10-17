@@ -25220,6 +25220,23 @@ class TestSessionAffinityOnMessages:
             assert not thread.is_alive(), "a released generation kept pinging"
             assert not pp._affinity_last, "it kept the bodies it no longer serves"
 
+    def case_a_session_rebound_to_another_slot_forgets_its_body(
+            self, monkeypatch, certdir):
+        """A request that moves the session to a slot that is not kept leaves
+        its body's cache on the old slot: a ping would write the whole prefix
+        on an account that never held it. A kept session keeps its body."""
+        from cswap_pin import proxy as pp
+        other = [("Authorization", "Bearer tok-B"),
+                 ("x-claude-code-session-id", "S")]
+        self._armed(monkeypatch, certdir)
+        assert pp._affinity_pick(certdir, other)[0] == "tok-A", "kept"
+        assert "S" in pp._affinity_last and pp._affinity["S"][0] == "tok-A"
+        pp._affinity_rest[self.IDENT] = time.monotonic() + 99
+        assert pp._affinity_pick(certdir, other) is None
+        assert pp._affinity["S"][0] == "tok-B", "rebound to the live account"
+        assert "S" not in pp._affinity_last, (
+            "a body whose cache is on another slot would be pinged")
+
     def case_an_unknown_held_prefix_passes_the_floor_once(
             self, monkeypatch, certdir):
         """A held body's prefix is unknown until a ping reply measures it, so

@@ -1098,7 +1098,8 @@ state is in memory and bounded, and a daemon handover starts every session cold.
 `/v1/messages` body that asks for the 1 h cache tier (in memory only, never
 logged, bounded in count and bytes, dropped with the session's entry or when
 the switch goes off; a subagent's request never replaces it, and a main-thread
-request for any other tier drops it). A thread of its own looks once a minute
+request for any other tier drops it, as does one that moves the session to a
+slot the pin does not keep). A thread of its own looks once a minute
 for a session whose body is about 55 minutes old (the body's own clock: a
 subagent's request does not reset it, a 2xx ping does) and whose slot the pin
 would keep, and it ends when the switch goes off or the process hands its
