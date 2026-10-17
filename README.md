@@ -730,7 +730,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 | `~/.claude.json` `env` (`$CLAUDE_CONFIG_DIR/.claude.json` when that is set) | sets `HTTPS_PROXY`, `https_proxy` and `ALL_PROXY` to the pin's loopback address, `NODE_EXTRA_CA_CERTS` to the pin's CA (or to `ca-bundle.pem` when a hop's CA is merged in) and `CSWAP_PIN_PORT` to its port; deletes `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` | the five removed and whatever they replaced restored; the three deleted stay deleted |
 | `~/.claude.json` `oauthAccount` | the pinned account's identity, re-asserted by every `--ensure` | the account you are logged in as |
 | `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
-| `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` or `sessionAffinity` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
+| `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
 | `<data>/pin-cleared` | written only by a `--clear` on a symlinked `settings.json` that records a pin: this machine reads the shared record as "nothing pinned" while it exists. Needs the matching claude-swap | removed by `cswap pin <account>` and by `--clear --everywhere` |
 | `<data>/pin-proxy/` | the CA and its keys, `ca-bundle.pem`, `upstream.json`, `shell-prefix.proxy` (the proxy the opt-in shell prefix hands the programs Claude Code starts), `proxy.json` (port and pid), `port.hint`, `settings.json` (from `--set_port`), `daemon.log`, locks and a FIFO, and `shell-prefix` only if you ran the command that writes it | left in place |
 | `~/.claude/ca-trust.d/cswap-pin.pem` (under `$CLAUDE_CONFIG_DIR` when that is set) | a copy of the pin's CA, for a launcher that builds one trust bundle from that directory. That is a launcher convention, not Claude Code's: with no such launcher nothing reads it | left in place |
@@ -756,8 +756,9 @@ session* means intercepting the requests.
 
 A local MITM forward proxy that swaps the `Authorization` bearer on exactly
 the routes whose server-side ownership is decided by it, and passes everything
-else — `/v1/messages` above all — through untouched (unless you arm
-session affinity, which is off: see beside `debugSlowMs` below).
+else — `/v1/messages` above all — through untouched (unless cswap's
+cache-aware strategy is on, which it is not by default: see Session affinity
+below).
 
 ```
 claude session
@@ -1080,16 +1081,44 @@ abandoned ones are left waiting: a store stuck for good costs four threads
 restarts.
 
 Real scope: under the `dynamic` strategy the proactive and at-limit moves
-leave an account at 97% or more, so the 90 gate never keeps a session through
-one. In practice it stops *alternation* and *manual* switches from moving
+leave an account at its own bar (97% unless the slot has its own switch
+threshold), so a session on a slot under that bar stays, and one at or over it
+moves. In practice it stops *alternation* and *manual* switches from moving
 warm sessions, and little else.
 
-Arm it for the whole fleet with `"sessionAffinity": true` in the same
-`remoteControl` section as `debugSlowMs` (that file is shared by every host
-that links it), or on one host alone by creating an empty file named
-`session-affinity` in `<data>/pin-proxy/` (the way `trace-to` works). Both are
-re-read within seconds; remove the file or the key to turn it off. The state
-is in memory and bounded, and a daemon handover starts every session cold.
+It is armed by cswap, not by a file here: `autoswitch.strategy` is `dynamic`
+and `autoswitch.cacheAware` is true (the `c` key of the auto-switch screen in
+`cswap tui`), re-read within seconds, so turning it off takes effect without a
+restart. A cswap without the `cacheAware` setting never arms it. The old
+switches, `remoteControl.sessionAffinity` in `settings.json` and the
+`session-affinity` file in `<data>/pin-proxy/`, no longer arm anything. The
+state is in memory and bounded, and a daemon handover starts every session cold.
+
+**Keep-alive.** While armed, the pin keeps each session's last main-thread
+`/v1/messages` body that asks for the 1 h cache tier (in memory only, never
+logged, bounded in count and bytes, dropped with the session's entry; a
+subagent's request never replaces it). A thread of its own looks once a minute
+for a session idle about 55 minutes whose slot the pin would keep, and sends
+that body once more with `max_tokens` 0 and `stream` false, on the kept slot's
+stored token, so the API's cache is renewed before it expires: at most two per
+real request, and none for a prefix under 20,000 tokens (cswap's
+`autoswitch.keepalive_due` has the rule; the pin has a copy for a cswap
+without it). A ping replays exactly the form of the session's last real body (a
+full history, or a `message-threads-` request whose history the server holds)
+and never converts one into the other. It never refreshes, consumes or probes
+a token: an expired stored token is refused. Any answer but a 2xx, a 429 or a
+401 included, is counted and ends that session's pings until its next real
+request; it never reaches the wall, take-back, rest or switch paths. A form no
+sandbox run has measured is refused (`form not measured`). Each ping writes one
+line to `daemon.log`: the slot, the form, the status, `cache_read` and
+`cache_creation`, whether it was a hit, and the reply's `utilization` headers.
+
+`/health` carries a `cache_aware` key (additive): `armed`; per slot, `warm`
+sessions, how many of them `kept`, `prefix_est` (tokens, summed; a held body
+counts 0 until a ping measures it) and `ttl_left_min_s`; `pings`
+(`sent`, `hit`, `refused` by reason, each reason counted once per request); and
+`since`, when this process started counting. Never a session id or a byte of a
+conversation.
 
 `CSWAP_PIN_LISTEN_FD` and `CSWAP_PIN_LISTEN_FROM` also appear in a daemon's
 environment. They are how a process hands its listening socket to the next
