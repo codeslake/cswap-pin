@@ -24281,7 +24281,7 @@ class TestSessionAffinityOnMessages:
             _, auths = self._send(certdir, [("tok-B", "S")])
             assert len(seen.fetches) == 2, "no rebuild started after the drop"
             assert auths == [f"Bearer {want}"], (age, auths)
-            assert any("dropped" in l for l in seen.logs) == (
+            assert any("dropped at its bar" in l for l in seen.logs) == (
                 want == "tok-B"), (age, seen.logs)
 
     def case_a_drop_on_the_slots_own_bearer_records_to_that_slot(
