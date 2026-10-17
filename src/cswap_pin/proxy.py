@@ -11305,20 +11305,25 @@ def clear_blind_recycle(certdir: Path) -> None:
 _BLIND_REASON_FILE = "blind-reason.json"
 
 
-def write_blind_reason(certdir: Path, rec: dict | None) -> None:
-    """Record ``rec`` atomically, or remove the record when it is None."""
+def write_blind_reason(certdir: Path, rec: dict | None) -> bool:
+    """Record ``rec`` atomically, or remove the record when it is None.
+    False when the write failed (the record is advisory: a successor that
+    finds none derives it itself, but the caller may try again)."""
     import json
 
     path = Path(certdir) / _BLIND_REASON_FILE
+    tmp = path.with_name(f"{_BLIND_REASON_FILE}.{os.getpid()}.tmp")
     try:
         if rec is None:
             path.unlink(missing_ok=True)
-            return
-        tmp = path.with_name(f"{_BLIND_REASON_FILE}.{os.getpid()}.tmp")
+            return True
         tmp.write_text(json.dumps(rec))
         os.replace(tmp, path)
+        return True
     except OSError:
-        pass  # advisory; a successor that finds no record derives it itself
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
 
 
 def clear_daemon_unpinnable(certdir: Path) -> bool:
@@ -17051,10 +17056,11 @@ class PinProxy:
         reason = getattr(p, "blind_reason", "") or ""
         if target_of is None or self._stop or reason == self._blind_carried:
             return
-        self._blind_carried = reason
         target = target_of() if reason else None
-        write_blind_reason(self._certdir, target and {
-            "slot": target[0], "mail": target[1], "reason": reason})
+        # Carried only once on disk: a raise above or a failed write is retried.
+        if write_blind_reason(self._certdir, target and {
+                "slot": target[0], "mail": target[1], "reason": reason}):
+            self._blind_carried = reason
 
     def _warm_mint_cache(self) -> None:
         """Populate the mint cache ONCE, off the request path and off
