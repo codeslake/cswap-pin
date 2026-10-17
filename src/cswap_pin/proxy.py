@@ -10445,10 +10445,11 @@ def ensure_wired_to(port: int, certdir: Path) -> bool:
     only ITS OWN daemon may rewire it — this one owns port ``port``, not
     that one. Measured 2026-09-24: a throwaway daemon on a spare certdir
     under the same ``$HOME`` rewired the shared ``.claude.json`` away from
-    the live pin four times in one day. A wiring naming a DEAD port (or
-    nothing) is still corrected, exactly as before, and that includes a
+    the live pin four times in one day. A wiring naming a port that REFUSES
+    (or nothing) is still corrected, exactly as before, and that includes a
     ``CSWAP_PIN_PORT`` block the pin never marked: its values are displaced
-    into the receipt's ``Saved`` and an unwire hands them back.
+    into the receipt's ``Saved`` and an unwire hands them back. A timeout or
+    EMFILE is no answer yet, not a refusal, so it is left alone (T2554).
 
     ONLY WHILE A PIN RECORD EXISTS. `cswap pin --clear` drops the record and
     the wiring and leaves this daemon serving the sessions it holds; a
@@ -10466,8 +10467,9 @@ def ensure_wired_to(port: int, certdir: Path) -> bool:
             return False
         if wired is not None and _wired_names_a_live_pin(wired):
             _log_lifecycle(
-                f"leaving .claude.json wired to {wired} — a live pin already "
-                f"answers there, and only its own daemon may rewire it")
+                f"leaving .claude.json wired to {wired} — a live pin answers "
+                f"there or has not refused yet, and only its own daemon may "
+                f"rewire it")
             return False
         wire_global_config(port, Path(certdir) / "ca.pem")
         _log_lifecycle(
@@ -11753,13 +11755,16 @@ def _wired_names_a_live_pin(port: int, timeout: float = 1.0) -> bool:
     A THIRD READER OF `_health_probe`'s ONE ROUND TRIP, same reason
     `_health_pid` is: no second HTTP client. Checks ``pin_proxy`` where
     `_health_pid` checks ``pid`` -- both fields the same body carries, see
-    `_serve_health`. A dead or non-pin port (nothing there, a stray
+    `_serve_health`. A refused or non-pin port (nothing listening, a stray
     listener, a wedge with no full answer) reads False, which is what
     leaves `ensure_wired_to` free to correct a wiring naming nothing that
-    mints.
+    mints. A connect that failed any other way (a timeout, EMFILE) is no
+    answer yet and reads True: under load it is a live peer (T2554).
     """
     buf = _health_probe(port, timeout)
-    if not buf or b"\r\n\r\n" not in buf:
+    if buf is None:
+        return not _port_refuses(port, timeout)
+    if b"\r\n\r\n" not in buf:
         return False
     try:
         body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
@@ -15328,18 +15333,22 @@ def _successor_is_serving(own_port: int) -> bool:
     different port four times in one day because this used to read the
     holder state alone and never asked whether the wired port was even ours.
 
-    A DIFFERENT PORT STILL HAS TO ANSWER TO COUNT. It is not automatically
+    A DIFFERENT PORT COUNTS ONLY IF IT DOES NOT REFUSE. It is not automatically
     a live pin just for being somebody else's -- a previous lineage's daemon
     that has since died leaves the config naming its corpse exactly as
     readily as ours does, and the owner's rule counts a DEAD port as safe to
     rewire whoever it belonged to. Trusting a different port unconditionally
     left that corpse wired forever, past the unwire that exists to clear it.
+
+    ONLY A REFUSAL IS NOBODY. A different port whose connect timed out under
+    load is a live peer not yet answering, and unwiring past it strips its
+    pin (T2554, the twin of T2534).
     """
     live = _wired_port()
     if live is None:
         return False
     if live != own_port:
-        return _port_answers(live)
+        return _port_answers(live) or not _port_refuses(live)
     if not _port_answers(live):
         return False
     return not held_by_a_holder()
@@ -15694,6 +15703,18 @@ def _port_answers(port: int, timeout: float = 0.5) -> bool:
             return True
     except OSError:
         return False
+
+
+def _port_refuses(port: int, timeout: float = 0.5) -> bool:
+    """Whether ``port`` REFUSES a loopback connect, the one proof nothing listens.
+
+    A timeout or any other OSError is no answer yet, never "nobody": a live
+    listener's connect can outlast the probe under load (T2534, T2554)."""
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return False
+    except OSError as exc:
+        return isinstance(exc, ConnectionRefusedError)
 
 
 def _resume_serving(server) -> bool:

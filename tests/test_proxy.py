@@ -15298,12 +15298,38 @@ print("OK", port)
         monkeypatch.setattr(pin_proxy, "held_by_a_holder", lambda: True)
         monkeypatch.setattr(pin_proxy, "_port_answers",
                             lambda p, timeout=0.5: False)
+        monkeypatch.setattr(pin_proxy, "_port_refuses",
+                            lambda p, timeout=0.5: True)
 
         assert pin_proxy._successor_is_serving(36301) is False, (
             "a wiring naming a DIFFERENT, DEAD port (41111) was read as "
             "somebody else serving -- the unwire is skipped and every "
             "later session dials a port nothing answers"
         )
+
+    def case_a_different_ports_connect_that_is_no_answer_yet_is_not_unwired(
+            self, tmp_path, monkeypatch):
+        """T2554: the probe above reads a timeout or EMFILE as nobody, so an
+        unclaimed daemon's teardown under host load ran the unwire over a
+        live peer. Only a REFUSED connect is nobody; the refusal is the
+        control and still unwires."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_wired_port", lambda: 41111)
+        monkeypatch.setattr(pin_proxy, "held_by_a_holder", lambda: True)
+        for exc, served in [
+            (TimeoutError("timed out"), True),
+            (OSError(errno.EMFILE, "Too many open files"), True),
+            (ConnectionRefusedError(errno.ECONNREFUSED, "refused"), False),
+        ]:
+            def _raises(*a, _exc=exc, **kw):
+                raise _exc
+
+            monkeypatch.setattr(pin_proxy.socket, "create_connection", _raises)
+            assert pin_proxy._successor_is_serving(36301) is served, (
+                f"{type(exc).__name__} on the wired port 41111 read as "
+                f"{'nobody' if served else 'somebody'}"
+            )
 
     def case_CONTROL_our_own_ports_wiring_still_uses_the_holder_corpse_check(
             self, tmp_path, monkeypatch):
@@ -20799,12 +20825,14 @@ class TestTheDaemonWatchesItsOwnCode:
 
         # A PORT THE DAEMON CANNOT TAKE AND NOBODY ANSWERS ON. Bound but never
         # listening: the daemon's own bind fails and it serves elsewhere, and a
-        # connect is refused, which is what "dead" means to the repair. A bare
+        # connect is read as refused (`_held_port_refuses`: Darwin times it
+        # out), which is what "dead" means to the repair. A bare
         # free port is not that -- the daemon simply reclaims it and serves
         # the very port the config names, so the arm under test never runs.
         hold = socket.socket()
         hold.bind(("127.0.0.1", 0))
         dead = hold.getsockname()[1]
+        self._held_port_refuses(monkeypatch, pin_proxy, dead)
         # A PIN RECORD: a daemon wires only while one exists.
         pin_proxy.save_pin(tmp_path, "a@b.c", "org")
         try:
@@ -20851,6 +20879,7 @@ class TestTheDaemonWatchesItsOwnCode:
         hold = socket.socket()
         hold.bind(("127.0.0.1", 0))
         dead = hold.getsockname()[1]
+        self._held_port_refuses(monkeypatch, pin_proxy, dead)
         seed = {"CSWAP_PIN_PORT": str(dead),
                 "HTTPS_PROXY": "http://launcher.example:3128"}
         # A PIN RECORD: a daemon wires only while one exists.
@@ -20881,6 +20910,19 @@ class TestTheDaemonWatchesItsOwnCode:
                 self._stop_live()
         finally:
             hold.close()
+
+    @staticmethod
+    def _held_port_refuses(monkeypatch, pin_proxy, dead):
+        """Read the HELD port as refused, as a crashed daemon's freed one is.
+
+        Measured on Darwin 24.6.0: a connect to a bound, never-listening
+        loopback port times out (0.504 s) where Linux refuses it, and
+        `_port_refuses` reads only a refusal as nobody (T2554). The hold stays:
+        it is what stops the daemon reclaiming the port."""
+        real = pin_proxy._port_refuses
+        monkeypatch.setattr(
+            pin_proxy, "_port_refuses",
+            lambda port, timeout=0.5: port == dead or real(port, timeout))
 
     def _live_daemon(self, tmp_path, monkeypatch, paths, stale_port=None,
                      cfg_text="{}"):
@@ -32775,6 +32817,39 @@ class TestTheServingDaemonOwnsTheWiring:
             f"a live pin's wiring on {live.port} was rewritten by a daemon "
             f"that is not its own: rc={rc} wrote={wrote}"
         )
+
+    @pytest.mark.parametrize("exc, steals", [
+        (TimeoutError("timed out"), False),
+        (OSError(errno.EMFILE, "Too many open files"), False),
+        (ConnectionRefusedError(errno.ECONNREFUSED, "refused"), True),
+    ], ids=["timeout", "emfile", "REFUSED"])
+    def test_a_wired_port_whose_connect_is_no_answer_yet_is_not_stolen(
+            self, tmp_path, monkeypatch, exc, steals):
+        """T2554: only a REFUSED connect proves nothing listens on the wired
+        port. A timeout or EMFILE under host load is no answer yet, and the
+        daemon starting up must not take a live peer's wiring on it (the
+        twin of T2534 in `_repair_wiring_if_ours`). The refusal is the
+        control: the same stub there still corrects the wiring."""
+        import cswap_pin.proxy as p
+
+        def _raises(*a, **kw):
+            raise exc
+
+        monkeypatch.setattr(p.socket, "create_connection", _raises)
+        rc, wrote = self._wire(tmp_path, monkeypatch, wired=41111)
+        assert (rc, wrote) == ((True, [36301]) if steals else (False, [])), (
+            f"{type(exc).__name__} on the wired port: rc={rc} wrote={wrote}")
+
+    def test_a_wired_port_that_accepts_and_never_answers_is_still_rewired(
+            self, tmp_path, monkeypatch):
+        """CONTROL for the case above: a connect that SUCCEEDS and is then
+        silent is a wedge, which `_wired_names_a_live_pin` still reads as not
+        a live pin (T1168), so the wiring is corrected."""
+        import cswap_pin.proxy as p
+
+        monkeypatch.setattr(p, "_health_probe", lambda port, timeout: b"")
+        rc, wrote = self._wire(tmp_path, monkeypatch, wired=41111)
+        assert rc is True and wrote == [36301], (rc, wrote)
 
     def test_CONTROL_a_correct_config_is_left_alone(self, tmp_path, monkeypatch):
         """`.claude.json` is watched live by Claude Code. Rewriting it on every
