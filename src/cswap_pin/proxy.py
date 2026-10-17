@@ -2536,10 +2536,14 @@ def _wire_global_config_locked(
         wanted = {
             "HTTPS_PROXY": proxy,
             "https_proxy": proxy,
-            # Claim it so every var names the same hop. Scoped to this file,
-            # which Claude Code applies to itself; the shell path deliberately
-            # does not create one (see wire_env).
+            # Claim both spellings so every var names the same hop: a session
+            # launched from a shell that exports all_proxy would otherwise keep
+            # the hop we chain through, and the status line reads that as "may
+            # not be on the pin". Scoped to this file, which Claude Code
+            # applies to itself; the shell path deliberately does not create
+            # one (see wire_env).
             "ALL_PROXY": proxy,
+            "all_proxy": proxy,
             # Node takes exactly ONE file here, so replacing an existing CA
             # blinds the session to every host the proxy behind us re-signs.
             "NODE_EXTRA_CA_CERTS": str(node_ca),

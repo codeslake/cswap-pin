@@ -13,7 +13,7 @@ the REAL written file under /bin/sh with the three spawn shapes Claude Code
 this process's own, which may itself carry a pin's proxy variables).
 
 The wiring guard at the end pins the other half of the owner's order: nothing
-here ever writes the variable, and the env block keeps exactly its five keys.
+here ever writes the variable, and the env block keeps exactly its six keys.
 """
 
 import hashlib
@@ -961,10 +961,10 @@ def test_a_chained_prefix_is_run_with_the_recorded_proxy_and_without_the_holder(
 
 # -- the owner's order: the wiring is untouched ----------------------------------
 
-ENV_KEYS = {"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "NODE_EXTRA_CA_CERTS", "CSWAP_PIN_PORT"}
+ENV_KEYS = {"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NODE_EXTRA_CA_CERTS", "CSWAP_PIN_PORT"}
 
 
-def test_the_wiring_writes_the_same_five_keys_and_never_the_prefix(tmp_path, monkeypatch, state):
+def test_the_wiring_writes_the_same_six_keys_and_never_the_prefix(tmp_path, monkeypatch, state):
     from cryptography.hazmat.primitives import serialization
 
     pin_proxy = _proxy()
