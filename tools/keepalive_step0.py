@@ -157,7 +157,8 @@ def verdict(rec):
     """PASS when the ping read the prefix and the next turn did too."""
     p, ping, nxt = rec["P"], rec["ping"], rec["next"]
     pu, nu = ping["usage"], nxt["usage"]
-    a = (ping["status"] is not None and 200 <= ping["status"] < 300 and p > 0
+    a = (rec["captured"] == rec["want"] and p > 0
+         and ping["status"] is not None and 200 <= ping["status"] < 300
          and pu.get("cache_read_input_tokens", 0) >= 0.9 * p
          and pu.get("cache_creation_input_tokens", 0) <= 0.1 * p)
     b = (nxt["ok"] and not rec["any_404"]
@@ -169,6 +170,7 @@ def table(form, rec):
     ping, nxt = rec["ping"], rec["next"]
     rows = [
         ("form captured", rec["captured"]), ("P (tokens)", rec["P"]),
+        ("last real turn", rec["last_turn"]),
         ("ping status / refused", f"{ping['status']} / {ping['refused']}"),
         ("ping error body", ping.get("error_body", "-")),
         ("ping cache_read", ping["usage"].get("cache_read_input_tokens")),
@@ -243,8 +245,7 @@ def measure(pp, proxy, seen, scratch, home, token, form):
            "HTTPS_PROXY": f"http://127.0.0.1:{proxy.port}",
            "NODE_EXTRA_CA_CERTS": str(proxy._certdir / "ca.pem"),
            "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h",
-           "CLAUDE_CODE_TETHER_LIVE": FORM_TETHER[form],
-           "DISABLE_AUTOUPDATER": "1"}
+           "CLAUDE_CODE_TETHER_LIVE": FORM_TETHER[form]}
     work = scratch / "w"
     work.mkdir(exist_ok=True)
     pp._affinity_last.clear()
@@ -259,7 +260,8 @@ def measure(pp, proxy, seen, scratch, home, token, form):
             session, got = captured_form(pp)
             if got == form or not last["ok"]:
                 break
-        rec = {"captured": got, "P": prefix(last["usage"]), "last_turn": last}
+        rec = {"captured": got, "want": form, "P": prefix(last["usage"]),
+               "last_turn": last}
         if got != form:
             rec["verdict"] = "FAIL"
             return rec | {"ping": {"status": None, "refused": f"form not captured ({got})",
@@ -269,6 +271,7 @@ def measure(pp, proxy, seen, scratch, home, token, form):
         ok_before = [s for s in seen[mark:] if 200 <= s["status"] < 300]
         rec["util_before"] = ok_before[-1]["util"] if ok_before else None
         rec["ping"] = probe_ping(proxy, session)
+        rec["captured"] = rec["ping"]["form"]  # the body the ping really replayed
         rec["health"] = health(proxy)
         rec["next"] = client.turn()
         rec["any_404"] = any(s["status"] == 404 for s in seen[mark:])
@@ -285,7 +288,6 @@ def self_check(pp, proxy, certdir, token):
                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}).encode()
     assert pp._affinity_pick(certdir, headers) is None, "client token is the kept one"
     assert pp._affinity_capture(certdir, headers, body, "/v1/messages"), "not armed"
-    proxy._keepalive_ensure()
     assert captured_form(pp) == ("SC", "full"), captured_form(pp)
     usage = {"cache_read_input_tokens": 9000, "cache_creation_input_tokens": 0,
              "input_tokens": 1000}
@@ -297,8 +299,10 @@ def self_check(pp, proxy, certdir, token):
     h = health(proxy)
     assert h["armed"] and h["captures"]["kept"] == 1 and h["pings"]["sent"] == 1, h
     ok = {"ok": True, "usage": usage}
-    rec = {"P": 10000, "ping": ping, "next": ok, "any_404": False}
+    rec = {"P": 10000, "ping": ping, "next": ok, "any_404": False,
+           "captured": "full", "want": "full"}
     assert verdict(rec) == "PASS" and verdict(rec | {"any_404": True}) == "FAIL"
+    assert verdict(rec | {"want": "held"}) == "FAIL"
     assert verdict(rec | {"next": {"ok": True, "usage": {}}}) == "FAIL"
     assert verdict(rec | {"ping": ping | {"status": 400}}) == "FAIL"
 
@@ -330,19 +334,19 @@ def main():
         else:
             for form in args.forms.split(","):
                 results[form] = measure(pp, proxy, seen, scratch, home, token, form)
-                print(table(form, results[form]), flush=True)
+                print(table(form, results[form]).replace(token, "<token>"), flush=True)
     finally:
         proxy.stop()
-    after = real_state()
-    print("rule0 after", after)
-    same = before == after
-    print("rule0", "IDENTICAL" if same else "CHANGED")
+        after = real_state()
+        same = before == after
+        print("rule0 after", after)
+        print("rule0", "IDENTICAL" if same else "CHANGED")
     if args.self_check:
         print("self-check ok")
     else:
         (scratch / "step0.json").write_text(json.dumps(
             {"rule0": {"before": before, "after": after, "identical": same},
-             "forms": results}, indent=1, default=str))
+             "forms": results}, indent=1, default=str).replace(token, "<token>"))
     sys.exit(0 if same else 1)
 
 
