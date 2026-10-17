@@ -3219,10 +3219,9 @@ def slow_report_ms(certdir) -> "float | None":
 # /v1/messages inside `autoswitch.cacheTtlSeconds`) keeps the account it was on
 # after cswap switches the live one, so the switch does not throw away its
 # prompt cache: the request goes out with that slot's STORED token. Armed by
-# `remoteControl.sessionAffinity: true` in settings.json (every host, that file
-# is shared) or by a `session-affinity` file in the certdir (this host alone,
-# like `trace-to`); both re-read on a short cache, like `slow_report_ms`.
-_AFFINITY_SWITCH_FILE = "session-affinity"
+# cswap's cache-aware strategy (`dynamic` with `autoswitch.cacheAware`), read
+# from settings on a short cache, like `slow_report_ms`. A cswap without the
+# field never arms it.
 _AFFINITY_RECHECK_S = 5.0
 _AFFINITY_CACHE: dict = {}
 _AFFINITY_MAX = 512  # entries per table below
@@ -3271,6 +3270,35 @@ _affinity_snap = {"tried": -math.inf, "at": -math.inf, "busy": False,
 # (slot, code) -> (monotonic time of its last lifecycle line, take-backs
 # folded into the next one)
 _affinity_logged: dict[tuple, tuple] = {}
+# THE USER'S CONVERSATION, IN MEMORY ONLY: never logged, never written. session
+# -> [headers minus Authorization, the body of its last main-thread 1 h-tier
+# /v1/messages, that tier's TTL in seconds, prefix estimate in tokens (0:
+# unknown, a `held` body until a ping reply measures it), its monotonic time
+# (the clock the API's cache keeps: set at capture, renewed by a 2xx ping),
+# keep-alive pings sent since it, the reason the sender last refused it (a
+# reason is counted once per request), its request path, the bearer the request
+# went out on]. Held only while armed, and only as long as the session's
+# `_affinity` entry (dropped with it).
+_affinity_last: dict[str, list] = {}
+_AFFINITY_BODY_MAX = 8 << 20  # one body; a longer one is not kept
+_AFFINITY_BODY_TOTAL = 128 << 20  # all of them; the oldest go first
+# keep-alive pings since `_AFFINITY_SINCE` (this process's start). `refused`
+# counts by reason: `_keepalive_due`'s, or the sender's own.
+_affinity_pings = {"sent": 0, "refused": {}, "hit": 0}
+# main-thread requests since `_AFFINITY_SINCE` whose body `_affinity_capture`
+# kept, and those it did not (and so dropped the one before), by reason.
+_affinity_captures = {"kept": 0, "dropped": {}}
+# The body forms the sandbox measured safe to ping ("full": the whole history;
+# "held": a `message-threads-` request whose history the server holds). None
+# yet: the sender refuses every session until a follow-up sets it.
+_KEEPALIVE_FORMS: frozenset = frozenset()
+_KEEPALIVE_MAX_TOKENS = 0
+_KEEPALIVE_TICK_S = 60.0
+_KEEPALIVE_IO_S = 30.0  # one connect, handshake, send or read of a ping
+_KEEPALIVE_MIN_PREFIX = 20000
+_KEEPALIVE_NOT_YET = "not idle long enough"  # cswap's wording; normal, uncounted
+_KEEPALIVE_ELSEWHERE = "sent on another account"
+_AFFINITY_SINCE = time.time()
 
 
 def session_affinity_config(certdir) -> "tuple[float, float, str] | None":
@@ -3286,19 +3314,42 @@ def session_affinity_config(certdir) -> "tuple[float, float, str] | None":
         return cfg
     cfg = None
     try:
-        _settings = require("settings")
-        root = Path(certdir).parent
-        section = _settings._read_raw(_settings.settings_path(root)).get(
-            "remoteControl")
-        if (isinstance(section, dict) and section.get("sessionAffinity") is True
-                ) or (Path(certdir) / _AFFINITY_SWITCH_FILE).exists():
-            loaded = _settings.load_settings(root)
+        loaded = require("settings").load_settings(Path(certdir).parent)
+        # an older host has no such function: the same rule, inline
+        if getattr(require("autoswitch"), "cache_aware_active",
+                   lambda s: s.strategy == "dynamic"
+                   and getattr(s, "cache_aware", False) is True)(loaded) is True:
             cfg = (float(getattr(loaded, "cache_ttl_seconds", 3600.0)),
                    float(loaded.threshold), str(loaded.strategy))
     except Exception:  # noqa: BLE001 — a switch must not cost a request
         cfg = None
     _AFFINITY_CACHE[key] = (now, cfg)
     return cfg
+
+
+def _keepalive_due_inline(*, idle_s, pings_since_request, ttl_s, prefix_est,
+                          slot_kept) -> "tuple[bool, str]":
+    """cswap's `autoswitch.keepalive_due` (991a1055), for a host without it:
+    ``(True, "")`` or ``(False, why)``, the same rules in the same order. Keep
+    it identical; `slot_kept` is `_affinity_slot_kept`, with a fresh snapshot."""
+    if ttl_s < 3600.0:
+        return False, "a 5 min cache tier is not worth a ping"
+    if not slot_kept:
+        return False, "its slot is not kept"
+    if idle_s < 3300.0:
+        return False, _KEEPALIVE_NOT_YET
+    if pings_since_request >= 2:
+        return False, "pings since its last request are spent"
+    if prefix_est < _KEEPALIVE_MIN_PREFIX:
+        return False, "its prefix is too small to pay"
+    return True, ""
+
+
+def _keepalive_due(**kw) -> "tuple[bool, str]":
+    """Whether an idle session's cache is worth a keep-alive ping now. cswap
+    owns the rule; the inline copy answers for a host that has none."""
+    return getattr(require("autoswitch"), "keepalive_due",
+                   _keepalive_due_inline)(**kw)
 
 
 def _bounded_put(table: dict, key, value) -> None:
@@ -3505,6 +3556,7 @@ def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
     with _affinity_lock:
         if code != 404:
             _affinity.pop(session, None)
+            _affinity_last.pop(session, None)
             _bounded_put(_affinity_rest, ident, now + wait)
         more = _affinity_due(_affinity_logged, (ident[0], code), now)
     if more is not None:
@@ -3537,10 +3589,11 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     """
     cfg = session_affinity_config(certdir)
     if cfg is None:
-        if _affinity_kept:  # switched off: no kept slot may outlive it
+        if _affinity_kept or _affinity_last:  # switched off: nothing outlives it
             with _affinity_lock:
                 _affinity_kept.clear()
                 _affinity_why.clear()
+                _affinity_last.clear()
         return None
     ttl, threshold, strategy = cfg
     client = session = ""
@@ -3591,6 +3644,185 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     if line:
         _log_lifecycle(line)
     return (token, held, session) if token else None
+
+
+def _final_cache_ttl_s(body: bytes) -> "float | None":
+    """The TTL in seconds (3600 for `1h`, else 300) of the last `cache_control`
+    in prompt order (tools, system, messages), or None: no breakpoint, or not
+    JSON. A body without the text `"1h"` is not parsed at all (its final
+    breakpoint can only be the 5 min one)."""
+    if b'"cache_control"' not in body:
+        return None
+    if b'"1h"' not in body:
+        return 300.0
+    try:
+        req = json.loads(body)
+        system = req.get("system")
+        blocks = [*(req.get("tools") or ()),
+                  *(system if isinstance(system, list) else ())]
+        for m in req.get("messages") or ():
+            if isinstance(m.get("content"), list):
+                blocks += m["content"]
+        ttl = None
+        for b in blocks:
+            cc = b.get("cache_control") if isinstance(b, dict) else None
+            if isinstance(cc, dict):
+                ttl = 3600.0 if cc.get("ttl") == "1h" else 300.0
+        return ttl
+    except Exception:  # noqa: BLE001 — a body we cannot read is not kept
+        return None
+
+
+def _keepalive_form(headers) -> str:
+    """`held` for a request of Claude Code's `message-threads-` mode (the
+    server holds the history; the body is the new turn), else `full`. A ping
+    replays the form of the session's last real body and never converts it: a
+    full send after held ones makes the API drop thinking blocks."""
+    return "held" if any(
+        k.lower() == "anthropic-beta" and "message-threads-" in v
+        for k, v in headers) else "full"
+
+
+def _affinity_capture(certdir, headers, body: bytes, path: str,
+                      inject=None) -> bool:
+    """Keep ``body`` as its session's last main-thread body when armed and it
+    asks for the 1 h tier, replacing the one before; a main-thread body that
+    writes a cache of another kind (a 5 min final breakpoint, too big to keep,
+    or a `message-threads-` turn with none, which advances the server's thread)
+    drops it, since the last body is the one a ping would replay. A body with
+    no `cache_control` at all (a side call: title, hook evaluation) writes no
+    cache and says nothing of the 1 h entry the API holds, so it is ignored.
+    True when it kept one. The main thread is told from a subagent by the
+    agent-id headers Claude Code puts on a subagent (it shares the session id
+    and often the tier, so the tier alone does not say). ``inject`` is
+    `_affinity_pick`'s answer: the bearer the request goes out on is its token,
+    else the client's.
+    shortcut: a Workflow subagent carries no such header, so it passes as the
+    main thread; the sandbox measurement says whether that matters.
+
+    The tables are bounded: past `_AFFINITY_BODY_TOTAL` bytes the oldest go,
+    and a body whose session lost its `_affinity` entry goes with it."""
+    if session_affinity_config(certdir) is None or not body:
+        return False
+    session = client = ""
+    for k, v in headers:
+        kl = k.lower()
+        if kl in ("x-claude-code-agent-id", "x-claude-code-parent-agent-id"):
+            return False
+        if kl == "x-claude-code-session-id":
+            session = v
+        elif kl == "authorization":
+            client = _bearer(v)
+    if not session:
+        return False
+    sent = [(k, v) for k, v in headers if k.lower() != "authorization"]
+    held = _keepalive_form(sent) == "held"
+    has_cc = b'"cache_control"' in body
+    if not (has_cc or held):
+        return False
+    # a body over the cap is not parsed on the request thread: it is not kept
+    over = len(body) > _AFFINITY_BODY_MAX
+    ttl_s = None if over else _final_cache_ttl_s(body)
+    why = (None if ttl_s == 3600.0 else "5 min tier" if ttl_s else
+           "over the body cap" if over else
+           "unreadable" if has_cc else "no breakpoint")
+    with _affinity_lock:
+        _affinity_last.pop(session, None)
+        why = why or (None if session in _affinity else "session not bound")
+        if why:
+            dropped = _affinity_captures["dropped"]
+            dropped[why] = dropped.get(why, 0) + 1
+            return False
+        _affinity_captures["kept"] += 1
+        _affinity_last[session] = [
+            sent, body, ttl_s,
+            # a held body is the new turn only: its bytes say nothing
+            0 if held else len(body) // 4,
+            time.monotonic(), 0, None, path, inject[0] if inject else client]
+        for gone in [x for x in _affinity_last if x not in _affinity]:
+            del _affinity_last[gone]
+        total = sum(len(v[1]) for v in _affinity_last.values())
+        while total > _AFFINITY_BODY_TOTAL:
+            total -= len(_affinity_last.pop(next(iter(_affinity_last)))[1])
+        return session in _affinity_last
+
+
+def _keepalive_refuse(session: str, why: str, entry,
+                      drop: bool = False) -> str:
+    """Count the sender declining ``entry``, ``session``'s body, for ``why``:
+    once per reason until the session's next real request, since it is asked
+    every tick. ``drop`` also forgets it, so it is not asked again. A request
+    that replaced ``entry`` meanwhile owns the session now: its body is left
+    alone, and the refusal is counted."""
+    with _affinity_lock:
+        mine = _affinity_last.get(session) is entry
+        if mine and drop:
+            del _affinity_last[session]
+        if not mine or entry[6] != why:
+            refused = _affinity_pings["refused"]
+            refused[why] = refused.get(why, 0) + 1
+            if mine:
+                entry[6] = why
+    return why
+
+
+def _sent_on_binding(entry, bound) -> bool:
+    """Under `_affinity_lock`: whether ``entry``'s request went out on the
+    account its session is bound to (``bound``, its `_affinity` row): the same
+    bearer, or two bearers of one slot (a token that rotated is the same
+    cache). A stale snapshot sends a request on the client's bearer and leaves
+    the binding where it was; that body's cache is on the client's account."""
+    sent, mine = entry[8], bound[0]
+    return sent == mine or (
+        _affinity_idents.get(sent) is not None
+        and _affinity_idents.get(sent) == _affinity_idents.get(mine))
+
+
+def _affinity_slot_kept(ident: tuple, now: float) -> bool:
+    """Under `_affinity_lock`: whether the pin would keep a warm session on
+    ``ident`` now: in the snapshot's kept slots, not resting, its stored token
+    unexpired. Whether the snapshot is fresh enough to rule is the caller's."""
+    stored = _affinity_kept.get(ident)
+    return bool(stored and _affinity_rest.get(ident, 0.0) <= now
+                and not oauth.is_oauth_token_expired(stored[1]))
+
+
+def _cache_aware_report(certdir) -> dict:
+    """`/health`'s `cache_aware` key. Per slot, over the sessions bound to it
+    whose last request is inside the TTL: `warm`, how many of those sit on a
+    slot the pin would keep (`kept`, snapshot freshness aside), `prefix_est`
+    the SUM of their kept bodies' estimates in tokens (what rides on the slot),
+    and `ttl_left_min_s` the least TTL left among them (on the kept body's own
+    clock where there is one, the clock the sender acts on, else the binding's).
+    `captures`: main-thread bodies kept, and dropped by reason. Never a session
+    id or a byte of a conversation. Empty `slots` when not armed."""
+    cfg = session_affinity_config(certdir)
+    now = time.monotonic()
+    slots: dict = {}
+    with _affinity_lock:
+        try:
+            for session, (bearer, at) in (_affinity.items() if cfg else ()):
+                ident, warm = _affinity_idents.get(bearer), cfg[0] - (now - at)
+                if ident is None or warm <= 0:
+                    continue
+                body = _affinity_last.get(session)
+                # the clock the sender acts on: the body's, not the binding's
+                left = max(0, int(warm if body is None
+                                  else body[2] - (now - body[4])))
+                row = slots.setdefault(ident[0], {
+                    "warm": 0, "kept": 0, "prefix_est": 0,
+                    "ttl_left_min_s": left})
+                row["warm"] += 1
+                row["kept"] += _affinity_slot_kept(ident, now)
+                row["prefix_est"] += (body or (0,) * 4)[3]
+                row["ttl_left_min_s"] = min(row["ttl_left_min_s"], left)
+        except Exception:  # noqa: BLE001 — a liveness probe answers anyway
+            slots = {}
+        pings = {**_affinity_pings, "refused": dict(_affinity_pings["refused"])}
+        captures = {**_affinity_captures,
+                    "dropped": dict(_affinity_captures["dropped"])}
+    return {"armed": cfg is not None, "slots": slots, "pings": pings,
+            "captures": captures, "since": _iso_utc(_AFFINITY_SINCE)}
 
 
 # THE TWO LINES `_report_deaf_bridges` writes, as symbols rather than prose.
@@ -20862,7 +21094,11 @@ class PinProxy:
              # this lineage is refused the Keychain, so a caller in the login
              # session can move the socket into its own.
              **({"keychain_denied": True}
-                if getattr(self, "_keychain_denied", False) else {})}
+                if getattr(self, "_keychain_denied", False) else {}),
+             # ADDITIVE: the cache-aware session affinity, armed or not (see
+             # `_cache_aware_report`); per slot, never per session.
+             "cache_aware": _cache_aware_report(
+                 getattr(self, "_certdir", None))}
         )
         try:
             conn.sendall(
@@ -21618,6 +21854,9 @@ class PinProxy:
         inject = None
         if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
             inject = _affinity_pick(getattr(self, "_certdir", None), headers)
+            if _affinity_capture(getattr(self, "_certdir", None), headers,
+                                 body, path, inject):
+                self._keepalive_ensure()
         if inject:
             headers = [
                 (k, f"Bearer {inject[0]}") if k.lower() == "authorization"
@@ -22168,6 +22407,202 @@ class PinProxy:
             # cause, a later request for this cse must not wait for an
             # exchange that is never going to settle on its own.
             _release_bridge_hold()
+
+    def _keepalive_ensure(self) -> None:
+        """Start the keep-alive sender when a body was just kept (so: armed)
+        and none runs. A thread that cannot start costs no request."""
+        with _affinity_lock:
+            thread = getattr(self, "_keepalive_thread", None)
+            if thread is not None and thread.is_alive():
+                return
+            try:
+                thread = threading.Thread(target=self._keepalive_loop,
+                                          daemon=True)
+                thread.start()
+                self._keepalive_thread = thread
+            except Exception:  # noqa: BLE001 (1abbafd)
+                self._keepalive_thread = None
+
+    def _keepalive_loop(self) -> None:
+        """One `_keepalive_tick` a minute until it says stop (the switch is
+        off, or `release_listener` ran) or the pin stops (the event
+        `_trace_tick_loop` ends on: a drain does not set it)."""
+        while not self._trace_tick_stop.wait(_KEEPALIVE_TICK_S):
+            try:
+                if not self._keepalive_tick():
+                    return
+            except Exception:  # noqa: BLE001 (never take this thread down)
+                pass
+
+    def _keepalive_tick(self) -> bool:
+        """Ping each kept session that `_keepalive_due` says is due; False
+        when the switch is off or this process has released its listener to a
+        successor (it holds no body then). Idle is the body's own clock, not
+        the session's binding, which a subagent's request refreshes. The
+        snapshot must be fresh to rule on a slot: when it is not, a session
+        that is due but for that waits one tick while the rebuild runs, and
+        only a form the gate lets through is worth the rebuild. The store is
+        never read here."""
+        cfg = session_affinity_config(getattr(self, "_certdir", None))
+        if cfg is None or self._stop:
+            with _affinity_lock:
+                _affinity_last.clear()
+            return False
+        now = time.monotonic()
+        with _affinity_lock:
+            fresh = now - _affinity_snap["at"] < _AFFINITY_STALE_S
+            rows = []
+            for session, e in _affinity_last.items():
+                bound = _affinity.get(session)
+                if bound is not None:
+                    rows.append((
+                        session, e, now - e[4], e[2], e[3], e[5],
+                        _keepalive_form(e[0]) in _KEEPALIVE_FORMS,
+                        _affinity_slot_kept(_affinity_idents.get(bound[0]), now),
+                        _sent_on_binding(e, bound)))
+        due, stale = [], False
+        for session, e, idle_s, ttl_s, prefix, pings, measured, kept, on in rows:
+            ok, why = _keepalive_due(
+                idle_s=idle_s, pings_since_request=pings, ttl_s=ttl_s,
+                # unknown (a held body's): ping 1 measures it, ping 2 needs it
+                prefix_est=prefix or (0 if pings else _KEEPALIVE_MIN_PREFIX),
+                slot_kept=kept or not fresh)
+            if not on:  # its cache is on an account the binding is not
+                ok, why = False, _KEEPALIVE_ELSEWHERE
+            elif ok and idle_s >= ttl_s:  # cold already: a ping would WRITE it
+                ok, why = False, "past its cache ttl"
+            elif ok and not measured:
+                ok, why = False, "form not measured"
+            if not ok:
+                if why != _KEEPALIVE_NOT_YET:
+                    _keepalive_refuse(session, why, e, not on)
+            elif fresh:
+                due.append((session, e))
+            else:
+                stale = True
+        if stale:
+            _affinity_kick(cfg[1], cfg[2])
+        for session, e in due:
+            self._keepalive_ping(session, entry=e)
+        return True
+
+    def _keepalive_ping(self, session: str, *, force_form: bool = False,
+                        entry=None) -> dict:
+        """Send ONE keep-alive ping for ``session`` now and return `form`,
+        `status`, `refused` (None, else why nothing was sent or the answer was
+        not a 2xx), `hit`, `usage` and `ratelimit` (the reply's
+        `anthropic-ratelimit-unified-*-utilization` headers). ``force_form``
+        skips only the `_KEEPALIVE_FORMS` gate, for a harness; whether the
+        session is due is `_keepalive_tick`'s to say. ``entry``, the body the
+        tick ruled on: when a real request has replaced it since, nothing is
+        sent, and that request's body is neither renewed nor dropped.
+
+        The session's last real body with `max_tokens` and `stream` set, on
+        its stored headers and the SNAPSHOT'S stored token for its slot, on a
+        socket of its own from `_connect_upstream`: not `_relay_response`,
+        whose 429 and 403 paths switch the account off, and not urllib, whose
+        proxy is this pin. NO refresh, no consume, no probe. A refusal of any
+        kind is counted and ends that session's pings until its next real
+        request; it enters no take-back, rest, drop or `_walled_switch_seen`."""
+        out = {"form": None, "status": None, "refused": None, "hit": False,
+               "usage": {}, "ratelimit": {}}
+        with _affinity_lock:
+            held = _affinity_last.get(session)
+            entry = held if entry is None or entry is held else None
+            bound = _affinity.get(session)
+            ident = _affinity_idents.get(bound[0]) if bound else None
+            stored = _affinity_kept.get(ident)
+            kept = _affinity_slot_kept(ident, time.monotonic())
+            other = bool(entry and bound and not _sent_on_binding(entry, bound))
+        if entry is None:
+            return {**out, "refused": "no body held"}
+        headers, body, form = entry[0], entry[1], _keepalive_form(entry[0])
+        out["form"] = form
+        why = (_KEEPALIVE_ELSEWHERE if other else
+               "form not measured"
+               if form not in _KEEPALIVE_FORMS and not force_form else
+               "token expired" if stored
+               and oauth.is_oauth_token_expired(stored[1]) else
+               "its slot is not kept" if not kept else None)
+        if why:
+            return {**out,
+                    "refused": _keepalive_refuse(session, why, entry, other)}
+
+        def ended(why: str) -> dict:
+            _log_lifecycle(
+                f"session affinity: keep-alive ping slot {ident[0]} form "
+                f"{form} failed ({why}); no more for that session until its "
+                f"next request")
+            return {**out,
+                    "refused": _keepalive_refuse(session, why, entry, True)}
+
+        try:
+            req = json.loads(body)
+            req.update(max_tokens=_KEEPALIVE_MAX_TOKENS, stream=False)
+            status, rheaders, raw = self._keepalive_exchange(
+                entry[7], stored[0], headers,
+                json.dumps(req, separators=(",", ":")).encode())
+        except Exception as exc:  # noqa: BLE001 (a ping never fails a caller)
+            return ended(f"error {type(exc).__name__}")
+        out["status"] = status
+        out["ratelimit"] = {
+            k.lower(): v for k, v in rheaders
+            if k.lower().startswith("anthropic-ratelimit-unified-")
+            and k.lower().endswith("utilization")}
+        if not 200 <= status < 300:
+            return ended(f"http {status}")
+        try:
+            usage = json.loads(raw).get("usage")
+        except (ValueError, AttributeError):
+            usage = None
+        out["usage"] = usage = usage if isinstance(usage, dict) else {}
+        read, made = (usage.get(k) if isinstance(usage.get(k), int) else 0
+                      for k in ("cache_read_input_tokens",
+                                "cache_creation_input_tokens"))
+        out["hit"] = hit = read > 0 and made <= read // 10
+        now = time.monotonic()
+        with _affinity_lock:
+            _affinity_pings["sent"] += 1
+            _affinity_pings["hit"] += hit
+            if _affinity_last.get(session) is entry:
+                entry[4] = now  # the API's cache is renewed: so is the body's
+                entry[5] += 1
+                if form == "held" and read:
+                    entry[3] = read  # the measure a held body lacks
+            if session in _affinity:  # and the binding's clock and place
+                _bounded_put(_affinity, session, (_affinity[session][0], now))
+        _log_lifecycle(
+            f"session affinity: keep-alive ping slot {ident[0]} form {form} "
+            f"status {status} cache_read {read} cache_creation {made} hit {hit}"
+            + "".join(f" {k}={v}" for k, v in out["ratelimit"].items()))
+        return out
+
+    def _keepalive_exchange(self, path: str, token: str, headers,
+                            body: bytes) -> tuple:
+        """One non-streamed POST on a socket of its own: `(status, response
+        headers, body)`. Every connect, handshake and read is bounded by
+        `_KEEPALIVE_IO_S`."""
+        skip = _HOP_BY_HOP | {"host", "content-length", "accept-encoding",
+                              "authorization"}
+        lines = [f"POST {path} HTTP/1.1", f"Host: {UPSTREAM_HOST}",
+                 f"Authorization: Bearer {token}", "Accept-Encoding: identity",
+                 "Connection: close", f"Content-Length: {len(body)}",
+                 *(f"{k}: {v}" for k, v in headers
+                   if k.lower() not in skip and not k.lower().startswith("proxy-"))]
+        up, via_loopback = self._connect_upstream()
+        try:
+            up.settimeout(_KEEPALIVE_IO_S)
+            up = _wrap_upstream(self._upstream_ctx(via_loopback), up,
+                                UPSTREAM_HOST)
+            up.sendall("\r\n".join(lines).encode("latin1") + b"\r\n\r\n" + body)
+            status = int((_read_line(up) or "").split()[1])
+            rheaders = []
+            while line := _read_line(up):
+                k, _, v = line.partition(":")
+                rheaders.append((k.strip(), v.strip()))
+            return status, rheaders, _read_body(up, rheaders)
+        finally:
+            up.close()
 
     def _upstream_conn(self) -> ssl.SSLSocket:
         """The live upstream TLS socket for this MITM connection, dialing on
