@@ -4750,21 +4750,24 @@ class TestAHeldDaemonThatStoppedAccepting:
         once its daemon is gone) and the daemon EXITS inside that probe.
         Probe 1 starts the silence; probe 2 is the lap that reaches the bound
         and probe 3 is the confirming one. Returns (holder, log, calls), with
-        `calls` the timeout of every probe asked."""
+        `calls` the timeout of every probe asked of the first daemon: the
+        respawn's own first lap, 0.1 s after it, is not one of them."""
         from cswap_pin import proxy as pin_proxy
 
         calls = []
 
         def _hang(port, timeout):
-            calls.append(timeout)
-            if len(calls) == nth:
-                holder._proc.exit()
+            if holder._proc is first:
+                calls.append(timeout)
+                if len(calls) == nth:
+                    first.exit()
             time.sleep(timeout)
             return None
 
         monkeypatch.setattr(pin_proxy, "_health_pid", _hang)
         holder, log = self._drive(tmp_path, monkeypatch, bound=0.3,
                                   probe=0.3, confirm=confirm)
+        first = holder._proc
         return holder, log, calls
 
     def case_a_daemon_that_exited_in_the_at_bound_probe_is_not_asked_again(
