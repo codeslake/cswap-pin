@@ -33,7 +33,10 @@ unarchives only bridges the scratch session registry holds (none);
 `sweep_policy_once` reads the account's policy with it and writes
 `policy-limits.json` under the scratch CLAUDE_CONFIG_DIR; `_freshen_pin_identity`
 reads the profile with it only when the scratch certdir holds a remembered pin
-identity (none). Every write lands under --scratch.
+identity (none). The request-path sweep (`sweep_superseded_bridges`, which
+closes the account's superseded bridges) fires when a client opens or posts to
+a bridge; the measuring client has no Remote Control, and `_should_sweep_bridges`
+is switched off here as well. Every write lands under --scratch.
 
 THE LIVE FLEET IS NOT TOUCHED, and the script checks it:
   - HOME, CLAUDE_CONFIG_DIR, TMPDIR and the cert dir are under --scratch BEFORE
@@ -138,6 +141,7 @@ def start_pin(pp, certdir, token, expires_ms, chain_port):
     holds ``token``, and a recorder of every /v1/messages reply it relays."""
     pp.session_affinity_config = lambda _certdir: (3600.0, 90.0, "dynamic")
     pp._spawn_usage_header_recorder = lambda fn: None  # no store read or write
+    pp.PinProxy._should_sweep_bridges = lambda *a, **k: False  # never close a live bridge
     ident = ("1", "step0@example.invalid")
     pp._affinity_idents[token] = ident
     pp._affinity_kept[ident] = (token, expires_ms, 101.0, None)
@@ -384,6 +388,7 @@ def self_check(pp, proxy, certdir, token, seen, scratch):
     assert ping["status"] == 200 and ping["refused"] is None and ping["hit"], ping
     h = health(proxy)
     assert h["armed"] and h["captures"]["kept"] == 1 and h["pings"]["sent"] == 1, h
+    assert not proxy._should_sweep_bridges("POST", "/v1/code/sessions"), "bridge sweep armed"
 
     def reply(status):  # through the pin's own hook, as the relay calls it
         line = f"HTTP/1.1 {status} X".encode()
