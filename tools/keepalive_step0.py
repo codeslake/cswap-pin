@@ -1,6 +1,7 @@
 """Step 0 of the keep-alive gate: does a ping keep a session's cache warm?
 
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> [--forms full,held]
+        [--claude <client binary>] [--chain-port 8118]
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> --self-check
 
 WHY THIS EXISTS AS A SCRIPT. `_KEEPALIVE_FORMS` ships empty: the sender replays
@@ -13,12 +14,31 @@ directly. Per body form (`full`: the whole history; `held`: a
 `message-threads-` turn the server holds the history of) it drives one Claude
 Code client through a throwaway pin, pings, sends one more real turn, and says
 PASS when the ping read the prefix (cache_read >= 0.9 P, cache_creation <=
-0.1 P) and the next turn did too with no 404.
+0.1 P) and the next turn did too (cache_read >= 0.9 P), in the SAME form, with
+no 404 after the ping and no `thinking_drop` attachment in the session's
+transcript after it. FAIL is a measured failure. NOT MEASURED is a form the
+run could not judge: it was never captured, or the recorder saw no 2xx
+/v1/messages before or after the ping (blind). The table says whether the
+session held any thinking block: a `thinking_drop` count of 0 with none proves
+nothing about the drop.
+
+EXIT STATUS: 1 when Rule 0 reads CHANGED, else 3 when any form is NOT MEASURED,
+else 0 (a FAIL is a result, not an error). The last line is `FORMS_PASS=<comma
+list or none>`.
+
+THE THROWAWAY PIN RUNS ITS BACKGROUND SWEEPS, so the live login is used beyond
+the ping (first pass ~20 s after start, then every 5 min): `sweep_titles_once`
+lists the account's bridges with the live access token and restores or
+unarchives only bridges the scratch session registry holds (none);
+`sweep_policy_once` reads the account's policy with it and writes
+`policy-limits.json` under the scratch CLAUDE_CONFIG_DIR; `_freshen_pin_identity`
+reads the profile with it only when the scratch certdir holds a remembered pin
+identity (none). Every write lands under --scratch.
 
 THE LIVE FLEET IS NOT TOUCHED, and the script checks it:
-  - HOME, CLAUDE_CONFIG_DIR and the cert dir are under --scratch BEFORE the
-    pin is imported (it reads `.claude.json` for the port to reclaim). Nothing
-    is written outside --scratch.
+  - HOME, CLAUDE_CONFIG_DIR, TMPDIR and the cert dir are under --scratch BEFORE
+    the pin is imported (it reads `.claude.json` for the port to reclaim).
+    Nothing is written outside --scratch.
   - The real home's `.claude.json` `env` and `oauthAccount` (the only keys a
     pin writes) are hashed before and after; CHANGED exits non-zero.
   - The ACTIVE login's access token is read in-process and handed to the
@@ -33,7 +53,9 @@ THE LIVE FLEET IS NOT TOUCHED, and the script checks it:
     wall cannot drop the slot the measurement needs.
 
 --self-check starts and stops the throwaway pin with a dummy token and no
-client, answers the ping from a canned reply, and makes no network call.
+client, answers the ping from a canned reply, feeds the recorder canned replies
+(a 404 after the ping mark is detected, one before it is not), reaps a fake
+client's process group, and makes no network call.
 """
 import argparse
 import hashlib
@@ -43,6 +65,7 @@ import os
 import pathlib
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -50,10 +73,17 @@ import time
 
 sys.dont_write_bytecode = True  # nothing outside --scratch, the .pyc files too
 REAL_HOME = os.path.expanduser("~")  # home-read
-CLIENT = os.path.join(REAL_HOME, ".local/share/claude/versions/2.1.302")  # home-read
 TOKEN_MIN_MS = 20 * 60 * 1000
 TURN_TIMEOUT_S = 240
 FORM_TETHER = {"full": "0", "held": "1"}
+
+
+def newest_client():
+    """The newest binary under the claude versions dir, never the PATH one."""
+    vdir = pathlib.Path(REAL_HOME, ".local/share/claude/versions")  # home-read
+    best = max(vdir.iterdir(), default=None,
+               key=lambda f: [int(n) for n in re.findall(r"\d+", f.name)])
+    return str(best) if best else sys.exit(f"no claude binary under {vdir}: pass --claude")
 
 
 def real_state():
@@ -93,15 +123,17 @@ def confine(scratch):
             del os.environ[k]
     home = scratch / "h"
     cfg = home / ".claude"
-    cfg.mkdir(parents=True, exist_ok=True)
-    os.environ.update(HOME=str(home), CLAUDE_CONFIG_DIR=str(cfg),
+    tmp = scratch / "tmp"
+    for d in (cfg, tmp):
+        d.mkdir(parents=True, exist_ok=True)
+    os.environ.update(HOME=str(home), CLAUDE_CONFIG_DIR=str(cfg), TMPDIR=str(tmp),
                       XDG_DATA_HOME=str(home / ".local/share"))
     certdir = home / ".local/share/claude-swap/pin-proxy"
     certdir.mkdir(parents=True, exist_ok=True)
     return home, certdir
 
 
-def start_pin(pp, certdir, token, expires_ms):
+def start_pin(pp, certdir, token, expires_ms, chain_port):
     """A throwaway pin on an ephemeral port, armed with one kept slot that
     holds ``token``, and a recorder of every /v1/messages reply it relays."""
     pp.session_affinity_config = lambda _certdir: (3600.0, 90.0, "dynamic")
@@ -121,7 +153,7 @@ def start_pin(pp, certdir, token, expires_ms):
 
     pp._note_usage_headers = record
     pp.ensure_ca(certdir, "api.anthropic.com")
-    proxy = pp.PinProxy(certdir, lambda: token, chain_proxy=("127.0.0.1", 8118))
+    proxy = pp.PinProxy(certdir, lambda: token, chain_proxy=("127.0.0.1", chain_port))
     proxy.start()
     return proxy, seen
 
@@ -159,20 +191,59 @@ def prefix(usage):
         "cache_read_input_tokens", "cache_creation_input_tokens", "input_tokens"))
 
 
+def window(seen, mark, ping_mark):
+    """What the recorder saw of the client's real requests: 2xx counts before
+    and after the ping, a 404 only AFTER it (the ping is not relayed)."""
+    ok = lambda xs: [s for s in xs if 200 <= s["status"] < 300]
+    before, after = seen[mark:ping_mark], seen[ping_mark:]
+    return {"ok_before": len(ok(before)), "ok_after": len(ok(after)),
+            "any_404": any(s["status"] == 404 for s in after),
+            "util_before": ok(before)[-1]["util"] if ok(before) else None}
+
+
+def scan_transcripts(cfg):
+    """(`thinking_drop` attachments, thinking blocks) over the scratch
+    transcripts (shape: cache-miss-audit-2026-10-16/A3-cache.md)."""
+    drops = thinking = 0
+    for f in pathlib.Path(cfg).glob("projects/**/*.jsonl"):
+        for line in f.open(errors="replace"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            drops += (r.get("attachment") or {}).get("type") == "thinking_drop"
+            content = (r.get("message") or {}).get("content")
+            thinking += sum(isinstance(b, dict) and b.get("type") in (
+                "thinking", "redacted_thinking") for b in content) \
+                if isinstance(content, list) else 0
+    return drops, thinking
+
+
 def verdict(rec):
-    """PASS when the ping read the prefix and the next turn did too."""
+    """FAIL on a 404 after the ping. NOT MEASURED when the recorder saw no 2xx
+    before or after it (blind). Else PASS when the ping read the prefix, the
+    next turn did too, in the measured form, with no `thinking_drop`."""
+    if rec["any_404"]:
+        return "FAIL"
+    if not (rec["ok_before"] and rec["ok_after"]):
+        return "NOT MEASURED"
     p, ping, nxt = rec["P"], rec["ping"], rec["next"]
     pu, nu = ping["usage"], nxt["usage"]
     a = (ping["status"] is not None and 200 <= ping["status"] < 300 and p > 0
          and pu.get("cache_read_input_tokens", 0) >= 0.9 * p
          and pu.get("cache_creation_input_tokens", 0) <= 0.1 * p)
-    b = (nxt["ok"] and not rec["any_404"]
+    b = (nxt["ok"] and rec["next_form"] == rec["form"] and not rec["drops"]
          and nu.get("cache_read_input_tokens", 0) >= 0.9 * p)
     return "PASS" if a and b else "FAIL"
 
 
 def table(form, rec):
+    head = f"### {form}: {rec['verdict']}"
+    if "ping" not in rec:
+        return (f"{head} ({rec['reason']})\n\ncaptured {rec['captured']}, "
+                f"last turn {rec['last_turn']}")
     ping, nxt = rec["ping"], rec["next"]
+    vacuous = "" if rec["thinking"] else " (VACUOUS: no thinking block appeared, nothing to drop)"
     rows = [
         ("form captured", rec["captured"]), ("P (tokens)", rec["P"]),
         ("last real turn", rec["last_turn"]),
@@ -184,24 +255,30 @@ def table(form, rec):
         ("utilization after (ping)", ping["ratelimit"]),
         ("next turn ok", nxt["ok"]),
         ("next turn cache_read", nxt["usage"].get("cache_read_input_tokens")),
-        ("any 404 from upstream", rec["any_404"]),
+        ("next request form (must be the captured one)", rec["next_form"]),
+        ("404 after the ping", rec["any_404"]),
+        ("2xx /v1/messages before / after the ping (0 = recorder blind)",
+         f"{rec['ok_before']} / {rec['ok_after']}"),
+        ("thinking_drop attachments after the ping", f"{rec['drops']}{vacuous}"),
+        ("thinking blocks in the session", rec["thinking"]),
         ("/health captures", rec["health"]["captures"]),
         ("/health pings", rec["health"]["pings"]),
     ]
-    return "\n".join([f"### {form}: {rec['verdict']}", "", "| row | value |", "|---|---|"]
+    return "\n".join([head, "", "| row | value |", "|---|---|"]
                      + [f"| {k} | {v} |" for k, v in rows])
 
 
 class Client:
-    """One `claude -p` stream-json process: turns on stdin keep its thread."""
+    """One `claude -p` stream-json process, in a process group of its own so
+    ``close`` takes its children with it: turns on stdin keep its thread."""
 
-    def __init__(self, env, cwd, token):
+    def __init__(self, claude, env, cwd, token):
         self.token, self.err, self.out = token, [], queue.Queue()
         self.proc = subprocess.Popen(
-            [CLIENT, "-p", "--input-format", "stream-json",
+            [claude, "-p", "--input-format", "stream-json",
              "--output-format", "stream-json", "--verbose"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=env, cwd=cwd, text=True)
+            env=env, cwd=cwd, text=True, start_new_session=True)
         threading.Thread(target=lambda: [self.out.put(l) for l in self.proc.stdout],
                          daemon=True).start()
         threading.Thread(target=lambda: [self.err.append(l) for l in self.proc.stderr],
@@ -232,7 +309,10 @@ class Client:
         return {"ok": False, "usage": {}, "timeout_or_exit": tail[-500:]}
 
     def close(self):
-        self.proc.kill()
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         self.proc.wait()
 
 
@@ -244,8 +324,9 @@ def captured_form(pp):
     return None, None
 
 
-def measure(pp, proxy, seen, scratch, home, token, form):
-    env = {"HOME": str(home), "CLAUDE_CONFIG_DIR": os.environ["CLAUDE_CONFIG_DIR"],
+def measure(pp, proxy, seen, scratch, home, token, form, claude):
+    cfg = os.environ["CLAUDE_CONFIG_DIR"]
+    env = {"HOME": str(home), "CLAUDE_CONFIG_DIR": cfg, "TMPDIR": os.environ["TMPDIR"],
            "PATH": os.environ["PATH"], "CLAUDE_CODE_OAUTH_TOKEN": token,
            "HTTPS_PROXY": f"http://127.0.0.1:{proxy.port}",
            "NODE_EXTRA_CA_CERTS": str(proxy._certdir / "ca.pem"),
@@ -256,8 +337,8 @@ def measure(pp, proxy, seen, scratch, home, token, form):
     pp._affinity_last.clear()
     pp._affinity_captures.update(kept=0, dropped={})
     pp._affinity_pings.update(sent=0, hit=0, refused={})
-    mark = len(seen)
-    client = Client(env, str(work), token)
+    mark, scan0 = len(seen), scan_transcripts(cfg)
+    client = Client(claude, env, str(work), token)
     try:
         session, got = None, None
         for _ in range(4):  # held: turn 1 is a full create, turn 2 held
@@ -265,27 +346,29 @@ def measure(pp, proxy, seen, scratch, home, token, form):
             session, got = captured_form(pp)
             if got == form or not last["ok"]:
                 break
-        rec = {"captured": got, "P": prefix(last["usage"]), "last_turn": last}
+        rec = {"form": form, "captured": got, "P": prefix(last["usage"]),
+               "last_turn": last}
         if got != form:
-            rec["verdict"] = "FAIL"
-            return rec | {"ping": {"status": None, "refused": f"form not captured ({got})",
-                                   "usage": {}, "ratelimit": {}},
-                          "next": {"ok": False, "usage": {}}, "any_404": None,
-                          "util_before": None, "health": health(proxy)}
-        ok_before = [s for s in seen[mark:] if 200 <= s["status"] < 300]
-        rec["util_before"] = ok_before[-1]["util"] if ok_before else None
+            return rec | {"verdict": "NOT MEASURED",
+                          "reason": f"form never captured (got {got})"}
+        scan1 = scan_transcripts(cfg)
         rec["ping"] = probe_ping(proxy, session)
+        ping_mark = len(seen)  # a 404 before this mark is not the ping's
         rec["health"] = health(proxy)
         rec["next"] = client.turn()
-        rec["any_404"] = any(s["status"] == 404 for s in seen[mark:])
+        rec["next_form"] = captured_form(pp)[1]
+        scan2 = scan_transcripts(cfg)
+        rec |= window(seen, mark, ping_mark)
+        rec |= {"drops": scan2[0] - scan1[0], "thinking": scan2[1] - scan0[1]}
         rec["verdict"] = verdict(rec)
         return rec
     finally:
         client.close()
 
 
-def self_check(pp, proxy, certdir, token):
-    """The arming wiring, the ping path on a canned reply, the verdict."""
+def self_check(pp, proxy, certdir, token, seen, scratch):
+    """The arming wiring, the ping path on a canned reply, the recorder on
+    canned replies, the transcript scan, a client's process group, the verdict."""
     headers = [("Authorization", f"Bearer {token}"), ("x-claude-code-session-id", "SC")]
     body = json.dumps({"model": "m", "system": [{"type": "text", "text": "s",
                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}).encode()
@@ -301,17 +384,65 @@ def self_check(pp, proxy, certdir, token):
     assert ping["status"] == 200 and ping["refused"] is None and ping["hit"], ping
     h = health(proxy)
     assert h["armed"] and h["captures"]["kept"] == 1 and h["pings"]["sent"] == 1, h
+
+    def reply(status):  # through the pin's own hook, as the relay calls it
+        line = f"HTTP/1.1 {status} X".encode()
+        pp._note_usage_headers(
+            line, [line, b"anthropic-ratelimit-unified-5h-utilization: 0.1"],
+            "/v1/messages?beta=true", f"Bearer {token}")
+
+    reply(404)  # the held form's own, before the ping: not the ping's
+    reply(200)
+    ping_mark = len(seen)
+    util = {"anthropic-ratelimit-unified-5h-utilization": "0.1"}
+    assert window(seen, 0, ping_mark) == {"ok_before": 1, "ok_after": 0, "any_404": False,
+                                          "util_before": util}, seen
+    reply(404)  # positive control: a 404 after the ping is seen
+    assert window(seen, 0, ping_mark)["any_404"], seen
+    assert window([], 0, 0) == {"ok_before": 0, "ok_after": 0, "any_404": False,
+                                "util_before": None}
+
+    cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"])
+    (cfg / "projects/p").mkdir(parents=True)
+    (cfg / "projects/p/s.jsonl").write_text("\n".join(json.dumps(r) for r in (
+        {"type": "attachment", "attachment": {"type": "thinking_drop"}},
+        {"type": "assistant", "message": {"content": [{"type": "thinking"}, {"type": "text"}]}},
+        {"type": "assistant", "message": {"content": "ok"}})) + "\nnot json\n")
+    assert scan_transcripts(cfg) == (1, 1)
+
+    fake = scratch / "fake-claude"  # a client with a child: close takes the group
+    fake.write_text('#!/bin/sh\nsleep 300 &\necho $! > "$KID"\nread l\n'
+                    'echo \'{"type":"result","is_error":false}\'\nwait\n')
+    fake.chmod(0o755)
+    kid = scratch / "kid"
+    client = Client(str(fake), {"KID": str(kid), "PATH": os.environ["PATH"]},
+                    str(scratch), token)
+    assert client.turn()["ok"], "fake client"
+    pid = int(kid.read_text())
+    client.close()
+    time.sleep(0.5)
+    stat = pathlib.Path(f"/proc/{pid}/stat")
+    assert not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[0] == "Z", \
+        "the client's child outlived close()"
+
     ok = {"ok": True, "usage": usage}
-    rec = {"P": 10000, "ping": ping, "next": ok, "any_404": False}
-    assert verdict(rec) == "PASS" and verdict(rec | {"any_404": True}) == "FAIL"
-    assert verdict(rec | {"next": {"ok": True, "usage": {}}}) == "FAIL"
-    assert verdict(rec | {"ping": ping | {"status": 400}}) == "FAIL"
+    rec = {"P": 10000, "form": "full", "next_form": "full", "ping": ping, "next": ok,
+           "any_404": False, "ok_before": 1, "ok_after": 1, "drops": 0}
+    assert verdict(rec) == "PASS"
+    for bad in ({"any_404": True}, {"any_404": True, "ok_after": 0},
+                {"next": {"ok": True, "usage": {}}}, {"ping": ping | {"status": 400}},
+                {"next_form": "held"}, {"next_form": None}, {"drops": 1}):
+        assert verdict(rec | bad) == "FAIL", bad
+    for blind in ({"ok_before": 0}, {"ok_after": 0}):
+        assert verdict(rec | blind) == "NOT MEASURED", blind
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scratch", required=True, type=pathlib.Path)
     ap.add_argument("--forms", default="full,held")
+    ap.add_argument("--claude", help="client binary (default: newest under the claude versions dir)")
+    ap.add_argument("--chain-port", type=int, default=8118, help="the egress chain's port")
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
     if not sys.platform.startswith("linux"):
@@ -323,18 +454,20 @@ def main():
         token, expires_ms = read_login()
         if expires_ms - time.time() * 1000 < TOKEN_MIN_MS:
             sys.exit("the login expires in under 20 min: refresh it first")
+        claude = args.claude or newest_client()
+        print("client", claude)
     before = real_state()
     print("rule0 before", before)
     home, certdir = confine(scratch)
     from cswap_pin import proxy as pp  # after confine: the pin reads HOME at start
-    proxy, seen = start_pin(pp, certdir, token, expires_ms)
+    proxy, seen = start_pin(pp, certdir, token, expires_ms, args.chain_port)
     results = {}
     try:
         if args.self_check:
-            self_check(pp, proxy, certdir, token)
+            self_check(pp, proxy, certdir, token, seen, scratch)
         else:
             for form in args.forms.split(","):
-                results[form] = measure(pp, proxy, seen, scratch, home, token, form)
+                results[form] = measure(pp, proxy, seen, scratch, home, token, form, claude)
                 print(table(form, results[form]).replace(token, "<token>"), flush=True)
     finally:
         proxy.stop()
@@ -346,8 +479,12 @@ def main():
         print("self-check ok")
     else:
         (scratch / "step0.json").write_text(json.dumps(
-            {"rule0": {"before": before, "after": after, "identical": same},
+            {"client": claude, "rule0": {"before": before, "after": after, "identical": same},
              "forms": results}, indent=1, default=str).replace(token, "<token>"))
+        passed = [f for f, r in results.items() if r["verdict"] == "PASS"]
+        print("FORMS_PASS=" + (",".join(passed) or "none"))
+        if same and any(r["verdict"] == "NOT MEASURED" for r in results.values()):
+            sys.exit(3)
     sys.exit(0 if same else 1)
 
 
