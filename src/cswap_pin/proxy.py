@@ -3273,7 +3273,8 @@ _affinity_logged: dict[tuple, tuple] = {}
 # THE USER'S CONVERSATION, IN MEMORY ONLY: never logged, never written. session
 # -> [headers minus Authorization, the body of its last main-thread 1 h-tier
 # /v1/messages, that tier's TTL in seconds, prefix estimate in tokens (0:
-# unknown, a `held` body until a ping reply measures it), its monotonic time,
+# unknown, a `held` body until a ping reply measures it), its monotonic time
+# (the clock the API's cache keeps: set at capture, renewed by a 2xx ping),
 # keep-alive pings sent since it, the reason the sender last refused it (a
 # reason is counted once per request), its request path]. Held only while
 # armed, and only as long as the session's `_affinity` entry (dropped with it).
@@ -3291,6 +3292,7 @@ _KEEPALIVE_MAX_TOKENS = 0
 _KEEPALIVE_TICK_S = 60.0
 _KEEPALIVE_IO_S = 30.0  # one connect, handshake, send or read of a ping
 _KEEPALIVE_MIN_PREFIX = 20000
+_KEEPALIVE_NOT_YET = "not idle long enough"  # cswap's wording; normal, uncounted
 _AFFINITY_SINCE = time.time()
 
 
@@ -3330,7 +3332,7 @@ def _keepalive_due_inline(*, idle_s, pings_since_request, ttl_s, prefix_est,
     if not slot_kept:
         return False, "its slot is not kept"
     if idle_s < 3300.0:
-        return False, "not idle long enough"
+        return False, _KEEPALIVE_NOT_YET
     if pings_since_request >= 2:
         return False, "pings since its last request are spent"
     if prefix_est < _KEEPALIVE_MIN_PREFIX:
@@ -3675,10 +3677,12 @@ def _keepalive_form(headers) -> str:
 
 def _affinity_capture(certdir, headers, body: bytes, path: str) -> bool:
     """Keep ``body`` as its session's last main-thread body when armed and it
-    asks for the 1 h tier, replacing the one before; a 1 h body too big to
-    keep drops it instead. True when it kept one. The main thread is told
-    from a subagent by the agent-id headers Claude Code puts on a subagent (it
-    shares the session id and often the tier, so the tier alone does not say).
+    asks for the 1 h tier, replacing the one before; any other main-thread
+    body (a 5 min tier, no breakpoint, too big to keep) drops it, since the
+    last body is the one a ping would replay. True when it kept one. The main
+    thread is told from a subagent by the agent-id headers Claude Code puts on
+    a subagent (it shares the session id and often the tier, so the tier alone
+    does not say).
     shortcut: a Workflow subagent carries no such header, so it passes as the
     main thread; the sandbox measurement says whether that matters.
 
@@ -3693,14 +3697,14 @@ def _affinity_capture(certdir, headers, body: bytes, path: str) -> bool:
             return False
         if kl == "x-claude-code-session-id":
             session = v
-    ttl_s = _final_cache_ttl_s(body)
-    if ttl_s != 3600.0 or not session:
+    if not session:
         return False
+    ttl_s = _final_cache_ttl_s(body)
     sent = [(k, v) for k, v in headers if k.lower() != "authorization"]
     with _affinity_lock:
-        if session not in _affinity:
-            return False
         _affinity_last.pop(session, None)
+        if ttl_s != 3600.0 or session not in _affinity:
+            return False
         if len(body) <= _AFFINITY_BODY_MAX:
             _affinity_last[session] = [
                 sent, body, ttl_s,
@@ -3750,17 +3754,21 @@ def _cache_aware_report(certdir) -> dict:
     now = time.monotonic()
     slots: dict = {}
     with _affinity_lock:
-        for session, (bearer, at) in (_affinity.items() if cfg else ()):
-            ident, left = _affinity_idents.get(bearer), cfg[0] - (now - at)
-            if ident is None or left <= 0:
-                continue
-            row = slots.setdefault(ident[0], {
-                "warm": 0, "kept": 0, "prefix_est": 0,
-                "ttl_left_min_s": int(left)})
-            row["warm"] += 1
-            row["kept"] += _affinity_slot_kept(ident, now)
-            row["prefix_est"] += (_affinity_last.get(session) or (0,) * 4)[3]
-            row["ttl_left_min_s"] = min(row["ttl_left_min_s"], int(left))
+        try:
+            for session, (bearer, at) in (_affinity.items() if cfg else ()):
+                ident, left = _affinity_idents.get(bearer), cfg[0] - (now - at)
+                if ident is None or left <= 0:
+                    continue
+                row = slots.setdefault(ident[0], {
+                    "warm": 0, "kept": 0, "prefix_est": 0,
+                    "ttl_left_min_s": int(left)})
+                row["warm"] += 1
+                row["kept"] += _affinity_slot_kept(ident, now)
+                row["prefix_est"] += (
+                    _affinity_last.get(session) or (0,) * 4)[3]
+                row["ttl_left_min_s"] = min(row["ttl_left_min_s"], int(left))
+        except Exception:  # noqa: BLE001 — a liveness probe answers anyway
+            slots = {}
         pings = {**_affinity_pings, "refused": dict(_affinity_pings["refused"])}
     return {"armed": cfg is not None, "slots": slots, "pings": pings,
             "since": _iso_utc(_AFFINITY_SINCE)}
@@ -22365,8 +22373,9 @@ class PinProxy:
                 self._keepalive_thread = None
 
     def _keepalive_loop(self) -> None:
-        """One `_keepalive_tick` a minute until the switch is off or the pin
-        stops (the event `_trace_tick_loop` ends on)."""
+        """One `_keepalive_tick` a minute until it says stop (the switch is
+        off, or `release_listener` ran) or the pin stops (the event
+        `_trace_tick_loop` ends on: a drain does not set it)."""
         while not self._trace_tick_stop.wait(_KEEPALIVE_TICK_S):
             try:
                 if not self._keepalive_tick():
@@ -22376,11 +22385,17 @@ class PinProxy:
 
     def _keepalive_tick(self) -> bool:
         """Ping each kept session that `_keepalive_due` says is due; False
-        when the switch is off. The snapshot must be fresh to rule on a slot:
-        when it is not, a session that is due but for that waits one tick while
-        the rebuild runs. The store is never read here."""
+        when the switch is off or this process has released its listener to a
+        successor (it holds no body then). Idle is the body's own clock, not
+        the session's binding, which a subagent's request refreshes. The
+        snapshot must be fresh to rule on a slot: when it is not, a session
+        that is due but for that waits one tick while the rebuild runs, and
+        only a form the gate lets through is worth the rebuild. The store is
+        never read here."""
         cfg = session_affinity_config(getattr(self, "_certdir", None))
-        if cfg is None:
+        if cfg is None or self._stop:
+            with _affinity_lock:
+                _affinity_last.clear()
             return False
         now = time.monotonic()
         with _affinity_lock:
@@ -22389,20 +22404,24 @@ class PinProxy:
             for session, e in _affinity_last.items():
                 bound = _affinity.get(session)
                 if bound is not None:
-                    ident = _affinity_idents.get(bound[0])
-                    rows.append((session, now - bound[1], e[2], e[3], e[5],
-                                 ident in _affinity_kept
-                                 and _affinity_rest.get(ident, 0.0) <= now))
+                    rows.append((
+                        session, now - e[4], e[2], e[3], e[5],
+                        _keepalive_form(e[0]) in _KEEPALIVE_FORMS,
+                        _affinity_slot_kept(_affinity_idents.get(bound[0]), now)))
         due, stale = [], False
-        for session, idle_s, ttl_s, prefix, pings, kept in rows:
+        for session, idle_s, ttl_s, prefix, pings, measured, kept in rows:
             ok, why = _keepalive_due(
                 idle_s=idle_s, pings_since_request=pings, ttl_s=ttl_s,
-                prefix_est=prefix or _KEEPALIVE_MIN_PREFIX,
+                # unknown (a held body's): ping 1 measures it, ping 2 needs it
+                prefix_est=prefix or (0 if pings else _KEEPALIVE_MIN_PREFIX),
                 slot_kept=kept or not fresh)
             if ok and idle_s >= ttl_s:  # cold already: a ping would WRITE it
                 ok, why = False, "past its cache ttl"
+            elif ok and not measured:
+                ok, why = False, "form not measured"
             if not ok:
-                _keepalive_refuse(session, why)
+                if why != _KEEPALIVE_NOT_YET:
+                    _keepalive_refuse(session, why)
             elif fresh:
                 due.append(session)
             else:
@@ -22478,15 +22497,17 @@ class PinProxy:
                       for k in ("cache_read_input_tokens",
                                 "cache_creation_input_tokens"))
         out["hit"] = hit = read > 0 and made <= read // 10
+        now = time.monotonic()
         with _affinity_lock:
             _affinity_pings["sent"] += 1
             _affinity_pings["hit"] += hit
             if _affinity_last.get(session) is entry:
+                entry[4] = now  # the API's cache is renewed: so is the body's
                 entry[5] += 1
                 if form == "held" and read:
                     entry[3] = read  # the measure a held body lacks
-            if session in _affinity:  # the API's cache is renewed: so is ours
-                _affinity[session] = (_affinity[session][0], time.monotonic())
+            if session in _affinity:  # and the binding's clock and place
+                _bounded_put(_affinity, session, (_affinity[session][0], now))
         _log_lifecycle(
             f"session affinity: keep-alive ping slot {ident[0]} form {form} "
             f"status {status} cache_read {read} cache_creation {made} hit {hit}"

@@ -1096,12 +1096,17 @@ state is in memory and bounded, and a daemon handover starts every session cold.
 
 **Keep-alive.** While armed, the pin keeps each session's last main-thread
 `/v1/messages` body that asks for the 1 h cache tier (in memory only, never
-logged, bounded in count and bytes, dropped with the session's entry; a
-subagent's request never replaces it). A thread of its own looks once a minute
-for a session idle about 55 minutes whose slot the pin would keep, and sends
+logged, bounded in count and bytes, dropped with the session's entry or when
+the switch goes off; a subagent's request never replaces it, and a main-thread
+request for any other tier drops it). A thread of its own looks once a minute
+for a session whose body is about 55 minutes old (the body's own clock: a
+subagent's request does not reset it, a 2xx ping does) and whose slot the pin
+would keep, and it ends when the switch goes off or the process hands its
+listener to a successor. It sends
 that body once more with `max_tokens` 0 and `stream` false, on the kept slot's
 stored token, so the API's cache is renewed before it expires: at most two per
-real request, and none for a prefix under 20,000 tokens (cswap's
+real request, and none for a prefix under 20,000 tokens (a held body's is
+unknown, so its first ping goes out and the reply measures it; cswap's
 `autoswitch.keepalive_due` has the rule; the pin has a copy for a cswap
 without it). A ping replays exactly the form of the session's last real body (a
 full history, or a `message-threads-` request whose history the server holds)
@@ -1116,7 +1121,8 @@ line to `daemon.log`: the slot, the form, the status, `cache_read` and
 `/health` carries a `cache_aware` key (additive): `armed`; per slot, `warm`
 sessions, how many of them `kept`, `prefix_est` (tokens, summed; a held body
 counts 0 until a ping measures it) and `ttl_left_min_s`; `pings`
-(`sent`, `hit`, `refused` by reason, each reason counted once per request); and
+(`sent`, `hit`, `refused` by reason, each reason counted once per request; a
+session not idle long enough yet is the normal state and is not counted); and
 `since`, when this process started counting. Never a session id or a byte of a
 conversation.
 
