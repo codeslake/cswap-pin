@@ -17243,6 +17243,31 @@ class TestThePinnedTokenIsRefreshedBeforeItsLivenessBuffer:
         finally:
             proxy.stop()
 
+    def case_a_temp_file_left_by_a_dead_writer_is_removed_by_the_next_write(
+            self, certdir, monkeypatch):
+        """A death between the temp write and the rename never runs the
+        except, and the temp's name carries the dead pid, so only a later
+        write, to set the record or to remove it, can sweep it."""
+        from cswap_pin import proxy as pp
+
+        rig = self._rig(certdir, monkeypatch)
+        reason = rig.provider.blind_reason = "refresh invalid_grant for slot 2 (x)"
+        proxy = pp.PinProxy(certdir=certdir, pin_token_provider=rig.provider,
+                            upstream=("127.0.0.1", 1))
+        carry, stale = certdir / "blind-reason.json", certdir / "blind-reason.json.99999.tmp"
+        try:
+            stale.write_text("{")
+            proxy._carry_blind_tick()
+            assert json.loads(carry.read_text())["reason"] == reason
+            assert not stale.exists()
+            stale.write_text("{")
+            rig.provider.blind_reason = ""
+            proxy._carry_blind_tick()
+            assert not carry.exists()
+            assert not stale.exists()
+        finally:
+            proxy.stop()
+
     def case_a_store_blob_that_crosses_the_buffer_is_judged_once(
             self, certdir, monkeypatch):
         """The store read's liveness was asked twice (the guard, then the

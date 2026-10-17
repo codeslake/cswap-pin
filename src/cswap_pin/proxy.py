@@ -11314,6 +11314,10 @@ def write_blind_reason(certdir: Path, rec: dict | None) -> bool:
     path = Path(certdir) / _BLIND_REASON_FILE
     tmp = path.with_name(f"{_BLIND_REASON_FILE}.{os.getpid()}.tmp")
     try:
+        # Sweep a killed writer's temp; a live peer's lost here only fails its replace (False, retried).
+        for old in path.parent.glob(f"{_BLIND_REASON_FILE}.*.tmp"):
+            with contextlib.suppress(OSError):
+                old.unlink()
         if rec is None:
             path.unlink(missing_ok=True)
             return True
