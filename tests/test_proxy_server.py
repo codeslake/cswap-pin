@@ -23850,8 +23850,9 @@ class TestSessionAffinityOnMessages:
         (certdir / "session-affinity").unlink()
         pp._AFFINITY_CACHE.clear()
         self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
-        assert not pp._affinity_kept and not pp._affinity_dropped, (
-            pp._affinity_kept, pp._affinity_dropped)
+        assert not (pp._affinity_kept or pp._affinity_dropped
+                    or pp._affinity_why), (
+            pp._affinity_kept, pp._affinity_dropped, pp._affinity_why)
         assert seen.recorded == [], seen.recorded
 
     def case_a_warm_session_keeps_its_account(self, monkeypatch, certdir):
@@ -23932,7 +23933,7 @@ class TestSessionAffinityOnMessages:
         """The client sees B's 200 and nothing of A's refusal; the wall and
         switch machinery never hears of it; and neither the session nor a
         second session kept on A tries A again. A 404 is the one exception: it
-        names the request (a model the account lacks), not the account, so it
+        is a per-request `thread_not_found`, not the account, so it
         is resent the same way but the session stays on A, A is not rested,
         and the line does not say it was."""
         from cswap_pin import proxy as pp
@@ -24008,15 +24009,15 @@ class TestSessionAffinityOnMessages:
             assert auths == [f"Bearer {want}"], (thresholds, pct, auths)
 
     def case_the_dynamic_strategys_bar_applies(self, monkeypatch, certdir):
-        """Under `dynamic` the engine switches at `100 - SPENT_HEADROOM_PCT`,
-        not at the configured threshold. The released host has no
-        `proactive_switch_bar_pct`, so this one stands in for it."""
+        """Under `dynamic` the engine switches at 97, not at the configured
+        threshold. The released host has no `proactive_switch_bar_pct`, so this
+        one stands in for it."""
         from claude_swap import autoswitch
         from cswap_pin import proxy as pp
         monkeypatch.setattr(
-            autoswitch, "proactive_switch_bar_pct", lambda strategy, t: (
-                100.0 - autoswitch.SPENT_HEADROOM_PCT
-                if strategy == "dynamic" else t), raising=False)
+            autoswitch, "proactive_switch_bar_pct",
+            lambda strategy, t: 97.0 if strategy == "dynamic" else t,
+            raising=False)
         for strategy, pct, want in (
                 ("dynamic", 93.0, "tok-A"), ("dynamic", 97.0, "tok-B"),
                 ("best", 93.0, "tok-B")):
@@ -24224,6 +24225,23 @@ class TestSessionAffinityOnMessages:
             assert auths == ["Bearer tok-A", f"Bearer {want}"], (
                 thresholds, util, auths)
             assert len(seen.fetches) == 1, "the drop read the store"
+
+    def case_a_drop_at_the_bar_names_itself_in_the_decline_line(
+            self, monkeypatch, certdir):
+        """A reply that crosses the bar drops the slot in memory, with no
+        rebuild after it: the next request on that warm session is passed over
+        for the drop, and its line says so (the slot's reason in the snapshot
+        is None, it was kept, and a None must not print or key the fold)."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        _, auths = self._send(
+            certdir, [("tok-A", "S"), ("tok-B", "S")], reply=self._util(0.95))
+        assert auths == ["Bearer tok-A", "Bearer tok-B"], auths
+        lines = [l for l in seen.logs if "a warm session was not kept" in l]
+        assert len(lines) == 1 and "dropped at its bar" in lines[0], seen.logs
+        assert "None" not in lines[0] and None not in pp._affinity_declined, (
+            lines, pp._affinity_declined)
 
     def case_a_snapshot_started_before_a_drop_does_not_undo_it(
             self, monkeypatch, certdir):

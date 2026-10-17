@@ -3257,6 +3257,7 @@ _affinity_kept: dict[tuple, tuple] = {}
 _affinity_dropped: dict[tuple, tuple[float, float]] = {}
 # (slot, email) -> why the last snapshot did not keep it (None: it did)
 _affinity_why: dict[tuple, "str | None"] = {}
+_AFFINITY_DROPPED_WHY = "dropped at its bar, no newer reading since"
 # reason -> (monotonic time of its last lifecycle line, declines folded into
 # the next one): `_affinity_pick` saying why a warm session was not kept
 _affinity_declined: dict[str, tuple] = {}
@@ -3338,7 +3339,7 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
         idents, kept, why, owed = {}, {}, {}, []
         for num, info in sw._get_sequence_data()["accounts"].items():
             slot, ident = str(num), (str(num), info["email"])
-            why[ident] = "its credentials could not be read"
+            why[ident] = "its reading could not be used"
             try:  # one unreadable slot must not end affinity for the rest
                 data = oauth.extract_oauth_data(
                     sw.read_account_credentials(num, info["email"]))
@@ -3380,7 +3381,7 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                                      and started > d[1]):
                         _affinity_kept[i] = v
                     else:
-                        why[i] = "dropped at its bar, no newer reading since"
+                        why[i] = _AFFINITY_DROPPED_WHY
                 _affinity_why.clear()
                 _affinity_why.update(why)
                 _affinity_snap["at"] = started
@@ -3470,6 +3471,7 @@ def _affinity_note_usage(token: str, headers: dict) -> "tuple | None":
         if stored is None or used < stored[2]:
             return None
         del _affinity_kept[ident]
+        _affinity_why[ident] = _AFFINITY_DROPPED_WHY
         _bounded_put(_affinity_dropped, ident, (time.time(), time.monotonic()))
         return ident
 
@@ -3490,9 +3492,10 @@ def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
     """The kept account refused a request, which goes out again on the
     client's bearer. A 401/403/429 also ends the session's affinity and rests
     the account until the 429's ``reset`` (epoch seconds), or for
-    `_AFFINITY_BACKOFF_S` when there is none. A 404 does neither: it names the
-    request (a model or route the account lacks), not the account, so the
-    session stays on it. One lifecycle line per (slot, code) per
+    `_AFFINITY_BACKOFF_S` when there is none. A 404 does neither: it is a
+    per-request `thread_not_found` (a server-held send whose thread state is
+    missing) that the client's full replay recovers from, not a verdict on
+    the account, so the session stays on it. One lifecycle line per (slot, code) per
     `_BUSY_REPORT_COOLDOWN_S`, folding the rest into "; N more": the slot, the
     code and the rest, never a bearer."""
     wait = _AFFINITY_BACKOFF_S
@@ -3537,6 +3540,7 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         if _affinity_kept:  # switched off: no kept slot may outlive it
             with _affinity_lock:
                 _affinity_kept.clear()
+                _affinity_why.clear()
         return None
     ttl, threshold, strategy = cfg
     client = session = ""
@@ -3578,7 +3582,7 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
                    else "resting after a refusal"
                    if _affinity_rest.get(held, 0.0) > now
                    else "its stored token has expired" if stored
-                   else _affinity_why.get(held, "it is in no snapshot"))
+                   else _affinity_why.get(held) or "it is in no snapshot")
             more = _affinity_due(_affinity_declined, why, now)
             if more is not None:
                 line = (f"session affinity: a warm session was not kept on "
