@@ -1,7 +1,8 @@
 """Step 0 of the keep-alive gate: does a ping keep a session's cache warm?
 
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> [--forms full,held]
-        [--claude <client binary>] [--chain-port 8118]
+        [--claude <client binary>] [--chain-port 8118] [--prompt <text>] [--thinking-tokens N]
+    PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> --no-ping
     PYTHONPATH=src <venv python> tools/keepalive_step0.py --scratch <dir> --self-check
 
 WHY THIS EXISTS AS A SCRIPT. `_KEEPALIVE_FORMS` ships empty: the sender replays
@@ -20,11 +21,20 @@ transcript after it. FAIL is a measured failure. NOT MEASURED is a form the
 run could not judge: it was never captured, or the recorder saw no 2xx
 /v1/messages before or after the ping (blind). The table says whether the
 session held any thinking block: a `thinking_drop` count of 0 with none proves
-nothing about the drop.
+nothing about the drop: `--thinking-tokens N` sets MAX_THINKING_TOKENS=N for the
+client (absent = unset) and `--prompt` replaces "reply with the word ok", so a run
+can make the session carry thinking blocks.
+
+WHY THE CONTROL EXISTS. `--no-ping` sends the same turns and no ping: each form's
+verdict reads CONTROL (it counts as measured) and its table still prints the next
+turn's cache_read, form and 404 rows. Measured 2026-10-17, the full form's next
+turn read 26746 of P 30274 both with and without a ping (Claude Code's full form
+re-creates ~3.5k of the tail every turn), so the absolute 0.9 P rule fails full
+regardless of the ping: compare a ping run against the control.
 
 EXIT STATUS: 1 when Rule 0 reads CHANGED, else 3 when any form is NOT MEASURED,
-else 0 (a FAIL is a result, not an error). The last line is `FORMS_PASS=<comma
-list or none>`.
+else 0 (a FAIL is a result, not an error, and a CONTROL is measured). The last
+line is `FORMS_PASS=<comma list or none>`.
 
 THE THROWAWAY PIN RUNS ITS BACKGROUND SWEEPS, so the live login is used beyond
 the ping (first pass ~20 s after start, then every 5 min): `sweep_titles_once`
@@ -73,11 +83,13 @@ import subprocess
 import sys
 import threading
 import time
+from unittest import mock
 
 sys.dont_write_bytecode = True  # nothing outside --scratch, the .pyc files too
 REAL_HOME = os.path.expanduser("~")  # home-read
 TOKEN_MIN_MS = 20 * 60 * 1000
 TURN_TIMEOUT_S = 240
+PROMPT = "reply with the word ok"
 FORM_TETHER = {"full": "0", "held": "1"}
 
 
@@ -224,13 +236,16 @@ def scan_transcripts(cfg):
 
 
 def verdict(rec):
-    """FAIL on a 404 after the ping. NOT MEASURED when the recorder saw no 2xx
-    before or after it (blind). Else PASS when the ping read the prefix, the
-    next turn did too, in the measured form, with no `thinking_drop`."""
-    if rec["any_404"]:
+    """CONTROL when no ping was sent (its 404 row is context, not a FAIL). FAIL
+    on a 404 after the ping. NOT MEASURED when the recorder saw no 2xx before or
+    after it (blind). Else PASS when the ping read the prefix, the next turn did
+    too, in the measured form, with no `thinking_drop`."""
+    if rec["any_404"] and rec["ping"]:
         return "FAIL"
     if not (rec["ok_before"] and rec["ok_after"]):
         return "NOT MEASURED"
+    if rec["ping"] is None:
+        return "CONTROL"
     p, ping, nxt = rec["P"], rec["ping"], rec["next"]
     pu, nu = ping["usage"], nxt["usage"]
     a = (ping["status"] is not None and 200 <= ping["status"] < 300 and p > 0
@@ -247,16 +262,17 @@ def table(form, rec):
         return (f"{head} ({rec['reason']})\n\ncaptured {rec['captured']}, "
                 f"last turn {rec['last_turn']}")
     ping, nxt = rec["ping"], rec["next"]
-    vacuous = "" if rec["thinking"] else " (VACUOUS: no thinking block appeared, nothing to drop)"
-    rows = [
-        ("form captured", rec["captured"]), ("P (tokens)", rec["P"]),
-        ("last real turn", rec["last_turn"]),
+    ping_rows = [] if ping is None else [
         ("ping status / refused", f"{ping['status']} / {ping['refused']}"),
         ("ping error body", ping.get("error_body", "-")),
         ("ping cache_read", ping["usage"].get("cache_read_input_tokens")),
         ("ping cache_creation", ping["usage"].get("cache_creation_input_tokens")),
-        ("utilization before (last real turn)", rec["util_before"]),
-        ("utilization after (ping)", ping["ratelimit"]),
+        ("utilization after (ping)", ping["ratelimit"])]
+    vacuous = "" if rec["thinking"] else " (VACUOUS: no thinking block appeared, nothing to drop)"
+    rows = [
+        ("form captured", rec["captured"]), ("P (tokens)", rec["P"]),
+        ("last real turn", rec["last_turn"]),
+        ("utilization before (last real turn)", rec["util_before"]), *ping_rows,
         ("next turn ok", nxt["ok"]),
         ("next turn cache_read", nxt["usage"].get("cache_read_input_tokens")),
         ("next request form (must be the captured one)", rec["next_form"]),
@@ -288,7 +304,7 @@ class Client:
         threading.Thread(target=lambda: [self.err.append(l) for l in self.proc.stderr],
                          daemon=True).start()
 
-    def turn(self, text="reply with the word ok"):
+    def turn(self, text=PROMPT):
         """The `result` event of one turn: ok, and the usage of its last API
         call (the `result` one may sum a session)."""
         msg = {"type": "user", "message": {"role": "user", "content": text}}
@@ -328,7 +344,8 @@ def captured_form(pp):
     return None, None
 
 
-def measure(pp, proxy, seen, scratch, home, token, form, claude):
+def measure(pp, proxy, seen, scratch, home, token, form, claude,
+            no_ping=False, prompt=PROMPT, thinking_tokens=None):
     cfg = os.environ["CLAUDE_CONFIG_DIR"]
     env = {"HOME": str(home), "CLAUDE_CONFIG_DIR": cfg, "TMPDIR": os.environ["TMPDIR"],
            "PATH": os.environ["PATH"], "CLAUDE_CODE_OAUTH_TOKEN": token,
@@ -336,6 +353,8 @@ def measure(pp, proxy, seen, scratch, home, token, form, claude):
            "NODE_EXTRA_CA_CERTS": str(proxy._certdir / "ca.pem"),
            "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h",
            "CLAUDE_CODE_TETHER_LIVE": FORM_TETHER[form]}
+    if thinking_tokens is not None:
+        env["MAX_THINKING_TOKENS"] = str(thinking_tokens)
     work = scratch / "w"
     work.mkdir(exist_ok=True)
     pp._affinity_last.clear()
@@ -346,7 +365,7 @@ def measure(pp, proxy, seen, scratch, home, token, form, claude):
     try:
         session, got = None, None
         for _ in range(4):  # held: turn 1 is a full create, turn 2 held
-            last = client.turn()
+            last = client.turn(prompt)
             session, got = captured_form(pp)
             if got == form or not last["ok"]:
                 break
@@ -356,10 +375,10 @@ def measure(pp, proxy, seen, scratch, home, token, form, claude):
             return rec | {"verdict": "NOT MEASURED",
                           "reason": f"form never captured (got {got})"}
         scan1 = scan_transcripts(cfg)
-        rec["ping"] = probe_ping(proxy, session)
+        rec["ping"] = None if no_ping else probe_ping(proxy, session)
         ping_mark = len(seen)  # a 404 before this mark is not the ping's
         rec["health"] = health(proxy)
-        rec["next"] = client.turn()
+        rec["next"] = client.turn(prompt)
         rec["next_form"] = captured_form(pp)[1]
         scan2 = scan_transcripts(cfg)
         rec |= window(seen, mark, ping_mark)
@@ -441,6 +460,38 @@ def self_check(pp, proxy, certdir, token, seen, scratch):
     for blind in ({"ok_before": 0}, {"ok_after": 0}):
         assert verdict(rec | blind) == "NOT MEASURED", blind
 
+    class Stub:  # a client that only answers: every turn is a 2xx the recorder sees
+        envs, prompts = [], []
+
+        def __init__(self, claude, env, cwd, token):
+            Stub.envs.append(env)
+
+        def turn(self, text):
+            Stub.prompts.append(text)
+            reply(200)
+            return {"ok": True, "usage": usage}
+
+        def close(self):
+            pass
+
+    def run(**kw):
+        Stub.envs, Stub.prompts, pinged = [], [], []
+        fake_ping = lambda *a: pinged.append(a) or ping
+        with mock.patch.multiple(sys.modules[__name__], Client=Stub, probe_ping=fake_ping,
+                                 captured_form=lambda pp: ("SC", "full")):
+            rec = measure(pp, proxy, seen, scratch, scratch, token, "full", "claude", **kw)
+        return rec, pinged
+
+    rec, pinged = run(no_ping=True, prompt="say hi", thinking_tokens=5)
+    assert not pinged and rec["ping"] is None and rec["verdict"] == "CONTROL", (pinged, rec)
+    assert Stub.prompts == ["say hi"] * 2 and Stub.envs[0]["MAX_THINKING_TOKENS"] == "5"
+    assert "ping status" not in table("full", rec) and "next turn cache_read" in table("full", rec)
+    rec, pinged = run()
+    assert len(pinged) == 1 and rec["verdict"] == "PASS", (pinged, rec)
+    assert Stub.prompts == [PROMPT] * 2 and "MAX_THINKING_TOKENS" not in Stub.envs[0]
+    assert verdict(rec | {"ping": None, "any_404": True}) == "CONTROL"
+    assert verdict(rec | {"ping": None, "ok_after": 0}) == "NOT MEASURED"
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -448,6 +499,9 @@ def main():
     ap.add_argument("--forms", default="full,held")
     ap.add_argument("--claude", help="client binary (default: newest under the claude versions dir)")
     ap.add_argument("--chain-port", type=int, default=8118, help="the egress chain's port")
+    ap.add_argument("--no-ping", action="store_true", help="the control arm: send no ping")
+    ap.add_argument("--prompt", default=PROMPT, help="the text of every turn")
+    ap.add_argument("--thinking-tokens", type=int, help="MAX_THINKING_TOKENS for the client")
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
     if not sys.platform.startswith("linux"):
@@ -472,7 +526,8 @@ def main():
             self_check(pp, proxy, certdir, token, seen, scratch)
         else:
             for form in args.forms.split(","):
-                results[form] = measure(pp, proxy, seen, scratch, home, token, form, claude)
+                results[form] = measure(pp, proxy, seen, scratch, home, token, form, claude,
+                                        args.no_ping, args.prompt, args.thinking_tokens)
                 print(table(form, results[form]).replace(token, "<token>"), flush=True)
     finally:
         proxy.stop()
