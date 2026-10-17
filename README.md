@@ -42,7 +42,7 @@ Pinning rewrites files Claude Code reads at startup (every one is listed under
 package is broken or gone. It:
 
 - removes the `env` keys the pin added to `.claude.json` (`HTTPS_PROXY`,
-  `https_proxy`, `ALL_PROXY`, `NODE_EXTRA_CA_CERTS`, `CSWAP_PIN_PORT`) and puts
+  `https_proxy`, `ALL_PROXY`, `all_proxy`, `NODE_EXTRA_CA_CERTS`, `CSWAP_PIN_PORT`) and puts
   back any value they replaced, so a proxy you had set before comes back;
 - points `oauthAccount` in the same file back at the account you are logged in
   as;
@@ -493,8 +493,8 @@ proxy and merges the CA for you.
 ## Keeping the programs Claude Code starts off the pin
 
 **What the pin wires, and who inherits it.** `cswap pin N` writes
-`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `NODE_EXTRA_CA_CERTS` and
-`CSWAP_PIN_PORT` into the `env` block of `~/.claude.json`. Claude Code puts that
+`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `all_proxy`, `NODE_EXTRA_CA_CERTS`
+and `CSWAP_PIN_PORT` into the `env` block of `~/.claude.json`. Claude Code puts that
 block into its own environment at start, and every program it starts inherits
 its environment: the Bash tool's shells, command hooks, stdio MCP servers, the
 status line, and everything those run (`aws`, `git`, `curl`). Their HTTPS then
@@ -727,7 +727,7 @@ start](#before-you-start-and-if-it-breaks)); `cswap pin --get_certdir` prints
 
 | where | what | after `cswap pin --clear` |
 | :-- | :-- | :-- |
-| `~/.claude.json` `env` (`$CLAUDE_CONFIG_DIR/.claude.json` when that is set) | sets `HTTPS_PROXY`, `https_proxy` and `ALL_PROXY` to the pin's loopback address, `NODE_EXTRA_CA_CERTS` to the pin's CA (or to `ca-bundle.pem` when a hop's CA is merged in) and `CSWAP_PIN_PORT` to its port; deletes `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` | the five removed and whatever they replaced restored; the three deleted stay deleted |
+| `~/.claude.json` `env` (`$CLAUDE_CONFIG_DIR/.claude.json` when that is set) | sets `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` and `all_proxy` to the pin's loopback address, `NODE_EXTRA_CA_CERTS` to the pin's CA (or to `ca-bundle.pem` when a hop's CA is merged in) and `CSWAP_PIN_PORT` to its port; deletes `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` | the six removed and whatever they replaced restored; the three deleted stay deleted |
 | `~/.claude.json` `oauthAccount` | the pinned account's identity, re-asserted by every `--ensure` | the account you are logged in as |
 | `<data>/pin-wiring/<key>.json` | the receipt: `_cswapPinWiredKeys` (what was set), `_cswapPinWiredKeysSaved` (what that replaced), `writtenBy` | emptied |
 | `<data>/settings.json`, `remoteControl` | `pinnedEmail`, `pinnedOrganizationUuid` (a `debugSlowMs` you add there is yours and is left alone) | the two pin keys dropped; when the file is a symlink (shared across machines) they are left alone unless you add `--everywhere` |
@@ -1522,7 +1522,7 @@ port.
 **Every shell a session starts inherits the pin.** Claude Code applies the
 `env` block of `.claude.json` to its own process, so every child it starts,
 Bash-tool shells included, inherits `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
-`NODE_EXTRA_CA_CERTS` and `CSWAP_PIN_PORT`. The child's HTTPS then goes through
+`all_proxy`, `NODE_EXTRA_CA_CERTS` and `CSWAP_PIN_PORT`. The child's HTTPS then goes through
 the proxy, which re-signs only `api.anthropic.com` and tunnels every other host
 untouched. The trust it hands the child is wider than that: the CA is a full CA
 (`CA:TRUE`) with no name constraints, so a Node child reading

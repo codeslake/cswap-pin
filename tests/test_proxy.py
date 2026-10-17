@@ -10404,20 +10404,21 @@ class TestWireGlobalConfig:
         from cswap_pin.proxy import wire_global_config
         path = self._config(
             tmp_path, monkeypatch,
-            {"env": {"ALL_PROXY": "http://127.0.0.1:9901"}},
+            {"env": {"ALL_PROXY": "http://127.0.0.1:9901",
+                     "all_proxy": "http://127.0.0.1:9901"}},
         )
 
         wire_global_config(9955, Path("/tmp/ca.pem"))
         env = json.loads(path.read_text())["env"]
-        assert env["ALL_PROXY"] == "http://127.0.0.1:9955"
-        assert env["ALL_PROXY"] == env["HTTPS_PROXY"]
+        for key in ("ALL_PROXY", "all_proxy"):
+            assert env[key] == "http://127.0.0.1:9955"
+            assert env[key] == env["HTTPS_PROXY"]
 
         # and it is ours to give back, like every other key we displace
         wire_global_config(None, None)
-        assert (
-            json.loads(path.read_text())["env"]["ALL_PROXY"]
-            == "http://127.0.0.1:9901"
-        )
+        env = json.loads(path.read_text())["env"]
+        for key in ("ALL_PROXY", "all_proxy"):
+            assert env[key] == "http://127.0.0.1:9901"
 
     def case_an_all_proxy_we_added_is_removed_not_blanked(
         self, tmp_path, monkeypatch
@@ -10431,11 +10432,13 @@ class TestWireGlobalConfig:
         path = self._config(tmp_path, monkeypatch, {"env": {"FOO": "bar"}})
 
         wire_global_config(9955, Path("/tmp/ca.pem"))
-        assert json.loads(path.read_text())["env"]["ALL_PROXY"].endswith(":9955")
+        env = json.loads(path.read_text())["env"]
+        assert env["ALL_PROXY"].endswith(":9955")
+        assert env["all_proxy"].endswith(":9955")
 
         wire_global_config(None, None)
         env = json.loads(path.read_text())["env"]
-        assert "ALL_PROXY" not in env
+        assert "ALL_PROXY" not in env and "all_proxy" not in env
         assert env == {"FOO": "bar"}
 
     def case_unwire_restores_a_displaced_value(self, tmp_path, monkeypatch):
