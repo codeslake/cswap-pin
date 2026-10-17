@@ -1097,13 +1097,20 @@ state is in memory and bounded, and a daemon handover starts every session cold.
 **Keep-alive.** While armed, the pin keeps each session's last main-thread
 `/v1/messages` body that asks for the 1 h cache tier (in memory only, never
 logged, bounded in count and bytes, dropped with the session's entry or when
-the switch goes off; a subagent's request never replaces it, and a main-thread
-request for any other tier drops it, as does one that moves the session to a
-slot the pin does not keep). A thread of its own looks once a minute
-for a session whose body is about 55 minutes old (the body's own clock: a
-subagent's request does not reset it, a 2xx ping does) and whose slot the pin
-would keep, and it ends when the switch goes off or the process hands its
-listener to a successor. It sends that body once more with `max_tokens` 0 and
+the switch goes off; a subagent's request never replaces it). A main-thread
+request that writes another cache drops it: a final breakpoint on the 5 minute
+tier, a body too big to keep, or a `message-threads-` turn with no breakpoint
+(it advances the history the server holds). A main-thread request with no
+`cache_control` at all (a title or hook-evaluation call) writes no cache and
+is ignored: the API's 1 h entry is still there. The body also records the
+bearer its request went out on; when that is on another account than the
+session is bound to (a stale snapshot sends the client's own token and leaves
+the binding), the cache is not on the bound slot and the sender drops the body
+(`sent on another account`) rather than write it there. A thread of its own
+looks once a minute for a session whose body is about 55 minutes old (the
+body's own clock: a subagent's request does not reset it, a 2xx ping does) and
+whose slot the pin would keep, and it ends when the switch goes off or the
+process hands its listener to a successor. It sends that body once more with `max_tokens` 0 and
 `stream` false, on the kept slot's stored token, so the API's cache is renewed
 before it expires: at most two per real request, and none for a prefix under
 20,000 tokens (a held body's is unknown, so its first ping goes out and the
@@ -1120,10 +1127,13 @@ line to `daemon.log`: the slot, the form, the status, `cache_read` and
 
 `/health` carries a `cache_aware` key (additive): `armed`; per slot, `warm`
 sessions, how many of them `kept`, `prefix_est` (tokens, summed; a held body
-counts 0 until a ping measures it) and `ttl_left_min_s`; `pings`
-(`sent`, `hit`, `refused` by reason, each reason counted once per request; a
-session not idle long enough yet is the normal state and is not counted); and
-`since`, when this process started counting. Never a session id or a byte of a
+counts 0 until a ping measures it) and `ttl_left_min_s` (the kept body's own
+clock where there is one, else the binding's); `pings` (`sent`, `hit`,
+`refused` by reason, each reason counted once per request; a session not idle
+long enough yet is the normal state and is not counted); `captures` (`kept`,
+and `dropped` by reason, for main-thread requests; a subagent's, and one with
+no `cache_control` at all, are neither); and `since`, when this process started
+counting. Never a session id or a byte of a
 conversation.
 
 `CSWAP_PIN_LISTEN_FD` and `CSWAP_PIN_LISTEN_FROM` also appear in a daemon's
