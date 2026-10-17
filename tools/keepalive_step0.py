@@ -48,6 +48,7 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True  # nothing outside --scratch, the .pyc files too
 REAL_HOME = os.path.expanduser("~")  # home-read
 CLIENT = os.path.join(REAL_HOME, ".local/share/claude/versions/2.1.302")  # home-read
 TOKEN_MIN_MS = 20 * 60 * 1000
