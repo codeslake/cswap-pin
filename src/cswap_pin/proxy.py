@@ -3546,7 +3546,9 @@ def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
     `_AFFINITY_BACKOFF_S` when there is none. A 404 does neither: it is a
     per-request `thread_not_found` (a server-held send whose thread state is
     missing) that the client's full replay recovers from, not a verdict on
-    the account, so the session stays on it. One lifecycle line per (slot, code) per
+    the account, so the session stays on it. Every code forgets the session's
+    kept body, which names the kept slot's bearer while the resend goes out on
+    the client's and is not captured. One lifecycle line per (slot, code) per
     `_BUSY_REPORT_COOLDOWN_S`, folding the rest into "; N more": the slot, the
     code and the rest, never a bearer."""
     wait = _AFFINITY_BACKOFF_S
@@ -3554,9 +3556,9 @@ def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
         wait = reset - time.time()
     now = time.monotonic()
     with _affinity_lock:
+        _affinity_last.pop(session, None)
         if code != 404:
             _affinity.pop(session, None)
-            _affinity_last.pop(session, None)
             _bounded_put(_affinity_rest, ident, now + wait)
         more = _affinity_due(_affinity_logged, (ident[0], code), now)
     if more is not None:
@@ -3649,15 +3651,16 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
 def _final_cache_ttl_s(body: bytes) -> "float | None":
     """The TTL in seconds (3600 for `1h`, else 300) of the last `cache_control`
     in prompt order (tools, system, messages), or None: no breakpoint, or not
-    JSON. A body without the text `"1h"` is not parsed at all (its final
-    breakpoint can only be the 5 min one)."""
+    JSON. A body that parses and lacks the text `"1h"` is not walked (its
+    final breakpoint can only be the 5 min one); one that does not parse is
+    unreadable, whatever it spells."""
     if b'"cache_control"' not in body:
         return None
-    if b'"1h"' not in body:
-        return 300.0
     try:
         req = json.loads(body)
         system = req.get("system")
+        if b'"1h"' not in body:
+            return 300.0
         blocks = [*(req.get("tools") or ()),
                   *(system if isinstance(system, list) else ())]
         for m in req.get("messages") or ():

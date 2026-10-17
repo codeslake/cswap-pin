@@ -24779,8 +24779,9 @@ class TestSessionAffinityOnMessages:
             self._send(certdir, [("tok-B", "S")], body=body,
                        reject_bearer="tok-A", reject_status=status)
             assert ("S" not in pp._affinity) is goes, (status, pp._affinity)
-            assert ("S" not in pp._affinity_last) is goes, (
+            assert "S" not in pp._affinity_last, (
                 status, list(pp._affinity_last))
+            assert bool(pp._affinity_rest) is goes, (status, pp._affinity_rest)
         seen = self._wire(monkeypatch, certdir)
         self._send(certdir, [self._call("S")], body=body)
         assert "S" in pp._affinity_last
@@ -24788,6 +24789,25 @@ class TestSessionAffinityOnMessages:
         pp._AFFINITY_CACHE.clear()
         self._send(certdir, [self._call("S")], body=body)
         assert not pp._affinity_last, "switching off kept the conversation"
+
+    def case_a_body_that_is_not_json_is_unreadable_not_a_5_min_tier(
+            self, monkeypatch, certdir):
+        """Only a body that parses can say its final breakpoint is the 5 min
+        one; the label must not come from the bytes alone."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        junk = '{"cache_control": not json'
+        five = json.dumps({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "x",
+             "cache_control": {"type": "ephemeral"}}]}]})
+        assert b'"1h"' not in junk.encode() + five.encode()
+        assert pp._final_cache_ttl_s(junk.encode()) is None
+        assert pp._final_cache_ttl_s(five.encode()) == 300.0
+        for body in (junk, five):
+            self._send(certdir, [self._call("S")], body=body)
+        assert self._health(certdir)["captures"] == {
+            "kept": 0, "dropped": {"unreadable": 1, "5 min tier": 1}}, (
+            pp._affinity_captures)
 
     def _health(self, certdir):
         from cswap_pin.proxy import PinProxy
