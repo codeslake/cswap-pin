@@ -20825,12 +20825,14 @@ class TestTheDaemonWatchesItsOwnCode:
 
         # A PORT THE DAEMON CANNOT TAKE AND NOBODY ANSWERS ON. Bound but never
         # listening: the daemon's own bind fails and it serves elsewhere, and a
-        # connect is refused, which is what "dead" means to the repair. A bare
+        # connect is read as refused (`_held_port_refuses`: Darwin times it
+        # out), which is what "dead" means to the repair. A bare
         # free port is not that -- the daemon simply reclaims it and serves
         # the very port the config names, so the arm under test never runs.
         hold = socket.socket()
         hold.bind(("127.0.0.1", 0))
         dead = hold.getsockname()[1]
+        self._held_port_refuses(monkeypatch, pin_proxy, dead)
         # A PIN RECORD: a daemon wires only while one exists.
         pin_proxy.save_pin(tmp_path, "a@b.c", "org")
         try:
@@ -20877,6 +20879,7 @@ class TestTheDaemonWatchesItsOwnCode:
         hold = socket.socket()
         hold.bind(("127.0.0.1", 0))
         dead = hold.getsockname()[1]
+        self._held_port_refuses(monkeypatch, pin_proxy, dead)
         seed = {"CSWAP_PIN_PORT": str(dead),
                 "HTTPS_PROXY": "http://launcher.example:3128"}
         # A PIN RECORD: a daemon wires only while one exists.
@@ -20907,6 +20910,19 @@ class TestTheDaemonWatchesItsOwnCode:
                 self._stop_live()
         finally:
             hold.close()
+
+    @staticmethod
+    def _held_port_refuses(monkeypatch, pin_proxy, dead):
+        """Read the HELD port as refused, as a crashed daemon's freed one is.
+
+        Measured on Darwin 24.6.0: a connect to a bound, never-listening
+        loopback port times out (0.504 s) where Linux refuses it, and
+        `_port_refuses` reads only a refusal as nobody (T2554). The hold stays:
+        it is what stops the daemon reclaiming the port."""
+        real = pin_proxy._port_refuses
+        monkeypatch.setattr(
+            pin_proxy, "_port_refuses",
+            lambda port, timeout=0.5: port == dead or real(port, timeout))
 
     def _live_daemon(self, tmp_path, monkeypatch, paths, stale_port=None,
                      cfg_text="{}"):
