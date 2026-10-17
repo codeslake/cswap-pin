@@ -15333,7 +15333,7 @@ def _successor_is_serving(own_port: int) -> bool:
     different port four times in one day because this used to read the
     holder state alone and never asked whether the wired port was even ours.
 
-    A DIFFERENT PORT STILL HAS TO ANSWER TO COUNT. It is not automatically
+    A DIFFERENT PORT COUNTS ONLY IF IT DOES NOT REFUSE. It is not automatically
     a live pin just for being somebody else's -- a previous lineage's daemon
     that has since died leaves the config naming its corpse exactly as
     readily as ours does, and the owner's rule counts a DEAD port as safe to

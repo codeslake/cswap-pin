@@ -15298,6 +15298,8 @@ print("OK", port)
         monkeypatch.setattr(pin_proxy, "held_by_a_holder", lambda: True)
         monkeypatch.setattr(pin_proxy, "_port_answers",
                             lambda p, timeout=0.5: False)
+        monkeypatch.setattr(pin_proxy, "_port_refuses",
+                            lambda p, timeout=0.5: True)
 
         assert pin_proxy._successor_is_serving(36301) is False, (
             "a wiring naming a DIFFERENT, DEAD port (41111) was read as "
