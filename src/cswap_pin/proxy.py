@@ -3699,18 +3699,19 @@ def _affinity_capture(certdir, headers, body: bytes, path: str) -> bool:
             session = v
     if not session:
         return False
-    ttl_s = _final_cache_ttl_s(body)
+    # a body over the cap is not parsed on the request thread: it is not kept
+    ttl_s = (_final_cache_ttl_s(body) if len(body) <= _AFFINITY_BODY_MAX
+             else None)
     sent = [(k, v) for k, v in headers if k.lower() != "authorization"]
     with _affinity_lock:
         _affinity_last.pop(session, None)
         if ttl_s != 3600.0 or session not in _affinity:
             return False
-        if len(body) <= _AFFINITY_BODY_MAX:
-            _affinity_last[session] = [
-                sent, body, ttl_s,
-                # a held body is the new turn only: its bytes say nothing
-                0 if _keepalive_form(sent) == "held" else len(body) // 4,
-                time.monotonic(), 0, None, path]
+        _affinity_last[session] = [
+            sent, body, ttl_s,
+            # a held body is the new turn only: its bytes say nothing
+            0 if _keepalive_form(sent) == "held" else len(body) // 4,
+            time.monotonic(), 0, None, path]
         for gone in [x for x in _affinity_last if x not in _affinity]:
             del _affinity_last[gone]
         total = sum(len(v[1]) for v in _affinity_last.values())
