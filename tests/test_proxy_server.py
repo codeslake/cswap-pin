@@ -23726,8 +23726,8 @@ class TestBulkTunnelsHaveTheirOwnPump:
 class TestSessionAffinityOnMessages:
     """A warm session keeps the account it was on after cswap switches the
     live one: the pin sends its `/v1/messages` with the kept slot's STORED
-    token. Opt-in, off by default (a marker file in the pin's certdir arms
-    these cases; `settings.json` is covered by the reader cases). Anything the
+    token. Opt-in, off by default (`_wire` arms these cases the way cswap
+    does: `dynamic` plus `cache_aware`; the arming cases cover the rule). Anything the
     pin cannot vouch for (cold, new, no headroom, expired, unknown slot)
     forwards the client's bearer exactly as it always did.
 
@@ -23833,14 +23833,26 @@ class TestSessionAffinityOnMessages:
                       pp._affinity_rest, pp._affinity_logged,
                       pp._affinity_dropped, pp._affinity_why,
                       pp._affinity_declined, pp._AFFINITY_CACHE,
+                      pp._affinity_last,
                       pp._usage_header_seen, pp._usage_header_spawn_seen):
             state.clear()
         pp._affinity_snap.update(
             tried=float("-inf"), at=float("-inf"), busy=False, stuck=0)
-        marker = certdir / "session-affinity"
-        marker.unlink(missing_ok=True)
-        if armed:
-            marker.write_text("")
+        # ARMED THE WAY CSWAP ARMS IT: dynamic + cache_aware. The CI host's
+        # claude-swap has no `cache_aware` and turns `dynamic` into `best`, so
+        # the loaded settings are faked; `seen.loaded` is what a case flips.
+        # The real modules are patched, not replaced: other cases patch
+        # attributes of `claude_swap.autoswitch` the pin reads.
+        from claude_swap import autoswitch, settings as cs_settings
+        seen.loaded = types.SimpleNamespace(
+            strategy="dynamic", cache_aware=armed, threshold=90.0,
+            cache_ttl_seconds=3600.0)
+        monkeypatch.setattr(cs_settings, "load_settings",
+                            lambda root: seen.loaded)
+        # the bar is the threshold, as on the CI host, whatever `dynamic`
+        # means to the installed claude-swap
+        monkeypatch.setattr(autoswitch, "proactive_switch_bar_pct",
+                            lambda _strategy, t: t, raising=False)
         return seen
 
     @staticmethod
@@ -23910,7 +23922,7 @@ class TestSessionAffinityOnMessages:
         seen = self._wire(monkeypatch, certdir)
         self._send(certdir, [("tok-A", "S0")])
         assert pp._affinity_kept, "armed, the first rebuild kept the slots"
-        (certdir / "session-affinity").unlink()
+        seen.loaded.cache_aware = False
         pp._AFFINITY_CACHE.clear()
         self._send(certdir, [("tok-A", "S")], reply=self._util(0.95))
         assert not (pp._affinity_kept or pp._affinity_dropped
@@ -24077,14 +24089,14 @@ class TestSessionAffinityOnMessages:
         one stands in for it."""
         from claude_swap import autoswitch
         from cswap_pin import proxy as pp
-        monkeypatch.setattr(
-            autoswitch, "proactive_switch_bar_pct",
-            lambda strategy, t: 97.0 if strategy == "dynamic" else t,
-            raising=False)
         for strategy, pct, want in (
                 ("dynamic", 93.0, "tok-A"), ("dynamic", 97.0, "tok-B"),
                 ("best", 93.0, "tok-B")):
             self._wire(monkeypatch, certdir, pct=pct)
+            monkeypatch.setattr(
+                autoswitch, "proactive_switch_bar_pct",
+                lambda strategy, t: 97.0 if strategy == "dynamic" else t,
+                raising=False)
             monkeypatch.setattr(pp, "session_affinity_config",
                                 lambda _c: (3600.0, 90.0, strategy))
             self._seed("S", "tok-A")
@@ -24544,35 +24556,271 @@ class TestSessionAffinityOnMessages:
         assert "swapped=False kept=1 ::" in rows[0], rows
         assert "kept=" not in rows[1], rows
 
-    def case_the_switch_is_settings_json_or_a_marker_file(
-            self, monkeypatch, tmp_path):
+    def case_arming_is_dynamic_plus_cache_aware(self, monkeypatch, tmp_path):
+        """The pin arms on cswap's own answer (`cache_aware_active`) and, on a
+        host that has none, on the same rule inline. A host with no
+        `cache_aware` field is unarmed."""
+        from claude_swap import autoswitch, settings as cs_settings
         from cswap_pin import proxy as pp
         certdir = tmp_path / "pin-proxy"
         certdir.mkdir()
+        loaded = {}
+        monkeypatch.setattr(cs_settings, "load_settings",
+                            lambda root: loaded["v"])
 
-        def read():
+        def read(**fields):
+            loaded["v"] = types.SimpleNamespace(
+                threshold=90.0, cache_ttl_seconds=3600.0, **fields)
             pp._AFFINITY_CACHE.clear()
             return pp.session_affinity_config(certdir)
 
-        def settings(**kw):
-            (tmp_path / "settings.json").write_text(json.dumps(kw))
-
-        assert read() is None  # nothing armed
-        settings(remoteControl={"sessionAffinity": True})
-        assert read()[:2] == (3600.0, 90.0)
-        settings(remoteControl={"sessionAffinity": "yes"})
-        assert read() is None
-        settings(remoteControl={"sessionAffinity": True},
-                 autoswitch={"threshold": 80, "cacheTtlSeconds": 120,
-                             "strategy": "consume-first"})
-        from claude_swap.settings import AutoSwitchSettings
-        # a host older than cacheTtlSeconds has no such field: the default
-        ttl = 120.0 if "cache_ttl_seconds" in AutoSwitchSettings.__dataclass_fields__ else 3600.0
-        assert read() == (ttl, 80.0, "consume-first")
-        settings(remoteControl={"sessionAffinity": False})
-        (certdir / "session-affinity").write_text("")
-        assert read()[:2] == (3600.0, 90.0), "the host-local marker"
+        monkeypatch.delattr(autoswitch, "cache_aware_active", raising=False)
+        assert read(strategy="dynamic", cache_aware=True) == (
+            3600.0, 90.0, "dynamic")
+        assert read(strategy="dynamic", cache_aware=False) is None
+        assert read(strategy="best", cache_aware=True) is None
+        assert read(strategy="dynamic", cache_aware="yes") is None
+        assert read(strategy="dynamic") is None, "an older cswap has no field"
+        monkeypatch.setattr(autoswitch, "cache_aware_active",
+                            lambda s: s.strategy == "best", raising=False)
+        assert read(strategy="best") == (3600.0, 90.0, "best"), (
+            "cswap's own answer was not the one used")
+        assert read(strategy="dynamic", cache_aware=True) is None
         assert pp.session_affinity_config(None) is None
+
+    def case_the_marker_and_the_settings_key_no_longer_arm(
+            self, monkeypatch, tmp_path):
+        from claude_swap import settings as cs_settings
+        from cswap_pin import proxy as pp
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir()
+        (certdir / "session-affinity").write_text("")
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"remoteControl": {"sessionAffinity": True}}))
+        monkeypatch.setattr(cs_settings, "load_settings",
+                            lambda root: types.SimpleNamespace(
+                                strategy="dynamic", cache_aware=False,
+                                threshold=90.0, cache_ttl_seconds=3600.0))
+        pp._AFFINITY_CACHE.clear()
+        assert pp.session_affinity_config(certdir) is None
+        assert not hasattr(pp, "_AFFINITY_SWITCH_FILE")
+
+    def case_an_older_cswap_stays_unarmed_on_the_wire(
+            self, monkeypatch, certdir):
+        from claude_swap import autoswitch
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        monkeypatch.delattr(autoswitch, "cache_aware_active", raising=False)
+        seen.loaded = types.SimpleNamespace(strategy="dynamic", threshold=90.0)
+        self._seed("S", "tok-A")
+        _, auths = self._send(
+            certdir, [("tok-B", "S"), ("tok-A", "S")], body=self._body())
+        assert auths == ["Bearer tok-B", "Bearer tok-A"], auths
+        assert not (seen.reads or seen.fetches), seen
+        assert not pp._affinity_last
+
+    def case_keepalive_due_falls_back_to_the_cswap_rule(self, monkeypatch):
+        """The inline copy answers what cswap's `keepalive_due` (991a1055)
+        answers, reason for reason and in its order, and cswap's own wins
+        when it exists."""
+        from claude_swap import autoswitch
+        from cswap_pin import proxy as pp
+        ok = dict(idle_s=3300.0, pings_since_request=0, ttl_s=3600.0,
+                  prefix_est=20000, slot_kept=True)
+        worst = dict(idle_s=0.0, pings_since_request=9, prefix_est=0)
+        tier = "a 5 min cache tier is not worth a ping"
+        rows = [
+            (ok, (True, "")),
+            (dict(ok, idle_s=99999.0, ttl_s=3599.9), (False, tier)),
+            (dict(ok, ttl_s=300.0, slot_kept=False, **worst), (False, tier)),
+            (dict(ok, slot_kept=False, **worst),
+             (False, "its slot is not kept")),
+            (dict(ok, **worst), (False, "not idle long enough")),
+            (dict(ok, idle_s=3299.9), (False, "not idle long enough")),
+            (dict(ok, pings_since_request=2, prefix_est=0),
+             (False, "pings since its last request are spent")),
+            (dict(ok, pings_since_request=1), (True, "")),
+            (dict(ok, prefix_est=19999),
+             (False, "its prefix is too small to pay")),
+        ]
+        cswaps = getattr(autoswitch, "keepalive_due", None)
+        monkeypatch.delattr(autoswitch, "keepalive_due", raising=False)
+        for kw, want in rows:
+            assert pp._keepalive_due(**kw) == want, (kw, want)
+            if cswaps:  # a host that ships the rule must agree with the copy
+                assert cswaps(**kw) == want, (kw, want)
+        monkeypatch.setattr(autoswitch, "keepalive_due",
+                            lambda **kw: (False, "cswap said"), raising=False)
+        assert pp._keepalive_due(**ok) == (False, "cswap said")
+
+    @staticmethod
+    def _body(ttl="1h", pad=0, tail="x"):
+        """A /v1/messages body whose final cache_control carries ``ttl``
+        (None: the 5 min default, no `ttl` key)."""
+        cc = {"type": "ephemeral", **({"ttl": ttl} if ttl else {})}
+        return json.dumps({
+            "model": "claude-fable-5-1", "max_tokens": 4,
+            "system": [{"type": "text", "text": "s",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x" * pad + tail,
+                 "cache_control": cc}]}]})
+
+    @staticmethod
+    def _call(session, **headers):
+        return dict(bearer="tok-A", extra_headers={
+            "x-claude-code-session-id": session, **headers})
+
+    def case_the_last_main_thread_body_is_kept_while_armed(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        body = self._body(pad=4000)
+        before = time.monotonic()
+        self._send(certdir, [self._call("S")], body=body)
+        headers, kept, ttl_s, est, at, pings = pp._affinity_last["S"]
+        assert kept == body.encode(), "the body is kept byte for byte"
+        assert ttl_s == 3600.0 and est == len(body.encode()) // 4, (ttl_s, est)
+        assert before <= at <= time.monotonic() and pings == 0, (at, pings)
+        names = {k.lower() for k, _ in headers}
+        assert "authorization" not in names, "a kept body carries no bearer"
+        assert "x-claude-code-session-id" in names, names
+        pp._affinity_last["S"][5] = 2  # pings sent since that request
+        newer = self._body(pad=10, tail="newer")
+        self._send(certdir, [self._call("S")], body=newer)
+        assert pp._affinity_last["S"][1] == newer.encode(), (
+            "the newest main-thread body replaces the last")
+        assert pp._affinity_last["S"][5] == 0, (
+            "a real request did not reset the pings sent since the last one")
+
+    def case_only_a_main_thread_1h_request_replaces_the_body(
+            self, monkeypatch, certdir):
+        """A subagent (CC names it in `x-claude-code-agent-id`, and
+        `x-claude-code-parent-agent-id` for a nested one) shares the main
+        thread's session id and often asks for the 1 h tier too, so the tier
+        alone does not say which conversation a body belongs to."""
+        from cswap_pin import proxy as pp
+        first = self._body(tail="first")
+        mixed = json.loads(self._body())
+        mixed["messages"][0]["content"][0]["cache_control"].pop("ttl")
+
+        def after(second, headers=None, armed=True):
+            self._wire(monkeypatch, certdir, armed=armed)
+            self._send(certdir, [self._call("S")], body=first)
+            if second is not None:
+                self._send(certdir, [self._call("S", **(headers or {}))],
+                           body=second)
+            entry = pp._affinity_last.get("S")
+            return entry and entry[1]
+
+        newer = self._body(tail="newer")
+        assert after(None) == first.encode()
+        assert after(newer) == newer.encode()
+        assert after(newer, armed=False) is None, "unarmed keeps nothing"
+        for name in ("x-claude-code-agent-id", "x-claude-code-parent-agent-id"):
+            assert after(newer, {name: "a1"}) == first.encode(), (
+                f"a subagent request ({name}) replaced the main thread's body")
+        for name, other in (
+                ("a 5 min request", self._body(ttl=None, tail="5m")),
+                ("a final breakpoint with no ttl", json.dumps(mixed)),
+                ("message text that spells a ttl",
+                 self._body(ttl=None, tail='"ttl":"1h"')),
+                ("no breakpoint at all",
+                 json.dumps({"model": "m", "messages": []})),
+                ("a body that is not JSON", "{1h")):
+            assert after(other) == first.encode(), (
+                f"{name} replaced a 1 h main-thread body")
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_MAX", len(first.encode()) + 5)
+        assert after(self._body(pad=200)) is None, (
+            "a 1 h body over the cap is not kept and drops the stale one")
+
+    def case_the_body_table_is_bounded_in_count_and_bytes(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        size = len(self._body(pad=900).encode())
+        self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_AFFINITY_BODY_TOTAL", 2 * size + size // 2)
+        for n in range(3):
+            self._send(certdir, [self._call(f"S{n}")],
+                       body=self._body(pad=900, tail=str(n)))
+        assert list(pp._affinity_last) == ["S1", "S2"], list(pp._affinity_last)
+        self._wire(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_AFFINITY_MAX", 2)
+        for n in range(3):
+            self._send(certdir, [self._call(f"S{n}")],
+                       body=self._body(tail=str(n)))
+        assert list(pp._affinity) == ["S1", "S2"], list(pp._affinity)
+        assert list(pp._affinity_last) == ["S1", "S2"], (
+            "a body outlived its session's binding", list(pp._affinity_last))
+
+    def case_the_body_goes_with_the_session(self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        body = self._body()
+        for status, goes in ((429, True), (404, False)):
+            self._wire(monkeypatch, certdir)
+            self._seed("S", "tok-A")
+            self._send(certdir, [("tok-B", "S")], body=body,
+                       reject_bearer="tok-A", reject_status=status)
+            assert ("S" not in pp._affinity) is goes, (status, pp._affinity)
+            assert ("S" not in pp._affinity_last) is goes, (
+                status, list(pp._affinity_last))
+        seen = self._wire(monkeypatch, certdir)
+        self._send(certdir, [self._call("S")], body=body)
+        assert "S" in pp._affinity_last
+        seen.loaded.cache_aware = False
+        pp._AFFINITY_CACHE.clear()
+        self._send(certdir, [self._call("S")], body=body)
+        assert not pp._affinity_last, "switching off kept the conversation"
+
+    def _health(self, certdir):
+        from cswap_pin.proxy import PinProxy
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+            conn.request("GET", "/health")
+            body = json.loads(conn.getresponse().read())
+            conn.close()
+        finally:
+            proxy.stop()
+        return body["cache_aware"]
+
+    def case_health_carries_the_cache_aware_key(self, monkeypatch, certdir):
+        import datetime as dt
+        from cswap_pin import proxy as pp
+        shape = {"sent": 0, "refused": {}, "hit": 0}
+        self._wire(monkeypatch, certdir, armed=False)
+        got = self._health(certdir)
+        assert got["armed"] is False and got["slots"] == {}, got
+        assert got["pings"] == shape, got
+        since = dt.datetime.strptime(got["since"], "%Y-%m-%dT%H:%M:%SZ")
+        assert since <= dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+        self._wire(monkeypatch, certdir)
+        now = time.monotonic()
+        one, two = ("1", self.EMAIL.format("1")), ("2", self.EMAIL.format("2"))
+        pp._affinity_idents.update({"tok-A": one, "tok-B": two})
+        for ident, tok in ((one, "tok-A"), (two, "tok-B")):
+            pp._affinity_kept[ident] = (tok, self.FAR, 90.0, None)
+        pp._affinity_rest[two] = now + 100
+        for session, tok, age, est in (
+                ("S1", "tok-A", 60, 1000), ("S2", "tok-A", 120, 500),
+                ("S3", "tok-A", 7200, 9999), ("S4", "tok-B", 30, 200),
+                ("S5", "tok-Z", 10, 77), ("S6", "tok-A", 5, None)):
+            pp._affinity[session] = (tok, now - age)
+            if est is not None:
+                pp._affinity_last[session] = [[], b"", 3600.0, est, now - age, 0]
+        got = self._health(certdir)
+        assert got["armed"] is True and got["pings"] == shape, got
+        assert set(got["slots"]) == {"1", "2"}, got
+        one_, two_ = got["slots"]["1"], got["slots"]["2"]
+        assert (one_["warm"], one_["kept"], one_["prefix_est"]) == (3, 3, 1500)
+        assert 3470 <= one_["ttl_left_min_s"] <= 3480, one_
+        assert (two_["warm"], two_["kept"], two_["prefix_est"]) == (1, 0, 200)
+        assert 3560 <= two_["ttl_left_min_s"] <= 3570, two_
+        pp._affinity_kept[one] = ("tok-A", 1, 90.0, None)
+        assert self._health(certdir)["slots"]["1"]["kept"] == 0, (
+            "an expired stored token is not kept")
 
     def case_the_session_table_is_bounded(self, monkeypatch, certdir):
         from cswap_pin import proxy as pp

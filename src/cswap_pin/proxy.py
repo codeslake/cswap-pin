@@ -3219,10 +3219,9 @@ def slow_report_ms(certdir) -> "float | None":
 # /v1/messages inside `autoswitch.cacheTtlSeconds`) keeps the account it was on
 # after cswap switches the live one, so the switch does not throw away its
 # prompt cache: the request goes out with that slot's STORED token. Armed by
-# `remoteControl.sessionAffinity: true` in settings.json (every host, that file
-# is shared) or by a `session-affinity` file in the certdir (this host alone,
-# like `trace-to`); both re-read on a short cache, like `slow_report_ms`.
-_AFFINITY_SWITCH_FILE = "session-affinity"
+# cswap's cache-aware strategy (`dynamic` with `autoswitch.cacheAware`), read
+# from settings on a short cache, like `slow_report_ms`. A cswap without the
+# field never arms it.
 _AFFINITY_RECHECK_S = 5.0
 _AFFINITY_CACHE: dict = {}
 _AFFINITY_MAX = 512  # entries per table below
@@ -3271,6 +3270,18 @@ _affinity_snap = {"tried": -math.inf, "at": -math.inf, "busy": False,
 # (slot, code) -> (monotonic time of its last lifecycle line, take-backs
 # folded into the next one)
 _affinity_logged: dict[tuple, tuple] = {}
+# THE USER'S CONVERSATION, IN MEMORY ONLY: never logged, never written. session
+# -> [headers minus Authorization, the body of its last main-thread 1 h-tier
+# /v1/messages, that tier's TTL in seconds, prefix estimate in tokens, its
+# monotonic time, keep-alive pings sent since it]. Held only while armed, and
+# only as long as the session's `_affinity` entry (dropped with it).
+_affinity_last: dict[str, list] = {}
+_AFFINITY_BODY_MAX = 8 << 20  # one body; a longer one is not kept
+_AFFINITY_BODY_TOTAL = 128 << 20  # all of them; the oldest go first
+# keep-alive pings since `_AFFINITY_SINCE` (this process's start), all zero until
+# a sender exists. `refused` counts by the reason `_keepalive_due` gave.
+_affinity_pings = {"sent": 0, "refused": {}, "hit": 0}
+_AFFINITY_SINCE = time.time()
 
 
 def session_affinity_config(certdir) -> "tuple[float, float, str] | None":
@@ -3286,19 +3297,42 @@ def session_affinity_config(certdir) -> "tuple[float, float, str] | None":
         return cfg
     cfg = None
     try:
-        _settings = require("settings")
-        root = Path(certdir).parent
-        section = _settings._read_raw(_settings.settings_path(root)).get(
-            "remoteControl")
-        if (isinstance(section, dict) and section.get("sessionAffinity") is True
-                ) or (Path(certdir) / _AFFINITY_SWITCH_FILE).exists():
-            loaded = _settings.load_settings(root)
+        loaded = require("settings").load_settings(Path(certdir).parent)
+        # an older host has no such function: the same rule, inline
+        if getattr(require("autoswitch"), "cache_aware_active",
+                   lambda s: s.strategy == "dynamic"
+                   and getattr(s, "cache_aware", False) is True)(loaded) is True:
             cfg = (float(getattr(loaded, "cache_ttl_seconds", 3600.0)),
                    float(loaded.threshold), str(loaded.strategy))
     except Exception:  # noqa: BLE001 — a switch must not cost a request
         cfg = None
     _AFFINITY_CACHE[key] = (now, cfg)
     return cfg
+
+
+def _keepalive_due_inline(*, idle_s, pings_since_request, ttl_s, prefix_est,
+                          slot_kept) -> "tuple[bool, str]":
+    """cswap's `autoswitch.keepalive_due` (991a1055), for a host without it:
+    ``(True, "")`` or ``(False, why)``, the same rules in the same order. Keep
+    it identical; `slot_kept` is `_affinity_slot_kept`, with a fresh snapshot."""
+    if ttl_s < 3600.0:
+        return False, "a 5 min cache tier is not worth a ping"
+    if not slot_kept:
+        return False, "its slot is not kept"
+    if idle_s < 3300.0:
+        return False, "not idle long enough"
+    if pings_since_request >= 2:
+        return False, "pings since its last request are spent"
+    if prefix_est < 20000:
+        return False, "its prefix is too small to pay"
+    return True, ""
+
+
+def _keepalive_due(**kw) -> "tuple[bool, str]":
+    """Whether an idle session's cache is worth a keep-alive ping now. cswap
+    owns the rule; the inline copy answers for a host that has none."""
+    return getattr(require("autoswitch"), "keepalive_due",
+                   _keepalive_due_inline)(**kw)
 
 
 def _bounded_put(table: dict, key, value) -> None:
@@ -3505,6 +3539,7 @@ def _affinity_take_back(session: str, ident: tuple, code: int, reset) -> None:
     with _affinity_lock:
         if code != 404:
             _affinity.pop(session, None)
+            _affinity_last.pop(session, None)
             _bounded_put(_affinity_rest, ident, now + wait)
         more = _affinity_due(_affinity_logged, (ident[0], code), now)
     if more is not None:
@@ -3537,10 +3572,11 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     """
     cfg = session_affinity_config(certdir)
     if cfg is None:
-        if _affinity_kept:  # switched off: no kept slot may outlive it
+        if _affinity_kept or _affinity_last:  # switched off: nothing outlives it
             with _affinity_lock:
                 _affinity_kept.clear()
                 _affinity_why.clear()
+                _affinity_last.clear()
         return None
     ttl, threshold, strategy = cfg
     client = session = ""
@@ -3591,6 +3627,104 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     if line:
         _log_lifecycle(line)
     return (token, held, session) if token else None
+
+
+def _final_cache_ttl_s(body: bytes) -> "float | None":
+    """The TTL in seconds (3600 for `1h`, else 300) of the last `cache_control`
+    in prompt order (tools, system, messages), or None: no breakpoint, or not
+    JSON. A body without the text `"1h"` is not parsed at all."""
+    if b'"1h"' not in body:
+        return None
+    try:
+        req = json.loads(body)
+        system = req.get("system")
+        blocks = [*(req.get("tools") or ()),
+                  *(system if isinstance(system, list) else ())]
+        for m in req.get("messages") or ():
+            if isinstance(m.get("content"), list):
+                blocks += m["content"]
+        ttl = None
+        for b in blocks:
+            cc = b.get("cache_control") if isinstance(b, dict) else None
+            if isinstance(cc, dict):
+                ttl = 3600.0 if cc.get("ttl") == "1h" else 300.0
+        return ttl
+    except Exception:  # noqa: BLE001 — a body we cannot read is not kept
+        return None
+
+
+def _affinity_capture(certdir, headers, body: bytes) -> None:
+    """Keep ``body`` as its session's last main-thread body when armed and it
+    asks for the 1 h tier, replacing the one before; a 1 h body too big to
+    keep drops it instead. The main thread is told from a subagent by the
+    agent-id headers Claude Code puts on a subagent (it shares the session id
+    and often the tier, so the tier alone does not say). shortcut: a Workflow
+    subagent carries no such header, so it passes as the main thread; build 2's
+    sandbox measurement says whether that matters.
+
+    The tables are bounded: past `_AFFINITY_BODY_TOTAL` bytes the oldest go,
+    and a body whose session lost its `_affinity` entry goes with it."""
+    if session_affinity_config(certdir) is None or not body:
+        return
+    session = ""
+    for k, v in headers:
+        kl = k.lower()
+        if kl in ("x-claude-code-agent-id", "x-claude-code-parent-agent-id"):
+            return
+        if kl == "x-claude-code-session-id":
+            session = v
+    ttl_s = _final_cache_ttl_s(body)
+    if ttl_s != 3600.0 or not session:
+        return
+    sent = [(k, v) for k, v in headers if k.lower() != "authorization"]
+    with _affinity_lock:
+        if session not in _affinity:
+            return
+        _affinity_last.pop(session, None)
+        if len(body) <= _AFFINITY_BODY_MAX:
+            _affinity_last[session] = [
+                sent, body, ttl_s, len(body) // 4, time.monotonic(), 0]
+        for gone in [x for x in _affinity_last if x not in _affinity]:
+            del _affinity_last[gone]
+        total = sum(len(v[1]) for v in _affinity_last.values())
+        while total > _AFFINITY_BODY_TOTAL:
+            total -= len(_affinity_last.pop(next(iter(_affinity_last)))[1])
+
+
+def _affinity_slot_kept(ident: tuple, now: float) -> bool:
+    """Under `_affinity_lock`: whether the pin would keep a warm session on
+    ``ident`` now: in the snapshot's kept slots, not resting, its stored token
+    unexpired. Whether the snapshot is fresh enough to rule is the caller's."""
+    stored = _affinity_kept.get(ident)
+    return bool(stored and _affinity_rest.get(ident, 0.0) <= now
+                and not oauth.is_oauth_token_expired(stored[1]))
+
+
+def _cache_aware_report(certdir) -> dict:
+    """`/health`'s `cache_aware` key. Per slot, over the sessions bound to it
+    whose last request is inside the TTL: `warm`, how many of those sit on a
+    slot the pin would keep (`kept`, snapshot freshness aside), `prefix_est`
+    the SUM of their kept bodies' estimates in tokens (what rides on the slot),
+    and `ttl_left_min_s` the least TTL left among them. Never a session id or
+    a byte of a conversation. Empty `slots` when not armed."""
+    cfg = session_affinity_config(certdir)
+    now = time.monotonic()
+    slots: dict = {}
+    with _affinity_lock:
+        for session, (bearer, at) in (_affinity.items() if cfg else ()):
+            ident, left = _affinity_idents.get(bearer), cfg[0] - (now - at)
+            if ident is None or left <= 0:
+                continue
+            row = slots.setdefault(ident[0], {
+                "warm": 0, "kept": 0, "prefix_est": 0,
+                "ttl_left_min_s": int(left)})
+            row["warm"] += 1
+            row["kept"] += _affinity_slot_kept(ident, now)
+            row["prefix_est"] += (_affinity_last.get(session) or (0,) * 4)[3]
+            row["ttl_left_min_s"] = min(row["ttl_left_min_s"], int(left))
+        pings = {**_affinity_pings, "refused": dict(_affinity_pings["refused"])}
+    return {"armed": cfg is not None, "slots": slots, "pings": pings,
+            "since": _iso_utc(_AFFINITY_SINCE)}
 
 
 # THE TWO LINES `_report_deaf_bridges` writes, as symbols rather than prose.
@@ -20862,7 +20996,11 @@ class PinProxy:
              # this lineage is refused the Keychain, so a caller in the login
              # session can move the socket into its own.
              **({"keychain_denied": True}
-                if getattr(self, "_keychain_denied", False) else {})}
+                if getattr(self, "_keychain_denied", False) else {}),
+             # ADDITIVE: the cache-aware session affinity, armed or not (see
+             # `_cache_aware_report`); per slot, never per session.
+             "cache_aware": _cache_aware_report(
+                 getattr(self, "_certdir", None))}
         )
         try:
             conn.sendall(
@@ -21618,6 +21756,7 @@ class PinProxy:
         inject = None
         if path.split("?", 1)[0].rstrip("/") == "/v1/messages":
             inject = _affinity_pick(getattr(self, "_certdir", None), headers)
+            _affinity_capture(getattr(self, "_certdir", None), headers, body)
         if inject:
             headers = [
                 (k, f"Bearer {inject[0]}") if k.lower() == "authorization"

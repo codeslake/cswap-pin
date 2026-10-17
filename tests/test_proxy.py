@@ -3,8 +3,9 @@
 The proxy MITMs api.anthropic.com and swaps the Authorization bearer to a
 pinned account's token, but ONLY on the Remote-Control and Artifact routes;
 inference (/v1/messages) and everything else must pass through untouched,
-except that an armed session-affinity switch (off by default) keeps a warm
-session's /v1/messages on the account it was on.
+except that armed session affinity (cswap's `dynamic` strategy with
+`cache_aware` on; off by default) keeps a warm session's /v1/messages on the
+account it was on.
 """
 
 from __future__ import annotations
