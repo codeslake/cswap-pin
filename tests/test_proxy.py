@@ -32696,7 +32696,7 @@ class TestTheServingDaemonOwnsTheWiring:
             f"rc={rc} wrote={wrote}")
 
     def _successor_wiring(self, tmp_path, monkeypatch, pinned, seed=None,
-                          settled=None):
+                          missing=None):
         """(CSWAP_PIN_PORT the successor left in `.claude.json`, its port).
 
         A REAL handed-down successor, because that is what both a
@@ -32704,8 +32704,9 @@ class TestTheServingDaemonOwnsTheWiring:
         predecessor's listening socket, then `daemon_main` in a new process.
 
         `seed(cfg, port)` runs once the port is known, before the spawn.
-        `settled(cfg)` replaces the log-marker wait, for a branch that logs
-        nothing (the successor finding the config already naming its port).
+        `missing(cfg)` replaces the log-marker wait, for a branch that logs
+        nothing (the successor finding the config already naming its port):
+        what is still missing, "" once settled.
         """
         import subprocess as _sp
 
@@ -32757,14 +32758,16 @@ class TestTheServingDaemonOwnsTheWiring:
             deadline = time.time() + 15
             while time.time() < deadline:
                 text = log.read_text() if log.exists() else ""
-                if (settled(cfg) if settled else
+                if (not missing(cfg) if missing else
                         "rewired .claude.json" in text
                         or "no pin record" in text):
                     break
                 time.sleep(0.1)
             else:
                 raise AssertionError(
-                    f"the successor never answered the wiring; log:\n{tail()}")
+                    f"the successor never answered the wiring"
+                    f"{': ' + missing(cfg) if missing else ''}; "
+                    f"log:\n{tail()}")
             env = json.loads(cfg.read_text()).get("env") or {}
             return env.get("CSWAP_PIN_PORT"), port
         finally:
@@ -32810,9 +32813,22 @@ class TestTheServingDaemonOwnsTheWiring:
         `rewire_if_version_changed` and a pin-only deploy never reaches it.
         The config here is exactly an older release's: this port, the key
         the current one adds missing, the receipt naming that older release."""
+        import subprocess
+        import sys
+
         import cswap_pin.proxy as p
 
         def seed(cfg, port):
+            # THE RECEIPT'S ROOT IS THE CHILD'S, not conftest's: it patches
+            # `get_backup_root` here only and reaches a child through
+            # XDG_DATA_HOME, which macOS never reads (`~/.claude-swap-backup`).
+            # Ask the resolver the child will use, under a HOME in tmp_path.
+            monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
+            root = subprocess.check_output(
+                [sys.executable, "-c", "from claude_swap.paths import "
+                 "get_backup_root; print(get_backup_root())"], text=True)
+            monkeypatch.setattr("claude_swap.paths.get_backup_root",
+                                lambda: Path(root.strip()))
             monkeypatch.setattr("claude_swap.paths.get_global_config_path",
                                 lambda: cfg)
             assert p.wire_global_config(port, tmp_path / "pin-proxy" / "ca.pem")
@@ -32825,13 +32841,16 @@ class TestTheServingDaemonOwnsTheWiring:
             led["writtenBy"] = "0.0.1"
             p._ledger_path(cfg).write_text(json.dumps(led))
 
-        def settled(cfg):
+        def missing(cfg):
             raw = json.loads(cfg.read_text())
-            return ("all_proxy" in raw["env"] and p._read_ledger(cfg, raw)
-                    .get("writtenBy") == p._own_version())
+            by = p._read_ledger(cfg, raw).get("writtenBy")
+            return (("" if "all_proxy" in (raw.get("env") or {})
+                     else "all_proxy absent from env; ")
+                    + ("" if by == p._own_version()
+                       else f"writtenBy still {by!r}"))
 
         wired, port = self._successor_wiring(
-            tmp_path, monkeypatch, pinned=True, seed=seed, settled=settled)
+            tmp_path, monkeypatch, pinned=True, seed=seed, missing=missing)
         assert p._own_version() and wired == str(port), (wired, port)
 
     def test_a_config_naming_a_LIVE_PINS_port_is_left_alone(
