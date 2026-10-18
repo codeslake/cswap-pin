@@ -1071,8 +1071,9 @@ A request never waits on the store or the Keychain for any of this. A
 snapshot of the roster (which slot stores which token, which slots have
 headroom) is rebuilt on a thread of its own, at most every 30 s and one at a
 time, by whichever armed request finds it that old, or by a thread of the pin
-when no request does; the request only reads it. With no snapshot yet, one
-older than two minutes (a rebuild that failed or is stuck: `daemon.log` names
+while a session is inside the cache time (or carried in from a predecessor),
+since with none nothing would read it; the request only reads it. With no
+snapshot yet, one older than two minutes (a rebuild that failed or is stuck: `daemon.log` names
 the exception class, and `/health` `cache_aware.snapshot` has `age_s`,
 `last_rebuild_ms` and `failures`), or a client token the snapshot has not seen
 yet (a token that rotated: the first request with it starts a rebuild at
@@ -1110,7 +1111,10 @@ predecessor writes none.
 A snapshot older than two minutes is still used for a slot it read at least 10
 points under its bar (the slot's own switch threshold, else the engine's), for
 up to an hour (cswap's own trust limit for a reading); a reply from the kept
-account updates that reading. A fresh reading that lacks a window which has just
+account updates that reading. A slot whose stored token reads expired is not
+kept this way: that expiry is as old as the snapshot, and cswap may have
+refreshed the token since, so the session is left alone as for any old
+snapshot. A fresh reading that lacks a window which has just
 rolled (its last reading's `resets_at` has passed) counts that window as 0%
 and scores the slot on the rest; one never measured is still no reading.
 
@@ -1145,8 +1149,8 @@ sandbox run has measured is refused (`form not measured`). Each ping writes one
 line to `daemon.log`: the slot, the form, the status, `cache_read` and
 `cache_creation`, whether it was a hit, and the reply's `utilization` headers.
 A ping the API refuses writes `error.type`, `error.details.error_code`,
-`error.message` (120 characters) and the `request-id` header instead, never the
-body as received.
+`error.message` (120 characters, control characters and backticks made
+spaces) and the `request-id` header instead, never the body as received.
 
 `/health` carries a `cache_aware` key (additive): `armed`; per slot, `warm`
 sessions, how many of them `kept`, `prefix_est` (tokens, summed; a held body

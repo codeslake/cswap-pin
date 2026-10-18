@@ -3433,7 +3433,8 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                     # A fresh reading drops a window that has rolled (cswap's
                     # 439e4043), which restarted near 0%: the last reading
                     # says which. One never measured stays unknown (78bd597).
-                    parse = require("poll_policy").parse_reset_ts
+                    parse = getattr(require("poll_policy"), "parse_reset_ts",
+                                    lambda _at: None)  # older host: no roll known
                     windows |= {
                         w for w, _, at in oauth.relevant_windows(
                             getattr(entry, "last_good", None))
@@ -3667,11 +3668,12 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     NEVER READS THE STORE: it reads the snapshot `_affinity_rebuild` made on
     its own thread. With no snapshot yet, one older than `_AFFINITY_STALE_S`
     (unless it is under `_AFFINITY_STALE_MAX_S` and read the kept slot
-    `_AFFINITY_STALE_MARGIN` points under its bar), or a client token it has
-    not seen (which starts a rebuild at once, once per token), the client's
-    bearer goes out and the session is left as it was (see the comment below),
-    until that rebuild has run. A session carried in from a predecessor is not
-    looked at until the first snapshot has landed its binding.
+    `_AFFINITY_STALE_MARGIN` points under its bar with an unexpired token),
+    or a client token it has not seen (which starts a rebuild at once, once
+    per token), the client's bearer goes out and the session is left as it
+    was (see the comment below), until that rebuild has run. A session
+    carried in from a predecessor is not looked at until the first snapshot
+    has landed its binding.
 
     A warm session whose slot is passed over leaves one lifecycle line naming
     why (`_affinity_due`: one per reason per `_BUSY_REPORT_COOLDOWN_S`).
@@ -3714,9 +3716,11 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
                   and _affinity_kept.get(held))
         # A snapshot too old to trust may still rule for a slot it read far
         # under its bar (and the replies since agree: `_affinity_note_usage`).
+        # (An expiry that old may be refreshed since: only a fresh one unbinds.)
         ruled = mine and (fresh or (
             age < _AFFINITY_STALE_MAX_S and stored
-            and stored[4] <= stored[2] - _AFFINITY_STALE_MARGIN))
+            and stored[4] <= stored[2] - _AFFINITY_STALE_MARGIN
+            and not oauth.is_oauth_token_expired(stored[1])))
         # NOTHING TO RULE ON when there is no snapshot, one too old for this
         # slot, or a client token it has not seen (a rotation since): the
         # request goes out on the client's token and the session is left as it
@@ -3864,7 +3868,7 @@ def _ping_error_note(raw: bytes, rheaders, ratelimit: dict) -> str:
     rid = next((v for k, v in rheaders if k.lower() == "request-id"), "")
 
     def clean(v, n):
-        return re.sub(r"[\r\n`]+", " ", str(v or ""))[:n]
+        return re.sub(r"[\x00-\x1f\x7f`]+", " ", str(v or ""))[:n]
 
     return "".join((
         f" {clean(err.get('type'), 60)}" if err.get("type") else "",
@@ -17586,11 +17590,18 @@ class PinProxy:
                 self._affinity_carry_rows = rows
 
     def _affinity_refresh_tick(self) -> None:
-        """Keep the snapshot fresh with no request to ask for it: a lull of
-        two minutes left the first request after it with an old one (5 of 17
-        measured declines). `_affinity_kick` holds the period."""
+        """Keep the snapshot fresh with no request to ask for it, while a
+        session is warm: a lull of two minutes left the first request after it
+        with an old one (5 of 17 measured declines). `_affinity_kick` holds
+        the period."""
         cfg = session_affinity_config(self._certdir)
-        if cfg is not None and not self._stop:
+        if cfg is None or self._stop:
+            return
+        now = time.monotonic()
+        with _affinity_lock:
+            warm = _affinity_carried or any(
+                now - at < cfg[0] for _, at in _affinity.values())
+        if warm:  # a rebuild with no session to rule on is a read for nothing
             _affinity_kick(cfg[1], cfg[2])
 
     def _warm_mint_cache(self) -> None:
