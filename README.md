@@ -1051,10 +1051,15 @@ under the slot's own switch threshold, when that is lower), and the client's
 token and the kept one both belong to a slot in your roster and to different
 ones. A new or cold session, a Console API key or an expired one is forwarded
 exactly as without it. A reply that shows a kept slot at or over its own
-limit takes the slot out at once, without waiting for the next snapshot. If the kept account answers 401, 403, 404 or
+limit takes the slot out at once, without waiting for the next snapshot. If the kept account answers 401, 403 or
 429, the pin takes that answer back before the client sees any of it, rests
 the account (until the 429's reset, else 60 s) and resends on the client's own
-token, so the client only ever hears from the live account. Each take-back
+token, so the client only ever hears from the live account. A 404 is the server
+saying the thread a held send names is not on that account, and a resend on the
+live account answered 404 again every time it was measured, so it is relayed to
+the client, which replays the conversation in full and is routed to the kept
+slot again; the session stays on it, the account is not rested, and the kept
+body is forgotten. Each take-back
 writes a line to `daemon.log` (the slot, the status code, the rest in
 seconds, at most one a minute per slot and code; the take-backs it folded into
 "; N more" are written by the next snapshot rebuild once the minute is up), the
@@ -1065,11 +1070,13 @@ shows `kept=<slot>` in the `trace-to` log.
 A request never waits on the store or the Keychain for any of this. A
 snapshot of the roster (which slot stores which token, which slots have
 headroom) is rebuilt on a thread of its own, at most every 30 s and one at a
-time, by whichever armed request finds it that old; the request only reads
-it. With no snapshot yet, one older than two minutes (a rebuild that failed or
-is stuck), or a client token the snapshot has not seen yet (a token that
-rotated: the next rebuild resolves it), the request goes out on the client's
-own token and the session keeps its account: it is not rebound to that token,
+time, by whichever armed request finds it that old, or by a thread of the pin
+when no request does; the request only reads it. With no snapshot yet, one
+older than two minutes (a rebuild that failed or is stuck: `daemon.log` names
+the exception class, and `/health` `cache_aware.snapshot` has `age_s`,
+`last_rebuild_ms` and `failures`), or a client token the snapshot has not seen
+yet (a token that rotated: the first request with it starts a rebuild at
+once), the request goes out on the client's own token and the session keeps its account: it is not rebound to that token,
 and its clock is not renewed, so the cache time still ends it. So with a stale
 snapshot a session can go A, then B for the requests that find it stale, then A
 again, and thinking blocks made on B are later sent to A. A rebuild that has
@@ -1092,7 +1099,20 @@ and `autoswitch.cacheAware` is true (the `c` key of the auto-switch screen in
 restart. A cswap without the `cacheAware` setting never arms it. The old
 switches, `remoteControl.sessionAffinity` in `settings.json` and the
 `session-affinity` file in `<data>/pin-proxy/`, no longer arm anything. The
-state is in memory and bounded, and a daemon handover starts every session cold.
+state is in memory and bounded. A daemon handover carries the bindings
+(session, slot, email, time of its last request: never a token, never a
+conversation) in `affinity-carry.json` beside `proxy.json`, written by the
+running daemon at most every 5 s while armed, and the successor lands them with
+its first snapshot, so a session inside the cache time keeps its account across
+the handover; the first release to carry them hands over cold, since the
+predecessor writes none.
+
+A snapshot older than two minutes is still used for a slot it read at least 10
+points under its bar (the slot's own switch threshold, else the engine's), for
+up to an hour (cswap's own trust limit for a reading); a reply from the kept
+account updates that reading. A fresh reading that lacks a window which has just
+rolled (its last reading's `resets_at` has passed) counts that window as 0%
+and scores the slot on the rest; one never measured is still no reading.
 
 **Keep-alive.** While armed, the pin keeps each session's last main-thread
 `/v1/messages` body that asks for the 1 h cache tier (in memory only, never
@@ -1124,13 +1144,18 @@ request; it never reaches the wall, take-back, rest or switch paths. A form no
 sandbox run has measured is refused (`form not measured`). Each ping writes one
 line to `daemon.log`: the slot, the form, the status, `cache_read` and
 `cache_creation`, whether it was a hit, and the reply's `utilization` headers.
+A ping the API refuses writes `error.type`, `error.details.error_code`,
+`error.message` (120 characters) and the `request-id` header instead, never the
+body as received.
 
 `/health` carries a `cache_aware` key (additive): `armed`; per slot, `warm`
 sessions, how many of them `kept`, `prefix_est` (tokens, summed; a held body
 counts 0 until a ping measures it) and `ttl_left_min_s` (the kept body's own
 clock where there is one, else the binding's); `pings` (`sent`, `hit`,
 `refused` by reason, each reason counted once per request; a session not idle
-long enough yet is the normal state and is not counted); `captures` (`kept`,
+long enough yet is the normal state and is not counted; `cost`, the `input`,
+`cache_read`, `cache_creation` and `output` tokens the answered pings used);
+`snapshot` (`age_s`, `last_rebuild_ms`, `failures`); `captures` (`kept`,
 and `dropped` by reason, for main-thread requests; a subagent's, and one with
 no `cache_control` at all, are neither); and `since`, when this process started
 counting. Never a session id or a byte of a

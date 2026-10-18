@@ -23748,13 +23748,16 @@ class TestSessionAffinityOnMessages:
     @classmethod
     def _wire(cls, monkeypatch, certdir, armed=True, pct=10.0, walled=False,
               expires=None, thresholds=None, disabled=None, fail=False,
-              no_expiry=False):
+              no_expiry=False, carry=False):
         """A fake switcher over two slots; returns what it was asked.
         ``pct`` is slot 1's usage on both windows (None: no reading).
         ``thresholds`` / ``disabled`` give the switcher the per-slot threshold
         and disabled-slot methods; left None it has neither, as an older
         claude-swap host. ``fail``: the usage read raises. ``no_expiry``:
-        slot 1's stored credential carries no `expiresAt`. A case moves
+        slot 1's stored credential carries no `expiresAt`. ``carry``: a
+        started pin's tick writes the bindings for a successor; off, so that
+        the next pin built in this process (a stand-in for a handover only in
+        a case that says so) does not read them. A case moves
         ``seen.wall1`` to change what the next usage read says of slot 1, and
         ``seen.age1`` to say how many seconds before that read the store row
         was fetched (None: it never was).
@@ -23762,6 +23765,9 @@ class TestSessionAffinityOnMessages:
         `_spawn_usage_header_recorder`."""
         from cswap_pin import proxy as pp
 
+        if not carry:
+            monkeypatch.setattr(pp.PinProxy, "_carry_affinity_tick",
+                                lambda self: None)
         seen = types.SimpleNamespace(
             reads=[], fetches=[], consumed=[], switched=[], walled=[],
             recorded=[], logs=[], fetch_times=[], wall1=walled, age1=0.0,
@@ -24132,6 +24138,9 @@ class TestSessionAffinityOnMessages:
 
     def case_other_credentials_and_sessionless_requests_are_untouched(
             self, monkeypatch, certdir):
+        from cswap_pin.proxy import PinProxy
+        # the tick's own refresh would read the store whatever a request is
+        monkeypatch.setattr(PinProxy, "_affinity_refresh_tick", lambda self: None)
         seen = self._wire(monkeypatch, certdir)
         self._seed("S", "tok-A")
         _, auths = self._send(certdir, [
@@ -24283,7 +24292,7 @@ class TestSessionAffinityOnMessages:
         bound to which slot (never a bearer, never a body); the successor
         lands them with its first snapshot."""
         from cswap_pin import proxy as pp
-        seen = self._wire(monkeypatch, certdir)
+        seen = self._wire(monkeypatch, certdir, carry=True)
         self._send(certdir, [("tok-A", "S0")])  # the tokens are known
         self._seed("S", "tok-A", age=100)
         self._successor(certdir)._carry_affinity_tick()
@@ -24345,7 +24354,7 @@ class TestSessionAffinityOnMessages:
     def case_the_carry_is_written_only_when_armed_changed_and_every_5s(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
-        seen = self._wire(monkeypatch, certdir)
+        seen = self._wire(monkeypatch, certdir, carry=True)
         self._send(certdir, [("tok-A", "S0")])
         path = certdir / pp._AFFINITY_CARRY_FILE
         proxy = self._successor(certdir)
@@ -24790,7 +24799,7 @@ class TestSessionAffinityOnMessages:
                 (dict(pct=95.0), "at its bar"), (dict(walled=True), "walled"),
                 (dict(disabled={"1"}), "disabled"),
                 (dict(no_expiry=True), "no expiry"),
-                (dict(pct=None), "no reading"),
+                (dict(pct=None), "too old to trust"),
                 (dict(expires=1), "has expired")):
             seen = self._wire(monkeypatch, certdir, **opts)
             self._seed("S", "tok-A")
@@ -24800,7 +24809,7 @@ class TestSessionAffinityOnMessages:
                 opts, auths, seen.logs)
             assert "slot 1" in lines[0] and why in lines[0], (opts, lines)
             assert not re.search(r"tok-|@", lines[0]), "a bearer or an email"
-        seen = self._wire(monkeypatch, certdir)
+        seen = self._wire(monkeypatch, certdir, pct=85.0)  # within the margin
         queued = []
         monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
         self._send(certdir, [("tok-A", "S0")])
@@ -25795,7 +25804,7 @@ class TestSessionAffinityOnMessages:
         pp._affinity_last["S"] = [[], b""]  # a row the report cannot read
         got = self._health(certdir)
         assert got["armed"] is True and got["slots"] == {}, got
-        assert set(got["pings"]) == {"sent", "refused", "hit"}, got
+        assert set(got["pings"]) == {"sent", "refused", "hit", "cost"}, got
 
     def case_a_thread_that_cannot_start_does_not_fail_the_request(
             self, monkeypatch, certdir):
