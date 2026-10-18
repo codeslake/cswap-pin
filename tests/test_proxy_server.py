@@ -24017,6 +24017,25 @@ class TestSessionAffinityOnMessages:
         _, auths = self._send(certdir, [("tok-B", "S")])
         assert auths == ["Bearer tok-B"], auths
 
+    def case_an_older_cswap_without_parse_reset_ts_knows_no_roll(
+            self, monkeypatch, certdir):
+        """`parse_reset_ts` is cswap's; one without it degrades to "no roll
+        known", the slot declining for the missing window as it always did."""
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        real = pp.require
+        monkeypatch.setattr(pp, "require", lambda name: (
+            types.SimpleNamespace() if name == "poll_policy" else real(name)))
+        seen.usage1 = {"seven_day": {"pct": 10.0}}
+        seen.last_good1 = {"five_hour": {"pct": 30.0, "resets_at": self._iso(60)},
+                           "seven_day": {"pct": 10.0,
+                                         "resets_at": self._iso(-86400)}}
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity_why[self.IDENT] == (
+            "a usage window has no reading"), pp._affinity_why
+
     def case_a_window_that_never_rolled_is_still_no_reading(
             self, monkeypatch, certdir):
         from cswap_pin import proxy as pp
@@ -24431,6 +24450,18 @@ class TestSessionAffinityOnMessages:
         _, auths = self._send(certdir, [("tok-X", "S")])
         assert auths == ["Bearer tok-X"], ("client token unseen", auths)
 
+    def case_a_stale_snapshot_never_unbinds_a_session_on_an_expired_token(
+            self, monkeypatch, certdir):
+        """A stale snapshot leaves a session alone. The kept slot's stored
+        token reads expired, but that `expiresAt` is minutes old and cswap may
+        have refreshed it since: rebinding the session to the client's bearer
+        would end its affinity for good."""
+        from cswap_pin import proxy as pp
+        self._stale(monkeypatch, certdir, pct=10.0, expires=1)
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity["S"][0] == "tok-A", pp._affinity["S"]
+
     def case_a_kept_reply_updates_the_last_known_use(self, monkeypatch, certdir):
         """The snapshot said 10; a reply on the kept token says 88 (bar 90,
         margin 10): a stale snapshot no longer keeps the slot."""
@@ -24454,10 +24485,37 @@ class TestSessionAffinityOnMessages:
         assert not seen.fetches and not pp._affinity_kept, "off, yet it read"
         seen.loaded.cache_aware = True
         pp._AFFINITY_CACHE.clear()
+        self._seed("S", "tok-A")
         proxy._affinity_refresh_tick()
         assert len(seen.fetches) == 1 and pp._affinity_kept, seen.fetches
         proxy._affinity_refresh_tick()
         assert len(seen.fetches) == 1, "a second rebuild inside the period"
+
+    def case_an_armed_pin_with_no_warm_session_refreshes_nothing(
+            self, monkeypatch, certdir):
+        """A rebuild reads every slot's credentials and calls cswap's usage
+        read, which has write arms: with no binding inside the TTL (and none
+        carried in) there is nothing for a snapshot to rule on."""
+        from cswap_pin import proxy as pp
+        from cswap_pin.proxy import PinProxy
+        seen = self._wire(monkeypatch, certdir)
+        queued = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", queued.append)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: None)
+        proxy._affinity_refresh_tick()
+        self._seed("S", "tok-A", age=pp.session_affinity_config(certdir)[0] + 1)
+        proxy._affinity_refresh_tick()
+        assert not queued, "a rebuild with no warm session"
+        self._seed("S", "tok-A")
+        proxy._affinity_refresh_tick()
+        assert len(queued) == 1, "a warm session, and no rebuild"
+        queued.clear()
+        pp._affinity.clear()
+        pp._affinity_snap["tried"] = float("-inf")
+        pp._affinity_snap["busy"] = False
+        pp._affinity_carried["S"] = (self.IDENT, time.time())
+        proxy._affinity_refresh_tick()
+        assert len(queued) == 1, "a carried binding, and no rebuild"
 
     def case_a_rebuild_that_raises_is_counted_and_said_once(
             self, monkeypatch, certdir):
@@ -25458,7 +25516,7 @@ class TestSessionAffinityOnMessages:
         err = json.dumps({"type": "error", "error": {
             "type": "not_found_error", "details": {"error_code": "thread_gone"},
             "message": "No thread state was found for the requested "
-                       "`previous_message_id`.\nReplay the full conversation "
+                       "`previous_message_id`.\nReplay\tthe \x1b[31mfull conversation "
                        + "z" * 200}}).encode()
         reply = (b"HTTP/1.1 404 Not Found\r\nrequest-id: req_abc123\r\n"
                  b"set-cookie: sid=hunter2\r\n" + self.RL
@@ -25474,6 +25532,7 @@ class TestSessionAffinityOnMessages:
         assert "tok-" not in line and "x" * 40 not in line, line
         assert "hunter2" not in line and '"type"' not in line, line
         assert "`" not in line and "\n" not in line and "z" * 100 not in line, line
+        assert not any(c < " " or c == "\x7f" for c in line), repr(line)
         assert pp._affinity_pings["refused"] == {"http 404": 1}, (
             "the counter's key is the status alone")
 
