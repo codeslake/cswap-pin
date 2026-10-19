@@ -4150,6 +4150,11 @@ def _is_policy_route(path: str) -> bool:
     return path.split("?", 1)[0].rstrip("/") == "/api/claude_code/policy_limits"
 
 
+def _is_profile_route(path: str) -> bool:
+    """CC's account-profile question, bare or with a query."""
+    return path.split("?", 1)[0].rstrip("/") == "/api/oauth/profile"
+
+
 # WHY a policy 503 says it, on the MITM and the absolute-form path alike.
 _POLICY_NO_MINT = ("the org-policy question needs the pinned token and none "
                    "could be minted; no other account answers it")
@@ -21943,6 +21948,7 @@ class PinProxy:
                     result = _relay_response(
                         up, conn, getattr(self._local, "cid", 0),
                         reject_on_auth_error=retry,
+                        drop_request_id=retry and _is_profile_route(rel),
                         method=method,
                         on_status=lambda st: _release_bridge_hold(),
                         note_hop=host == UPSTREAM_HOST and secure,
@@ -22696,6 +22702,7 @@ class PinProxy:
             keep = _relay_response(
                 up, client, getattr(self._local, "cid", 0),
                 reject_on_auth_error=swapped,
+                drop_request_id=swapped and _is_profile_route(path),
                 affinity=affinity,
                 # THE RELAY SEES THE STATUS AND THE CALLER SEES THE ROUTE, and
                 # a spurious stream 404 needs both to be recognised.
@@ -25647,9 +25654,14 @@ def _relay_response(
     note_hop: bool = True,
     on_hop_trouble=None,
     affinity: "tuple[str, str] | None" = None,
+    drop_request_id: bool = False,
 ) -> bool:
     """Stream one upstream response to the client; return whether the
     connection may be reused for another request.
+
+    ``drop_request_id`` strips the upstream's ``request-id`` header: CC 2.1.304
+    stamps a profile answer by it and copies the PINNED account's plan into the
+    active credential, and an unstamped one still gets its identity written.
 
     ``affinity`` is the (slot, email) a session-affinity request was sent as
     (`_affinity_pick`): a 401/403/429 from that account is returned as
@@ -25950,7 +25962,7 @@ def _relay_response(
             # false` would stop the retry the relay depends on. Stripped
             # either way.
             continue
-        if kl in _HOP_BY_HOP_BYTES:
+        if kl in _HOP_BY_HOP_BYTES or (drop_request_id and kl == b"request-id"):
             continue
         out.append(line)
     if _fleet_reset is not None:
@@ -26031,6 +26043,7 @@ def _relay_response(
                 on_headers=None, on_status=on_status, path=path,
                 certdir=certdir, auth=auth, session=session, note_hop=note_hop,
                 on_hop_trouble=on_hop_trouble, affinity=affinity,
+                drop_request_id=drop_request_id,
             )
         return _relay_response(
             up, client, cid,
@@ -26038,6 +26051,7 @@ def _relay_response(
             on_headers=None, on_status=on_status, path=path,
             certdir=certdir, auth=auth, session=session, note_hop=note_hop,
             on_hop_trouble=on_hop_trouble, affinity=affinity,
+            drop_request_id=drop_request_id,
         )
     if bodyless:
         # 204/304 (and 1xx) carry no body by definition and commonly send
