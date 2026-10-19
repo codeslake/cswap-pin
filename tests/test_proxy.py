@@ -35615,10 +35615,8 @@ else:
             # A ps that fails must not skip the reap or replace the body's
             # failure: `lineage` stays None and the assert below fails clean.
             lineage = None
-            try:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
                 lineage = carrying_the_root()
-            except (OSError, subprocess.SubprocessError):
-                pass
             _reap_pin_processes(certdir)
             shutil.rmtree(base, ignore_errors=True)
         # Past the `finally` only when the body did not raise, so a failure
