@@ -37,7 +37,7 @@ from cswap_pin.proxy import (
 # stubs the module attribute for every test.
 from cswap_pin.proxy import pin_profile_for as _real_pin_profile_for
 
-from conftest import PIN_STAMP, run_cases
+from conftest import PIN_STAMP, run_cases, short_root
 
 # A REAL zero-serial root CA (GoDaddy Root Certificate Authority - G2),
 # extracted from this box's ambient `/etc/ssl/certs/ca-certificates.crt`.
@@ -33983,13 +33983,12 @@ else:
         import shutil
         import subprocess
         import sys
-        import tempfile
         import types
 
         from conftest import _reap_pin_processes
         from cswap_pin import proxy as pp
 
-        base = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        base = short_root().resolve()
         certdir = base / "pin-proxy"
         certdir.mkdir()
         echo = self._Echo()
@@ -34348,12 +34347,11 @@ else:
         so the holder spawns nothing (an old-lineage successor is the move it
         was meant to end). None, or one older than any helper listens, spawns
         exactly as it always did."""
-        import tempfile
         import shutil
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = short_root().resolve()
         spawned = []
         lsn = socket.socket()
         lsn.bind(("127.0.0.1", 0))
@@ -34442,12 +34440,11 @@ else:
         import shutil
         import subprocess
         import sys
-        import tempfile
 
         from conftest import _reap_pin_processes
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = short_root().resolve()
         old = socket.socket()
         old.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         old.bind(("127.0.0.1", 0))
@@ -34699,12 +34696,11 @@ else:
         socket the helper has stopped (or is about to stop) accepting on."""
         import subprocess
         import sys
-        import tempfile
         import shutil
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = short_root().resolve()
         try:
             gone = subprocess.Popen([sys.executable, "-c", "pass"])
             gone.wait()
@@ -35038,12 +35034,11 @@ else:
         live rendezvous alone makes the tick run the gapless sequence (ask the
         holder, wait for the successor's record, release, uncapped drain,
         exit 0)."""
-        import tempfile
         import shutil
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = short_root().resolve()
         try:
             released, exited, signalled = self._watch(
                 pp, monkeypatch, certdir, 0.5, publish=True)
@@ -35059,12 +35054,11 @@ else:
         NOT release, drain or exit; it hands the drain announcement back and
         goes on serving, and its record is the one it had (the helper never
         marks it: the daemon serves throughout)."""
-        import tempfile
         import shutil
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = short_root().resolve()
         serving = socket.socket()
         serving.bind(("127.0.0.1", 0))
         serving.listen(1)
@@ -35096,12 +35090,11 @@ else:
         (a capped drain that cuts held tunnels, and a holder that respawns on
         a socket it handed away). THE CONTROL is the same stale tick with no
         helper: it asks the holder and takes the ordinary exit-75 fallback."""
-        import tempfile
         import shutil
 
         from cswap_pin import proxy as pp
 
-        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = short_root().resolve()
         try:
             released, exited, signalled = self._watch(
                 pp, monkeypatch, certdir, 0.3, publish=False, stale=True,
@@ -35115,7 +35108,7 @@ else:
             f"exited={exited}: it took the ordinary exit-75 arm")
         assert drains == [], "the drain announcement was not handed back"
 
-        certdir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        certdir = short_root().resolve()
         try:
             with monkeypatch.context() as m:
                 m.setattr(pp, "_waiting_caller", lambda cd: None)
@@ -35406,6 +35399,23 @@ class TestTheDaemonRaisesItsFdLimit:
         assert "before soft=2048 " in lines[1] and " after soft=2048 " in lines[1]
 
 
+def test_a_reaper_whose_ps_fails_returns_instead_of_raising(
+        tmp_path, monkeypatch):
+    """T2725: `_mine()` answers a ps failure with the arity its caller
+    unpacks, so a ps that times out on a loaded host ends the sweep quietly
+    (a `finally` runs it) rather than as a ValueError that replaces the
+    case's own failure."""
+    import subprocess
+
+    import conftest
+
+    def ps(*a, **k):
+        raise subprocess.TimeoutExpired("ps", 5)
+
+    monkeypatch.setattr(subprocess, "run", ps)
+    conftest._reap_pin_processes(tmp_path, timeout=1.0)
+
+
 class TestAHolderRespawnsASuccessorThatDiesBeforePublishing:
     """T2071: a deploy's `uv tool install --force` rebuilds the venv in place, a
     code-watch tick lands inside it, and the successor the HOLDER spawns for the
@@ -35524,12 +35534,11 @@ else:
         import shutil
         import subprocess
         import sys
-        import tempfile
 
         from conftest import _reap_pin_processes
         from cswap_pin import proxy as pp
 
-        base = Path(tempfile.mkdtemp(prefix="r", dir="/tmp")).resolve()
+        base = short_root().resolve()
         certdir = base / "pin-proxy"
         certdir.mkdir()
         pkg = base / "shim" / "t2071_cswap_pin"
@@ -35542,6 +35551,12 @@ else:
         away = pkg.with_name("t2071_cswap_pin.gone")
         origin = self._Origin()
         timer = client = None
+
+        def carrying_the_root():
+            out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
+                                 capture_output=True, text=True, timeout=5).stdout
+            return [ln for ln in out.splitlines() if str(base) in ln]
+
         try:
             pp.ensure_ca(certdir, "api.anthropic.com")
             pp.save_pin(base, self.EMAIL, "org-1")
@@ -35597,8 +35612,20 @@ else:
                 client.close()
             origin.release.set()
             origin.srv.close()
+            # A ps that fails must not skip the reap or replace the body's
+            # failure: `lineage` stays None and the assert below fails clean.
+            lineage = None
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                lineage = carrying_the_root()
             _reap_pin_processes(certdir)
             shutil.rmtree(base, ignore_errors=True)
+        # Past the `finally` only when the body did not raise, so a failure
+        # here never hides one from the case. `lineage` is the control: the
+        # scan found the holder, daemon and standby before the reap.
+        assert lineage, "premise: the scan sees the lineage it must find gone"
+        self._until(f"processes carrying {base} survived the reap",
+                    lambda: not carrying_the_root(), 5)
+        assert not base.exists()
 
     def _one_daemon_is_left(self, t, pid):
         from cswap_pin import proxy as pp
@@ -35630,6 +35657,50 @@ else:
             self, monkeypatch):
         with self._held_reply_across_a_window(monkeypatch, 1.0) as (t, rest):
             self._a_successor_serves_and_the_reply_completed(t, rest)
+
+    def case_a_scan_that_fails_in_the_finally_still_reaps(self, monkeypatch):
+        """T2725: the helper's `finally` scans before it reaps. A ps that
+        times out there must not skip the reap (the leak this closes) nor
+        replace the body's own failure. The body stops right after the
+        launcher returns, with the holder and standby up."""
+        import shutil
+        import subprocess
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as pp
+
+        real, armed, base, up = subprocess.run, [], [], []
+
+        def carrying():
+            out = real(["ps", "-ww", "-eo", "pid=,command="],
+                       capture_output=True, text=True, timeout=5).stdout
+            return [ln for ln in out.splitlines() if str(base[0]) in ln]
+
+        def run(argv, *a, **k):
+            if armed and argv[0] == "ps":
+                armed.clear()
+                raise subprocess.TimeoutExpired(argv, 5)
+            return real(argv, *a, **k)
+
+        def stop_here(certdir):
+            base.append(certdir.parent)
+            up.extend(self._until("the lineage never came up", carrying, 10))
+            armed.append(1)
+            raise RuntimeError("the body stopped")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        monkeypatch.setattr(pp, "read_daemon_state", stop_here)
+        try:
+            with pytest.raises(RuntimeError, match="the body stopped"):
+                with self._held_reply_across_a_window(monkeypatch, 1.0):
+                    pass
+            assert up and not armed, "the fault did not fire on a live lineage"
+            assert not carrying(), carrying()
+            assert not base[0].exists()
+        finally:
+            for b in base:
+                _reap_pin_processes(b / "pin-proxy")
+                shutil.rmtree(b, ignore_errors=True)
 
     def case_a_window_of_several_seconds_takes_several_respawns(
             self, monkeypatch):
@@ -35966,3 +36037,86 @@ def test_the_pass_that_follows_the_handover_pass_waits_a_whole_tick_again(monkey
     waits, events, hups = _stand_down(monkeypatch, tmp_path, holder_goes=True, idle_after=True)
     assert len(hups) == 1 and ("spawn", "1") not in events
     assert waits.count(0) == 1 and waits[-1] == 30.0, f"{len(waits)} waits, tail {waits[-3:]}"
+
+
+@pytest.mark.parametrize("owner", ["dead", "alive", "unmarked"])
+def test_session_start_reaps_a_short_root_only_when_its_marked_owner_is_dead(
+        tmp_path, owner):
+    """T2725: a pytest killed mid-case never reaches the `finally` that reaps
+    the short `/tmp/r*` root a real-holder case made, and nothing swept it.
+    The root now carries its creator's pid in a marker; session start reaps
+    what runs under it and removes it when that pid is gone. The controls:
+    a live owner's root is left alone, and so is an unrelated `/tmp/r*`
+    directory that has no marker (the prefix alone selects nothing)."""
+    import shutil
+    import subprocess
+    import sys
+
+    import conftest
+
+    own_root = tmp_path / "pytest-of-x" / "pytest-100"
+    own_root.mkdir(parents=True)
+    session = types.SimpleNamespace(config=types.SimpleNamespace(
+        _tmp_path_factory=types.SimpleNamespace(getbasetemp=lambda: own_root)))
+    root = conftest.short_root().resolve()
+    # argv `_reap_pin_processes` selects on: the product module, then a path
+    # under the root as the LAST token.
+    stand_in = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "cswap_pin.proxy", str(root / "pin-proxy")])
+    try:
+        marker = root / conftest._OWNER_MARK
+        assert marker.read_text() == str(os.getpid()), "the helper did not stamp its creator"
+        if owner == "dead":
+            gone = subprocess.Popen([sys.executable, "-c", "pass"])
+            gone.wait()
+            marker.write_text(str(gone.pid))
+        elif owner == "unmarked":
+            marker.unlink()
+        time.sleep(0.3)
+        assert stand_in.poll() is None, "the stand-in exited on its own"
+
+        conftest.pytest_sessionstart(session)
+
+        if owner == "dead":
+            # Our own child, so "gone" is its exit status: no process whose
+            # argv carries the root is left.
+            stand_in.wait(timeout=10)
+            assert not root.exists(), "the dead owner's root was left behind"
+        else:
+            time.sleep(0.5)
+            assert stand_in.poll() is None and root.exists(), (
+                f"a root whose owner is {owner} was swept")
+    finally:
+        stand_in.terminate()
+        stand_in.wait()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_term_unwinds_pytest_once_so_every_finally_runs(monkeypatch):
+    """T2725: Python's default SIGTERM exit skips `finally`, which is where a
+    real-holder case reaps its daemons. The conftest turns it into the
+    interrupt pytest already unwinds on, and installs it at session start.
+    ONCE: `timeout` delivers TERM twice (measured, a reentrant handler call
+    through `uv run`), and a second raise lands inside the `finally` the first
+    one is running, which left the root and its daemons behind. The second is
+    swallowed and restores the default, so a third (a hung `finally`) kills."""
+    import signal
+
+    import conftest
+
+    real = signal.getsignal(signal.SIGTERM)
+    assert real is conftest._unwind_on_term
+    monkeypatch.setattr(conftest, "_term_seen", False)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            conftest._unwind_on_term(signal.SIGTERM, None)
+        try:
+            conftest._unwind_on_term(signal.SIGTERM, None)
+        except BaseException as e:
+            pytest.fail(f"the second TERM raised {type(e).__name__}")
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL, (
+            "the second TERM left the handler in place: a third, from an "
+            "operator's `kill` or a plain `timeout`, would be ignored too")
+    finally:
+        signal.signal(signal.SIGTERM, real)

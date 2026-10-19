@@ -30,6 +30,7 @@ throws it away.
 import json
 import re
 import pathlib
+import signal
 import sys
 import threading
 import warnings
@@ -603,7 +604,7 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
             out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
                                  capture_output=True, text=True, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
-            return [], []
+            return [], [], []
         standbys, holders, daemons = [], [], []
         for line in out.splitlines():
             pid_s, _, cmd = line.strip().partition(" ")
@@ -661,8 +662,11 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
         time.sleep(0.2)
 
 
-def _root_owner_alive(root) -> bool:
+def _root_owner_alive(root, mark: str = ".lock") -> bool:
     """Whether ``root`` is CLAIMED by a session this sweep must not touch.
+
+    The claim is the pid in ``root/<mark>``: pytest's ``.lock`` by default, or
+    ``short_root``'s own stamp.
 
     Every numbered root pytest makes for a session (``.../pytest-of-<user>/
     pytest-N``) carries a ``.lock`` file stamped with that session's own pid
@@ -701,7 +705,7 @@ def _root_owner_alive(root) -> bool:
     """
     import os
 
-    lock = pathlib.Path(root) / ".lock"
+    lock = pathlib.Path(root) / mark
     try:
         pid = int(lock.read_text().strip())
     except (OSError, ValueError):
@@ -715,6 +719,61 @@ def _root_owner_alive(root) -> bool:
     except Exception:
         return True
     return True
+
+
+_SHORT_ROOT_DIR = "/tmp"
+_OWNER_MARK = ".cswap-pin-test-owner"
+
+
+def short_root() -> pathlib.Path:
+    """A `/tmp/r*` root short enough for an AF_UNIX path, stamped with its creator.
+
+    The stamp is what lets `_sweep_dead_short_roots` tell this suite's root
+    from any other `/tmp/r*` directory (`r1.txt`, `rc-six-gate-hdr-*`): the
+    prefix alone selects nothing.
+    """
+    import os
+    import tempfile
+
+    root = pathlib.Path(tempfile.mkdtemp(prefix="r", dir=_SHORT_ROOT_DIR))
+    (root / _OWNER_MARK).write_text(str(os.getpid()))
+    return root
+
+
+def _sweep_dead_short_roots() -> None:
+    """Reap and remove every stamped short root whose creator is gone.
+
+    `_root_owner_alive` reads a missing or unreadable stamp as owned, so an
+    unstamped directory, or a root whose stamp is still being written, stays.
+    """
+    import shutil
+
+    for root in pathlib.Path(_SHORT_ROOT_DIR).glob("r*"):
+        if _root_owner_alive(root, _OWNER_MARK):
+            continue
+        _reap_pin_processes(root, timeout=5.0)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+_term_seen = False
+
+
+def _unwind_on_term(signum, frame):
+    """SIGTERM unwinds pytest like Ctrl-C, so every test's `finally` runs.
+
+    Python's default SIGTERM exit skips them, and a real-holder case reaps its
+    standbys there (a standby ignores SIGTERM; its pid is on no disk). ONCE:
+    `timeout` delivers TERM twice, and a second raise would land inside the
+    `finally` the first is running and abandon the reap. The second is
+    swallowed and puts the default back, so a hung `finally` still dies to a
+    third.
+    """
+    global _term_seen
+    if _term_seen:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        return
+    _term_seen = True
+    raise KeyboardInterrupt
 
 
 def pytest_sessionstart(session) -> None:
@@ -733,6 +792,7 @@ def pytest_sessionstart(session) -> None:
     (`_root_owner_alive`), which itself fails toward "owned" on anything it
     can't read.
     """
+    signal.signal(signal.SIGTERM, _unwind_on_term)
     # ponytail: two ceilings from that same "fail toward owned" rule, both
     # acceptable: (1) under xdist (this project's default, `-n 4`) each
     # WORKER's own sweep is a no-op — its siblings are unlocked `popen-gw*`
@@ -751,6 +811,10 @@ def pytest_sessionstart(session) -> None:
         if _root_owner_alive(sibling):
             continue
         _reap_pin_processes(sibling, timeout=5.0)
+    # Not under pytest's tree: a case that needs an AF_UNIX path short enough
+    # for macOS roots itself at /tmp/r*, where no sweep looked and a killed
+    # run left its daemons.
+    _sweep_dead_short_roots()
 
 
 def pytest_sessionfinish(session) -> None:
