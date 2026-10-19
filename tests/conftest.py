@@ -30,6 +30,7 @@ throws it away.
 import json
 import re
 import pathlib
+import signal
 import sys
 import threading
 import warnings
@@ -763,10 +764,13 @@ def _unwind_on_term(signum, frame):
     Python's default SIGTERM exit skips them, and a real-holder case reaps its
     standbys there (a standby ignores SIGTERM; its pid is on no disk). ONCE:
     `timeout` delivers TERM twice, and a second raise would land inside the
-    `finally` the first is running and abandon the reap.
+    `finally` the first is running and abandon the reap. The second is
+    swallowed and puts the default back, so a hung `finally` still dies to a
+    third.
     """
     global _term_seen
     if _term_seen:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         return
     _term_seen = True
     raise KeyboardInterrupt
@@ -788,8 +792,6 @@ def pytest_sessionstart(session) -> None:
     (`_root_owner_alive`), which itself fails toward "owned" on anything it
     can't read.
     """
-    import signal
-
     signal.signal(signal.SIGTERM, _unwind_on_term)
     # ponytail: two ceilings from that same "fail toward owned" rule, both
     # acceptable: (1) under xdist (this project's default, `-n 4`) each

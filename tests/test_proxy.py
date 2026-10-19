@@ -35534,6 +35534,12 @@ else:
         away = pkg.with_name("t2071_cswap_pin.gone")
         origin = self._Origin()
         timer = client = None
+
+        def carrying_the_root():
+            out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
+                                 capture_output=True, text=True, timeout=5).stdout
+            return [ln for ln in out.splitlines() if str(base) in ln]
+
         try:
             pp.ensure_ca(certdir, "api.anthropic.com")
             pp.save_pin(base, self.EMAIL, "org-1")
@@ -35589,8 +35595,16 @@ else:
                 client.close()
             origin.release.set()
             origin.srv.close()
+            lineage = carrying_the_root()
             _reap_pin_processes(certdir)
             shutil.rmtree(base, ignore_errors=True)
+        # Past the `finally` only when the body did not raise, so a failure
+        # here never hides one from the case. `lineage` is the control: the
+        # scan found the holder, daemon and standby before the reap.
+        assert lineage, "premise: the scan sees the lineage it must find gone"
+        self._until(f"processes carrying {base} survived the reap",
+                    lambda: not carrying_the_root(), 5)
+        assert not base.exists()
 
     def _one_daemon_is_left(self, t, pid):
         from cswap_pin import proxy as pp
@@ -36020,13 +36034,24 @@ def test_a_term_unwinds_pytest_once_so_every_finally_runs(monkeypatch):
     interrupt pytest already unwinds on, and installs it at session start.
     ONCE: `timeout` delivers TERM twice (measured, a reentrant handler call
     through `uv run`), and a second raise lands inside the `finally` the first
-    one is running, which left the root and its daemons behind."""
+    one is running, which left the root and its daemons behind. The second is
+    swallowed and restores the default, so a third (a hung `finally`) kills."""
     import signal
 
     import conftest
 
-    assert signal.getsignal(signal.SIGTERM) is conftest._unwind_on_term
+    real = signal.getsignal(signal.SIGTERM)
+    assert real is conftest._unwind_on_term
     monkeypatch.setattr(conftest, "_term_seen", False)
-    with pytest.raises(KeyboardInterrupt):
-        conftest._unwind_on_term(signal.SIGTERM, None)
-    conftest._unwind_on_term(signal.SIGTERM, None)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            conftest._unwind_on_term(signal.SIGTERM, None)
+        try:
+            conftest._unwind_on_term(signal.SIGTERM, None)
+        except BaseException as e:
+            pytest.fail(f"the second TERM raised {type(e).__name__}")
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL, (
+            "the second TERM left the handler in place: a third, from an "
+            "operator's `kill` or a plain `timeout`, would be ignored too")
+    finally:
+        signal.signal(signal.SIGTERM, real)
