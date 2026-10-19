@@ -23433,15 +23433,11 @@ class PinProxy:
         `oauth_token` in its first WebSocket message -- can carry the pin's.
         The handshake and every later frame pass through as they arrived.
 
-        THE HOST IS NOT ALL `/chrome/`: Claude Code 2.1.303 also reaches
-        `/devices/mcp` here, over https and wss. Only a `GET /chrome/...`
-        WebSocket upgrade is read and rewritten; anything else is relayed
-        byte for byte, so a POST body is never held behind a handshake wait and
-        a server that speaks first after its 101 is never held for a client
-        frame. `Sec-WebSocket-Extensions` is dropped from the /chrome/
-        handshake only, so no compression is negotiated there: a deflated
-        connect frame could not be read here.
-        True when the connection was handed to the pump.
+        THE HOST IS NOT ALL `/chrome/` (`/devices/mcp` is here too, over https
+        and wss): only a `GET /chrome/...` upgrade is read and rewritten, and
+        only its handshake drops `Sec-WebSocket-Extensions`, so no compression
+        is negotiated there and the connect frame stays readable. Anything
+        else is relayed byte for byte. True when handed to the pump.
         """
         try:
             token = self._pin_token_provider()
@@ -23832,10 +23828,8 @@ def _read_head(sock) -> bytes | None:
 def _is_chrome_upgrade(head: bytes) -> bool:
     """Whether `head` is `GET /chrome/...` with `Upgrade: websocket`: the one
     request on the bridge host whose first frame carries a bearer."""
-    first, *headers = head.split(b"\r\n")
-    return first.startswith(b"GET /chrome/") and any(
-        h.lower().startswith(b"upgrade:") and b"websocket" in h.lower()
-        for h in headers)
+    return head.startswith(b"GET /chrome/") and bool(
+        re.search(rb"(?im)^upgrade:[ \t]*websocket", head))
 
 
 def _strip_ws_extensions(head: bytes) -> bytes:

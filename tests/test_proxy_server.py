@@ -26151,8 +26151,8 @@ class TestChromeBridgeCarriesThePinnedToken:
                             "bridge.claudeusercontent.com"}
 
 
-    def _other_traffic(self, certdir, mode, request, want):
-        """`request` through a pin that HOLDS a pinned token, to a relay that
+    def _other_traffic(self, certdir, mode, req, want):
+        """`req` through a pin that HOLDS a pinned token, to a relay that
         answers as `mode`: (what reached the client, what the relay read)."""
         from cswap_pin.proxy import PinProxy
 
@@ -26166,7 +26166,7 @@ class TestChromeBridgeCarriesThePinnedToken:
         try:
             tls = self._open(proxy, certdir)
             tls.settimeout(5)
-            tls.sendall(request)  # one TLS record: head and body together
+            tls.sendall(req)  # one TLS record: head and body together
             try:
                 while want not in got:
                     chunk = tls.recv(4096)
