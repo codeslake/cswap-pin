@@ -31730,6 +31730,37 @@ class TestABlindDaemonRepairsItself:
         assert pin_proxy.read_daemon_state(tmp_path)["unpinnable"] is True
         assert sum("re-login" in m for m in said) == 1, said
 
+    def test_a_dead_lineage_mark_a_rewrite_dropped_is_put_back(
+            self, monkeypatch, tmp_path):
+        """The mark is the only on-disk sign that an idle dead-lineage daemon
+        cannot pin (`blind-recycle.json` is never written for it), and a
+        launch's handover rewrite or a republish rebuilds the record without
+        it. The once-flag gates the LOG, not the mark: a later tick puts the
+        mark back, and the log is still one line."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._own_record(tmp_path)
+        said = []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+
+        class _RewrittenBetweenTicks(self._CannotMint):
+            def __call__(inner):
+                if inner.calls == 1:    # the second tick, ahead of its check
+                    pin_proxy.clear_daemon_unpinnable(tmp_path)
+                    assert "unpinnable" not in pin_proxy.read_daemon_state(
+                        tmp_path), "the fault was not injected"
+                return super().__call__()
+
+        provider = _RewrittenBetweenTicks("refresh invalid_grant for slot 2 (x)")
+
+        signalled, exited = self._drive(monkeypatch, tmp_path, provider)
+
+        assert provider.calls == 2, "both ticks must have asked the provider"
+        assert signalled == [] and exited == []
+        assert pin_proxy.read_daemon_state(tmp_path)["unpinnable"] is True, (
+            "a rewrite dropped the mark and nothing put it back")
+        assert sum("re-login" in m for m in said) == 1, said
+
     @pytest.mark.parametrize("reason", [
         "refresh transient for slot 2 (x)",
         "refresh invalid_client for slot 2 (x)",

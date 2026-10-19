@@ -14967,19 +14967,25 @@ def _watch_own_code(
             # permanent, so a successor cannot mint either and replacing would
             # be a handover per backoff step, for ever. `blind-recycle.json` is
             # then never written, so the record says it instead: the mark
-            # `_read_alive_port` and the badge read, once per episode.
+            # `_read_alive_port` and the badge read. Put back on every tick it
+            # is missing, because a launch's handover rewrite and a republish
+            # build the record without it; only the log line is once per
+            # episode.
             dead_lineage = blind and str(
                 getattr(_mint_provider, "blind_reason", "") or ""
             ).startswith(("refresh invalid_grant", "refresh no_refresh_token"))
-            if dead_lineage and not getattr(server, "_dead_lineage_noted", False):
-                setattr(server, "_dead_lineage_noted", True)
-                with contextlib.suppress(OSError):
-                    mark_daemon_unpinnable(certdir)
-                _log_lifecycle(
-                    "the pinned account's refresh token is dead and a re-login "
-                    "is needed — replacing ourselves would not help, so no "
-                    "successor is asked for"
-                )
+            if dead_lineage:
+                if not (read_daemon_state(certdir) or {}).get("unpinnable"):
+                    with contextlib.suppress(OSError):
+                        mark_daemon_unpinnable(certdir)
+                if not getattr(server, "_dead_lineage_noted", False):
+                    setattr(server, "_dead_lineage_noted", True)
+                    _log_lifecycle(
+                        "the pinned account's refresh token is dead and a "
+                        "re-login is needed — this watchdog does not replace "
+                        "itself, which would not help (a launch may still "
+                        "replace a marked daemon)"
+                    )
             replace_for_blind = (blind and not dead_lineage
                                  and blind_recycle_due(certdir, now))
             # A CALLER IN THE LOGIN SESSION IS WAITING FOR THE SOCKET. Its
