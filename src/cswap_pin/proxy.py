@@ -11744,6 +11744,14 @@ def read_port_hint(certdir: Path) -> int | None:
         return None
 
 
+def _state_tmp(certdir: Path) -> Path:
+    """The temp path of one ``proxy.json`` write. Per thread as well as per
+    pid: the refcount republish, the watchdog and the request path all write
+    it from one process, and a shared name lets one's ``write_text`` truncate
+    another's before its replace."""
+    return Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+
+
 def write_daemon_state(
     certdir: Path, port: int, pid: int, fingerprint: str, handover: bool = False,
     ungated: bool = False,
@@ -11768,7 +11776,7 @@ def write_daemon_state(
         rec["handover"] = True
     if ungated:
         rec[_PLAIN_RELAY_UNGATED_KEY] = True
-    tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
+    tmp = _state_tmp(certdir)
     tmp.write_text(json.dumps(rec))
     os.replace(tmp, Path(certdir) / _STATE_FILE)
 
@@ -11791,8 +11799,12 @@ def mark_daemon_unpinnable(certdir: Path) -> None:
         return
     if not isinstance(st, dict) or st.get("pid") != os.getpid():
         return
+    # A departing daemon's read-modify-replace can land after the successor's
+    # publish and overwrite it (see `_republish_own_record`).
+    if st.get("handover") or this_process_is_draining():
+        return
     st["unpinnable"] = True
-    tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
+    tmp = _state_tmp(certdir)
     tmp.write_text(json.dumps(st))
     os.replace(tmp, path)
 
@@ -11920,7 +11932,7 @@ def clear_daemon_unpinnable(certdir: Path) -> bool:
         return False
     if not st.pop("unpinnable", None):
         return False
-    tmp = Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.tmp"
+    tmp = _state_tmp(certdir)
     try:
         tmp.write_text(json.dumps(st))
         os.replace(tmp, path)
