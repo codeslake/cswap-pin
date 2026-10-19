@@ -844,6 +844,21 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
     )
     failures = []
     skipped = []
+
+    def stop_accept_loops():
+        """Stop and join every live proxy accept loop; return those still serving."""
+        import cswap_pin.proxy as pp
+
+        serving = []
+        for t in threading.enumerate():
+            target = getattr(t, "_target", None)
+            if getattr(target, "__func__", None) is pp.PinProxy._accept_loop:
+                if not target.__self__._stop:
+                    serving.append(t)
+                target.__self__._stop = True
+                t.join(timeout=2)
+        return serving
+
     for i, (instance, name, method) in enumerate(work):
         wants = [
             a
@@ -863,6 +878,11 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
 
         with _pp._hop_trouble_lock:
             _pp._hop_trouble_at = 0.0
+        # AND A PROXY ACCEPT LOOP, BEFORE TOO. One that predates this case (a
+        # plain test leaked it; on macOS `_close_sockets_the_test_left_open`
+        # cannot close a listener) would pop `_ADOPTED_BACKLOG` under this case
+        # and then be blamed on it. Stopped here, it can do neither.
+        stop_accept_loops()
         try:
             # The autouse guards ran once for the DRIVER's tmp_path. Re-point
             # them at this case's dir, or a case's config writes land in the
@@ -903,6 +923,16 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             failures.append(f"--- {name} ---\n{traceback.format_exc()}")
         finally:
             mp.undo()
+            # A PROXY ACCEPT LOOP STILL SERVING, stopped FIRST: it keeps
+            # popping the module-global `_ADOPTED_BACKLOG` (and accepting on
+            # its socket) under every later case, and a dying loop or its
+            # `_serve_client` threads could rewrite the globals reset below.
+            # `case_adopting_a_socket_does_not_drop_the_client_already_queued_
+            # on_it` read `kept == []` on macOS CI, where all cases share one
+            # process. Fail THIS case, which leaked it. A loop whose `_stop` is
+            # already set is just slow to exit.
+            if stop_accept_loops():
+                failures.append(f"--- {name} ---\nleft a proxy accept loop serving")
             # A MODULE GLOBAL IS OUTSIDE MONKEYPATCH'S REACH, and this one
             # decides how the relay frames replies. `this_process_is_draining`
             # matches the marker BASENAME — the pid — so a drain announced
@@ -930,22 +960,6 @@ def run_cases(instance, request, tmp_path_factory, extra=None):
             # test time. Same shape as `_DRAINING_DEPTH` above.
             with _pp._hop_trouble_lock:
                 _pp._hop_trouble_at = 0.0
-            # AND A PROXY ACCEPT LOOP STILL SERVING. It keeps popping the
-            # module-global `_ADOPTED_BACKLOG` (and accepting on its socket)
-            # under every later case: `case_adopting_a_socket_does_not_drop_
-            # the_client_already_queued_on_it` read `kept == []` on macOS CI,
-            # where all cases share one process. Stop it so the next case
-            # starts clean, and fail THIS case, which is the one that leaked
-            # it. A loop whose `_stop` is already set is just slow to exit.
-            for t in threading.enumerate():
-                target = getattr(t, "_target", None)
-                if getattr(target, "__func__", None) is _pp.PinProxy._accept_loop:
-                    if not target.__self__._stop:
-                        failures.append(
-                            f"--- {name} ---\nleft a proxy accept loop serving"
-                        )
-                    target.__self__._stop = True
-                    t.join(timeout=2)
     if failures:
         raise AssertionError(
             f"{len(failures)} of {len(work)} cases failed:\n\n" + "\n".join(failures)
