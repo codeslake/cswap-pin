@@ -35399,6 +35399,23 @@ class TestTheDaemonRaisesItsFdLimit:
         assert "before soft=2048 " in lines[1] and " after soft=2048 " in lines[1]
 
 
+def test_a_reaper_whose_ps_fails_returns_instead_of_raising(
+        tmp_path, monkeypatch):
+    """T2725: `_mine()` answers a ps failure with the arity its caller
+    unpacks, so a ps that times out on a loaded host ends the sweep quietly
+    (a `finally` runs it) rather than as a ValueError that replaces the
+    case's own failure."""
+    import subprocess
+
+    import conftest
+
+    def ps(*a, **k):
+        raise subprocess.TimeoutExpired("ps", 5)
+
+    monkeypatch.setattr(subprocess, "run", ps)
+    conftest._reap_pin_processes(tmp_path, timeout=1.0)
+
+
 class TestAHolderRespawnsASuccessorThatDiesBeforePublishing:
     """T2071: a deploy's `uv tool install --force` rebuilds the venv in place, a
     code-watch tick lands inside it, and the successor the HOLDER spawns for the
@@ -35595,7 +35612,13 @@ else:
                 client.close()
             origin.release.set()
             origin.srv.close()
-            lineage = carrying_the_root()
+            # A ps that fails must not skip the reap or replace the body's
+            # failure: `lineage` stays None and the assert below fails clean.
+            lineage = None
+            try:
+                lineage = carrying_the_root()
+            except (OSError, subprocess.SubprocessError):
+                pass
             _reap_pin_processes(certdir)
             shutil.rmtree(base, ignore_errors=True)
         # Past the `finally` only when the body did not raise, so a failure
@@ -35636,6 +35659,50 @@ else:
             self, monkeypatch):
         with self._held_reply_across_a_window(monkeypatch, 1.0) as (t, rest):
             self._a_successor_serves_and_the_reply_completed(t, rest)
+
+    def case_a_scan_that_fails_in_the_finally_still_reaps(self, monkeypatch):
+        """T2725: the helper's `finally` scans before it reaps. A ps that
+        times out there must not skip the reap (the leak this closes) nor
+        replace the body's own failure. The body stops right after the
+        launcher returns, with the holder and standby up."""
+        import shutil
+        import subprocess
+
+        from conftest import _reap_pin_processes
+        from cswap_pin import proxy as pp
+
+        real, armed, base, up = subprocess.run, [], [], []
+
+        def carrying():
+            out = real(["ps", "-ww", "-eo", "pid=,command="],
+                       capture_output=True, text=True, timeout=5).stdout
+            return [ln for ln in out.splitlines() if str(base[0]) in ln]
+
+        def run(argv, *a, **k):
+            if armed and argv[0] == "ps":
+                armed.clear()
+                raise subprocess.TimeoutExpired(argv, 5)
+            return real(argv, *a, **k)
+
+        def stop_here(certdir):
+            base.append(certdir.parent)
+            up.extend(self._until("the lineage never came up", carrying, 10))
+            armed.append(1)
+            raise RuntimeError("the body stopped")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        monkeypatch.setattr(pp, "read_daemon_state", stop_here)
+        try:
+            with pytest.raises(RuntimeError, match="the body stopped"):
+                with self._held_reply_across_a_window(monkeypatch, 1.0):
+                    pass
+            assert up and not armed, "the fault did not fire on a live lineage"
+            assert not carrying(), carrying()
+            assert not base[0].exists()
+        finally:
+            for b in base:
+                _reap_pin_processes(b / "pin-proxy")
+                shutil.rmtree(b, ignore_errors=True)
 
     def case_a_window_of_several_seconds_takes_several_respawns(
             self, monkeypatch):

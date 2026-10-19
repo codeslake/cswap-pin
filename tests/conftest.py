@@ -604,7 +604,7 @@ def _reap_pin_processes(certdir, timeout: float = 20.0) -> None:
             out = subprocess.run(["ps", "-ww", "-eo", "pid=,command="],
                                  capture_output=True, text=True, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
-            return [], []
+            return [], [], []
         standbys, holders, daemons = [], [], []
         for line in out.splitlines():
             pid_s, _, cmd = line.strip().partition(" ")
