@@ -9283,6 +9283,52 @@ def test_a_hot_stamp_left_by_a_plain_test_does_not_blind_the_first_run_cases_dea
             pp._hop_trouble_at = 0.0
 
 
+def test_a_case_that_leaves_a_proxy_accept_loop_serving_fails_and_the_loop_is_stopped(
+        request, tmp_path_factory):
+    """T2715: an accept loop left running pops `_ADOPTED_BACKLOG` (a module
+    global) out from under the next case, which is how
+    `case_adopting_a_socket_does_not_drop_the_client_already_queued_on_it`
+    read `kept == []` on macOS CI. `run_cases` must fail the case that leaked
+    it, and stop the loop so the case after it starts clean. A case that
+    stopped its own loop is not blamed."""
+    import cswap_pin.proxy as pp
+
+    made = []
+
+    def serving_loop():
+        srv = pp.PinProxy.__new__(pp.PinProxy)
+        srv._stop = False
+        srv._srv = socket.socket()
+        srv._srv.bind(("127.0.0.1", 0))
+        srv._srv.listen(1)
+        t = threading.Thread(target=srv._accept_loop, daemon=True)
+        t.start()
+        made.append((srv, t))
+        return srv, t
+
+    class _Holder:
+        def case_leaves_one_serving(self):
+            serving_loop()
+
+        def case_stops_its_own(self):
+            srv, t = serving_loop()
+            srv._stop = True
+            t.join(timeout=2)
+
+    try:
+        with pytest.raises(AssertionError) as exc:
+            run_cases(_Holder(), request, tmp_path_factory)
+        msg = str(exc.value)
+        assert "case_leaves_one_serving" in msg, msg
+        assert "case_stops_its_own" not in msg, msg
+        assert not any(t.is_alive() for _, t in made), (
+            "the leaked accept loop was left running for the next case")
+    finally:
+        for srv, _ in made:
+            srv._stop = True
+            srv._srv.close()
+
+
 class TestDrainReportsWhatItCut:
     """The drain line must say what was still open, not always zero.
 
