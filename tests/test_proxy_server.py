@@ -25957,6 +25957,52 @@ class _FakeChromeBridge:
             self._srv.close()
 
 
+class _FakeBridgeOtherTraffic:
+    """bridge.claudeusercontent.com for what is NOT `/chrome/`: Claude Code
+    2.1.303 also uses this host for `/devices/mcp`, over https and wss.
+    ``post``: reads the head AND the whole body before it answers 200.
+    ``server_first``: answers 101 and speaks a frame at once, before the
+    client has sent one."""
+
+    def __init__(self, certdir: Path, mode: str):
+        self.got = b""
+        self.mode = mode
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(str(certdir / "leaf.pem"),
+                                  str(certdir / "leaf.key"))
+        self._srv = socket.socket()
+        self._srv.settimeout(15)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        from cswap_pin.proxy import _read_head
+        try:
+            conn, _ = self._srv.accept()
+            conn.settimeout(15)
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+            head = _read_head(tls)
+            self.got = head
+            if self.mode == "post":
+                n = int(re.search(rb"(?i)content-length: *(\d+)", head)[1])
+                body = b""
+                while len(body) < n:
+                    body += tls.recv(n - len(body))
+                self.got += body
+                tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            else:
+                tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                            b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                tls.sendall(b"\x81\x05hello")  # its own TLS record
+            tls.recv(1)  # held open until the client lets go
+        except Exception:  # noqa: BLE001 — the asserts report what is missing
+            pass
+        finally:
+            self._srv.close()
+
+
 class TestChromeBridgeCarriesThePinnedToken:
     """Claude in Chrome authenticates in its first WebSocket message, with the
     ACTIVE account's token, to a path naming the PINNED account. Without the
@@ -26103,3 +26149,77 @@ class TestChromeBridgeCarriesThePinnedToken:
             .get_values_for_type(x509.DNSName)
         assert set(san) == {"api.anthropic.com",
                             "bridge.claudeusercontent.com"}
+
+
+    def _other_traffic(self, certdir, mode, request, want):
+        """`request` through a pin that HOLDS a pinned token, to a relay that
+        answers as `mode`: (what reached the client, what the relay read)."""
+        from cswap_pin.proxy import PinProxy
+
+        bridge = _FakeBridgeOtherTraffic(certdir, mode)
+        proxy = PinProxy(certdir=certdir, pin_token_provider=lambda: "PINNED")
+        proxy._dial_tunnel = lambda target, conn: (
+            socket.create_connection(("127.0.0.1", bridge.port), timeout=10),
+            False)
+        proxy.start()
+        got = b""
+        try:
+            tls = self._open(proxy, certdir)
+            tls.settimeout(5)
+            tls.sendall(request)  # one TLS record: head and body together
+            try:
+                while want not in got:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+            except (OSError, ssl.SSLError) as e:
+                got += f" <{type(e).__name__}>".encode()
+            tls.close()
+        finally:
+            proxy.stop()
+        return got, bridge.got
+
+    POST = (b"POST /devices/mcp HTTP/1.1\r\n"
+            b"Host: bridge.claudeusercontent.com\r\n"
+            b"Authorization: Bearer ACTIVE\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 17\r\n\r\n"
+            b'{"jsonrpc":"2.0"}')
+
+    def case_a_post_with_a_body_to_another_path_reaches_the_relay(
+        self, certdir
+    ):
+        """`/devices/mcp` is not `/chrome/`: nothing there is rewritten, and
+        the body that followed the head must still get upstream."""
+        got, seen = self._other_traffic(
+            certdir, "post", self.POST, b"HTTP/1.1 200")
+        assert got.startswith(b"HTTP/1.1 200"), got
+        assert seen == self.POST, "the head or the body was altered"
+
+    def case_a_websocket_to_another_path_where_the_relay_speaks_first(
+        self, certdir
+    ):
+        """No client frame is owed on `/devices/mcp`: the relay's frame must
+        reach the client, and the handshake goes through as the client sent
+        it, compression offer included."""
+        req = (b"GET /devices/mcp HTTP/1.1\r\n"
+               b"Host: bridge.claudeusercontent.com\r\n"
+               b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+               b"Sec-WebSocket-Version: 13\r\n"
+               b"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
+        got, seen = self._other_traffic(certdir, "server_first", req, b"hello")
+        assert b"hello" in got, got
+        assert seen == req, "the handshake was altered"
+
+    def case_the_armed_trace_sees_the_bridge_mitm(self, certdir):
+        """The MITM replaces a blind tunnel, which writes a trace line (01759e19)
+        so a missing channel shows; this path owes the same line."""
+        import cswap_pin.proxy as pp
+
+        out = certdir / "armed-trace.log"
+        (certdir / pp._TRACE_SWITCH_FILE).write_text(str(out))
+        pp._TRACE_CACHE.clear()
+        self._other_traffic(certdir, "post", self.POST, b"HTTP/1.1 200")
+        assert out.exists() and "CONNECT bridge.claudeusercontent.com:443" in (
+            out.read_text()), "the bridge MITM left no line in the armed trace"

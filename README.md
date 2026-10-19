@@ -781,10 +781,13 @@ claude.ai-side assets are pinned.
 
 **Claude in Chrome** goes to a second host, `bridge.claudeusercontent.com`, and
 puts its bearer in the first WebSocket message (`{"type":"connect",
-"oauth_token": ...}`) rather than a header. The pin MITMs that host too and
-rewrites `oauth_token` in that one message to the pinned account's token. The
-handshake and every later frame pass through unchanged, and compression is
-left unnegotiated so the message stays readable. When there is nothing to swap
+"oauth_token": ...}`) rather than a header. The pin MITMs that host too, so it
+terminates TLS for the whole host, but rewrites only the connect frame of a
+`GET /chrome/...` WebSocket upgrade: `oauth_token` becomes the pinned account's
+token. Everything else on the host (Claude Code's `/devices/mcp`, over https
+and wss) is relayed byte for byte. On the `/chrome/` socket the handshake and
+every later frame pass through unchanged, and compression is left
+unnegotiated there so the message stays readable. When there is nothing to swap
 (the pin is the active account, or no pinned token can be minted) the host is
 tunnelled blind, as before. The MITM leaf carries both names, so an existing
 install gets a new leaf under the same CA on its next start.

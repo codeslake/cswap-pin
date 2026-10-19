@@ -23433,9 +23433,14 @@ class PinProxy:
         `oauth_token` in its first WebSocket message -- can carry the pin's.
         The handshake and every later frame pass through as they arrived.
 
-        `Sec-WebSocket-Extensions` is dropped from the handshake so no
-        compression is negotiated: a deflated connect frame could not be read
-        here, and this socket carries only small JSON control messages.
+        THE HOST IS NOT ALL `/chrome/`: Claude Code 2.1.303 also reaches
+        `/devices/mcp` here, over https and wss. Only a `GET /chrome/...`
+        WebSocket upgrade is read and rewritten; anything else is relayed
+        byte for byte, so a POST body is never held behind a handshake wait and
+        a server that speaks first after its 101 is never held for a client
+        frame. `Sec-WebSocket-Extensions` is dropped from the /chrome/
+        handshake only, so no compression is negotiated there: a deflated
+        connect frame could not be read here.
         True when the connection was handed to the pump.
         """
         try:
@@ -23444,6 +23449,9 @@ class PinProxy:
             token = None
         if not token:
             return self._capped_tunnel(target, conn)
+        self._tunnel_trace(
+            f"CONNECT {target} MITM'd (pin: only the /chrome/ connect frame "
+            "is rewritten, the rest is relayed unchanged)")
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         tls = up = None
         handed = False
@@ -23460,19 +23468,26 @@ class PinProxy:
             up = _wrap_upstream(
                 self._upstream_ctx(via_loopback), up, CHROME_BRIDGE_HOST)
             up.settimeout(_CHROME_HANDSHAKE_S)
-            up.sendall(_strip_ws_extensions(head))
-            if not _relay_upgrade(up, tls):
-                return False
-            frame = _read_ws_frame(tls)
-            if frame is None:
-                return False
-            swapped = _swap_connect_token(frame, token)
-            up.sendall(swapped or frame)
-            if swapped:
-                _log_lifecycle(
-                    "a Claude in Chrome bridge connected with the pinned "
-                    "account's token, so the extension signed in to it stays "
-                    "reachable across the account rotation")
+            if _is_chrome_upgrade(head):
+                up.sendall(_strip_ws_extensions(head))
+                if not _relay_upgrade(up, tls):
+                    return False
+                frame = _read_ws_frame(tls)
+                if frame is None:
+                    return False
+                swapped = _swap_connect_token(frame, token)
+                up.sendall(swapped or frame)
+                if swapped:
+                    _log_lifecycle(
+                        "a Claude in Chrome bridge connected with the pinned "
+                        "account's token, so the extension signed in to it "
+                        "stays reachable across the account rotation")
+            else:
+                up.sendall(head)
+            # Decrypted behind the head or the connect frame (a POST's body
+            # shares its TLS record), which the pump's selector cannot see.
+            while tls.pending():
+                up.sendall(tls.recv(65536))
             tls.settimeout(None)
             up.settimeout(None)
             _c = getattr(self._local, "conn", None) or conn
@@ -23812,6 +23827,15 @@ def _read_head(sock) -> bytes | None:
             return None
         buf += chunk
     return bytes(buf)
+
+
+def _is_chrome_upgrade(head: bytes) -> bool:
+    """Whether `head` is `GET /chrome/...` with `Upgrade: websocket`: the one
+    request on the bridge host whose first frame carries a bearer."""
+    first, *headers = head.split(b"\r\n")
+    return first.startswith(b"GET /chrome/") and any(
+        h.lower().startswith(b"upgrade:") and b"websocket" in h.lower()
+        for h in headers)
 
 
 def _strip_ws_extensions(head: bytes) -> bytes:
