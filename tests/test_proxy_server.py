@@ -238,9 +238,11 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
                            bearer: "str | None" = None,
                            ua: str | None = None, body: str = "{}",
                            extra_headers: "dict[str, str] | None" = None,
-                           method: str = "POST"):
+                           method: str = "POST",
+                           headers_out: "dict[str, str] | None" = None):
     """Make an HTTPS request to api.anthropic.com<path> via the proxy (CONNECT),
-    trusting the proxy's CA. Returns the response status.
+    trusting the proxy's CA. Returns the response status; `headers_out`, when
+    given, is filled with the response headers (lower-cased names).
 
     `bearer=None` sends no `Authorization` header at all -- a client that
     never had one, not one that was cleared. `extra_headers` merges in
@@ -263,6 +265,8 @@ def _request_through_proxy(proxy_port: int, ca_path: Path, path: str,
     resp = conn.getresponse()
     resp.read()
     conn.close()
+    if headers_out is not None:
+        headers_out.update((k.lower(), v) for k, v in resp.getheaders())
     return resp.status
 
 
@@ -594,6 +598,80 @@ class TestPinProxyServer:
         finally:
             proxy.stop()
             upstream.stop()
+
+    def case_a_swapped_profile_answer_carries_no_request_id(self, certdir):
+        # CC 2.1.304 stamps a profile answer by its `request-id` and copies the
+        # PINNED account's plan into the active credential; unstamped, the
+        # identity write still runs. Only the swapped answer loses the header.
+        from cswap_pin.proxy import PinProxy
+
+        reply = (b"HTTP/1.1 200 OK\r\nrequest-id: req_0123abc\r\n"
+                 b"Content-Length: 2\r\n\r\n{}")
+        # (path, ua, upstream refuses the pin's bearer, request-id kept)
+        for path, ua, refuse, kept in (
+            ("/api/oauth/profile", "claude-code/2.1.304", False, False),
+            ("/api/oauth/profile?a=b", "claude-code/2.1.304", False, False),
+            ("/api/oauth/profile", "claude-swap/1.0", False, True),
+            # the swap was refused: the unswapped fall-back answer is the
+            # active account's own and keeps its stamp
+            ("/api/oauth/profile", "claude-code/2.1.304", True, True),
+            ("/api/oauth/validate", "claude-code/2.1.304", False, True),
+        ):
+            upstream = _FakeUpstream(
+                certdir, reply=reply, reject_status=401,
+                reject_bearer="PIN-TOKEN" if refuse else None)
+            proxy = PinProxy(
+                certdir=certdir,
+                pin_token_provider=lambda: "PIN-TOKEN",
+                upstream=("127.0.0.1", upstream.port),
+            )
+            proxy.start()
+            try:
+                got: dict[str, str] = {}
+                status = _request_through_proxy(
+                    proxy.port, certdir / "ca.pem", path, bearer="disk-token",
+                    ua=ua, method="GET", body="", headers_out=got)
+                assert status == 200, (path, ua, refuse)
+                assert ("request-id" in got) is kept, (path, ua, refuse, got)
+            finally:
+                proxy.stop()
+                upstream.stop()
+
+    def case_an_absolute_form_swapped_profile_answer_carries_no_request_id(
+        self, certdir
+    ):
+        from cswap_pin.proxy import PinProxy, write_upstream_hint
+
+        chain = _RecordingChain(lambda req: (
+            b"HTTP/1.1 200 OK\r\nrequest-id: req_0123abc\r\n"
+            b"Content-Length: 2\r\n\r\n{}"))
+        proxy = None
+        try:
+            write_upstream_hint(certdir, f"http://127.0.0.1:{chain.port}")
+            proxy = PinProxy(certdir=certdir,
+                             pin_token_provider=lambda: "PINTOKEN",
+                             rediscover_chain=True)
+            proxy.start()
+            for ua, kept in (("claude-code/2.1.304", False),
+                             ("claude-swap/1.0", True)):
+                c = socket.create_connection(("127.0.0.1", proxy.port),
+                                             timeout=10)
+                try:
+                    c.sendall(
+                        "GET https://api.anthropic.com/api/oauth/profile "
+                        "HTTP/1.1\r\nHost: api.anthropic.com\r\n"
+                        f"User-Agent: {ua}\r\nConnection: close\r\n"
+                        "Authorization: Bearer ACTIVE\r\n\r\n".encode())
+                    answer = b""
+                    while chunk := c.recv(4096):
+                        answer += chunk
+                finally:
+                    c.close()
+                assert (b"request-id:" in answer.lower()) is kept, (ua, answer)
+        finally:
+            if proxy:
+                proxy.stop()
+            chain.stop()
 
     def case_inference_route_keeps_original_bearer(self, certdir):
         from cswap_pin.proxy import PinProxy
