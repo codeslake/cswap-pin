@@ -14949,6 +14949,7 @@ def _watch_own_code(
                 _note_mint_busy(_busy_s)
             elif not blind:
                 clear_blind_recycle(certdir)
+                setattr(server, "_dead_lineage_noted", False)
                 # AND TAKE THE MARK BACK. Recovery is not only "stop trying to
                 # recycle" -- the record has to stop saying the pin is dead, or
                 # the badge lies and every launch refuses a daemon that works.
@@ -14961,7 +14962,26 @@ def _watch_own_code(
                         "the pinned token can be minted again — cleared the "
                         "unpinnable mark"
                     )
-            replace_for_blind = blind and blind_recycle_due(certdir, now)
+            # A DEAD REFRESH LINEAGE IS NOT REPAIRED BY A SUCCESSOR. The refresh
+            # errors that need a re-login (claude-swap's `dead` set) are
+            # permanent, so a successor cannot mint either and replacing would
+            # be a handover per backoff step, for ever. `blind-recycle.json` is
+            # then never written, so the record says it instead: the mark
+            # `_read_alive_port` and the badge read, once per episode.
+            dead_lineage = blind and str(
+                getattr(_mint_provider, "blind_reason", "") or ""
+            ).startswith(("refresh invalid_grant", "refresh no_refresh_token"))
+            if dead_lineage and not getattr(server, "_dead_lineage_noted", False):
+                setattr(server, "_dead_lineage_noted", True)
+                with contextlib.suppress(OSError):
+                    mark_daemon_unpinnable(certdir)
+                _log_lifecycle(
+                    "the pinned account's refresh token is dead and a re-login "
+                    "is needed — replacing ourselves would not help, so no "
+                    "successor is asked for"
+                )
+            replace_for_blind = (blind and not dead_lineage
+                                 and blind_recycle_due(certdir, now))
             # A CALLER IN THE LOGIN SESSION IS WAITING FOR THE SOCKET. Its
             # rendezvous alone is a trigger (a daemon refused the Keychain
             # reports can_pin true while it serves, so it is neither blind nor

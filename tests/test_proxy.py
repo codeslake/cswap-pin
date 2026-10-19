@@ -31670,6 +31670,110 @@ class TestABlindDaemonRepairsItself:
         assert signalled == [] and exited == [], (
             "a HEALTHY pin was recycled on a timer")
 
+    # -- a dead refresh lineage: a successor cannot mint either ------------
+
+    class _CannotMint:
+        """A provider that mints nothing and says why, as the real one does.
+        With `mints_from_call` it mints from that call on (a re-login)."""
+
+        def __init__(self, reason, mints_from_call=None):
+            self.blind_reason = reason
+            self.mints_from_call = mints_from_call
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.mints_from_call and self.calls >= self.mints_from_call:
+                self.blind_reason = ""
+                return "a-token"
+            return None
+
+    def _own_record(self, tmp_path):
+        """`mark_daemon_unpinnable` and its eraser only touch a record that
+        names THIS process, so a tick can observe nothing without one."""
+        from cswap_pin import proxy as pin_proxy
+
+        (tmp_path / pin_proxy._STATE_FILE).write_text(json.dumps(
+            {"port": 41000, "pid": os.getpid(), "fingerprint": "FP"}))
+
+    def _count_marks(self, monkeypatch):
+        """Count calls to the real `mark_daemon_unpinnable`, which still runs."""
+        from cswap_pin import proxy as pin_proxy
+
+        marks = []
+        real = pin_proxy.mark_daemon_unpinnable
+        monkeypatch.setattr(pin_proxy, "mark_daemon_unpinnable",
+                            lambda cd: marks.append(cd) or real(cd))
+        return marks
+
+    @pytest.mark.parametrize("err", ["invalid_grant", "no_refresh_token"])
+    def test_a_dead_lineage_is_marked_once_and_not_replaced(
+            self, monkeypatch, tmp_path, err):
+        """A refresh error that needs a re-login is permanent: a successor
+        cannot mint either, so replacing is a handover per backoff for ever.
+        The mark keeps the pin reading as not applying, and
+        `blind-recycle.json` (which `runtime_health` reads) is never written."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._own_record(tmp_path)
+        marks, said = self._count_marks(monkeypatch), []
+        monkeypatch.setattr(pin_proxy, "_log_lifecycle", said.append)
+        provider = self._CannotMint(f"refresh {err} for slot 2 (x)")
+
+        signalled, exited = self._drive(monkeypatch, tmp_path, provider)
+
+        assert provider.calls == 2, "both ticks must have asked the provider"
+        assert signalled == [] and exited == [], (
+            f"a dead lineage was replaced; signals {signalled}, exits {exited}")
+        assert not pin_proxy._blind_recycle_path(tmp_path).exists()
+        assert len(marks) == 1, f"marked {len(marks)} times across two ticks"
+        assert pin_proxy.read_daemon_state(tmp_path)["unpinnable"] is True
+        assert sum("re-login" in m for m in said) == 1, said
+
+    @pytest.mark.parametrize("reason", [
+        "refresh transient for slot 2 (x)",
+        "refresh invalid_client for slot 2 (x)",
+        "refresh foreign-lineage for slot 2 (x)",
+        "no token after refresh for slot 2 (x)",
+        "",
+    ])
+    def test_any_other_blindness_still_replaces_itself(
+            self, monkeypatch, tmp_path, reason):
+        """THE CONTROL: only a lineage that needs a re-login stops the recycle."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._own_record(tmp_path)
+        marks = self._count_marks(monkeypatch)
+
+        signalled, exited = self._drive(
+            monkeypatch, tmp_path, self._CannotMint(reason))
+
+        assert any(sig == pin_proxy._REPLACE_ME_SIGNAL for _p, sig in signalled)
+        assert exited == [0]
+        assert marks == []
+
+    def test_a_dead_lineage_mark_is_cleared_when_minting_works_again(
+            self, monkeypatch, tmp_path):
+        """After a re-login the mark goes, and a SECOND dead lineage on the
+        same daemon is reported again rather than staying silent."""
+        from cswap_pin import proxy as pin_proxy
+
+        self._own_record(tmp_path)
+        marks = self._count_marks(monkeypatch)
+        dead = "refresh invalid_grant for slot 2 (x)"
+        provider = self._CannotMint(dead, mints_from_call=2)
+        srv = self._Srv(provider)
+
+        self._drive_with(monkeypatch, tmp_path, srv)    # dead, then minting
+        assert len(marks) == 1
+        assert "unpinnable" not in pin_proxy.read_daemon_state(tmp_path), (
+            "the record still says the pin is dead after it recovered")
+
+        provider.mints_from_call, provider.blind_reason = None, dead
+        self._drive_with(monkeypatch, tmp_path, srv)    # dead again
+        assert len(marks) == 2, "a second episode was not reported"
+        assert pin_proxy.read_daemon_state(tmp_path)["unpinnable"] is True
+
     def test_a_server_with_no_provider_is_left_alone(self, monkeypatch, tmp_path):
         """`_can_mint` answers None for a stand-in with no provider. Acting on
         falsiness instead of `is False` recycles every test server, and every
