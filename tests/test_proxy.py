@@ -31528,6 +31528,21 @@ class TestABlindDaemonRepairsItself:
 
     _Ticks = _Ticks
 
+    @pytest.fixture(autouse=True)
+    def _no_drain_outlives_a_test(self):
+        """A replace announces a drain its exiting process never withdraws.
+        `os._exit` is stubbed here, so the drain would answer yes for every
+        later test and `mark_daemon_unpinnable` would stand down for it."""
+        from cswap_pin import proxy as pin_proxy
+
+        def clear():
+            with pin_proxy._DRAINING_LOCK:
+                pin_proxy._DRAINING_DEPTH.clear()
+
+        clear()
+        yield
+        clear()
+
     def _drive_with(self, monkeypatch, tmp_path, srv):
         """`_drive` for a server the caller already holds, so a test can read
         state back off the instance."""
@@ -31760,6 +31775,64 @@ class TestABlindDaemonRepairsItself:
         assert pin_proxy.read_daemon_state(tmp_path)["unpinnable"] is True, (
             "a rewrite dropped the mark and nothing put it back")
         assert sum("re-login" in m for m in said) == 1, said
+
+    @pytest.mark.parametrize("arm", ["handover", "draining"])
+    def test_a_departing_daemon_leaves_the_record_alone(
+            self, monkeypatch, tmp_path, arm):
+        """Once a successor is being spawned the record is the successor's to
+        publish: a read-modify-replace here can land after its write and put
+        the departing daemon's identity back (`_republish_own_record`'s
+        incident). Both shared callers, the watchdog re-mark and
+        `_warn_unpinnable`, are covered by the function itself."""
+        from cswap_pin import proxy as pin_proxy
+
+        rec = tmp_path / pin_proxy._STATE_FILE
+        pin_proxy.write_daemon_state(
+            tmp_path, 41000, os.getpid(), "FP", handover=arm == "handover")
+        monkeypatch.setattr(pin_proxy, "this_process_is_draining",
+                            lambda: arm == "draining")
+        before = rec.read_bytes()
+
+        pin_proxy.mark_daemon_unpinnable(tmp_path)
+
+        assert rec.read_bytes() == before, "a departing daemon rewrote the record"
+        # THE CONTROL: the same record without the departure is marked, so the
+        # silence above was the guard and not a mark that never writes.
+        monkeypatch.setattr(pin_proxy, "this_process_is_draining", lambda: False)
+        pin_proxy.write_daemon_state(tmp_path, 41000, os.getpid(), "FP")
+        pin_proxy.mark_daemon_unpinnable(tmp_path)
+        assert json.loads(rec.read_text())["unpinnable"] is True
+
+    def test_state_writers_on_different_threads_use_different_temp_paths(
+            self, monkeypatch, tmp_path):
+        """The refcount republish, the watchdog and the request path write
+        `proxy.json` from three threads of one process; a temp name keyed by
+        pid alone lets one's `write_text` truncate another's before its
+        replace. The threads stay alive: an ident is reused once one exits."""
+        from cswap_pin import proxy as pin_proxy
+
+        srcs, release = [], threading.Event()
+        real = os.replace
+        monkeypatch.setattr(os, "replace",
+                            lambda s, d: srcs.append(os.fspath(s)) or real(s, d))
+
+        def on_a_thread(fn):
+            done = threading.Event()
+            t = threading.Thread(
+                target=lambda: (fn(tmp_path), done.set(), release.wait(5)))
+            t.start()
+            assert done.wait(5)
+            return t
+
+        pin_proxy.write_daemon_state(tmp_path, 41000, os.getpid(), "FP")
+        threads = [on_a_thread(pin_proxy.mark_daemon_unpinnable),
+                   on_a_thread(pin_proxy.clear_daemon_unpinnable)]
+        release.set()
+        for t in threads:
+            t.join()
+
+        assert len(srcs) == 3, f"expected a replace per writer, saw {srcs}"
+        assert len(set(srcs)) == 3, f"writers shared a temp path: {srcs}"
 
     @pytest.mark.parametrize("reason", [
         "refresh transient for slot 2 (x)",
