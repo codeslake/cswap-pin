@@ -9283,6 +9283,91 @@ def test_a_hot_stamp_left_by_a_plain_test_does_not_blind_the_first_run_cases_dea
             pp._hop_trouble_at = 0.0
 
 
+def _serving_accept_loop(pp):
+    """A `PinProxy._accept_loop` thread blocked in accept() with `_stop` unset.
+
+    A synthetic PinProxy (no `__init__`) plus a listener that signals once the
+    loop is inside accept(), so a caller that sets `_stop` and walks away is
+    certain the thread is still alive afterwards.
+    """
+    entered = threading.Event()
+
+    class _Listener(socket.socket):
+        def accept(self):
+            entered.set()
+            return super().accept()
+
+    srv = pp.PinProxy.__new__(pp.PinProxy)
+    srv._stop = False
+    srv._srv = _Listener()
+    srv._srv.bind(("127.0.0.1", 0))
+    srv._srv.listen(1)
+    t = threading.Thread(target=srv._accept_loop, daemon=True)
+    t.start()
+    assert entered.wait(2), "the accept loop never reached accept()"
+    return srv, t
+
+
+def test_a_case_that_leaves_a_proxy_accept_loop_serving_fails_and_the_loop_is_stopped(
+        request, tmp_path_factory, monkeypatch):
+    """T2715: an accept loop left running pops `_ADOPTED_BACKLOG` (a module
+    global) out from under the next case, which is how
+    `case_adopting_a_socket_does_not_drop_the_client_already_queued_on_it`
+    read `kept == []` on macOS CI. `run_cases` must fail the case that leaked
+    it, and stop the loop so the case after it starts clean. A case that
+    set `_stop` on its own loop (still winding down) is not blamed."""
+    import cswap_pin.proxy as pp
+
+    monkeypatch.setattr(pp, "_ADOPTED_BACKLOG", [])
+    made = []
+
+    def serving_loop():
+        made.append(_serving_accept_loop(pp))
+        return made[-1]
+
+    class _Holder:
+        def case_leaves_one_serving(self):
+            serving_loop()
+
+        def case_stops_its_own(self):
+            srv, _ = serving_loop()
+            srv._stop = True
+
+    try:
+        with pytest.raises(AssertionError) as exc:
+            run_cases(_Holder(), request, tmp_path_factory)
+        msg = str(exc.value)
+        assert "case_leaves_one_serving" in msg, msg
+        assert "case_stops_its_own" not in msg, msg
+        assert not any(t.is_alive() for _, t in made), (
+            "the leaked accept loop was left running for the next case")
+    finally:
+        for srv, _ in made:
+            srv._stop = True
+            srv._srv.close()
+
+
+def test_a_proxy_accept_loop_serving_before_run_cases_is_stopped_and_not_blamed(
+        request, tmp_path_factory, monkeypatch):
+    """T2715: a loop that predates the case (leaked by a plain test; on macOS
+    `_close_sockets_the_test_left_open` cannot close a listener) must be
+    stopped before the first case runs, and that case must not be blamed."""
+    import cswap_pin.proxy as pp
+
+    monkeypatch.setattr(pp, "_ADOPTED_BACKLOG", [])
+    srv, t = _serving_accept_loop(pp)
+
+    class _Holder:
+        def case_starts_clean(self):
+            assert not t.is_alive(), "a loop from before the case was still serving"
+
+    try:
+        run_cases(_Holder(), request, tmp_path_factory)
+    finally:
+        srv._stop = True
+        srv._srv.close()
+
+
 class TestDrainReportsWhatItCut:
     """The drain line must say what was still open, not always zero.
 
