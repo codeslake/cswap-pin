@@ -23461,9 +23461,11 @@ class PinProxy:
             if dialled is None:
                 return False
             up, via_loopback = dialled  # raw first, so a failed wrap closes it
+            # Before the wrap, which inherits it: a hop that answered 200 and
+            # went silent would park this thread in the handshake for good.
+            up.settimeout(_CHROME_HANDSHAKE_S)
             up = _wrap_upstream(
                 self._upstream_ctx(via_loopback), up, CHROME_BRIDGE_HOST)
-            up.settimeout(_CHROME_HANDSHAKE_S)
             if _is_chrome_upgrade(head):
                 up.sendall(_strip_ws_extensions(head))
                 if not _relay_upgrade(up, tls):

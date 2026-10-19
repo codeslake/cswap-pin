@@ -26076,6 +26076,48 @@ class TestChromeBridgeCarriesThePinnedToken:
         assert bridge.frames[1] == later_frame, (
             "a frame after the connect message was altered")
 
+    def case_a_relay_that_never_speaks_tls_is_given_up_on_and_released(
+        self, certdir, monkeypatch
+    ):
+        """A hop that answers CONNECT 200 and goes silent passes the open
+        check, then parks the thread in the UPSTREAM handshake: unbounded, it
+        kept three fds and the connection's debt for good."""
+        import cswap_pin.proxy as px
+
+        monkeypatch.setattr(px, "_CHROME_HANDSHAKE_S", 1.0)
+        silent = socket.socket()
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(1)
+        silent.settimeout(10)
+        proxy = px.PinProxy(certdir=certdir, pin_token_provider=lambda: "P")
+        proxy._dial_tunnel = lambda target, conn: (
+            socket.create_connection(silent.getsockname(), timeout=10), False)
+        proxy.start()
+        try:
+            tls = self._open(proxy, certdir)
+            tls.sendall(b"GET /chrome/pin-uuid HTTP/1.1\r\n"
+                        b"Host: bridge.claudeusercontent.com\r\n\r\n")
+            hop, _ = silent.accept()
+            assert proxy.inflight_requests() == 1, "premise: the debt is owed"
+            hop.settimeout(4)
+            try:  # the proxy's ClientHello, then EOF once it gives up
+                while hop.recv(4096):
+                    pass
+                cut = True
+            except OSError:
+                cut = False
+            end = time.monotonic() + 5
+            while (proxy.inflight_requests() or proxy.live_client_count()) \
+                    and time.monotonic() < end:
+                time.sleep(0.05)
+            released = not (proxy.inflight_requests()
+                            or proxy.live_client_count())
+            tls.close()
+        finally:
+            proxy.stop()
+        assert cut, "the upstream handshake was never given up on"
+        assert released, "the connection was not released after giving up"
+
     def case_without_a_pinned_token_the_bridge_is_a_blind_tunnel(
         self, certdir
     ):
