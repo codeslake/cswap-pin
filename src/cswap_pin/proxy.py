@@ -11745,10 +11745,8 @@ def read_port_hint(certdir: Path) -> int | None:
 
 
 def _state_tmp(certdir: Path) -> Path:
-    """The temp path of one ``proxy.json`` write. Per thread as well as per
-    pid: the refcount republish, the watchdog and the request path all write
-    it from one process, and a shared name lets one's ``write_text`` truncate
-    another's before its replace."""
+    """Per pid AND thread: republish, watchdog and request path write
+    ``proxy.json`` from one process, and a shared temp truncates a peer's."""
     return Path(certdir) / f"{_STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
 
 
@@ -11799,8 +11797,7 @@ def mark_daemon_unpinnable(certdir: Path) -> None:
         return
     if not isinstance(st, dict) or st.get("pid") != os.getpid():
         return
-    # A departing daemon's read-modify-replace can land after the successor's
-    # publish and overwrite it (see `_republish_own_record`).
+    # A departing daemon's replace can clobber its successor's publish.
     if st.get("handover") or this_process_is_draining():
         return
     st["unpinnable"] = True
