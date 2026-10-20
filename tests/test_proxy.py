@@ -23899,11 +23899,15 @@ class TestHealReWiresAServingDaemon:
         finally:
             srv.close()
 
-    def _heal_from_shell(self, tmp_path, monkeypatch, record, env=lambda _p: {}):
+    def _heal_from_shell(self, tmp_path, monkeypatch, record, env=lambda _p: {},
+                         dangling=False):
         """Heal from a shell whose proxy variables are ``env(daemon port)``
         (empty = a plain shell) over an ``upstream.json`` holding ``record``
-        (None = absent). Returns ``upstream.json`` as a dict, or None."""
+        (None = absent); ``dangling`` empties the registry the pin names.
+        Returns ``upstream.json`` as a dict, or None."""
         srv, port, _cfg = self._fixture(tmp_path, monkeypatch, wired_port=None)
+        if dangling:
+            (tmp_path / "sequence.json").write_text(json.dumps({"accounts": {}}))
         for name in ("HTTPS_PROXY", "https_proxy", "CSWAP_PIN_PORT",
                      "NODE_EXTRA_CA_CERTS"):
             monkeypatch.delenv(name, raising=False)
@@ -23944,6 +23948,15 @@ class TestHealReWiresAServingDaemon:
             tmp_path, monkeypatch, record,
             lambda _port: {"HTTPS_PROXY": "http://127.0.0.1:9"})
         assert got == record
+
+    def case_heal_records_nothing_for_a_dangling_pin(self, tmp_path, monkeypatch):
+        """A pin whose account is gone from the registry has no slot, and the
+        rest of `heal` is a total no-op for it: the hop stays unrecorded."""
+        empty = {"proxy": "", "ca": "", "next": ""}
+        got = self._heal_from_shell(
+            tmp_path, monkeypatch, empty,
+            lambda _port: {"HTTPS_PROXY": "http://127.0.0.1:9"}, dangling=True)
+        assert got == empty
 
     def case_heal_never_records_the_pins_own_port(self, tmp_path, monkeypatch):
         """A wired session's Bash child exports the pin as its proxy. Recorded,

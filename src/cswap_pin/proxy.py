@@ -23411,7 +23411,8 @@ class PinProxy:
         THE RECORD HAS TO BE ABLE TO GROW AFTER THE LAUNCH THAT MADE IT.
         `_probe_next_hop` runs at hint-writing time and nowhere else, and
         `cswap pin --ensure` — what an rc hook calls before every `claude` —
-        routes to `heal`, which never re-stamps the hint. So the only chance
+        routes to `heal`, which never re-stamps a non-empty hint and fills an
+        empty one (T2753). So the only chance
         to learn the outer hop was a launch that happened while the inner one
         was answering. Miss it once and the chain is single-hop for good.
 
