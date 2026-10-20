@@ -24908,6 +24908,8 @@ class TestSessionAffinityOnMessages:
         out on slot 1's bearer, where its cache is."""
         from cswap_pin import proxy as pp
         for headers in self.SUBAGENT:
+            monkeypatch.setattr(type(self), "TOKENS",
+                                {"1": "tok-A", "2": "tok-B"})
             seen = self._wire(monkeypatch, certdir, expires=1)
             self._send(certdir, [("tok-A", "S0")])
             self._seed("S", "tok-A")
