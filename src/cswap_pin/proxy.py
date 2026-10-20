@@ -3342,8 +3342,11 @@ _AFFINITY_MAX = 512  # entries per table below
 _AFFINITY_REFRESH_S = 30.0
 # cswap adopts a token Claude Code refreshed itself about a second after the
 # pin first sees it: one more immediate rebuild for a token still unseen after
-# this long, so a request is not left waiting for the refresh above
+# this long, so a request is not left waiting for the refresh above. Only for
+# the window after the token's first sighting: a token no slot ever adopts
+# (a fresh /login) is served by the refresh alone after it.
 _AFFINITY_UNSEEN_RETRY_S = 2.0
+_AFFINITY_UNSEEN_WINDOW_S = 10.0
 _AFFINITY_STALE_S = 120.0
 # A snapshot older than the bound above may still keep a slot read at least
 # the margin (percentage points) under its bar, until it is this old: cswap's
@@ -3361,8 +3364,9 @@ _AFFINITY_CARRY_FILE = "affinity-carry.json"
 # session -> ((slot, email), wall time of its last request): carried in, not
 # yet landed in `_affinity` by a snapshot
 _affinity_carried: dict[str, tuple] = {}
-# client token -> monotonic time of the last immediate rebuild started for it
-_affinity_unseen: dict[str, float] = {}
+# client token -> monotonic times of the first and of the last immediate
+# rebuild started for it
+_affinity_unseen: dict[str, tuple[float, float]] = {}
 # session -> (bearer it last went out on, monotonic time of that request)
 _affinity: dict[str, tuple[str, float]] = {}
 # bearer -> (slot, email) whose stored credential held it. Grows with every
@@ -3405,8 +3409,6 @@ _affinity_logged: dict[tuple, tuple] = {}
 # went out on]. Held only while armed, and only as long as the session's
 # `_affinity` entry (dropped with it).
 _affinity_last: dict[str, list] = {}
-# what Claude Code puts on a subagent's request (it shares its parent's session id)
-_SUBAGENT_HEADERS = ("x-claude-code-agent-id", "x-claude-code-parent-agent-id")
 _AFFINITY_BODY_MAX = 8 << 20  # one body; a longer one is not kept
 _AFFINITY_BODY_TOTAL = 128 << 20  # all of them; the oldest go first
 # keep-alive pings since `_AFFINITY_SINCE` (this process's start). `refused`
@@ -3626,11 +3628,13 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
 def _affinity_kick(threshold: float, strategy: str, unseen: str = "") -> None:
     """Start `_affinity_rebuild` on a thread of its own when the last one
     started `_AFFINITY_REFRESH_S` ago, or at once for a client token
-    (``unseen``) no rebuild has been started for in `_AFFINITY_UNSEEN_RETRY_S`,
-    and none is running (one at a time, a failed one is not retried per
-    request). The immediate one returns a545ec4's: "the 30 s refresh resolves a
-    rotated token" did not hold, 4 of 4 measured declines for an unseen token
-    sat inside that 30 s. A token that stays unseen costs one per interval.
+    (``unseen``) no rebuild has been started for in `_AFFINITY_UNSEEN_RETRY_S`
+    and first seen less than `_AFFINITY_UNSEEN_WINDOW_S` ago, and none is
+    running (one at a time, a failed one is not retried per request). The
+    immediate one returns a545ec4's: "the 30 s refresh resolves a rotated
+    token" did not hold, 4 of 4 measured declines for an unseen token sat
+    inside that 30 s. A token that stays unseen costs one per interval for the
+    window, then none.
 
     A rebuild that has run `_AFFINITY_STALE_S` is ABANDONED: a hung Keychain
     or store read must not end affinity while it hangs. Its thread is left to
@@ -3643,19 +3647,20 @@ def _affinity_kick(threshold: float, strategy: str, unseen: str = "") -> None:
     now = time.monotonic()
     snap = _affinity_snap
     with _affinity_lock:
+        first, last = _affinity_unseen.get(unseen, (now, -math.inf))
         age = now - snap["tried"]
         abandon = (snap["busy"] and age >= _AFFINITY_STALE_S
                    and snap["stuck"] < _AFFINITY_STUCK_MAX)
         due = abandon or (not snap["busy"] and (
             age >= _AFFINITY_REFRESH_S
-            or (unseen and now - _affinity_unseen.get(unseen, -math.inf)
-                >= _AFFINITY_UNSEEN_RETRY_S)))
+            or (unseen and now - first < _AFFINITY_UNSEEN_WINDOW_S
+                and now - last >= _AFFINITY_UNSEEN_RETRY_S)))
         if due:
             if abandon:
                 snap["stuck"] += 1
             snap.update(busy=True, tried=now)
             if unseen:
-                _bounded_put(_affinity_unseen, unseen, now)
+                _bounded_put(_affinity_unseen, unseen, (first, now))
     if abandon:
         _log_lifecycle(
             f"session affinity: a snapshot rebuild started {age:.0f}s ago has "
@@ -3787,18 +3792,21 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     looked at; a new, cold, no-headroom, no-expiry or expired one rebinds the
     session to the client's bearer and forwards it as it always did. Nor is a
     request whose `x-api-key` is unlike its bearer: that pair is the client's
-    own. A request not kept because the slot is RESTING, or that is a
-    subagent's, forwards the client's bearer and leaves the binding as it was.
+    own. A request not kept because the slot is RESTING (a refusal that did
+    not take it out of the snapshot) forwards the client's bearer and leaves
+    the binding as it was; a slot that is gone (dropped at its bar, walled,
+    expired) rebinds, subagent or not.
 
     NEVER READS THE STORE: it reads the snapshot `_affinity_rebuild` made on
     its own thread. With no snapshot yet, one older than `_AFFINITY_STALE_S`
     (unless it is under `_AFFINITY_STALE_MAX_S` and read the kept slot
     `_AFFINITY_STALE_MARGIN` points under its bar with an unexpired token),
-    or a client token it has not seen (which starts a rebuild at once, once
-    per token), the client's bearer goes out and the session is left as it
-    was (see the comment below), until that rebuild has run. A session
-    carried in from a predecessor is not looked at until the first snapshot
-    has landed its binding.
+    or a client token it has not seen (which starts a rebuild at once, again
+    after `_AFFINITY_UNSEEN_RETRY_S` for `_AFFINITY_UNSEEN_WINDOW_S`), the
+    client's bearer goes out and the session is left as it was (see the
+    comment below), until that rebuild has run. A session carried in from a
+    predecessor is not looked at until the first snapshot has landed its
+    binding.
 
     A warm session whose slot is passed over leaves one lifecycle line naming
     why (`_affinity_due`: one per reason per `_BUSY_REPORT_COOLDOWN_S`).
@@ -3813,7 +3821,6 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         return None
     ttl, threshold, strategy = cfg
     client = session = key = ""
-    agent = False
     for k, v in headers:
         kl = k.lower()
         if kl == "authorization":
@@ -3822,8 +3829,6 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
             session = v
         elif kl == "x-api-key":
             key = v
-        elif kl in _SUBAGENT_HEADERS:
-            agent = True
     if not (client and session) or key not in ("", client):
         return None
     now = time.monotonic()
@@ -3841,7 +3846,11 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         mine = _affinity_idents.get(client)
         age = now - _affinity_snap["at"]
         fresh = age < _AFFINITY_STALE_S
-        resting = held != mine and _affinity_rest.get(held, 0.0) > now
+        # RESTING holds a binding only while the slot is otherwise keepable: a
+        # 429 at the wall also drops it from `_affinity_kept`, and its rest runs
+        # to the window's reset, hours long
+        resting = (held != mine and held in _affinity_kept
+                   and _affinity_rest.get(held, 0.0) > now)
         stored = (held and mine and held != mine and not resting
                   and _affinity_kept.get(held))
         # A snapshot too old to trust may still rule for a slot it read far
@@ -3859,9 +3868,8 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         if ruled:
             token = (stored and not oauth.is_oauth_token_expired(stored[1])
                      and stored[0])
-            # a rest ends and a subagent is not the session's own turn: neither
-            # moves the session to the live account
-            if token or not (resting or agent):
+            # a rest ends: it does not move the session to the live account
+            if token or not resting:
                 _bounded_put(_affinity, session,
                              (prior[0] if token else client, now))
         elif fresh:
@@ -3946,7 +3954,7 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
     session = client = ""
     for k, v in headers:
         kl = k.lower()
-        if kl in _SUBAGENT_HEADERS:
+        if kl in ("x-claude-code-agent-id", "x-claude-code-parent-agent-id"):
             return False
         if kl == "x-claude-code-session-id":
             session = v

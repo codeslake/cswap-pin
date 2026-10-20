@@ -24064,6 +24064,14 @@ class TestSessionAffinityOnMessages:
         from cswap_pin import proxy as pp
         pp._affinity[session] = (token, time.monotonic() - age)
 
+    @staticmethod
+    def _age_unseen(token, seconds):
+        """The rebuild for the unseen ``token`` started `seconds` ago, and it
+        was first seen as long before."""
+        from cswap_pin import proxy as pp
+        first, last = pp._affinity_unseen[token]
+        pp._affinity_unseen[token] = (first - seconds, last - seconds)
+
     @classmethod
     def _send(cls, certdir, calls, body=None, trace=None,
               path="/v1/messages", **upstream_kw):
@@ -24851,17 +24859,57 @@ class TestSessionAffinityOnMessages:
         _, auths = self._send(certdir, [("tok-B", "S")])
         assert auths == ["Bearer tok-A"], ("after the rest", auths)
 
-    def case_a_subagent_request_never_moves_its_parent_session(
+    def case_a_subagent_request_is_ruled_as_a_main_thread_one_is(
             self, monkeypatch, certdir):
+        """A subagent shares its parent's session id. While the parent's slot
+        is only RESTING its request leaves the binding alone; once the slot is
+        gone (at its bar, walled, a stored token that has expired) it moves
+        the parent as a main-thread request does, never leaves it bound to an
+        account it can no longer be kept on."""
         from cswap_pin import proxy as pp
-        self._wire(monkeypatch, certdir, pct=95.0)  # slot 1 is at its bar
+        sub = [dict(bearer="tok-B", extra_headers={
+            "x-claude-code-session-id": "S",
+            "x-claude-code-agent-id": "agent-1"})]
+        self._wire(monkeypatch, certdir)
         self._send(certdir, [("tok-A", "S0")])
         self._seed("S", "tok-A")
-        _, auths = self._send(certdir, [dict(bearer="tok-B", extra_headers={
-            "x-claude-code-session-id": "S",
-            "x-claude-code-agent-id": "agent-1"})])
+        at = pp._affinity["S"]
+        pp._affinity_rest[self.IDENT] = time.monotonic() + 99
+        _, auths = self._send(certdir, sub)
         assert auths == ["Bearer tok-B"], auths
-        assert pp._affinity["S"][0] == "tok-A", "a subagent moved its parent"
+        assert pp._affinity["S"] == at, "a subagent moved its parent in a rest"
+        for wire in (dict(pct=95.0), dict(walled=True), dict(expires=1)):
+            self._wire(monkeypatch, certdir, **wire)
+            self._send(certdir, [("tok-A", "S0")])
+            self._seed("S", "tok-A")
+            _, auths = self._send(certdir, sub)
+            assert auths == ["Bearer tok-B"], (wire, auths)
+            assert pp._affinity["S"][0] == "tok-B", (
+                wire, "the parent stayed bound to a slot that is gone")
+
+    def case_a_kept_429_at_the_wall_does_not_hold_the_other_sessions_on_the_slot(
+            self, monkeypatch, certdir):
+        """The 429 that reads the bar drops the slot AND rests it until the
+        window's reset, minutes to hours. Holding every other warm session on
+        it for that long keeps them on a walled account with their clocks
+        frozen, and a reset inside their TTL moves them back for no reason of
+        the bar's. Only a slot that is otherwise keepable (a 401/403's 60 s
+        rest, a 429 below the bar) holds a binding."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        self._seed("S1", "tok-A")
+        self._seed("S2", "tok-A")
+        self._send(certdir, [("tok-B", "S1")], reject_bearer="tok-A",
+                   reject_status=429, reject_headers=(
+                       b"anthropic-ratelimit-unified-5h-utilization: 1.0\r\n"
+                       b"anthropic-ratelimit-unified-reset: %d\r\n"
+                       % (time.time() + 600)))
+        assert self.IDENT not in pp._affinity_kept, "the 429 did not drop it"
+        assert pp._affinity_rest[self.IDENT] - time.monotonic() > 500
+        _, auths = self._send(certdir, [("tok-B", "S2")])
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity["S2"][0] == "tok-B", (
+            "a slot at its bar held a warm session", pp._affinity["S2"])
 
     def case_a_decline_that_means_the_account_is_gone_still_moves_the_session(
             self, monkeypatch, certdir):
@@ -24897,7 +24945,7 @@ class TestSessionAffinityOnMessages:
         _, auths = self._send(certdir, [("tok-B2", "S")])  # adopted, 1 s later
         assert auths == ["Bearer tok-B2"] and len(started) == 2, (
             "a second rebuild inside the interval", auths, started)
-        pp._affinity_unseen["tok-B2"] -= pp._AFFINITY_UNSEEN_RETRY_S + 1
+        self._age_unseen("tok-B2", pp._AFFINITY_UNSEEN_RETRY_S + 1)
         _, auths = self._send(certdir, [("tok-B2", "S"), ("tok-B2", "S")])
         assert auths == ["Bearer tok-B2", "Bearer tok-A"], auths
         assert len(started) == 3, started
@@ -24906,8 +24954,37 @@ class TestSessionAffinityOnMessages:
             _, auths = self._send(certdir, [("tok-Z", "S"), ("tok-Z", "S")])
             assert auths == ["Bearer tok-Z"] * 2 and len(started) == n + 1, (
                 auths, started)
-            pp._affinity_unseen["tok-Z"] -= pp._AFFINITY_UNSEEN_RETRY_S + 1
+            self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_RETRY_S + 1)
         assert pp._affinity["S"][0] == "tok-A", pp._affinity["S"]
+
+    def case_a_token_nobody_adopts_is_rebuilt_for_only_in_a_short_window(
+            self, monkeypatch, certdir):
+        """A token no slot ever holds (a fresh /login the pin must not
+        override) would cost a store and Keychain read every
+        `_AFFINITY_UNSEEN_RETRY_S` for as long as its session sends. The
+        immediate rebuilds stop `_AFFINITY_UNSEEN_WINDOW_S` after the token was
+        first seen; the 30 s refresh alone serves it after that."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir)
+        started = []
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder",
+                            lambda fn: (started.append(1), fn()))
+        self._send(certdir, [("tok-A", "S0")])
+        self._seed("S", "tok-A")
+        n = len(started)
+        self._send(certdir, [("tok-Z", "S")])
+        assert len(started) == n + 1, "no rebuild for a token first seen"
+        self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_RETRY_S + 1)
+        self._send(certdir, [("tok-Z", "S")])
+        assert len(started) == n + 2, "no retry inside the window"
+        self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_WINDOW_S)
+        for _ in range(3):
+            self._send(certdir, [("tok-Z", "S")])
+            self._age_unseen("tok-Z", pp._AFFINITY_UNSEEN_RETRY_S + 1)
+        assert len(started) == n + 2, "a retry after the window"
+        pp._affinity_snap["tried"] -= pp._AFFINITY_REFRESH_S + 1
+        self._send(certdir, [("tok-Z", "S")])
+        assert len(started) == n + 3, "the 30 s refresh no longer runs"
 
     def case_a_rebuild_that_hangs_is_abandoned_and_the_next_one_runs(
             self, monkeypatch, certdir):
