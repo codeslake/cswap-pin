@@ -1950,6 +1950,24 @@ def heal(backup_root: Path, identity: dict | None = None,
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
             pass
 
+    # AN EMPTY EGRESS RECORD IS FILLED HERE, NEVER CHANGED (T2753). A pin first
+    # set from a plain ssh shell records `proxy ""`, and `cswap pin --ensure`
+    # (this function) never wrote it, so the daemon dialed direct for ever until
+    # a re-pin from a proxy-exporting shell. Recorded as `ensure_proxy`'s hint
+    # block does: a recorded value is never touched (6882848 keeps a credential
+    # URL; the outer-first re-record stays there), no /health is asked
+    # (`learn_next_hop` fills `next`), and the pin itself is never recorded:
+    # `_ambient_proxy` skips it by CSWAP_PIN_PORT, a bare `export HTTPS_PROXY`
+    # lacks that, so `_names_the_pin` reads the daemon's own record too.
+    if account_num and not _read_upstream(certdir, "proxy"):
+        try:
+            hop = _ambient_proxy(certdir=certdir)
+            if hop and not _names_the_pin(certdir, hop):
+                write_upstream_hint(
+                    certdir, hop, os.environ.get("NODE_EXTRA_CA_CERTS"))
+        except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+            pass
+
     # THE ACTUAL PER-LAUNCH HOOK LANDS HERE, NOT IN `ensure_proxy`. The rc file
     # runs `cswap pin --ensure` before every hand-launched `claude`, and that
     # flag routes to THIS function — `ensure_proxy` is reached only from `cswap

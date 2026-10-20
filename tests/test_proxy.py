@@ -23899,6 +23899,78 @@ class TestHealReWiresAServingDaemon:
         finally:
             srv.close()
 
+    def _heal_from_shell(self, tmp_path, monkeypatch, record, env=lambda _p: {}):
+        """Heal from a shell whose proxy variables are ``env(daemon port)``
+        (empty = a plain shell) over an ``upstream.json`` holding ``record``
+        (None = absent). Returns ``upstream.json`` as a dict, or None."""
+        srv, port, _cfg = self._fixture(tmp_path, monkeypatch, wired_port=None)
+        for name in ("HTTPS_PROXY", "https_proxy", "CSWAP_PIN_PORT",
+                     "NODE_EXTRA_CA_CERTS"):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env(port).items():
+            monkeypatch.setenv(name, value)
+        path = tmp_path / "pin-proxy" / "upstream.json"
+        if record is not None:
+            path.write_text(json.dumps(record))
+        try:
+            from cswap_pin import proxy
+
+            proxy.heal(tmp_path)
+        finally:
+            srv.close()
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def case_heal_records_the_shells_hop_over_an_empty_or_absent_record(
+            self, tmp_path, monkeypatch):
+        """T2753. A pin first set from a plain ssh shell wrote
+        ``{"proxy": ""}``, and `heal` (what `cswap pin --ensure` runs on every
+        terminal launch) never re-stamped it, so the daemon dialed Anthropic
+        direct for ever. Only an absent value is filled, with the proxy and
+        the CA `ensure_proxy`'s own hint block records."""
+        env = lambda _port: {  # noqa: E731 -- the hop is never dialed
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "NODE_EXTRA_CA_CERTS": "/etc/hop-ca.pem"}
+        for record in ({"proxy": "", "ca": "", "next": ""}, None):
+            got = self._heal_from_shell(tmp_path, monkeypatch, record, env)
+            assert got and got["proxy"] == "http://127.0.0.1:9", got
+            assert got["ca"] == "/etc/hop-ca.pem", got
+            (tmp_path / "pin-proxy" / "upstream.json").unlink()
+
+    def case_heal_never_overwrites_a_recorded_hop(self, tmp_path, monkeypatch):
+        """6882848: a credential-bearing raw URL survives a no-proxy re-pin,
+        and 0.1.310's outer-first re-record lives in `ensure_proxy` alone."""
+        record = {"proxy": "http://u:p@corp.example:3128", "ca": "", "next": ""}
+        got = self._heal_from_shell(
+            tmp_path, monkeypatch, record,
+            lambda _port: {"HTTPS_PROXY": "http://127.0.0.1:9"})
+        assert got == record
+
+    def case_heal_never_records_the_pins_own_port(self, tmp_path, monkeypatch):
+        """A wired session's Bash child exports the pin as its proxy. Recorded,
+        the daemon would CONNECT to itself and every request would loop."""
+        empty = {"proxy": "", "ca": "", "next": ""}
+        own = lambda port: f"http://127.0.0.1:{port}"  # noqa: E731
+        # Without CSWAP_PIN_PORT (a bare `export HTTPS_PROXY`) only the
+        # daemon's own record names the port; with it, `_ambient_proxy` does.
+        for env in (lambda port: {"HTTPS_PROXY": own(port)},
+                    lambda port: {"HTTPS_PROXY": own(port),
+                                  "CSWAP_PIN_PORT": str(port)}):
+            assert self._heal_from_shell(tmp_path, monkeypatch, empty, env) == empty
+
+    def case_heal_stays_non_raising_when_the_hop_cannot_be_read(
+            self, tmp_path, monkeypatch):
+        from cswap_pin import proxy
+
+        def boom(*_a, **_k):
+            raise RuntimeError("receipt unreadable")
+
+        monkeypatch.setattr(proxy, "_ambient_proxy", boom)
+        empty = {"proxy": "", "ca": "", "next": ""}
+        got = self._heal_from_shell(
+            tmp_path, monkeypatch, empty,
+            lambda _port: {"HTTPS_PROXY": "http://127.0.0.1:9"})
+        assert got == empty
+
 
 class TestSharedBundleGuardMatchesNode:
     """The merged `ca-trust.pem` guard must agree with node's CA loader.
