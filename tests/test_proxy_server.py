@@ -3660,9 +3660,10 @@ class TestChainRediscovery:
         LAUNCH records one. One was missing anyway: `_probe_next_hop` ran at
         hint-writing time and nowhere else, and `--ensure` — what an rc hook
         calls before every `claude` — routes to `heal`, which never re-stamps
-        the hint. So the only chance to learn the outer hop was a launch that
-        happened while the inner one was answering. Miss it once and the
-        chain is single-hop for good. Measured, and it was the steady state:
+        a non-empty hint and fills an empty one (T2753). So the only chance
+        to learn the outer hop was a launch that happened while the inner one
+        was answering. Miss it once and the chain is single-hop for good.
+        Measured, and it was the steady state:
 
             upstream.json {"proxy": "http://127.0.0.1:9901", ...} no "next",
             written 2026-08-04 01:32, unchanged a day later, while 9901's
