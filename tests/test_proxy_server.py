@@ -23945,7 +23945,8 @@ class TestSessionAffinityOnMessages:
         started pin's tick writes the bindings for a successor; off, so that
         the next pin built in this process (a stand-in for a handover only in
         a case that says so) does not read them. A case moves
-        ``seen.wall1`` to change what the next usage read says of slot 1, and
+        ``seen.wall1`` to change what the next usage read says of slot 1,
+        ``seen.expires1`` to change slot 1's `expiresAt` (None: far off), and
         ``seen.age1`` to say how many seconds before that read the store row
         was fetched (None: it never was).
         Every snapshot rebuild runs inline unless a case swaps
@@ -23958,12 +23959,13 @@ class TestSessionAffinityOnMessages:
         seen = types.SimpleNamespace(
             reads=[], fetches=[], consumed=[], switched=[], walled=[],
             recorded=[], logs=[], fetch_times=[], wall1=walled, age1=0.0,
-            last_good1=None, usage1=None if pct is None else {
+            last_good1=None, expires1=expires, usage1=None if pct is None else {
                 "five_hour": {"pct": pct}, "seven_day": {"pct": pct}})
 
         def _creds(num, mail):
             seen.reads.append(num)
-            exp = expires if (num == "1" and expires is not None) else cls.FAR
+            exp = (seen.expires1 if num == "1" and seen.expires1 is not None
+                   else cls.FAR)
             cred = {"accessToken": cls.TOKENS[num], "expiresAt": exp}
             if num == "1" and no_expiry:
                 del cred["expiresAt"]
@@ -24860,33 +24862,101 @@ class TestSessionAffinityOnMessages:
         _, auths = self._send(certdir, [("tok-B", "S")])
         assert auths == ["Bearer tok-A"], ("after the rest", auths)
 
-    def case_a_subagent_request_is_ruled_as_a_main_thread_one_is(
+    SUBAGENT = ({"x-claude-code-agent-id": "agent-1"},
+                {"x-claude-code-parent-agent-id": "parent-1"})
+
+    def case_a_subagent_request_that_is_not_kept_leaves_the_parent_bound(
             self, monkeypatch, certdir):
-        """A subagent shares its parent's session id. While the parent's slot
-        is only RESTING its request leaves the binding alone; once the slot is
-        gone (at its bar, walled, a stored token that has expired) it moves
-        the parent as a main-thread request does, never leaves it bound to an
-        account it can no longer be kept on."""
+        """A subagent (or an in-process teammate) shares its parent's session
+        id but carries none of the parent's cache: Claude Code 2.1.304 puts
+        `x-claude-code-agent-id` on every non-main request. One declined
+        because the parent's slot is resting, at its bar, walled or holding an
+        expired token goes out on its own bearer and leaves the binding
+        exactly as it was (bearer and clock); moving the parent to the
+        subagent's account sent its next request there too, 404 and a full
+        replay (window 2: 327,805 and 379,420 tokens written)."""
         from cswap_pin import proxy as pp
-        sub = [dict(bearer="tok-B", extra_headers={
-            "x-claude-code-session-id": "S",
-            "x-claude-code-agent-id": "agent-1"})]
-        self._wire(monkeypatch, certdir)
-        self._send(certdir, [("tok-A", "S0")])
-        self._seed("S", "tok-A")
-        at = pp._affinity["S"]
-        pp._affinity_rest[self.IDENT] = time.monotonic() + 99
-        _, auths = self._send(certdir, sub)
-        assert auths == ["Bearer tok-B"], auths
-        assert pp._affinity["S"] == at, "a subagent moved its parent in a rest"
-        for wire in (dict(pct=95.0), dict(walled=True), dict(expires=1)):
-            self._wire(monkeypatch, certdir, **wire)
+        for headers in self.SUBAGENT:
+            sub = [dict(bearer="tok-B", extra_headers={
+                "x-claude-code-session-id": "S", **headers})]
+            self._wire(monkeypatch, certdir)
             self._send(certdir, [("tok-A", "S0")])
             self._seed("S", "tok-A")
+            at = pp._affinity["S"]
+            pp._affinity_rest[self.IDENT] = time.monotonic() + 99
             _, auths = self._send(certdir, sub)
-            assert auths == ["Bearer tok-B"], (wire, auths)
-            assert pp._affinity["S"][0] == "tok-B", (
-                wire, "the parent stayed bound to a slot that is gone")
+            assert auths == ["Bearer tok-B"], (headers, auths)
+            assert pp._affinity["S"] == at, (
+                headers, "a subagent moved its parent in a rest")
+            for wire in (dict(pct=95.0), dict(walled=True), dict(expires=1)):
+                self._wire(monkeypatch, certdir, **wire)
+                self._send(certdir, [("tok-A", "S0")])
+                self._seed("S", "tok-A")
+                at = pp._affinity["S"]
+                _, auths = self._send(certdir, sub)
+                assert auths == ["Bearer tok-B"], (headers, wire, auths)
+                assert pp._affinity["S"] == at, (
+                    headers, wire, "a subagent moved its parent")
+
+    def case_a_subagent_that_met_an_expired_slot_does_not_cost_the_parent_its_cache(
+            self, monkeypatch, certdir):
+        """Window 2, 13:56:44 and 14:02:02: slot 1's stored token expired, a
+        subagent's request was declined and moved its parent to slot 2, then
+        slot 1 came back with a fresh token and the parent's own request was
+        kept on slot 2, where its thread is not. Left bound, the parent's next
+        request is ruled against the same snapshot: slot 1 is back, so it goes
+        out on slot 1's bearer, where its cache is."""
+        from cswap_pin import proxy as pp
+        for headers in self.SUBAGENT:
+            seen = self._wire(monkeypatch, certdir, expires=1)
+            self._send(certdir, [("tok-A", "S0")])
+            self._seed("S", "tok-A")
+            at = pp._affinity["S"]
+            _, auths = self._send(certdir, [dict(bearer="tok-B", extra_headers={
+                "x-claude-code-session-id": "S", **headers})])
+            assert auths == ["Bearer tok-B"], (headers, auths)
+            assert pp._affinity["S"] == at, (headers, "the parent moved")
+            # slot 1 is rebuilt with a fresh token: the client's rotated one
+            monkeypatch.setattr(type(self), "TOKENS",
+                                {"1": "tok-A2", "2": "tok-B"})
+            seen.expires1 = None
+            main = [("tok-A2", "S")]
+            _, auths = self._send(certdir, main)  # unseen: a rebuild, no rule
+            assert auths == ["Bearer tok-A2"], (headers, auths)
+            _, auths = self._send(certdir, main * 2)
+            assert auths == ["Bearer tok-A2"] * 2, (
+                headers, "kept on the subagent's slot", auths)
+            assert pp._affinity["S"][0] == "tok-A2", pp._affinity["S"]
+
+    def case_a_held_body_survives_a_subagents_decline_and_is_pinged_when_the_slot_is_back(
+            self, monkeypatch, certdir):
+        """The parent left bound to slot 1, the keep-alive tick still sees its
+        body as sent on the binding: it is not dropped as sent on another
+        account, and once slot 1 is kept again the ping goes out on its
+        stored token."""
+        from cswap_pin import proxy as pp
+        usage = {"cache_read_input_tokens": 30000,
+                 "cache_creation_input_tokens": 0}
+        seen = self._armed(monkeypatch, certdir, expires=1)
+        at = pp._affinity["S"]
+        sub = dict(bearer="tok-B", extra_headers={
+            "x-claude-code-session-id": "S", "x-claude-code-agent-id": "a-1"})
+        _, auths = self._send(certdir, [sub], body=self._body(pad=10))
+        assert auths == ["Bearer tok-B"], auths
+        assert pp._affinity["S"] == at, "a subagent moved its parent"
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()
+        assert up.bodies_seen == [], "pinged a slot that is not kept"
+        assert "S" in pp._affinity_last, "the body was dropped as sent elsewhere"
+        assert pp._affinity_pings["refused"] == {"its slot is not kept": 1}
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A2", "2": "tok-B"})
+        seen.expires1 = None
+        pp._affinity_snap.update(tried=float("-inf"), at=float("-inf"))
+        with self._pair(certdir, reply=self._reply(usage)) as (proxy, up):
+            proxy._keepalive_tick()  # the stale snapshot is rebuilt first
+            proxy._keepalive_tick()
+        assert len(up.bodies_seen) == 1, up.bodies_seen
+        assert up.seen_auth == "Bearer tok-A2", up.seen_auth
 
     def case_a_kept_429_at_the_wall_does_not_hold_the_other_sessions_on_the_slot(
             self, monkeypatch, certdir):

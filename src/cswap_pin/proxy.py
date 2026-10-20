@@ -3799,6 +3799,11 @@ def _swap_credential(headers, token: str) -> list:
             else (k, v) for k, v in headers]
 
 
+# Claude Code 2.1.304 puts the first on every non-main request (subagent,
+# in-process teammate, Workflow subagent), with the lead's session id
+_SUBAGENT_HEADERS = ("x-claude-code-agent-id", "x-claude-code-parent-agent-id")
+
+
 def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     """(token, (slot, email), session) to send in place of the client's
     bearer, or None to forward the client's own.
@@ -3813,7 +3818,10 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
     own. A request not kept because the slot is RESTING (a refusal that did
     not take it out of the snapshot) forwards the client's bearer and leaves
     the binding as it was; a slot that is gone (dropped at its bar, walled,
-    expired) rebinds, subagent or not.
+    expired) rebinds, unless the request is a subagent's (`_SUBAGENT_HEADERS`):
+    it carries no main-thread cache, so it never moves its parent. The
+    parent's own next request is ruled against the same snapshot: still gone,
+    it rebinds the session; back, it is kept where its cache is.
 
     NEVER READS THE STORE: it reads the snapshot `_affinity_rebuild` made on
     its own thread. With no snapshot yet, one older than `_AFFINITY_STALE_S`
@@ -3839,6 +3847,7 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         return None
     ttl, threshold, strategy = cfg
     client = session = key = ""
+    agent = False
     for k, v in headers:
         kl = k.lower()
         if kl == "authorization":
@@ -3847,6 +3856,8 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
             session = v
         elif kl == "x-api-key":
             key = v
+        elif kl in _SUBAGENT_HEADERS:
+            agent = True
     if not (client and session) or key not in ("", client):
         return None
     now = time.monotonic()
@@ -3886,8 +3897,9 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         if ruled:
             token = (stored and not oauth.is_oauth_token_expired(stored[1])
                      and stored[0])
-            # a rest ends: it does not move the session to the live account
-            if token or not resting:
+            # a rest ends, and a subagent's request is no main thread's: neither
+            # moves the session to the live account
+            if token or not (resting or agent):
                 _bounded_put(_affinity, session,
                              (prior[0] if token else client, now))
         elif fresh:
@@ -3962,8 +3974,6 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
     and often the tier, so the tier alone does not say). ``inject`` is
     `_affinity_pick`'s answer: the bearer the request goes out on is its token,
     else the client's.
-    shortcut: a Workflow subagent carries no such header, so it passes as the
-    main thread; the sandbox measurement says whether that matters.
 
     The tables are bounded: past `_AFFINITY_BODY_TOTAL` bytes the oldest go,
     and a body whose session lost its `_affinity` entry goes with it."""
@@ -3972,7 +3982,7 @@ def _affinity_capture(certdir, headers, body: bytes, path: str,
     session = client = ""
     for k, v in headers:
         kl = k.lower()
-        if kl in ("x-claude-code-agent-id", "x-claude-code-parent-agent-id"):
+        if kl in _SUBAGENT_HEADERS:
             return False
         if kl == "x-claude-code-session-id":
             session = v
