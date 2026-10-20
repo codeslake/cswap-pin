@@ -3433,6 +3433,15 @@ def _http_hop(status, body=b""):
     return srv, f"http://127.0.0.1:{srv.getsockname()[1]}", served
 
 
+def _port_is_serving_10s(host, port):
+    """`proxy._port_is_serving` with a 10 s connect budget (T2741)."""
+    try:
+        with socket.create_connection((host, port), timeout=10):
+            return True
+    except OSError:
+        return False
+
+
 def _launch_from(shell_proxy, tmp_path, monkeypatch):
     """``(ensure_proxy_once, certdir)``: the real call site, one launch whose
     shell exports `shell_proxy`, with everything past the hint block stubbed."""
@@ -3455,6 +3464,9 @@ def _launch_from(shell_proxy, tmp_path, monkeypatch):
         ("_ANSWERED_HEALTH", set()),
         # timeout=10: a server-thread reply, not the network (T1076).
         ("_probe_next_hop", functools.partial(pp._probe_next_hop, timeout=10)),
+        # and 10 s, not 0.5 s, for the connect `_port_is_serving` makes: a
+        # stalled runner holds a loopback handshake past 0.5 s (T2741).
+        ("_port_is_serving", _port_is_serving_10s),
     ):
         monkeypatch.setattr(pp, name, fake)
 
