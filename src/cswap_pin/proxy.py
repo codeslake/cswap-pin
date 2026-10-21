@@ -3373,6 +3373,15 @@ _AFFINITY_STALE_MAX_S = 3600.0
 _AFFINITY_STALE_MARGIN = 10.0
 _AFFINITY_STUCK_MAX = 3
 _AFFINITY_BACKOFF_S = 60.0  # a refusing account's rest when its 429 names no reset
+# A kept 401 may be a token cswap rotated since the snapshot (its refresh
+# revokes the old one): `_affinity_reread` forces one rebuild and waits this
+# long for it, never longer; past it the session is taken back as ever.
+_AFFINITY_REREAD_WAIT_S = 5.0
+# The pin's own expiry margin for keeping a session, in place of cswap's 5 min
+# `OAUTH_EXPIRY_BUFFER_MS`: cswap refreshes a slot at or after its expiry, so
+# the buffer declined a valid token for up to 5 min (11 warm moves in one
+# window). The ping and `/health` stay on cswap's buffer.
+_AFFINITY_KEEP_MARGIN_MS = 60_000
 # IN MEMORY, ONE LOCK. A daemon handover carries the bindings (session, slot,
 # email, wall time of its last request) in `affinity-carry.json`, never a
 # bearer and never a kept body: the successor lands them with its first
@@ -3643,9 +3652,11 @@ def _affinity_rebuild(threshold: float, strategy: str, started: float) -> None:
                 _affinity_snap["stuck"] -= 1
 
 
-def _affinity_kick(threshold: float, strategy: str, unseen: str = "") -> None:
+def _affinity_kick(threshold: float, strategy: str, unseen: str = "",
+                   since: float = -math.inf) -> None:
     """Start `_affinity_rebuild` on a thread of its own when the last one
-    started `_AFFINITY_REFRESH_S` ago, or at once for a client token
+    started `_AFFINITY_REFRESH_S` ago, or at once when none has started since
+    ``since`` (monotonic: `_affinity_reread`), or at once for a client token
     (``unseen``) no rebuild has been started for in `_AFFINITY_UNSEEN_RETRY_S`
     and first seen less than `_AFFINITY_UNSEEN_WINDOW_S` ago, and none is
     running (one at a time, a failed one is not retried per request). The
@@ -3670,7 +3681,7 @@ def _affinity_kick(threshold: float, strategy: str, unseen: str = "") -> None:
         abandon = (snap["busy"] and age >= _AFFINITY_STALE_S
                    and snap["stuck"] < _AFFINITY_STUCK_MAX)
         due = abandon or (not snap["busy"] and (
-            age >= _AFFINITY_REFRESH_S
+            age >= _AFFINITY_REFRESH_S or snap["tried"] <= since
             or (unseen and now - first < _AFFINITY_UNSEEN_WINDOW_S
                 and now - last >= _AFFINITY_UNSEEN_RETRY_S)))
         if due:
@@ -3799,6 +3810,52 @@ def _swap_credential(headers, token: str) -> list:
             else (k, v) for k, v in headers]
 
 
+def _affinity_token_live(expires_at) -> bool:
+    """A kept slot's stored token is unexpired by `_AFFINITY_KEEP_MARGIN_MS`,
+    not cswap's buffer. The host's predicate takes no buffer on every release
+    the pin supports, so the margin moves the expiry (as `_freshen_due`)."""
+    return not oauth.is_oauth_token_expired(
+        expires_at + oauth.OAUTH_EXPIRY_BUFFER_MS - _AFFINITY_KEEP_MARGIN_MS)
+
+
+def _affinity_reread(certdir, ident: tuple, sent: str) -> "str | None":
+    """A kept request drew a 401: the slot's stored token if it is not
+    ``sent`` and the pin would keep a session on it now (kept, not resting,
+    live by the keep margin), else None. cswap's freshen rotates a token up
+    to 10 min before its expiry and the refresh revokes the old one, so the
+    snapshot's copy can be dead while the account is fine (78eb8a8e: a take-back
+    moved the session, a 243,630-token cache write). The store is read by a
+    rebuild forced now (`_affinity_kick`, its own thread, never this one) and
+    waited for `_AFFINITY_REREAD_WAIT_S` at most: one that started before the
+    401 may hold the old token, so only one started after it counts. One
+    lifecycle line per slot per `_BUSY_REPORT_COOLDOWN_S`, never a token."""
+    cfg = session_affinity_config(certdir)
+    if cfg is None:
+        return None
+    t0 = time.monotonic()
+    while True:
+        _affinity_kick(cfg[1], cfg[2], since=t0)
+        with _affinity_lock:
+            if _affinity_snap["at"] > t0:
+                stored = _affinity_kept.get(ident)
+                if not (stored and stored[0] != sent
+                        and _affinity_rest.get(ident, 0.0) <= t0
+                        and _affinity_token_live(stored[1])):
+                    return None
+                more = _affinity_due(
+                    _affinity_declined, f"slot {ident[0]} rotated", t0)
+                break
+        if time.monotonic() - t0 >= _AFFINITY_REREAD_WAIT_S:
+            return None
+        time.sleep(0.05)
+    if more is not None:
+        _log_lifecycle(
+            f"session affinity: slot {ident[0]}'s stored token rotated under a "
+            f"kept session, resent once on the new token"
+            + (f"; {more} more" if more else ""))
+    return stored[0]
+
+
 # Claude Code 2.1.304 puts the first on every non-main request (subagent,
 # in-process teammate, Workflow subagent), with the lead's session id
 _SUBAGENT_HEADERS = ("x-claude-code-agent-id", "x-claude-code-parent-agent-id")
@@ -3888,14 +3945,14 @@ def _affinity_pick(certdir, headers) -> "tuple[str, tuple, str] | None":
         ruled = mine and (fresh or (
             age < _AFFINITY_STALE_MAX_S and stored
             and stored[4] <= stored[2] - _AFFINITY_STALE_MARGIN
-            and not oauth.is_oauth_token_expired(stored[1])))
+            and _affinity_token_live(stored[1])))
         # NOTHING TO RULE ON when there is no snapshot, one too old for this
         # slot, or a client token it has not seen (a rotation since): the
         # request goes out on the client's token and the session is left as it
         # was, its clock too, so the real TTL still ends it. Rebinding it here
         # would end its affinity for good after every idle gap.
         if ruled:
-            token = (stored and not oauth.is_oauth_token_expired(stored[1])
+            token = (stored and _affinity_token_live(stored[1])
                      and stored[0])
             # a rest ends, and a subagent's request is no main thread's: neither
             # moves the session to the live account
@@ -22396,6 +22453,18 @@ class PinProxy:
             keep = self._forward(method, path, headers, body, tls,
                                  swapped=swapped, bridge_hold=_bridge_hold,
                                  affinity=inject[1] if inject else None)
+            if inject and isinstance(keep, _AuthRejected) and keep.code == 401:
+                # A 401 MAY BE A ROTATED TOKEN, not the account: one resend on
+                # the slot's token as the store holds it now, on both
+                # credential headers (`_swap_credential`), the binding kept.
+                # Refused again, it is taken back below like any refusal.
+                fresh = _affinity_reread(
+                    getattr(self, "_certdir", None), inject[1], inject[0])
+                if fresh:
+                    self._drop_upstream()
+                    keep = self._forward(
+                        method, path, _swap_credential(original_headers, fresh),
+                        body, tls, swapped=swapped, affinity=inject[1])
             if inject and isinstance(keep, _AuthRejected):
                 # THE KEPT ACCOUNT REFUSED (401/403/429), and nothing has
                 # reached the client: its answer is not the client's. Resend

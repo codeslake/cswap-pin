@@ -24372,6 +24372,139 @@ class TestSessionAffinityOnMessages:
         assert not pp._affinity_rest, pp._affinity_rest
         assert not [l for l in seen.logs if "answered" in l], seen.logs
 
+    def _prime_then_rotate(self, monkeypatch, certdir):
+        """Slot 1's snapshot holds `tok-A`; the store then moves the slot to
+        `tok-A2`, as a cswap refresh does a second before a kept request."""
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A", "2": "tok-B"})
+        seen = self._wire(monkeypatch, certdir)
+        self._send(certdir, [("tok-A", "S0")])
+        monkeypatch.setattr(type(self), "TOKENS", {"1": "tok-A2", "2": "tok-B"})
+        self._seed("S", "tok-A")
+        return seen
+
+    def case_a_kept_401_after_a_token_rotation_is_resent_on_the_new_token(
+            self, monkeypatch, certdir):
+        """78eb8a8e: cswap's freshen rotated slot 1's token a second before a
+        kept request carried the old one, and the take-back moved the session
+        onto the live account (a 243,630-token cache write). The 401 is read
+        against the store (a rebuild forced now, on its own thread) and the
+        request goes again on the slot, on the token it stores now."""
+        from cswap_pin import proxy as pp
+        seen = self._prime_then_rotate(monkeypatch, certdir)
+        spawned = []
+
+        def _thread(fn):  # a real thread, as in the daemon
+            spawned.append(fn)
+            threading.Thread(target=fn, daemon=True).start()
+
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", _thread)
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A", reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-A2"]), (
+            statuses, auths)
+        assert len(spawned) == 1, "the store is read by one rebuild, off this thread"
+        assert not pp._affinity_rest, pp._affinity_rest
+        assert pp._affinity["S"][0] == "tok-A", pp._affinity["S"]
+        assert not [l for l in seen.logs if "rested" in l or "live" in l], seen.logs
+        (line,) = [l for l in seen.logs if "rotated" in l]
+        assert "slot 1" in line and "tok-" not in line, line
+        # the binding is the slot: its next request is sent on the new token
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A2"], auths
+
+    def case_a_helper_shaped_kept_401_after_a_rotation_resends_one_credential(
+            self, monkeypatch, certdir):
+        """Rewriting only Authorization on the resend is round 2's two
+        credentials (ff789a0): both headers carry the new token."""
+        self._prime_then_rotate(monkeypatch, certdir)
+        statuses, _ = self._send(
+            certdir, [self._helper("tok-B", "S")], reject_bearer="tok-A",
+            reject_status=401, reject_two_credentials=True)
+        assert statuses == [200], statuses
+        assert [self._creds(h) for h in self.heads] == [
+            {"authorization": "Bearer tok-A", "x-api-key": "tok-A"},
+            {"authorization": "Bearer tok-A2", "x-api-key": "tok-A2"}], self.heads
+
+    def case_a_kept_401_with_the_store_unchanged_is_taken_back(
+            self, monkeypatch, certdir):
+        from cswap_pin import proxy as pp
+        seen = self._wire(monkeypatch, certdir)
+        self._seed("S", "tok-A")
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A", reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-B"]), (
+            statuses, auths)
+        assert len(seen.fetches) == 2, ("the 401 reads the store once", seen.fetches)
+        assert pp._affinity_rest and "S" not in pp._affinity, pp._affinity
+        assert not [l for l in seen.logs if "rotated" in l], seen.logs
+
+    def case_a_resend_on_the_rotated_token_that_is_also_refused_is_taken_back(
+            self, monkeypatch, certdir):
+        """At most one extra attempt: kept, kept on the new token, live."""
+        from cswap_pin import proxy as pp
+        self._prime_then_rotate(monkeypatch, certdir)
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer={"tok-A", "tok-A2"},
+            reject_status=401)
+        assert (statuses, auths) == (
+            [200], ["Bearer tok-A", "Bearer tok-A2", "Bearer tok-B"]), (
+            statuses, auths)
+        assert pp._affinity_rest and "S" not in pp._affinity, pp._affinity
+
+    def case_only_a_401_reads_the_store_for_a_rotation(
+            self, monkeypatch, certdir):
+        """A 403 or a 429 is no stale token: taken back at once, no re-read."""
+        from cswap_pin import proxy as pp
+        for code in (403, 429):
+            seen = self._prime_then_rotate(monkeypatch, certdir)
+            statuses, auths = self._send(
+                certdir, [("tok-B", "S")], reject_bearer="tok-A",
+                reject_status=code)
+            assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-B"]), (
+                code, statuses, auths)
+            assert len(seen.fetches) == 1 and pp._affinity_rest, (code, seen)
+
+    def case_a_rebuild_that_does_not_land_in_time_takes_the_session_back(
+            self, monkeypatch, certdir):
+        """The wait is bounded: a store that answers late is today's take-back,
+        never a longer stall."""
+        from cswap_pin import proxy as pp
+        self._prime_then_rotate(monkeypatch, certdir)
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", lambda fn: None)
+        monkeypatch.setattr(pp, "_AFFINITY_REREAD_WAIT_S", 0.3)
+        t = time.monotonic()
+        statuses, auths = self._send(
+            certdir, [("tok-B", "S")], reject_bearer="tok-A", reject_status=401)
+        assert (statuses, auths) == ([200], ["Bearer tok-A", "Bearer tok-B"]), (
+            statuses, auths)
+        assert time.monotonic() - t < 5, "the wait was not bounded"
+        assert pp._affinity_rest, pp._affinity_rest
+
+    def case_a_kept_token_three_minutes_from_expiry_is_kept(
+            self, monkeypatch, certdir):
+        """cswap refreshes only at or after expiry, so the pin's own margin is
+        a minute, not cswap's five (11 warm moves in window 3). The ping and
+        `/health` stay on cswap's buffer."""
+        from cswap_pin import proxy as pp
+        self._wire(monkeypatch, certdir,
+                   expires=int(time.time() * 1000) + 3 * 60_000)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-A"], auths
+        with pp._affinity_lock:
+            assert not pp._affinity_slot_kept(
+                ("1", self.EMAIL.format("1")), time.monotonic())
+
+    def case_a_kept_token_thirty_seconds_from_expiry_is_declined(
+            self, monkeypatch, certdir):
+        seen = self._wire(monkeypatch, certdir,
+                          expires=int(time.time() * 1000) + 30_000)
+        self._seed("S", "tok-A")
+        _, auths = self._send(certdir, [("tok-B", "S")])
+        assert auths == ["Bearer tok-B"], auths
+        assert [l for l in seen.logs if "its stored token has expired" in l], (
+            seen.logs)
+
     def case_a_kept_404_is_relayed_not_resent(self, monkeypatch, certdir):
         """A resend after a kept 404 answered 404 again every time it was
         measured (12 of 12, then 0 of 40 came back 200): the thread the 404
