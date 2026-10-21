@@ -11835,6 +11835,14 @@ class TestRefcount:
         cfg = tmp_path / ".claude.json"
         cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "59999"}}))  # someone else
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        # THE HOST'S SOCKETS ARE NOT THIS CASE'S. `_is_claimed` ends on a
+        # /proc/net/tcp scan for peers connected to the port, and 40404 is a
+        # real pin's port on a dev box: a long-lived peer there (measured, a
+        # proxy on 127.0.0.1 holding an ESTABLISHED socket to :40404) reads
+        # as a client of this fake daemon and it is never reaped.
+        monkeypatch.setattr(
+            "cswap_pin.proxy.clients_that_arming_would_cut_off", lambda _p: 0
+        )
         fired = threading.Event()
         threading.Thread(
             target=watch_refcount, args=(fifo, fired.set),
@@ -11919,6 +11927,10 @@ class TestRefcount:
         cfg.write_text(_json.dumps({"env": {"CSWAP_PIN_PORT": "59999"}}))  # not us
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         monkeypatch.setattr("cswap_pin.proxy._CLAIM_RECHECK_INTERVAL", 0.05)
+        # No host peer on :40404, as in the unwired case above.
+        monkeypatch.setattr(
+            "cswap_pin.proxy.clients_that_arming_would_cut_off", lambda _p: 0
+        )
 
         holder = os.open(fifo, os.O_RDWR)
         reached = _watch_blocking_phase(monkeypatch)  # as above
@@ -11979,6 +11991,10 @@ class TestRefcount:
         monkeypatch.setattr(
             pin_proxy._PUMP, "live_pairs", lambda *a, **k: claim["channel"]
         )
+        # No host peer on :40404 either: with the channel dropped below, the
+        # socket scan is the last claim left, and a real one would keep the
+        # loop ticking past the test.
+        monkeypatch.setattr(pin_proxy, "clients_that_arming_would_cut_off", lambda _p: 0)
 
         republished = []
 
