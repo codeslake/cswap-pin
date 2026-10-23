@@ -17754,8 +17754,8 @@ class PinProxy:
                 continue
             try:
                 self.sweep_titles_once()
-            except Exception:  # noqa: BLE001 — never take the daemon down
-                pass
+            except Exception as exc:  # noqa: BLE001 — never take the daemon down
+                self._note_title_sweep(f"raised:{type(exc).__name__}")
             # ON THE SAME BEAT, and deliberately after the titles: both are
             # repairs of state a live session reads, and one API call each.
             # Separate try/except so a title failure cannot skip the policy —
@@ -18553,9 +18553,11 @@ class PinProxy:
         """
         token = self._pin_token_provider()
         if not token:
+            self._note_title_sweep("no-token")
             return 0            # nothing to do without the pinned identity
         sessions = self._list_bridges(token)
         if sessions is None:
+            self._note_title_sweep("list-failed")
             return 0            # asked and got nothing — not "nothing to fix"
         # ON THE LISTING WE ALREADY PAID FOR. Reviving an archived bridge and
         # restoring its title are two repairs of the same object, and both are
@@ -20872,12 +20874,13 @@ class PinProxy:
         adopt_renamed_sessions()
         names = live_bridge_names()
         if not names:
+            self._note_title_sweep(None)
             return 0
         done = 0
         certdir = getattr(self, "_certdir", None)
         ours = _titles_we_wrote(certdir)
-        for sid, want in titles_to_restore(
-                sessions, names, ours, invented_bridge_names()):
+        todo = titles_to_restore(sessions, names, ours, invented_bridge_names())
+        for sid, want in todo:
             body = json.dumps({"title": want}).encode("utf-8")
             if self._bridge_api(
                 "PUT", f"/v1/code/sessions/{sid}", token, body=body
@@ -20893,6 +20896,7 @@ class PinProxy:
                 f"restored the session name on {done} bridge(s) the "
                 f"reconnect had left under a generated title"
             )
+        self._note_title_sweep("all-puts-refused" if todo and not done else None)
         return done
 
     def sweep_superseded_bridges(self, token: str) -> int:
@@ -23445,6 +23449,26 @@ class PinProxy:
             return
         self._hop_fault = state
         _log_lifecycle(f"hop {hop[0]}:{hop[1]} unusable — {why}")
+
+    #: The last non-success outcome of the title repair, None while it works.
+    #: Class-level so a daemon built without `__init__` reads it too.
+    _title_sweep_fault: "str | None" = None
+
+    def _note_title_sweep(self, fault: "str | None") -> None:
+        """Log why the title repair did nothing, once per CHANGE of outcome.
+
+        `sweep_titles_once` returned 0 in silence for a missing pinned token,
+        a failed listing and a PUT every one of which was refused, and the
+        loop swallowed whatever else it raised, so titles stayed wrong with
+        nothing in `daemon.log` to say why. Deduplicated like
+        :meth:`_note_hop_unusable`: a steady fault costs one line, and any
+        success (something restored, nothing to rename, no live names)
+        resets it, saying `ok` once if it was a fault that ended.
+        """
+        if fault == self._title_sweep_fault:
+            return
+        self._title_sweep_fault = fault
+        _log_lifecycle(f"cloud bridge titles: {fault or 'ok'}")
 
     def _note_egress(
         self,
