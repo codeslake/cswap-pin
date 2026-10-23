@@ -32328,6 +32328,30 @@ class TestAnFdStarvedDaemonRepairsItself:
         assert self.reads_at_ask == 1 and exited == [0]
 
 
+class TestAnAbsentPackageIsNotYetChangedCode:
+    """T2890: `uv tool install --force` empties the tool venv before it
+    downloads the new wheels, so for a network-bound window `cswap_pin` is
+    absent. The empty tree fingerprints as changed, the daemon asks the holder,
+    the successor dies on `ModuleNotFoundError`, and a window past the daemon's
+    `_SPAWN_WAIT_S` ends on exit 75 with a capped drain. An ABSENT package has
+    no code to switch to, so the daemon waits for the next tick."""
+
+    def test_a_package_that_is_not_on_disk_reads_as_current(
+            self, monkeypatch, tmp_path):
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(
+            pin_proxy, "__file__", str(tmp_path / "cswap_pin" / "proxy.py"))
+        assert pin_proxy._code_is_current("a-fingerprint-it-no-longer-has")
+
+    def test_a_package_that_is_on_disk_and_differs_still_reads_as_changed(
+            self):
+        """THE CONTROL: only the file's absence is excused."""
+        from cswap_pin import proxy as pin_proxy
+
+        assert not pin_proxy._code_is_current("a-fingerprint-it-no-longer-has")
+
+
 class TestTheUnpinnableMarkComesBackOff:
     """A repaired account must clear the mark, or nothing looks repaired.
 

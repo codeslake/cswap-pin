@@ -15001,8 +15001,15 @@ def _code_is_current(own: str) -> bool:
     descriptor probe, and only a refused one earns the second read. A second
     unreadable result still reads as changed: that is the only recovery an
     unheld wedged daemon has.
+
+    AN ABSENT PACKAGE IS "NOT YET", NOT "CHANGED" (T2890). `uv tool install
+    --force` empties the venv before it downloads the wheels. A successor
+    cannot start without this file, and asking only ends on exit 75 and a
+    capped drain; the next tick looks again. A stat needs no descriptor.
     """
     if daemon_fingerprint() == own:
+        return True
+    if not Path(__file__).exists():
         return True
     try:
         os.close(os.open(os.devnull, os.O_RDONLY))
