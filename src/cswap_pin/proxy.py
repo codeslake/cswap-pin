@@ -14990,6 +14990,14 @@ def _hand_over_to_the_caller(server, certdir: Path) -> None:
     os._exit(0)
 
 
+# HOW LONG THIS FILE MAY BE ABSENT AND STILL READ AS "NOT YET" (T2890). Generous
+# for a wheel download through a slow egress proxy; bounded because a venv
+# rebuilt under another interpreter never brings this path back.
+_ABSENT_CODE_GRACE_S = 300.0
+# `time.monotonic()` of the first absent read in the current absence, else None.
+_absent_code_since: float | None = None
+
+
 def _code_is_current(own: str) -> bool:
     """Whether the code on disk still fingerprints as ``own``.
 
@@ -15001,9 +15009,31 @@ def _code_is_current(own: str) -> bool:
     descriptor probe, and only a refused one earns the second read. A second
     unreadable result still reads as changed: that is the only recovery an
     unheld wedged daemon has.
+
+    AN ABSENT PACKAGE IS "NOT YET", NOT "CHANGED", FOR `_ABSENT_CODE_GRACE_S`
+    (T2890). `uv tool install --force` empties the venv before it downloads
+    the wheels. A successor cannot start without this file, so asking inside
+    the window only ends on exit 75 when it outlasts `_SPAWN_WAIT_S` (the
+    holder's respawn loop otherwise rides it out), and the next tick looks
+    again. The wait is bounded because a venv rebuilt under another
+    interpreter (a different Python minor) never brings this path back: the
+    new code is elsewhere and the holder's `sys.executable` finds it. The
+    clock starts at the first absent read and clears when the file is there
+    again. `os.path.exists` never raises, where `Path.exists` re-raises
+    EACCES/EIO/ESTALE on Python 3.10-3.13 and a raise here ends the watchdog.
     """
+    global _absent_code_since
     if daemon_fingerprint() == own:
+        _absent_code_since = None
         return True
+    if os.path.exists(__file__):
+        _absent_code_since = None
+    else:
+        now = time.monotonic()
+        if _absent_code_since is None:
+            _absent_code_since = now
+        if now - _absent_code_since < _ABSENT_CODE_GRACE_S:
+            return True
     try:
         os.close(os.open(os.devnull, os.O_RDONLY))
     except OSError as exc:

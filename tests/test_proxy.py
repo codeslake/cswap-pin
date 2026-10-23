@@ -32328,6 +32328,88 @@ class TestAnFdStarvedDaemonRepairsItself:
         assert self.reads_at_ask == 1 and exited == [0]
 
 
+class TestAnAbsentPackageIsNotYetChangedCode:
+    """T2890: `uv tool install --force` empties the tool venv before it
+    downloads the new wheels, so for a network-bound window `cswap_pin` is
+    absent. The empty tree fingerprints as changed, the daemon asks the holder,
+    the successor dies on `ModuleNotFoundError`, and a window past the daemon's
+    `_SPAWN_WAIT_S` ends on exit 75 with a capped drain. An ABSENT package has
+    no code to switch to, so the daemon waits for the next tick, but only for
+    `_ABSENT_CODE_GRACE_S`: a venv rebuilt under another interpreter never
+    brings this path back, and the new code is somewhere else."""
+
+    FP = "a-fingerprint-it-no-longer-has"
+
+    @pytest.fixture
+    def pin_proxy(self, monkeypatch, tmp_path):
+        """The module with its own file gone and no absence on record."""
+        from cswap_pin import proxy
+
+        monkeypatch.setattr(proxy, "_absent_code_since", None)
+        monkeypatch.setattr(
+            proxy, "__file__", str(tmp_path / "cswap_pin" / "proxy.py"))
+        return proxy
+
+    @staticmethod
+    def _absent_for(seconds):
+        return time.monotonic() - seconds
+
+    def test_a_package_that_is_not_on_disk_reads_as_current(self, pin_proxy):
+        assert pin_proxy._code_is_current(self.FP)
+        assert pin_proxy._absent_code_since is not None
+
+    def test_a_package_absent_past_the_grace_reads_as_changed(
+            self, monkeypatch, pin_proxy):
+        """A venv rebuilt under another Python minor never brings this path
+        back: the new code is in `lib/python3.13`, so a daemon that waits
+        forever serves the old code forever."""
+        monkeypatch.setattr(
+            pin_proxy, "_absent_code_since",
+            self._absent_for(pin_proxy._ABSENT_CODE_GRACE_S + 1))
+        assert not pin_proxy._code_is_current(self.FP)
+
+    def test_the_package_coming_back_gives_a_later_absence_a_fresh_grace(
+            self, monkeypatch, pin_proxy):
+        monkeypatch.setattr(
+            pin_proxy, "_absent_code_since",
+            self._absent_for(10 * pin_proxy._ABSENT_CODE_GRACE_S))
+        here = Path(pin_proxy.__file__)
+        here.parent.mkdir()
+        here.write_text("")
+        monkeypatch.setattr(pin_proxy, "daemon_fingerprint", lambda *a: self.FP)
+        assert pin_proxy._code_is_current(self.FP)
+        assert pin_proxy._absent_code_since is None
+        here.unlink()
+        assert pin_proxy._code_is_current(self.FP + "-gone")
+
+    def test_a_stat_that_raises_does_not_end_the_watchdog(
+            self, monkeypatch, pin_proxy):
+        """`Path.exists()` re-raises EACCES/EIO/ESTALE on Python 3.10-3.13, and
+        a raise out of `_code_is_current` ends the watchdog for good. A
+        transient error reads as absent, which is "current" until the next
+        tick."""
+        real = os.stat
+
+        def stat(path, *a, **k):
+            if str(path) == pin_proxy.__file__:
+                raise PermissionError(errno.EACCES, "denied")
+            return real(path, *a, **k)
+
+        monkeypatch.setattr(os, "stat", stat)
+        assert pin_proxy._code_is_current(self.FP)
+
+    def test_a_package_that_is_on_disk_and_differs_still_reads_as_changed(
+            self, monkeypatch):
+        """THE CONTROL: only the file's absence is excused, and its return
+        clears the clock even when the code that came back is different."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(
+            pin_proxy, "_absent_code_since", self._absent_for(1))
+        assert not pin_proxy._code_is_current(self.FP)
+        assert pin_proxy._absent_code_since is None
+
+
 class TestTheUnpinnableMarkComesBackOff:
     """A repaired account must clear the mark, or nothing looks repaired.
 
