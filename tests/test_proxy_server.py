@@ -7847,6 +7847,121 @@ class TestChainRediscovery:
             shell_srv.close()
 
 
+class TestTheTitleSweepSaysWhyItDidNothing:
+    """The bridge-title sweep returned 0 in silence for a missing pinned token,
+    a failed listing and a PUT every one of which was refused, and the loop
+    swallowed whatever else it raised: titles stayed wrong with nothing in
+    `daemon.log` to say why. One `cloud bridge titles: <outcome>` line per
+    CHANGE of outcome, the same dedup as `_note_hop_unusable`, so a steady
+    fault costs one line and not one per five minutes."""
+
+    def test_all(self, request, tmp_path_factory):
+        run_cases(self, request, tmp_path_factory)
+
+    def _daemon(self, monkeypatch, *, token="tok", listing=(), todo=(),
+                put_ok=lambda: True):
+        import cswap_pin.proxy as pp
+
+        d = pp.PinProxy.__new__(pp.PinProxy)
+        d._pin_token_provider = lambda: token
+        d._list_bridges = lambda t: None if listing is None else list(listing)
+        d.revive_archived_bridges = lambda sessions, t: 0
+        d._bridge_api = lambda m, p, t, **kw: {} if put_ok() else None
+        monkeypatch.setattr(pp, "adopt_renamed_sessions", lambda: None)
+        monkeypatch.setattr(pp, "live_bridge_names", lambda: {"cse_A": "alpha"})
+        monkeypatch.setattr(pp, "_titles_we_wrote", lambda certdir: {})
+        monkeypatch.setattr(pp, "invented_bridge_names", lambda: set())
+        monkeypatch.setattr(pp, "titles_to_restore", lambda *a, **k: list(todo))
+        monkeypatch.setattr(pp, "_record_title", lambda *a, **k: None)
+        return d
+
+    def _log(self, run) -> list[str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            run()
+        return [re.sub(r"^\[\S+\] \S+ pid=\d+ ", "", l)
+                for l in buf.getvalue().splitlines()]
+
+    def _sweeps(self, d, n=2) -> list[str]:
+        return self._log(lambda: [d.sweep_titles_once() for _ in range(n)])
+
+    def case_no_pinned_token_is_said_once(self, monkeypatch):
+        d = self._daemon(monkeypatch, token=None)
+        assert self._sweeps(d) == ["cloud bridge titles: no-token"]
+
+    def case_a_failed_listing_is_said_once(self, monkeypatch):
+        d = self._daemon(monkeypatch, listing=None)
+        assert self._sweeps(d) == ["cloud bridge titles: list-failed"]
+
+    def case_every_put_refused_is_said_once(self, monkeypatch):
+        d = self._daemon(monkeypatch, listing=[{"id": "cse_A"}],
+                         todo=[("cse_A", "alpha")], put_ok=lambda: False)
+        assert self._sweeps(d) == ["cloud bridge titles: all-puts-refused"]
+
+    def case_an_exception_the_loop_swallows_is_said_once(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        d = self._daemon(monkeypatch)
+        d._stop = False
+        d.sweep_policy_once = lambda: None
+        calls = []
+
+        def _sweep():
+            calls.append(1)
+            if len(calls) > 2:
+                d._stop = True
+                return 0
+            raise ValueError("boom")
+
+        d.sweep_titles_once = _sweep
+        monkeypatch.setattr(pp.PinProxy, "_TITLE_SWEEP_FIRST_S", 0.0)
+        monkeypatch.setattr(pp.PinProxy, "_TITLE_SWEEP_S", 0.0)
+        monkeypatch.setattr(pp, "live_bridge_names", lambda: {})
+        assert self._log(d._title_sweep_loop) == [
+            "cloud bridge titles: raised:ValueError"]
+        assert len(calls) == 3, "the loop did not keep running past the raise"
+
+    def case_one_put_landing_is_not_all_refused(self, monkeypatch):
+        answers = iter([True, False])
+        d = self._daemon(monkeypatch, listing=[{"id": "cse_A"}],
+                         todo=[("cse_A", "alpha"), ("cse_B", "beta")],
+                         put_ok=lambda: next(answers))
+        got = self._sweeps(d, 1)
+        assert len(got) == 1 and got[0].startswith(
+            "restored the session name on 1 bridge"), got
+
+    def case_a_different_failure_is_a_new_line(self, monkeypatch):
+        d = self._daemon(monkeypatch, token=None)
+        got = self._sweeps(d)
+        d._pin_token_provider = lambda: "tok"
+        d._list_bridges = lambda t: None
+        assert got + self._sweeps(d) == [
+            "cloud bridge titles: no-token", "cloud bridge titles: list-failed"]
+
+    def case_recovery_from_a_failure_says_ok_once(self, monkeypatch):
+        import cswap_pin.proxy as pp
+
+        d = self._daemon(monkeypatch, listing=None)
+        assert self._sweeps(d) == ["cloud bridge titles: list-failed"]
+        d._list_bridges = lambda t: [{"id": "cse_A"}]   # nothing to rename
+        assert self._sweeps(d, 3) == ["cloud bridge titles: ok"]
+        # the same fault again after the recovery is a new line, and so is
+        # the recovery, this time through "no live names"
+        d._list_bridges = lambda t: None
+        monkeypatch.setattr(pp, "live_bridge_names", lambda: {})
+        got = self._sweeps(d)
+        d._list_bridges = lambda t: [{"id": "cse_A"}]
+        assert got + self._sweeps(d) == [
+            "cloud bridge titles: list-failed", "cloud bridge titles: ok"]
+
+    def case_success_after_success_adds_no_titles_line(self, monkeypatch):
+        d = self._daemon(monkeypatch, listing=[{"id": "cse_A"}],
+                         todo=[("cse_A", "alpha")])
+        got = self._sweeps(d)
+        # the existing restored line is unchanged, and nothing joins it
+        assert len(got) == 2 and all(
+            l.startswith("restored the session name on 1 bridge") for l in got), got
+
 
 class TestAbsoluteFormPassthrough:
     """The native auto-updater and telemetry use axios in plain-proxy mode:
